@@ -12,15 +12,14 @@ use crate::sql::executor::{
     public_surface_registry_mutations, CompiledExecution, PreparedPublicWrite,
 };
 use crate::sql::physical_plan::PublicWriteExecutionPartition;
-use crate::transaction::PendingTransactionView;
+use crate::write_runtime::buffered::{
+    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
+};
+use crate::write_runtime::{PendingTransactionView, TransactionCommitOutcome};
 use crate::{LixBackendTransaction, LixError};
 
 use super::compile::SqlBufferedWriteCommand;
 use super::runtime::{CompiledExecutionRoute, SqlExecutionOutcome};
-use crate::transaction::commands::{
-    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
-};
-use crate::transaction::contracts::TransactionCommitOutcome;
 use crate::version::GLOBAL_VERSION_ID;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -81,7 +80,7 @@ pub(super) async fn refresh_public_surface_registry_from_pending_transaction_vie
 
 pub(crate) async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixBackendTransaction,
-    applied_output: &crate::commit::CreateCommitAppliedOutput,
+    applied_output: &crate::write_runtime::commit::CreateCommitAppliedOutput,
 ) -> Result<(), LixError> {
     for row in &applied_output.canonical_output.changes {
         if row.schema_key != REGISTERED_SCHEMA_KEY {

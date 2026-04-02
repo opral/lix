@@ -12,7 +12,7 @@ use crate::contracts::traits::{
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::LixError;
 
-use super::overlay::PendingWriteOverlay;
+use crate::write_runtime::overlay::PendingWriteOverlay;
 
 type BatchTrackedRowRequest = BatchRowRequest;
 type BatchUntrackedRowRequest = BatchRowRequest;

@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::contracts::artifacts::{PlanEffects, ResultContract, SchemaRegistrationSet};
 use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::deterministic_mode::RuntimeFunctionProvider;
@@ -15,13 +14,14 @@ use crate::sql::executor::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
     PreparedPublicRead,
 };
-use crate::transaction::PendingTransactionView;
+use crate::write_runtime::buffered::apply_schema_registrations_in_transaction;
+use crate::write_runtime::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
+use crate::write_runtime::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 use sqlparser::ast::Statement;
 
 use super::planned_write::{build_planned_write_delta, PlannedWriteDelta};
 use super::planned_write_runner::execute_planned_write_delta;
-use crate::transaction::coordinator::apply_schema_registrations_in_transaction;
 pub(crate) struct CompiledExecutionStep {
     execution: CompiledExecution,
     planned_write_delta: Option<PlannedWriteDelta>,

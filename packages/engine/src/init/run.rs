@@ -4,7 +4,6 @@ use crate::account;
 use crate::binary_cas;
 use crate::canonical;
 use crate::checkpoint;
-use crate::commit;
 use crate::engine::Engine;
 use crate::filesystem;
 use crate::key_value;
@@ -21,6 +20,7 @@ use crate::schema;
 use crate::undo_redo;
 use crate::version;
 use crate::workspace;
+use crate::write_runtime::commit;
 use crate::{LixError, TransactionMode};
 
 use super::tables::prepare_backend_for_init;

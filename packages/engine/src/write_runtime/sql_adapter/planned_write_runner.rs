@@ -1,6 +1,6 @@
-use crate::commit::PendingPublicCommitSession;
 use crate::contracts::artifacts::PlanEffects;
 use crate::engine::Engine;
+use crate::write_runtime::commit::PendingPublicCommitSession;
 use crate::{LixBackendTransaction, LixError};
 
 use super::internal_apply::run_internal_write_txn_with_transaction;

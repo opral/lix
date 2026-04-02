@@ -5,10 +5,9 @@ use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
 use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::parser::parse_sql;
-use crate::transaction::{
-    execute_parsed_statements_in_borrowed_write_transaction, BorrowedWriteTransaction,
-};
 use crate::version::GLOBAL_VERSION_ID;
+use crate::write_runtime::sql_adapter::execute_parsed_statements_in_borrowed_write_transaction;
+use crate::write_runtime::BorrowedWriteTransaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 

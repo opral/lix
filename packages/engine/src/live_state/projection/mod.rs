@@ -15,7 +15,6 @@ pub(crate) mod status;
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::commit::{CanonicalCommitReceipt, UpdatedVersionRef};
 use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
@@ -29,6 +28,7 @@ use crate::version::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
     version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
 };
+use crate::write_runtime::commit::{CanonicalCommitReceipt, UpdatedVersionRef};
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, ReplayCursor,
     TransactionMode,
@@ -431,13 +431,13 @@ mod tests {
         catch_up_live_state_to_current_frontier, projection_status, replay, status,
         DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
     };
-    use crate::commit::CanonicalCommitReceipt;
     use crate::live_state::LiveStateMode;
     use crate::test_support::{
         boot_test_engine, init_test_backend_core, seed_canonical_change_row,
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
+    use crate::write_runtime::commit::CanonicalCommitReceipt;
     use crate::ReplayCursor;
     use crate::{CommittedVersionFrontier, LixBackend, LixError, TransactionMode};
     use crate::{CreateVersionOptions, VersionId};

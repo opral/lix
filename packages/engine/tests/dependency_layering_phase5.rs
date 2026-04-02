@@ -90,6 +90,24 @@ const CROSS_OWNER_CATEGORIES: &[CrossOwnerCategory] = &[
         needle: "crate::live_state::",
         exact_path: None,
     },
+    CrossOwnerCategory {
+        key: "write_runtime -> sql",
+        prefix: "src/write_runtime/",
+        needle: "crate::sql::",
+        exact_path: None,
+    },
+    CrossOwnerCategory {
+        key: "write_runtime -> live_state",
+        prefix: "src/write_runtime/",
+        needle: "crate::live_state::",
+        exact_path: None,
+    },
+    CrossOwnerCategory {
+        key: "write_runtime -> read_runtime",
+        prefix: "src/write_runtime/",
+        needle: "crate::read_runtime::",
+        exact_path: None,
+    },
 ];
 
 const EXPECTED_CROSS_OWNER_COUNTS: &[(&str, usize)] = &[
@@ -103,22 +121,32 @@ const EXPECTED_CROSS_OWNER_COUNTS: &[(&str, usize)] = &[
     ("live_state -> session", 0),
     ("read -> sql", 0),
     ("engine -> sql", 0),
-    ("transaction -> sql", 14),
+    ("transaction -> sql", 0),
     ("transaction -> live_state", 0),
+    ("write_runtime -> sql", 15),
+    ("write_runtime -> live_state", 1),
+    ("write_runtime -> read_runtime", 0),
 ];
 
-const ALLOWED_TRANSACTION_SQL_FILES: &[&str] = &[
-    "src/transaction/sql_adapter/compile.rs",
-    "src/transaction/sql_adapter/effects.rs",
-    "src/transaction/sql_adapter/execute.rs",
-    "src/transaction/sql_adapter/planned_write.rs",
-    "src/transaction/sql_adapter/runtime.rs",
-    "src/transaction/sql_adapter/tracked_apply.rs",
+const ALLOWED_TRANSACTION_SQL_FILES: &[&str] = &[];
+
+const ALLOWED_WRITE_RUNTIME_SQL_FILES: &[&str] = &[
+    "src/write_runtime/mod.rs",
+    "src/write_runtime/sql_adapter/compile.rs",
+    "src/write_runtime/sql_adapter/effects.rs",
+    "src/write_runtime/sql_adapter/execute.rs",
+    "src/write_runtime/sql_adapter/planned_write.rs",
+    "src/write_runtime/sql_adapter/runtime.rs",
+    "src/write_runtime/sql_adapter/tracked_apply.rs",
 ];
 
 const ALLOWED_TRANSACTION_LIVE_STATE_FILES: &[&str] = &[];
 
-const ALLOWED_LOCAL_BARREL_FILES: &[&str] = &[];
+const ALLOWED_WRITE_RUNTIME_LIVE_STATE_FILES: &[&str] = &["src/write_runtime/commit/preflight.rs"];
+
+const ALLOWED_WRITE_RUNTIME_READ_RUNTIME_FILES: &[&str] = &[];
+
+const ALLOWED_LOCAL_BARREL_FILES: &[&str] = &["src/transaction/mod.rs"];
 
 #[test]
 fn cross_owner_import_counts_match_plan22_phase1_budget() {
@@ -147,7 +175,7 @@ fn transaction_sql_imports_are_confined_to_phase1_allowlist() {
         "transaction -> sql",
         &hits,
         ALLOWED_TRANSACTION_SQL_FILES,
-        "transaction -> sql leaks should stay confined to transaction/sql_adapter/* during Phase 1",
+        "transaction -> sql leaks should remain eliminated after Phase D",
     );
 }
 
@@ -161,6 +189,47 @@ fn transaction_live_state_imports_are_confined_to_phase1_allowlist() {
         &hits,
         ALLOWED_TRANSACTION_LIVE_STATE_FILES,
         "transaction -> live_state leaks should remain sealed after Phase 2",
+    );
+}
+
+#[test]
+fn write_runtime_sql_imports_are_confined_to_phase_d_allowlist() {
+    let imports = collect_all_import_sites();
+    let hits = filter_imports_by_prefix_and_needle(&imports, "src/write_runtime/", "crate::sql::");
+    assert_path_allowlist(
+        "write_runtime -> sql",
+        &hits,
+        ALLOWED_WRITE_RUNTIME_SQL_FILES,
+        "write_runtime -> sql leaks should stay confined to write_runtime/sql_adapter/* plus the root write_runtime facade",
+    );
+}
+
+#[test]
+fn write_runtime_live_state_imports_are_confined_to_phase_d_allowlist() {
+    let imports = collect_all_import_sites();
+    let hits =
+        filter_imports_by_prefix_and_needle(&imports, "src/write_runtime/", "crate::live_state::");
+    assert_path_allowlist(
+        "write_runtime -> live_state",
+        &hits,
+        ALLOWED_WRITE_RUNTIME_LIVE_STATE_FILES,
+        "write_runtime -> live_state leaks should stay confined to commit preflight during Phase D",
+    );
+}
+
+#[test]
+fn write_runtime_read_runtime_imports_are_confined_to_phase_f_allowlist() {
+    let imports = collect_all_import_sites();
+    let hits = filter_imports_by_prefix_and_needle(
+        &imports,
+        "src/write_runtime/",
+        "crate::read_runtime::",
+    );
+    assert_path_allowlist(
+        "write_runtime -> read_runtime",
+        &hits,
+        ALLOWED_WRITE_RUNTIME_READ_RUNTIME_FILES,
+        "write_runtime should stay separate from read_runtime ownership during Plan 36",
     );
 }
 

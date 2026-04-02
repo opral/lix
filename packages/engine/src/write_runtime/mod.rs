@@ -1,9 +1,26 @@
+pub(crate) mod buffered;
+pub(crate) mod commit;
+mod contracts;
+mod execution;
+pub(crate) mod overlay;
+mod read_context;
+pub(crate) mod sql_adapter;
+
 use async_trait::async_trait;
 
 use crate::engine::DeferredTransactionSideEffects;
 use crate::sql::executor::execution_program::{BoundStatementTemplateInstance, ExecutionContext};
-pub(crate) use crate::transaction::{BorrowedWriteTransaction, WriteTransaction};
 use crate::{LixError, QueryResult};
+
+pub(crate) use buffered::PlannedWriteDelta;
+pub(crate) use contracts::BufferedWriteExecutionContext;
+pub use contracts::{
+    CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
+};
+pub(crate) use execution::BorrowedWriteTransaction;
+pub use execution::WriteTransaction;
+pub(crate) use overlay::PendingTransactionView;
+pub use read_context::ReadContext;
 
 #[async_trait(?Send)]
 pub(crate) trait WriteProgramExecutor {

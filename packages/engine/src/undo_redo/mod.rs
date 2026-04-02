@@ -12,11 +12,11 @@ use crate::canonical::read::{
     CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::commit::ProposedDomainChange;
 use crate::runtime::streams::StateCommitStreamOperation;
 use crate::version::context::{
     load_version_context_with_executor, ResolvedVersionTarget, VersionContextSource,
 };
+use crate::write_runtime::commit::ProposedDomainChange;
 use crate::{LixBackendTransaction, LixError, SessionTransaction};
 
 pub(crate) use init::init;
