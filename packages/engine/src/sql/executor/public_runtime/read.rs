@@ -39,12 +39,11 @@ use crate::sql::logical_plan::{
     StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::physical_plan::lowerer::{
-    lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
-};
+use crate::sql::physical_plan::lowerer::lower_broad_public_read_for_execution_with_layouts;
 use crate::sql::physical_plan::{
-    compile_public_rowset_query, try_compile_read_time_projection_read, LoweredReadProgram,
-    LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
+    compile_public_rowset_query, select_specialized_public_read_artifact,
+    CompilerOwnedPublicReadExecutionSelection, LoweredReadProgram, LoweredResultColumn,
+    LoweredResultColumns, PreparedPublicReadExecution, SpecializedPublicReadArtifactSelection,
 };
 use crate::sql::routing::{
     route_broad_public_read_statement_with_known_live_layouts, route_public_read_execution_strategy,
@@ -510,14 +509,6 @@ fn decode_boolean_value(value: &Value) -> Option<Value> {
     }
 }
 
-fn required_schema_keys_from_dependency_spec(
-    dependency_spec: Option<&DependencySpec>,
-) -> BTreeSet<String> {
-    dependency_spec
-        .map(|spec| spec.schema_keys.iter().cloned().collect())
-        .unwrap_or_default()
-}
-
 fn public_output_columns_from_statement(statement: &Statement) -> Option<Vec<String>> {
     match statement {
         Statement::Query(query) => public_output_columns_from_query(query),
@@ -542,56 +533,6 @@ fn public_output_columns_from_select(select: &Select) -> Option<Vec<String>> {
         }
     }
     Some(output)
-}
-
-async fn load_known_live_layouts_for_dependency_spec(
-    backend: &dyn LixBackend,
-    dependency_spec: Option<&DependencySpec>,
-) -> Result<BTreeMap<String, JsonValue>, LixError> {
-    let mut provider = SqlRegisteredSchemaProvider::new(backend);
-    let mut schemas = BTreeMap::new();
-    for schema_key in required_schema_keys_from_dependency_spec(dependency_spec) {
-        schemas.insert(
-            schema_key.clone(),
-            provider.load_latest_schema(&schema_key).await?,
-        );
-    }
-    Ok(schemas)
-}
-
-async fn load_known_live_layouts_for_public_read(
-    backend: &dyn LixBackend,
-    structured_read: &StructuredPublicRead,
-    dependency_spec: Option<&DependencySpec>,
-    effective_state_request: Option<&EffectiveStateRequest>,
-) -> Result<BTreeMap<String, JsonValue>, LixError> {
-    let mut provider = SqlRegisteredSchemaProvider::new(backend);
-    let mut schemas = load_known_live_layouts_for_dependency_spec(backend, dependency_spec).await?;
-    if let Some(request) = effective_state_request {
-        if let Some(schema_key) = structured_read
-            .surface_binding
-            .implicit_overrides
-            .fixed_schema_key
-            .as_ref()
-        {
-            if !schemas.contains_key(schema_key) {
-                schemas.insert(
-                    schema_key.clone(),
-                    provider.load_latest_schema(schema_key).await?,
-                );
-            }
-        }
-        for schema_key in &request.schema_set {
-            if schemas.contains_key(schema_key) {
-                continue;
-            }
-            schemas.insert(
-                schema_key.clone(),
-                provider.load_latest_schema(schema_key).await?,
-            );
-        }
-    }
-    Ok(schemas)
 }
 
 async fn load_known_live_layouts_for_broad_public_read(
@@ -4525,171 +4466,51 @@ async fn try_prepare_public_read_via_specialized_optimization(
         strategy_decision.direct_execution && is_direct_only_history_surface(&surface_binding);
     stage_timings.record(ExplainStage::Routing, routing_started.elapsed());
     let routing_passes = strategy_decision.pass_traces;
+    let current_version_heads = if surface_binding.descriptor.surface_family == SurfaceFamily::Admin
+        && surface_binding.descriptor.public_name == "lix_version"
+    {
+        load_current_committed_version_frontier_with_backend(backend)
+            .await?
+            .version_heads
+    } else {
+        BTreeMap::new()
+    };
 
     let physical_started = Instant::now();
-    let (execution, pushdown_decision) = if direct_execution {
-        match (
-            surface_binding.descriptor.surface_family,
-            surface_binding.descriptor.public_name.as_str(),
-        ) {
-            (SurfaceFamily::State, "lix_state_history") => {
-                match build_direct_state_history_plan(&structured_read) {
-                    Ok(Some(plan)) => {
-                        let pushdown_decision = direct_state_history_pushdown_decision(&plan);
-                        (
-                            PreparedPublicReadExecution::Direct(
-                                DirectPublicReadPlan::StateHistory(plan),
-                            ),
-                            pushdown_decision,
-                        )
-                    }
-                    Ok(None) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: format!(
-                                "specialized read optimization declined '{}'",
-                                structured_read.surface_binding.descriptor.public_name
-                            ),
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                        return Err(error)
-                    }
-                    Err(error) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: error.description,
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                }
-            }
-            (SurfaceFamily::Entity, _) => {
-                match build_direct_entity_history_plan(&structured_read) {
-                    Ok(Some(plan)) => {
-                        let pushdown_decision = direct_entity_history_pushdown_decision(&plan);
-                        (
-                            PreparedPublicReadExecution::Direct(
-                                DirectPublicReadPlan::EntityHistory(plan),
-                            ),
-                            pushdown_decision,
-                        )
-                    }
-                    Ok(None) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: format!(
-                                "specialized read optimization declined '{}'",
-                                structured_read.surface_binding.descriptor.public_name
-                            ),
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                        return Err(error)
-                    }
-                    Err(error) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: error.description,
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                }
-            }
-            (SurfaceFamily::Filesystem, "lix_directory_history") => {
-                match build_direct_directory_history_plan(&structured_read) {
-                    Ok(Some(plan)) => {
-                        let pushdown_decision = direct_directory_history_pushdown_decision(&plan);
-                        (
-                            PreparedPublicReadExecution::Direct(
-                                DirectPublicReadPlan::DirectoryHistory(plan),
-                            ),
-                            pushdown_decision,
-                        )
-                    }
-                    Ok(None) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: format!(
-                                "specialized read optimization declined '{}'",
-                                structured_read.surface_binding.descriptor.public_name
-                            ),
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                        return Err(error)
-                    }
-                    Err(error) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: error.description,
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                }
-            }
-            (SurfaceFamily::Filesystem, _) => {
-                match build_direct_file_history_plan(&structured_read) {
-                    Ok(Some(plan)) => {
-                        let pushdown_decision = direct_file_history_pushdown_decision(&plan);
-                        (
-                            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(
-                                plan,
-                            )),
-                            pushdown_decision,
-                        )
-                    }
-                    Ok(None) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: format!(
-                                "specialized read optimization declined '{}'",
-                                structured_read.surface_binding.descriptor.public_name
-                            ),
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                    Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                        return Err(error)
-                    }
-                    Err(error) => {
-                        return Ok(SpecializedPublicReadPreparation::Declined {
-                            reason: error.description,
-                            bound_statement: analysis.bound_statement,
-                        })
-                    }
-                }
-            }
-            _ => {
-                unreachable!("direct_execution already restricted to direct-only history surfaces")
-            }
+    let selection = match select_specialized_public_read_artifact(
+        backend,
+        &structured_read,
+        direct_execution,
+        analysis.dependency_spec.as_ref(),
+        analysis.semantics.effective_state_request.as_ref(),
+        analysis.semantics.effective_state_plan.as_ref(),
+        &current_version_heads,
+        &mut stage_timings,
+    )
+    .await
+    {
+        Ok(selection) => selection,
+        Err(error) if specialized_public_read_error_is_semantic(&error) => return Err(error),
+        Err(error) => {
+            return Ok(SpecializedPublicReadPreparation::Declined {
+                reason: error.description,
+                bound_statement: analysis.bound_statement,
+            })
         }
-    } else {
-        if let Some(artifact) = try_compile_read_time_projection_read(&structured_read) {
-            (
-                PreparedPublicReadExecution::ReadTimeProjection(artifact),
-                None,
-            )
-        } else {
-            let capability_started = Instant::now();
-            let known_live_layouts = load_known_live_layouts_for_public_read(
-                backend,
-                &structured_read,
-                analysis.dependency_spec.as_ref(),
-                analysis.semantics.effective_state_request.as_ref(),
-            )
-            .await?;
-            stage_timings.record(
-                ExplainStage::CapabilityResolution,
-                capability_started.elapsed(),
-            );
-            let current_version_heads =
-                load_local_version_heads_for_surface(backend, &surface_binding).await?;
-            let lowered_read = match lower_read_for_execution_with_layouts(
-                backend.dialect(),
-                &structured_read,
-                analysis.semantics.effective_state_request.as_ref(),
-                analysis.semantics.effective_state_plan.as_ref(),
-                &known_live_layouts,
-                &current_version_heads,
-            ) {
-                Ok(Some(program)) => Ok::<LoweredReadProgram, LixError>(program),
+    };
+
+    let (execution, pushdown_decision) = match selection {
+        SpecializedPublicReadArtifactSelection::DirectStateHistory => {
+            match build_direct_state_history_plan(&structured_read) {
+                Ok(Some(plan)) => {
+                    let pushdown_decision = direct_state_history_pushdown_decision(&plan);
+                    (
+                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(
+                            plan,
+                        )),
+                        pushdown_decision,
+                    )
+                }
                 Ok(None) => {
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: format!(
@@ -4708,12 +4529,115 @@ async fn try_prepare_public_read_via_specialized_optimization(
                         bound_statement: analysis.bound_statement,
                     })
                 }
-            }?;
-            let pushdown_decision = Some(lowered_read.pushdown_decision.clone());
-            (
-                PreparedPublicReadExecution::LoweredSql(lowered_read),
+            }
+        }
+        SpecializedPublicReadArtifactSelection::DirectEntityHistory => {
+            match build_direct_entity_history_plan(&structured_read) {
+                Ok(Some(plan)) => {
+                    let pushdown_decision = direct_entity_history_pushdown_decision(&plan);
+                    (
+                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(
+                            plan,
+                        )),
+                        pushdown_decision,
+                    )
+                }
+                Ok(None) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: format!(
+                            "specialized read optimization declined '{}'",
+                            structured_read.surface_binding.descriptor.public_name
+                        ),
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+                Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: error.description,
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+            }
+        }
+        SpecializedPublicReadArtifactSelection::DirectDirectoryHistory => {
+            match build_direct_directory_history_plan(&structured_read) {
+                Ok(Some(plan)) => {
+                    let pushdown_decision = direct_directory_history_pushdown_decision(&plan);
+                    (
+                        PreparedPublicReadExecution::Direct(
+                            DirectPublicReadPlan::DirectoryHistory(plan),
+                        ),
+                        pushdown_decision,
+                    )
+                }
+                Ok(None) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: format!(
+                            "specialized read optimization declined '{}'",
+                            structured_read.surface_binding.descriptor.public_name
+                        ),
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+                Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: error.description,
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+            }
+        }
+        SpecializedPublicReadArtifactSelection::DirectFileHistory => {
+            match build_direct_file_history_plan(&structured_read) {
+                Ok(Some(plan)) => {
+                    let pushdown_decision = direct_file_history_pushdown_decision(&plan);
+                    (
+                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(
+                            plan,
+                        )),
+                        pushdown_decision,
+                    )
+                }
+                Ok(None) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: format!(
+                            "specialized read optimization declined '{}'",
+                            structured_read.surface_binding.descriptor.public_name
+                        ),
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+                Err(error) if specialized_public_read_error_is_semantic(&error) => {
+                    return Err(error)
+                }
+                Err(error) => {
+                    return Ok(SpecializedPublicReadPreparation::Declined {
+                        reason: error.description,
+                        bound_statement: analysis.bound_statement,
+                    })
+                }
+            }
+        }
+        SpecializedPublicReadArtifactSelection::Prepared(
+            CompilerOwnedPublicReadExecutionSelection {
+                execution,
                 pushdown_decision,
-            )
+            },
+        ) => (execution, pushdown_decision),
+        SpecializedPublicReadArtifactSelection::Declined => {
+            return Ok(SpecializedPublicReadPreparation::Declined {
+                reason: format!(
+                    "specialized read optimization declined '{}'",
+                    structured_read.surface_binding.descriptor.public_name
+                ),
+                bound_statement: analysis.bound_statement,
+            })
         }
     };
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
@@ -4791,23 +4715,6 @@ async fn try_prepare_public_read_via_specialized_optimization(
             execution,
         },
     ))
-}
-
-async fn load_local_version_heads_for_surface(
-    backend: &dyn LixBackend,
-    surface_binding: &SurfaceBinding,
-) -> Result<BTreeMap<String, String>, LixError> {
-    if surface_binding.descriptor.surface_family != SurfaceFamily::Admin
-        || surface_binding.descriptor.public_name != "lix_version"
-    {
-        return Ok(BTreeMap::new());
-    }
-
-    Ok(
-        load_current_committed_version_frontier_with_backend(backend)
-            .await?
-            .version_heads,
-    )
 }
 
 fn direct_state_history_pushdown_decision(

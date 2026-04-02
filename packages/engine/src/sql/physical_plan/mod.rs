@@ -4,6 +4,7 @@
 
 pub(crate) mod lowerer;
 pub(crate) mod plan;
+mod public_read_artifacts;
 mod rowset_query;
 
 pub(crate) use plan::{
@@ -12,4 +13,8 @@ pub(crate) use plan::{
     PublicWriteMaterialization, TerminalRelationRenderNode, TrackedWriteExecution,
     UntrackedWriteExecution,
 };
-pub(crate) use rowset_query::{compile_public_rowset_query, try_compile_read_time_projection_read};
+pub(crate) use public_read_artifacts::{
+    select_specialized_public_read_artifact, CompilerOwnedPublicReadExecutionSelection,
+    SpecializedPublicReadArtifactSelection,
+};
+pub(crate) use rowset_query::compile_public_rowset_query;
