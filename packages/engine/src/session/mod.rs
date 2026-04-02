@@ -32,11 +32,12 @@ use crate::sql::internal::script::extract_explicit_transaction_script_from_state
 #[cfg(test)]
 use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
-use crate::transaction::{TransactionCommitOutcome, WriteTransaction};
 use crate::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
 };
+use crate::write_runtime::sql_adapter::execute_parsed_statements_in_write_transaction;
+use crate::write_runtime::{TransactionCommitOutcome, WriteTransaction};
 use crate::{ExecuteResult, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -669,7 +670,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_canonical_commit_receipt(
         &mut self,
-        receipt: crate::commit::CanonicalCommitReceipt,
+        receipt: crate::write_runtime::commit::CanonicalCommitReceipt,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()
@@ -719,7 +720,7 @@ impl<'a> SessionTransaction<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        crate::transaction::execute_parsed_statements_in_write_transaction(
+        execute_parsed_statements_in_write_transaction(
             self.engine,
             write_transaction,
             parsed_statements,
@@ -743,7 +744,7 @@ impl<'a> SessionTransaction<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        crate::transaction::execute_parsed_statements_in_write_transaction(
+        execute_parsed_statements_in_write_transaction(
             self.engine,
             write_transaction,
             parsed_statements,

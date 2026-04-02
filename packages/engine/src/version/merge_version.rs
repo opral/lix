@@ -5,7 +5,6 @@ use crate::canonical::read::{
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
@@ -18,6 +17,7 @@ use crate::version::context::{
     exact_resolved_head_preconditions, require_version_context_pair_in_transaction,
     validate_expected_head_commit_id,
 };
+use crate::write_runtime::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

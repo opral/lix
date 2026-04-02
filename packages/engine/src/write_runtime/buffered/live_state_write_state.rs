@@ -2,11 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::artifacts::{entity_id_in_constraint, EffectiveRowsRequest};
 use crate::contracts::traits::EffectiveRowsResolver;
+use crate::write_runtime::{CommitOutcome, ReadContext, TransactionDelta, TransactionJournal};
 use crate::LixError;
 
-use super::contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 use super::coordinator::TransactionCoordinator;
-use super::read_context::ReadContext;
 use super::write_plan::WritePlan;
 use super::write_runner::apply_write_plan;
 

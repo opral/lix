@@ -1,8 +1,8 @@
 //! Commit authoring and orchestration boundary.
 //!
-//! `commit` owns commit authoring, preflight, receipts, idempotency, and the
-//! atomic write path that composes canonical facts with local refs, workspace
-//! annotations, and narrow live-state hooks.
+//! `write_runtime/commit` owns commit authoring, preflight, receipts,
+//! idempotency, and the atomic write path that composes canonical facts with
+//! local refs, workspace annotations, and narrow live-state hooks.
 
 pub(crate) mod append;
 pub(crate) mod create;

@@ -9,7 +9,7 @@ use crate::sql::executor::{
     prepared_execution_mutates_public_surface_registry, PreparationPolicy,
 };
 use crate::sql::parser::parse_sql_with_timing;
-use crate::transaction::PendingTransactionView;
+use crate::write_runtime::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;
 

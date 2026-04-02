@@ -2,9 +2,9 @@ use crate::contracts::artifacts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::contracts::traits::{TrackedWriteParticipant, UntrackedWriteParticipant};
+use crate::write_runtime::CommitOutcome;
 use crate::{LixBackendTransaction, LixError};
 
-use super::contracts::CommitOutcome;
 use super::write_plan::{WritePlan, WriteUnit};
 
 pub(crate) async fn apply_write_plan(
@@ -54,5 +54,3 @@ fn untracked_writes_summary(writes: &[UntrackedWriteRow]) -> (usize, usize) {
     }
     (upserts, deletes)
 }
-
-pub(crate) use super::sql_adapter::execute_planned_write_delta;

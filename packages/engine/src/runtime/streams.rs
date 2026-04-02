@@ -660,8 +660,8 @@ mod tests {
         state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
         StateCommitStreamRuntimeMetadata,
     };
-    use crate::commit::ProposedDomainChange;
     use crate::contracts::artifacts::PlannedStateRow;
+    use crate::write_runtime::commit::ProposedDomainChange;
     use crate::Value;
     use std::collections::BTreeMap;
 

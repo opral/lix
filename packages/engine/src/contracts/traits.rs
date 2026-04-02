@@ -12,10 +12,8 @@ use crate::contracts::artifacts::{
 use crate::contracts::surface::SurfaceRegistry;
 use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
-use crate::{
-    commit::CanonicalCommitReceipt, LixBackend, LixBackendTransaction, LixError, QueryResult,
-    ReplayCursor, Value,
-};
+use crate::write_runtime::commit::CanonicalCommitReceipt;
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, ReplayCursor, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {

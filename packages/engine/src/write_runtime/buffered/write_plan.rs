@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::contracts::artifacts::{RowIdentity, TrackedWriteRow, UntrackedWriteRow};
+use crate::write_runtime::overlay::PendingWriteOverlay;
+use crate::write_runtime::TransactionDelta;
 use crate::LixError;
-
-use super::contracts::TransactionDelta;
-use super::overlay::PendingWriteOverlay;
 
 #[derive(Debug, Clone)]
 pub(crate) enum WriteUnit {
@@ -203,8 +202,3 @@ where
     }
     latest.into_values().collect()
 }
-
-pub(crate) use super::sql_adapter::{
-    BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,
-    PendingSemanticOverlay, PendingWorkspaceWriterKeyOverlay, PlannedWriteDelta,
-};

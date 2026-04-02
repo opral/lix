@@ -242,7 +242,7 @@ pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(
     crate::live_state::init(backend).await?;
     crate::schema::init(backend).await?;
     crate::canonical::init(backend).await?;
-    crate::commit::init(backend).await?;
+    crate::write_runtime::commit::init(backend).await?;
     crate::version::init(backend).await?;
     Ok(())
 }
