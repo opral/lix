@@ -5,6 +5,7 @@
 pub(crate) mod lowerer;
 pub(crate) mod plan;
 mod public_read_artifacts;
+pub(crate) mod public_surface_sql_support;
 mod rowset_query;
 
 pub(crate) use plan::{

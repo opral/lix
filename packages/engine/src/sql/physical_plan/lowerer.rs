@@ -21,6 +21,10 @@ use crate::sql::physical_plan::plan::{
     compile_terminal_read_statement_from_template, FilesystemPublicSurface, LoweredReadProgram,
     LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
 };
+use crate::sql::physical_plan::public_surface_sql_support::{
+    entity_surface_has_live_payload_collisions, entity_surface_payload_alias,
+    entity_surface_uses_payload_alias, escape_sql_string, render_identifier,
+};
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
@@ -1089,50 +1093,6 @@ fn build_effective_state_source_sql(
     )
 }
 
-fn is_live_state_raw_envelope_column(column: &str) -> bool {
-    matches!(
-        column,
-        "entity_id"
-            | "schema_key"
-            | "file_id"
-            | "version_id"
-            | "plugin_key"
-            | "schema_version"
-            | "metadata"
-            | "created_at"
-            | "updated_at"
-            | "global"
-            | "change_id"
-            | "commit_id"
-            | "untracked"
-            | "writer_key"
-            | "root_commit_id"
-            | "depth"
-    )
-}
-
-fn entity_surface_has_live_payload_collisions(surface_binding: &SurfaceBinding) -> bool {
-    surface_binding.descriptor.surface_family == SurfaceFamily::Entity
-        && surface_binding.descriptor.surface_variant != SurfaceVariant::History
-        && surface_binding
-            .exposed_columns
-            .iter()
-            .any(|column| is_live_state_raw_envelope_column(column))
-}
-
-fn entity_surface_uses_payload_alias(surface_binding: &SurfaceBinding, column: &str) -> bool {
-    entity_surface_has_live_payload_collisions(surface_binding)
-        && surface_binding
-            .exposed_columns
-            .iter()
-            .any(|candidate| candidate.eq_ignore_ascii_case(column))
-        && is_live_state_raw_envelope_column(column)
-}
-
-fn entity_surface_payload_alias(column: &str) -> String {
-    format!("payload__{column}")
-}
-
 fn build_change_source_sql() -> String {
     "SELECT \
         ch.id AS id, \
@@ -1453,14 +1413,6 @@ fn combine_conjunctive_predicates(predicates: Vec<Expr>) -> Option<Expr> {
 
 fn read_predicates_from_query(canonicalized: &StructuredPublicRead) -> Vec<Expr> {
     canonicalized.query.selection_predicates.clone()
-}
-
-fn render_identifier(value: &str) -> String {
-    Ident::new(value).to_string()
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 #[cfg(test)]
