@@ -124,11 +124,12 @@ impl Session {
         })
     }
 
-    /// Opens a child session with optional workspace-selector overrides.
+    /// Opens an ephemeral child session with optional workspace-selector
+    /// overrides.
     ///
     /// The returned session may read or write committed state, but these
     /// overrides only affect workspace selection for that session.
-    pub async fn open_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
+    pub async fn open_child_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
         let active_version_id = options
             .active_version_id
             .unwrap_or_else(|| self.active_version_id());
@@ -1109,7 +1110,7 @@ mod tests {
                 .expect("engine init should succeed");
             backend.clear_modes();
             let session = engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("workspace session should open");
 
@@ -1133,7 +1134,7 @@ mod tests {
                 .expect("engine init should succeed");
             backend.clear_modes();
             let session = engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("workspace session should open");
 
@@ -1156,7 +1157,7 @@ mod tests {
                 .await
                 .expect("engine init should succeed");
             let session = engine
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("workspace session should open");
 

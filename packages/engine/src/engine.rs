@@ -31,16 +31,8 @@ impl Engine {
         self.runtime.backend()
     }
 
-    pub async fn open_workspace_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
+    pub async fn open_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
         crate::Session::open_workspace(Arc::clone(self)).await
-    }
-
-    pub async fn open_session(
-        self: &Arc<Self>,
-        options: crate::OpenSessionOptions,
-    ) -> Result<crate::Session, LixError> {
-        let workspace = self.open_workspace_session().await?;
-        workspace.open_session(options).await
     }
 
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {

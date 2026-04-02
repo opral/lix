@@ -77,7 +77,7 @@ impl SimulationEngine {
 
     pub async fn initialize(&self) -> Result<(), LixError> {
         self.engine.initialize().await?;
-        let session = Arc::new(self.engine.open_workspace_session().await?);
+        let session = Arc::new(self.engine.open_session().await?);
         let _ = self.session.set(session);
         self.initialized.store(true, Ordering::SeqCst);
         if self.behavior == SimulationBehavior::Rematerialization {
@@ -299,7 +299,7 @@ impl SimulationEngine {
         if let Some(session) = self.session.get() {
             return Ok(Arc::clone(session));
         }
-        let session = Arc::new(self.engine.open_workspace_session().await?);
+        let session = Arc::new(self.engine.open_session().await?);
         let _ = self.session.set(Arc::clone(&session));
         Ok(self.session.get().map(Arc::clone).unwrap_or(session))
     }
