@@ -1,6 +1,5 @@
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
-
-use super::write_plan::{
+use crate::write_runtime::buffered::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingWorkspaceWriterKeyOverlay,
 };

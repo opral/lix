@@ -1,19 +1,18 @@
-use crate::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::contracts::artifacts::SchemaRegistration;
 use crate::engine::Engine;
 use crate::runtime::streams::StateCommitStreamChange;
+use crate::write_runtime::buffered::{
+    BufferedWriteState, LiveStateWriteState, TransactionCoordinator,
+};
+use crate::write_runtime::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
+use crate::write_runtime::overlay::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, ReplayCursor};
 
-use super::buffered_write_state::BufferedWriteState;
-use super::contracts::{
-    BufferedWriteExecutionContext, CommitOutcome, TransactionCommitOutcome, TransactionDelta,
-    TransactionJournal,
+use super::{
+    BufferedWriteExecutionContext, CommitOutcome, ReadContext, TransactionCommitOutcome,
+    TransactionDelta, TransactionJournal,
 };
-use super::coordinator::TransactionCoordinator;
-use super::live_state_write_state::LiveStateWriteState;
-use super::read_context::ReadContext;
-use super::write_plan::PlannedWriteDelta;
-use super::PendingTransactionView;
+use crate::write_runtime::PlannedWriteDelta;
 
 pub struct WriteTransaction<'a> {
     coordinator: TransactionCoordinator<'a>,
@@ -373,8 +372,8 @@ mod tests {
         BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
         UntrackedWriteRow,
     };
-    use crate::transaction::live_state_write_state::prepare_materialization_plan;
     use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
+    use crate::write_runtime::buffered::prepare_materialization_plan;
 
     use super::*;
 

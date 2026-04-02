@@ -218,7 +218,7 @@ fn relative_display(manifest_dir: &Path, path: &Path) -> String {
 
 fn is_owner_import(line: &str) -> bool {
     line.contains("crate::canonical::")
-        || line.contains("crate::commit::")
+        || line.contains("crate::write_runtime::commit::")
         || line.contains("crate::refs::")
         || line.contains("crate::version::")
         || line.contains("crate::live_state::")
@@ -237,7 +237,7 @@ fn is_canonical_internal_import(line: &str) -> bool {
 }
 
 fn is_commit_import(line: &str) -> bool {
-    line.contains("crate::commit::")
+    line.contains("crate::write_runtime::commit::")
 }
 
 fn is_refs_import(line: &str) -> bool {

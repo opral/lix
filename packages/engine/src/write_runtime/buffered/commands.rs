@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 
 use crate::engine::{DeferredTransactionSideEffects, Engine};
+use crate::write_runtime::TransactionCommitOutcome;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
-use super::contracts::TransactionCommitOutcome;
-use super::write_plan::PlannedWriteDelta;
+use super::PlannedWriteDelta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BufferedWriteExecutionRoute {

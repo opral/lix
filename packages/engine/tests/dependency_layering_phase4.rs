@@ -120,20 +120,25 @@ fn session_contracts_shim_is_deleted() {
 }
 
 #[test]
-fn transaction_sql_adapter_mod_does_not_reexport_sql() {
+fn write_runtime_sql_adapter_mod_does_not_reexport_sql() {
     assert_file_has_no_reference(
-        "src/transaction/sql_adapter/mod.rs",
+        "src/write_runtime/sql_adapter/mod.rs",
         "pub(crate) use crate::sql::",
     );
 }
 
 #[test]
-fn transaction_sql_adapter_mod_does_not_reexport_crate_modules() {
+fn write_runtime_sql_adapter_mod_does_not_reexport_crate_modules() {
     assert_file_has_no_reference(
-        "src/transaction/sql_adapter/mod.rs",
+        "src/write_runtime/sql_adapter/mod.rs",
         "pub(crate) use crate::",
     );
-    assert_file_has_no_reference("src/transaction/sql_adapter/mod.rs", "pub use crate::");
+    assert_file_has_no_reference("src/write_runtime/sql_adapter/mod.rs", "pub use crate::");
+}
+
+#[test]
+fn transaction_sql_adapter_module_is_deleted() {
+    assert_path_absent("src/transaction/sql_adapter/mod.rs");
 }
 
 fn assert_no_reference(relative_dir: &str, needle: &str) {

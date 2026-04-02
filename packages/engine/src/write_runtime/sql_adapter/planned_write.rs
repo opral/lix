@@ -19,7 +19,7 @@ use crate::sql::physical_plan::{
     PhysicalPlan, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
     UntrackedWriteExecution,
 };
-use crate::transaction::PendingTransactionView;
+use crate::write_runtime::PendingTransactionView;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
