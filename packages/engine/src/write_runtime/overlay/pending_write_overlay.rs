@@ -5,9 +5,8 @@ use crate::contracts::artifacts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedRow, UntrackedWriteOperation,
     UntrackedWriteRow,
 };
+use crate::write_runtime::TransactionDelta;
 use crate::LixError;
-
-use super::contracts::TransactionDelta;
 
 /// Session-local pending-write overlay.
 ///

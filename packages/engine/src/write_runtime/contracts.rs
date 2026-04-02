@@ -5,7 +5,7 @@ use crate::contracts::artifacts::{
 use crate::runtime::streams::StateCommitStreamChange;
 use crate::LixError;
 
-use super::write_plan::{WriteDelta, WriteJournal};
+use crate::write_runtime::buffered::{WriteDelta, WriteJournal};
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct TransactionDelta {

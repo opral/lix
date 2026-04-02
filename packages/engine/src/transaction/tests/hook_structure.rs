@@ -9,7 +9,7 @@ fn read_engine_source(relative: &str) -> String {
 }
 
 #[test]
-fn sql_execution_uses_transaction_module_for_write_orchestration() {
+fn sql_execution_uses_write_runtime_for_write_orchestration() {
     let source = read_engine_source("sql/executor/execution_program.rs");
     assert!(
         source.contains("use crate::write_runtime::{"),
@@ -57,55 +57,159 @@ fn sql_execution_module_no_longer_owns_write_txn_modules() {
 }
 
 #[test]
-fn transaction_module_uses_sql_adapter_boundary_for_sql_facing_write_paths() {
-    let source = read_engine_source("transaction/mod.rs");
+fn write_runtime_exists_as_real_owner_directory() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     assert!(
-        source.contains("mod sql_adapter;"),
-        "transaction/mod.rs should compile the transaction-owned sql_adapter boundary"
+        root.join("write_runtime").is_dir(),
+        "write_runtime/ should exist as a real owner directory"
     );
     assert!(
-        !source.contains("mod buffered_write_execution;"),
-        "transaction/mod.rs should not compile the removed monolithic buffered_write_execution module"
+        root.join("write_runtime/mod.rs").exists(),
+        "write_runtime/mod.rs should exist as the real owner module"
     );
     assert!(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("src/transaction/sql_adapter/mod.rs")
-            .exists(),
-        "transaction/sql_adapter/mod.rs should exist for the SQL-to-transaction adapter boundary"
+        !root.join("write_runtime.rs").exists(),
+        "the legacy top-level write_runtime.rs shim file should be gone after Phase A"
+    );
+
+    let lib_source = read_engine_source("lib.rs");
+    assert!(
+        lib_source.contains("pub(crate) mod write_runtime;"),
+        "lib.rs should wire the write_runtime/ directory as the write owner"
     );
 }
 
 #[test]
-fn core_transaction_files_do_not_import_sql_modules_directly() {
+fn write_runtime_owns_sql_adapter_boundary_for_sql_facing_write_paths() {
+    let source = read_engine_source("transaction/mod.rs");
+    assert!(
+        !source.contains("crate::write_runtime::sql_adapter::"),
+        "transaction/mod.rs should stop re-exporting the sql_adapter boundary once session targets write_runtime directly"
+    );
+    assert!(
+        !source.contains("mod buffered_write_runner;"),
+        "transaction/mod.rs should not compile buffered write core files once write_runtime owns them"
+    );
+    assert!(
+        !source.contains("mod execution;"),
+        "transaction/mod.rs should not compile write execution core files once write_runtime owns them"
+    );
+    assert!(
+        !source.contains("mod overlay;"),
+        "transaction/mod.rs should not compile overlay core files once write_runtime owns them"
+    );
+
+    let adapter_mod_source = read_engine_source("write_runtime/sql_adapter/mod.rs");
+    assert!(
+        adapter_mod_source.contains("mod tracked_apply;"),
+        "write_runtime/sql_adapter/mod.rs should compile the tracked_apply adapter split"
+    );
+    assert!(
+        adapter_mod_source.contains("mod internal_apply;"),
+        "write_runtime/sql_adapter/mod.rs should compile the internal_apply adapter split"
+    );
+    assert!(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/write_runtime/sql_adapter/mod.rs")
+            .exists(),
+        "write_runtime/sql_adapter/mod.rs should exist for the runtime-owned SQL bridge"
+    );
+    assert!(
+        !PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/transaction/sql_adapter/mod.rs")
+            .exists(),
+        "transaction/sql_adapter/mod.rs should be deleted once the adapter moves under write_runtime/"
+    );
+}
+
+#[test]
+fn core_write_runtime_files_do_not_import_sql_modules_directly() {
     let core_files = [
-        "transaction/buffered_write_runner.rs",
-        "transaction/buffered_write_state.rs",
-        "transaction/commands.rs",
-        "transaction/contracts.rs",
-        "transaction/coordinator.rs",
-        "transaction/execution.rs",
-        "transaction/live_state_write_state.rs",
-        "transaction/overlay.rs",
-        "transaction/read_context.rs",
-        "transaction/write_plan.rs",
-        "transaction/write_runner.rs",
+        "write_runtime/buffered/buffered_write_runner.rs",
+        "write_runtime/buffered/buffered_write_state.rs",
+        "write_runtime/buffered/commands.rs",
+        "write_runtime/contracts.rs",
+        "write_runtime/buffered/coordinator.rs",
+        "write_runtime/execution.rs",
+        "write_runtime/buffered/live_state_write_state.rs",
+        "write_runtime/overlay/pending_write_overlay.rs",
+        "write_runtime/read_context.rs",
+        "write_runtime/buffered/write_plan.rs",
+        "write_runtime/buffered/write_runner.rs",
     ];
 
     for relative in core_files {
         let source = read_engine_source(relative);
         assert!(
             !source.contains("crate::sql::"),
-            "{relative} should depend on SQL only through transaction/sql_adapter/*"
+            "{relative} should depend on SQL only through write_runtime/sql_adapter/*"
         );
     }
 }
 
 #[test]
-fn session_runtime_api_targets_transaction_module_for_write_lifecycle() {
+fn write_runtime_owns_buffered_write_core_files() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    for required in [
+        "write_runtime/contracts.rs",
+        "write_runtime/execution.rs",
+        "write_runtime/read_context.rs",
+        "write_runtime/buffered/buffered_write_runner.rs",
+        "write_runtime/buffered/buffered_write_state.rs",
+        "write_runtime/buffered/commands.rs",
+        "write_runtime/buffered/coordinator.rs",
+        "write_runtime/buffered/live_state_write_state.rs",
+        "write_runtime/buffered/write_plan.rs",
+        "write_runtime/buffered/write_runner.rs",
+        "write_runtime/overlay/pending_view.rs",
+        "write_runtime/overlay/pending_write_overlay.rs",
+    ] {
+        assert!(
+            root.join(required).exists(),
+            "{required} should exist under write_runtime/ after Phase B"
+        );
+    }
+
+    for removed in [
+        "transaction/contracts.rs",
+        "transaction/execution.rs",
+        "transaction/read_context.rs",
+        "transaction/buffered_write_runner.rs",
+        "transaction/buffered_write_state.rs",
+        "transaction/commands.rs",
+        "transaction/coordinator.rs",
+        "transaction/live_state_write_state.rs",
+        "transaction/write_plan.rs",
+        "transaction/write_runner.rs",
+        "transaction/pending_view.rs",
+        "transaction/overlay.rs",
+    ] {
+        assert!(
+            !root.join(removed).exists(),
+            "{removed} should be deleted once write_runtime owns the buffered core"
+        );
+    }
+}
+
+#[test]
+fn session_runtime_api_targets_write_runtime_for_write_lifecycle() {
     let source = read_engine_source("session/mod.rs");
     assert!(
-        source.contains("WriteTransaction"),
-        "session/mod.rs should target the transaction module for the runtime write boundary"
+        source.contains("use crate::write_runtime::"),
+        "session/mod.rs should import its write lifecycle from write_runtime directly"
+    );
+    assert!(
+        source.contains("execute_parsed_statements_in_write_transaction("),
+        "session/mod.rs should execute statements through write_runtime::sql_adapter"
+    );
+    assert!(
+        !source.contains("use crate::transaction::{"),
+        "session/mod.rs should not import write lifecycle types from the transitional transaction barrel"
+    );
+    assert!(
+        !source.contains("crate::transaction::execute_parsed_statements_in_write_transaction"),
+        "session/mod.rs should not call the transitional transaction-barrel adapter entrypoint"
     );
     assert!(
         source.contains("begin_write_unit().await?"),
@@ -113,15 +217,15 @@ fn session_runtime_api_targets_transaction_module_for_write_lifecycle() {
     );
     assert!(
         source.contains("WriteTransaction::new_buffered_write("),
-        "session/mod.rs should construct buffered-write transactions through the transaction module"
+        "session/mod.rs should construct buffered-write transactions through write_runtime"
     );
     assert!(
         source.contains(".commit_buffered_write("),
-        "session/mod.rs should commit through the transaction-owned buffered-write lifecycle"
+        "session/mod.rs should commit through the write-runtime-owned buffered-write lifecycle"
     );
     assert!(
         source.contains(".rollback_buffered_write()"),
-        "session/mod.rs should roll back through the transaction-owned buffered-write lifecycle"
+        "session/mod.rs should roll back through the write-runtime-owned buffered-write lifecycle"
     );
 
     let engine_source = read_engine_source("engine.rs");
@@ -280,71 +384,71 @@ fn execution_program_is_a_thin_client_for_adapter_runtime() {
         "sql/executor/compiled.rs should not depend on transaction-owned contracts"
     );
 
-    let adapter_source = read_engine_source("transaction/sql_adapter/runtime.rs");
+    let adapter_source = read_engine_source("write_runtime/sql_adapter/runtime.rs");
     assert!(
         !adapter_source.contains("struct CompiledExecution {"),
-        "transaction/sql_adapter/runtime.rs should not own neutral compiled execution types anymore"
+        "write_runtime/sql_adapter/runtime.rs should not own neutral compiled execution types anymore"
     );
     assert!(
         adapter_source.contains("fn execute_compiled_execution_step_with_transaction"),
-        "transaction/sql_adapter/runtime.rs should own compiled step execution"
+        "write_runtime/sql_adapter/runtime.rs should own compiled step execution"
     );
 
-    let adapter_mod_source = read_engine_source("transaction/sql_adapter/mod.rs");
+    let adapter_mod_source = read_engine_source("write_runtime/sql_adapter/mod.rs");
     assert!(
         !adapter_mod_source.contains("pub(crate) use crate::sql::executor::compiled::"),
-        "transaction/sql_adapter/mod.rs should not re-export the neutral compiled execution model"
+        "write_runtime/sql_adapter/mod.rs should not re-export the neutral compiled execution model"
     );
     assert!(
         !adapter_mod_source.contains("pub(crate) use crate::"),
-        "transaction/sql_adapter/mod.rs should not serve as a crate-level compatibility barrel"
+        "write_runtime/sql_adapter/mod.rs should not serve as a crate-level compatibility barrel"
     );
 }
 
 #[test]
-fn pending_transaction_view_is_transaction_owned() {
+fn pending_transaction_view_is_write_runtime_owned() {
     let executor_compile_source = read_engine_source("sql/executor/compile.rs");
     assert!(
         !executor_compile_source.contains("struct PendingTransactionView"),
-        "executor compile ownership should not define PendingTransactionView once transaction owns pending visibility"
+        "executor compile ownership should not define PendingTransactionView once write_runtime owns pending visibility"
     );
 
-    let transaction_mod_source = read_engine_source("transaction/mod.rs");
+    let overlay_mod_source = read_engine_source("write_runtime/overlay/mod.rs");
     assert!(
-        transaction_mod_source.contains("mod pending_view;"),
-        "transaction/mod.rs should compile a transaction-owned pending_view module"
+        overlay_mod_source.contains("mod pending_view;"),
+        "write_runtime/overlay/mod.rs should compile the pending_view module"
     );
 
-    let pending_view_source = read_engine_source("transaction/pending_view.rs");
+    let pending_view_source = read_engine_source("write_runtime/overlay/pending_view.rs");
     assert!(
         pending_view_source.contains("struct PendingTransactionView"),
-        "transaction/pending_view.rs should own PendingTransactionView"
+        "write_runtime/overlay/pending_view.rs should own PendingTransactionView"
     );
 }
 
 #[test]
-fn schema_registration_and_commit_effects_are_transaction_owned() {
-    let coordinator_source = read_engine_source("transaction/coordinator.rs");
+fn schema_registration_and_commit_effects_are_write_runtime_owned() {
+    let coordinator_source = read_engine_source("write_runtime/buffered/coordinator.rs");
     assert!(
         coordinator_source.contains("register_schema_in_transaction("),
-        "coordinator.rs should own live-state schema registration application"
+        "write_runtime/buffered/coordinator.rs should own live-state schema registration application"
     );
 
     for relative in [
-        "transaction/sql_adapter/runtime.rs",
-        "transaction/sql_adapter/planned_write_runner.rs",
+        "write_runtime/sql_adapter/runtime.rs",
+        "write_runtime/sql_adapter/planned_write_runner.rs",
     ] {
         let source = read_engine_source(relative);
         assert!(
-            !source.contains("register_schema_in_transaction("),
-            "{relative} should not call register_schema_in_transaction directly"
+            !source.contains("pub(crate) async fn register_schema_in_transaction("),
+            "{relative} should not define schema registration application locally"
         );
     }
 
     let session_source = read_engine_source("session/mod.rs");
     assert!(
         session_source.contains("apply_transaction_commit_outcome"),
-        "session/mod.rs should apply a transaction-owned commit outcome"
+        "session/mod.rs should apply a write-runtime-owned commit outcome"
     );
     assert!(
         !session_source.contains("finalize_committed_execution_context"),
@@ -359,25 +463,91 @@ fn schema_registration_and_commit_effects_are_transaction_owned() {
 }
 
 #[test]
-fn init_and_plugin_paths_use_transaction_owned_write_entrypoints() {
+fn commit_authoring_is_write_runtime_owned() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    let commit_mod_source = read_engine_source("write_runtime/commit/mod.rs");
+    assert!(
+        commit_mod_source.contains("pub(crate) mod create;"),
+        "write_runtime/commit/mod.rs should compile commit authoring modules"
+    );
+    assert!(
+        commit_mod_source.contains("pub(crate) use append::{"),
+        "write_runtime/commit/mod.rs should re-export the write-runtime commit surface"
+    );
+
+    for required in [
+        "write_runtime/commit/append.rs",
+        "write_runtime/commit/create.rs",
+        "write_runtime/commit/generate.rs",
+        "write_runtime/commit/init.rs",
+        "write_runtime/commit/pending.rs",
+        "write_runtime/commit/preflight.rs",
+        "write_runtime/commit/receipt.rs",
+        "write_runtime/commit/types.rs",
+    ] {
+        assert!(
+            root.join(required).exists(),
+            "{required} should exist under write_runtime/commit/ after Phase C"
+        );
+    }
+
+    for removed in [
+        "commit/mod.rs",
+        "commit/append.rs",
+        "commit/create.rs",
+        "commit/generate.rs",
+        "commit/init.rs",
+        "commit/pending.rs",
+        "commit/preflight.rs",
+        "commit/receipt.rs",
+        "commit/types.rs",
+    ] {
+        assert!(
+            !root.join(removed).exists(),
+            "{removed} should be removed once commit authoring moves under write_runtime/commit/"
+        );
+    }
+
+    let init_source = read_engine_source("init/run.rs");
+    assert!(
+        init_source.contains("use crate::write_runtime::commit;"),
+        "init/run.rs should bootstrap commit tables through write_runtime::commit"
+    );
+
+    let merge_source = read_engine_source("version/merge_version.rs");
+    assert!(
+        merge_source.contains("use crate::write_runtime::commit::{"),
+        "version/merge_version.rs should depend on the write-runtime commit owner"
+    );
+
+    let lib_source = read_engine_source("lib.rs");
+    assert!(
+        !lib_source.contains("mod commit;"),
+        "lib.rs should not compile a top-level commit owner once commit lives under write_runtime/commit/"
+    );
+}
+
+#[test]
+fn init_and_plugin_paths_use_write_runtime_owned_write_entrypoints() {
     let init_source = read_engine_source("init/seed.rs");
     assert!(
         init_source.contains("BorrowedWriteTransaction"),
-        "init/seed.rs should route its borrowed backend transaction through a transaction-owned wrapper"
+        "init/seed.rs should route its borrowed backend transaction through the write-runtime wrapper"
     );
     assert!(
         init_source.contains("execute_parsed_statements_in_borrowed_write_transaction"),
-        "init/seed.rs should execute writes through the transaction module"
+        "init/seed.rs should execute writes through write_runtime::sql_adapter"
     );
 
     let plugin_source = read_engine_source("plugin/install.rs");
     assert!(
         plugin_source.contains("WriteTransaction::new_buffered_write("),
-        "plugin/install.rs should use the transaction-owned buffered write lifecycle"
+        "plugin/install.rs should use the write-runtime-owned buffered write lifecycle"
     );
     assert!(
         plugin_source.contains("execute_with_options_in_write_transaction"),
-        "plugin/install.rs should execute statements through the transaction module"
+        "plugin/install.rs should execute statements through write_runtime::sql_adapter"
     );
 }
 
@@ -420,22 +590,22 @@ fn internal_vtable_runtime_no_longer_uses_legacy_parallel_contracts() {
 
 #[test]
 fn transaction_runtime_uses_normal_internal_execution_not_postprocess_callbacks() {
-    let runtime_source = read_engine_source("transaction/sql_adapter/runtime.rs");
+    let runtime_source = read_engine_source("write_runtime/sql_adapter/runtime.rs");
     assert!(
         !runtime_source.contains("execute_internal_postprocess_with_transaction"),
-        "transaction runtime should not call the removed postprocess callback path"
+        "write-runtime sql adapter should not call the removed postprocess callback path"
     );
     assert!(
         !runtime_source.contains("postprocess:"),
-        "transaction runtime should not carry a postprocess field"
+        "write-runtime sql adapter should not carry a postprocess field"
     );
     assert!(
         !runtime_source.contains("execute_internal_mutation_with_transaction"),
-        "transaction runtime should not preserve a second internal_mutation execution path"
+        "write-runtime sql adapter should not preserve a second internal_mutation execution path"
     );
     assert!(
         runtime_source.contains("execute_prepared_with_transaction"),
-        "transaction runtime should execute internal compatibility statements through normal prepared execution"
+        "write-runtime sql adapter should execute internal compatibility statements through normal prepared execution"
     );
 
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/sql/internal");
@@ -459,17 +629,17 @@ fn transaction_runtime_uses_normal_internal_execution_not_postprocess_callbacks(
 
 #[test]
 fn planned_write_runner_is_split_by_apply_owner() {
-    let adapter_mod_source = read_engine_source("transaction/sql_adapter/mod.rs");
+    let adapter_mod_source = read_engine_source("write_runtime/sql_adapter/mod.rs");
     assert!(
         adapter_mod_source.contains("mod tracked_apply;"),
-        "transaction/sql_adapter/mod.rs should compile a tracked_apply module"
+        "write_runtime/sql_adapter/mod.rs should compile a tracked_apply module"
     );
     assert!(
         adapter_mod_source.contains("mod internal_apply;"),
-        "transaction/sql_adapter/mod.rs should compile an internal_apply module"
+        "write_runtime/sql_adapter/mod.rs should compile an internal_apply module"
     );
 
-    let runner_source = read_engine_source("transaction/sql_adapter/planned_write_runner.rs");
+    let runner_source = read_engine_source("write_runtime/sql_adapter/planned_write_runner.rs");
     assert!(
         runner_source.contains("run_public_tracked_append_txn_with_transaction("),
         "planned_write_runner.rs should delegate tracked append apply"

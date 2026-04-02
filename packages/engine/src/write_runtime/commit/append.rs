@@ -265,8 +265,8 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::commit::ProposedDomainChange {
-        crate::commit::ProposedDomainChange {
+    fn sample_change() -> crate::write_runtime::commit::ProposedDomainChange {
+        crate::write_runtime::commit::ProposedDomainChange {
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),

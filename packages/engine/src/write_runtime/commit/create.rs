@@ -1341,7 +1341,6 @@ mod tests {
         CreateCommitWriteLane,
     };
     use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
-    use crate::commit::receipt::UpdatedVersionRef;
     use crate::contracts::artifacts::OptionalTextPatch;
     use crate::filesystem::runtime::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::functions::LixFunctionProvider;
@@ -1350,6 +1349,7 @@ mod tests {
         CanonicalChangeSeed, TestSqliteBackend,
     };
     use crate::version::GLOBAL_VERSION_ID;
+    use crate::write_runtime::commit::receipt::UpdatedVersionRef;
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
         LixBackend, LixBackendTransaction, LixError, Value, VersionId,
@@ -1436,7 +1436,7 @@ mod tests {
 
     fn create_commit_args(
         preconditions: CreateCommitPreconditions,
-        changes: Vec<crate::commit::ProposedDomainChange>,
+        changes: Vec<crate::write_runtime::commit::ProposedDomainChange>,
         filesystem_state: FilesystemTransactionState,
     ) -> CreateCommitArgs {
         CreateCommitArgs {
@@ -1483,8 +1483,8 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::commit::ProposedDomainChange {
-        crate::commit::ProposedDomainChange {
+    fn sample_change() -> crate::write_runtime::commit::ProposedDomainChange {
+        crate::write_runtime::commit::ProposedDomainChange {
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -1497,8 +1497,8 @@ mod tests {
         }
     }
 
-    fn sample_global_change() -> crate::commit::ProposedDomainChange {
-        crate::commit::ProposedDomainChange {
+    fn sample_global_change() -> crate::write_runtime::commit::ProposedDomainChange {
+        crate::write_runtime::commit::ProposedDomainChange {
             entity_id: "version-a".try_into().unwrap(),
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),

@@ -8,7 +8,6 @@ mod canonical_json;
 mod cel;
 mod change_view;
 pub(crate) mod checkpoint;
-pub(crate) mod commit;
 mod committed_frontier;
 pub(crate) mod contracts;
 mod deterministic_mode;
@@ -41,7 +40,7 @@ mod undo_redo;
 mod version;
 pub mod wire;
 pub(crate) mod workspace;
-mod write_runtime;
+pub(crate) mod write_runtime;
 
 pub mod image {
     pub use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
