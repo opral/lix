@@ -85,7 +85,7 @@ mod tests {
                 .expect("create version should succeed");
 
             let ephemeral = session
-                .open_session(OpenSessionOptions {
+                .open_child_session(OpenSessionOptions {
                     active_version_id: Some("version-b".to_string()),
                     ..OpenSessionOptions::default()
                 })

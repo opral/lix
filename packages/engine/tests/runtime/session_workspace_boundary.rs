@@ -154,7 +154,63 @@ async fn workspace_metadata_value(session: &Session, key: &str) -> Option<String
 }
 
 #[test]
-fn open_session_snapshots_active_version_and_isolates_switches() {
+fn engine_open_session_returns_workspace_backed_root_session() {
+    run_with_large_stack(|| async move {
+        let path = temp_sqlite_path("engine-root-session");
+        let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
+
+        let engine = boot_engine(&path);
+        engine.initialize().await.expect("init should succeed");
+
+        let workspace = engine
+            .open_session()
+            .await
+            .expect("workspace open_session should succeed");
+        let version = workspace
+            .create_version(CreateVersionOptions {
+                name: Some("engine-root-session".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("create_version should succeed");
+        workspace
+            .switch_version(version.id.clone())
+            .await
+            .expect("switch_version should succeed");
+        workspace
+            .set_active_account_ids(vec!["acct-root".to_string()])
+            .await
+            .expect("set_active_account_ids should succeed");
+
+        assert_eq!(
+            workspace_metadata_value(&workspace, "active_version_id").await,
+            Some(version.id.clone())
+        );
+        assert_eq!(
+            workspace_metadata_value(&workspace, "active_account_ids").await,
+            Some(r#"["acct-root"]"#.to_string())
+        );
+
+        drop(workspace);
+
+        let reopened_engine = boot_engine(&path);
+        let reopened = reopened_engine
+            .open_session()
+            .await
+            .expect("reopen open_session should succeed");
+
+        assert_eq!(reopened.active_version_id(), version.id);
+        assert_eq!(reopened.active_account_ids(), vec!["acct-root".to_string()]);
+
+        drop(reopened);
+        drop(reopened_engine);
+        drop(engine);
+        cleanup_sqlite_path(&path);
+    });
+}
+
+#[test]
+fn open_child_session_snapshots_active_version_and_isolates_switches() {
     run_with_large_stack(|| async move {
         let path = temp_sqlite_path("snapshot");
         let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
@@ -178,9 +234,9 @@ fn open_session_snapshots_active_version_and_isolates_switches() {
             .expect("switch_version should succeed");
 
         let worker = lix
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("open_session should succeed");
+            .expect("open_child_session should succeed");
         worker
             .switch_version("global".to_string())
             .await
@@ -253,7 +309,7 @@ fn workspace_backed_lix_reopens_on_persisted_active_version() {
 }
 
 #[test]
-fn open_session_snapshots_active_accounts_and_allows_explicit_overrides() {
+fn open_child_session_snapshots_active_accounts_and_allows_explicit_overrides() {
     run_with_large_stack(|| async move {
         let path = temp_sqlite_path("active-accounts-snapshot");
         let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
@@ -266,23 +322,23 @@ fn open_session_snapshots_active_accounts_and_allows_explicit_overrides() {
             .expect("open should succeed");
 
         let seeded = lix
-            .open_session(OpenSessionOptions {
+            .open_child_session(OpenSessionOptions {
                 active_account_ids: Some(vec!["acct-parent".to_string()]),
                 ..Default::default()
             })
             .await
-            .expect("seeded open_session should succeed");
+            .expect("seeded open_child_session should succeed");
         let worker = seeded
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("snapshot open_session should succeed");
+            .expect("snapshot open_child_session should succeed");
         let override_worker = seeded
-            .open_session(OpenSessionOptions {
+            .open_child_session(OpenSessionOptions {
                 active_account_ids: Some(vec!["acct-override".to_string()]),
                 ..Default::default()
             })
             .await
-            .expect("open_session override should succeed");
+            .expect("open_child_session override should succeed");
 
         let seeded_accounts = seeded
             .execute("SELECT lix_active_account_ids()", &[])
@@ -343,9 +399,9 @@ fn create_version_uses_the_calling_sessions_active_version_by_default() {
             .expect("workspace switch_version should succeed");
 
         let worker = lix
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("open_session should succeed");
+            .expect("open_child_session should succeed");
         worker
             .switch_version("global".to_string())
             .await
@@ -410,9 +466,9 @@ fn create_checkpoint_uses_the_calling_sessions_active_version() {
             .expect("workspace create_checkpoint should succeed");
 
         let worker = lix
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("open_session should succeed");
+            .expect("open_child_session should succeed");
         let worker_version = worker
             .create_version(CreateVersionOptions {
                 name: Some("worker-undo-redo".to_string()),
@@ -483,9 +539,9 @@ fn undo_and_redo_default_to_the_calling_sessions_active_version() {
             .expect("switch_version should succeed");
 
         let worker = lix
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("open_session should succeed");
+            .expect("open_child_session should succeed");
         let worker_version = worker
             .create_version(CreateVersionOptions {
                 name: Some("worker-observe".to_string()),
@@ -610,7 +666,7 @@ fn observe_initial_snapshot_is_session_scoped() {
             .expect("switch_version should succeed");
 
         let worker = lix
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
             .expect("open_session should succeed");
         let worker_version = worker
@@ -684,13 +740,13 @@ fn extra_session_switch_version_refreshes_only_its_own_observes() {
         engine.initialize().await.expect("init should succeed");
 
         let workspace = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("open_workspace_session should succeed");
+            .expect("workspace open_session should succeed");
         let worker = workspace
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("open_session should succeed");
+            .expect("open_child_session should succeed");
         let worker_version = worker
             .create_version(CreateVersionOptions {
                 name: Some("worker-observe-switch".to_string()),
@@ -749,13 +805,13 @@ fn extra_session_active_account_changes_refresh_only_its_own_observes() {
         engine.initialize().await.expect("init should succeed");
 
         let workspace = engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("open_workspace_session should succeed");
+            .expect("workspace open_session should succeed");
         let worker = workspace
-            .open_session(OpenSessionOptions::default())
+            .open_child_session(OpenSessionOptions::default())
             .await
-            .expect("open_session should succeed");
+            .expect("open_child_session should succeed");
 
         let query = ObserveQuery::new("SELECT lix_active_account_ids()", Vec::new());
         let mut worker_observed = worker
@@ -808,9 +864,9 @@ fn workspace_reopen_restores_runtime_state_from_workspace_metadata() {
             let engine = boot_engine(&path);
             engine.initialize().await.expect("init should succeed");
             let workspace = engine
-                .open_workspace_session()
+                .open_session()
                 .await
-                .expect("open_workspace_session should succeed");
+                .expect("workspace open_session should succeed");
             let version = workspace
                 .create_version(CreateVersionOptions {
                     name: Some("workspace-metadata-reopen".to_string()),
@@ -841,9 +897,9 @@ fn workspace_reopen_restores_runtime_state_from_workspace_metadata() {
 
         let reopened_engine = boot_engine(&path);
         let reopened = reopened_engine
-            .open_workspace_session()
+            .open_session()
             .await
-            .expect("reopen open_workspace_session should succeed");
+            .expect("reopen open_session should succeed");
 
         assert_eq!(reopened.active_version_id(), version_id);
         assert_eq!(
@@ -879,12 +935,12 @@ fn tracked_writes_use_the_calling_sessions_active_accounts() {
             .expect("open should succeed");
 
         let worker = lix
-            .open_session(OpenSessionOptions {
+            .open_child_session(OpenSessionOptions {
                 active_account_ids: Some(vec!["acct-session".to_string()]),
                 ..Default::default()
             })
             .await
-            .expect("open_session override should succeed");
+            .expect("open_child_session override should succeed");
 
         worker
             .execute(
