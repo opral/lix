@@ -5,11 +5,8 @@ use std::time::Duration;
 use crate::engine::{DeferredTransactionSideEffects, Engine};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
-use crate::sql::executor::execution_program::{
-    execute_execution_program_with_borrowed_write_transaction,
-    execute_execution_program_with_write_transaction, BoundStatementTemplateInstance,
-    ExecutionContext, ExecutionProgram,
-};
+use crate::session::execution_context::ExecutionContext;
+use crate::sql::prepare::execution_program::{BoundStatementTemplateInstance, ExecutionProgram};
 use crate::write_runtime::buffered::{
     execute_buffered_write_input, BufferedWriteAdapter, BufferedWriteCommandMetadata,
     BufferedWriteExecutionResult, BufferedWriteScope,
@@ -120,6 +117,74 @@ pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
         context,
     )
     .await
+}
+
+pub(crate) async fn execute_execution_program_with_write_transaction(
+    executor: &dyn WriteProgramExecutor,
+    write_transaction: &mut WriteTransaction<'_>,
+    program: &ExecutionProgram,
+    allow_internal_tables: bool,
+    context: &mut ExecutionContext,
+) -> Result<ExecuteResult, LixError> {
+    let mut results = Vec::new();
+
+    for step in program.steps() {
+        let result = executor
+            .execute_bound_statement_template_instance_in_write_transaction(
+                write_transaction,
+                step,
+                allow_internal_tables,
+                context,
+                None,
+                false,
+            )
+            .await?;
+        results.push(result);
+    }
+
+    if crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(
+        program.source_statements(),
+    ) {
+        write_transaction.mark_installed_plugins_cache_invalidation_pending();
+    }
+
+    Ok(ExecuteResult {
+        statements: results,
+    })
+}
+
+pub(crate) async fn execute_execution_program_with_borrowed_write_transaction(
+    executor: &dyn WriteProgramExecutor,
+    write_transaction: &mut BorrowedWriteTransaction<'_>,
+    program: &ExecutionProgram,
+    allow_internal_tables: bool,
+    context: &mut ExecutionContext,
+) -> Result<ExecuteResult, LixError> {
+    let mut results = Vec::new();
+
+    for step in program.steps() {
+        let result = executor
+            .execute_bound_statement_template_instance_in_borrowed_write_transaction(
+                write_transaction,
+                step,
+                allow_internal_tables,
+                context,
+                None,
+                false,
+            )
+            .await?;
+        results.push(result);
+    }
+
+    if crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(
+        program.source_statements(),
+    ) {
+        write_transaction.mark_installed_plugins_cache_invalidation_pending();
+    }
+
+    Ok(ExecuteResult {
+        statements: results,
+    })
 }
 
 pub(crate) async fn execute_with_options_in_write_transaction(

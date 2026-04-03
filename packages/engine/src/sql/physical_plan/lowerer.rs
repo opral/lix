@@ -7,9 +7,6 @@ use crate::errors::sql_unknown_column_error;
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
-use crate::public_read_sql::{
-    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
-};
 use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
@@ -20,6 +17,9 @@ use crate::sql::physical_plan::plan::{
     compile_final_read_statement, compile_lowered_read_statement,
     compile_terminal_read_statement_from_template, FilesystemPublicSurface, LoweredReadProgram,
     LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
+};
+use crate::sql::physical_plan::public_surface_source_sql::{
+    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_has_live_payload_collisions, entity_surface_payload_alias,

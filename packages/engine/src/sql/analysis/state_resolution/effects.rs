@@ -4,9 +4,9 @@ use crate::runtime::streams::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
 
-use crate::sql::executor::contracts::effects::PlanEffects;
-use crate::sql::executor::contracts::planned_statement::PlannedStatementSet;
-use crate::sql::executor::contracts::planner_error::PlannerError;
+use crate::sql::prepare::contracts::effects::PlanEffects;
+use crate::sql::prepare::contracts::planned_statement::PlannedStatementSet;
+use crate::sql::prepare::contracts::planner_error::PlannerError;
 
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
@@ -33,7 +33,7 @@ pub(crate) fn derive_effects_from_state_resolution(
 mod tests {
     use super::derive_effects_from_state_resolution;
     use crate::backend::prepared::PreparedStatement;
-    use crate::sql::executor::contracts::planned_statement::{
+    use crate::sql::prepare::contracts::planned_statement::{
         MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan,
     };
     use serde_json::json;

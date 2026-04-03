@@ -3,7 +3,7 @@ use crate::engine::Engine;
 use crate::refs::load_committed_version_head_commit_id;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
-use crate::sql::executor::execution_program::{ExecutionContext, SessionExecutionRuntime};
+use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::parser::parse_sql;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::write_runtime::sql_adapter::execute_parsed_statements_in_borrowed_write_transaction;

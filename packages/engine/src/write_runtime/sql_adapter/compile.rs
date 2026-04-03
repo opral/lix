@@ -1,19 +1,25 @@
-use crate::contracts::traits::PendingView;
 use crate::engine::Engine;
 use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
-use crate::sql::executor::execution_program::{
-    BoundStatementTemplateInstance, ExecutionContext, StatementTemplate, StatementTemplateCacheKey,
-};
-use crate::sql::executor::{
-    compile_execution_from_template_instance_with_backend,
-    prepared_execution_mutates_public_surface_registry, PreparationPolicy,
-};
+use crate::session::execution_context::ExecutionContext;
 use crate::sql::parser::parse_sql_with_timing;
+use crate::sql::prepare::execution_program::{
+    BoundStatementTemplateInstance, StatementTemplate, StatementTemplateCacheKey,
+};
+use crate::sql::prepare::intent::filesystem_transaction_state_from_planned;
+use crate::sql::prepare::{
+    compile_execution_from_template_instance_with_context,
+    prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
+    PreparationPolicy,
+};
+use crate::sql::semantic_ir::validation::validate_batch_local_write;
+use crate::version::context::load_target_version_history_root_commit_id_with_backend;
 use crate::write_runtime::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;
 
+use super::planned_write::materialize_prepared_public_write;
 use super::runtime::CompiledExecutionStep;
+use super::validation::validate_update_plans;
 
 pub(super) struct SqlBufferedWriteCommand {
     pub(super) statement: Statement,
@@ -41,17 +47,28 @@ pub(super) async fn compile_sql_buffered_write_command(
             .await?;
     }
     let backend = TransactionBackendAdapter::new(transaction);
-    let compiled_execution = match compile_execution_from_template_instance_with_backend(
-        engine.runtime().as_ref(),
+    let active_history_root_commit_id = load_target_version_history_root_commit_id_with_backend(
         &backend,
-        pending_transaction_view.map(|view| view as &dyn PendingView),
+        Some(context.active_version_id.as_str()),
+        "active_version_id",
+    )
+    .await?;
+    let preparation_context = DefaultSqlPreparationContext {
+        backend: &backend,
+        cel_evaluator: engine.runtime().as_ref().cel_evaluator(),
+        schema_cache: engine.runtime().as_ref().schema_cache(),
+        deterministic_settings: runtime_state.settings(),
+        functions: runtime_state.provider(),
+        active_history_root_commit_id: active_history_root_commit_id.as_deref(),
+        public_surface_registry_override: Some(&context.public_surface_registry),
+    };
+    let mut compiled_execution = match compile_execution_from_template_instance_with_context(
+        &preparation_context,
         bound_statement_template,
         context.active_version_id.as_str(),
         &context.active_account_ids,
         writer_key.as_deref(),
         allow_internal_tables,
-        Some(&context.public_surface_registry),
-        Some(runtime_state),
         PreparationPolicy {
             skip_side_effect_collection,
         },
@@ -68,6 +85,76 @@ pub(super) async fn compile_sql_buffered_write_command(
             .await);
         }
     };
+    if let Some(internal) = compiled_execution.internal_execution() {
+        if !internal.update_validations.is_empty() {
+            validate_update_plans(
+                &backend,
+                engine.runtime().as_ref().schema_cache(),
+                &internal.update_validations,
+                bound_statement_template.params(),
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "prepare_execution_with_backend update validation failed: {}",
+                    error.description
+                ),
+            })?;
+        }
+    }
+    if let Some(public_write) = compiled_execution.public_write().cloned() {
+        let functions = compiled_execution.runtime_state.provider().clone();
+        let public_write = match materialize_prepared_public_write(
+            &backend,
+            pending_transaction_view,
+            &public_write,
+            functions,
+        )
+        .await
+        {
+            Ok(public_write) => public_write,
+            Err(error) => {
+                return Err(normalize_sql_execution_error_with_backend(
+                    &backend,
+                    error,
+                    parsed_statements,
+                )
+                .await);
+            }
+        };
+        validate_batch_local_write(
+            &backend,
+            engine.runtime().as_ref().schema_cache(),
+            &public_write.planned_write,
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "prepare_execution_with_backend public batch-local validation failed: {}",
+                error.description
+            ),
+        })?;
+
+        compiled_execution.intent.filesystem_state = public_write
+            .planned_write
+            .resolved_write_plan
+            .as_ref()
+            .map(|resolved| filesystem_transaction_state_from_planned(&resolved.filesystem_state()))
+            .unwrap_or_default();
+        compiled_execution.physical_plan = Some(
+            crate::sql::physical_plan::PhysicalPlan::PublicWrite(public_write.execution.clone()),
+        );
+        compiled_execution.explain = public_write
+            .explain
+            .request
+            .as_ref()
+            .map(|_| public_write.explain.clone());
+        *compiled_execution
+            .public_write_mut()
+            .expect("public write compile path must still hold a public write body") = public_write;
+    }
     let compiled = CompiledExecutionStep::compile(compiled_execution, writer_key.as_deref())?;
     let registry_mutated_during_planning =
         prepared_execution_mutates_public_surface_registry(compiled.execution())?;
