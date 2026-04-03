@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
+use crate::backend::prepared::PreparedStatement;
 use crate::contracts::artifacts::{PlanEffects, ResultContract, SchemaRegistrationSet};
 use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::deterministic_mode::RuntimeFunctionProvider;
@@ -8,9 +9,8 @@ use crate::engine::Engine;
 use crate::functions::SharedFunctionProvider;
 use crate::runtime::streams::StateCommitStreamChange;
 use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
-use crate::sql::executor::contracts::executor_error::ExecutorError;
-use crate::sql::executor::execute_prepared::execute_prepared_with_transaction;
-use crate::sql::executor::{
+use crate::sql::prepare::contracts::executor_error::ExecutorError;
+use crate::sql::prepare::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
     PreparedPublicRead,
 };
@@ -276,4 +276,20 @@ fn public_result_from_contract(
             internal_result.clone()
         }
     }
+}
+
+async fn execute_prepared_with_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    statements: &[PreparedStatement],
+) -> Result<QueryResult, LixError> {
+    let mut last_result = QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
+    };
+    for statement in statements {
+        last_result = transaction
+            .execute(&statement.sql, &statement.params)
+            .await?;
+    }
+    Ok(last_result)
 }

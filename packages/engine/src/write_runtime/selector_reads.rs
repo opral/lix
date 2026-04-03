@@ -1,8 +1,10 @@
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
-use crate::sql::executor::{
-    execute_prepared_public_read, try_prepare_public_read_with_registry_and_internal_access,
+use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
+use crate::sql::prepare::{
+    prepare_public_read_artifact, try_prepare_public_read_with_registry_and_internal_access,
 };
+use crate::version::context::load_target_version_history_root_commit_id_with_backend;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{Query, Statement};
 
@@ -23,12 +25,19 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
         None => SurfaceRegistry::bootstrap_with_backend(backend).await?,
     };
     let statement = Statement::Query(Box::new(query));
+    let active_history_root_commit_id = load_target_version_history_root_commit_id_with_backend(
+        backend,
+        Some(active_version_id),
+        "active_version_id",
+    )
+    .await?;
     let prepared = try_prepare_public_read_with_registry_and_internal_access(
         backend,
         &registry,
         &[statement],
         params,
         active_version_id,
+        active_history_root_commit_id.as_deref(),
         writer_key,
         false,
         None,
@@ -49,6 +58,9 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
                 )
                 .await
         }
-        None => execute_prepared_public_read(backend, &public_read).await,
+        None => {
+            let artifact = prepare_public_read_artifact(&public_read, backend.dialect())?;
+            execute_prepared_public_read_artifact_with_backend(backend, &artifact).await
+        }
     }
 }

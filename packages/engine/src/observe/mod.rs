@@ -2,10 +2,10 @@ use crate::contracts::artifacts::SessionDependency;
 use crate::errors;
 use crate::runtime::streams::StateCommitStream;
 use crate::session::Session;
-use crate::sql::executor::dependency_spec::{
+use crate::sql::parser::parse_sql_statements;
+use crate::sql::prepare::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
-use crate::sql::parser::parse_sql_statements;
 use crate::wire::WireValue;
 use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};

@@ -6,4 +6,3 @@ pub(crate) mod filesystem_planning;
 pub(crate) mod state_assignments;
 pub(crate) mod surface_semantics;
 pub(crate) mod write_analysis;
-pub(crate) mod write_resolver;

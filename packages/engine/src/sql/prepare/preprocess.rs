@@ -1,5 +1,5 @@
 use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::{
     result_contract_for_statements, verify_logical_plan, InternalLogicalPlan, LogicalPlan,
 };
@@ -11,39 +11,12 @@ use sqlparser::ast::Statement;
 use super::contracts::planned_statement::PlannedStatementSet;
 use super::statement_references_public_surface_with_backend;
 
-pub(crate) async fn preprocess_sql_to_plan(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql_text: &str,
-    params: &[Value],
-) -> Result<PlannedStatementSet, LixError> {
-    let functions = SharedFunctionProvider::new(SystemFunctionProvider);
-    preprocess_sql_with_provider(backend, evaluator, sql_text, params, functions).await
-}
-
-async fn preprocess_sql_with_provider<P: LixFunctionProvider>(
+pub(crate) async fn preprocess_sql_to_plan_with_functions<P: LixFunctionProvider>(
     backend: &dyn LixBackend,
     evaluator: &CelEvaluator,
     sql_text: &str,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
-) -> Result<PlannedStatementSet, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    preprocess_sql_with_provider_and_writer_key(
-        backend, evaluator, sql_text, params, functions, None,
-    )
-    .await
-}
-
-async fn preprocess_sql_with_provider_and_writer_key<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
-    evaluator: &CelEvaluator,
-    sql_text: &str,
-    params: &[Value],
-    functions: SharedFunctionProvider<P>,
-    writer_key: Option<&str>,
 ) -> Result<PlannedStatementSet, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -54,7 +27,7 @@ where
         parse_sql_statements(sql_text)?,
         params,
         functions,
-        writer_key,
+        None,
     )
     .await
 }

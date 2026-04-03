@@ -1,4 +1,4 @@
-use crate::sql::executor::contracts::planner_error::PlannerError;
+use crate::sql::prepare::contracts::planner_error::PlannerError;
 use crate::LixError;
 use sqlparser::ast::Statement;
 use sqlparser::dialect::GenericDialect;

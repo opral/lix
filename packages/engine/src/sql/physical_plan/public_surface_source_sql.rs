@@ -1,8 +1,4 @@
-//! Transitional surface-family SQL builders.
-//!
-//! This module should only hold not-yet-migrated surface-family source builders.
-//! Generic compiler-owned predicate/rendering helpers belong under
-//! `sql/physical_plan/*`.
+//! Compiler-owned public surface source SQL builders.
 
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};

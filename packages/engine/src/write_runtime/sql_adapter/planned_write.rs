@@ -1,29 +1,128 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Instant;
 
 use crate::contracts::artifacts::{
     coalesce_live_table_requirements, DomainChangeBatch, ExpectedHead, MutationRow,
     OptionalTextPatch, PlanEffects, PlannedRowIdentity, PlannedStateRow, ResultContract,
     RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::sql::executor::{
-    build_tracked_txn_unit, CompiledExecution, CompiledInternalExecution, PreparedPublicWrite,
-    TrackedTxnUnit,
+use crate::sql::explain::{
+    build_public_write_explain_artifacts, stage_timing, ExplainStage, PublicWriteExplainBuildInput,
 };
 use crate::sql::physical_plan::{
     PhysicalPlan, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
     UntrackedWriteExecution,
 };
+use crate::sql::prepare::{
+    build_public_write_execution, build_public_write_invariant_trace, build_tracked_txn_unit,
+    finalize_public_write_execution, public_authoritative_write_error,
+    public_write_preparation_error, CompiledExecution, CompiledInternalExecution,
+    PreparedPublicWrite, TrackedTxnUnit,
+};
+use crate::sql::semantic_ir::semantics::domain_changes::{
+    build_domain_change_batch, derive_commit_preconditions,
+};
+use crate::write_runtime::resolve_write_plan_with_functions;
 use crate::write_runtime::PendingTransactionView;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
+
+pub(crate) async fn materialize_prepared_public_write<P>(
+    backend: &dyn crate::LixBackend,
+    pending_transaction_view: Option<&PendingTransactionView>,
+    public_write: &PreparedPublicWrite,
+    functions: SharedFunctionProvider<P>,
+) -> Result<PreparedPublicWrite, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let physical_started = Instant::now();
+    let mut public_write = public_write.clone();
+    let resolved_write_plan = resolve_write_plan_with_functions(
+        backend,
+        &public_write.planned_write,
+        pending_transaction_view.map(|view| view as &dyn PendingView),
+        functions,
+    )
+    .await
+    .map_err(|error| {
+        public_authoritative_write_error(&public_write.canonicalized, error.message.clone())
+            .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", error.message))
+    })?;
+
+    public_write.planned_write.resolved_write_plan = Some(resolved_write_plan);
+
+    let domain_change_batches =
+        build_domain_change_batch(&public_write.planned_write).map_err(|error| {
+            public_write_preparation_error(&public_write.canonicalized, &error.message)
+                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
+        })?;
+    let commit_preconditions = derive_commit_preconditions(backend, &public_write.planned_write)
+        .await
+        .map_err(|error| {
+            public_write_preparation_error(&public_write.canonicalized, &error.message)
+                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
+        })?;
+    public_write.planned_write.commit_preconditions = commit_preconditions.clone();
+
+    let mut execution = build_public_write_execution(
+        &public_write.planned_write,
+        &domain_change_batches,
+        &commit_preconditions,
+    )?
+    .ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public write target must route through explicit public materialization",
+        )
+    })?;
+    let filesystem_state = crate::sql::prepare::intent::filesystem_transaction_state_from_planned(
+        &public_write
+            .planned_write
+            .resolved_write_plan
+            .as_ref()
+            .expect("public write materialization requires a resolved write plan")
+            .filesystem_state(),
+    );
+    if let PreparedPublicWriteExecution::Materialize(materialization) = &mut execution {
+        finalize_public_write_execution(
+            materialization,
+            &public_write.planned_write,
+            &filesystem_state,
+        )?;
+    }
+
+    let mut stage_timings = public_write.explain_plan.stage_timings.clone();
+    stage_timings.push(stage_timing(
+        ExplainStage::PhysicalPlanning,
+        physical_started.elapsed(),
+    ));
+
+    public_write.domain_change_batches = domain_change_batches.clone();
+    public_write.execution = execution.clone();
+    public_write.explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
+        request: public_write.explain_plan.request.clone(),
+        semantics: public_write.explain_plan.semantics.clone(),
+        planned_write: public_write.planned_write.clone(),
+        execution,
+        domain_change_batches,
+        invariant_trace: Some(build_public_write_invariant_trace(
+            &public_write.planned_write,
+        )),
+        stage_timings,
+    });
+
+    Ok(public_write)
+}
 
 #[derive(Clone)]
 pub(crate) struct PlannedPublicUntrackedWriteUnit {

@@ -1,19 +1,14 @@
-use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::runtime::execution_state::{ExecutionRuntimeEffects, ExecutionRuntimeState};
+use crate::runtime::execution_state::ExecutionRuntimeEffects;
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
 };
 use crate::sql::internal::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::write_runtime::{BorrowedWriteTransaction, WriteProgramExecutor, WriteTransaction};
-use crate::{ExecuteResult, LixError, SqlDialect, Value};
+use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 use super::contracts::requirements::PlanRequirements;
@@ -22,136 +17,6 @@ use super::{classify_public_execution_route_with_registry, PublicExecutionRoute}
 pub(crate) struct ExecutionProgram {
     source_statements: Vec<Statement>,
     steps: Vec<ExecutionProgramStep>,
-}
-
-pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;
-
-pub(crate) struct SessionExecutionRuntime {
-    public_surface_registry_generation: AtomicU64,
-    statement_template_cache: Mutex<BTreeMap<StatementTemplateCacheKey, StatementTemplate>>,
-}
-
-impl SessionExecutionRuntime {
-    pub(crate) fn new() -> SessionExecutionRuntimeHandle {
-        Arc::new(Self {
-            public_surface_registry_generation: AtomicU64::new(0),
-            statement_template_cache: Mutex::new(BTreeMap::new()),
-        })
-    }
-
-    pub(crate) fn public_surface_registry_generation(&self) -> u64 {
-        self.public_surface_registry_generation
-            .load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn bump_public_surface_registry_generation(&self) {
-        self.public_surface_registry_generation
-            .fetch_add(1, Ordering::SeqCst);
-    }
-
-    pub(crate) fn cached_statement_template(
-        &self,
-        key: &StatementTemplateCacheKey,
-    ) -> Option<StatementTemplate> {
-        self.statement_template_cache
-            .lock()
-            .expect("statement template cache lock poisoned")
-            .get(key)
-            .cloned()
-    }
-
-    pub(crate) fn cache_statement_template(
-        &self,
-        key: StatementTemplateCacheKey,
-        template: StatementTemplate,
-    ) {
-        self.statement_template_cache
-            .lock()
-            .expect("statement template cache lock poisoned")
-            .insert(key, template);
-    }
-}
-
-pub(crate) struct ExecutionContext {
-    pub(crate) options: ExecuteOptions,
-    pub(crate) public_surface_registry: SurfaceRegistry,
-    session_runtime: SessionExecutionRuntimeHandle,
-    pub(crate) active_version_id: String,
-    pub(crate) active_account_ids: Vec<String>,
-    execution_runtime_state: Option<ExecutionRuntimeState>,
-}
-
-impl ExecutionContext {
-    pub(crate) fn new(
-        options: ExecuteOptions,
-        public_surface_registry: SurfaceRegistry,
-        session_runtime: SessionExecutionRuntimeHandle,
-        active_version_id: String,
-        active_account_ids: Vec<String>,
-    ) -> Self {
-        Self {
-            options,
-            public_surface_registry,
-            session_runtime,
-            active_version_id,
-            active_account_ids,
-            execution_runtime_state: None,
-        }
-    }
-
-    pub(crate) fn bump_public_surface_registry_generation(&mut self) {
-        self.session_runtime
-            .bump_public_surface_registry_generation();
-    }
-
-    pub(crate) fn public_surface_registry_generation(&self) -> u64 {
-        self.session_runtime.public_surface_registry_generation()
-    }
-
-    pub(crate) fn cached_statement_template(
-        &self,
-        key: &StatementTemplateCacheKey,
-    ) -> Option<StatementTemplate> {
-        self.session_runtime.cached_statement_template(key)
-    }
-
-    pub(crate) fn cache_statement_template(
-        &self,
-        key: StatementTemplateCacheKey,
-        template: StatementTemplate,
-    ) {
-        self.session_runtime.cache_statement_template(key, template);
-    }
-
-    pub(crate) fn session_runtime(&self) -> SessionExecutionRuntimeHandle {
-        Arc::clone(&self.session_runtime)
-    }
-
-    pub(crate) fn execution_runtime_state(&self) -> Option<&ExecutionRuntimeState> {
-        self.execution_runtime_state.as_ref()
-    }
-
-    pub(crate) fn set_execution_runtime_state(&mut self, runtime_state: ExecutionRuntimeState) {
-        self.execution_runtime_state = Some(runtime_state);
-    }
-
-    pub(crate) fn clear_execution_runtime_state(&mut self) {
-        self.execution_runtime_state = None;
-    }
-
-    pub(crate) fn runtime_binding_values(&self) -> Result<RuntimeBindingValues, LixError> {
-        Ok(RuntimeBindingValues {
-            active_version_id: self.active_version_id.clone(),
-            active_account_ids_json: serde_json::to_string(&self.active_account_ids).map_err(
-                |error| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("active account ids serialization failed: {error}"),
-                    )
-                },
-            )?,
-        })
-    }
 }
 
 enum ExecutionProgramStep {
@@ -231,7 +96,7 @@ impl StatementTemplate {
             Self {
                 binding_template,
                 plan_requirements:
-                    crate::sql::executor::derive_requirements::derive_plan_requirements(
+                    crate::sql::prepare::derive_requirements::derive_plan_requirements(
                         std::slice::from_ref(&statement),
                     ),
                 ownership_hint,
@@ -384,84 +249,6 @@ impl ExecutionProgram {
             ExecutionProgramStep::Statement(step) => Some(&step.bound_template),
         })
     }
-}
-
-pub(crate) async fn execute_execution_program_with_write_transaction(
-    executor: &dyn WriteProgramExecutor,
-    write_transaction: &mut WriteTransaction<'_>,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
-) -> Result<ExecuteResult, LixError> {
-    let mut results = Vec::with_capacity(program.steps.len());
-
-    for step in &program.steps {
-        match step {
-            ExecutionProgramStep::TransactionControl => {}
-            ExecutionProgramStep::Statement(step) => {
-                let result = executor
-                    .execute_bound_statement_template_instance_in_write_transaction(
-                        write_transaction,
-                        &step.bound_template,
-                        allow_internal_tables,
-                        context,
-                        None,
-                        false,
-                    )
-                    .await?;
-                results.push(result);
-            }
-        }
-    }
-
-    if crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(
-        program.source_statements(),
-    ) {
-        write_transaction.mark_installed_plugins_cache_invalidation_pending();
-    }
-
-    Ok(ExecuteResult {
-        statements: results,
-    })
-}
-
-pub(crate) async fn execute_execution_program_with_borrowed_write_transaction(
-    executor: &dyn WriteProgramExecutor,
-    write_transaction: &mut BorrowedWriteTransaction<'_>,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
-) -> Result<ExecuteResult, LixError> {
-    let mut results = Vec::with_capacity(program.steps.len());
-
-    for step in &program.steps {
-        match step {
-            ExecutionProgramStep::TransactionControl => {}
-            ExecutionProgramStep::Statement(step) => {
-                let result = executor
-                    .execute_bound_statement_template_instance_in_borrowed_write_transaction(
-                        write_transaction,
-                        &step.bound_template,
-                        allow_internal_tables,
-                        context,
-                        None,
-                        false,
-                    )
-                    .await?;
-                results.push(result);
-            }
-        }
-    }
-
-    if crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(
-        program.source_statements(),
-    ) {
-        write_transaction.mark_installed_plugins_cache_invalidation_pending();
-    }
-
-    Ok(ExecuteResult {
-        statements: results,
-    })
 }
 
 fn is_transaction_control(statement: &Statement) -> bool {

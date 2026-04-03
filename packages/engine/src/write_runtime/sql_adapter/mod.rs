@@ -7,8 +7,10 @@ mod planned_write_runner;
 mod runtime;
 mod tracked_apply;
 mod untracked_apply;
+mod validation;
 
 pub(crate) use execute::{
+    execute_execution_program_with_write_transaction,
     execute_parsed_statements_in_borrowed_write_transaction,
     execute_parsed_statements_in_write_transaction, execute_with_options_in_write_transaction,
 };

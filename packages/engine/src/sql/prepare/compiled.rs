@@ -11,7 +11,7 @@ use super::contracts::effects::PlanEffects;
 use super::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use super::public_runtime::{PreparedPublicRead, PreparedPublicWrite};
+use super::public_surface::{PreparedPublicRead, PreparedPublicWrite};
 
 #[derive(Clone)]
 pub(crate) struct CompiledInternalExecution {
@@ -23,7 +23,7 @@ pub(crate) struct CompiledInternalExecution {
 }
 
 pub(crate) struct CompiledExecution {
-    pub(crate) intent: crate::sql::executor::intent::ExecutionIntent,
+    pub(crate) intent: crate::sql::prepare::intent::ExecutionIntent,
     pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) physical_plan: Option<PhysicalPlan>,
     pub(crate) explain: Option<ExplainArtifacts>,
@@ -49,6 +49,13 @@ impl CompiledExecution {
 
     pub(crate) fn public_write(&self) -> Option<&PreparedPublicWrite> {
         match &self.body {
+            CompiledExecutionBody::PublicWrite(write) => Some(write),
+            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Internal(_) => None,
+        }
+    }
+
+    pub(crate) fn public_write_mut(&mut self) -> Option<&mut PreparedPublicWrite> {
+        match &mut self.body {
             CompiledExecutionBody::PublicWrite(write) => Some(write),
             CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Internal(_) => None,
         }

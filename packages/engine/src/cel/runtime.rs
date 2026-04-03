@@ -174,8 +174,8 @@ mod tests {
                 include_str!("../sql/semantic_ir/semantics/state_assignments.rs"),
             ),
             (
-                "packages/engine/src/sql/semantic_ir/semantics/write_resolver/state_backed_writes.rs",
-                include_str!("../sql/semantic_ir/semantics/write_resolver/state_backed_writes.rs"),
+                "packages/engine/src/write_runtime/resolve_write_plan/state_backed_writes.rs",
+                include_str!("../write_runtime/resolve_write_plan/state_backed_writes.rs"),
             ),
         ] {
             assert!(

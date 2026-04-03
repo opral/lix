@@ -13,6 +13,7 @@ use crate::backend::QueryExecutor;
 use crate::cel::CelEvaluator;
 use crate::contracts::artifacts::MutationRow;
 use crate::contracts::surface::SurfaceRegistry;
+use crate::contracts::traits::CompiledSchemaCache;
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
 use crate::key_value::key_value_schema_key;
@@ -91,6 +92,14 @@ impl Runtime {
 
     pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
         self.wasm_runtime.as_ref()
+    }
+
+    pub(crate) fn cel_evaluator(&self) -> &CelEvaluator {
+        &self.cel_evaluator
+    }
+
+    pub(crate) fn schema_cache(&self) -> &SchemaCache {
+        &self.schema_cache
     }
 
     pub(crate) fn access_to_internal(&self) -> bool {
@@ -257,11 +266,20 @@ impl SchemaCache {
     }
 }
 
+impl CompiledSchemaCache for SchemaCache {
+    fn get_compiled_schema(&self, key: &SchemaKey) -> Option<Arc<JSONSchema>> {
+        self.read().ok().and_then(|guard| guard.get(key).cloned())
+    }
+
+    fn insert_compiled_schema(&self, key: SchemaKey, schema: Arc<JSONSchema>) {
+        if let Ok(mut guard) = self.write() {
+            guard.insert(key, schema);
+        }
+    }
+}
+
 #[async_trait(?Send)]
 pub(crate) trait RuntimeHost {
-    fn cel_evaluator(&self) -> &CelEvaluator;
-    fn schema_cache(&self) -> &SchemaCache;
-
     async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
@@ -289,14 +307,6 @@ pub(crate) trait RuntimeHost {
 
 #[async_trait(?Send)]
 impl RuntimeHost for Runtime {
-    fn cel_evaluator(&self) -> &CelEvaluator {
-        &self.cel_evaluator
-    }
-
-    fn schema_cache(&self) -> &SchemaCache {
-        &self.schema_cache
-    }
-
     async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
@@ -343,6 +353,23 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
 ) -> LixError {
     crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
         .await
+}
+
+pub(crate) async fn normalize_sql_execution_error_from_source_sql_with_backend(
+    backend: &dyn LixBackend,
+    error: LixError,
+    source_sql: &[String],
+) -> LixError {
+    let mut statements = Vec::new();
+    for sql in source_sql {
+        match crate::sql::parser::parse_sql_statements(sql) {
+            Ok(mut parsed) => statements.append(&mut parsed),
+            Err(_) => {
+                return error;
+            }
+        }
+    }
+    normalize_sql_execution_error_with_backend(backend, error, &statements).await
 }
 
 pub(crate) fn direct_state_file_cache_refresh_targets(
