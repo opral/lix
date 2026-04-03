@@ -2,8 +2,7 @@ use std::collections::BTreeSet;
 
 use crate::sql::logical_plan::public_ir::PlannedFilesystemState;
 use crate::sql::prepare::contracts::requirements::PlanRequirements;
-use crate::{LixBackend, LixError, Value};
-use sqlparser::ast::Statement;
+use crate::LixError;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct IntentCollectionPolicy {
@@ -14,12 +13,7 @@ pub(crate) struct ExecutionIntent {
     pub(crate) filesystem_state: PlannedFilesystemState,
 }
 
-pub(crate) async fn collect_execution_intent_with_backend(
-    _backend: &dyn LixBackend,
-    _statements: &[Statement],
-    _params: &[Value],
-    _active_version_id: &str,
-    _writer_key: Option<&str>,
+pub(crate) async fn collect_execution_intent(
     requirements: &PlanRequirements,
     policy: IntentCollectionPolicy,
 ) -> Result<ExecutionIntent, LixError> {

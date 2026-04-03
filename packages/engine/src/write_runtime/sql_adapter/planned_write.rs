@@ -113,9 +113,8 @@ where
             public_write_preparation_error(&public_write.canonicalized, &error.message)
                 .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
         })?;
-    let commit_preconditions = derive_commit_preconditions(backend, &public_write.planned_write)
-        .await
-        .map_err(|error| {
+    let commit_preconditions =
+        derive_commit_preconditions(&public_write.planned_write).map_err(|error| {
             public_write_preparation_error(&public_write.canonicalized, &error.message)
                 .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
         })?;

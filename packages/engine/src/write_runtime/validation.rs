@@ -1,3 +1,11 @@
+//! Authoritative runtime validation for write-side SQL artifacts.
+//!
+//! This module owns validations that require live backend truth such as:
+//! - committed uniqueness / foreign-key checks
+//! - live schema visibility
+//! - binary CAS existence checks
+//! - commit-time revalidation of tracked writes
+
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
