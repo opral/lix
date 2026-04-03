@@ -426,7 +426,6 @@ async fn boot_engine_with_json_plugin(
     let engine = sim
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
-            active_account: None,
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
@@ -457,7 +456,6 @@ async fn boot_engine_with_path_echo_plugin(
     let engine = sim
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
-            active_account: None,
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
@@ -488,7 +486,6 @@ async fn boot_engine_with_before_aware_plugin(
     let engine = sim
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
-            active_account: None,
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
@@ -861,7 +858,6 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     let engine = sim
         .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
             key_values: Vec::new(),
-            active_account: None,
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
@@ -954,7 +950,6 @@ simulation_test!(
         let engine = sim
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
-                active_account: None,
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
@@ -1078,7 +1073,6 @@ simulation_test!(
         let engine = sim
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
-                active_account: None,
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
@@ -1138,7 +1132,6 @@ simulation_test!(
         let engine = sim
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
-                active_account: None,
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
@@ -1241,7 +1234,6 @@ mod legacy_plugin_and_cache_tests {
             let engine = sim
                 .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                     key_values: Vec::new(),
-                    active_account: None,
                     wasm_runtime: runtime,
                     access_to_internal: true,
                 }))
@@ -1351,7 +1343,6 @@ mod legacy_plugin_and_cache_tests {
             let engine = sim
                 .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                     key_values: Vec::new(),
-                    active_account: None,
                     wasm_runtime: runtime,
                     access_to_internal: true,
                 }))
@@ -1450,7 +1441,6 @@ mod legacy_plugin_and_cache_tests {
             let engine = sim
                 .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                     key_values: Vec::new(),
-                    active_account: None,
                     wasm_runtime: runtime,
                     access_to_internal: true,
                 }))
@@ -3440,7 +3430,6 @@ simulation_test!(
         let engine = sim
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
-                active_account: None,
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
@@ -3518,7 +3507,6 @@ simulation_test!(
         let engine = sim
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
-                active_account: None,
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
@@ -3591,7 +3579,6 @@ simulation_test!(
         let engine = sim
             .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
                 key_values: Vec::new(),
-                active_account: None,
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))

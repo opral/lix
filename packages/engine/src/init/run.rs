@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use crate::account;
 use crate::binary_cas;
 use crate::canonical;
 use crate::checkpoint;
@@ -78,9 +77,6 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             version::init(&backend)
                 .await
                 .map_err(|error| init_step_error("version::init", error))?;
-            account::init(&backend)
-                .await
-                .map_err(|error| init_step_error("account::init", error))?;
             workspace::init(&backend)
                 .await
                 .map_err(|error| init_step_error("workspace::init", error))?;
@@ -113,9 +109,6 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         key_value::seed_bootstrap(&mut init, &default_active_version_id)
             .await
             .map_err(|error| init_step_error("key_value::seed_bootstrap", error))?;
-        account::seed_bootstrap(&mut init)
-            .await
-            .map_err(|error| init_step_error("account::seed_bootstrap", error))?;
         init.persist_runtime_state()
             .await
             .map_err(|error| init_step_error("persist_runtime_state", error))?;

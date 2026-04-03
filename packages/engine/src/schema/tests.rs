@@ -1,3 +1,4 @@
+use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::{validate_lix_schema, validate_lix_schema_definition};
 use serde_json::json;
 
@@ -268,6 +269,29 @@ fn x_lix_key_must_be_snake_case() {
         schema["x-lix-key"] = json!(key);
         assert!(validate_lix_schema_definition(&schema).is_ok());
     }
+}
+
+#[test]
+fn builtin_storage_metadata_parses_lix_account_from_schema_owner() {
+    let metadata = builtin_schema_storage_metadata("lix_account")
+        .expect("lix_account builtin storage metadata should exist");
+
+    assert_eq!(metadata.schema_key, "lix_account");
+    assert_eq!(metadata.schema_version, "1");
+    assert_eq!(metadata.file_id, "lix");
+    assert_eq!(metadata.plugin_key, "lix");
+    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Global);
+}
+
+#[test]
+fn builtin_storage_metadata_marks_non_global_builtins_as_versioned() {
+    let metadata = builtin_schema_storage_metadata("lix_key_value")
+        .expect("lix_key_value builtin storage metadata should exist");
+
+    assert_eq!(metadata.schema_key, "lix_key_value");
+    assert_eq!(metadata.file_id, "lix");
+    assert_eq!(metadata.plugin_key, "lix");
+    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Versioned);
 }
 
 #[test]

@@ -35,7 +35,6 @@ impl LixConfig {
             backend: self.backend,
             wasm_runtime: self.wasm_runtime,
             key_values: self.key_values,
-            active_account: None,
             access_to_internal: false,
         }
     }
