@@ -7,7 +7,7 @@ use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,
 };
-use crate::{LixBackend, LixError};
+use crate::LixError;
 use serde_json::{json, Map, Value as JsonValue};
 
 impl TrackedDomainChangeView for PublicDomainChange {
@@ -69,8 +69,7 @@ pub(crate) fn build_domain_change_batch(
         .collect()
 }
 
-pub(crate) async fn derive_commit_preconditions(
-    _backend: &dyn LixBackend,
+pub(crate) fn derive_commit_preconditions(
     planned_write: &PlannedWrite,
 ) -> Result<Vec<CommitPreconditions>, DomainChangeError> {
     let resolved = planned_write
@@ -496,14 +495,13 @@ mod tests {
                 .build()
                 .expect("test runtime should build")
                 .block_on(async move {
-                    let (planned_write, backend) = planned_write(
+                    let (planned_write, _backend) = planned_write(
                         "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
                          VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')"
                     )
                     .await;
 
-                    let preconditions = derive_commit_preconditions(&backend, &planned_write)
-                        .await
+                    let preconditions = derive_commit_preconditions(&planned_write)
                         .expect("preconditions should derive")
                         .into_iter()
                         .next()
@@ -530,7 +528,7 @@ mod tests {
                 .build()
                 .expect("test runtime should build")
                 .block_on(async move {
-                    let (planned_write, backend) = planned_write_with_params(
+                    let (planned_write, _backend) = planned_write_with_params(
                         "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
                          VALUES ($1, $2, $3, 'version-a')",
                         vec![
@@ -541,8 +539,7 @@ mod tests {
                     )
                     .await;
 
-                    let preconditions = derive_commit_preconditions(&backend, &planned_write)
-                        .await
+                    let preconditions = derive_commit_preconditions(&planned_write)
                         .expect("preconditions should derive")
                         .into_iter()
                         .next()

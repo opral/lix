@@ -1,18 +1,20 @@
 use crate::cel::CelEvaluator;
+use crate::contracts::surface::SurfaceRegistry;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::{
     result_contract_for_statements, verify_logical_plan, InternalLogicalPlan, LogicalPlan,
 };
 use crate::sql::parser::parse_sql_statements;
-use crate::sql::semantic_ir::prepare_internal_statements_with_backend_to_plan;
-use crate::{LixBackend, LixError, Value};
+use crate::sql::semantic_ir::prepare_internal_statements_to_plan;
+use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 use super::contracts::planned_statement::PlannedStatementSet;
-use super::statement_references_public_surface_with_backend;
+use super::statement_references_public_surface;
 
 pub(crate) async fn preprocess_sql_to_plan_with_functions<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
+    registry: &SurfaceRegistry,
     evaluator: &CelEvaluator,
     sql_text: &str,
     params: &[Value],
@@ -22,7 +24,8 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     preprocess_with_surfaces_to_plan(
-        backend,
+        dialect,
+        registry,
         evaluator,
         parse_sql_statements(sql_text)?,
         params,
@@ -33,7 +36,8 @@ where
 }
 
 pub(crate) async fn preprocess_with_surfaces_to_plan<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
+    registry: &SurfaceRegistry,
     evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
@@ -44,7 +48,7 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     Ok(preprocess_with_surfaces_to_logical_plan(
-        backend, evaluator, statements, params, functions, writer_key,
+        dialect, registry, evaluator, statements, params, functions, writer_key,
     )
     .await?
     .normalized_statements
@@ -52,7 +56,8 @@ where
 }
 
 pub(crate) async fn preprocess_with_surfaces_to_logical_plan<P: LixFunctionProvider>(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
+    registry: &SurfaceRegistry,
     evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
@@ -62,10 +67,10 @@ pub(crate) async fn preprocess_with_surfaces_to_logical_plan<P: LixFunctionProvi
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    reject_public_surface_statements_with_backend(backend, &statements).await?;
+    reject_public_surface_statements(registry, &statements)?;
     let result_contract = result_contract_for_statements(&statements);
-    let normalized_statements = prepare_internal_statements_with_backend_to_plan(
-        backend, evaluator, statements, params, functions, writer_key,
+    let normalized_statements = prepare_internal_statements_to_plan(
+        dialect, evaluator, statements, params, functions, writer_key,
     )
     .await?;
     let logical_plan = InternalLogicalPlan {
@@ -84,12 +89,12 @@ where
     Ok(logical_plan)
 }
 
-async fn reject_public_surface_statements_with_backend(
-    backend: &dyn LixBackend,
+fn reject_public_surface_statements(
+    registry: &SurfaceRegistry,
     statements: &[Statement],
 ) -> Result<(), LixError> {
     for statement in statements {
-        if statement_references_public_surface_with_backend(backend, statement).await {
+        if statement_references_public_surface(registry, statement) {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "public surface statements must route through public lowering",

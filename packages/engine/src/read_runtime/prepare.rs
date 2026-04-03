@@ -42,6 +42,7 @@ use crate::sql::prepare::{
 use crate::{LixBackend, LixError, TransactionMode, Value};
 
 pub(crate) async fn compile_committed_read_program_with_context(
+    error_backend: &dyn LixBackend,
     preparation_context: &dyn SqlPreparationContext,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
@@ -57,6 +58,7 @@ pub(crate) async fn compile_committed_read_program_with_context(
 
     for step in program.steps() {
         let prepared_step = compile_committed_read_step_with_context(
+            error_backend,
             preparation_context,
             step,
             allow_internal_tables,
@@ -75,6 +77,7 @@ pub(crate) async fn compile_committed_read_program_with_context(
 }
 
 pub(crate) async fn compile_committed_read_step_with_context(
+    error_backend: &dyn LixBackend,
     preparation_context: &dyn SqlPreparationContext,
     bound_statement_template: &BoundStatementTemplateInstance,
     allow_internal_tables: bool,
@@ -83,6 +86,7 @@ pub(crate) async fn compile_committed_read_step_with_context(
 ) -> Result<PreparedReadStep, LixError> {
     let source_sql = vec![bound_statement_template.statement().to_string()];
     let compiled = compile_committed_execution_step_with_context(
+        error_backend,
         preparation_context,
         bound_statement_template,
         allow_internal_tables,
@@ -90,10 +94,11 @@ pub(crate) async fn compile_committed_read_step_with_context(
         runtime_state,
     )
     .await?;
-    prepared_read_step_from_compiled_execution(preparation_context.backend(), compiled, source_sql)
+    prepared_read_step_from_compiled_execution(preparation_context.dialect(), compiled, source_sql)
 }
 
 async fn compile_committed_execution_step_with_context(
+    error_backend: &dyn LixBackend,
     preparation_context: &dyn SqlPreparationContext,
     bound_statement_template: &BoundStatementTemplateInstance,
     allow_internal_tables: bool,
@@ -102,12 +107,13 @@ async fn compile_committed_execution_step_with_context(
 ) -> Result<CompiledExecution, LixError> {
     let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
     let step_context = DefaultSqlPreparationContext {
-        backend: preparation_context.backend(),
+        dialect: preparation_context.dialect(),
         cel_evaluator: preparation_context.cel_evaluator(),
         schema_cache: preparation_context.schema_cache(),
         functions: runtime_state.provider(),
+        surface_registry: &context.public_surface_registry,
+        compiler_metadata: preparation_context.compiler_metadata(),
         active_history_root_commit_id: preparation_context.active_history_root_commit_id(),
-        public_surface_registry_override: Some(&context.public_surface_registry),
     };
     match compile_execution_from_template_instance_with_context(
         &step_context,
@@ -123,17 +129,17 @@ async fn compile_committed_execution_step_with_context(
     .await
     {
         Ok(compiled) => Ok(compiled),
-        Err(error) => Err(normalize_sql_execution_error_with_backend(
-            preparation_context.backend(),
-            error,
-            parsed_statements,
-        )
-        .await),
+        Err(error) => {
+            Err(
+                normalize_sql_execution_error_with_backend(error_backend, error, parsed_statements)
+                    .await,
+            )
+        }
     }
 }
 
 fn prepared_read_step_from_compiled_execution(
-    backend: &dyn LixBackend,
+    dialect: crate::SqlDialect,
     compiled: CompiledExecution,
     source_sql: Vec<String>,
 ) -> Result<PreparedReadStep, LixError> {
@@ -159,10 +165,7 @@ fn prepared_read_step_from_compiled_execution(
     });
 
     let artifact = if let Some(public_read) = compiled.public_read() {
-        PreparedReadArtifact::Public(prepare_public_read_artifact(
-            public_read,
-            backend.dialect(),
-        )?)
+        PreparedReadArtifact::Public(prepare_public_read_artifact(public_read, dialect)?)
     } else if let Some(internal) = compiled.internal_execution() {
         PreparedReadArtifact::Internal(PreparedInternalReadArtifact {
             prepared_batch: PreparedBatch {

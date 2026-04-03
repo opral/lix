@@ -3,7 +3,7 @@ use crate::contracts::traits::{LiveReadShapeContract, LiveStateQueryBackend};
 use crate::runtime::SchemaCache;
 use crate::sql::binder::bind_sql;
 use crate::sql::prepare::contracts::planned_statement::UpdateValidationPlan;
-use crate::sql::semantic_ir::validation::validate_update_inputs;
+use crate::write_runtime::validate_update_inputs;
 use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
 

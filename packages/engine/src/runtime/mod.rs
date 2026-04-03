@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, RwLock};
 pub(crate) mod execution_state;
 pub(crate) mod functions;
 pub mod image;
+mod sql_compiler_metadata;
 pub mod streams;
 pub mod wasm;
 
@@ -354,6 +355,8 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
     crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
         .await
 }
+
+pub(crate) use sql_compiler_metadata::load_sql_compiler_metadata;
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
 // Internal access to the raw transaction pointer is serialized with a mutex.

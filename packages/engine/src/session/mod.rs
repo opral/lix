@@ -46,7 +46,7 @@ use crate::write_runtime::sql_adapter::{
     execute_parsed_statements_in_write_transaction,
 };
 use crate::write_runtime::{TransactionCommitOutcome, WriteTransaction};
-use crate::{ExecuteResult, LixError, Value};
+use crate::{ExecuteResult, LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenSessionOptions {
@@ -393,15 +393,22 @@ impl Session {
                         "active_version_id",
                     )
                     .await?;
+                let compiler_metadata = crate::runtime::load_sql_compiler_metadata(
+                    self.runtime.backend().as_ref(),
+                    &context.public_surface_registry,
+                )
+                .await?;
                 let preparation_context = DefaultSqlPreparationContext {
-                    backend: self.runtime.backend().as_ref(),
+                    dialect: self.runtime.backend().dialect(),
                     cel_evaluator: self.runtime.cel_evaluator(),
                     schema_cache: self.runtime.schema_cache(),
                     functions: runtime_state.provider(),
+                    surface_registry: &context.public_surface_registry,
+                    compiler_metadata: &compiler_metadata,
                     active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-                    public_surface_registry_override: Some(&context.public_surface_registry),
                 };
                 let prepared_committed_read = compile_committed_read_program_with_context(
+                    self.runtime.backend().as_ref(),
                     &preparation_context,
                     &program,
                     allow_internal_sql,
@@ -444,15 +451,22 @@ impl Session {
                             "active_version_id",
                         )
                         .await?;
+                    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(
+                        self.runtime.backend().as_ref(),
+                        &context.public_surface_registry,
+                    )
+                    .await?;
                     let preparation_context = DefaultSqlPreparationContext {
-                        backend: self.runtime.backend().as_ref(),
+                        dialect: self.runtime.backend().dialect(),
                         cel_evaluator: self.runtime.cel_evaluator(),
                         schema_cache: self.runtime.schema_cache(),
                         functions: runtime_state.provider(),
+                        surface_registry: &context.public_surface_registry,
+                        compiler_metadata: &compiler_metadata,
                         active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-                        public_surface_registry_override: Some(&context.public_surface_registry),
                     };
                     let prepared_committed_read = compile_committed_read_program_with_context(
+                        self.runtime.backend().as_ref(),
                         &preparation_context,
                         &program,
                         allow_internal_sql,
@@ -501,17 +515,22 @@ impl Session {
                                 "active_version_id",
                             )
                             .await?;
+                        let compiler_metadata = crate::runtime::load_sql_compiler_metadata(
+                            &backend,
+                            &context.public_surface_registry,
+                        )
+                        .await?;
                         let preparation_context = DefaultSqlPreparationContext {
-                            backend: &backend,
+                            dialect: backend.dialect(),
                             cel_evaluator: self.runtime.cel_evaluator(),
                             schema_cache: self.runtime.schema_cache(),
                             functions: runtime_state.provider(),
+                            surface_registry: &context.public_surface_registry,
+                            compiler_metadata: &compiler_metadata,
                             active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-                            public_surface_registry_override: Some(
-                                &context.public_surface_registry,
-                            ),
                         };
                         compile_committed_read_program_with_context(
+                            &backend,
                             &preparation_context,
                             &program,
                             allow_internal_sql,
