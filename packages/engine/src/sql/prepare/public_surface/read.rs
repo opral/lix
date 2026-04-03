@@ -7,8 +7,6 @@ use crate::contracts::artifacts::{
     StateHistoryVersionScope,
 };
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
-use crate::refs::load_current_committed_version_frontier_with_backend;
-use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::explain::{
     build_public_read_explain_artifacts, unwrap_explain_statement, ExplainStage,
@@ -42,7 +40,6 @@ use crate::sql::semantic_ir::{
     unknown_public_state_schema_error, PublicReadSemantics, StructuredPublicReadPreparation,
 };
 use crate::SqlDialect;
-use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value as SqlValue,
@@ -205,38 +202,6 @@ fn public_output_columns_from_select(select: &Select) -> Option<Vec<String>> {
         }
     }
     Some(output)
-}
-
-async fn load_known_live_layouts_for_broad_public_read(
-    backend: &dyn LixBackend,
-    registry: &SurfaceRegistry,
-    surface_bindings: &[SurfaceBinding],
-) -> Result<BTreeMap<String, JsonValue>, LixError> {
-    let mut provider = SqlRegisteredSchemaProvider::new(backend);
-    let mut schemas = BTreeMap::new();
-    let mut required_schema_keys = surface_bindings
-        .iter()
-        .filter(|binding| {
-            matches!(
-                binding.descriptor.surface_family,
-                SurfaceFamily::State | SurfaceFamily::Entity
-            )
-        })
-        .filter_map(|binding| binding.implicit_overrides.fixed_schema_key.clone())
-        .collect::<BTreeSet<_>>();
-    if surface_bindings
-        .iter()
-        .any(|binding| binding.descriptor.surface_family == SurfaceFamily::State)
-    {
-        required_schema_keys.extend(registry.registered_state_surface_schema_keys());
-    }
-    for schema_key in required_schema_keys {
-        schemas.insert(
-            schema_key.clone(),
-            provider.load_latest_schema(&schema_key).await?,
-        );
-    }
-    Ok(schemas)
 }
 
 fn build_direct_state_history_plan(
@@ -3093,7 +3058,8 @@ fn public_read_preparation_error(bindings: &[SurfaceBinding], message: &str) -> 
 }
 
 async fn try_prepare_public_read_via_specialized_optimization(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
+    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
     bound_statement: BoundStatement,
     active_history_root_commit_id: Option<&str>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
@@ -3147,29 +3113,34 @@ async fn try_prepare_public_read_via_specialized_optimization(
         strategy_decision.direct_execution && is_direct_only_history_surface(&surface_binding);
     stage_timings.record(ExplainStage::Routing, routing_started.elapsed());
     let routing_passes = strategy_decision.pass_traces;
+    let empty_current_version_heads = BTreeMap::new();
     let current_version_heads = if surface_binding.descriptor.surface_family == SurfaceFamily::Admin
         && surface_binding.descriptor.public_name == "lix_version"
     {
-        load_current_committed_version_frontier_with_backend(backend)
-            .await?
-            .version_heads
+        compiler_metadata
+            .current_version_heads
+            .as_ref()
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "compiler metadata is missing current version heads for lix_version",
+                )
+            })?
     } else {
-        BTreeMap::new()
+        &empty_current_version_heads
     };
 
     let physical_started = Instant::now();
     let selection = match select_specialized_public_read_artifact(
-        backend,
+        dialect,
         &structured_read,
         direct_execution,
-        analysis.dependency_spec.as_ref(),
         analysis.semantics.effective_state_request.as_ref(),
         analysis.semantics.effective_state_plan.as_ref(),
-        &current_version_heads,
+        &compiler_metadata.known_live_schema_definitions,
+        current_version_heads,
         &mut stage_timings,
-    )
-    .await
-    {
+    ) {
         Ok(selection) => selection,
         Err(error) if specialized_public_read_error_is_semantic(&error) => return Err(error),
         Err(error) => {
@@ -3330,7 +3301,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 lowered_read,
                 &analysis.bound_statement.bound_parameters,
                 &analysis.bound_statement.execution_context,
-                backend.dialect(),
+                dialect,
             )?;
             stage_timings.record(
                 ExplainStage::ArtifactPreparation,
@@ -3599,9 +3570,11 @@ pub(super) async fn try_prepare_public_read(
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
+    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
     try_prepare_public_read_with_registry_and_internal_access(
-        backend,
+        backend.dialect(),
         &registry,
+        &compiler_metadata,
         parsed_statements,
         params,
         active_version_id,
@@ -3614,8 +3587,9 @@ pub(super) async fn try_prepare_public_read(
 }
 
 pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
     registry: &SurfaceRegistry,
+    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -3625,8 +3599,9 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     parse_duration: Option<Duration>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     try_prepare_public_read_with_internal_access(
-        backend,
+        dialect,
         registry,
+        compiler_metadata,
         parsed_statements,
         params,
         active_version_id,
@@ -3639,8 +3614,9 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
 }
 
 async fn try_prepare_public_read_with_internal_access(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
     registry: &SurfaceRegistry,
+    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -3688,7 +3664,7 @@ async fn try_prepare_public_read_with_internal_access(
         statement,
         params.to_vec(),
         ExecutionContext {
-            dialect: Some(backend.dialect()),
+            dialect: Some(dialect),
             writer_key: writer_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
             active_account_ids: Vec::new(),
@@ -3703,7 +3679,8 @@ async fn try_prepare_public_read_with_internal_access(
     if read_summary.bound_surface_bindings.len() > 1 {
         attempted_broad_lowering = true;
         if let Some(prepared) = prepare_public_read_via_surface_lowering(
-            backend,
+            dialect,
+            compiler_metadata,
             bound_statement.clone(),
             broad_statement.clone(),
             explain_request.as_ref(),
@@ -3718,7 +3695,8 @@ async fn try_prepare_public_read_with_internal_access(
         }
     }
     let specialized = try_prepare_public_read_via_specialized_optimization(
-        backend,
+        dialect,
+        compiler_metadata,
         bound_statement,
         active_history_root_commit_id,
         explain_request.as_ref(),
@@ -3735,7 +3713,8 @@ async fn try_prepare_public_read_with_internal_access(
         } => {
             if !attempted_broad_lowering {
                 if let Some(prepared) = prepare_public_read_via_surface_lowering(
-                    backend,
+                    dialect,
+                    compiler_metadata,
                     bound_statement,
                     broad_statement,
                     explain_request.as_ref(),
@@ -3763,7 +3742,8 @@ async fn try_prepare_public_read_with_internal_access(
 }
 
 pub(super) async fn prepare_public_read_via_surface_lowering(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
+    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
     bound_statement: BoundStatement,
     broad_statement: Option<BroadPublicReadStatement>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
@@ -3839,12 +3819,6 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         .requested_version_id
         .as_deref();
     let capability_started = Instant::now();
-    let known_live_layouts = load_known_live_layouts_for_broad_public_read(
-        backend,
-        registry,
-        &read_summary.bound_surface_bindings,
-    )
-    .await?;
     stage_timings.record(
         ExplainStage::CapabilityResolution,
         capability_started.elapsed(),
@@ -3854,9 +3828,9 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     let routed_broad_read = match route_broad_public_read_statement_with_known_live_layouts(
         &broad_statement,
         registry,
-        backend.dialect(),
+        dialect,
         active_version_id,
-        &known_live_layouts,
+        &compiler_metadata.known_live_schema_definitions,
     ) {
         Ok(optimized) => optimized,
         Err(error) => {
@@ -3891,10 +3865,10 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     let Some(lowered_read) = lower_broad_public_read_for_execution_with_layouts(
         &routed_broad_read.broad_statement,
         registry,
-        backend.dialect(),
+        dialect,
         bound_statement.bound_parameters.len(),
         active_version_id,
-        &known_live_layouts,
+        &compiler_metadata.known_live_schema_definitions,
     )?
     else {
         return Ok(None);
@@ -3917,7 +3891,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         &lowered_read,
         &bound_statement.bound_parameters,
         &bound_statement.execution_context,
-        backend.dialect(),
+        dialect,
     )?;
     stage_timings.record(
         ExplainStage::ArtifactPreparation,

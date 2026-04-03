@@ -8,9 +8,10 @@ use crate::sql::explain::{
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
 };
 use crate::sql::physical_plan::PhysicalPlan;
-use crate::sql::semantic_ir::validation::validate_inserts;
-use crate::{LixBackend, LixError, Value};
+use crate::{LixError, SqlDialect, Value};
+use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
+use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -21,17 +22,14 @@ use super::contracts::requirements::PlanRequirements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::execution_program::{BoundStatementTemplateInstance, StatementTemplateOwnership};
-use super::intent::{
-    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
-};
+use super::intent::{collect_execution_intent, ExecutionIntent, IntentCollectionPolicy};
 use super::preprocess::preprocess_with_surfaces_to_logical_plan;
 use super::public_surface::{
-    finalize_public_write_execution, prepare_public_execution_with_internal_access_and_functions,
-    prepare_public_execution_with_registry_context_and_functions,
+    finalize_public_write_execution, prepare_public_execution_with_registry_context_and_functions,
     prepared_public_write_mutates_public_surface_registry,
     try_prepare_public_read_with_registry_and_internal_access,
-    try_prepare_public_write_with_functions, try_prepare_public_write_with_registry_and_functions,
-    PreparedPublicExecution, PreparedPublicWrite,
+    try_prepare_public_write_with_registry_and_functions, PreparedPublicExecution,
+    PreparedPublicWrite,
 };
 use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
 
@@ -42,8 +40,14 @@ pub(crate) struct PreparationPolicy {
     pub(crate) skip_side_effect_collection: bool,
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SqlCompilerMetadata {
+    pub(crate) known_live_schema_definitions: BTreeMap<String, JsonValue>,
+    pub(crate) current_version_heads: Option<BTreeMap<String, String>>,
+}
+
 pub(crate) trait SqlPreparationContext {
-    fn backend(&self) -> &dyn LixBackend;
+    fn dialect(&self) -> SqlDialect;
 
     fn cel_evaluator(&self) -> &CelEvaluator;
 
@@ -51,27 +55,28 @@ pub(crate) trait SqlPreparationContext {
 
     fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider>;
 
-    fn active_history_root_commit_id(&self) -> Option<&str> {
-        None
-    }
+    fn surface_registry(&self) -> &SurfaceRegistry;
 
-    fn public_surface_registry_override(&self) -> Option<&SurfaceRegistry> {
+    fn compiler_metadata(&self) -> &SqlCompilerMetadata;
+
+    fn active_history_root_commit_id(&self) -> Option<&str> {
         None
     }
 }
 
 pub(crate) struct DefaultSqlPreparationContext<'a> {
-    pub(crate) backend: &'a dyn LixBackend,
+    pub(crate) dialect: SqlDialect,
     pub(crate) cel_evaluator: &'a CelEvaluator,
     pub(crate) schema_cache: &'a dyn CompiledSchemaCache,
     pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) surface_registry: &'a SurfaceRegistry,
+    pub(crate) compiler_metadata: &'a SqlCompilerMetadata,
     pub(crate) active_history_root_commit_id: Option<&'a str>,
-    pub(crate) public_surface_registry_override: Option<&'a SurfaceRegistry>,
 }
 
 impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
-    fn backend(&self) -> &dyn LixBackend {
-        self.backend
+    fn dialect(&self) -> SqlDialect {
+        self.dialect
     }
 
     fn cel_evaluator(&self) -> &CelEvaluator {
@@ -86,12 +91,16 @@ impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
         self.functions
     }
 
-    fn active_history_root_commit_id(&self) -> Option<&str> {
-        self.active_history_root_commit_id
+    fn surface_registry(&self) -> &SurfaceRegistry {
+        self.surface_registry
     }
 
-    fn public_surface_registry_override(&self) -> Option<&SurfaceRegistry> {
-        self.public_surface_registry_override
+    fn compiler_metadata(&self) -> &SqlCompilerMetadata {
+        self.compiler_metadata
+    }
+
+    fn active_history_root_commit_id(&self) -> Option<&str> {
+        self.active_history_root_commit_id
     }
 }
 
@@ -142,7 +151,7 @@ async fn compile_execution_with_context(
     policy: PreparationPolicy,
     static_artifacts: StaticCompilationArtifacts<'_>,
 ) -> Result<CompiledExecution, LixError> {
-    let backend = preparation_context.backend();
+    let dialect = preparation_context.dialect();
     let functions = preparation_context.functions().clone();
 
     let mut statements = parsed_statements.to_vec();
@@ -162,7 +171,9 @@ async fn compile_execution_with_context(
         .unwrap_or_else(|| derive_plan_requirements(&statements));
 
     let public_execution = prepare_public_execution_for_compile(
-        backend,
+        dialect,
+        preparation_context.surface_registry(),
+        preparation_context.compiler_metadata(),
         &statements,
         params,
         active_version_id,
@@ -170,7 +181,6 @@ async fn compile_execution_with_context(
         active_account_ids,
         writer_key,
         allow_internal_tables,
-        preparation_context.public_surface_registry_override(),
         static_artifacts.parse_duration,
         static_artifacts.ownership_hint,
     )
@@ -204,12 +214,7 @@ async fn compile_execution_with_context(
             filesystem_state: Default::default(),
         }
     } else {
-        collect_execution_intent_with_backend(
-            backend,
-            &statements,
-            params,
-            active_version_id,
-            writer_key,
+        collect_execution_intent(
             &requirements,
             IntentCollectionPolicy {
                 skip_side_effect_collection,
@@ -219,7 +224,7 @@ async fn compile_execution_with_context(
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "prepare_execution_with_backend intent collection failed: {}",
+                "compile_execution intent collection failed: {}",
                 error.description
             ),
         })?
@@ -233,7 +238,7 @@ async fn compile_execution_with_context(
                 .map_err(|error| LixError {
                     code: error.code,
                     description: format!(
-                        "prepare_execution_with_backend public execution finalization failed: {}",
+                        "compile_execution public execution finalization failed: {}",
                         error.description
                     ),
                 })?;
@@ -257,7 +262,8 @@ async fn compile_execution_with_context(
             .unwrap_or_else(|| statements.clone());
         let internal_logical_planning_started = Instant::now();
         let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
-            backend,
+            dialect,
+            preparation_context.surface_registry(),
             preparation_context.cel_evaluator(),
             internal_source_statements,
             params,
@@ -269,7 +275,7 @@ async fn compile_execution_with_context(
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "prepare_execution_with_backend internal compilation failed: {}",
+                "compile_execution internal compilation failed: {}",
                 error.description
             ),
         })?;
@@ -277,22 +283,6 @@ async fn compile_execution_with_context(
         let preprocess: PlannedStatementSet =
             internal_logical_plan.normalized_statements.clone().into();
         validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
-
-        if !preprocess.mutations.is_empty() {
-            validate_inserts(
-                backend,
-                preparation_context.schema_cache(),
-                &preprocess.mutations,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "prepare_execution_with_backend insert validation failed: {}",
-                    error.description
-                ),
-            })?;
-        }
         let effects = derive_plan_effects(&preprocess, writer_key).map_err(LixError::from)?;
         let internal_execution = CompiledInternalExecution {
             prepared_statements: preprocess.prepared_statements,
@@ -372,7 +362,9 @@ async fn compile_execution_with_context(
 }
 
 async fn prepare_public_execution_for_compile(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
+    registry: &crate::contracts::surface::SurfaceRegistry,
+    compiler_metadata: &SqlCompilerMetadata,
     statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -380,15 +372,15 @@ async fn prepare_public_execution_for_compile(
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
     parse_duration: Option<Duration>,
     ownership_hint: Option<StatementTemplateOwnership>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
     let prepared = match ownership_hint {
-        Some(StatementTemplateOwnership::PublicRead) => match public_surface_registry_override {
-            Some(registry) => try_prepare_public_read_with_registry_and_internal_access(
-                backend,
+        Some(StatementTemplateOwnership::PublicRead) => {
+            try_prepare_public_read_with_registry_and_internal_access(
+                dialect,
                 registry,
+                compiler_metadata,
                 statements,
                 params,
                 active_version_id,
@@ -398,25 +390,11 @@ async fn prepare_public_execution_for_compile(
                 parse_duration,
             )
             .await?
-            .map(PreparedPublicExecution::Read),
-            None => {
-                prepare_public_execution_with_internal_access_and_functions(
-                    backend,
-                    statements,
-                    params,
-                    active_version_id,
-                    active_history_root_commit_id,
-                    active_account_ids,
-                    writer_key,
-                    allow_internal_tables,
-                    parse_duration,
-                )
-                .await?
-            }
-        },
-        Some(StatementTemplateOwnership::PublicWrite) => match public_surface_registry_override {
-            Some(registry) => try_prepare_public_write_with_registry_and_functions(
-                backend,
+            .map(PreparedPublicExecution::Read)
+        }
+        Some(StatementTemplateOwnership::PublicWrite) => {
+            try_prepare_public_write_with_registry_and_functions(
+                dialect,
                 registry,
                 statements,
                 params,
@@ -426,51 +404,25 @@ async fn prepare_public_execution_for_compile(
                 parse_duration,
             )
             .await?
-            .map(PreparedPublicExecution::Write),
-            None => try_prepare_public_write_with_functions(
-                backend,
+            .map(PreparedPublicExecution::Write)
+        }
+        Some(StatementTemplateOwnership::Internal) => None,
+        None => {
+            prepare_public_execution_with_registry_context_and_functions(
+                dialect,
+                registry,
+                compiler_metadata,
                 statements,
                 params,
                 active_version_id,
+                active_history_root_commit_id,
                 active_account_ids,
                 writer_key,
+                allow_internal_tables,
                 parse_duration,
             )
             .await?
-            .map(PreparedPublicExecution::Write),
-        },
-        Some(StatementTemplateOwnership::Internal) => None,
-        None => match public_surface_registry_override {
-            Some(registry) => {
-                prepare_public_execution_with_registry_context_and_functions(
-                    backend,
-                    registry,
-                    statements,
-                    params,
-                    active_version_id,
-                    active_history_root_commit_id,
-                    active_account_ids,
-                    writer_key,
-                    allow_internal_tables,
-                    parse_duration,
-                )
-                .await?
-            }
-            None => {
-                prepare_public_execution_with_internal_access_and_functions(
-                    backend,
-                    statements,
-                    params,
-                    active_version_id,
-                    active_history_root_commit_id,
-                    active_account_ids,
-                    writer_key,
-                    allow_internal_tables,
-                    parse_duration,
-                )
-                .await?
-            }
-        },
+        }
     };
 
     if matches!(

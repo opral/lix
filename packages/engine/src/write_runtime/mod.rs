@@ -10,6 +10,7 @@ mod read_context;
 mod resolve_write_plan;
 mod selector_reads;
 pub(crate) mod sql_adapter;
+mod validation;
 
 use async_trait::async_trait;
 
@@ -35,6 +36,10 @@ pub use read_context::ReadContext;
 pub(crate) use resolve_write_plan::resolve_write_plan;
 pub(crate) use resolve_write_plan::resolve_write_plan_with_functions;
 pub(crate) use selector_reads::execute_public_query_with_optional_pending_transaction_view;
+pub(crate) use validation::{
+    validate_batch_local_write, validate_commit_time_write, validate_inserts,
+    validate_update_inputs,
+};
 
 #[async_trait(?Send)]
 pub(crate) trait WriteProgramExecutor {

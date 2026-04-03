@@ -31,9 +31,11 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
         "active_version_id",
     )
     .await?;
+    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
     let prepared = try_prepare_public_read_with_registry_and_internal_access(
-        backend,
+        backend.dialect(),
         &registry,
+        &compiler_metadata,
         &[statement],
         params,
         active_version_id,

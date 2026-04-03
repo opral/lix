@@ -11,7 +11,6 @@ use crate::runtime::{SchemaCache, TransactionBackendAdapter};
 use crate::sql::prepare::{
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation, PreparedPublicWrite,
 };
-use crate::sql::semantic_ir::validation::validate_commit_time_write;
 use crate::write_runtime::commit::ProposedDomainChange;
 use crate::write_runtime::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs, CreateCommitDisposition,
@@ -19,6 +18,7 @@ use crate::write_runtime::commit::{
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
     PendingPublicCommitSession,
 };
+use crate::write_runtime::validate_commit_time_write;
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::effects::mirror_public_registered_schema_bootstrap_rows;
