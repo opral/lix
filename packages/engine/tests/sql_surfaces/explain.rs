@@ -38,7 +38,7 @@ const BROAD_PUBLIC_READ_STAGE_CONTRACT: &[&str] = &[
     "capability_resolution",
     "routing",
     "physical_planning",
-    "executor_preparation",
+    "artifact_preparation",
 ];
 
 fn broad_public_read_stage_contract_query() -> &'static str {
@@ -274,7 +274,7 @@ fn assert_no_rust_debug_leaks(explain_json: &JsonValue) {
         "LogicalPlanning",
         "PhysicalPlanning",
         "CapabilityResolution",
-        "ExecutorPreparation",
+        "ArtifactPreparation",
         "PushdownSupport",
         "SurfaceFamily",
         "SurfaceVariant",
@@ -1500,15 +1500,15 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
         Some("lowered_sql")
     );
 
-    let executor_artifacts = json_object_at(explain_json, "executor_artifacts", "explain_json");
+    let compiled_artifacts = json_object_at(explain_json, "compiled_artifacts", "explain_json");
     assert!(
-        executor_artifacts.get("surface_bindings").is_none(),
-        "executor_artifacts should not duplicate typed surface bindings as top-level names"
+        compiled_artifacts.get("surface_bindings").is_none(),
+        "compiled_artifacts should not duplicate typed surface bindings as top-level names"
     );
     let bound_public_leaves = json_array(
-        executor_artifacts
+        compiled_artifacts
             .get("bound_public_leaves")
-            .expect("executor_artifacts should include bound_public_leaves"),
+            .expect("compiled_artifacts should include bound_public_leaves"),
         "bound_public_leaves",
     );
     assert_eq!(bound_public_leaves.len(), 1);
@@ -1554,10 +1554,10 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
         "bound_public_leaf"
     ));
 
-    let pushdown = executor_artifacts
+    let pushdown = compiled_artifacts
         .get("pushdown")
-        .map(|value| json_object(value, "executor_artifacts.pushdown"))
-        .expect("executor_artifacts should include pushdown");
+        .map(|value| json_object(value, "compiled_artifacts.pushdown"))
+        .expect("compiled_artifacts should include pushdown");
     assert_object_keys(
         pushdown,
         &[
@@ -1591,12 +1591,12 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
         Some(0)
     );
 
-    let lowered_sql = executor_artifacts
+    let lowered_sql = compiled_artifacts
         .get("lowered_sql")
         .and_then(JsonValue::as_array)
         .and_then(|values| values.first())
         .and_then(JsonValue::as_str)
-        .expect("executor_artifacts.lowered_sql should expose the lowered query");
+        .expect("compiled_artifacts.lowered_sql should expose the lowered query");
     assert!(!lowered_sql.starts_with("EXPLAIN "));
     assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
 
@@ -1797,19 +1797,19 @@ fn assert_public_read_physical_kind(explain_json: &JsonValue, expected_kind: &st
 }
 
 fn assert_lowered_sql_presence(explain_json: &JsonValue, expected_non_empty: bool) {
-    let lowered_sql = json_object_at(explain_json, "executor_artifacts", "explain_json")
+    let lowered_sql = json_object_at(explain_json, "compiled_artifacts", "explain_json")
         .get("lowered_sql")
         .and_then(JsonValue::as_array)
-        .expect("executor_artifacts.lowered_sql should be an array");
+        .expect("compiled_artifacts.lowered_sql should be an array");
     if expected_non_empty {
         assert!(
             !lowered_sql.is_empty(),
-            "executor_artifacts.lowered_sql should be populated"
+            "compiled_artifacts.lowered_sql should be populated"
         );
     } else {
         assert!(
             lowered_sql.is_empty(),
-            "executor_artifacts.lowered_sql should be empty"
+            "compiled_artifacts.lowered_sql should be empty"
         );
     }
 }
@@ -1888,20 +1888,20 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
         Some("public_write")
     );
 
-    let executor_artifacts = json_object_at(explain_json, "executor_artifacts", "explain_json");
+    let compiled_artifacts = json_object_at(explain_json, "compiled_artifacts", "explain_json");
     assert!(
-        executor_artifacts.get("surface_bindings").is_none(),
-        "executor_artifacts should not duplicate typed surface bindings as top-level names"
+        compiled_artifacts.get("surface_bindings").is_none(),
+        "compiled_artifacts should not duplicate typed surface bindings as top-level names"
     );
     assert!(
-        executor_artifacts.get("write_phase_trace").is_none(),
+        compiled_artifacts.get("write_phase_trace").is_none(),
         "plain public-write explain should not expose a static write phase trace shim"
     );
 
     let commit_preconditions = json_array(
-        executor_artifacts
+        compiled_artifacts
             .get("commit_preconditions")
-            .expect("executor_artifacts should include commit_preconditions"),
+            .expect("compiled_artifacts should include commit_preconditions"),
         "commit_preconditions",
     );
     assert_eq!(commit_preconditions.len(), 1);
@@ -1973,9 +1973,9 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
     );
 
     let domain_change_batches = json_array(
-        executor_artifacts
+        compiled_artifacts
             .get("domain_change_batches")
-            .expect("executor_artifacts should include domain_change_batches"),
+            .expect("compiled_artifacts should include domain_change_batches"),
         "domain_change_batches",
     );
     assert_eq!(domain_change_batches.len(), 1);
@@ -2016,7 +2016,7 @@ simulation_test!(
                 "logical_plan",
                 "optimized_logical_plan",
                 "physical_plan",
-                "executor_artifacts",
+                "compiled_artifacts",
                 "stage_timings",
             ],
             &[
@@ -2033,7 +2033,7 @@ simulation_test!(
                     "physical_plan",
                     &["kind: public_read", "execution: lowered_sql"],
                 ),
-                ("stage_timings", &["parse:", "executor_preparation:"]),
+                ("stage_timings", &["parse:", "artifact_preparation:"]),
             ],
         );
     }
@@ -2098,7 +2098,7 @@ simulation_test!(
                 "routing",
                 "capability_resolution",
                 "physical_planning",
-                "executor_preparation",
+                "artifact_preparation",
             ]
             .as_slice(),
         );
@@ -2106,7 +2106,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    explain_direct_history_public_read_omits_executor_preparation,
+    explain_direct_history_public_read_omits_artifact_preparation,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -2145,7 +2145,7 @@ simulation_test!(
         );
         assert_missing_stage_names(
             explain_json,
-            &["capability_resolution", "executor_preparation"],
+            &["capability_resolution", "artifact_preparation"],
         );
     }
 );
@@ -2500,7 +2500,7 @@ simulation_test!(
                 "routing",
                 "capability_resolution",
                 "physical_planning",
-                "executor_preparation",
+                "artifact_preparation",
             ],
         );
         assert_no_rust_debug_leaks(explain_json);
@@ -2538,7 +2538,7 @@ simulation_test!(
         );
         assert_missing_stage_names(
             explain_json,
-            &["routing", "capability_resolution", "executor_preparation"],
+            &["routing", "capability_resolution", "artifact_preparation"],
         );
         assert_public_write_json_contract(explain_json);
     }
@@ -2763,7 +2763,7 @@ simulation_test!(
                 "routing",
                 "capability_resolution",
                 "physical_planning",
-                "executor_preparation",
+                "artifact_preparation",
             ],
         );
         let analyzed_runtime = explain_json
@@ -3036,7 +3036,7 @@ simulation_test!(
                 "semantic_statement",
                 "logical_plan",
                 "optimized_logical_plan",
-                "executor_artifacts",
+                "compiled_artifacts",
                 "stage_timings",
             ],
             &[
@@ -3046,7 +3046,7 @@ simulation_test!(
                     "logical_plan",
                     &["kind: internal", "result_contract: select"],
                 ),
-                ("executor_artifacts", &["lowered_sql_statements: 1"]),
+                ("compiled_artifacts", &["lowered_sql_statements: 1"]),
                 ("stage_timings", &["parse:", "logical_planning:"]),
             ],
         );

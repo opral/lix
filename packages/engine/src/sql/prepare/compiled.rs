@@ -2,7 +2,6 @@ use crate::backend::prepared::PreparedStatement;
 use crate::contracts::artifacts::{
     coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
 };
-use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
 use crate::sql::physical_plan::PhysicalPlan;
@@ -24,7 +23,6 @@ pub(crate) struct CompiledInternalExecution {
 
 pub(crate) struct CompiledExecution {
     pub(crate) intent: crate::sql::prepare::intent::ExecutionIntent,
-    pub(crate) runtime_state: ExecutionRuntimeState,
     pub(crate) physical_plan: Option<PhysicalPlan>,
     pub(crate) explain: Option<ExplainArtifacts>,
     pub(crate) result_contract: ResultContract,

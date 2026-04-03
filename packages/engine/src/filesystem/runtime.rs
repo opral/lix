@@ -75,17 +75,6 @@ pub(crate) fn binary_blob_writes_from_filesystem_state(
         .collect()
 }
 
-pub(crate) fn delete_targets_from_filesystem_state(
-    state: &FilesystemTransactionState,
-) -> BTreeSet<(String, String)> {
-    state
-        .files
-        .values()
-        .filter(|file| file.deleted)
-        .map(|file| (file.file_id.clone(), file.version_id.clone()))
-        .collect()
-}
-
 pub(crate) fn filesystem_transaction_state_has_binary_payloads(
     state: &FilesystemTransactionState,
 ) -> bool {

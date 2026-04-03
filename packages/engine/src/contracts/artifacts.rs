@@ -8,7 +8,7 @@ use crate::contracts::surface::{
     SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
 };
 use crate::runtime::streams::StateCommitStreamChange;
-use crate::{CommittedVersionFrontier, LixError, QueryResult, ReplayCursor, Value};
+use crate::{CommittedVersionFrontier, LixError, ReplayCursor, Value};
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
@@ -813,7 +813,7 @@ pub(crate) struct PreparedAnalyzedRuntime {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
-pub(crate) enum PreparedAnalyzedExplainTemplate {
+pub(crate) enum PreparedExplainTemplate {
     Text { sections: Vec<(String, String)> },
     Json { base_json: JsonValue },
 }
@@ -828,8 +828,8 @@ pub(crate) enum PreparedAnalyzedExplainTemplate {
 pub(crate) struct ReadDiagnosticContext {
     pub(crate) source_sql: Vec<String>,
     pub(crate) explain_mode: Option<PreparedExplainMode>,
-    pub(crate) plain_explain_result: Option<QueryResult>,
-    pub(crate) analyzed_explain_template: Option<PreparedAnalyzedExplainTemplate>,
+    pub(crate) plain_explain_template: Option<PreparedExplainTemplate>,
+    pub(crate) analyzed_explain_template: Option<PreparedExplainTemplate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2274,7 +2274,7 @@ mod tests {
         let context = ReadDiagnosticContext {
             source_sql: vec!["SELECT * FROM lix_version".into()],
             explain_mode: Some(PreparedExplainMode::Analyze),
-            plain_explain_result: None,
+            plain_explain_template: None,
             analyzed_explain_template: None,
         };
 
@@ -2313,7 +2313,7 @@ mod tests {
             diagnostic_context: ReadDiagnosticContext {
                 source_sql: vec!["SELECT * FROM lix_file_history".into()],
                 explain_mode: Some(PreparedExplainMode::Plain),
-                plain_explain_result: None,
+                plain_explain_template: None,
                 analyzed_explain_template: None,
             },
         };
@@ -2331,7 +2331,7 @@ mod tests {
             diagnostic_context: ReadDiagnosticContext {
                 source_sql: vec!["SELECT 1".into()],
                 explain_mode: None,
-                plain_explain_result: None,
+                plain_explain_template: None,
                 analyzed_explain_template: None,
             },
         };

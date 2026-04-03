@@ -5,7 +5,6 @@ use crate::sql::parser::parse_sql_with_timing;
 use crate::sql::prepare::execution_program::{
     BoundStatementTemplateInstance, StatementTemplate, StatementTemplateCacheKey,
 };
-use crate::sql::prepare::intent::filesystem_transaction_state_from_planned;
 use crate::sql::prepare::{
     compile_execution_from_template_instance_with_context,
     prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
@@ -57,7 +56,6 @@ pub(super) async fn compile_sql_buffered_write_command(
         backend: &backend,
         cel_evaluator: engine.runtime().as_ref().cel_evaluator(),
         schema_cache: engine.runtime().as_ref().schema_cache(),
-        deterministic_settings: runtime_state.settings(),
         functions: runtime_state.provider(),
         active_history_root_commit_id: active_history_root_commit_id.as_deref(),
         public_surface_registry_override: Some(&context.public_surface_registry),
@@ -104,7 +102,7 @@ pub(super) async fn compile_sql_buffered_write_command(
         }
     }
     if let Some(public_write) = compiled_execution.public_write().cloned() {
-        let functions = compiled_execution.runtime_state.provider().clone();
+        let functions = runtime_state.provider().clone();
         let public_write = match materialize_prepared_public_write(
             &backend,
             pending_transaction_view,
@@ -141,7 +139,7 @@ pub(super) async fn compile_sql_buffered_write_command(
             .planned_write
             .resolved_write_plan
             .as_ref()
-            .map(|resolved| filesystem_transaction_state_from_planned(&resolved.filesystem_state()))
+            .map(|resolved| resolved.filesystem_state())
             .unwrap_or_default();
         compiled_execution.physical_plan = Some(
             crate::sql::physical_plan::PhysicalPlan::PublicWrite(public_write.execution.clone()),
@@ -155,7 +153,8 @@ pub(super) async fn compile_sql_buffered_write_command(
             .public_write_mut()
             .expect("public write compile path must still hold a public write body") = public_write;
     }
-    let compiled = CompiledExecutionStep::compile(compiled_execution, writer_key.as_deref())?;
+    let compiled =
+        CompiledExecutionStep::compile(compiled_execution, runtime_state, writer_key.as_deref())?;
     let registry_mutated_during_planning =
         prepared_execution_mutates_public_surface_registry(compiled.execution())?;
 

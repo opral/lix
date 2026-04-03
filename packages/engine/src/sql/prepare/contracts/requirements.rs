@@ -1,4 +1,4 @@
-use crate::runtime::execution_state::ExecutionRuntimeEffects;
+use crate::execution_effects::ExecutionRuntimeEffects;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlanRequirements {
