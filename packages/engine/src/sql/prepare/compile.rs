@@ -1,9 +1,8 @@
 use crate::cel::CelEvaluator;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
-use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
+use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::functions::SharedFunctionProvider;
-use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
@@ -23,8 +22,7 @@ use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
 use super::execution_program::{BoundStatementTemplateInstance, StatementTemplateOwnership};
 use super::intent::{
-    collect_execution_intent_with_backend, filesystem_transaction_state_from_planned,
-    ExecutionIntent, IntentCollectionPolicy,
+    collect_execution_intent_with_backend, ExecutionIntent, IntentCollectionPolicy,
 };
 use super::preprocess::preprocess_with_surfaces_to_logical_plan;
 use super::public_surface::{
@@ -51,8 +49,6 @@ pub(crate) trait SqlPreparationContext {
 
     fn schema_cache(&self) -> &dyn CompiledSchemaCache;
 
-    fn deterministic_settings(&self) -> DeterministicSettings;
-
     fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider>;
 
     fn active_history_root_commit_id(&self) -> Option<&str> {
@@ -68,7 +64,6 @@ pub(crate) struct DefaultSqlPreparationContext<'a> {
     pub(crate) backend: &'a dyn LixBackend,
     pub(crate) cel_evaluator: &'a CelEvaluator,
     pub(crate) schema_cache: &'a dyn CompiledSchemaCache,
-    pub(crate) deterministic_settings: DeterministicSettings,
     pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) active_history_root_commit_id: Option<&'a str>,
     pub(crate) public_surface_registry_override: Option<&'a SurfaceRegistry>,
@@ -85,10 +80,6 @@ impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
 
     fn schema_cache(&self) -> &dyn CompiledSchemaCache {
         self.schema_cache
-    }
-
-    fn deterministic_settings(&self) -> DeterministicSettings {
-        self.deterministic_settings
     }
 
     fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider> {
@@ -371,10 +362,6 @@ async fn compile_execution_with_context(
 
     Ok(CompiledExecution {
         intent,
-        runtime_state: ExecutionRuntimeState::from_prepared_parts(
-            preparation_context.deterministic_settings(),
-            functions,
-        ),
         physical_plan,
         explain,
         result_contract,
@@ -537,7 +524,7 @@ fn derived_public_execution_intent(
     };
 
     crate::sql::prepare::intent::ExecutionIntent {
-        filesystem_state: filesystem_transaction_state_from_planned(&resolved.filesystem_state()),
+        filesystem_state: resolved.filesystem_state(),
     }
 }
 

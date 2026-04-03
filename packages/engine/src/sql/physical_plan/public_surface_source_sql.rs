@@ -2,7 +2,7 @@
 
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
-use crate::live_state::schema_access::{
+use crate::live_schema_access::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
     snapshot_select_expr_for_schema, tracked_relation_name,
 };

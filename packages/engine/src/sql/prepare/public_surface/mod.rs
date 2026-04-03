@@ -11,14 +11,6 @@ use crate::contracts::surface::{
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
-use crate::filesystem::runtime::{
-    binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
-    FilesystemTransactionState,
-};
-use crate::runtime::streams::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
-};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
@@ -28,6 +20,7 @@ use crate::sql::explain::{
     ExplainRequest, ExplainStage, ExplainStageTiming, ExplainTimingCollector,
     PublicWriteExplainBuildInput,
 };
+use crate::sql::logical_plan::public_ir::PlannedFilesystemState;
 use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, WriteOperationKind};
 #[cfg(test)]
 use crate::sql::logical_plan::DependencySpec;
@@ -39,12 +32,19 @@ use crate::sql::physical_plan::{
 };
 use crate::sql::prepare::contracts::effects::PlanEffects;
 use crate::sql::prepare::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::sql::prepare::intent::authoritative_binary_blob_write_targets;
+use crate::sql::prepare::intent::{
+    authoritative_binary_blob_write_targets_from_planned_state,
+    delete_targets_from_planned_filesystem_state,
+};
 use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
+};
+use crate::state_commit_stream::{
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -182,9 +182,6 @@ struct BoundPublicReadSummary {
 }
 
 pub(crate) mod read;
-pub(crate) mod tracked_write_plan;
-
-pub(crate) use tracked_write_plan::{build_tracked_txn_unit, TrackedTxnUnit};
 
 #[cfg(test)]
 pub(crate) async fn prepare_public_execution(
@@ -1348,7 +1345,7 @@ pub(crate) fn build_public_write_execution(
 pub(crate) fn finalize_public_write_execution(
     execution: &mut PublicWriteMaterialization,
     planned_write: &PlannedWrite,
-    filesystem_state: &FilesystemTransactionState,
+    filesystem_state: &PlannedFilesystemState,
 ) -> Result<(), LixError> {
     for partition in &mut execution.partitions {
         let PublicWriteExecutionPartition::Untracked(untracked) = partition else {
@@ -1524,7 +1521,7 @@ pub(crate) fn state_commit_stream_operation(
 fn semantic_plan_effects_from_untracked_public_write(
     planned_write: &PlannedWrite,
     intended_post_state: &[crate::sql::logical_plan::public_ir::PlannedStateRow],
-    filesystem_state: &FilesystemTransactionState,
+    filesystem_state: &PlannedFilesystemState,
 ) -> Result<PlanEffects, LixError> {
     let mut effects = PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_planned_rows(
@@ -1545,10 +1542,10 @@ fn semantic_plan_effects_from_untracked_public_write(
         planned_write.command.target.descriptor.public_name.as_str(),
         "lix_file" | "lix_file_by_version"
     ) {
-        let binary_blob_writes = binary_blob_writes_from_filesystem_state(filesystem_state);
-        let pending_file_delete_targets = delete_targets_from_filesystem_state(filesystem_state);
+        let pending_file_delete_targets =
+            delete_targets_from_planned_filesystem_state(filesystem_state);
         effects.file_cache_refresh_targets =
-            authoritative_binary_blob_write_targets(&binary_blob_writes);
+            authoritative_binary_blob_write_targets_from_planned_state(filesystem_state);
         effects
             .file_cache_refresh_targets
             .extend(pending_file_delete_targets);
@@ -1873,8 +1870,8 @@ mod tests {
     use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
     use crate::live_state::{self, mark_mode_with_backend};
     use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
+    use crate::read_runtime::prepare_public_read_artifact;
     use crate::schema::builtin::types::LixCommit;
-    use crate::sql::prepare::prepare_public_read_artifact;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
@@ -2158,7 +2155,7 @@ mod tests {
         match &admin_read.execution {
             PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
                 assert_eq!(artifact.surface.public_name(), "lix_version");
-                assert!(admin_read.explain.executor_artifacts.lowered_sql.is_empty());
+                assert!(admin_read.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::LoweredSql(_) => {
                 panic!("plain lix_version read should use read-time projection execution")
@@ -2202,7 +2199,7 @@ mod tests {
                     }
 
                     assert!(
-                        prepared.explain.executor_artifacts.lowered_sql.is_empty(),
+                        prepared.explain.compiled_artifacts.lowered_sql.is_empty(),
                         "read-time projection execution should not emit lowered SQL"
                     );
                     match prepared.explain.physical_plan.as_deref() {
@@ -2265,7 +2262,7 @@ mod tests {
                         prepared.execution,
                         PreparedPublicReadExecution::ReadTimeProjection(_)
                     ));
-                    assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                    assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
                     let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
                         .expect("descriptor-only lix_version read should convert");
@@ -2334,7 +2331,7 @@ mod tests {
                         prepared.execution,
                         PreparedPublicReadExecution::ReadTimeProjection(_)
                     ));
-                    assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                    assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
                     let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
                         .expect("descriptor+ref lix_version read should convert");
@@ -2418,7 +2415,7 @@ mod tests {
                         prepared.execution,
                         PreparedPublicReadExecution::ReadTimeProjection(_)
                     ));
-                    assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                    assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
                     let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
                         .expect("multi-version lix_version read should convert");
@@ -2573,7 +2570,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -2583,7 +2580,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("live public entity read should lower");
@@ -2631,7 +2628,7 @@ mod tests {
         assert!(prepared.effective_state_plan().is_some());
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("registered-schema entity read should lower");
@@ -2856,7 +2853,7 @@ mod tests {
                     .expect("registered-schema derived public query should prepare through backend registry")
                     .expect("registered-schema derived public query should lower through backend registry");
                     let lowered_sql = prepared
-                        .explain.executor_artifacts.lowered_sql
+                        .explain.compiled_artifacts.lowered_sql
                         .first()
                         .expect("registered-schema derived public query should lower");
 
@@ -2900,7 +2897,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -2913,7 +2910,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("entity by-version read should lower");
@@ -2959,7 +2956,7 @@ mod tests {
                     assert_eq!(
                         prepared
                             .explain
-                            .executor_artifacts
+                            .compiled_artifacts
                             .pushdown
                             .as_ref()
                             .expect("pushdown trace should be recorded")
@@ -2975,7 +2972,7 @@ mod tests {
                                 plan.request.root_scope,
                                 StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
-                            assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                            assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
                         }
                         _ => {
                             panic!("entity history read should use direct entity-history execution")
@@ -3015,7 +3012,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3025,7 +3022,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("change read should lower");
@@ -3063,7 +3060,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3073,7 +3070,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("working-changes read should lower");
@@ -3127,7 +3124,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3137,7 +3134,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("filesystem read should lower");
@@ -3172,7 +3169,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3185,7 +3182,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("filesystem by-version read should lower");
@@ -3217,7 +3214,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3231,7 +3228,7 @@ mod tests {
                     plan.request.root_scope,
                     FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
-                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
                 panic!("filesystem history read should not use state-history direct plan")
@@ -3277,7 +3274,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3294,7 +3291,7 @@ mod tests {
                     plan.request.version_scope,
                     FileHistoryVersionScope::RequestedVersions(vec!["version-a".to_string()])
                 );
-                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
                 panic!(
@@ -3343,7 +3340,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3361,7 +3358,7 @@ mod tests {
                     FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
                 assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
-                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
                 panic!("directory history read should not use state-history direct plan")
@@ -3478,7 +3475,7 @@ mod tests {
                                 plan.request.root_scope,
                                 StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
-                            assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                            assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
                         }
                         _ => {
                             panic!("entity history read should use direct entity-history execution")
@@ -3516,7 +3513,7 @@ mod tests {
                         PreparedPublicExecution::Read(prepared) => {
                             assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
                             assert!(
-                                prepared.explain.executor_artifacts.lowered_sql.is_empty(),
+                                prepared.explain.compiled_artifacts.lowered_sql.is_empty(),
                                 "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
                             );
                             assert!(
@@ -3530,10 +3527,10 @@ mod tests {
                             assert!(
                                 stage_duration_us(
                                     &prepared,
-                                    crate::sql::explain::ExplainStage::ExecutorPreparation,
+                                    crate::sql::explain::ExplainStage::ArtifactPreparation,
                                 )
                                 .is_none(),
-                                "direct-history EXPLAIN should not record executor_preparation timing"
+                                "direct-history EXPLAIN should not record artifact_preparation timing"
                             );
                         }
                         PreparedPublicExecution::Write(_) => {
@@ -3563,7 +3560,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3573,7 +3570,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("explain state read should lower");
@@ -3731,7 +3728,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .bound_public_leaves
                 .iter()
                 .map(|leaf| leaf.public_name.as_str())
@@ -3747,7 +3744,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("surface-expanded read should lower");
@@ -3838,7 +3835,7 @@ mod tests {
         assert_eq!(prepared.surface_bindings(), vec!["lix_state"]);
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("group-by/having read should lower");
@@ -3891,7 +3888,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3902,7 +3899,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3912,7 +3909,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("state read should lower");
@@ -3938,7 +3935,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3951,7 +3948,7 @@ mod tests {
         );
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("state-by-version read should lower");
@@ -3980,7 +3977,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -3994,7 +3991,7 @@ mod tests {
                     plan.request.root_scope,
                     StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
-                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
                 panic!("state-history read should not use entity-history direct plan")
@@ -4037,7 +4034,7 @@ mod tests {
         assert_eq!(
             prepared
                 .explain
-                .executor_artifacts
+                .compiled_artifacts
                 .pushdown
                 .as_ref()
                 .expect("pushdown trace should be recorded")
@@ -4051,7 +4048,7 @@ mod tests {
                     plan.request.root_scope,
                     StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
-                assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             _ => panic!("grouped state-history read should use direct state-history execution"),
         }
@@ -4076,7 +4073,7 @@ mod tests {
 
         let lowered_sql = prepared
             .explain
-            .executor_artifacts
+            .compiled_artifacts
             .lowered_sql
             .first()
             .expect("nested filesystem subquery should lower");
@@ -4114,7 +4111,7 @@ mod tests {
                         PreparedPublicReadExecution::LoweredSql(_) => {
                             let lowered_sql = prepared
                                 .explain
-                                .executor_artifacts
+                                .compiled_artifacts
                                 .lowered_sql
                                 .first()
                                 .expect("runtime-function lix_version read should still lower SQL");

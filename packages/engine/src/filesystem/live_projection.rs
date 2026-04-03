@@ -1,7 +1,7 @@
 use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::filesystem::path::ParsedFilePath;
 use crate::filesystem::queries::lookup_file_id_by_path;
-use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
 use crate::text::escape_sql_string;
 use crate::version::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::workspace::writer_key::WORKSPACE_WRITER_KEY_TABLE;

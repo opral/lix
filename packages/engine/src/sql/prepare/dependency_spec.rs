@@ -8,11 +8,11 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::contracts::artifacts::{is_untracked_live_table, SessionDependency};
-use crate::runtime::streams::StateCommitStreamFilter;
 use crate::sql::binder::bind_sql_with_state;
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::PlaceholderState;
+use crate::state_commit_stream::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};
 
 pub(crate) fn derive_dependency_spec_from_statements(

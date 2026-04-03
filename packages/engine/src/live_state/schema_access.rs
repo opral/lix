@@ -108,37 +108,7 @@ pub(crate) async fn live_storage_relation_exists_with_backend(
 }
 
 pub(crate) fn tracked_relation_name(schema_key: &str) -> String {
-    super::storage::tracked_live_table_name(schema_key)
-}
-
-pub(crate) fn payload_column_name_for_schema(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    property_name: &str,
-) -> Result<String, LixError> {
-    let layout = schema_layout(schema_key, schema_definition)?;
-    super::storage::live_column_name_for_property(&layout, property_name)
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "live schema '{}' does not include property '{}'",
-                    schema_key, property_name
-                ),
-            )
-        })
-}
-
-pub(crate) fn normalized_projection_sql_for_schema(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    table_alias: Option<&str>,
-) -> Result<String, LixError> {
-    Ok(
-        super::storage::LiveRowAccess::new(schema_layout(schema_key, schema_definition)?)
-            .normalized_projection_sql(table_alias),
-    )
+    crate::live_schema_access::tracked_relation_name(schema_key)
 }
 
 pub(crate) fn snapshot_select_expr_for_schema(
@@ -147,11 +117,12 @@ pub(crate) fn snapshot_select_expr_for_schema(
     dialect: SqlDialect,
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
-    Ok(super::shared::snapshot_sql::live_snapshot_select_expr(
-        &schema_layout(schema_key, schema_definition)?,
+    crate::live_schema_access::snapshot_select_expr_for_schema(
+        schema_key,
+        schema_definition,
         dialect,
         table_alias,
-    ))
+    )
 }
 
 #[cfg(test)]
@@ -194,6 +165,7 @@ pub(crate) fn schema_column_names(
         .collect())
 }
 
+#[cfg(test)]
 fn schema_layout(
     schema_key: &str,
     schema_definition: Option<&JsonValue>,

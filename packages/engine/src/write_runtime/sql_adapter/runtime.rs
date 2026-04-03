@@ -6,10 +6,12 @@ use crate::contracts::artifacts::{PlanEffects, ResultContract, SchemaRegistratio
 use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::deterministic_mode::RuntimeFunctionProvider;
 use crate::engine::Engine;
+use crate::explain_output::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::functions::SharedFunctionProvider;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::streams::StateCommitStreamChange;
 use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
-use crate::sql::prepare::contracts::executor_error::ExecutorError;
+use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::prepare::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
     PreparedPublicRead,
@@ -24,6 +26,7 @@ use super::planned_write::{build_planned_write_delta, PlannedWriteDelta};
 use super::planned_write_runner::execute_planned_write_delta;
 pub(crate) struct CompiledExecutionStep {
     execution: CompiledExecution,
+    runtime_state: ExecutionRuntimeState,
     planned_write_delta: Option<PlannedWriteDelta>,
     schema_registrations: SchemaRegistrationSet,
 }
@@ -44,16 +47,18 @@ pub(crate) enum CompiledExecutionStepResult {
 impl CompiledExecutionStep {
     pub(crate) fn compile(
         execution: CompiledExecution,
+        runtime_state: &ExecutionRuntimeState,
         writer_key: Option<&str>,
     ) -> Result<Self, LixError> {
         let schema_registrations = schema_registrations_for_compiled_execution(&execution);
         let planned_write_delta = if execution.explain().is_some() {
             None
         } else {
-            build_planned_write_delta(&execution, writer_key)?
+            build_planned_write_delta(&execution, runtime_state, writer_key)?
         };
         Ok(Self {
             execution,
+            runtime_state: runtime_state.clone(),
             planned_write_delta,
             schema_registrations,
         })
@@ -65,6 +70,10 @@ impl CompiledExecutionStep {
 
     pub(crate) fn planned_write_delta(&self) -> Option<&PlannedWriteDelta> {
         self.planned_write_delta.as_ref()
+    }
+
+    pub(crate) fn runtime_state(&self) -> &ExecutionRuntimeState {
+        &self.runtime_state
     }
 
     pub(crate) fn schema_registrations(&self) -> &SchemaRegistrationSet {
@@ -120,9 +129,17 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
     writer_key: Option<&str>,
 ) -> Result<CompiledExecutionStepResult, LixError> {
     match step.route() {
-        CompiledExecutionRoute::Explain(explain) => Ok(CompiledExecutionStepResult::Immediate(
-            explain.render_query_result()?,
-        )),
+        CompiledExecutionRoute::Explain(explain) => {
+            let template = prepare_plain_explain_template(explain)?.ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "plain explain route expected a non-analyze explain template",
+                )
+            })?;
+            Ok(CompiledExecutionStepResult::Immediate(
+                render_plain_explain_result(&template)?,
+            ))
+        }
         CompiledExecutionRoute::PublicRead(public_read) => {
             let execution_started = Instant::now();
             let public_result = match transaction
@@ -145,8 +162,15 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
                 }
             };
             if let Some(explain) = step.execution().analyzed_explain() {
+                let template = prepare_analyzed_explain_template(explain)?.ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "analyzed explain route expected an analyze explain template",
+                    )
+                })?;
                 return Ok(CompiledExecutionStepResult::Immediate(
-                    explain.render_analyzed_query_result(
+                    render_analyzed_explain_result(
+                        &template,
                         &public_result,
                         execution_started.elapsed(),
                     )?,
@@ -175,7 +199,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
                 transaction,
                 internal,
                 step.execution().result_contract,
-                step.execution().runtime_state.provider(),
+                step.runtime_state().provider(),
                 writer_key,
             )
             .await
@@ -183,8 +207,16 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             {
                 Ok(execution) => {
                     if let Some(explain) = step.execution().analyzed_explain() {
+                        let template =
+                            prepare_analyzed_explain_template(explain)?.ok_or_else(|| {
+                                LixError::new(
+                                    "LIX_ERROR_UNKNOWN",
+                                    "analyzed explain route expected an analyze explain template",
+                                )
+                            })?;
                         return Ok(CompiledExecutionStepResult::Immediate(
-                            explain.render_analyzed_query_result(
+                            render_analyzed_explain_result(
+                                &template,
                                 &execution.public_result,
                                 execution_started.elapsed(),
                             )?,
@@ -244,12 +276,10 @@ pub(crate) async fn execute_internal_execution_with_transaction(
     result_contract: ResultContract,
     functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
     writer_key: Option<&str>,
-) -> Result<SqlExecutionOutcome, ExecutorError> {
+) -> Result<SqlExecutionOutcome, LixError> {
     let _ = (functions, writer_key, internal.should_refresh_file_cache);
     let internal_result =
-        execute_prepared_with_transaction(transaction, &internal.prepared_statements)
-            .await
-            .map_err(ExecutorError::execute)?;
+        execute_prepared_with_transaction(transaction, &internal.prepared_statements).await?;
     let public_result = public_result_from_contract(result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {
