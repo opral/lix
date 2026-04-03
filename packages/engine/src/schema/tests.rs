@@ -1,4 +1,7 @@
 use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
+use crate::schema::builtin::storage::{
+    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+};
 use crate::{validate_lix_schema, validate_lix_schema_definition};
 use serde_json::json;
 
@@ -292,6 +295,14 @@ fn builtin_storage_metadata_marks_non_global_builtins_as_versioned() {
     assert_eq!(metadata.file_id, "lix");
     assert_eq!(metadata.plugin_key, "lix");
     assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Versioned);
+}
+
+#[test]
+fn key_value_storage_accessors_are_schema_owned() {
+    assert_eq!(key_value_schema_key(), "lix_key_value");
+    assert_eq!(key_value_schema_version(), "1");
+    assert_eq!(key_value_file_id(), "lix");
+    assert_eq!(key_value_plugin_key(), "lix");
 }
 
 #[test]

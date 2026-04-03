@@ -662,6 +662,43 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
     assert_eq!(parsed["value"]["x-lix-version"], "1");
 });
 
+simulation_test!(init_seeds_lix_id_key_value, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.initialize().await.unwrap();
+
+    let result = engine
+        .execute(
+            "SELECT snapshot_content \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'lix_id' \
+               AND file_id = 'lix' \
+               AND version_id = 'global' \
+               AND snapshot_content IS NOT NULL \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(result.statements[0].rows.len(), 1);
+
+    let snapshot_content = match &result.statements[0].rows[0][0] {
+        lix_engine::Value::Text(value) => value,
+        other => panic!("expected text snapshot_content, got {other:?}"),
+    };
+    let parsed: serde_json::Value = serde_json::from_str(snapshot_content).unwrap();
+    assert_eq!(parsed["key"], "lix_id");
+    let value = parsed["value"]
+        .as_str()
+        .expect("lix_id bootstrap value should be a string");
+    assert_uuid_v7_like(value, "lix_id");
+});
+
 simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
     let engine = sim
         .boot_simulated_engine(None)
@@ -1274,6 +1311,37 @@ simulation_test!(
             first_result_rows(&boot_key).len(),
             1,
             "boot key seed row should persist"
+        );
+    }
+);
+
+simulation_test!(
+    initialize_rejects_reserved_lix_id_boot_key,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                key_values: vec![BootKeyValue {
+                    key: "lix_id".to_string(),
+                    value: json!("caller-provided"),
+                    lixcol_global: Some(true),
+                    lixcol_untracked: Some(false),
+                }],
+                ..support::simulation_test::SimulationBootArgs::default()
+            }))
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        let err = engine
+            .initialize()
+            .await
+            .expect_err("reserved boot key should reject initialization");
+
+        assert!(
+            err.description
+                .contains("boot key `lix_id` is reserved for engine-owned identity state"),
+            "unexpected initialize error: {}",
+            err.description
         );
     }
 );

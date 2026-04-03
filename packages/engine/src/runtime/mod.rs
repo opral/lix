@@ -16,13 +16,13 @@ use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
-use crate::key_value::key_value_schema_key;
 use crate::plugin::runtime::CachedPluginComponent;
 use crate::plugin::types::InstalledPlugin;
 use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::runtime::wasm::WasmRuntime;
+use crate::schema::builtin::storage::key_value_schema_key;
 use crate::schema::SchemaKey;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,

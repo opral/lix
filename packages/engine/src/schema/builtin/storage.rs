@@ -1,4 +1,5 @@
 use serde_json::Value as JsonValue;
+use std::sync::OnceLock;
 
 use crate::version::GLOBAL_VERSION_ID;
 
@@ -20,6 +21,8 @@ pub(crate) struct BuiltinSchemaStorageMetadata {
     pub(crate) plugin_key: String,
     pub(crate) storage_lane: BuiltinSchemaStorageLane,
 }
+
+static KEY_VALUE_STORAGE_METADATA: OnceLock<BuiltinSchemaStorageMetadata> = OnceLock::new();
 
 #[allow(dead_code)]
 pub(crate) fn builtin_schema_storage_metadata(
@@ -50,4 +53,27 @@ pub(crate) fn builtin_schema_storage_metadata(
         plugin_key: decode_lixcol_literal(plugin_key_raw),
         storage_lane,
     })
+}
+
+pub(crate) fn key_value_storage_metadata() -> &'static BuiltinSchemaStorageMetadata {
+    KEY_VALUE_STORAGE_METADATA.get_or_init(|| {
+        builtin_schema_storage_metadata("lix_key_value")
+            .expect("lix_key_value builtin storage metadata should exist")
+    })
+}
+
+pub(crate) fn key_value_schema_key() -> &'static str {
+    &key_value_storage_metadata().schema_key
+}
+
+pub(crate) fn key_value_schema_version() -> &'static str {
+    &key_value_storage_metadata().schema_version
+}
+
+pub(crate) fn key_value_file_id() -> &'static str {
+    &key_value_storage_metadata().file_id
+}
+
+pub(crate) fn key_value_plugin_key() -> &'static str {
+    &key_value_storage_metadata().plugin_key
 }

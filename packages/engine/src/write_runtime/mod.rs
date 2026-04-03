@@ -1,6 +1,7 @@
 pub(crate) mod buffered;
 pub(crate) mod commit;
 mod contracts;
+mod deterministic_sequence;
 mod effective_state;
 mod execution;
 pub(crate) mod overlay;
@@ -20,6 +21,10 @@ pub(crate) use buffered::PlannedWriteDelta;
 pub(crate) use contracts::BufferedWriteExecutionContext;
 pub use contracts::{
     CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
+};
+pub(crate) use deterministic_sequence::{
+    build_ensure_runtime_sequence_row_sql, build_persist_sequence_highest_batch,
+    build_update_runtime_sequence_highest_sql, load_runtime_sequence_start_in_transaction,
 };
 pub(crate) use execution::BorrowedWriteTransaction;
 pub use execution::WriteTransaction;

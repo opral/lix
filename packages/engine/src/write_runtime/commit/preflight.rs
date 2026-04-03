@@ -1,11 +1,12 @@
 use std::collections::BTreeMap;
 
+use crate::deterministic_mode::deterministic_sequence_key;
 use crate::filesystem::runtime::{
     ExactFilesystemDescriptorState, FilesystemDescriptorState, FILESYSTEM_DESCRIPTOR_FILE_ID,
     FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
 };
-use crate::key_value::key_value_schema_key;
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
+use crate::schema::builtin::storage::key_value_schema_key;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
@@ -22,7 +23,7 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
         &ExactUntrackedRowRequest {
             schema_key: key_value_schema_key().to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            entity_id: "lix_deterministic_sequence_number".to_string(),
+            entity_id: deterministic_sequence_key().to_string(),
             file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
         },
     )
@@ -45,8 +46,8 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
     let tracked = load_exact_committed_state_row_at_version_head_with_executor(
         executor,
         &ExactCommittedStateRowRequest {
-            entity_id: "lix_deterministic_sequence_number".to_string(),
-            schema_key: "lix_key_value".to_string(),
+            entity_id: deterministic_sequence_key().to_string(),
+            schema_key: key_value_schema_key().to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             exact_filters: BTreeMap::from([
                 (
