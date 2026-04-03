@@ -9,25 +9,23 @@ use serde_json::Value as JsonValue;
 use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
 use crate::contracts::artifacts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
-    LiveSnapshotStorage,
+    LiveSnapshotStorage, UpdateValidationInput,
 };
 use crate::contracts::surface::SurfaceFamily;
-use crate::contracts::traits::{LiveReadShapeContract, LiveStateQueryBackend};
+use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend};
 use crate::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
-use crate::runtime::SchemaCache;
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
-use crate::sql::binder::bind_sql;
-use crate::sql::executor::contracts::planned_statement::{
-    MutationOperation, MutationRow, UpdateValidationPlan,
-};
 use crate::sql::logical_plan::public_ir::{
     InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
     WriteOperationKind,
+};
+use crate::sql::prepare::contracts::planned_statement::{
+    MutationOperation, MutationRow, UpdateValidationPlan,
 };
 use crate::{LixBackend, LixError, Value};
 
@@ -110,7 +108,7 @@ struct ConstraintRowView<'a> {
 
 pub async fn validate_inserts(
     backend: &dyn LixBackend,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     mutations: &[MutationRow],
 ) -> Result<(), LixError> {
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
@@ -162,67 +160,33 @@ pub async fn validate_inserts(
     Ok(())
 }
 
-pub async fn validate_updates(
+pub(crate) async fn validate_update_inputs(
     backend: &dyn LixBackend,
-    cache: &SchemaCache,
-    plans: &[UpdateValidationPlan],
-    params: &[Value],
+    cache: &dyn CompiledSchemaCache,
+    inputs: &[UpdateValidationInput],
 ) -> Result<(), LixError> {
     let mut schema_provider = SqlRegisteredSchemaProvider::new(backend);
     let mut pending_rows = Vec::new();
     let mut deleted_rows = Vec::new();
 
-    for plan in plans {
-        let live_access = backend
-            .load_live_read_shape_for_table_name(&plan.table)
-            .await?;
-        let snapshot_projection = if live_access.is_some() {
-            String::new()
-        } else {
-            ", snapshot_content".to_string()
-        };
-        let normalized_projection = live_access
-            .as_ref()
-            .map(|access| access.normalized_projection_sql(None))
-            .unwrap_or_default();
-        let mut sql = format!(
-            "SELECT entity_id, file_id, version_id, plugin_key, schema_key, schema_version{snapshot_projection}{normalized_projection} FROM {}",
-            plan.table,
-            snapshot_projection = snapshot_projection,
-            normalized_projection = normalized_projection,
-        );
-        if let Some(where_clause) = &plan.where_clause {
-            sql.push_str(" WHERE ");
-            sql.push_str(&where_clause.to_string());
-        }
-
-        let bound = bind_sql(&sql, params, backend.dialect())?;
-        let result = backend.execute(&bound.sql, &bound.params).await?;
-        if result.rows.is_empty() {
+    for input in inputs {
+        let plan = &input.plan;
+        if input.rows.is_empty() {
             continue;
         }
 
-        for row in result.rows {
-            let entity_id = value_to_string(&row[0], "entity_id")?;
-            let schema_key = value_to_string(&row[4], "schema_key")?;
-            let schema_version = value_to_string(&row[5], "schema_version")?;
-            let base_snapshot = required_projected_row_snapshot_json(
-                live_access.as_deref(),
-                &schema_key,
-                &row,
-                6,
-                6,
-            )?;
-            let snapshot = resolve_update_snapshot(plan, &base_snapshot, &schema_key)?;
+        for row in &input.rows {
+            let snapshot =
+                resolve_update_snapshot(plan, &row.base_snapshot, row.schema_key.as_str())?;
             let storage = storage_kind_for_table(&plan.table);
 
             validate_checkpoint_label_mutation(
-                &schema_key,
-                Some(&base_snapshot),
+                &row.schema_key,
+                Some(&row.base_snapshot),
                 snapshot.as_ref(),
             )?;
 
-            if schema_key == REGISTERED_SCHEMA_KEY {
+            if row.schema_key == REGISTERED_SCHEMA_KEY {
                 if let Some(snapshot) = snapshot.as_ref() {
                     validate_registered_schema_snapshot(&mut schema_provider, snapshot).await?;
                 }
@@ -232,19 +196,19 @@ pub async fn validate_updates(
             if plan.delete {
                 deleted_rows.push(ConstraintDeletedRow {
                     identity: ConstraintRowIdentity {
-                        entity_id,
-                        schema_key,
-                        file_id: value_to_string(&row[1], "file_id")?,
-                        version_id: value_to_string(&row[2], "version_id")?,
+                        entity_id: row.entity_id.clone(),
+                        schema_key: row.schema_key.clone(),
+                        file_id: row.file_id.clone(),
+                        version_id: row.version_id.clone(),
                     },
-                    schema_version,
-                    snapshot: base_snapshot,
+                    schema_version: row.schema_version.clone(),
+                    snapshot: row.base_snapshot.clone(),
                     storage,
                 });
                 continue;
             }
 
-            let key = SchemaKey::new(schema_key.clone(), schema_version.clone());
+            let key = SchemaKey::new(row.schema_key.clone(), row.schema_version.clone());
             let schema = schema_provider.load_schema(&key).await?;
 
             if schema.get("x-lix-immutable").and_then(|v| v.as_bool()) == Some(true) {
@@ -252,7 +216,7 @@ pub async fn validate_updates(
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!(
                         "Schema '{}' is immutable and cannot be updated.",
-                        schema_key
+                        row.schema_key
                     ),
                 });
             }
@@ -262,7 +226,7 @@ pub async fn validate_updates(
                 validate_entity_id_matches_primary_key(
                     &mut schema_provider,
                     &key,
-                    &entity_id,
+                    &row.entity_id,
                     snapshot,
                 )
                 .await?;
@@ -270,12 +234,12 @@ pub async fn validate_updates(
                 pending_rows.push(ConstraintCandidateRow {
                     index: pending_rows.len(),
                     identity: ConstraintRowIdentity {
-                        entity_id,
-                        schema_key: schema_key.clone(),
-                        file_id: value_to_string(&row[1], "file_id")?,
-                        version_id: value_to_string(&row[2], "version_id")?,
+                        entity_id: row.entity_id.clone(),
+                        schema_key: row.schema_key.clone(),
+                        file_id: row.file_id.clone(),
+                        version_id: row.version_id.clone(),
                     },
-                    schema_version,
+                    schema_version: row.schema_version.clone(),
                     snapshot: snapshot.clone(),
                     storage,
                     shadows_committed_identity: true,
@@ -312,64 +276,9 @@ pub async fn validate_updates(
     Ok(())
 }
 
-fn required_projected_row_snapshot_json(
-    access: Option<&dyn LiveReadShapeContract>,
-    schema_key: &str,
-    row: &[Value],
-    first_projected_column: usize,
-    raw_snapshot_index: usize,
-) -> Result<JsonValue, LixError> {
-    let snapshot = match access {
-        Some(access) => access.snapshot_from_projected_row(
-            schema_key,
-            row,
-            first_projected_column,
-            raw_snapshot_index,
-        )?,
-        None => value_snapshot_json(row.get(raw_snapshot_index), schema_key)?,
-    };
-    snapshot.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "projected row for schema '{}' did not contain a logical snapshot",
-                schema_key
-            ),
-        )
-    })
-}
-
-fn value_snapshot_json(
-    value: Option<&Value>,
-    schema_key: &str,
-) -> Result<Option<JsonValue>, LixError> {
-    match value {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Json(json)) => Ok(Some(json.clone())),
-        Some(Value::Text(text)) => serde_json::from_str::<JsonValue>(text)
-            .map(Some)
-            .map_err(|err| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "projected snapshot_content for schema '{}' is not valid JSON: {err}",
-                        schema_key
-                    ),
-                )
-            }),
-        Some(other) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "projected snapshot_content for schema '{}' must be JSON, text, or null, got {other:?}",
-                schema_key
-            ),
-        )),
-    }
-}
-
 pub(crate) async fn validate_batch_local_write(
     backend: &dyn LixBackend,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     planned_write: &PlannedWrite,
 ) -> Result<(), LixError> {
     validate_planned_write(backend, cache, planned_write, false).await
@@ -377,7 +286,7 @@ pub(crate) async fn validate_batch_local_write(
 
 pub(crate) async fn validate_commit_time_write(
     backend: &dyn LixBackend,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     planned_write: &PlannedWrite,
 ) -> Result<(), LixError> {
     validate_planned_write(backend, cache, planned_write, true).await
@@ -385,7 +294,7 @@ pub(crate) async fn validate_commit_time_write(
 
 async fn validate_planned_write(
     backend: &dyn LixBackend,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     planned_write: &PlannedWrite,
     require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
@@ -646,7 +555,7 @@ fn storage_kind_for_table(table: &str) -> ConstraintStorageKind {
 
 async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
     provider: &mut P,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
@@ -707,7 +616,7 @@ async fn validate_update_is_mutable(
 async fn validate_planned_row(
     backend: &dyn LixBackend,
     provider: &mut OverlaySchemaProvider<'_>,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     operation_kind: WriteOperationKind,
     row: &PlannedStateRow,
     require_binary_blob_ref_cas: bool,
@@ -1879,11 +1788,11 @@ fn shadowed_committed_identities(
 
 async fn load_compiled_schema<P: SchemaProvider + ?Sized>(
     provider: &mut P,
-    cache: &SchemaCache,
+    cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
 ) -> Result<Arc<JSONSchema>, LixError> {
-    if let Some(existing) = cache.read().unwrap().get(key) {
-        return Ok(existing.clone());
+    if let Some(existing) = cache.get_compiled_schema(key) {
+        return Ok(existing);
     }
 
     let schema = provider.load_schema(key).await?;
@@ -1896,19 +1805,9 @@ async fn load_compiled_schema<P: SchemaProvider + ?Sized>(
     })?;
     let compiled = Arc::new(compiled);
 
-    cache.write().unwrap().insert(key.clone(), compiled.clone());
+    cache.insert_compiled_schema(key.clone(), compiled.clone());
 
     Ok(compiled)
-}
-
-fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("expected text value for {name}"),
-        }),
-    }
 }
 
 fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String, LixError> {

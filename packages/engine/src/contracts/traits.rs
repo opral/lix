@@ -1,6 +1,8 @@
 use async_trait::async_trait;
+use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::contracts::artifacts::{
     EffectiveRowSet, EffectiveRowsRequest, ExactUntrackedLookupRequest, LiveFilter,
@@ -11,6 +13,7 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::surface::SurfaceRegistry;
 use crate::filesystem::runtime::FilesystemTransactionFileState;
+use crate::schema::SchemaKey;
 use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::write_runtime::commit::CanonicalCommitReceipt;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, ReplayCursor, Value};
@@ -63,6 +66,121 @@ pub(crate) trait PendingView {
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>>;
+}
+
+pub(crate) trait CompiledSchemaCache {
+    fn get_compiled_schema(&self, key: &SchemaKey) -> Option<Arc<JSONSchema>>;
+
+    fn insert_compiled_schema(&self, key: SchemaKey, schema: Arc<JSONSchema>);
+}
+
+pub(crate) trait PendingStateOverlay {
+    fn visible_semantic_rows(
+        &self,
+        storage: PendingSemanticStorage,
+        schema_key: &str,
+    ) -> Vec<PendingSemanticRow>;
+
+    fn workspace_writer_key_annotation_for_state_row(
+        &self,
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+        file_id: &str,
+    ) -> Option<Option<String>>;
+
+    fn as_pending_view(&self) -> &dyn PendingView;
+}
+
+pub(crate) struct PendingStateOverlayRef<'a> {
+    view: &'a dyn PendingView,
+}
+
+impl<'a> PendingStateOverlayRef<'a> {
+    pub(crate) fn new(view: &'a dyn PendingView) -> Self {
+        Self { view }
+    }
+}
+
+impl<T> PendingStateOverlay for T
+where
+    T: PendingView,
+{
+    fn visible_semantic_rows(
+        &self,
+        storage: PendingSemanticStorage,
+        schema_key: &str,
+    ) -> Vec<PendingSemanticRow> {
+        PendingView::visible_semantic_rows(self, storage, schema_key)
+    }
+
+    fn workspace_writer_key_annotation_for_state_row(
+        &self,
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+        file_id: &str,
+    ) -> Option<Option<String>> {
+        PendingView::workspace_writer_key_annotation_for_state_row(
+            self, version_id, schema_key, entity_id, file_id,
+        )
+    }
+
+    fn as_pending_view(&self) -> &dyn PendingView {
+        self
+    }
+}
+
+impl PendingStateOverlay for dyn PendingView + '_ {
+    fn visible_semantic_rows(
+        &self,
+        storage: PendingSemanticStorage,
+        schema_key: &str,
+    ) -> Vec<PendingSemanticRow> {
+        PendingView::visible_semantic_rows(self, storage, schema_key)
+    }
+
+    fn workspace_writer_key_annotation_for_state_row(
+        &self,
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+        file_id: &str,
+    ) -> Option<Option<String>> {
+        PendingView::workspace_writer_key_annotation_for_state_row(
+            self, version_id, schema_key, entity_id, file_id,
+        )
+    }
+
+    fn as_pending_view(&self) -> &dyn PendingView {
+        self
+    }
+}
+
+impl PendingStateOverlay for PendingStateOverlayRef<'_> {
+    fn visible_semantic_rows(
+        &self,
+        storage: PendingSemanticStorage,
+        schema_key: &str,
+    ) -> Vec<PendingSemanticRow> {
+        PendingView::visible_semantic_rows(self.view, storage, schema_key)
+    }
+
+    fn workspace_writer_key_annotation_for_state_row(
+        &self,
+        version_id: &str,
+        schema_key: &str,
+        entity_id: &str,
+        file_id: &str,
+    ) -> Option<Option<String>> {
+        PendingView::workspace_writer_key_annotation_for_state_row(
+            self.view, version_id, schema_key, entity_id, file_id,
+        )
+    }
+
+    fn as_pending_view(&self) -> &dyn PendingView {
+        self.view
+    }
 }
 
 /// Declarative projection definition boundary.

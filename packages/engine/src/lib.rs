@@ -23,7 +23,6 @@ mod lix;
 mod observe;
 mod plugin;
 pub(crate) mod projections;
-mod public_read_sql;
 pub(crate) mod read_runtime;
 pub(crate) mod refs;
 mod replay_cursor;

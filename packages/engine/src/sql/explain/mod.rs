@@ -8,10 +8,10 @@ use crate::backend::SqlDialect;
 use crate::contracts::artifacts::{
     CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
-    FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PublicDomainChange,
-    ReadTimeProjectionRead, SemanticEffect, SessionDependency, SessionStateDelta,
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
-    StateHistoryRootScope, StateHistoryVersionScope,
+    FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope,
+    PreparedAnalyzedExplainTemplate, PublicDomainChange, ReadTimeProjectionRead, SemanticEffect,
+    SessionDependency, SessionStateDelta, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
@@ -20,10 +20,6 @@ use crate::contracts::surface::{
 use crate::runtime::streams::StateCommitStreamChange;
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
-use crate::sql::executor::contracts::effects::PlanEffects;
-use crate::sql::executor::contracts::planned_statement::{
-    MutationOperation, MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
-};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
     DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
@@ -66,6 +62,10 @@ use crate::sql::physical_plan::{
     PublicWriteMaterialization, TerminalRelationRenderNode, TrackedWriteExecution,
     UntrackedWriteExecution,
 };
+use crate::sql::prepare::contracts::effects::PlanEffects;
+use crate::sql::prepare::contracts::planned_statement::{
+    MutationOperation, MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
+};
 use crate::sql::routing::RoutingPassTrace;
 use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
@@ -76,7 +76,7 @@ use crate::sql::semantic_ir::{
     BoundPublicLeaf, PublicReadSemantics, PublicWriteInvariantTrace, PublicWriteSemantics,
     SemanticStatement,
 };
-use crate::{LixError, QueryResult, Value};
+use crate::{LixError, Value};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{AnalyzeFormatKind, DescribeAlias, Expr, Statement, UtilityOption};
@@ -156,7 +156,7 @@ pub(crate) struct ExplainAnalyzedRuntime {
 }
 
 impl ExplainAnalyzedRuntime {
-    fn from_query_result(result: &QueryResult, execution_duration: Duration) -> Self {
+    fn from_query_result(result: &crate::QueryResult, execution_duration: Duration) -> Self {
         Self {
             execution_duration_us: saturating_duration_us(execution_duration),
             output_row_count: result.rows.len(),
@@ -1845,7 +1845,7 @@ impl ExplainArtifacts {
             .is_some_and(ExplainRequest::requires_execution)
     }
 
-    pub(crate) fn render_query_result(&self) -> Result<QueryResult, LixError> {
+    pub(crate) fn render_query_result(&self) -> Result<crate::QueryResult, LixError> {
         let Some(request) = self.request.as_ref() else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1861,9 +1861,9 @@ impl ExplainArtifacts {
 
     pub(crate) fn render_analyzed_query_result(
         &self,
-        result: &QueryResult,
+        result: &crate::QueryResult,
         execution_duration: Duration,
-    ) -> Result<QueryResult, LixError> {
+    ) -> Result<crate::QueryResult, LixError> {
         if !self.requires_execution() {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -1879,25 +1879,25 @@ impl ExplainArtifacts {
         analyzed.render_query_result()
     }
 
-    fn render_text_result(&self) -> Result<QueryResult, LixError> {
+    fn render_text_result(&self) -> Result<crate::QueryResult, LixError> {
         let mut rows = Vec::new();
         for (key, value) in self.text_sections()? {
             rows.push(vec![Value::Text(key), Value::Text(value)]);
         }
-        Ok(QueryResult {
+        Ok(crate::QueryResult {
             columns: vec!["explain_key".to_string(), "explain_value".to_string()],
             rows,
         })
     }
 
-    fn render_json_result(&self) -> Result<QueryResult, LixError> {
+    fn render_json_result(&self) -> Result<crate::QueryResult, LixError> {
         let explain_json = serde_json::to_value(self).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("failed to serialize explain output: {error}"),
             )
         })?;
-        Ok(QueryResult {
+        Ok(crate::QueryResult {
             columns: vec!["explain_json".to_string()],
             rows: vec![vec![Value::Json(explain_json)]],
         })
@@ -1957,6 +1957,41 @@ impl ExplainArtifacts {
         }
 
         Ok(sections)
+    }
+}
+
+pub(crate) fn render_plain_explain_query_result(
+    explain: &ExplainArtifacts,
+) -> Result<Option<crate::QueryResult>, LixError> {
+    if explain.request().is_none() || explain.requires_execution() {
+        return Ok(None);
+    }
+    explain.render_query_result().map(Some)
+}
+
+pub(crate) fn prepare_analyzed_explain_template(
+    explain: &ExplainArtifacts,
+) -> Result<Option<PreparedAnalyzedExplainTemplate>, LixError> {
+    if !explain.requires_execution() {
+        return Ok(None);
+    }
+
+    let Some(request) = explain.request() else {
+        return Ok(None);
+    };
+
+    match request.output_format() {
+        ExplainOutputFormat::Text => Ok(Some(PreparedAnalyzedExplainTemplate::Text {
+            sections: explain.text_sections()?,
+        })),
+        ExplainOutputFormat::Json => Ok(Some(PreparedAnalyzedExplainTemplate::Json {
+            base_json: serde_json::to_value(explain).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("failed to serialize explain output: {error}"),
+                )
+            })?,
+        })),
     }
 }
 

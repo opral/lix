@@ -18,7 +18,7 @@ use crate::init::seed::text_value;
 use crate::init::tables::execute_init_statements;
 use crate::init::InitExecutor;
 use crate::sql::common::text::escape_sql_string;
-use crate::sql::executor::PreparedPublicWrite;
+use crate::sql::prepare::PreparedPublicWrite;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 const HISTORY_INIT_STATEMENTS: &[&str] = &[

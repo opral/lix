@@ -50,7 +50,9 @@ pub(super) async fn resolve_filesystem_write(
                 resolve_existing_file_write(
                     hydrator.backend(),
                     planned_write,
-                    hydrator.pending_transaction_view(),
+                    hydrator
+                        .pending_state_overlay()
+                        .map(|overlay| overlay.as_pending_view()),
                 )
                 .await
             }
@@ -64,7 +66,9 @@ pub(super) async fn resolve_filesystem_write(
                     resolve_existing_directory_write(
                         hydrator.backend(),
                         planned_write,
-                        hydrator.pending_transaction_view(),
+                        hydrator
+                            .pending_state_overlay()
+                            .map(|overlay| overlay.as_pending_view()),
                     )
                     .await
                 }
