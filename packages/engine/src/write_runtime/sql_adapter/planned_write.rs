@@ -11,8 +11,8 @@ use crate::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::runtime::execution_state::ExecutionRuntimeState;
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::explain::{
     build_public_write_explain_artifacts, stage_timing, ExplainStage, PublicWriteExplainBuildInput,
 };

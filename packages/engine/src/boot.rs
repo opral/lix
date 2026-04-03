@@ -1,5 +1,7 @@
-use crate::deterministic_mode::{parse_deterministic_settings_value, DeterministicSettings};
 use crate::engine::Engine;
+use crate::runtime::deterministic_mode::{
+    parse_deterministic_settings_value, DeterministicSettings,
+};
 use crate::runtime::wasm::WasmRuntime;
 use crate::{LixBackend, LixError};
 use serde_json::Value as JsonValue;

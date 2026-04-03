@@ -1,7 +1,9 @@
 use cel::Context;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+use crate::runtime::functions::{
+    LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+};
 use crate::LixError;
 
 use super::value::json_to_cel;
@@ -39,7 +41,7 @@ pub fn build_context(variables: &JsonMap<String, JsonValue>) -> Result<Context<'
 #[cfg(test)]
 mod tests {
     use super::{build_context, build_context_with_functions};
-    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
     use cel::Program;
     use serde_json::Map as JsonMap;
 

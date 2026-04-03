@@ -6,7 +6,7 @@ use crate::contracts::artifacts::{
     WriteLane,
 };
 use crate::engine::Engine;
-use crate::functions::LixFunctionProvider;
+use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::{SchemaCache, TransactionBackendAdapter};
 use crate::sql::prepare::{
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation, PreparedPublicWrite,

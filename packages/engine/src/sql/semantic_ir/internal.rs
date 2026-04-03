@@ -4,9 +4,9 @@
 //! parse/bind but before later planning and execution-specific wrapping.
 
 use crate::backend::prepared::PreparedStatement;
-use crate::cel::CelEvaluator;
-use crate::functions::LixFunctionProvider;
-use crate::functions::SharedFunctionProvider;
+use crate::runtime::cel::CelEvaluator;
+use crate::runtime::functions::LixFunctionProvider;
+use crate::runtime::functions::SharedFunctionProvider;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::sql::internal::param_context::normalize_statement_placeholders_in_batch;

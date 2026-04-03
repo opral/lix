@@ -1,7 +1,7 @@
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::cel::CelEvaluator;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::runtime::cel::CelEvaluator;
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
 pub(crate) fn apply_schema_defaults<P>(
@@ -81,8 +81,10 @@ where
 mod tests {
     use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
-    use crate::cel::CelEvaluator;
-    use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+    use crate::runtime::cel::CelEvaluator;
+    use crate::runtime::functions::{
+        LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+    };
 
     use super::apply_schema_defaults_with_context;
 

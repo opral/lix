@@ -6,9 +6,11 @@ use serde_json::Value as JsonValue;
 use zip::read::ZipArchive;
 
 use crate::engine::Engine;
-use crate::plugin::manifest::parse_plugin_manifest_json;
-use crate::plugin::storage::{plugin_storage_archive_file_id, plugin_storage_archive_path};
-use crate::plugin::types::PluginManifest;
+use crate::runtime::plugin::manifest::parse_plugin_manifest_json;
+use crate::runtime::plugin::storage::{
+    plugin_storage_archive_file_id, plugin_storage_archive_path,
+};
+use crate::runtime::plugin::types::PluginManifest;
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::session::execution_context::ExecutionContext;
 use crate::write_runtime::sql_adapter::execute_with_options_in_write_transaction;

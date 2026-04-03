@@ -1,4 +1,4 @@
-use crate::functions::LixFunctionProvider;
+use crate::runtime::functions::LixFunctionProvider;
 use crate::version::context::{
     exact_current_head_preconditions, require_version_context_with_executor, ResolvedVersionTarget,
     VersionContextSource,

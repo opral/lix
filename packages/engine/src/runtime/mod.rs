@@ -3,22 +3,25 @@ use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+pub(crate) mod cel;
+pub(crate) mod deterministic_mode;
 pub(crate) mod execution_state;
 pub(crate) mod functions;
 pub mod image;
+pub(crate) mod plugin;
 mod sql_compiler_metadata;
 pub mod streams;
 pub mod wasm;
 
 use crate::backend::QueryExecutor;
-use crate::cel::CelEvaluator;
 use crate::contracts::artifacts::MutationRow;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
-use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::functions::SharedFunctionProvider;
-use crate::plugin::runtime::CachedPluginComponent;
-use crate::plugin::types::InstalledPlugin;
+use crate::runtime::cel::CelEvaluator;
+use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
+use crate::runtime::functions::SharedFunctionProvider;
+use crate::runtime::plugin::runtime::CachedPluginComponent;
+use crate::runtime::plugin::types::InstalledPlugin;
 use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
@@ -213,10 +216,10 @@ impl Runtime {
     ) -> bool {
         mutations.iter().any(|row| {
             row.schema_key == key_value_schema_key()
-                && row.entity_id == crate::deterministic_mode::deterministic_mode_key()
+                && row.entity_id == crate::runtime::deterministic_mode::deterministic_mode_key()
         }) || state_commit_stream_changes.iter().any(|change| {
             change.schema_key == key_value_schema_key()
-                && change.entity_id == crate::deterministic_mode::deterministic_mode_key()
+                && change.entity_id == crate::runtime::deterministic_mode::deterministic_mode_key()
         })
     }
 

@@ -4,7 +4,7 @@ use globset::Glob;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
-use crate::plugin::types::{PluginManifest, ValidatedPluginManifest};
+use crate::runtime::plugin::types::{PluginManifest, ValidatedPluginManifest};
 use crate::LixError;
 
 static PLUGIN_MANIFEST_SCHEMA: OnceLock<JsonValue> = OnceLock::new();
@@ -106,7 +106,7 @@ fn format_validation_errors<'a>(
 #[cfg(test)]
 mod tests {
     use super::parse_plugin_manifest_json;
-    use crate::plugin::types::{PluginContentType, StateContextColumn};
+    use crate::runtime::plugin::types::{PluginContentType, StateContextColumn};
 
     #[test]
     fn parses_valid_manifest() {

@@ -1,8 +1,8 @@
-use crate::cel::CelEvaluator;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
-use crate::deterministic_mode::RuntimeFunctionProvider;
-use crate::functions::SharedFunctionProvider;
+use crate::runtime::cel::CelEvaluator;
+use crate::runtime::deterministic_mode::RuntimeFunctionProvider;
+use crate::runtime::functions::SharedFunctionProvider;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,

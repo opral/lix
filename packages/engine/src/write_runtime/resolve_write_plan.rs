@@ -2,8 +2,8 @@ use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
 use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
-use crate::functions::SystemFunctionProvider;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::runtime::functions::SystemFunctionProvider;
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateSelector, MutationPayload, PlannedFilesystemDescriptor, PlannedFilesystemFile,
     PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef,

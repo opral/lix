@@ -3,7 +3,7 @@ mod storage;
 use serde_json::Value as JsonValue;
 
 use crate::errors::classification::is_missing_relation_error;
-use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
+use crate::runtime::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::{LixBackend, LixError};
 use storage::load_persisted_key_value_payloads;
 

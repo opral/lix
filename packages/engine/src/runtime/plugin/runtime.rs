@@ -1,16 +1,16 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF;
-use crate::cel::shared_runtime;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::filesystem::live_projection::{
     build_filesystem_file_projection_sql, FilesystemProjectionScope,
 };
-use crate::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
-use crate::plugin::manifest::parse_plugin_manifest_json;
-use crate::plugin::matching::select_best_glob_match;
-use crate::plugin::storage::plugin_key_from_archive_path;
-use crate::plugin::types::{InstalledPlugin, PluginContentType};
+use crate::runtime::cel::shared_runtime;
+use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
+use crate::runtime::plugin::manifest::parse_plugin_manifest_json;
+use crate::runtime::plugin::matching::select_best_glob_match;
+use crate::runtime::plugin::storage::plugin_key_from_archive_path;
+use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
 use crate::sql::prepare::preprocess::preprocess_sql_to_plan_with_functions as preprocess_sql;
 use crate::{LixBackend, LixError, Value};
@@ -782,8 +782,8 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 #[cfg(test)]
 mod tests {
     use super::{load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent};
-    use crate::plugin::matching::glob_matches_path;
-    use crate::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
+    use crate::runtime::plugin::matching::glob_matches_path;
+    use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
     use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
     use crate::LixError;
     use async_trait::async_trait;

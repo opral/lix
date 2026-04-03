@@ -1,5 +1,5 @@
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::identity::{derive_entity_id_from_json_paths, EntityIdDerivationError};
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::annotations::defaults::apply_schema_defaults;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateAssignments, MutationPayload, PlannedStateRow,
@@ -361,7 +361,7 @@ where
     apply_schema_defaults(
         &mut snapshot,
         semantics.schema,
-        crate::cel::shared_runtime(),
+        crate::runtime::cel::shared_runtime(),
         functions,
         semantics.schema_key,
         semantics.schema_version,
