@@ -1,6 +1,7 @@
 use crate::contracts::surface::{
     DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant,
 };
+use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
 use sqlparser::ast::{
@@ -927,6 +928,7 @@ pub(crate) struct ResolvedWritePlan {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PlannedWrite {
     pub(crate) command: WriteCommand,
+    pub(crate) filesystem_write_intent: Option<FilesystemWriteIntent>,
     pub(crate) scope_proof: ScopeProof,
     pub(crate) schema_proof: SchemaProof,
     pub(crate) target_set_proof: Option<TargetSetProof>,
