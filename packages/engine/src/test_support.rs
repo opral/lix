@@ -234,7 +234,7 @@ pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Engine>
         Arc::new(NoopWasmRuntime),
     )));
     engine.initialize().await?;
-    let session = engine.open_workspace_session().await?;
+    let session = engine.open_session().await?;
     Ok((backend, engine, session))
 }
 

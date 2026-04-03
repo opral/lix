@@ -347,7 +347,7 @@ fn workspace_writer_key_annotation_persists_across_engine_reopen_sqlite() {
                 engine_a.initialize().await.expect("init should succeed");
 
                 let session_a = engine_a
-                    .open_workspace_session()
+                    .open_session()
                     .await
                     .expect("workspace session should open");
                 session_a
@@ -385,7 +385,7 @@ fn workspace_writer_key_annotation_persists_across_engine_reopen_sqlite() {
                     .expect("rebuild after reopen should succeed");
 
                 let session_b = engine_b
-                    .open_workspace_session()
+                    .open_session()
                     .await
                     .expect("workspace session should reopen");
 

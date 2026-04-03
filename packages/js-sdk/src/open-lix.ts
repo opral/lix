@@ -122,7 +122,7 @@ export type Lix = {
 	undo(args?: UndoOptions): Promise<UndoResult>;
 	redo(args?: RedoOptions): Promise<RedoResult>;
 	switchVersion(versionId: string): Promise<void>;
-	openSession(options?: OpenSessionOptions): Promise<Lix>;
+	openChildSession(options?: OpenSessionOptions): Promise<Lix>;
 	installPlugin(
 		args: InstallPluginOptions | Uint8Array | ArrayBuffer,
 	): Promise<void>;
@@ -363,12 +363,12 @@ function createLixHandle(args: {
 		await runQueued(() => (wasmLix as any).switchVersion(versionId));
 	};
 
-	const openSession = async (
+	const openChildSession = async (
 		options: OpenSessionOptions = {},
 	): Promise<Lix> => {
-		ensureOpen("openSession");
-		if (typeof (wasmLix as any).openSession !== "function") {
-			throw new Error("openSession is not available in this wasm build");
+		ensureOpen("openChildSession");
+		if (typeof (wasmLix as any).openChildSession !== "function") {
+			throw new Error("openChildSession is not available in this wasm build");
 		}
 		if (
 			options.activeVersionId !== undefined &&
@@ -376,7 +376,7 @@ function createLixHandle(args: {
 				options.activeVersionId.length === 0)
 		) {
 			throw new Error(
-				"openSession requires activeVersionId to be a non-empty string",
+				"openChildSession requires activeVersionId to be a non-empty string",
 			);
 		}
 		if (
@@ -388,11 +388,11 @@ function createLixHandle(args: {
 				))
 		) {
 			throw new Error(
-				"openSession requires activeAccountIds to be an array of non-empty strings",
+				"openChildSession requires activeAccountIds to be an array of non-empty strings",
 			);
 		}
 		const sessionWasmLix = await runQueued(() =>
-			(wasmLix as any).openSession(options),
+			(wasmLix as any).openChildSession(options),
 		);
 		return createLixHandle({
 			backend,
@@ -591,7 +591,7 @@ function createLixHandle(args: {
 		undo,
 		redo,
 		switchVersion,
-		openSession,
+		openChildSession,
 		installPlugin,
 		export_image,
 		close,
