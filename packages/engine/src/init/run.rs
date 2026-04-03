@@ -12,10 +12,9 @@ use crate::live_state::{
     try_claim_bootstrap_with_backend, LiveStateMode, LiveStateRebuildDebugMode,
     LiveStateRebuildRequest, LiveStateRebuildScope,
 };
-use crate::observe;
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
-use crate::undo_redo;
+use crate::session::{observe, undo_redo};
 use crate::version;
 use crate::workspace;
 use crate::write_runtime::commit;

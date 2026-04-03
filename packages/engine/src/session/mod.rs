@@ -6,6 +6,8 @@
 //! version refs and committed graph state.
 
 pub(crate) mod execution_context;
+pub(crate) mod observe;
+pub(crate) mod undo_redo;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -76,7 +78,7 @@ pub struct Session {
     execution_runtime: SessionExecutionRuntimeHandle,
     #[allow(dead_code)]
     observe_shared_sources:
-        Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>>,
+        Mutex<BTreeMap<String, Arc<Mutex<crate::session::observe::SharedObserveSource>>>>,
     active_version_generation: AtomicU64,
     active_account_generation: AtomicU64,
     runtime_generation: AtomicU64,
@@ -213,7 +215,7 @@ impl Session {
     #[allow(dead_code)]
     pub(crate) fn observe_shared_sources(
         &self,
-    ) -> &Mutex<BTreeMap<String, Arc<Mutex<crate::observe::SharedObserveSource>>>> {
+    ) -> &Mutex<BTreeMap<String, Arc<Mutex<crate::session::observe::SharedObserveSource>>>> {
         &self.observe_shared_sources
     }
 
@@ -287,7 +289,7 @@ impl Session {
         &self,
         options: crate::UndoOptions,
     ) -> Result<crate::UndoResult, LixError> {
-        crate::undo_redo::undo_with_options_in_session(self, options).await
+        crate::session::undo_redo::undo_with_options_in_session(self, options).await
     }
 
     pub async fn redo(&self) -> Result<crate::RedoResult, LixError> {
@@ -298,7 +300,7 @@ impl Session {
         &self,
         options: crate::RedoOptions,
     ) -> Result<crate::RedoResult, LixError> {
-        crate::undo_redo::redo_with_options_in_session(self, options).await
+        crate::session::undo_redo::redo_with_options_in_session(self, options).await
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
