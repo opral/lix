@@ -1,6 +1,6 @@
 //! Shared public surface registry contracts.
 
-use crate::cel::shared_runtime;
+use crate::runtime::cel::shared_runtime;
 use crate::schema::annotations::overrides::{collect_lixcol_overrides, LixcolOverrideValue};
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
 use crate::schema::schema_from_registered_snapshot;

@@ -5,12 +5,12 @@ use crate::canonical::read::{
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
+use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::TransactionBackendAdapter;
 use crate::version::context::{

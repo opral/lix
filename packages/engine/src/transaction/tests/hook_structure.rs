@@ -550,7 +550,7 @@ fn init_and_plugin_paths_use_write_runtime_owned_write_entrypoints() {
         "init/seed.rs should execute writes through write_runtime::sql_adapter"
     );
 
-    let plugin_source = read_engine_source("plugin/install.rs");
+    let plugin_source = read_engine_source("runtime/plugin/install.rs");
     assert!(
         plugin_source.contains("WriteTransaction::new_buffered_write("),
         "plugin/install.rs should use the write-runtime-owned buffered write lifecycle"

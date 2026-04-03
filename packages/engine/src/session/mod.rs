@@ -304,7 +304,7 @@ impl Session {
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        crate::plugin::install::install_plugin_in_session(self, archive_bytes).await
+        crate::runtime::plugin::install::install_plugin_in_session(self, archive_bytes).await
     }
 
     pub async fn register_schema(&self, schema: &serde_json::Value) -> Result<(), LixError> {

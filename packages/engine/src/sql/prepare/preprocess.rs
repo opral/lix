@@ -1,6 +1,6 @@
-use crate::cel::CelEvaluator;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::runtime::cel::CelEvaluator;
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::{
     result_contract_for_statements, verify_logical_plan, InternalLogicalPlan, LogicalPlan,
 };

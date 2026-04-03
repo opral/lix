@@ -12,7 +12,7 @@ use crate::canonical::journal::{
 use crate::canonical::read::{load_version_info_for_versions, CommitQueryExecutor, VersionInfo};
 use crate::canonical_json::CanonicalJson;
 use crate::filesystem::runtime::BinaryBlobWrite;
-use crate::functions::LixFunctionProvider;
+use crate::runtime::functions::LixFunctionProvider;
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
     LixBackendTransaction, LixError, QueryResult, Value, VersionId,

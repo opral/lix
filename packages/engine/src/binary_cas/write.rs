@@ -115,7 +115,7 @@ pub(crate) fn build_binary_blob_fastcdc_write_program(
 fn build_binary_cas_write_batch(
     payloads: &[BinaryBlobWriteInput<'_>],
 ) -> Result<BinaryCasWriteBatch, LixError> {
-    let now = crate::functions::timestamp::timestamp();
+    let now = crate::runtime::functions::timestamp::timestamp();
     let mut manifest_rows = BTreeMap::<String, BinaryBlobManifestRow>::new();
     let mut blob_store_rows = BTreeMap::<String, BinaryBlobStoreRow>::new();
     let mut chunk_store_rows = BTreeMap::<String, BinaryChunkStoreRow>::new();

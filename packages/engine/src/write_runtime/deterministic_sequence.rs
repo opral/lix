@@ -1,6 +1,6 @@
 use crate::backend::prepared::PreparedBatch;
-use crate::deterministic_mode::{deterministic_sequence_key, load_runtime_sequence_start};
 use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::runtime::deterministic_mode::{deterministic_sequence_key, load_runtime_sequence_start};
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema::builtin::storage::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,

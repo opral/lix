@@ -21,8 +21,8 @@ use crate::filesystem::runtime::{
     FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
     FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY, FILESYSTEM_FILE_SCHEMA_VERSION,
 };
-use crate::functions::LixFunctionProvider;
 use crate::refs::load_committed_version_head_commit_id;
+use crate::runtime::functions::LixFunctionProvider;
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::write_runtime::{
@@ -1343,7 +1343,7 @@ mod tests {
     use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
     use crate::contracts::artifacts::OptionalTextPatch;
     use crate::filesystem::runtime::{FilesystemTransactionFileState, FilesystemTransactionState};
-    use crate::functions::LixFunctionProvider;
+    use crate::runtime::functions::LixFunctionProvider;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,

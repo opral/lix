@@ -1,6 +1,6 @@
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
-use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::functions::SharedFunctionProvider;
+use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
+use crate::runtime::functions::SharedFunctionProvider;
 use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
 };

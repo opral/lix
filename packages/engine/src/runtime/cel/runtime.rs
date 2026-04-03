@@ -4,7 +4,9 @@ use std::sync::{Arc, OnceLock, RwLock};
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
+use crate::runtime::functions::{
+    LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+};
 use crate::LixError;
 
 use super::context::build_context_with_functions;
@@ -162,20 +164,20 @@ mod tests {
     fn production_consumers_use_shared_runtime() {
         for (path, source) in [
             (
-                "packages/engine/src/plugin/runtime.rs",
+                "packages/engine/src/runtime/plugin/runtime.rs",
                 include_str!("../plugin/runtime.rs"),
             ),
             (
                 "packages/engine/src/contracts/surface.rs",
-                include_str!("../contracts/surface.rs"),
+                include_str!("../../contracts/surface.rs"),
             ),
             (
                 "packages/engine/src/sql/semantic_ir/semantics/state_assignments.rs",
-                include_str!("../sql/semantic_ir/semantics/state_assignments.rs"),
+                include_str!("../../sql/semantic_ir/semantics/state_assignments.rs"),
             ),
             (
                 "packages/engine/src/write_runtime/resolve_write_plan/state_backed_writes.rs",
-                include_str!("../write_runtime/resolve_write_plan/state_backed_writes.rs"),
+                include_str!("../../write_runtime/resolve_write_plan/state_backed_writes.rs"),
             ),
         ] {
             assert!(

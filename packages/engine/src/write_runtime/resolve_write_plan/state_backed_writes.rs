@@ -1,6 +1,6 @@
 use super::*;
-use crate::cel::shared_runtime;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::runtime::cel::shared_runtime;
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::annotations::defaults::apply_schema_defaults;
 use crate::schema::annotations::overrides::collect_state_column_overrides;
 use crate::schema::builtin::builtin_schema_definition;

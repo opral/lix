@@ -11,6 +11,10 @@ use crate::contracts::surface::{
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
+use crate::runtime::streams::{
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
+};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
@@ -41,10 +45,6 @@ use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveState
 use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
-};
-use crate::state_commit_stream::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -2601,8 +2601,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explain_broad_registered_schema_reads_keep_layout_loading_outside_compiler_stages()
-    {
+    async fn explain_broad_registered_schema_reads_keep_layout_loading_outside_compiler_stages() {
         let delay = Duration::from_millis(150);
         let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
         backend

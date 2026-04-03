@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::cel::CelEvaluator;
+use crate::runtime::cel::CelEvaluator;
 use crate::LixError;
 use crate::Value;
 

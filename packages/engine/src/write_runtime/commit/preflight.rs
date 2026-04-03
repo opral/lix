@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 
-use crate::deterministic_mode::deterministic_sequence_key;
 use crate::filesystem::runtime::{
     ExactFilesystemDescriptorState, FilesystemDescriptorState, FILESYSTEM_DESCRIPTOR_FILE_ID,
     FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
+use crate::runtime::deterministic_mode::deterministic_sequence_key;
 use crate::schema::builtin::storage::key_value_schema_key;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
