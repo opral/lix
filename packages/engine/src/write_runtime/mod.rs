@@ -3,6 +3,7 @@ pub(crate) mod commit;
 mod contracts;
 mod effective_state;
 mod execution;
+mod filesystem_state;
 pub(crate) mod overlay;
 mod read_context;
 mod resolve_write_plan;

@@ -3,16 +3,22 @@ use std::path::{Path, PathBuf};
 
 const READ_RUNTIME_DIR: &str = "src/read_runtime";
 const READ_RUNTIME_MOD_FILE: &str = "src/read_runtime/mod.rs";
+const READ_RUNTIME_PREPARE_FILE: &str = "src/read_runtime/prepare.rs";
 const READ_RUNTIME_ROWSET_FILE: &str = "src/read_runtime/rowset.rs";
 const PUBLIC_READ_ARTIFACTS_FILE: &str = "src/sql/physical_plan/public_read_artifacts.rs";
 const PHYSICAL_PLAN_MOD_FILE: &str = "src/sql/physical_plan/mod.rs";
-const SPECIALIZED_PUBLIC_READ_FILE: &str = "src/sql/executor/public_runtime/read.rs";
+const SPECIALIZED_PUBLIC_READ_FILE: &str = "src/sql/prepare/public_surface/read.rs";
 
 #[test]
-fn read_runtime_directory_does_not_import_compiler_ir() {
+fn read_runtime_directory_does_not_import_compiler_ir_outside_prepare_seam() {
     let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut hits = Vec::new();
     collect_rs_files(&manifest_dir.join(READ_RUNTIME_DIR), &mut |path| {
+        let relative = relative_display(manifest_dir, path);
+        if relative == READ_RUNTIME_PREPARE_FILE {
+            return;
+        }
+
         let text = fs::read_to_string(path)
             .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
         for forbidden in [
@@ -23,20 +29,51 @@ fn read_runtime_directory_does_not_import_compiler_ir() {
             "use crate::sql::semantic_ir::",
         ] {
             if text.contains(forbidden) {
-                hits.push(format!(
-                    "{}: {}",
-                    relative_display(manifest_dir, path),
-                    forbidden
-                ));
+                hits.push(format!("{relative}: {forbidden}"));
             }
         }
     });
 
     assert!(
         hits.is_empty(),
-        "read_runtime should not import compiler IR directly outside the existing committed-read execution seam\nhits:\n{}",
+        "read_runtime should not import compiler IR directly outside the existing committed-read preparation seam\nhits:\n{}",
         hits.join("\n"),
     );
+}
+
+#[test]
+fn committed_read_prepare_seam_stays_bounded_to_prepared_compiler_artifacts() {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let text = fs::read_to_string(manifest_dir.join(READ_RUNTIME_PREPARE_FILE))
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", READ_RUNTIME_PREPARE_FILE));
+
+    for required in [
+        "use crate::sql::explain::",
+        "use crate::sql::logical_plan::direct_reads::",
+        "use crate::sql::physical_plan::",
+        "use crate::sql::prepare::",
+    ] {
+        assert!(
+            text.contains(required),
+            "read_runtime/prepare.rs should remain the explicit committed-read preparation seam over compiler-owned artifacts\nfile: {}\nrequired: {}",
+            READ_RUNTIME_PREPARE_FILE,
+            required,
+        );
+    }
+
+    for forbidden in [
+        "use crate::sql::binder::",
+        "use crate::sql::optimizer::",
+        "use crate::sql::parser::",
+        "use crate::sql::semantic_ir::",
+    ] {
+        assert!(
+            !text.contains(forbidden),
+            "read_runtime/prepare.rs should stay bounded to prepared compiler artifacts instead of reaching into deeper compiler IR\nfile: {}\nforbidden: {}",
+            READ_RUNTIME_PREPARE_FILE,
+            forbidden,
+        );
+    }
 }
 
 #[test]
@@ -115,7 +152,7 @@ fn compiler_owned_public_read_artifact_selection_lives_under_sql_physical_plan()
     assert!(
         !executor_text.contains("try_compile_read_time_projection_read(")
             && !executor_text.contains("lower_read_for_execution_with_layouts("),
-        "executor orchestration should not compile public-read artifacts locally\nfile: {}",
+        "executor orchestration should not compile public-read artifacts locally\nfile: {}\n",
         SPECIALIZED_PUBLIC_READ_FILE,
     );
 }

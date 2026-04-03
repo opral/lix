@@ -5,7 +5,7 @@ use crate::filesystem::live_projection::{
 };
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::filesystem::runtime::FilesystemTransactionFileState;
-use crate::live_state::schema_access::tracked_relation_name;
+use crate::live_schema_access::tracked_relation_name;
 use crate::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, SqlDialect, Value};

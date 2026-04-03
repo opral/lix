@@ -19,7 +19,7 @@ use crate::contracts::artifacts::{
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::normalize_sql_execution_error_with_backend;
 use crate::session::execution_context::ExecutionContext;
-use crate::sql::explain::{prepare_analyzed_explain_template, render_plain_explain_query_result};
+use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
     DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
@@ -34,14 +34,12 @@ use crate::sql::logical_plan::direct_reads::{
 use crate::sql::physical_plan::{
     LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
 };
-use crate::sql::prepare::execution_program::ExecutionProgram;
-use crate::{LixBackend, LixError, TransactionMode, Value};
-
-use super::execution_program::BoundStatementTemplateInstance;
-use super::{
-    compile_execution_from_template_instance_with_context, CompiledExecution, PreparationPolicy,
-    SqlPreparationContext,
+use crate::sql::prepare::execution_program::{BoundStatementTemplateInstance, ExecutionProgram};
+use crate::sql::prepare::{
+    compile_execution_from_template_instance_with_context, CompiledExecution,
+    DefaultSqlPreparationContext, PreparationPolicy, PreparedPublicRead, SqlPreparationContext,
 };
+use crate::{LixBackend, LixError, TransactionMode, Value};
 
 pub(crate) async fn compile_committed_read_program_with_context(
     preparation_context: &dyn SqlPreparationContext,
@@ -103,11 +101,10 @@ async fn compile_committed_execution_step_with_context(
     runtime_state: &ExecutionRuntimeState,
 ) -> Result<CompiledExecution, LixError> {
     let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
-    let step_context = super::DefaultSqlPreparationContext {
+    let step_context = DefaultSqlPreparationContext {
         backend: preparation_context.backend(),
         cel_evaluator: preparation_context.cel_evaluator(),
         schema_cache: preparation_context.schema_cache(),
-        deterministic_settings: runtime_state.settings(),
         functions: runtime_state.provider(),
         active_history_root_commit_id: preparation_context.active_history_root_commit_id(),
         public_surface_registry_override: Some(&context.public_surface_registry),
@@ -141,9 +138,9 @@ fn prepared_read_step_from_compiled_execution(
     source_sql: Vec<String>,
 ) -> Result<PreparedReadStep, LixError> {
     let transaction_mode = transaction_mode_for_committed_read_execution(&compiled)?;
-    let plain_explain_result = compiled
+    let plain_explain_template = compiled
         .plain_explain()
-        .map(render_plain_explain_query_result)
+        .map(prepare_plain_explain_template)
         .transpose()?
         .flatten();
     let analyzed_explain_template = compiled
@@ -186,18 +183,17 @@ fn prepared_read_step_from_compiled_execution(
         diagnostic_context: ReadDiagnosticContext {
             source_sql,
             explain_mode,
-            plain_explain_result,
+            plain_explain_template,
             analyzed_explain_template,
         },
     })
 }
 
 pub(crate) fn prepare_public_read_artifact(
-    public_read: &super::public_surface::PreparedPublicRead,
+    public_read: &PreparedPublicRead,
     dialect: crate::SqlDialect,
 ) -> Result<PreparedPublicReadArtifact, LixError> {
-    let mut contract =
-        crate::sql::prepare::public_surface::read::prepared_public_read_contract(public_read);
+    let mut contract = crate::sql::prepare::prepared_public_read_contract(public_read);
     if contract.result_columns.is_none() {
         contract.result_columns = result_columns_for_public_read_execution(&public_read.execution);
     }

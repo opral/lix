@@ -18,23 +18,70 @@ use crate::sql::explain::{
 };
 use crate::sql::physical_plan::{
     PhysicalPlan, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
-    UntrackedWriteExecution,
+    TrackedWriteExecution, UntrackedWriteExecution,
 };
 use crate::sql::prepare::{
-    build_public_write_execution, build_public_write_invariant_trace, build_tracked_txn_unit,
+    build_public_write_execution, build_public_write_invariant_trace,
     finalize_public_write_execution, public_authoritative_write_error,
     public_write_preparation_error, CompiledExecution, CompiledInternalExecution,
-    PreparedPublicWrite, TrackedTxnUnit,
+    PreparedPublicWrite,
 };
 use crate::sql::semantic_ir::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions,
 };
+use crate::write_runtime::filesystem_state::filesystem_transaction_state_from_planned;
 use crate::write_runtime::resolve_write_plan_with_functions;
 use crate::write_runtime::PendingTransactionView;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
+
+#[derive(Clone)]
+pub(crate) struct TrackedTxnUnit {
+    pub(crate) public_writes: Vec<PreparedPublicWrite>,
+    pub(crate) public_write: PreparedPublicWrite,
+    pub(crate) execution: TrackedWriteExecution,
+    pub(crate) filesystem_state: FilesystemTransactionState,
+    pub(crate) runtime_state: ExecutionRuntimeState,
+    pub(crate) writer_key: Option<String>,
+}
+
+impl TrackedTxnUnit {
+    pub(crate) fn should_emit_observe_tick(&self) -> bool {
+        self.has_compiler_only_filesystem_changes()
+            || !self
+                .execution
+                .semantic_effects
+                .state_commit_stream_changes
+                .is_empty()
+    }
+
+    pub(crate) fn has_compiler_only_filesystem_changes(&self) -> bool {
+        self.execution.domain_change_batch.is_none() && !self.filesystem_state.files.is_empty()
+    }
+
+    pub(crate) fn is_merged_transaction_plan(&self) -> bool {
+        self.public_writes.len() > 1
+    }
+}
+
+fn build_tracked_txn_unit(
+    public_write: &PreparedPublicWrite,
+    execution: &TrackedWriteExecution,
+    filesystem_state: &FilesystemTransactionState,
+    runtime_state: &ExecutionRuntimeState,
+    writer_key: Option<&str>,
+) -> TrackedTxnUnit {
+    TrackedTxnUnit {
+        public_writes: vec![public_write.clone()],
+        public_write: public_write.clone(),
+        execution: execution.clone(),
+        filesystem_state: filesystem_state.clone(),
+        runtime_state: runtime_state.clone(),
+        writer_key: writer_key.map(str::to_string),
+    }
+}
 
 pub(crate) async fn materialize_prepared_public_write<P>(
     backend: &dyn crate::LixBackend,
@@ -85,14 +132,12 @@ where
             "public write target must route through explicit public materialization",
         )
     })?;
-    let filesystem_state = crate::sql::prepare::intent::filesystem_transaction_state_from_planned(
-        &public_write
-            .planned_write
-            .resolved_write_plan
-            .as_ref()
-            .expect("public write materialization requires a resolved write plan")
-            .filesystem_state(),
-    );
+    let filesystem_state = public_write
+        .planned_write
+        .resolved_write_plan
+        .as_ref()
+        .expect("public write materialization requires a resolved write plan")
+        .filesystem_state();
     if let PreparedPublicWriteExecution::Materialize(materialization) = &mut execution {
         finalize_public_write_execution(
             materialization,
@@ -485,9 +530,12 @@ impl PendingSemanticOverlay {
 
 pub(crate) fn build_planned_write_plan(
     prepared: &CompiledExecution,
+    runtime_state: &ExecutionRuntimeState,
     writer_key: Option<&str>,
 ) -> Option<PlannedWritePlan> {
     let mut units = Vec::new();
+    let filesystem_state =
+        filesystem_transaction_state_from_planned(&prepared.intent.filesystem_state);
 
     if let Some(public_write) = prepared.public_write() {
         let Some(PhysicalPlan::PublicWrite(execution)) = prepared.physical_plan() else {
@@ -497,16 +545,21 @@ pub(crate) fn build_planned_write_plan(
             for partition in &materialization.partitions {
                 match partition {
                     PublicWriteExecutionPartition::Tracked(tracked) => {
-                        let tracked_plan =
-                            build_tracked_txn_unit(public_write, tracked, prepared, writer_key);
+                        let tracked_plan = build_tracked_txn_unit(
+                            public_write,
+                            tracked,
+                            &filesystem_state,
+                            runtime_state,
+                            writer_key,
+                        );
                         units.push(PlannedWriteUnit::PublicTracked(tracked_plan));
                     }
                     PublicWriteExecutionPartition::Untracked(untracked) => {
                         units.push(PlannedWriteUnit::PublicUntracked(
                             PlannedPublicUntrackedWriteUnit {
                                 execution: untracked.clone(),
-                                filesystem_state: prepared.intent.filesystem_state.clone(),
-                                runtime_state: prepared.runtime_state.clone(),
+                                filesystem_state: filesystem_state.clone(),
+                                runtime_state: runtime_state.clone(),
                                 writer_key: writer_key.map(str::to_string),
                             },
                         ));
@@ -529,8 +582,8 @@ pub(crate) fn build_planned_write_plan(
             execution: internal_execution,
             effects: prepared.effects.clone(),
             result_contract: prepared.result_contract,
-            filesystem_state: prepared.intent.filesystem_state.clone(),
-            runtime_state: prepared.runtime_state.clone(),
+            filesystem_state,
+            runtime_state: runtime_state.clone(),
             writer_key: writer_key.map(str::to_string),
         }));
     }
@@ -546,9 +599,10 @@ pub(crate) fn build_planned_write_plan(
 
 pub(crate) fn build_planned_write_delta(
     prepared: &CompiledExecution,
+    runtime_state: &ExecutionRuntimeState,
     writer_key: Option<&str>,
 ) -> Result<Option<PlannedWriteDelta>, LixError> {
-    build_planned_write_plan(prepared, writer_key)
+    build_planned_write_plan(prepared, runtime_state, writer_key)
         .map(PlannedWriteDelta::from_materialization_plan)
         .transpose()
 }

@@ -1,6 +1,6 @@
 use crate::contracts::artifacts::{
-    PreparedAnalyzedExplainTemplate, PreparedAnalyzedRuntime, PreparedPublicReadArtifact,
-    PreparedPublicReadExecutionArtifact, PublicReadResultColumn, PublicReadResultColumns,
+    PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact, PublicReadResultColumn,
+    PublicReadResultColumns,
 };
 use crate::contracts::surface::SurfaceReadFreshness;
 use crate::contracts::traits::{
@@ -11,10 +11,10 @@ use crate::runtime::TransactionBackendAdapter;
 use crate::sql::prepare::PreparedPublicRead;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
-use std::time::Duration;
 
 use super::direct::execute_direct_public_read_with_backend;
 use super::execute_read_time_projection_read_with_backend;
+use super::prepare_public_read_artifact;
 
 #[async_trait(?Send)]
 impl PreparedPublicReadExecutor for PreparedPublicRead {
@@ -23,7 +23,7 @@ impl PreparedPublicReadExecutor for PreparedPublicRead {
     }
 
     async fn execute(&self, backend: &dyn LixBackend) -> Result<QueryResult, LixError> {
-        let artifact = crate::sql::prepare::prepare_public_read_artifact(self, backend.dialect())?;
+        let artifact = prepare_public_read_artifact(self, backend.dialect())?;
         execute_prepared_public_read_artifact_with_backend(backend, &artifact).await
     }
 
@@ -31,7 +31,7 @@ impl PreparedPublicReadExecutor for PreparedPublicRead {
         &self,
         backend: &dyn LixBackend,
     ) -> Result<QueryResult, LixError> {
-        let artifact = crate::sql::prepare::prepare_public_read_artifact(self, backend.dialect())?;
+        let artifact = prepare_public_read_artifact(self, backend.dialect())?;
         execute_prepared_public_read_artifact_without_freshness_check_with_backend(
             backend, &artifact,
         )
@@ -42,8 +42,7 @@ impl PreparedPublicReadExecutor for PreparedPublicRead {
         &self,
         transaction: &mut dyn LixBackendTransaction,
     ) -> Result<QueryResult, LixError> {
-        let artifact =
-            crate::sql::prepare::prepare_public_read_artifact(self, transaction.dialect())?;
+        let artifact = prepare_public_read_artifact(self, transaction.dialect())?;
         execute_prepared_public_read_artifact_in_transaction(transaction, &artifact).await
     }
 }
@@ -87,64 +86,6 @@ pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_chec
         }
     };
     Ok(finalize_prepared_public_read_result(result, artifact))
-}
-
-pub(crate) fn render_analyzed_explain_result(
-    template: &PreparedAnalyzedExplainTemplate,
-    result: &QueryResult,
-    execution_duration: Duration,
-) -> Result<QueryResult, LixError> {
-    let runtime = PreparedAnalyzedRuntime {
-        execution_duration_us: execution_duration.as_micros().min(u64::MAX as u128) as u64,
-        output_row_count: result.rows.len(),
-        output_column_count: result.columns.len(),
-        output_columns: result.columns.clone(),
-    };
-
-    match template {
-        PreparedAnalyzedExplainTemplate::Text { sections } => {
-            let mut rows = sections
-                .iter()
-                .map(|(key, value)| vec![Value::Text(key.clone()), Value::Text(value.clone())])
-                .collect::<Vec<_>>();
-            rows.push(vec![
-                Value::Text("analyzed_runtime".to_string()),
-                Value::Text(format!(
-                    "execution_duration_us: {}\noutput_row_count: {}\noutput_column_count: {}\noutput_columns: {}",
-                    runtime.execution_duration_us,
-                    runtime.output_row_count,
-                    runtime.output_column_count,
-                    runtime.output_columns.join(", "),
-                )),
-            ]);
-            Ok(QueryResult {
-                columns: vec!["explain_key".to_string(), "explain_value".to_string()],
-                rows,
-            })
-        }
-        PreparedAnalyzedExplainTemplate::Json { base_json } => {
-            let mut json = base_json.clone();
-            let Some(object) = json.as_object_mut() else {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "prepared analyzed explain template expected a JSON object",
-                ));
-            };
-            object.insert(
-                "analyzed_runtime".to_string(),
-                serde_json::to_value(runtime).map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("failed to serialize analyzed explain runtime: {error}"),
-                    )
-                })?,
-            );
-            Ok(QueryResult {
-                columns: vec!["explain_json".to_string()],
-                rows: vec![vec![Value::Json(json)]],
-            })
-        }
-    }
 }
 
 fn finalize_prepared_public_read_result(

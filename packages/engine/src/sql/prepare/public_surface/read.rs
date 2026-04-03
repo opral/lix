@@ -12,7 +12,7 @@ use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
 use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::explain::{
     build_public_read_explain_artifacts, unwrap_explain_statement, ExplainStage,
-    ExplainTimingCollector, PublicReadExplainBuildInput, PublicReadExplainRuntimeArtifacts,
+    ExplainTimingCollector, PublicReadExplainBuildInput, PublicReadExplainCompiledArtifacts,
 };
 use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::logical_plan::{
@@ -3111,7 +3111,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     //   execution once the strategy requires backend capability state.
     // - physical_planning: build the direct history plan or the lowered read program after any
     //   required capability resolution has completed.
-    // - executor_preparation: render lowered backend SQL from a lowered read program. Direct
+    // - artifact_preparation: render lowered backend SQL from a lowered read program. Direct
     //   history plans omit this stage because they do not prepare backend SQL text.
     let runtime_bindings =
         runtime_binding_values_from_execution_context(&bound_statement.execution_context)?;
@@ -3325,7 +3325,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
 
     let lowered_sql = match &execution {
         PreparedPublicReadExecution::LoweredSql(lowered_read) => {
-            let executor_started = Instant::now();
+            let artifact_started = Instant::now();
             let lowered_sql = render_lowered_read_sql(
                 lowered_read,
                 &analysis.bound_statement.bound_parameters,
@@ -3333,8 +3333,8 @@ async fn try_prepare_public_read_via_specialized_optimization(
                 backend.dialect(),
             )?;
             stage_timings.record(
-                ExplainStage::ExecutorPreparation,
-                executor_started.elapsed(),
+                ExplainStage::ArtifactPreparation,
+                artifact_started.elapsed(),
             );
             lowered_sql
         }
@@ -3366,7 +3366,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
         logical_plan: logical_plan.clone(),
         optimized_logical_plan: optimized_logical_plan.clone(),
         execution: execution.clone(),
-        runtime_artifacts: PublicReadExplainRuntimeArtifacts {
+        compiled_artifacts: PublicReadExplainCompiledArtifacts {
             pushdown_decision: pushdown_decision.clone(),
             lowered_sql,
         },
@@ -3783,7 +3783,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     // - routing: route typed broad public relations into lowerable broad relations.
     // - physical_planning: lower the optimized typed broad statement into the
     //   lowered read program.
-    // - executor_preparation: render backend SQL from the lowered read program.
+    // - artifact_preparation: render backend SQL from the lowered read program.
     // Broad lowering does not run structured semantic analysis, so semantic_analysis is omitted.
     let logical_started = Instant::now();
     let read_summary = summarize_bound_public_read_statement(registry, &bound_statement.statement);
@@ -3912,7 +3912,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         effective_state_plan: None,
     };
 
-    let executor_started = Instant::now();
+    let artifact_started = Instant::now();
     let lowered_sql = render_lowered_read_sql(
         &lowered_read,
         &bound_statement.bound_parameters,
@@ -3920,8 +3920,8 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         backend.dialect(),
     )?;
     stage_timings.record(
-        ExplainStage::ExecutorPreparation,
-        executor_started.elapsed(),
+        ExplainStage::ArtifactPreparation,
+        artifact_started.elapsed(),
     );
     let surface_bindings = semantic_read
         .surface_bindings
@@ -3934,7 +3934,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         logical_plan: logical_plan.clone(),
         optimized_logical_plan: optimized_logical_plan.clone(),
         execution: PreparedPublicReadExecution::LoweredSql(lowered_read.clone()),
-        runtime_artifacts: PublicReadExplainRuntimeArtifacts {
+        compiled_artifacts: PublicReadExplainCompiledArtifacts {
             pushdown_decision: Some(PushdownDecision::default()),
             lowered_sql,
         },
