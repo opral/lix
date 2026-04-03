@@ -1,6 +1,6 @@
 use crate::support;
 
-use lix_engine::{BootAccount, Value};
+use lix_engine::Value;
 use support::simulation_test::SimulationBootArgs;
 
 fn first_text(result: &lix_engine::ExecuteResult) -> String {
@@ -40,17 +40,11 @@ async fn workspace_metadata_value(
 }
 
 simulation_test!(
-    active_account_ids_function_reads_boot_account,
+    active_account_ids_function_defaults_to_empty_selection,
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(SimulationBootArgs {
-                active_account: Some(BootAccount {
-                    id: "acct-boot".to_string(),
-                    name: "Boot Account".to_string(),
-                }),
-                ..SimulationBootArgs::default()
-            }))
+            .boot_simulated_engine(Some(SimulationBootArgs::default()))
             .await
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.expect("init should succeed");
@@ -59,7 +53,7 @@ simulation_test!(
             .execute("SELECT lix_active_account_ids()", &[])
             .await
             .expect("active account ids query should succeed");
-        assert_eq!(first_string_vec(&result), vec!["acct-boot".to_string()]);
+        assert_eq!(first_string_vec(&result), Vec::<String>::new());
     }
 );
 
@@ -99,17 +93,15 @@ simulation_test!(
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(SimulationBootArgs {
-                active_account: Some(BootAccount {
-                    id: "acct-clear".to_string(),
-                    name: "Clear Me".to_string(),
-                }),
-                ..SimulationBootArgs::default()
-            }))
+            .boot_simulated_engine(Some(SimulationBootArgs::default()))
             .await
             .expect("boot_simulated_engine should succeed");
         engine.initialize().await.expect("init should succeed");
 
+        engine
+            .set_active_account_ids(vec!["acct-clear".to_string()])
+            .await
+            .expect("seeding active account ids should succeed");
         engine
             .set_active_account_ids(Vec::new())
             .await

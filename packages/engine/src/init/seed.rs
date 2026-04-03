@@ -39,10 +39,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         self.engine.boot_key_values()
     }
 
-    pub(crate) fn boot_active_account(&self) -> Option<&crate::BootAccount> {
-        self.engine.boot_active_account()
-    }
-
     pub(crate) async fn execute_internal(
         &mut self,
         sql: &str,
