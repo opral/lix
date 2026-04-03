@@ -12,14 +12,13 @@ use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub use crate::boot::{boot, BootAccount, BootArgs, BootKeyValue};
+pub use crate::boot::{boot, BootArgs, BootKeyValue};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
 pub struct Engine {
     runtime: Arc<Runtime>,
     boot_key_values: Vec<BootKeyValue>,
-    boot_active_account: Option<BootAccount>,
 }
 
 impl Engine {
@@ -53,10 +52,6 @@ impl Engine {
 
     pub(crate) fn boot_key_values(&self) -> &[BootKeyValue] {
         &self.boot_key_values
-    }
-
-    pub(crate) fn boot_active_account(&self) -> Option<&BootAccount> {
-        self.boot_active_account.as_ref()
     }
 
     pub(crate) fn public_surface_registry(&self) -> crate::contracts::surface::SurfaceRegistry {
@@ -254,7 +249,6 @@ impl Engine {
                 boot_deterministic_settings,
             )),
             boot_key_values: args.key_values,
-            boot_active_account: args.active_account,
         }
     }
 }

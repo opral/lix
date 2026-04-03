@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 
 use crate::schema::lix_schema_definition;
 
+pub(crate) mod storage;
 pub(crate) mod types;
 
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";

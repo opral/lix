@@ -1,4 +1,3 @@
-mod account;
 mod api;
 mod backend;
 mod binary_cas;
@@ -77,7 +76,7 @@ pub use committed_frontier::CommittedVersionFrontier;
 pub use contracts::artifacts::ExecuteOptions;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
-pub use engine::{BootAccount, BootKeyValue, Engine};
+pub use engine::{BootKeyValue, Engine};
 pub use errors::LixError;
 pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,

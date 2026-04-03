@@ -91,23 +91,9 @@ impl Session {
         let runtime = Arc::clone(engine.runtime());
         let active_version_id =
             require_workspace_active_version_id(runtime.backend().as_ref()).await?;
-        let active_account_ids =
-            match load_workspace_active_account_ids(runtime.backend().as_ref()).await? {
-                Some(active_account_ids) => active_account_ids,
-                None => match engine.boot_active_account() {
-                    Some(account) => {
-                        let active_account_ids = vec![account.id.clone()];
-                        persist_workspace_selectors(
-                            runtime.backend().as_ref(),
-                            None,
-                            Some(&active_account_ids),
-                        )
-                        .await?;
-                        active_account_ids
-                    }
-                    None => Vec::new(),
-                },
-            };
+        let active_account_ids = load_workspace_active_account_ids(runtime.backend().as_ref())
+            .await?
+            .unwrap_or_default();
         let registry = runtime.public_surface_registry();
         Ok(Self {
             engine,
