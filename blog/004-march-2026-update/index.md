@@ -1,7 +1,7 @@
 ---
 date: "2026-04-03"
 og:description: "Without the semantic layer, Lix is ~8x faster than Git on commits. But the semantic layer is non-negotiable and not fast enough yet."
-og:image: "./cover.png"
+og:image: "./8x-faster.png"
 og:image:alt: "March 2026 update: the engine is proven fast, the semantic layer is next"
 ---
 
