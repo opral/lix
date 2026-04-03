@@ -729,11 +729,11 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 
@@ -798,11 +798,11 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 
@@ -878,11 +878,11 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 
@@ -943,11 +943,11 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 
@@ -1015,11 +1015,11 @@ fn observe_external_same_writer_key_is_suppressed() {
             .await
             .expect("engine_b init should succeed");
         let session_a = engine_a
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session_a should open");
         let session_b = engine_b
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session_b should open");
 
@@ -1077,11 +1077,11 @@ fn observe_external_different_writer_key_emits() {
             .await
             .expect("engine_b init should succeed");
         let session_a = engine_a
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session_a should open");
         let session_b = engine_b
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session_b should open");
 
@@ -1141,11 +1141,11 @@ fn observe_external_null_writer_key_emits() {
             .await
             .expect("engine_b init should succeed");
         let session_a = engine_a
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session_a should open");
         let session_b = engine_b
-            .open_workspace_session()
+            .open_session()
             .await
             .expect("session_b should open");
 
@@ -1202,11 +1202,11 @@ fn observe_external_read_only_transaction_does_not_emit() {
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 
@@ -1259,11 +1259,11 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 
@@ -1339,11 +1339,11 @@ fn observe_external_unrelated_mutation_does_not_emit() {
                 .await
                 .expect("engine_b init should succeed");
             let session_a = engine_a
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_a should open");
             let session_b = engine_b
-                .open_workspace_session()
+                .open_session()
                 .await
                 .expect("session_b should open");
 

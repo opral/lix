@@ -200,7 +200,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     engine_a.initialize().await.expect("first init should succeed");
 
                     let session_a = engine_a
-                        .open_workspace_session()
+                        .open_session()
                         .await
                         .expect("workspace session should open after init");
 
@@ -262,7 +262,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                         .await
                         .expect("reopen open should load active version state");
                     let session_b = engine_b
-                        .open_workspace_session()
+                        .open_session()
                         .await
                         .expect("workspace session should open after reopen");
 
@@ -382,7 +382,7 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                     // This is exactly what the CLI does when a user runs:
                     //   lix sql execute "INSERT ...; INSERT ...;"
                     let session_a = engine_a
-                        .open_workspace_session()
+                        .open_session()
                         .await
                         .expect("workspace session should open after init");
 
@@ -404,7 +404,7 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                              with LIX_ERROR_LIVE_STATE_NOT_READY",
                     );
                     let session_b = engine_b
-                        .open_workspace_session()
+                        .open_session()
                         .await
                         .expect("workspace session should open after reopen");
 

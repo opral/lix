@@ -147,12 +147,12 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 	await lix.close();
 });
 
-test("openSession snapshots the caller active version and isolates later switches", async () => {
+test("openChildSession snapshots the caller active version and isolates later switches", async () => {
 	const lix = await createInitializedLix();
 	const version = await lix.createVersion({ name: "session-branch" });
 	await lix.switchVersion(version.id);
 
-	const worker = await lix.openSession();
+	const worker = await lix.openChildSession();
 	await worker.switchVersion("global");
 
 	expect(await lix.activeVersionId()).toBe(version.id);
@@ -162,11 +162,11 @@ test("openSession snapshots the caller active version and isolates later switche
 	await lix.close();
 });
 
-test("openSession accepts an explicit activeVersionId override", async () => {
+test("openChildSession accepts an explicit activeVersionId override", async () => {
 	const lix = await createInitializedLix();
 	const version = await lix.createVersion({ name: "override-branch" });
 
-	const worker = await lix.openSession({
+	const worker = await lix.openChildSession({
 		activeVersionId: version.id,
 	});
 	expect(await worker.activeVersionId()).toBe(version.id);
@@ -175,13 +175,13 @@ test("openSession accepts an explicit activeVersionId override", async () => {
 	await lix.close();
 });
 
-test("openSession snapshots active accounts and allows explicit overrides", async () => {
+test("openChildSession snapshots active accounts and allows explicit overrides", async () => {
 	const lix = await createInitializedLix();
-	const seeded = await lix.openSession({
+	const seeded = await lix.openChildSession({
 		activeAccountIds: ["acct-parent"],
 	});
-	const worker = await seeded.openSession();
-	const overrideWorker = await seeded.openSession({
+	const worker = await seeded.openChildSession();
+	const overrideWorker = await seeded.openChildSession({
 		activeAccountIds: ["acct-override"],
 	});
 

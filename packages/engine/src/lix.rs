@@ -54,7 +54,7 @@ pub struct Lix {
 impl Lix {
     pub async fn open(config: LixConfig) -> Result<Self, LixError> {
         let engine = Arc::new(Engine::open(config.into_engine_config()).await?);
-        let session = engine.open_workspace_session().await?;
+        let session = engine.open_session().await?;
         Ok(Self {
             session: Arc::new(session),
         })
@@ -96,8 +96,8 @@ impl Lix {
     ///
     /// This changes workspace selection for the child session only; it does
     /// not mutate replica-local version heads or committed history.
-    pub async fn open_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
-        let session = self.session.open_session(options).await?;
+    pub async fn open_child_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
+        let session = self.session.open_child_session(options).await?;
         Ok(Self {
             session: Arc::new(session),
         })

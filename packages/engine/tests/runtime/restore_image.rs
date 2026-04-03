@@ -471,7 +471,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .await
         .expect("source init should succeed");
     let source_session = source_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("source workspace session should open");
     let source_version = source_session
@@ -496,7 +496,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .await
         .expect("destination init should succeed");
     let destination_session = destination_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("destination workspace session should open");
     let destination_version = destination_session
@@ -519,7 +519,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .await
         .expect("restore_from_image should succeed");
     let restored_session = destination_engine
-        .open_workspace_session()
+        .open_session()
         .await
         .expect("workspace session should reopen after restore");
 

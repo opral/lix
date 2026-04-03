@@ -262,10 +262,14 @@ export type LixObserveEvents = {
             self.lix.switch_version(version_id).await.map_err(js_error)
         }
 
-        #[wasm_bindgen(js_name = openSession)]
-        pub async fn open_session(&self, args: Option<JsValue>) -> Result<Lix, JsValue> {
-            let options = parse_open_session_options(args).map_err(js_error)?;
-            let session = self.lix.open_session(options).await.map_err(js_error)?;
+        #[wasm_bindgen(js_name = openChildSession)]
+        pub async fn open_child_session(&self, args: Option<JsValue>) -> Result<Lix, JsValue> {
+            let options = parse_open_child_session_options(args).map_err(js_error)?;
+            let session = self
+                .lix
+                .open_child_session(options)
+                .await
+                .map_err(js_error)?;
             Ok(Lix {
                 lix: Arc::new(session),
             })
@@ -455,7 +459,7 @@ export type LixObserveEvents = {
         config
     }
 
-    fn parse_open_session_options(
+    fn parse_open_child_session_options(
         input: Option<JsValue>,
     ) -> Result<lix_engine::OpenSessionOptions, LixError> {
         let Some(input) = input else {
@@ -469,21 +473,21 @@ export type LixObserveEvents = {
             .map_err(|_| {
             LixError::new(
                 "LIX_ERROR_JS_SDK",
-                "openSession activeVersionId lookup failed",
+                "openChildSession activeVersionId lookup failed",
             )
         })? {
             value if value.is_null() || value.is_undefined() => None,
             _value => Some(read_required_string_property(
                 &object,
                 "activeVersionId",
-                "openSession options",
+                "openChildSession options",
             )?),
         };
         let active_account_ids = match Reflect::get(&object, &JsValue::from_str("activeAccountIds"))
             .map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_JS_SDK",
-                    "openSession activeAccountIds lookup failed",
+                    "openChildSession activeAccountIds lookup failed",
                 )
             })? {
             value if value.is_null() || value.is_undefined() => None,
@@ -491,7 +495,7 @@ export type LixObserveEvents = {
                 if !Array::is_array(&value) {
                     return Err(LixError::new(
                         "LIX_ERROR_JS_SDK",
-                        "openSession activeAccountIds must be an array",
+                        "openChildSession activeAccountIds must be an array",
                     ));
                 }
                 let values = Array::from(&value);
@@ -500,13 +504,13 @@ export type LixObserveEvents = {
                     let account_id = entry.as_string().ok_or_else(|| {
                         LixError::new(
                             "LIX_ERROR_JS_SDK",
-                            "openSession activeAccountIds entries must be strings",
+                            "openChildSession activeAccountIds entries must be strings",
                         )
                     })?;
                     if account_id.is_empty() {
                         return Err(LixError::new(
                             "LIX_ERROR_JS_SDK",
-                            "openSession activeAccountIds entries must be non-empty strings",
+                            "openChildSession activeAccountIds entries must be non-empty strings",
                         ));
                     }
                     parsed.push(account_id);

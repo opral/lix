@@ -169,7 +169,7 @@ fn build_template_with_trace(
         .block_on(engine.initialize())
         .expect("engine initialization should succeed");
     let session = runtime
-        .block_on(engine.open_workspace_session())
+        .block_on(engine.open_session())
         .expect("workspace session should open");
 
     for revision in 0..history_depth {
@@ -220,7 +220,7 @@ fn build_fixture_from_template_with_trace(
         .block_on(engine.open_existing())
         .expect("existing template db should open");
     let session = runtime
-        .block_on(engine.open_workspace_session())
+        .block_on(engine.open_session())
         .expect("workspace session should open");
 
     BenchFixture {
