@@ -16,7 +16,6 @@ mod filesystem;
 mod functions;
 mod identity;
 mod init;
-mod key_value;
 pub mod live_state;
 mod lix;
 mod observe;

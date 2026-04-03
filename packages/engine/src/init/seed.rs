@@ -3,6 +3,9 @@ use crate::engine::Engine;
 use crate::refs::load_committed_version_head_commit_id;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
+use crate::schema::builtin::storage::{
+    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+};
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::parser::parse_sql;
 use crate::version::GLOBAL_VERSION_ID;
@@ -10,6 +13,8 @@ use crate::write_runtime::sql_adapter::execute_parsed_statements_in_borrowed_wri
 use crate::write_runtime::BorrowedWriteTransaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
+
+pub(crate) const LIX_ID_KEY: &str = "lix_id";
 
 pub(crate) struct InitExecutor<'engine, 'tx> {
     engine: &'engine Engine,
@@ -177,6 +182,108 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             });
         };
         Ok(commit_id)
+    }
+
+    pub(crate) async fn insert_bootstrap_key_value(
+        &mut self,
+        key: &str,
+        value: &JsonValue,
+        version_id: &str,
+        untracked: bool,
+        tracked_commit_id: Option<&str>,
+    ) -> Result<(), LixError> {
+        let snapshot_content = serde_json::json!({
+            "key": key,
+            "value": value,
+        })
+        .to_string();
+
+        if untracked {
+            self.insert_bootstrap_untracked_row(
+                key,
+                key_value_schema_key(),
+                key_value_schema_version(),
+                key_value_file_id(),
+                version_id,
+                key_value_plugin_key(),
+                &snapshot_content,
+            )
+            .await
+        } else {
+            self.insert_bootstrap_tracked_row(
+                tracked_commit_id,
+                key,
+                key_value_schema_key(),
+                key_value_schema_version(),
+                key_value_file_id(),
+                version_id,
+                key_value_plugin_key(),
+                &snapshot_content,
+            )
+            .await
+        }
+    }
+
+    pub(crate) async fn seed_boot_config_key_values(
+        &mut self,
+        default_active_version_id: &str,
+    ) -> Result<(), LixError> {
+        if self
+            .boot_key_values()
+            .iter()
+            .any(|key_value| key_value.key == LIX_ID_KEY)
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("boot key `{LIX_ID_KEY}` is reserved for engine-owned identity state"),
+            ));
+        }
+
+        let mut bootstrap_commit_id: Option<String> = None;
+        for key_value in self.boot_key_values().to_vec() {
+            let version_id = if key_value.lixcol_global.unwrap_or(false) {
+                GLOBAL_VERSION_ID.to_string()
+            } else {
+                default_active_version_id.to_string()
+            };
+            let untracked = key_value.lixcol_untracked.unwrap_or(true);
+
+            let tracked_commit_id = if untracked {
+                None
+            } else {
+                Some(match &bootstrap_commit_id {
+                    Some(commit_id) => commit_id.clone(),
+                    None => {
+                        let commit_id = self.load_global_version_commit_id().await?;
+                        bootstrap_commit_id = Some(commit_id.clone());
+                        commit_id
+                    }
+                })
+            };
+
+            self.insert_bootstrap_key_value(
+                &key_value.key,
+                &key_value.value,
+                &version_id,
+                untracked,
+                tracked_commit_id.as_deref(),
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn seed_lix_id_key(&mut self) -> Result<(), LixError> {
+        let lix_id_value = self.generate_runtime_uuid().await?;
+        self.insert_bootstrap_key_value(
+            LIX_ID_KEY,
+            &JsonValue::String(lix_id_value),
+            GLOBAL_VERSION_ID,
+            false,
+            None,
+        )
+        .await
     }
 
     pub(crate) async fn add_change_id_to_commit(

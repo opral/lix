@@ -1,10 +1,12 @@
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::deterministic_mode::{
-    build_persist_sequence_highest_batch, load_runtime_sequence_start_in_transaction,
     load_runtime_settings, DeterministicSettings, RuntimeFunctionProvider,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::write_runtime::{
+    build_persist_sequence_highest_batch, load_runtime_sequence_start_in_transaction,
+};
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 use super::Runtime;

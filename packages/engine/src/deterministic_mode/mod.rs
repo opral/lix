@@ -1,16 +1,11 @@
+mod storage;
+
 use serde_json::Value as JsonValue;
 
-use crate::backend::prepared::PreparedBatch;
 use crate::errors::classification::is_missing_relation_error;
 use crate::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
-use crate::key_value::{
-    build_ensure_runtime_sequence_row_sql as build_ensure_runtime_sequence_row_sql_impl,
-    build_lock_runtime_sequence_row_sql as build_lock_runtime_sequence_row_sql_impl,
-    build_update_runtime_sequence_highest_sql as build_update_runtime_sequence_highest_sql_impl,
-    load_key_value_payloads,
-};
-use crate::runtime::TransactionBackendAdapter;
-use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect, Value};
+use crate::{LixBackend, LixError};
+use storage::load_persisted_key_value_payloads;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 const SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -26,6 +21,10 @@ pub struct DeterministicSettings {
 
 pub(crate) fn deterministic_mode_key() -> &'static str {
     DETERMINISTIC_MODE_KEY
+}
+
+pub(crate) fn deterministic_sequence_key() -> &'static str {
+    SEQUENCE_KEY
 }
 
 impl DeterministicSettings {
@@ -173,7 +172,7 @@ pub(crate) fn parse_deterministic_settings_value(mode_value: &JsonValue) -> Dete
 pub(crate) async fn load_runtime_settings(
     backend: &dyn LixBackend,
 ) -> Result<DeterministicSettings, LixError> {
-    let values = match load_key_value_payloads(backend, &[DETERMINISTIC_MODE_KEY]).await {
+    let values = match load_persisted_key_value_payloads(backend, &[DETERMINISTIC_MODE_KEY]).await {
         Ok(values) => values,
         Err(err) if is_missing_relation_error(&err) => return Ok(DeterministicSettings::disabled()),
         Err(err) => return Err(err),
@@ -185,47 +184,8 @@ pub(crate) async fn load_runtime_settings(
         .unwrap_or_else(DeterministicSettings::disabled))
 }
 
-pub(crate) async fn load_runtime_sequence_start_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<i64, LixError> {
-    let visible_sequence_start = {
-        let backend = TransactionBackendAdapter::new(transaction);
-        load_runtime_sequence_start(&backend).await?
-    };
-    let ensure_sql =
-        build_ensure_runtime_sequence_row_sql(visible_sequence_start - 1, transaction.dialect());
-    transaction.execute(&ensure_sql, &[]).await?;
-
-    let load_sql = build_lock_runtime_sequence_row_sql(transaction.dialect());
-    let result = transaction.execute(&load_sql, &[]).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(0);
-    };
-    let Some(value_json) = row.first() else {
-        return Ok(0);
-    };
-    let raw = value_to_string(value_json, "value_json")?;
-    let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("deterministic sequence value_json invalid JSON: {err}"),
-    })?;
-    Ok(parsed.as_i64().unwrap_or(-1) + 1)
-}
-
-pub(crate) fn build_persist_sequence_highest_batch(
-    highest_seen: i64,
-    dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
-    let mut batch = PreparedBatch { steps: Vec::new() };
-    batch.append_sql(build_update_runtime_sequence_highest_sql(
-        highest_seen,
-        dialect,
-    ));
-    Ok(batch)
-}
-
 pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Result<i64, LixError> {
-    let values = match load_key_value_payloads(backend, &[SEQUENCE_KEY]).await {
+    let values = match load_persisted_key_value_payloads(backend, &[SEQUENCE_KEY]).await {
         Ok(values) => values,
         Err(err) if is_missing_relation_error(&err) => return Ok(0),
         Err(err) => return Err(err),
@@ -235,39 +195,11 @@ pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Res
     Ok(highest_seen.unwrap_or(-1) + 1)
 }
 
-pub(crate) fn build_ensure_runtime_sequence_row_sql(
-    highest_seen: i64,
-    dialect: SqlDialect,
-) -> String {
-    build_ensure_runtime_sequence_row_sql_impl(highest_seen, dialect, SEQUENCE_KEY)
-}
-
-pub(crate) fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String {
-    build_lock_runtime_sequence_row_sql_impl(dialect, SEQUENCE_KEY)
-}
-
-pub(crate) fn build_update_runtime_sequence_highest_sql(
-    highest_seen: i64,
-    dialect: SqlDialect,
-) -> String {
-    build_update_runtime_sequence_highest_sql_impl(highest_seen, dialect, SEQUENCE_KEY)
-}
-
 fn parse_integer_value(value: &JsonValue) -> Option<i64> {
     match value {
         JsonValue::Number(number) => number.as_i64(),
         JsonValue::String(text) => text.parse::<i64>().ok(),
         _ => None,
-    }
-}
-
-fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("expected text value for {name}"),
-        }),
     }
 }
 

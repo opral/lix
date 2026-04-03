@@ -5,7 +5,6 @@ use crate::canonical;
 use crate::checkpoint;
 use crate::engine::Engine;
 use crate::filesystem;
-use crate::key_value;
 use crate::live_state;
 use crate::live_state::{
     load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
@@ -71,9 +70,6 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             observe::init(&backend)
                 .await
                 .map_err(|error| init_step_error("observe::init", error))?;
-            key_value::init(&backend)
-                .await
-                .map_err(|error| init_step_error("key_value::init", error))?;
             version::init(&backend)
                 .await
                 .map_err(|error| init_step_error("version::init", error))?;
@@ -106,9 +102,12 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         checkpoint::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("checkpoint::seed_bootstrap", error))?;
-        key_value::seed_bootstrap(&mut init, &default_active_version_id)
+        init.seed_boot_config_key_values(&default_active_version_id)
             .await
-            .map_err(|error| init_step_error("key_value::seed_bootstrap", error))?;
+            .map_err(|error| init_step_error("InitExecutor::seed_boot_config_key_values", error))?;
+        init.seed_lix_id_key()
+            .await
+            .map_err(|error| init_step_error("InitExecutor::seed_lix_id_key", error))?;
         init.persist_runtime_state()
             .await
             .map_err(|error| init_step_error("persist_runtime_state", error))?;
