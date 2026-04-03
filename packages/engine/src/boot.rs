@@ -15,17 +15,10 @@ pub struct BootKeyValue {
     pub lixcol_untracked: Option<bool>,
 }
 
-#[derive(Debug, Clone)]
-pub struct BootAccount {
-    pub id: String,
-    pub name: String,
-}
-
 pub struct EngineConfig {
     pub backend: Box<dyn LixBackend + Send + Sync>,
     pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub key_values: Vec<BootKeyValue>,
-    pub active_account: Option<BootAccount>,
     pub access_to_internal: bool,
 }
 
@@ -38,7 +31,6 @@ impl EngineConfig {
             backend,
             wasm_runtime,
             key_values: Vec::new(),
-            active_account: None,
             access_to_internal: false,
         }
     }

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lix_engine::wasm::NoopWasmRuntime;
-use lix_engine::{boot, BootAccount, BootArgs, BootKeyValue, Value};
+use lix_engine::{boot, BootArgs, BootKeyValue, Value};
 use serde_json::json;
 
 const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
@@ -499,13 +499,8 @@ simulation_test!(
 simulation_test!(
     init_does_not_seed_runtime_active_account_rows,
     |sim| async move {
-        let mut boot_args = support::simulation_test::SimulationBootArgs::default();
-        boot_args.active_account = Some(BootAccount {
-            id: "account-bootstrap".to_string(),
-            name: "Bootstrap Account".to_string(),
-        });
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_engine(None)
             .await
             .expect("boot_simulated_engine should succeed");
 
@@ -525,6 +520,32 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(init_does_not_seed_lix_account_rows, |sim| async move {
+    let engine = sim
+        .boot_simulated_engine(None)
+        .await
+        .expect("boot_simulated_engine should succeed");
+
+    engine.initialize().await.unwrap();
+
+    let result = engine
+        .execute(
+            "SELECT COUNT(*) \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_account' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        i64_value(&result.statements[0].rows[0][0], "lix_account_row_count"),
+        0
+    );
+});
 
 simulation_test!(init_creates_snapshot_table, |sim| async move {
     let engine = sim
@@ -1217,10 +1238,6 @@ simulation_test!(
                     lixcol_global: Some(true),
                     lixcol_untracked: Some(false),
                 }],
-                active_account: Some(BootAccount {
-                    id: "plan3-account".to_string(),
-                    name: "Plan 3".to_string(),
-                }),
                 ..support::simulation_test::SimulationBootArgs::default()
             }))
             .await
@@ -1257,24 +1274,6 @@ simulation_test!(
             first_result_rows(&boot_key).len(),
             1,
             "boot key seed row should persist"
-        );
-
-        let account = engine
-            .execute(
-                "SELECT snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_account' \
-                   AND entity_id = $1 \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL",
-                &[Value::Text("plan3-account".to_string())],
-            )
-            .await
-            .expect("boot account query should succeed");
-        assert_eq!(
-            first_result_rows(&account).len(),
-            1,
-            "boot account seed row should persist"
         );
     }
 );

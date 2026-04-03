@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use lix_engine::wasm::{NoopWasmRuntime, WasmRuntime};
 use lix_engine::{
-    boot, BootAccount, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
+    boot, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
     CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
     LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
@@ -49,7 +49,6 @@ pub struct SimulationArgs {
 
 pub struct SimulationBootArgs {
     pub key_values: Vec<BootKeyValue>,
-    pub active_account: Option<BootAccount>,
     pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub access_to_internal: bool,
 }
@@ -445,7 +444,6 @@ impl SimulationArgs {
                 backend: (self.backend_factory)(),
                 wasm_runtime: args.wasm_runtime,
                 key_values: args.key_values,
-                active_account: args.active_account,
                 access_to_internal: args.access_to_internal,
             })),
             session: OnceLock::new(),
@@ -464,7 +462,6 @@ impl SimulationArgs {
                 lixcol_global: Some(true),
                 lixcol_untracked: None,
             }],
-            active_account: None,
             wasm_runtime: default_simulation_wasm_runtime(),
             access_to_internal: true,
         }))
@@ -486,7 +483,6 @@ impl SimulationArgs {
 fn default_simulation_boot_args() -> SimulationBootArgs {
     SimulationBootArgs {
         key_values: Vec::new(),
-        active_account: None,
         wasm_runtime: default_simulation_wasm_runtime(),
         access_to_internal: true,
     }
