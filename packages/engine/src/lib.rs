@@ -21,7 +21,6 @@ mod init;
 pub(crate) mod live_schema_access;
 pub mod live_state;
 mod lix;
-mod observe;
 mod plugin;
 pub(crate) mod projections;
 pub(crate) mod read_runtime;
@@ -37,7 +36,6 @@ mod test_support;
 mod text;
 pub mod transaction;
 mod types;
-mod undo_redo;
 mod version;
 pub mod wire;
 pub(crate) mod workspace;
@@ -92,15 +90,15 @@ pub use live_state::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 pub use lix::{InitResult, Lix, LixConfig};
-pub use observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use replay_cursor::ReplayCursor;
+pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use session::undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub use session::{OpenSessionOptions, Session, SessionTransaction};
 #[doc(hidden)]
 pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
 #[doc(hidden)]
 pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
 pub use types::{ExecuteResult, QueryResult, Value};
-pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 pub use version::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult,

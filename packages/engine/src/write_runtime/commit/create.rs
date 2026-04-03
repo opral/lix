@@ -1368,7 +1368,7 @@ mod tests {
         crate::filesystem::init(&backend)
             .await
             .expect("filesystem tables should init");
-        crate::observe::init(&backend)
+        crate::session::observe::init(&backend)
             .await
             .expect("observe tables should init");
         backend
