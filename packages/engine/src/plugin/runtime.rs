@@ -4,13 +4,14 @@ use crate::cel::shared_runtime;
 use crate::filesystem::live_projection::{
     build_filesystem_file_projection_sql, FilesystemProjectionScope,
 };
+use crate::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::plugin::manifest::parse_plugin_manifest_json;
 use crate::plugin::matching::select_best_glob_match;
 use crate::plugin::storage::plugin_key_from_archive_path;
 use crate::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
-use crate::sql::executor::preprocess::preprocess_sql_to_plan as preprocess_sql;
+use crate::sql::prepare::preprocess::preprocess_sql_to_plan_with_functions as preprocess_sql;
 use crate::{LixBackend, LixError, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -381,7 +382,14 @@ async fn load_file_paths_for_descriptors(
          ORDER BY f.lixcol_version_id, f.id",
     );
 
-    let preprocessed = preprocess_sql(backend, shared_runtime(), &sql, &params).await?;
+    let preprocessed = preprocess_sql(
+        backend,
+        shared_runtime(),
+        &sql,
+        &params,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+    )
+    .await?;
     let rows = backend
         .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
         .await?;

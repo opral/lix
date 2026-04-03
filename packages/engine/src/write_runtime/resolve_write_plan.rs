@@ -1,5 +1,5 @@
 use crate::contracts::surface::SurfaceFamily;
-use crate::contracts::traits::PendingView;
+use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
 use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
 use crate::functions::SystemFunctionProvider;
@@ -10,9 +10,6 @@ use crate::sql::logical_plan::public_ir::{
     ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
-use crate::sql::semantic_ir::hydration::{
-    HydratedVersionAdminRow as VersionAdminRow, PublicWriteHydrator,
-};
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
 };
@@ -22,13 +19,13 @@ use crate::sql::semantic_ir::semantics::state_assignments::StateAssignmentsError
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
 };
-use crate::sql::services::public_reads::execute_public_query_with_optional_pending_transaction_view;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
     version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
     version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
+use crate::write_runtime::execute_public_query_with_optional_pending_transaction_view;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
@@ -39,9 +36,11 @@ use sqlparser::ast::{
 use std::collections::{BTreeMap, BTreeSet};
 
 mod filesystem_writes;
+mod hydration;
 mod state_backed_writes;
 
 use filesystem_writes::resolve_filesystem_write;
+use hydration::{HydratedVersionAdminRow as VersionAdminRow, PublicWriteHydrator};
 use state_backed_writes::{resolve_entity_write, resolve_state_write};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,7 +220,14 @@ pub(crate) async fn resolve_write_plan_with_functions<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut hydrator = PublicWriteHydrator::new(backend, pending_transaction_view);
+    let pending_state_overlay =
+        pending_transaction_view.map(|view| PendingStateOverlayRef::new(view));
+    let mut hydrator = PublicWriteHydrator::new(
+        backend,
+        pending_state_overlay
+            .as_ref()
+            .map(|overlay| overlay as &dyn PendingStateOverlay),
+    );
     let resolved = match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => {
             resolve_state_write(&mut hydrator, planned_write, functions.clone()).await
@@ -327,7 +333,9 @@ async fn resolve_existing_version_write(
     let version_ids = query_text_selector_values_for_write_selector(
         hydrator.backend(),
         planned_write,
-        hydrator.pending_transaction_view(),
+        hydrator
+            .pending_state_overlay()
+            .map(|overlay| overlay.as_pending_view()),
         "id",
         "public version selector resolver expected id text rows",
     )

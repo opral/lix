@@ -1,14 +1,13 @@
-//! Executor-owned implementation of the public SQL runtime surface.
+//! Compiler-owned preparation of public surface artifacts.
 
 use crate::change_view::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
-    SessionStateDelta,
+    PreparedPublicReadContract, SessionStateDelta,
 };
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
-use crate::contracts::traits::PendingView;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
@@ -16,9 +15,6 @@ use crate::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, delete_targets_from_filesystem_state,
     FilesystemTransactionState,
 };
-#[cfg(test)]
-use crate::functions::SystemFunctionProvider;
-use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::runtime::streams::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
@@ -27,28 +23,25 @@ use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
-use crate::sql::executor::contracts::effects::PlanEffects;
-use crate::sql::executor::contracts::planned_statement::SchemaLiveTableRequirement;
-use crate::sql::executor::intent::authoritative_binary_blob_write_targets;
 use crate::sql::explain::{
-    build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts, ExplainStage,
-    ExplainTimingCollector, PublicWriteExplainBuildInput,
+    build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts,
+    ExplainRequest, ExplainStage, ExplainStageTiming, ExplainTimingCollector,
+    PublicWriteExplainBuildInput,
 };
 use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, WriteOperationKind};
-use crate::sql::logical_plan::{
-    verify_logical_plan, DependencySpec, LogicalPlan, PublicReadLogicalPlan,
-};
+#[cfg(test)]
+use crate::sql::logical_plan::DependencySpec;
+use crate::sql::logical_plan::{verify_logical_plan, LogicalPlan, PublicReadLogicalPlan};
 use crate::sql::physical_plan::{
     LoweredReadProgram, PreparedPublicReadExecution, PreparedPublicWriteExecution,
     PublicWriteExecutionPartition, PublicWriteMaterialization, TrackedWriteExecution,
     UntrackedWriteExecution,
 };
+use crate::sql::prepare::contracts::effects::PlanEffects;
+use crate::sql::prepare::contracts::planned_statement::SchemaLiveTableRequirement;
+use crate::sql::prepare::intent::authoritative_binary_blob_write_targets;
 use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
-use crate::sql::semantic_ir::semantics::domain_changes::{
-    build_domain_change_batch, derive_commit_preconditions,
-};
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
-use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan_with_functions;
 use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
@@ -57,7 +50,7 @@ use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
@@ -88,8 +81,6 @@ pub(crate) struct PreparedPublicRead {
     pub(crate) explain: ExplainArtifacts,
 }
 
-pub(crate) use read::execute_prepared_public_read;
-
 impl PreparedPublicRead {
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
         self.logical_plan.structured_read()
@@ -103,6 +94,7 @@ impl PreparedPublicRead {
         self.logical_plan.effective_state_plan()
     }
 
+    #[cfg(test)]
     pub(crate) fn dependency_spec(&self) -> Option<&DependencySpec> {
         self.logical_plan.dependency_spec()
     }
@@ -119,6 +111,11 @@ impl PreparedPublicRead {
         read::committed_read_mode_from_prepared_public_read(self)
     }
 
+    pub(crate) fn public_read_contract(&self) -> PreparedPublicReadContract {
+        read::prepared_public_read_contract(self)
+    }
+
+    #[cfg(test)]
     pub(crate) fn surface_bindings(&self) -> &[String] {
         &self.surface_bindings
     }
@@ -128,10 +125,18 @@ impl PreparedPublicRead {
 pub(crate) struct PreparedPublicWrite {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
+    pub(crate) explain_plan: PreparedPublicWriteExplainPlan,
     pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
     pub(crate) surface_bindings: Vec<String>,
     pub(crate) execution: PreparedPublicWriteExecution,
     pub(crate) explain: ExplainArtifacts,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PreparedPublicWriteExplainPlan {
+    pub(crate) request: Option<ExplainRequest>,
+    pub(crate) semantics: PublicWriteSemantics,
+    pub(crate) stage_timings: Vec<ExplainStageTiming>,
 }
 
 impl PreparedPublicWrite {
@@ -190,11 +195,19 @@ pub(crate) async fn prepare_public_execution(
     active_account_ids: &[String],
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
+    let active_history_root_commit_id =
+        crate::version::context::load_target_version_history_root_commit_id_with_backend(
+            backend,
+            Some(active_version_id),
+            "active_version_id",
+        )
+        .await?;
     prepare_public_execution_with_internal_access(
         backend,
         parsed_statements,
         params,
         active_version_id,
+        active_history_root_commit_id.as_deref(),
         active_account_ids,
         writer_key,
         false,
@@ -202,24 +215,18 @@ pub(crate) async fn prepare_public_execution(
     .await
 }
 
-pub(crate) async fn prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions<
-    P,
->(
+pub(crate) async fn prepare_public_execution_with_registry_context_and_functions(
     backend: &dyn LixBackend,
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    pending_transaction_view: Option<&dyn PendingView>,
     parse_duration: Option<Duration>,
-    functions: SharedFunctionProvider<P>,
-) -> Result<Option<PreparedPublicExecution>, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
+) -> Result<Option<PreparedPublicExecution>, LixError> {
     let Some(route) = classify_public_execution_route_with_registry(registry, parsed_statements)
     else {
         return Ok(None);
@@ -237,9 +244,7 @@ where
                 active_version_id,
                 active_account_ids,
                 writer_key,
-                pending_transaction_view,
                 parse_duration,
-                functions,
             )
             .await?;
             prepared
@@ -268,6 +273,7 @@ where
                 parsed_statements,
                 params,
                 active_version_id,
+                active_history_root_commit_id,
                 writer_key,
                 allow_internal_tables,
                 parse_duration,
@@ -291,6 +297,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
@@ -300,44 +307,40 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
         parsed_statements,
         params,
         active_version_id,
+        active_history_root_commit_id,
         active_account_ids,
         writer_key,
         allow_internal_tables,
         None,
-        SharedFunctionProvider::new(SystemFunctionProvider),
     )
     .await
 }
 
-pub(crate) async fn prepare_public_execution_with_internal_access_and_functions<P>(
+pub(crate) async fn prepare_public_execution_with_internal_access_and_functions(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     parse_duration: Option<Duration>,
-    functions: SharedFunctionProvider<P>,
-) -> Result<Option<PreparedPublicExecution>, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
+) -> Result<Option<PreparedPublicExecution>, LixError> {
     let builtin_registry = SurfaceRegistry::with_builtin_surfaces();
     if classify_public_execution_route_with_registry(&builtin_registry, parsed_statements).is_some()
     {
-        return prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
+        return prepare_public_execution_with_registry_context_and_functions(
             backend,
             &builtin_registry,
             parsed_statements,
             params,
             active_version_id,
+            active_history_root_commit_id,
             active_account_ids,
             writer_key,
             allow_internal_tables,
-            None,
             parse_duration,
-            functions,
         )
         .await;
     }
@@ -345,18 +348,17 @@ where
     let registry = SurfaceRegistry::bootstrap_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
+    prepare_public_execution_with_registry_context_and_functions(
         backend,
         &registry,
         parsed_statements,
         params,
         active_version_id,
+        active_history_root_commit_id,
         active_account_ids,
         writer_key,
         allow_internal_tables,
-        None,
         parse_duration,
-        functions,
     )
     .await
 }
@@ -388,6 +390,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     parse_duration: Option<Duration>,
@@ -398,6 +401,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
         parsed_statements,
         params,
         active_version_id,
+        active_history_root_commit_id,
         writer_key,
         allow_internal_tables,
         parse_duration,
@@ -487,11 +491,21 @@ pub(crate) async fn prepare_public_read(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Option<PreparedPublicRead> {
+    let active_history_root_commit_id =
+        crate::version::context::load_target_version_history_root_commit_id_with_backend(
+            backend,
+            Some(active_version_id),
+            "active_version_id",
+        )
+        .await
+        .ok()
+        .flatten();
     read::prepare_public_read(
         backend,
         parsed_statements,
         params,
         active_version_id,
+        active_history_root_commit_id.as_deref(),
         writer_key,
     )
     .await
@@ -505,11 +519,19 @@ pub(crate) async fn prepare_public_read_strict(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
+    let active_history_root_commit_id =
+        crate::version::context::load_target_version_history_root_commit_id_with_backend(
+            backend,
+            Some(active_version_id),
+            "active_version_id",
+        )
+        .await?;
     read::prepare_public_read_strict(
         backend,
         parsed_statements,
         params,
         active_version_id,
+        active_history_root_commit_id.as_deref(),
         writer_key,
     )
     .await
@@ -1107,7 +1129,7 @@ fn expr_string_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
-pub(crate) async fn try_prepare_public_write_with_functions<P>(
+pub(crate) async fn try_prepare_public_write_with_functions(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
@@ -1115,11 +1137,7 @@ pub(crate) async fn try_prepare_public_write_with_functions<P>(
     active_account_ids: &[String],
     writer_key: Option<&str>,
     parse_duration: Option<Duration>,
-    functions: SharedFunctionProvider<P>,
-) -> Result<Option<PreparedPublicWrite>, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
+) -> Result<Option<PreparedPublicWrite>, LixError> {
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
@@ -1135,14 +1153,12 @@ where
         active_version_id,
         active_account_ids,
         writer_key,
-        None,
         parse_duration,
-        functions,
     )
     .await
 }
 
-pub(crate) async fn try_prepare_public_write_with_registry_and_functions<P>(
+pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     backend: &dyn LixBackend,
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
@@ -1150,13 +1166,8 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions<P>(
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    pending_transaction_view: Option<&dyn PendingView>,
     parse_duration: Option<Duration>,
-    functions: SharedFunctionProvider<P>,
-) -> Result<Option<PreparedPublicWrite>, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
+) -> Result<Option<PreparedPublicWrite>, LixError> {
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
@@ -1220,43 +1231,8 @@ where
         }
     };
     let canonicalized = &write_analysis.semantics.canonicalized;
-    let mut planned_write = write_analysis.planned_write.clone();
+    let planned_write = write_analysis.planned_write.clone();
     stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
-    let physical_started = Instant::now();
-    let resolved_write_plan = match resolve_write_plan_with_functions(
-        backend,
-        &planned_write,
-        pending_transaction_view,
-        functions.clone(),
-    )
-    .await
-    {
-        Ok(resolved_write_plan) => resolved_write_plan,
-        Err(error) => match public_authoritative_write_error(&canonicalized, error.message) {
-            Some(error) => return Err(error),
-            None => return Ok(None),
-        },
-    };
-    planned_write.resolved_write_plan = Some(resolved_write_plan.clone());
-    let domain_change_batches = match build_domain_change_batch(&planned_write) {
-        Ok(domain_change_batches) => domain_change_batches,
-        Err(error) => {
-            if let Some(error) = public_write_preparation_error(&canonicalized, &error.message) {
-                return Err(error);
-            }
-            return Ok(None);
-        }
-    };
-    let commit_preconditions = match derive_commit_preconditions(backend, &planned_write).await {
-        Ok(commit_preconditions) => commit_preconditions,
-        Err(error) => {
-            if let Some(error) = public_write_preparation_error(&canonicalized, &error.message) {
-                return Err(error);
-            }
-            return Ok(None);
-        }
-    };
-    planned_write.commit_preconditions = commit_preconditions.clone();
     write_analysis.planned_write = planned_write.clone();
     let write_logical_plan = write_analysis.logical_plan();
     verify_logical_plan(&LogicalPlan::PublicWrite(write_logical_plan)).map_err(|error| {
@@ -1268,40 +1244,34 @@ where
             ),
         )
     })?;
-    let invariant_trace = Some(build_public_write_invariant_trace(&planned_write));
-    let execution = build_public_write_execution(
-        &planned_write,
-        &domain_change_batches,
-        &commit_preconditions,
-    )?
-    .ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public write target must route through explicit public materialization",
-        )
-    })?;
-    stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
+    let explain_plan = PreparedPublicWriteExplainPlan {
+        request: explain_request.clone(),
+        semantics: write_analysis.semantics.clone(),
+        stage_timings: stage_timings.finish(),
+    };
+    let execution = PreparedPublicWriteExecution::Noop;
     let explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
         request: explain_request,
         semantics: write_analysis.semantics.clone(),
         planned_write: planned_write.clone(),
         execution: execution.clone(),
-        domain_change_batches: domain_change_batches.clone(),
-        invariant_trace: invariant_trace.clone(),
-        stage_timings: stage_timings.finish(),
+        domain_change_batches: Vec::new(),
+        invariant_trace: Some(build_public_write_invariant_trace(&planned_write)),
+        stage_timings: explain_plan.stage_timings.clone(),
     });
 
     Ok(Some(PreparedPublicWrite {
         explain,
         planned_write,
-        domain_change_batches,
+        explain_plan,
+        domain_change_batches: Vec::new(),
         surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
         execution,
         canonicalized: canonicalized.clone(),
     }))
 }
 
-fn build_public_write_execution(
+pub(crate) fn build_public_write_execution(
     planned_write: &PlannedWrite,
     domain_change_batches: &[DomainChangeBatch],
     commit_preconditions: &[CommitPreconditions],
@@ -1653,14 +1623,14 @@ fn planned_row_optional_json_text_value<'a>(
     }
 }
 
-fn public_authoritative_write_error(
+pub(crate) fn public_authoritative_write_error(
     canonicalized: &CanonicalizedWrite,
     message: String,
 ) -> Option<LixError> {
     public_write_preparation_error(canonicalized, &message)
 }
 
-fn public_write_preparation_error(
+pub(crate) fn public_write_preparation_error(
     canonicalized: &CanonicalizedWrite,
     message: &str,
 ) -> Option<LixError> {
@@ -1822,7 +1792,9 @@ fn public_filesystem_write_error(target_name: &str, message: &str) -> LixError {
     )
 }
 
-fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWriteInvariantTrace {
+pub(crate) fn build_public_write_invariant_trace(
+    planned_write: &PlannedWrite,
+) -> PublicWriteInvariantTrace {
     let mut batch_local_checks = Vec::new();
     let mut commit_time_checks = vec![
         "write_lane.head_precondition".to_string(),
@@ -1892,15 +1864,17 @@ fn build_public_write_invariant_trace(planned_write: &PlannedWrite) -> PublicWri
 #[cfg(test)]
 mod tests {
     use super::{
-        execute_prepared_public_read, prepare_public_execution, prepare_public_read,
-        prepare_public_read_strict, PreparedPublicExecution, PreparedPublicReadExecution,
+        prepare_public_execution, prepare_public_read, prepare_public_read_strict,
+        PreparedPublicExecution, PreparedPublicReadExecution,
     };
     use crate::contracts::artifacts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
     use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
     use crate::live_state::{self, mark_mode_with_backend};
+    use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
     use crate::schema::builtin::types::LixCommit;
+    use crate::sql::prepare::prepare_public_read_artifact;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
@@ -1919,7 +1893,7 @@ mod tests {
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_snapshot_content,
     };
-    use crate::{LixBackend, LixError, QueryResult, Session, SqlDialect, Value};
+    use crate::{LixBackend, LixError, Session, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
     use sqlparser::ast::Statement;
@@ -1957,7 +1931,11 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+        async fn execute(
+            &self,
+            sql: &str,
+            _params: &[Value],
+        ) -> Result<crate::QueryResult, LixError> {
             if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
                 self.registered_schema_query_count
                     .fetch_add(1, Ordering::SeqCst);
@@ -1993,7 +1971,7 @@ mod tests {
                     })
                     .filter(|row| !row.is_empty())
                     .collect::<Vec<_>>();
-                return Ok(QueryResult {
+                return Ok(crate::QueryResult {
                     rows,
                     columns: if sql.contains("SELECT schema_version, snapshot_content") {
                         vec!["schema_version".to_string(), "snapshot_content".to_string()]
@@ -2003,12 +1981,12 @@ mod tests {
                 });
             }
             if sql.contains("FROM lix_internal_workspace_metadata") {
-                return Ok(QueryResult {
+                return Ok(crate::QueryResult {
                     rows: Vec::new(),
                     columns: vec!["value".to_string()],
                 });
             }
-            Ok(QueryResult {
+            Ok(crate::QueryResult {
                 rows: Vec::new(),
                 columns: Vec::new(),
             })
@@ -2248,7 +2226,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_only_lix_version_read_matches_current_admin_sql_through_public_runtime() {
+    fn descriptor_only_lix_version_read_matches_current_admin_sql_through_public_surface_preparation(
+    ) {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2288,12 +2267,15 @@ mod tests {
                     ));
                     assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
 
-                    let actual = execute_prepared_public_read(&backend, &prepared)
-                        .await
-                        .expect("descriptor-only lix_version read should execute");
+                    let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
+                        .expect("descriptor-only lix_version read should convert");
+                    let actual =
+                        execute_prepared_public_read_artifact_with_backend(&backend, &artifact)
+                            .await
+                            .expect("descriptor-only lix_version read should execute");
                     assert_eq!(
                         actual,
-                        QueryResult {
+                        crate::QueryResult {
                             columns: vec![
                                 "id".to_string(),
                                 "name".to_string(),
@@ -2313,7 +2295,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_and_ref_lix_version_read_matches_current_admin_sql_through_public_runtime() {
+    fn descriptor_and_ref_lix_version_read_matches_current_admin_sql_through_public_surface_preparation(
+    ) {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2353,12 +2336,15 @@ mod tests {
                     ));
                     assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
 
-                    let actual = execute_prepared_public_read(&backend, &prepared)
-                        .await
-                        .expect("descriptor+ref lix_version read should execute");
+                    let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
+                        .expect("descriptor+ref lix_version read should convert");
+                    let actual =
+                        execute_prepared_public_read_artifact_with_backend(&backend, &artifact)
+                            .await
+                            .expect("descriptor+ref lix_version read should execute");
                     assert_eq!(
                         actual,
-                        QueryResult {
+                        crate::QueryResult {
                             columns: vec![
                                 "id".to_string(),
                                 "name".to_string(),
@@ -2378,7 +2364,8 @@ mod tests {
     }
 
     #[test]
-    fn multi_version_lix_version_read_matches_current_admin_sql_through_public_runtime() {
+    fn multi_version_lix_version_read_matches_current_admin_sql_through_public_surface_preparation()
+    {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2433,12 +2420,17 @@ mod tests {
                     ));
                     assert!(prepared.explain.executor_artifacts.lowered_sql.is_empty());
 
-                    let actual = execute_prepared_public_read(&backend, &prepared)
-                        .await
-                        .expect("multi-version lix_version read should execute");
+                    let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
+                        .expect("multi-version lix_version read should convert");
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &artifact,
+                    )
+                    .await
+                    .expect("multi-version lix_version read should execute");
                     assert_eq!(
                         actual,
-                        QueryResult {
+                        crate::QueryResult {
                             columns: vec![
                                 "id".to_string(),
                                 "name".to_string(),

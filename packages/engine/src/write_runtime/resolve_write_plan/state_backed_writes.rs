@@ -35,7 +35,9 @@ async fn query_entity_selector_rows(
     let query_result = execute_public_selector_query_strict(
         hydrator.backend(),
         planned_write,
-        hydrator.pending_transaction_view(),
+        hydrator
+            .pending_state_overlay()
+            .map(|overlay| overlay.as_pending_view()),
         build_public_selector_query(
             &planned_write.command.target.descriptor.public_name,
             &selector,
@@ -85,7 +87,9 @@ async fn query_state_selector_rows(
     let query_result = execute_public_selector_query_strict(
         hydrator.backend(),
         planned_write,
-        hydrator.pending_transaction_view(),
+        hydrator
+            .pending_state_overlay()
+            .map(|overlay| overlay.as_pending_view()),
         build_public_selector_query(
             &planned_write.command.target.descriptor.public_name,
             &selector,

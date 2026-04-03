@@ -6,12 +6,12 @@ use crate::filesystem::runtime::{
     merge_filesystem_transaction_state, resolve_binary_blob_writes_in_transaction,
 };
 use crate::runtime::TransactionBackendAdapter;
-use crate::sql::executor::execution_program::ExecutionContext;
-use crate::sql::executor::{
+use crate::session::execution_context::ExecutionContext;
+use crate::sql::physical_plan::PublicWriteExecutionPartition;
+use crate::sql::prepare::{
     apply_public_surface_registry_mutations, prepared_execution_mutates_public_surface_registry,
     public_surface_registry_mutations, CompiledExecution, PreparedPublicWrite,
 };
-use crate::sql::physical_plan::PublicWriteExecutionPartition;
 use crate::write_runtime::buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
 };

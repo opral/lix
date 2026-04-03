@@ -387,8 +387,8 @@ mod tests {
     use crate::sql::logical_plan::public_ir::WriteLane;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
-    use crate::sql::semantic_ir::semantics::write_resolver::resolve_write_plan;
     use crate::sql::semantic_ir::ExecutionContext;
+    use crate::write_runtime::resolve_write_plan;
     use crate::{CreateVersionOptions, Value};
 
     async fn planned_write_with_params(

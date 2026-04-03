@@ -30,15 +30,22 @@ pub(crate) struct ExecutionRuntimeState {
 }
 
 impl ExecutionRuntimeState {
+    pub(crate) fn from_prepared_parts(
+        settings: DeterministicSettings,
+        functions: SharedFunctionProvider<RuntimeFunctionProvider>,
+    ) -> Self {
+        Self {
+            settings,
+            functions,
+        }
+    }
+
     pub(crate) async fn prepare(
         host: &dyn RuntimeHost,
         backend: &dyn LixBackend,
     ) -> Result<Self, LixError> {
         let (settings, functions) = host.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(Self {
-            settings,
-            functions,
-        })
+        Ok(Self::from_prepared_parts(settings, functions))
     }
 
     pub(crate) fn settings(&self) -> DeterministicSettings {

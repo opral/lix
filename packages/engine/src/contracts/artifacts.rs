@@ -3,10 +3,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::backend::prepared::PreparedStatement;
-use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::contracts::surface::{
+    SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
+};
 use crate::runtime::streams::StateCommitStreamChange;
-use crate::{CommittedVersionFrontier, LixError, ReplayCursor, Value};
+use crate::{CommittedVersionFrontier, LixError, QueryResult, ReplayCursor, Value};
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
@@ -442,6 +444,414 @@ pub(crate) struct ReadTimeProjectionReadQuery {
 pub(crate) struct ReadTimeProjectionRead {
     pub(crate) surface: ReadTimeProjectionSurface,
     pub(crate) query: ReadTimeProjectionReadQuery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectPublicReadKind {
+    StateHistory,
+    EntityHistory,
+    FileHistory,
+    DirectoryHistory,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectStateHistoryField {
+    EntityId,
+    SchemaKey,
+    FileId,
+    PluginKey,
+    SnapshotContent,
+    Metadata,
+    SchemaVersion,
+    ChangeId,
+    CommitId,
+    CommitCreatedAt,
+    RootCommitId,
+    Depth,
+    VersionId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedStateHistoryAggregate {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedStateHistoryProjectionValue {
+    Field(PreparedDirectStateHistoryField),
+    Aggregate(PreparedStateHistoryAggregate),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedStateHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) value: PreparedStateHistoryProjectionValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedStateHistorySortValue {
+    Field(PreparedDirectStateHistoryField),
+    Aggregate(PreparedStateHistoryAggregate),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedStateHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) value: Option<PreparedStateHistorySortValue>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedStateHistoryPredicate {
+    Eq(PreparedDirectStateHistoryField, Value),
+    NotEq(PreparedDirectStateHistoryField, Value),
+    Gt(PreparedDirectStateHistoryField, Value),
+    GtEq(PreparedDirectStateHistoryField, Value),
+    Lt(PreparedDirectStateHistoryField, Value),
+    LtEq(PreparedDirectStateHistoryField, Value),
+    In(PreparedDirectStateHistoryField, Vec<Value>),
+    IsNull(PreparedDirectStateHistoryField),
+    IsNotNull(PreparedDirectStateHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedStateHistoryAggregatePredicate {
+    Eq(PreparedStateHistoryAggregate, i64),
+    NotEq(PreparedStateHistoryAggregate, i64),
+    Gt(PreparedStateHistoryAggregate, i64),
+    GtEq(PreparedStateHistoryAggregate, i64),
+    Lt(PreparedStateHistoryAggregate, i64),
+    LtEq(PreparedStateHistoryAggregate, i64),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedStateHistoryDirectReadPlan {
+    pub(crate) request: StateHistoryRequest,
+    pub(crate) predicates: Vec<PreparedStateHistoryPredicate>,
+    pub(crate) projections: Vec<PreparedStateHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) group_by_fields: Vec<PreparedDirectStateHistoryField>,
+    pub(crate) having: Option<PreparedStateHistoryAggregatePredicate>,
+    pub(crate) sort_keys: Vec<PreparedStateHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectEntityHistoryField {
+    Property(String),
+    State(PreparedDirectStateHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedEntityHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: PreparedDirectEntityHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedEntityHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<PreparedDirectEntityHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedEntityHistoryPredicate {
+    Eq(PreparedDirectEntityHistoryField, Value),
+    NotEq(PreparedDirectEntityHistoryField, Value),
+    Gt(PreparedDirectEntityHistoryField, Value),
+    GtEq(PreparedDirectEntityHistoryField, Value),
+    Lt(PreparedDirectEntityHistoryField, Value),
+    LtEq(PreparedDirectEntityHistoryField, Value),
+    In(PreparedDirectEntityHistoryField, Vec<Value>),
+    IsNull(PreparedDirectEntityHistoryField),
+    IsNotNull(PreparedDirectEntityHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedEntityHistoryDirectReadPlan {
+    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) request: StateHistoryRequest,
+    pub(crate) predicates: Vec<PreparedEntityHistoryPredicate>,
+    pub(crate) projections: Vec<PreparedEntityHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<PreparedEntityHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectFileHistoryField {
+    Id,
+    Path,
+    Data,
+    Metadata,
+    Hidden,
+    EntityId,
+    SchemaKey,
+    FileId,
+    VersionId,
+    PluginKey,
+    SchemaVersion,
+    ChangeId,
+    LixcolMetadata,
+    CommitId,
+    CommitCreatedAt,
+    RootCommitId,
+    Depth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedFileHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: PreparedDirectFileHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedFileHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<PreparedDirectFileHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedFileHistoryPredicate {
+    Eq(PreparedDirectFileHistoryField, Value),
+    NotEq(PreparedDirectFileHistoryField, Value),
+    Gt(PreparedDirectFileHistoryField, Value),
+    GtEq(PreparedDirectFileHistoryField, Value),
+    Lt(PreparedDirectFileHistoryField, Value),
+    LtEq(PreparedDirectFileHistoryField, Value),
+    In(PreparedDirectFileHistoryField, Vec<Value>),
+    IsNull(PreparedDirectFileHistoryField),
+    IsNotNull(PreparedDirectFileHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedFileHistoryAggregate {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedFileHistoryDirectReadPlan {
+    pub(crate) request: FileHistoryRequest,
+    pub(crate) predicates: Vec<PreparedFileHistoryPredicate>,
+    pub(crate) projections: Vec<PreparedFileHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<PreparedFileHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+    pub(crate) aggregate: Option<PreparedFileHistoryAggregate>,
+    pub(crate) aggregate_output_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectDirectoryHistoryField {
+    Id,
+    ParentId,
+    Name,
+    Path,
+    Hidden,
+    EntityId,
+    SchemaKey,
+    FileId,
+    VersionId,
+    PluginKey,
+    SchemaVersion,
+    ChangeId,
+    LixcolMetadata,
+    CommitId,
+    CommitCreatedAt,
+    RootCommitId,
+    Depth,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedDirectoryHistoryProjection {
+    pub(crate) output_name: String,
+    pub(crate) field: PreparedDirectDirectoryHistoryField,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedDirectoryHistorySortKey {
+    pub(crate) output_name: String,
+    pub(crate) field: Option<PreparedDirectDirectoryHistoryField>,
+    pub(crate) descending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectoryHistoryPredicate {
+    Eq(PreparedDirectDirectoryHistoryField, Value),
+    NotEq(PreparedDirectDirectoryHistoryField, Value),
+    Gt(PreparedDirectDirectoryHistoryField, Value),
+    GtEq(PreparedDirectDirectoryHistoryField, Value),
+    Lt(PreparedDirectDirectoryHistoryField, Value),
+    LtEq(PreparedDirectDirectoryHistoryField, Value),
+    In(PreparedDirectDirectoryHistoryField, Vec<Value>),
+    IsNull(PreparedDirectDirectoryHistoryField),
+    IsNotNull(PreparedDirectDirectoryHistoryField),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectoryHistoryAggregate {
+    Count,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedDirectoryHistoryDirectReadPlan {
+    pub(crate) request: DirectoryHistoryRequest,
+    pub(crate) predicates: Vec<PreparedDirectoryHistoryPredicate>,
+    pub(crate) projections: Vec<PreparedDirectoryHistoryProjection>,
+    pub(crate) wildcard_projection: bool,
+    pub(crate) wildcard_columns: Vec<String>,
+    pub(crate) sort_keys: Vec<PreparedDirectoryHistorySortKey>,
+    pub(crate) limit: Option<u64>,
+    pub(crate) offset: u64,
+    pub(crate) aggregate: Option<PreparedDirectoryHistoryAggregate>,
+    pub(crate) aggregate_output_name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedDirectPublicRead {
+    StateHistory(PreparedStateHistoryDirectReadPlan),
+    EntityHistory(PreparedEntityHistoryDirectReadPlan),
+    FileHistory(PreparedFileHistoryDirectReadPlan),
+    DirectoryHistory(PreparedDirectoryHistoryDirectReadPlan),
+}
+
+#[allow(dead_code)]
+impl PreparedDirectPublicRead {
+    pub(crate) fn kind(&self) -> PreparedDirectPublicReadKind {
+        match self {
+            Self::StateHistory(_) => PreparedDirectPublicReadKind::StateHistory,
+            Self::EntityHistory(_) => PreparedDirectPublicReadKind::EntityHistory,
+            Self::FileHistory(_) => PreparedDirectPublicReadKind::FileHistory,
+            Self::DirectoryHistory(_) => PreparedDirectPublicReadKind::DirectoryHistory,
+        }
+    }
+}
+
+/// Runtime-neutral execution artifact for a prepared public read.
+///
+/// This intentionally stays on contract-owned DTOs. It does not depend on
+/// SQL AST, binder output, logical-plan IR, or executor-private wrapper types.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedPublicReadExecutionArtifact {
+    ReadTimeProjection(ReadTimeProjectionRead),
+    LoweredSql(PreparedBatch),
+    Direct(PreparedDirectPublicRead),
+}
+
+/// Runtime-neutral prepared public-read package.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedPublicReadArtifact {
+    pub(crate) contract: PreparedPublicReadContract,
+    pub(crate) freshness_contract: SurfaceReadFreshness,
+    pub(crate) surface_bindings: Vec<String>,
+    pub(crate) public_output_columns: Option<Vec<String>>,
+    pub(crate) execution: PreparedPublicReadExecutionArtifact,
+}
+
+/// Runtime-neutral prepared internal-read package.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedInternalReadArtifact {
+    pub(crate) prepared_batch: PreparedBatch,
+    pub(crate) result_contract: ResultContract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedExplainMode {
+    Plain,
+    Analyze,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct PreparedAnalyzedRuntime {
+    pub(crate) execution_duration_us: u64,
+    pub(crate) output_row_count: usize,
+    pub(crate) output_column_count: usize,
+    #[serde(default)]
+    pub(crate) output_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[allow(dead_code)]
+pub(crate) enum PreparedAnalyzedExplainTemplate {
+    Text { sections: Vec<(String, String)> },
+    Json { base_json: JsonValue },
+}
+
+/// Diagnostic context handed to read runtime alongside a prepared read step.
+///
+/// The context is intentionally text-shaped so runtime can report/normalize
+/// errors and route explain behavior without importing parser/executor-private
+/// statement types.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[allow(dead_code)]
+pub(crate) struct ReadDiagnosticContext {
+    pub(crate) source_sql: Vec<String>,
+    pub(crate) explain_mode: Option<PreparedExplainMode>,
+    pub(crate) plain_explain_result: Option<QueryResult>,
+    pub(crate) analyzed_explain_template: Option<PreparedAnalyzedExplainTemplate>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedReadArtifact {
+    Public(PreparedPublicReadArtifact),
+    Internal(PreparedInternalReadArtifact),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedReadStep {
+    pub(crate) transaction_mode: crate::TransactionMode,
+    pub(crate) artifact: PreparedReadArtifact,
+    pub(crate) diagnostic_context: ReadDiagnosticContext,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedReadProgram {
+    pub(crate) transaction_mode: crate::TransactionMode,
+    pub(crate) steps: Vec<PreparedReadStep>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -897,6 +1307,22 @@ pub(crate) struct UpdateValidationPlan {
     pub(crate) where_clause: Option<Expr>,
     pub(crate) snapshot_content: Option<JsonValue>,
     pub(crate) snapshot_patch: Option<BTreeMap<String, JsonValue>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UpdateValidationInputRow {
+    pub(crate) entity_id: String,
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) schema_version: String,
+    pub(crate) base_snapshot: JsonValue,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UpdateValidationInput {
+    pub(crate) plan: UpdateValidationPlan,
+    pub(crate) rows: Vec<UpdateValidationInputRow>,
 }
 
 #[derive(Debug, Clone)]
@@ -1596,12 +2022,18 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        DerivedRow, ProjectionHydratedRow, ProjectionInput, ProjectionInputRows,
+        DerivedRow, FileHistoryRequest, PreparedDirectPublicRead, PreparedExplainMode,
+        PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
+        PreparedPublicReadArtifact, PreparedPublicReadContract,
+        PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
+        PreparedReadStep, ProjectionHydratedRow, ProjectionInput, ProjectionInputRows,
         ProjectionInputSpec, ProjectionLifecycle, ProjectionRegistration, ProjectionStorageKind,
-        ProjectionSurfaceSpec, ReadTimeProjectionRead, ReadTimeProjectionReadQuery,
-        ReadTimeProjectionSurface, RowIdentity, TrackedRow, UntrackedRow,
+        ProjectionSurfaceSpec, ReadDiagnosticContext, ReadTimeProjectionRead,
+        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, ResultContract, RowIdentity,
+        TrackedRow, UntrackedRow,
     };
-    use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+    use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+    use crate::contracts::surface::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
     use crate::Value;
 
     #[test]
@@ -1779,6 +2211,154 @@ mod tests {
         assert_eq!(artifact.query.filters.len(), 1);
         assert_eq!(artifact.query.order_by.len(), 1);
         assert_eq!(artifact.query.limit, Some(10));
+    }
+
+    #[test]
+    fn prepared_public_read_artifact_stays_on_contract_dtos() {
+        let artifact = PreparedPublicReadArtifact {
+            contract: PreparedPublicReadContract {
+                committed_mode: super::CommittedReadMode::CommittedOnly,
+                pending_view_query: None,
+                result_columns: None,
+            },
+            freshness_contract: SurfaceReadFreshness::AllowsStaleProjection,
+            surface_bindings: vec!["lix_version".into()],
+            public_output_columns: None,
+            execution: PreparedPublicReadExecutionArtifact::ReadTimeProjection(
+                ReadTimeProjectionRead {
+                    surface: ReadTimeProjectionSurface::LixVersion,
+                    query: ReadTimeProjectionReadQuery {
+                        projections: vec![super::PendingViewProjection::Column {
+                            source_column: "id".into(),
+                            output_column: "id".into(),
+                        }],
+                        filters: vec![],
+                        order_by: vec![],
+                        limit: None,
+                    },
+                },
+            ),
+        };
+
+        match artifact.execution {
+            PreparedPublicReadExecutionArtifact::ReadTimeProjection(read) => {
+                assert_eq!(read.surface.public_name(), "lix_version");
+            }
+            _ => panic!("expected read-time projection execution artifact"),
+        }
+        assert_eq!(
+            artifact.contract.execution_mode(),
+            super::PublicReadExecutionMode::Committed(super::CommittedReadMode::CommittedOnly)
+        );
+    }
+
+    #[test]
+    fn prepared_internal_read_artifact_keeps_lowered_statements_runtime_neutral() {
+        let artifact = PreparedInternalReadArtifact {
+            prepared_batch: PreparedBatch {
+                steps: vec![PreparedStatement {
+                    sql: "SELECT 1".into(),
+                    params: vec![],
+                }],
+            },
+            result_contract: ResultContract::Select,
+        };
+
+        assert_eq!(artifact.prepared_batch.steps.len(), 1);
+        assert_eq!(artifact.prepared_batch.steps[0].sql, "SELECT 1");
+        assert_eq!(artifact.result_contract, ResultContract::Select);
+    }
+
+    #[test]
+    fn read_diagnostic_context_uses_text_and_explain_mode_not_statement_ast() {
+        let context = ReadDiagnosticContext {
+            source_sql: vec!["SELECT * FROM lix_version".into()],
+            explain_mode: Some(PreparedExplainMode::Analyze),
+            plain_explain_result: None,
+            analyzed_explain_template: None,
+        };
+
+        assert_eq!(context.source_sql, vec!["SELECT * FROM lix_version"]);
+        assert_eq!(context.explain_mode, Some(PreparedExplainMode::Analyze));
+    }
+
+    #[test]
+    fn prepared_read_program_wraps_public_or_internal_artifacts_with_diagnostics() {
+        let public_step = PreparedReadStep {
+            transaction_mode: crate::TransactionMode::Deferred,
+            artifact: PreparedReadArtifact::Public(PreparedPublicReadArtifact {
+                contract: PreparedPublicReadContract {
+                    committed_mode: super::CommittedReadMode::MaterializedState,
+                    pending_view_query: None,
+                    result_columns: None,
+                },
+                freshness_contract: SurfaceReadFreshness::RequiresFreshProjection,
+                surface_bindings: vec!["lix_file".into()],
+                public_output_columns: None,
+                execution: PreparedPublicReadExecutionArtifact::Direct(
+                    PreparedDirectPublicRead::FileHistory(PreparedFileHistoryDirectReadPlan {
+                        request: FileHistoryRequest::default(),
+                        predicates: Vec::new(),
+                        projections: Vec::new(),
+                        wildcard_projection: true,
+                        wildcard_columns: vec!["id".into()],
+                        sort_keys: Vec::new(),
+                        limit: None,
+                        offset: 0,
+                        aggregate: None,
+                        aggregate_output_name: None,
+                    }),
+                ),
+            }),
+            diagnostic_context: ReadDiagnosticContext {
+                source_sql: vec!["SELECT * FROM lix_file_history".into()],
+                explain_mode: Some(PreparedExplainMode::Plain),
+                plain_explain_result: None,
+                analyzed_explain_template: None,
+            },
+        };
+        let internal_step = PreparedReadStep {
+            transaction_mode: crate::TransactionMode::Read,
+            artifact: PreparedReadArtifact::Internal(PreparedInternalReadArtifact {
+                prepared_batch: PreparedBatch {
+                    steps: vec![PreparedStatement {
+                        sql: "SELECT 1".into(),
+                        params: vec![],
+                    }],
+                },
+                result_contract: ResultContract::Select,
+            }),
+            diagnostic_context: ReadDiagnosticContext {
+                source_sql: vec!["SELECT 1".into()],
+                explain_mode: None,
+                plain_explain_result: None,
+                analyzed_explain_template: None,
+            },
+        };
+        let program = PreparedReadProgram {
+            transaction_mode: crate::TransactionMode::Deferred,
+            steps: vec![public_step, internal_step],
+        };
+
+        assert_eq!(program.steps.len(), 2);
+        assert_eq!(program.transaction_mode, crate::TransactionMode::Deferred);
+        match &program.steps[0].artifact {
+            PreparedReadArtifact::Public(public) => match &public.execution {
+                PreparedPublicReadExecutionArtifact::Direct(
+                    PreparedDirectPublicRead::FileHistory(_),
+                ) => {
+                    assert_eq!(public.surface_bindings, vec!["lix_file".to_string()]);
+                }
+                _ => panic!("expected direct public read artifact"),
+            },
+            _ => panic!("expected public read step"),
+        }
+        match &program.steps[1].artifact {
+            PreparedReadArtifact::Internal(internal) => {
+                assert_eq!(internal.prepared_batch.steps[0].sql, "SELECT 1");
+            }
+            _ => panic!("expected internal read step"),
+        }
     }
 
     fn sample_tracked_row() -> TrackedRow {

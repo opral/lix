@@ -4,10 +4,10 @@ use crate::filesystem::runtime::{
     BinaryBlobWrite, FilesystemDescriptorState, FilesystemTransactionFileState,
     FilesystemTransactionState,
 };
-use crate::sql::executor::contracts::requirements::PlanRequirements;
 use crate::sql::logical_plan::public_ir::{
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
 };
+use crate::sql::prepare::contracts::requirements::PlanRequirements;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 

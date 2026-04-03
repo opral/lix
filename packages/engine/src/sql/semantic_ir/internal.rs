@@ -8,12 +8,12 @@ use crate::cel::CelEvaluator;
 use crate::functions::LixFunctionProvider;
 use crate::functions::SharedFunctionProvider;
 use crate::sql::ast::lowering::lower_statement;
-use crate::sql::executor::contracts::planned_statement::{
-    MutationRow, PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
-};
 use crate::sql::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::sql::internal::param_context::normalize_statement_placeholders_in_batch;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
+use crate::sql::prepare::contracts::planned_statement::{
+    MutationRow, PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
+};
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;

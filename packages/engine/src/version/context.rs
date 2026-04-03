@@ -212,6 +212,18 @@ pub(crate) async fn load_target_version_context_with_backend(
     load_version_context_with_executor(&mut executor, target).await
 }
 
+pub(crate) async fn load_target_version_history_root_commit_id_with_backend(
+    backend: &dyn LixBackend,
+    requested_version_id: Option<&str>,
+    field_name: &str,
+) -> Result<Option<String>, LixError> {
+    Ok(
+        load_target_version_context_with_backend(backend, requested_version_id, field_name)
+            .await?
+            .map(|context| context.history_root_commit_id().to_string()),
+    )
+}
+
 pub(crate) async fn require_version_context_pair_in_transaction(
     tx: &mut SessionTransaction<'_>,
     source_version_id: &str,

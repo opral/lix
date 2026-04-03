@@ -1,15 +1,15 @@
-use crate::contracts::traits::PendingView;
+use crate::cel::CelEvaluator;
+use crate::contracts::surface::SurfaceRegistry;
+use crate::contracts::traits::CompiledSchemaCache;
+use crate::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::functions::SharedFunctionProvider;
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::RuntimeHost;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
 };
 use crate::sql::physical_plan::PhysicalPlan;
-use crate::sql::semantic_ir::validation::{
-    validate_batch_local_write, validate_inserts, validate_updates,
-};
+use crate::sql::semantic_ir::validation::validate_inserts;
 use crate::{LixBackend, LixError, Value};
 use sqlparser::ast::Statement;
 use std::time::Duration;
@@ -27,9 +27,9 @@ use super::intent::{
     ExecutionIntent, IntentCollectionPolicy,
 };
 use super::preprocess::preprocess_with_surfaces_to_logical_plan;
-use super::public_runtime::{
+use super::public_surface::{
     finalize_public_write_execution, prepare_public_execution_with_internal_access_and_functions,
-    prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions,
+    prepare_public_execution_with_registry_context_and_functions,
     prepared_public_write_mutates_public_surface_registry,
     try_prepare_public_read_with_registry_and_internal_access,
     try_prepare_public_write_with_functions, try_prepare_public_write_with_registry_and_functions,
@@ -42,6 +42,66 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
     pub(crate) skip_side_effect_collection: bool,
+}
+
+pub(crate) trait SqlPreparationContext {
+    fn backend(&self) -> &dyn LixBackend;
+
+    fn cel_evaluator(&self) -> &CelEvaluator;
+
+    fn schema_cache(&self) -> &dyn CompiledSchemaCache;
+
+    fn deterministic_settings(&self) -> DeterministicSettings;
+
+    fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider>;
+
+    fn active_history_root_commit_id(&self) -> Option<&str> {
+        None
+    }
+
+    fn public_surface_registry_override(&self) -> Option<&SurfaceRegistry> {
+        None
+    }
+}
+
+pub(crate) struct DefaultSqlPreparationContext<'a> {
+    pub(crate) backend: &'a dyn LixBackend,
+    pub(crate) cel_evaluator: &'a CelEvaluator,
+    pub(crate) schema_cache: &'a dyn CompiledSchemaCache,
+    pub(crate) deterministic_settings: DeterministicSettings,
+    pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) active_history_root_commit_id: Option<&'a str>,
+    pub(crate) public_surface_registry_override: Option<&'a SurfaceRegistry>,
+}
+
+impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
+    fn backend(&self) -> &dyn LixBackend {
+        self.backend
+    }
+
+    fn cel_evaluator(&self) -> &CelEvaluator {
+        self.cel_evaluator
+    }
+
+    fn schema_cache(&self) -> &dyn CompiledSchemaCache {
+        self.schema_cache
+    }
+
+    fn deterministic_settings(&self) -> DeterministicSettings {
+        self.deterministic_settings
+    }
+
+    fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider> {
+        self.functions
+    }
+
+    fn active_history_root_commit_id(&self) -> Option<&str> {
+        self.active_history_root_commit_id
+    }
+
+    fn public_surface_registry_override(&self) -> Option<&SurfaceRegistry> {
+        self.public_surface_registry_override
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -80,31 +140,19 @@ pub(crate) fn prepared_execution_mutates_public_surface_registry(
     Ok(false)
 }
 
-async fn compile_execution_with_backend(
-    runtime_host: &dyn RuntimeHost,
-    backend: &dyn LixBackend,
-    pending_transaction_view: Option<&dyn PendingView>,
+async fn compile_execution_with_context(
+    preparation_context: &dyn SqlPreparationContext,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
     policy: PreparationPolicy,
-    runtime_state: Option<&ExecutionRuntimeState>,
     static_artifacts: StaticCompilationArtifacts<'_>,
 ) -> Result<CompiledExecution, LixError> {
-    let owned_runtime_state = match runtime_state {
-        Some(_) => None,
-        None => Some(ExecutionRuntimeState::prepare(runtime_host, backend).await?),
-    };
-    let runtime_state = runtime_state.unwrap_or_else(|| {
-        owned_runtime_state
-            .as_ref()
-            .expect("owned runtime state should exist when no caller-owned state is provided")
-    });
-    let functions = runtime_state.provider().clone();
+    let backend = preparation_context.backend();
+    let functions = preparation_context.functions().clone();
 
     let mut statements = parsed_statements.to_vec();
     crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
@@ -124,17 +172,16 @@ async fn compile_execution_with_backend(
 
     let public_execution = prepare_public_execution_for_compile(
         backend,
-        pending_transaction_view,
         &statements,
         params,
         active_version_id,
+        preparation_context.active_history_root_commit_id(),
         active_account_ids,
         writer_key,
         allow_internal_tables,
-        public_surface_registry_override,
+        preparation_context.public_surface_registry_override(),
         static_artifacts.parse_duration,
         static_artifacts.ownership_hint,
-        functions.clone(),
     )
     .await?;
     let (public_read, mut public_write) = match public_execution {
@@ -220,7 +267,7 @@ async fn compile_execution_with_backend(
         let internal_logical_planning_started = Instant::now();
         let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
             backend,
-            runtime_host.cel_evaluator(),
+            preparation_context.cel_evaluator(),
             internal_source_statements,
             params,
             functions.clone(),
@@ -241,33 +288,20 @@ async fn compile_execution_with_backend(
         validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
 
         if !preprocess.mutations.is_empty() {
-            validate_inserts(backend, runtime_host.schema_cache(), &preprocess.mutations)
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "prepare_execution_with_backend insert validation failed: {}",
-                        error.description
-                    ),
-                })?;
-        }
-        if !preprocess.update_validations.is_empty() {
-            validate_updates(
+            validate_inserts(
                 backend,
-                runtime_host.schema_cache(),
-                &preprocess.update_validations,
-                params,
+                preparation_context.schema_cache(),
+                &preprocess.mutations,
             )
             .await
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "prepare_execution_with_backend update validation failed: {}",
+                    "prepare_execution_with_backend insert validation failed: {}",
                     error.description
                 ),
             })?;
         }
-
         let effects = derive_plan_effects(&preprocess, writer_key).map_err(LixError::from)?;
         let internal_execution = CompiledInternalExecution {
             prepared_statements: preprocess.prepared_statements,
@@ -292,22 +326,6 @@ async fn compile_execution_with_backend(
         }
         (effects, Some(internal_execution))
     };
-
-    if let Some(public_write) = public_write.as_ref() {
-        validate_batch_local_write(
-            backend,
-            runtime_host.schema_cache(),
-            &public_write.planned_write,
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "prepare_execution_with_backend public batch-local validation failed: {}",
-                error.description
-            ),
-        })?;
-    }
 
     let body = match (public_read, public_write, internal_execution) {
         (Some(public_read), None, None) => CompiledExecutionBody::PublicRead(public_read),
@@ -353,7 +371,10 @@ async fn compile_execution_with_backend(
 
     Ok(CompiledExecution {
         intent,
-        runtime_state: runtime_state.clone(),
+        runtime_state: ExecutionRuntimeState::from_prepared_parts(
+            preparation_context.deterministic_settings(),
+            functions,
+        ),
         physical_plan,
         explain,
         result_contract,
@@ -365,17 +386,16 @@ async fn compile_execution_with_backend(
 
 async fn prepare_public_execution_for_compile(
     backend: &dyn LixBackend,
-    pending_transaction_view: Option<&dyn PendingView>,
     statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
+    active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
     parse_duration: Option<Duration>,
     ownership_hint: Option<StatementTemplateOwnership>,
-    functions: SharedFunctionProvider<crate::deterministic_mode::RuntimeFunctionProvider>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
     let prepared = match ownership_hint {
         Some(StatementTemplateOwnership::PublicRead) => match public_surface_registry_override {
@@ -385,24 +405,27 @@ async fn prepare_public_execution_for_compile(
                 statements,
                 params,
                 active_version_id,
+                active_history_root_commit_id,
                 writer_key,
                 allow_internal_tables,
                 parse_duration,
             )
             .await?
             .map(PreparedPublicExecution::Read),
-            None => prepare_public_execution_with_internal_access_and_functions(
-                backend,
-                statements,
-                params,
-                active_version_id,
-                active_account_ids,
-                writer_key,
-                allow_internal_tables,
-                parse_duration,
-                functions.clone(),
-            )
-            .await?,
+            None => {
+                prepare_public_execution_with_internal_access_and_functions(
+                    backend,
+                    statements,
+                    params,
+                    active_version_id,
+                    active_history_root_commit_id,
+                    active_account_ids,
+                    writer_key,
+                    allow_internal_tables,
+                    parse_duration,
+                )
+                .await?
+            }
         },
         Some(StatementTemplateOwnership::PublicWrite) => match public_surface_registry_override {
             Some(registry) => try_prepare_public_write_with_registry_and_functions(
@@ -413,9 +436,7 @@ async fn prepare_public_execution_for_compile(
                 active_version_id,
                 active_account_ids,
                 writer_key,
-                pending_transaction_view,
                 parse_duration,
-                functions.clone(),
             )
             .await?
             .map(PreparedPublicExecution::Write),
@@ -427,7 +448,6 @@ async fn prepare_public_execution_for_compile(
                 active_account_ids,
                 writer_key,
                 parse_duration,
-                functions.clone(),
             )
             .await?
             .map(PreparedPublicExecution::Write),
@@ -435,18 +455,17 @@ async fn prepare_public_execution_for_compile(
         Some(StatementTemplateOwnership::Internal) => None,
         None => match public_surface_registry_override {
             Some(registry) => {
-                prepare_public_execution_with_registry_and_internal_access_and_pending_transaction_view_and_functions(
+                prepare_public_execution_with_registry_context_and_functions(
                     backend,
                     registry,
                     statements,
                     params,
                     active_version_id,
+                    active_history_root_commit_id,
                     active_account_ids,
                     writer_key,
                     allow_internal_tables,
-                    pending_transaction_view,
                     parse_duration,
-                    functions.clone(),
                 )
                 .await?
             }
@@ -456,11 +475,11 @@ async fn prepare_public_execution_for_compile(
                     statements,
                     params,
                     active_version_id,
+                    active_history_root_commit_id,
                     active_account_ids,
                     writer_key,
                     allow_internal_tables,
                     parse_duration,
-                    functions.clone(),
                 )
                 .await?
             }
@@ -481,32 +500,24 @@ async fn prepare_public_execution_for_compile(
     Ok(prepared)
 }
 
-pub(crate) async fn compile_execution_from_template_instance_with_backend(
-    runtime_host: &dyn RuntimeHost,
-    backend: &dyn LixBackend,
-    pending_transaction_view: Option<&dyn PendingView>,
+pub(crate) async fn compile_execution_from_template_instance_with_context(
+    preparation_context: &dyn SqlPreparationContext,
     template_instance: &BoundStatementTemplateInstance,
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
     allow_internal_tables: bool,
-    public_surface_registry_override: Option<&crate::contracts::surface::SurfaceRegistry>,
-    runtime_state: Option<&ExecutionRuntimeState>,
     policy: PreparationPolicy,
 ) -> Result<CompiledExecution, LixError> {
-    compile_execution_with_backend(
-        runtime_host,
-        backend,
-        pending_transaction_view,
+    compile_execution_with_context(
+        preparation_context,
         std::slice::from_ref(template_instance.statement()),
         template_instance.params(),
         active_version_id,
         active_account_ids,
         writer_key,
         allow_internal_tables,
-        public_surface_registry_override,
         policy,
-        runtime_state,
         StaticCompilationArtifacts {
             parse_duration: template_instance.parse_duration(),
             ownership_hint: template_instance.ownership_hint(),
@@ -518,14 +529,14 @@ pub(crate) async fn compile_execution_from_template_instance_with_backend(
 
 fn derived_public_execution_intent(
     prepared: &PreparedPublicWrite,
-) -> crate::sql::executor::intent::ExecutionIntent {
+) -> crate::sql::prepare::intent::ExecutionIntent {
     let Some(resolved) = prepared.planned_write.resolved_write_plan.as_ref() else {
-        return crate::sql::executor::intent::ExecutionIntent {
+        return crate::sql::prepare::intent::ExecutionIntent {
             filesystem_state: Default::default(),
         };
     };
 
-    crate::sql::executor::intent::ExecutionIntent {
+    crate::sql::prepare::intent::ExecutionIntent {
         filesystem_state: filesystem_transaction_state_from_planned(&resolved.filesystem_state()),
     }
 }
