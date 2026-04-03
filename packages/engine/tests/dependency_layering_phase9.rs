@@ -9,7 +9,7 @@ struct ImportSite {
 }
 
 const READ_RUNTIME_FILE: &str = "src/read_runtime/mod.rs";
-const SPECIALIZED_PUBLIC_READ_FILE: &str = "src/sql/executor/public_runtime/read.rs";
+const SPECIALIZED_PUBLIC_READ_FILE: &str = "src/sql/prepare/public_surface/read.rs";
 
 const FORBIDDEN_READ_RUNTIME_IMPORTS: &[&str] = &[
     "crate::projections::version::",

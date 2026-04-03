@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::marker::PhantomData;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -353,36 +353,6 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
 ) -> LixError {
     crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
         .await
-}
-
-pub(crate) async fn normalize_sql_execution_error_from_source_sql_with_backend(
-    backend: &dyn LixBackend,
-    error: LixError,
-    source_sql: &[String],
-) -> LixError {
-    let mut statements = Vec::new();
-    for sql in source_sql {
-        match crate::sql::parser::parse_sql_statements(sql) {
-            Ok(mut parsed) => statements.append(&mut parsed),
-            Err(_) => {
-                return error;
-            }
-        }
-    }
-    normalize_sql_execution_error_with_backend(backend, error, &statements).await
-}
-
-pub(crate) fn direct_state_file_cache_refresh_targets(
-    mutations: &[MutationRow],
-) -> BTreeSet<(String, String)> {
-    mutations
-        .iter()
-        .filter(|mutation| !mutation.untracked)
-        .filter(|mutation| mutation.file_id != "lix")
-        .filter(|mutation| mutation.schema_key != "lix_file_descriptor")
-        .filter(|mutation| mutation.schema_key != "lix_directory_descriptor")
-        .map(|mutation| (mutation.file_id.clone(), mutation.version_id.clone()))
-        .collect()
 }
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.

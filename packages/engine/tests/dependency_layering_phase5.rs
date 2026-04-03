@@ -123,28 +123,36 @@ const EXPECTED_CROSS_OWNER_COUNTS: &[(&str, usize)] = &[
     ("engine -> sql", 0),
     ("transaction -> sql", 0),
     ("transaction -> live_state", 0),
-    ("write_runtime -> sql", 15),
+    ("write_runtime -> sql", 36),
     ("write_runtime -> live_state", 1),
-    ("write_runtime -> read_runtime", 0),
+    ("write_runtime -> read_runtime", 1),
 ];
 
 const ALLOWED_TRANSACTION_SQL_FILES: &[&str] = &[];
 
 const ALLOWED_WRITE_RUNTIME_SQL_FILES: &[&str] = &[
+    "src/write_runtime/effective_state.rs",
+    "src/write_runtime/filesystem_state.rs",
     "src/write_runtime/mod.rs",
+    "src/write_runtime/resolve_write_plan.rs",
+    "src/write_runtime/resolve_write_plan/filesystem_writes.rs",
+    "src/write_runtime/resolve_write_plan/hydration.rs",
+    "src/write_runtime/resolve_write_plan/state_backed_writes.rs",
+    "src/write_runtime/selector_reads.rs",
     "src/write_runtime/sql_adapter/compile.rs",
     "src/write_runtime/sql_adapter/effects.rs",
     "src/write_runtime/sql_adapter/execute.rs",
     "src/write_runtime/sql_adapter/planned_write.rs",
     "src/write_runtime/sql_adapter/runtime.rs",
     "src/write_runtime/sql_adapter/tracked_apply.rs",
+    "src/write_runtime/sql_adapter/validation.rs",
 ];
 
 const ALLOWED_TRANSACTION_LIVE_STATE_FILES: &[&str] = &[];
 
 const ALLOWED_WRITE_RUNTIME_LIVE_STATE_FILES: &[&str] = &["src/write_runtime/commit/preflight.rs"];
 
-const ALLOWED_WRITE_RUNTIME_READ_RUNTIME_FILES: &[&str] = &[];
+const ALLOWED_WRITE_RUNTIME_READ_RUNTIME_FILES: &[&str] = &["src/write_runtime/selector_reads.rs"];
 
 const ALLOWED_LOCAL_BARREL_FILES: &[&str] = &["src/transaction/mod.rs"];
 

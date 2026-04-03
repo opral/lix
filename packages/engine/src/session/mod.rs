@@ -21,7 +21,10 @@ use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, Sessi
 use crate::contracts::surface::SurfaceRegistry;
 use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
-use crate::read_runtime::execute_prepared_read_program_in_committed_read_transaction;
+use crate::read_runtime::{
+    compile_committed_read_program_with_context,
+    execute_prepared_read_program_in_committed_read_transaction,
+};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::{Runtime, TransactionBackendAdapter};
 use crate::session::execution_context::{
@@ -32,9 +35,7 @@ use crate::sql::internal::script::extract_explicit_transaction_script_from_state
 use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
 use crate::sql::prepare::execution_program::ExecutionProgram;
-use crate::sql::prepare::{
-    compile_committed_read_program_with_context, DefaultSqlPreparationContext,
-};
+use crate::sql::prepare::DefaultSqlPreparationContext;
 use crate::version::context::load_target_version_history_root_commit_id_with_backend;
 use crate::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
@@ -410,7 +411,6 @@ impl Session {
                     backend: self.runtime.backend().as_ref(),
                     cel_evaluator: self.runtime.cel_evaluator(),
                     schema_cache: self.runtime.schema_cache(),
-                    deterministic_settings: runtime_state.settings(),
                     functions: runtime_state.provider(),
                     active_history_root_commit_id: active_history_root_commit_id.as_deref(),
                     public_surface_registry_override: Some(&context.public_surface_registry),
@@ -462,7 +462,6 @@ impl Session {
                         backend: self.runtime.backend().as_ref(),
                         cel_evaluator: self.runtime.cel_evaluator(),
                         schema_cache: self.runtime.schema_cache(),
-                        deterministic_settings: runtime_state.settings(),
                         functions: runtime_state.provider(),
                         active_history_root_commit_id: active_history_root_commit_id.as_deref(),
                         public_surface_registry_override: Some(&context.public_surface_registry),
@@ -520,7 +519,6 @@ impl Session {
                             backend: &backend,
                             cel_evaluator: self.runtime.cel_evaluator(),
                             schema_cache: self.runtime.schema_cache(),
-                            deterministic_settings: runtime_state.settings(),
                             functions: runtime_state.provider(),
                             active_history_root_commit_id: active_history_root_commit_id.as_deref(),
                             public_surface_registry_override: Some(

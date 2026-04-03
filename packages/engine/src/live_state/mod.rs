@@ -39,7 +39,7 @@ mod query_contracts;
 pub(crate) mod raw;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
-mod storage;
+pub(crate) mod storage;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod tracked;

@@ -4,7 +4,7 @@ use super::schema::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     KEY_VALUE_GLOBAL_VERSION,
 };
-use crate::live_state::schema_access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
 use crate::text::escape_sql_string;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;

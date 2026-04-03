@@ -10,7 +10,6 @@ use crate::functions::LixFunctionProvider;
 use crate::runtime::{SchemaCache, TransactionBackendAdapter};
 use crate::sql::prepare::{
     semantic_plan_effects_from_domain_changes, state_commit_stream_operation, PreparedPublicWrite,
-    TrackedTxnUnit,
 };
 use crate::sql::semantic_ir::validation::validate_commit_time_write;
 use crate::write_runtime::commit::ProposedDomainChange;
@@ -23,6 +22,7 @@ use crate::write_runtime::commit::{
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::effects::mirror_public_registered_schema_bootstrap_rows;
+use super::planned_write::TrackedTxnUnit;
 use super::runtime::{empty_public_write_execution_outcome, SqlExecutionOutcome};
 
 struct PublicCommitInvariantChecker<'a> {

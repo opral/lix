@@ -1,23 +1,22 @@
 //! Explain stage ownership.
 //!
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
-//! and the final text/JSON rendering returned to callers.
+//! and compiler-owned explain payload/template generation.
 
 use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
 use crate::contracts::artifacts::{
     CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
-    FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope,
-    PreparedAnalyzedExplainTemplate, PublicDomainChange, ReadTimeProjectionRead, SemanticEffect,
-    SessionDependency, SessionStateDelta, StateHistoryContentMode, StateHistoryLineageScope,
-    StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
+    FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PreparedExplainTemplate,
+    PublicDomainChange, ReadTimeProjectionRead, SemanticEffect, SessionDependency,
+    SessionStateDelta, StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder,
+    StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
 };
-use crate::runtime::streams::StateCommitStreamChange;
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::logical_plan::direct_reads::{
@@ -76,6 +75,7 @@ use crate::sql::semantic_ir::{
     BoundPublicLeaf, PublicReadSemantics, PublicWriteInvariantTrace, PublicWriteSemantics,
     SemanticStatement,
 };
+use crate::state_commit_stream::StateCommitStreamChange;
 use crate::{LixError, Value};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
@@ -136,8 +136,8 @@ pub(crate) enum ExplainStage {
     CapabilityResolution,
     /// Lower logical plans into physical plans or lowered programs.
     PhysicalPlanning,
-    /// Prepare executor artifacts such as rendered backend SQL.
-    ExecutorPreparation,
+    /// Prepare compiled artifacts such as rendered backend SQL.
+    ArtifactPreparation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -153,17 +153,6 @@ pub(crate) struct ExplainAnalyzedRuntime {
     pub(crate) output_column_count: usize,
     #[serde(default)]
     pub(crate) output_columns: Vec<String>,
-}
-
-impl ExplainAnalyzedRuntime {
-    fn from_query_result(result: &crate::QueryResult, execution_duration: Duration) -> Self {
-        Self {
-            execution_duration_us: saturating_duration_us(execution_duration),
-            output_row_count: result.rows.len(),
-            output_column_count: result.columns.len(),
-            output_columns: result.columns.clone(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1777,7 +1766,7 @@ pub(crate) struct PlannedWriteSnapshot {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
-pub(crate) struct ExecutorExplainArtifacts {
+pub(crate) struct CompiledExplainArtifacts {
     #[serde(default)]
     pub(crate) bound_public_leaves: Vec<BoundPublicLeafSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1826,7 +1815,7 @@ pub(crate) struct ExplainArtifacts {
     pub(crate) optimized_logical_plan: Option<Box<ExplainLogicalPlanSnapshot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) physical_plan: Option<Box<ExplainPhysicalPlanSnapshot>>,
-    pub(crate) executor_artifacts: ExecutorExplainArtifacts,
+    pub(crate) compiled_artifacts: CompiledExplainArtifacts,
     #[serde(default)]
     pub(crate) routing_passes: Vec<RoutingPassTrace>,
     #[serde(default)]
@@ -1843,64 +1832,6 @@ impl ExplainArtifacts {
     pub(crate) fn requires_execution(&self) -> bool {
         self.request()
             .is_some_and(ExplainRequest::requires_execution)
-    }
-
-    pub(crate) fn render_query_result(&self) -> Result<crate::QueryResult, LixError> {
-        let Some(request) = self.request.as_ref() else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "explain rendering requires an explain request",
-            ));
-        };
-
-        match request.output_format() {
-            ExplainOutputFormat::Text => self.render_text_result(),
-            ExplainOutputFormat::Json => self.render_json_result(),
-        }
-    }
-
-    pub(crate) fn render_analyzed_query_result(
-        &self,
-        result: &crate::QueryResult,
-        execution_duration: Duration,
-    ) -> Result<crate::QueryResult, LixError> {
-        if !self.requires_execution() {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "analyzed explain rendering requires EXPLAIN ANALYZE",
-            ));
-        }
-
-        let mut analyzed = self.clone();
-        analyzed.analyzed_runtime = Some(ExplainAnalyzedRuntime::from_query_result(
-            result,
-            execution_duration,
-        ));
-        analyzed.render_query_result()
-    }
-
-    fn render_text_result(&self) -> Result<crate::QueryResult, LixError> {
-        let mut rows = Vec::new();
-        for (key, value) in self.text_sections()? {
-            rows.push(vec![Value::Text(key), Value::Text(value)]);
-        }
-        Ok(crate::QueryResult {
-            columns: vec!["explain_key".to_string(), "explain_value".to_string()],
-            rows,
-        })
-    }
-
-    fn render_json_result(&self) -> Result<crate::QueryResult, LixError> {
-        let explain_json = serde_json::to_value(self).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("failed to serialize explain output: {error}"),
-            )
-        })?;
-        Ok(crate::QueryResult {
-            columns: vec!["explain_json".to_string()],
-            rows: vec![vec![Value::Json(explain_json)]],
-        })
     }
 
     fn text_sections(&self) -> Result<Vec<(String, String)>, LixError> {
@@ -1934,8 +1865,8 @@ impl ExplainArtifacts {
             ));
         }
         sections.push((
-            "executor_artifacts".to_string(),
-            render_executor_artifacts_text(&self.executor_artifacts),
+            "compiled_artifacts".to_string(),
+            render_compiled_artifacts_text(&self.compiled_artifacts),
         ));
         if !self.routing_passes.is_empty() {
             sections.push((
@@ -1960,38 +1891,47 @@ impl ExplainArtifacts {
     }
 }
 
-pub(crate) fn render_plain_explain_query_result(
+pub(crate) fn prepare_plain_explain_template(
     explain: &ExplainArtifacts,
-) -> Result<Option<crate::QueryResult>, LixError> {
+) -> Result<Option<PreparedExplainTemplate>, LixError> {
     if explain.request().is_none() || explain.requires_execution() {
         return Ok(None);
     }
-    explain.render_query_result().map(Some)
+    prepare_explain_template(explain).map(Some)
 }
 
 pub(crate) fn prepare_analyzed_explain_template(
     explain: &ExplainArtifacts,
-) -> Result<Option<PreparedAnalyzedExplainTemplate>, LixError> {
+) -> Result<Option<PreparedExplainTemplate>, LixError> {
     if !explain.requires_execution() {
         return Ok(None);
     }
 
+    prepare_explain_template(explain).map(Some)
+}
+
+fn prepare_explain_template(
+    explain: &ExplainArtifacts,
+) -> Result<PreparedExplainTemplate, LixError> {
     let Some(request) = explain.request() else {
-        return Ok(None);
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "explain template preparation requires an explain request",
+        ));
     };
 
     match request.output_format() {
-        ExplainOutputFormat::Text => Ok(Some(PreparedAnalyzedExplainTemplate::Text {
+        ExplainOutputFormat::Text => Ok(PreparedExplainTemplate::Text {
             sections: explain.text_sections()?,
-        })),
-        ExplainOutputFormat::Json => Ok(Some(PreparedAnalyzedExplainTemplate::Json {
+        }),
+        ExplainOutputFormat::Json => Ok(PreparedExplainTemplate::Json {
             base_json: serde_json::to_value(explain).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!("failed to serialize explain output: {error}"),
                 )
             })?,
-        })),
+        }),
     }
 }
 
@@ -2128,7 +2068,7 @@ fn render_physical_plan_text(plan: &ExplainPhysicalPlanSnapshot) -> String {
     }
 }
 
-fn render_executor_artifacts_text(artifacts: &ExecutorExplainArtifacts) -> String {
+fn render_compiled_artifacts_text(artifacts: &CompiledExplainArtifacts) -> String {
     let mut lines = vec![
         format!(
             "bound_public_leaves: {}",
@@ -2386,7 +2326,7 @@ fn normalize_explain_request(
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublicReadExplainRuntimeArtifacts {
+pub(crate) struct PublicReadExplainCompiledArtifacts {
     pub(crate) pushdown_decision: Option<PushdownDecision>,
     pub(crate) lowered_sql: Vec<String>,
 }
@@ -2398,7 +2338,7 @@ pub(crate) struct PublicReadExplainBuildInput {
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) optimized_logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PreparedPublicReadExecution,
-    pub(crate) runtime_artifacts: PublicReadExplainRuntimeArtifacts,
+    pub(crate) compiled_artifacts: PublicReadExplainCompiledArtifacts,
     pub(crate) routing_passes: Vec<RoutingPassTrace>,
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
 }
@@ -2532,10 +2472,10 @@ pub(crate) fn build_public_read_explain_artifacts(
     input: PublicReadExplainBuildInput,
 ) -> Result<ExplainArtifacts, LixError> {
     validate_public_read_explain_artifacts(&input)?;
-    let executor_artifacts = executor_artifacts_for_public_read(
+    let compiled_artifacts = compiled_artifacts_for_public_read(
         &input.semantics,
         &input.optimized_logical_plan,
-        &input.runtime_artifacts,
+        &input.compiled_artifacts,
     );
 
     Ok(build_explain_artifacts(
@@ -2544,7 +2484,7 @@ pub(crate) fn build_public_read_explain_artifacts(
         Some(LogicalPlan::PublicRead(input.logical_plan)),
         Some(LogicalPlan::PublicRead(input.optimized_logical_plan)),
         Some(PhysicalPlan::PublicRead(input.execution)),
-        executor_artifacts,
+        compiled_artifacts,
         input.routing_passes,
         input.stage_timings,
     ))
@@ -2553,7 +2493,7 @@ pub(crate) fn build_public_read_explain_artifacts(
 pub(crate) fn build_public_write_explain_artifacts(
     input: PublicWriteExplainBuildInput,
 ) -> ExplainArtifacts {
-    let executor_artifacts = executor_artifacts_for_public_write(
+    let compiled_artifacts = compiled_artifacts_for_public_write(
         &input.planned_write,
         &input.domain_change_batches,
         input.invariant_trace.as_ref(),
@@ -2569,7 +2509,7 @@ pub(crate) fn build_public_write_explain_artifacts(
             planned_write: input.planned_write,
         })),
         Some(PhysicalPlan::PublicWrite(input.execution)),
-        executor_artifacts,
+        compiled_artifacts,
         Vec::new(),
         input.stage_timings,
     )
@@ -2609,7 +2549,7 @@ fn broad_public_read_explain_artifacts_collapsed(
 pub(crate) fn build_internal_explain_artifacts(
     input: InternalExplainBuildInput,
 ) -> ExplainArtifacts {
-    let executor_artifacts = executor_artifacts_for_internal(&input.logical_plan);
+    let compiled_artifacts = compiled_artifacts_for_internal(&input.logical_plan);
 
     build_explain_artifacts(
         Some(input.request),
@@ -2619,7 +2559,7 @@ pub(crate) fn build_internal_explain_artifacts(
         Some(LogicalPlan::Internal(input.logical_plan.clone())),
         Some(LogicalPlan::Internal(input.logical_plan)),
         None,
-        executor_artifacts,
+        compiled_artifacts,
         Vec::new(),
         input.stage_timings,
     )
@@ -2631,7 +2571,7 @@ fn build_explain_artifacts(
     logical_plan: Option<LogicalPlan>,
     optimized_logical_plan: Option<LogicalPlan>,
     physical_plan: Option<PhysicalPlan>,
-    executor_artifacts: ExecutorExplainArtifacts,
+    compiled_artifacts: CompiledExplainArtifacts,
     routing_passes: Vec<RoutingPassTrace>,
     stage_timings: Vec<ExplainStageTiming>,
 ) -> ExplainArtifacts {
@@ -2653,19 +2593,19 @@ fn build_explain_artifacts(
             .as_ref()
             .map(physical_plan_snapshot)
             .map(Box::new),
-        executor_artifacts,
+        compiled_artifacts,
         routing_passes,
         stage_timings,
         analyzed_runtime: None,
     }
 }
 
-fn executor_artifacts_for_public_read(
+fn compiled_artifacts_for_public_read(
     semantics: &PublicReadSemantics,
     optimized_logical_plan: &PublicReadLogicalPlan,
-    runtime_artifacts: &PublicReadExplainRuntimeArtifacts,
-) -> ExecutorExplainArtifacts {
-    ExecutorExplainArtifacts {
+    compiled_artifacts: &PublicReadExplainCompiledArtifacts,
+) -> CompiledExplainArtifacts {
+    CompiledExplainArtifacts {
         bound_public_leaves: semantics
             .surface_bindings
             .iter()
@@ -2684,12 +2624,12 @@ fn executor_artifacts_for_public_read(
             .effective_state_plan()
             .map(effective_state_plan_snapshot)
             .map(Box::new),
-        pushdown: runtime_artifacts
+        pushdown: compiled_artifacts
             .pushdown_decision
             .as_ref()
             .map(pushdown_snapshot)
             .map(Box::new),
-        lowered_sql: runtime_artifacts.lowered_sql.clone(),
+        lowered_sql: compiled_artifacts.lowered_sql.clone(),
         write_command: None,
         scope_proof: None,
         schema_proof: None,
@@ -2704,14 +2644,14 @@ fn executor_artifacts_for_public_read(
     }
 }
 
-fn executor_artifacts_for_public_write(
+fn compiled_artifacts_for_public_write(
     planned_write: &PlannedWrite,
     domain_change_batches: &[DomainChangeBatch],
     invariant_trace: Option<&PublicWriteInvariantTrace>,
-) -> ExecutorExplainArtifacts {
+) -> CompiledExplainArtifacts {
     let target = &planned_write.command.target;
 
-    ExecutorExplainArtifacts {
+    CompiledExplainArtifacts {
         bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(target)]
             .iter()
             .map(bound_public_leaf_snapshot)
@@ -2756,10 +2696,10 @@ fn executor_artifacts_for_public_write(
     }
 }
 
-fn executor_artifacts_for_internal(logical_plan: &InternalLogicalPlan) -> ExecutorExplainArtifacts {
+fn compiled_artifacts_for_internal(logical_plan: &InternalLogicalPlan) -> CompiledExplainArtifacts {
     let statements = &logical_plan.normalized_statements;
 
-    ExecutorExplainArtifacts {
+    CompiledExplainArtifacts {
         bound_public_leaves: Vec::new(),
         dependency_spec: None,
         effective_state_request: None,
@@ -6583,7 +6523,7 @@ fn explain_stage_label(stage: ExplainStage) -> &'static str {
         ExplainStage::Routing => "routing",
         ExplainStage::CapabilityResolution => "capability_resolution",
         ExplainStage::PhysicalPlanning => "physical_planning",
-        ExplainStage::ExecutorPreparation => "executor_preparation",
+        ExplainStage::ArtifactPreparation => "artifact_preparation",
     }
 }
 

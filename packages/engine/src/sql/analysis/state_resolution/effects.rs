@@ -1,12 +1,12 @@
 use crate::contracts::artifacts::SessionStateDelta;
-use crate::runtime::direct_state_file_cache_refresh_targets;
-use crate::runtime::streams::{
+use crate::state_commit_stream::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
 
 use crate::sql::prepare::contracts::effects::PlanEffects;
 use crate::sql::prepare::contracts::planned_statement::PlannedStatementSet;
 use crate::sql::prepare::contracts::planner_error::PlannerError;
+use std::collections::BTreeSet;
 
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
@@ -27,6 +27,19 @@ pub(crate) fn derive_effects_from_state_resolution(
         },
         file_cache_refresh_targets,
     })
+}
+
+fn direct_state_file_cache_refresh_targets(
+    mutations: &[crate::contracts::artifacts::MutationRow],
+) -> BTreeSet<(String, String)> {
+    mutations
+        .iter()
+        .filter(|mutation| !mutation.untracked)
+        .filter(|mutation| mutation.file_id != "lix")
+        .filter(|mutation| mutation.schema_key != "lix_file_descriptor")
+        .filter(|mutation| mutation.schema_key != "lix_directory_descriptor")
+        .map(|mutation| (mutation.file_id.clone(), mutation.version_id.clone()))
+        .collect()
 }
 
 #[cfg(test)]
