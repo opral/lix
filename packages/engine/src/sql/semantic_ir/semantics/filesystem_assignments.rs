@@ -46,13 +46,23 @@ pub(crate) struct DirectoryUpdateAssignments {
     pub(crate) metadata: OptionalTextAssignment,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FilesystemWriteIntent {
+    DirectoryInsert(Vec<DirectoryInsertAssignments>),
+    DirectoryUpdate(DirectoryUpdateAssignments),
+    DirectoryDelete,
+    FileInsert(Vec<FileInsertAssignments>),
+    FileUpdate(FileUpdateAssignments),
+    FileDelete,
+}
+
 impl DirectoryUpdateAssignments {
     pub(crate) fn changes_structure(&self) -> bool {
         self.path.is_some() || self.name.is_some() || self.parent_id.is_some()
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileUpdateAssignments {
     pub(crate) path: Option<ParsedFilePath>,
     pub(crate) hidden: Option<bool>,
@@ -60,7 +70,7 @@ pub(crate) struct FileUpdateAssignments {
     pub(crate) data: BlobAssignment,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DirectoryInsertAssignments {
     pub(crate) id: Option<String>,
     pub(crate) parent_id: Option<String>,
@@ -70,7 +80,7 @@ pub(crate) struct DirectoryInsertAssignments {
     pub(crate) metadata: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FileInsertAssignments {
     pub(crate) id: Option<String>,
     pub(crate) path: ParsedFilePath,

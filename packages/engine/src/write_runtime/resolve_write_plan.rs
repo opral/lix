@@ -13,8 +13,6 @@ use crate::sql::logical_plan::public_ir::{
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
 };
-use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemAssignmentsError;
-use crate::sql::semantic_ir::semantics::filesystem_planning::FilesystemPlanningError;
 use crate::sql::semantic_ir::semantics::state_assignments::StateAssignmentsError;
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column, OverlayLane,
@@ -1286,19 +1284,6 @@ fn build_public_selector_query(
     }
 }
 
-fn payload_map(planned_write: &PlannedWrite) -> Result<BTreeMap<String, Value>, WriteResolveError> {
-    match &planned_write.command.payload {
-        MutationPayload::InsertRows(payloads) => match payloads.as_slice() {
-            [payload] => Ok(payload.clone()),
-            _ => Err(WriteResolveError {
-                message: "public resolver expected a single-row payload".to_string(),
-            }),
-        },
-        MutationPayload::UpdatePatch(payload) => Ok(payload.clone()),
-        MutationPayload::Tombstone => Ok(Default::default()),
-    }
-}
-
 fn payload_text_value(planned_write: &PlannedWrite, key: &str) -> Option<String> {
     match &planned_write.command.payload {
         MutationPayload::InsertRows(payloads) => {
@@ -1360,20 +1345,6 @@ fn write_resolve_backend_error(error: crate::LixError) -> WriteResolveError {
 }
 
 fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteResolveError {
-    WriteResolveError {
-        message: error.message,
-    }
-}
-
-fn write_resolve_filesystem_assignments_error(
-    error: FilesystemAssignmentsError,
-) -> WriteResolveError {
-    WriteResolveError {
-        message: error.message,
-    }
-}
-
-fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> WriteResolveError {
     WriteResolveError {
         message: error.message,
     }

@@ -1,3 +1,9 @@
+mod insert_planning;
+
+use self::insert_planning::{
+    build_directory_insert_snapshot, build_file_insert_snapshot, plan_directory_insert_batch,
+    plan_file_insert_batch,
+};
 use super::*;
 use crate::contracts::traits::PendingView;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
@@ -17,16 +23,14 @@ use crate::filesystem::queries::{
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::semantic_ir::semantics::filesystem_assignments::{
-    parse_directory_insert_assignments, parse_directory_update_assignments,
-    parse_file_insert_assignments, parse_file_update_assignments, DirectoryInsertAssignments,
-    DirectoryUpdateAssignments, FileInsertAssignments, FileUpdateAssignments,
-};
-use crate::sql::semantic_ir::semantics::filesystem_planning::{
-    plan_directory_insert_batch, plan_file_insert_batch,
+    DirectoryInsertAssignments, DirectoryUpdateAssignments, FileInsertAssignments,
+    FileUpdateAssignments, FilesystemWriteIntent,
 };
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};
+
+use self::insert_planning::FilesystemPlanningError;
 
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
 const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
@@ -36,6 +40,12 @@ const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
+
+fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> WriteResolveError {
+    WriteResolveError {
+        message: error.message,
+    }
+}
 
 pub(super) async fn resolve_filesystem_write(
     hydrator: &mut PublicWriteHydrator<'_>,
@@ -101,12 +111,79 @@ async fn resolved_filesystem_version_id(
     })
 }
 
+fn filesystem_write_intent(
+    planned_write: &PlannedWrite,
+) -> Result<&FilesystemWriteIntent, WriteResolveError> {
+    planned_write
+        .filesystem_write_intent
+        .as_ref()
+        .ok_or_else(|| WriteResolveError {
+            message: format!(
+                "public filesystem write '{}' is missing compiler-owned filesystem intent",
+                planned_write.command.target.descriptor.public_name
+            ),
+        })
+}
+
+fn directory_insert_assignments_batch(
+    planned_write: &PlannedWrite,
+) -> Result<&[DirectoryInsertAssignments], WriteResolveError> {
+    match filesystem_write_intent(planned_write)? {
+        FilesystemWriteIntent::DirectoryInsert(rows) => Ok(rows.as_slice()),
+        _ => Err(WriteResolveError {
+            message: "public filesystem directory insert expected typed directory-insert intent"
+                .to_string(),
+        }),
+    }
+}
+
+fn file_insert_assignments_batch(
+    planned_write: &PlannedWrite,
+) -> Result<&[FileInsertAssignments], WriteResolveError> {
+    match filesystem_write_intent(planned_write)? {
+        FilesystemWriteIntent::FileInsert(rows) => Ok(rows.as_slice()),
+        _ => Err(WriteResolveError {
+            message: "public filesystem file insert expected typed file-insert intent".to_string(),
+        }),
+    }
+}
+
+fn directory_update_assignments(
+    planned_write: &PlannedWrite,
+) -> Result<&DirectoryUpdateAssignments, WriteResolveError> {
+    match filesystem_write_intent(planned_write)? {
+        FilesystemWriteIntent::DirectoryUpdate(assignments) => Ok(assignments),
+        _ => Err(WriteResolveError {
+            message: "public filesystem directory update expected typed directory-update intent"
+                .to_string(),
+        }),
+    }
+}
+
+fn file_update_assignments(
+    planned_write: &PlannedWrite,
+) -> Result<&FileUpdateAssignments, WriteResolveError> {
+    match filesystem_write_intent(planned_write)? {
+        FilesystemWriteIntent::FileUpdate(assignments) => Ok(assignments),
+        _ => Err(WriteResolveError {
+            message: "public filesystem file update expected typed file-update intent".to_string(),
+        }),
+    }
+}
+
 async fn resolve_directory_insert_write_plan(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let payloads = payload_maps(planned_write)?;
+    let assignments_rows = directory_insert_assignments_batch(planned_write)?;
+    if payloads.len() != assignments_rows.len() {
+        return Err(WriteResolveError {
+            message: "public filesystem directory insert compiler/runtime row count mismatch"
+                .to_string(),
+        });
+    }
     let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     if payloads.len() != row_version_ids.len() {
         return Err(WriteResolveError {
@@ -117,15 +194,17 @@ async fn resolve_directory_insert_write_plan(
     }
 
     let mut grouped_batches = Vec::<(WriteMode, String, Vec<DirectoryInsertAssignments>)>::new();
-    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.into_iter()) {
+    for ((payload, version_id), assignments) in payloads
+        .into_iter()
+        .zip(row_version_ids.into_iter())
+        .zip(assignments_rows.iter().cloned())
+    {
         let version_id = version_id.ok_or_else(|| WriteResolveError {
             message: "public filesystem write requires a concrete version_id".to_string(),
         })?;
         let execution_mode = default_execution_mode_for_request(
             write_mode_request_for_insert_payload(planned_write, &payload),
         );
-        let assignments = parse_directory_insert_assignments(&payload)
-            .map_err(write_resolve_filesystem_assignments_error)?;
         if let Some((_, _, batch)) =
             grouped_batches
                 .iter_mut()
@@ -141,14 +220,19 @@ async fn resolve_directory_insert_write_plan(
 
     let mut partitions = ResolvedWritePlanBuilder::default();
     for (execution_mode, version_id, assignments_batch) in grouped_batches {
-        let planned_batch = plan_directory_insert_batch(
+        let snapshot = build_directory_insert_snapshot(
             hydrator.backend(),
+            hydrator
+                .pending_state_overlay()
+                .map(|overlay| overlay.as_pending_view()),
             &assignments_batch,
             &version_id,
             lookup_scope,
         )
         .await
         .map_err(write_resolve_filesystem_planning_error)?;
+        let planned_batch = plan_directory_insert_batch(&snapshot, &assignments_batch, &version_id)
+            .map_err(write_resolve_filesystem_planning_error)?;
         let target_write_lane = target_write_lane_for_version(
             planned_write,
             execution_mode,
@@ -197,9 +281,7 @@ async fn resolve_existing_directory_write(
     }
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let payload = payload_map(planned_write)?;
-            let assignments = parse_directory_update_assignments(&payload)
-                .map_err(write_resolve_filesystem_assignments_error)?;
+            let assignments = directory_update_assignments(planned_write)?;
 
             let mut partitions = ResolvedWritePlanBuilder::default();
             let next_rows = if current_rows.len() > 1 && assignments.changes_structure() {
@@ -406,6 +488,13 @@ async fn resolve_file_insert_write_plan(
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let payloads = payload_maps(planned_write)?;
+    let assignments_rows = file_insert_assignments_batch(planned_write)?;
+    if payloads.len() != assignments_rows.len() {
+        return Err(WriteResolveError {
+            message: "public filesystem file insert compiler/runtime row count mismatch"
+                .to_string(),
+        });
+    }
     let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     if payloads.len() != row_version_ids.len() {
         return Err(WriteResolveError {
@@ -415,15 +504,17 @@ async fn resolve_file_insert_write_plan(
     }
 
     let mut grouped_batches = Vec::<(WriteMode, String, Vec<FileInsertAssignments>)>::new();
-    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.into_iter()) {
+    for ((payload, version_id), assignments) in payloads
+        .into_iter()
+        .zip(row_version_ids.into_iter())
+        .zip(assignments_rows.iter().cloned())
+    {
         let version_id = version_id.ok_or_else(|| WriteResolveError {
             message: "public filesystem write requires a concrete version_id".to_string(),
         })?;
         let execution_mode = default_execution_mode_for_request(
             write_mode_request_for_insert_payload(planned_write, &payload),
         );
-        let assignments = parse_file_insert_assignments(&payload)
-            .map_err(write_resolve_filesystem_assignments_error)?;
         if let Some((_, _, batch)) =
             grouped_batches
                 .iter_mut()
@@ -439,14 +530,19 @@ async fn resolve_file_insert_write_plan(
 
     let mut partitions = ResolvedWritePlanBuilder::default();
     for (execution_mode, version_id, assignments_batch) in grouped_batches {
-        let planned_batch = plan_file_insert_batch(
+        let snapshot = build_file_insert_snapshot(
             hydrator.backend(),
+            hydrator
+                .pending_state_overlay()
+                .map(|overlay| overlay.as_pending_view()),
             &assignments_batch,
             &version_id,
             lookup_scope,
         )
         .await
         .map_err(write_resolve_filesystem_planning_error)?;
+        let planned_batch = plan_file_insert_batch(&snapshot, &assignments_batch, &version_id)
+            .map_err(write_resolve_filesystem_planning_error)?;
         let target_write_lane = target_write_lane_for_version(
             planned_write,
             execution_mode,
@@ -526,9 +622,7 @@ async fn resolve_existing_file_write(
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
-            let payload = payload_map(planned_write)?;
-            let assignments = parse_file_update_assignments(&payload)
-                .map_err(write_resolve_filesystem_assignments_error)?;
+            let assignments = file_update_assignments(planned_write)?;
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,

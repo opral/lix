@@ -669,3 +669,42 @@ fn planned_write_runner_is_split_by_apply_owner() {
         );
     }
 }
+
+#[test]
+fn filesystem_write_resolution_lives_under_one_runtime_owner_area() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+
+    assert!(
+        root.join("write_runtime/resolve_write_plan/filesystem_writes.rs")
+            .exists(),
+        "filesystem_writes.rs should remain the runtime-owned resolver entrypoint"
+    );
+    assert!(
+        root.join("write_runtime/resolve_write_plan/filesystem_writes/insert_planning.rs")
+            .exists(),
+        "insert planning should live under the filesystem_writes runtime owner area"
+    );
+    assert!(
+        !root
+            .join("write_runtime/resolve_write_plan/filesystem_insert_planning.rs")
+            .exists(),
+        "the standalone filesystem_insert_planning.rs owner split should be gone after Phase D"
+    );
+
+    let resolve_source = read_engine_source("write_runtime/resolve_write_plan.rs");
+    assert!(
+        resolve_source.contains("mod filesystem_writes;"),
+        "resolve_write_plan.rs should compile the filesystem_writes runtime owner"
+    );
+    assert!(
+        !resolve_source.contains("mod filesystem_insert_planning;"),
+        "resolve_write_plan.rs should not compile a sibling filesystem_insert_planning module"
+    );
+
+    let filesystem_source =
+        read_engine_source("write_runtime/resolve_write_plan/filesystem_writes.rs");
+    assert!(
+        filesystem_source.contains("mod insert_planning;"),
+        "filesystem_writes.rs should compile its insert planning as an internal runtime submodule"
+    );
+}

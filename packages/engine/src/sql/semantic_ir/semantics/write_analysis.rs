@@ -1,10 +1,14 @@
 use crate::contracts::surface::SurfaceOverrideValue;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
-    WriteModeRequest,
+    WriteModeRequest, WriteOperationKind,
 };
 use crate::sql::semantic_ir::canonicalize::{
     evaluate_public_write_expr_to_value, CanonicalizedWrite,
+};
+use crate::sql::semantic_ir::semantics::filesystem_assignments::{
+    parse_directory_insert_assignments, parse_directory_update_assignments,
+    parse_file_insert_assignments, parse_file_update_assignments, FilesystemWriteIntent,
 };
 use crate::sql::semantic_ir::semantics::surface_semantics::canonical_filter_column_name;
 use crate::version::GLOBAL_VERSION_ID;
@@ -33,9 +37,11 @@ pub(crate) fn analyze_write(
 
     let schema_proof = derive_write_schema_facts(canonicalized);
     let target_set_proof = derive_write_target_facts(canonicalized);
+    let filesystem_write_intent = analyze_filesystem_write_intent(canonicalized)?;
 
     Ok(PlannedWrite {
         command: canonicalized.write_command.clone(),
+        filesystem_write_intent,
         scope_proof,
         schema_proof,
         target_set_proof,
@@ -56,6 +62,74 @@ pub(crate) fn analyze_write(
             .collect(),
         backend_rejections: Vec::new(),
     })
+}
+
+fn analyze_filesystem_write_intent(
+    canonicalized: &CanonicalizedWrite,
+) -> Result<Option<FilesystemWriteIntent>, WriteAnalysisError> {
+    match (
+        canonicalized
+            .surface_binding
+            .descriptor
+            .public_name
+            .as_str(),
+        canonicalized.write_command.operation_kind,
+        &canonicalized.write_command.payload,
+    ) {
+        (
+            "lix_directory" | "lix_directory_by_version",
+            WriteOperationKind::Insert,
+            MutationPayload::InsertRows(rows),
+        ) => rows
+            .iter()
+            .map(|row| {
+                parse_directory_insert_assignments(row)
+                    .map_err(write_analysis_filesystem_assignments_error)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(FilesystemWriteIntent::DirectoryInsert)
+            .map(Some),
+        (
+            "lix_directory" | "lix_directory_by_version",
+            WriteOperationKind::Update,
+            MutationPayload::UpdatePatch(payload),
+        ) => parse_directory_update_assignments(payload)
+            .map(FilesystemWriteIntent::DirectoryUpdate)
+            .map(Some)
+            .map_err(write_analysis_filesystem_assignments_error),
+        (
+            "lix_directory" | "lix_directory_by_version",
+            WriteOperationKind::Delete,
+            MutationPayload::Tombstone,
+        ) => Ok(Some(FilesystemWriteIntent::DirectoryDelete)),
+        (
+            "lix_file" | "lix_file_by_version",
+            WriteOperationKind::Insert,
+            MutationPayload::InsertRows(rows),
+        ) => rows
+            .iter()
+            .map(|row| {
+                parse_file_insert_assignments(row)
+                    .map_err(write_analysis_filesystem_assignments_error)
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map(FilesystemWriteIntent::FileInsert)
+            .map(Some),
+        (
+            "lix_file" | "lix_file_by_version",
+            WriteOperationKind::Update,
+            MutationPayload::UpdatePatch(payload),
+        ) => parse_file_update_assignments(payload)
+            .map(FilesystemWriteIntent::FileUpdate)
+            .map(Some)
+            .map_err(write_analysis_filesystem_assignments_error),
+        (
+            "lix_file" | "lix_file_by_version",
+            WriteOperationKind::Delete,
+            MutationPayload::Tombstone,
+        ) => Ok(Some(FilesystemWriteIntent::FileDelete)),
+        _ => Ok(None),
+    }
 }
 
 fn analyze_write_scope(
@@ -554,6 +628,14 @@ fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<
     None
 }
 
+fn write_analysis_filesystem_assignments_error(
+    error: crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemAssignmentsError,
+) -> WriteAnalysisError {
+    WriteAnalysisError {
+        message: error.message,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::analyze_write;
@@ -561,6 +643,7 @@ mod tests {
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
+    use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
     use crate::sql::semantic_ir::ExecutionContext;
     use std::collections::BTreeSet;
 
@@ -726,5 +809,57 @@ mod tests {
                 "version-b".to_string(),
             ]))
         );
+    }
+
+    #[test]
+    fn builds_file_insert_intent_during_write_analysis() {
+        let planned = analyze_write(&canonicalized_write(
+            "INSERT INTO lix_file (path, metadata) VALUES ('/docs/readme.md', '{\"kind\":\"doc\"}')",
+            "main",
+        ))
+        .expect("write analysis should succeed");
+
+        let Some(FilesystemWriteIntent::FileInsert(rows)) = planned.filesystem_write_intent else {
+            panic!("filesystem file insert should produce typed intent");
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].path.normalized_path.as_str(), "/docs/readme.md");
+        assert_eq!(rows[0].path.name, "readme");
+        assert_eq!(rows[0].path.extension.as_deref(), Some("md"));
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"kind\":\"doc\"}"));
+    }
+
+    #[test]
+    fn builds_directory_update_intent_during_write_analysis() {
+        let planned = analyze_write(&canonicalized_write(
+            "UPDATE lix_directory SET path = '/docs/archive/', hidden = true WHERE id = 'dir-1'",
+            "main",
+        ))
+        .expect("write analysis should succeed");
+
+        let Some(FilesystemWriteIntent::DirectoryUpdate(assignments)) =
+            planned.filesystem_write_intent
+        else {
+            panic!("filesystem directory update should produce typed intent");
+        };
+        assert_eq!(
+            assignments.path.as_ref().map(|path| path.as_str()),
+            Some("/docs/archive/")
+        );
+        assert_eq!(assignments.hidden, Some(true));
+    }
+
+    #[test]
+    fn builds_directory_delete_intent_during_write_analysis() {
+        let planned = analyze_write(&canonicalized_write(
+            "DELETE FROM lix_directory WHERE id = 'dir-1'",
+            "main",
+        ))
+        .expect("write analysis should succeed");
+
+        assert!(matches!(
+            planned.filesystem_write_intent,
+            Some(FilesystemWriteIntent::DirectoryDelete)
+        ));
     }
 }

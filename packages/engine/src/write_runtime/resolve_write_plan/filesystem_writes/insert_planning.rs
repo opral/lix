@@ -1,12 +1,15 @@
+use crate::contracts::traits::PendingView;
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::filesystem::path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::filesystem::queries::{
-    ensure_no_file_at_directory_path, load_directory_descriptors_by_parent_name_pairs,
-    load_file_descriptors_by_directory_name_extension_triplets, lookup_directory_id_by_path,
-    lookup_directory_path_by_id, FilesystemQueryError,
+    load_directory_descriptors_by_parent_name_pairs,
+    load_file_descriptors_by_directory_name_extension_triplets,
+    lookup_directory_id_by_path_with_pending_transaction_view,
+    lookup_directory_path_by_id_with_pending_transaction_view,
+    lookup_file_id_by_path_with_pending_transaction_view, FilesystemQueryError,
 };
 use crate::sql::semantic_ir::semantics::filesystem_assignments::{
     DirectoryInsertAssignments, FileInsertAssignments,
@@ -16,8 +19,8 @@ use crate::LixBackend;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FilesystemPlanningError {
-    pub(crate) message: String,
+pub(super) struct FilesystemPlanningError {
+    pub(super) message: String,
 }
 
 impl From<FilesystemQueryError> for FilesystemPlanningError {
@@ -29,34 +32,57 @@ impl From<FilesystemQueryError> for FilesystemPlanningError {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedDirectoryInsertTarget {
-    pub(crate) id: String,
-    pub(crate) parent_id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) hidden: bool,
-    pub(crate) metadata: Option<String>,
+pub(super) struct PlannedDirectoryInsertTarget {
+    pub(super) id: String,
+    pub(super) parent_id: Option<String>,
+    pub(super) name: String,
+    pub(super) hidden: bool,
+    pub(super) metadata: Option<String>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedFileInsertTarget {
-    pub(crate) id: String,
-    pub(crate) directory_id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) extension: Option<String>,
-    pub(crate) hidden: bool,
-    pub(crate) metadata: Option<String>,
-    pub(crate) data: Option<Vec<u8>>,
+pub(super) struct PlannedFileInsertTarget {
+    pub(super) id: String,
+    pub(super) directory_id: Option<String>,
+    pub(super) name: String,
+    pub(super) extension: Option<String>,
+    pub(super) hidden: bool,
+    pub(super) metadata: Option<String>,
+    pub(super) data: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedDirectoryInsertBatch {
-    pub(crate) directories: Vec<PlannedDirectoryInsertTarget>,
+pub(super) struct PlannedDirectoryInsertBatch {
+    pub(super) directories: Vec<PlannedDirectoryInsertTarget>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedFileInsertBatch {
-    pub(crate) directories: Vec<PlannedDirectoryInsertTarget>,
-    pub(crate) files: Vec<PlannedFileInsertTarget>,
+pub(super) struct PlannedFileInsertBatch {
+    pub(super) directories: Vec<PlannedDirectoryInsertTarget>,
+    pub(super) files: Vec<PlannedFileInsertTarget>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub(super) struct FilesystemInsertSnapshot {
+    existing_directory_ids_by_path: BTreeMap<String, String>,
+    existing_directory_paths_by_id: BTreeMap<String, String>,
+    existing_file_ids_by_path: BTreeMap<String, String>,
+}
+
+impl FilesystemInsertSnapshot {
+    fn directory_id_by_path(&self, path: &str) -> Option<String> {
+        self.existing_directory_ids_by_path.get(path).cloned()
+    }
+
+    fn directory_path_by_id(&self, directory_id: &str) -> Option<String> {
+        self.existing_directory_paths_by_id
+            .get(directory_id)
+            .cloned()
+    }
+
+    fn file_id_by_path(&self, path: &str) -> Option<String> {
+        self.existing_file_ids_by_path.get(path).cloned()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,55 +124,84 @@ struct PendingFileInsert {
     data: Option<Vec<u8>>,
 }
 
-#[derive(Debug, Default, Clone)]
-struct FileInsertPreflight {
-    existing_directory_ids_by_path: BTreeMap<String, String>,
-    existing_file_ids_by_path: BTreeMap<String, String>,
-}
-
-pub(crate) async fn plan_directory_insert_batch(
+pub(super) async fn build_directory_insert_snapshot(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&dyn PendingView>,
     assignments: &[DirectoryInsertAssignments],
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<PlannedDirectoryInsertBatch, FilesystemPlanningError> {
-    let mut batch = PendingFilesystemInsertBatch::default();
-    for assignments in assignments {
-        let computed = resolve_directory_insert_target(
-            backend,
-            assignments,
-            version_id,
-            lookup_scope,
-            &mut batch,
-        )
-        .await?;
-        batch.register_directory_target(computed)?;
-    }
-    Ok(PlannedDirectoryInsertBatch {
-        directories: finalize_pending_directory_insert_batch(
-            backend,
-            &batch,
-            version_id,
-            lookup_scope,
-        )
-        .await?,
-    })
+) -> Result<FilesystemInsertSnapshot, FilesystemPlanningError> {
+    let requested_directory_ids = collect_requested_parent_directory_ids(assignments);
+    let existing_directory_paths_by_id = resolve_visible_directory_paths_by_id(
+        backend,
+        pending_transaction_view,
+        version_id,
+        &requested_directory_ids,
+        lookup_scope,
+    )
+    .await?;
+    let (requested_directory_paths, requested_file_paths) =
+        collect_directory_insert_requests(assignments, &existing_directory_paths_by_id)?;
+    let mut snapshot = build_insert_snapshot(
+        backend,
+        pending_transaction_view,
+        version_id,
+        &requested_directory_paths,
+        &requested_file_paths,
+        lookup_scope,
+    )
+    .await?;
+    snapshot.existing_directory_paths_by_id = existing_directory_paths_by_id;
+    Ok(snapshot)
 }
 
-pub(crate) async fn plan_file_insert_batch(
+pub(super) async fn build_file_insert_snapshot(
     backend: &dyn LixBackend,
+    pending_transaction_view: Option<&dyn PendingView>,
     assignments: &[FileInsertAssignments],
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
-    let preflight =
-        build_file_insert_preflight(backend, assignments, version_id, lookup_scope).await?;
+) -> Result<FilesystemInsertSnapshot, FilesystemPlanningError> {
+    let (requested_directory_paths, requested_file_paths) =
+        collect_file_insert_requests(assignments);
+    build_insert_snapshot(
+        backend,
+        pending_transaction_view,
+        version_id,
+        &requested_directory_paths,
+        &requested_file_paths,
+        lookup_scope,
+    )
+    .await
+}
+
+pub(super) fn plan_directory_insert_batch(
+    snapshot: &FilesystemInsertSnapshot,
+    assignments: &[DirectoryInsertAssignments],
+    version_id: &str,
+) -> Result<PlannedDirectoryInsertBatch, FilesystemPlanningError> {
     let mut batch = PendingFilesystemInsertBatch::default();
     for assignments in assignments {
-        let computed = resolve_file_insert_target(assignments, version_id, &preflight, &mut batch)?;
+        let computed =
+            resolve_directory_insert_target(snapshot, assignments, version_id, &mut batch)?;
+        batch.register_directory_target(computed)?;
+    }
+    Ok(PlannedDirectoryInsertBatch {
+        directories: finalize_pending_directory_insert_batch(snapshot, &batch),
+    })
+}
+
+pub(super) fn plan_file_insert_batch(
+    snapshot: &FilesystemInsertSnapshot,
+    assignments: &[FileInsertAssignments],
+    version_id: &str,
+) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
+    let mut batch = PendingFilesystemInsertBatch::default();
+    for assignments in assignments {
+        let computed = resolve_file_insert_target(snapshot, assignments, version_id, &mut batch)?;
         batch.register_file_target(computed, assignments.data.clone())?;
     }
-    finalize_pending_file_insert_batch(&batch, &preflight)
+    finalize_pending_file_insert_batch(snapshot, &batch)
 }
 
 impl PendingFilesystemInsertBatch {
@@ -308,23 +363,252 @@ impl PendingFilesystemInsertBatch {
     }
 }
 
+fn collect_requested_parent_directory_ids(
+    assignments: &[DirectoryInsertAssignments],
+) -> BTreeSet<String> {
+    assignments
+        .iter()
+        .filter_map(|assignments| assignments.parent_id.clone())
+        .collect()
+}
+
+fn collect_directory_insert_requests(
+    assignments: &[DirectoryInsertAssignments],
+    existing_directory_paths_by_id: &BTreeMap<String, String>,
+) -> Result<(BTreeSet<String>, BTreeSet<String>), FilesystemPlanningError> {
+    let mut requested_directory_paths = BTreeSet::new();
+    let mut requested_file_paths = BTreeSet::new();
+
+    for assignments in assignments {
+        if let Some(path) = assignments.path.as_ref() {
+            register_directory_path_with_ancestors(
+                &mut requested_directory_paths,
+                &mut requested_file_paths,
+                path.as_str(),
+            );
+            continue;
+        }
+
+        let Some(name) = assignments.name.as_deref() else {
+            continue;
+        };
+        let parent_path = match assignments.parent_id.as_deref() {
+            Some(parent_id) => existing_directory_paths_by_id.get(parent_id).cloned(),
+            None => Some("/".to_string()),
+        };
+        let Some(parent_path) = parent_path else {
+            continue;
+        };
+
+        if assignments.parent_id.is_some() {
+            register_directory_path_request(
+                &mut requested_directory_paths,
+                &mut requested_file_paths,
+                &parent_path,
+            );
+        }
+
+        let candidate_path =
+            compose_directory_path(parent_path.as_str(), name).map_err(filesystem_path_error)?;
+        register_directory_path_request(
+            &mut requested_directory_paths,
+            &mut requested_file_paths,
+            &candidate_path,
+        );
+    }
+
+    Ok((requested_directory_paths, requested_file_paths))
+}
+
+fn collect_file_insert_requests(
+    assignments: &[FileInsertAssignments],
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut requested_directory_paths = BTreeSet::new();
+    let mut requested_file_paths = BTreeSet::new();
+
+    for assignments in assignments {
+        let file_path = assignments.path.normalized_path.as_str();
+        requested_file_paths.insert(file_path.to_string());
+        requested_directory_paths.insert(format!("{}/", file_path.trim_end_matches('/')));
+
+        if let Some(directory_path) = assignments.path.directory_path.as_ref() {
+            for ancestor in directory_ancestor_paths(directory_path.as_str()) {
+                requested_file_paths.insert(ancestor.trim_end_matches('/').to_string());
+                requested_directory_paths.insert(ancestor);
+            }
+            let directory_path = directory_path.as_str().to_string();
+            requested_file_paths.insert(directory_path.trim_end_matches('/').to_string());
+            requested_directory_paths.insert(directory_path);
+        }
+    }
+
+    (requested_directory_paths, requested_file_paths)
+}
+
+fn register_directory_path_with_ancestors(
+    requested_directory_paths: &mut BTreeSet<String>,
+    requested_file_paths: &mut BTreeSet<String>,
+    path: &str,
+) {
+    for ancestor in directory_ancestor_paths(path) {
+        register_directory_path_request(requested_directory_paths, requested_file_paths, &ancestor);
+    }
+    register_directory_path_request(requested_directory_paths, requested_file_paths, path);
+}
+
+fn register_directory_path_request(
+    requested_directory_paths: &mut BTreeSet<String>,
+    requested_file_paths: &mut BTreeSet<String>,
+    path: &str,
+) {
+    requested_directory_paths.insert(path.to_string());
+    requested_file_paths.insert(path.trim_end_matches('/').to_string());
+}
+
+async fn build_insert_snapshot(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&dyn PendingView>,
+    version_id: &str,
+    requested_directory_paths: &BTreeSet<String>,
+    requested_file_paths: &BTreeSet<String>,
+    lookup_scope: FilesystemProjectionScope,
+) -> Result<FilesystemInsertSnapshot, FilesystemPlanningError> {
+    let committed_directory_ids_by_path = resolve_committed_directory_ids_by_path(
+        backend,
+        version_id,
+        requested_directory_paths,
+        lookup_scope,
+    )
+    .await?;
+    let committed_file_ids_by_path = resolve_committed_file_ids_by_path(
+        backend,
+        version_id,
+        requested_file_paths,
+        &committed_directory_ids_by_path,
+        lookup_scope,
+    )
+    .await?;
+
+    Ok(FilesystemInsertSnapshot {
+        existing_directory_ids_by_path: merge_visible_directory_ids_by_path(
+            backend,
+            pending_transaction_view,
+            version_id,
+            requested_directory_paths,
+            lookup_scope,
+            committed_directory_ids_by_path,
+        )
+        .await?,
+        existing_directory_paths_by_id: BTreeMap::new(),
+        existing_file_ids_by_path: merge_visible_file_ids_by_path(
+            backend,
+            pending_transaction_view,
+            version_id,
+            requested_file_paths,
+            lookup_scope,
+            committed_file_ids_by_path,
+        )
+        .await?,
+    })
+}
+
+async fn resolve_visible_directory_paths_by_id(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&dyn PendingView>,
+    version_id: &str,
+    directory_ids: &BTreeSet<String>,
+    lookup_scope: FilesystemProjectionScope,
+) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+    let mut resolved = BTreeMap::new();
+    for directory_id in directory_ids {
+        if let Some(path) = lookup_directory_path_by_id_with_pending_transaction_view(
+            backend,
+            pending_transaction_view,
+            version_id,
+            directory_id,
+            lookup_scope,
+        )
+        .await?
+        {
+            resolved.insert(directory_id.clone(), path);
+        }
+    }
+    Ok(resolved)
+}
+
+async fn merge_visible_directory_ids_by_path(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&dyn PendingView>,
+    version_id: &str,
+    requested_paths: &BTreeSet<String>,
+    lookup_scope: FilesystemProjectionScope,
+    committed_directory_ids_by_path: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+    if !pending_transaction_view.is_some_and(|view| view.has_overlays()) {
+        return Ok(committed_directory_ids_by_path);
+    }
+
+    let mut resolved = BTreeMap::new();
+    for path in requested_paths {
+        if let Some(directory_id) = lookup_directory_id_by_path_with_pending_transaction_view(
+            backend,
+            pending_transaction_view,
+            version_id,
+            &NormalizedDirectoryPath::from_normalized(path.clone()),
+            lookup_scope,
+        )
+        .await?
+        {
+            resolved.insert(path.clone(), directory_id);
+        }
+    }
+    Ok(resolved)
+}
+
+async fn merge_visible_file_ids_by_path(
+    backend: &dyn LixBackend,
+    pending_transaction_view: Option<&dyn PendingView>,
+    version_id: &str,
+    requested_paths: &BTreeSet<String>,
+    lookup_scope: FilesystemProjectionScope,
+    committed_file_ids_by_path: BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+    if !pending_transaction_view.is_some_and(|view| view.has_overlays()) {
+        return Ok(committed_file_ids_by_path);
+    }
+
+    let mut resolved = BTreeMap::new();
+    for path in requested_paths {
+        let parsed =
+            ParsedFilePath::from_normalized_path(path.clone()).map_err(filesystem_path_error)?;
+        if let Some(file_id) = lookup_file_id_by_path_with_pending_transaction_view(
+            backend,
+            pending_transaction_view,
+            version_id,
+            &parsed,
+            lookup_scope,
+        )
+        .await?
+        {
+            resolved.insert(path.clone(), file_id);
+        }
+    }
+    Ok(resolved)
+}
+
 fn resolve_file_insert_target(
+    snapshot: &FilesystemInsertSnapshot,
     assignments: &FileInsertAssignments,
     version_id: &str,
-    preflight: &FileInsertPreflight,
     batch: &mut PendingFilesystemInsertBatch,
 ) -> Result<ResolvedFileInsertTarget, FilesystemPlanningError> {
     let parsed = &assignments.path;
     let explicit_id = assignments.id.as_deref();
-    ensure_no_directory_at_file_path_in_file_insert_preflight(
-        parsed.normalized_path.as_str(),
-        preflight,
-        batch,
-    )?;
+    ensure_no_directory_at_file_path_in_snapshot(parsed.normalized_path.as_str(), snapshot, batch)?;
     let directory_path = ensure_parent_directories_for_file_insert_batch(
         version_id,
         parsed.directory_path.as_ref(),
-        preflight,
+        snapshot,
         batch,
     )?;
 
@@ -337,10 +621,7 @@ fn resolve_file_insert_target(
                 ),
             });
         }
-    } else if let Some(existing_id) = preflight
-        .existing_file_ids_by_path
-        .get(parsed.normalized_path.as_str())
-    {
+    } else if let Some(existing_id) = snapshot.file_id_by_path(parsed.normalized_path.as_str()) {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
             .unwrap_or(false);
@@ -369,11 +650,10 @@ fn resolve_file_insert_target(
     })
 }
 
-async fn resolve_directory_insert_target(
-    backend: &dyn LixBackend,
+fn resolve_directory_insert_target(
+    snapshot: &FilesystemInsertSnapshot,
     assignments: &DirectoryInsertAssignments,
     version_id: &str,
-    lookup_scope: FilesystemProjectionScope,
     batch: &mut PendingFilesystemInsertBatch,
 ) -> Result<ResolvedDirectoryInsertTarget, FilesystemPlanningError> {
     let explicit_id = assignments.id.as_deref();
@@ -388,25 +668,18 @@ async fn resolve_directory_insert_target(
                 message: "Directory name must be provided".to_string(),
             })?;
         let derived_parent_path = ensure_parent_directories_for_insert_batch(
-            backend,
             version_id,
             parent_directory_path(&normalized_path)
                 .map(NormalizedDirectoryPath::from_normalized)
                 .as_ref(),
-            lookup_scope,
+            snapshot,
             batch,
-        )
-        .await?;
+        )?;
         let derived_parent_id = match derived_parent_path.as_deref() {
-            Some(parent_path) => lookup_directory_id_by_path_in_insert_batch(
-                backend,
-                version_id,
-                parent_path,
-                lookup_scope,
-                batch,
-            )
-            .await?
-            .or_else(|| Some(auto_directory_id(version_id, parent_path))),
+            Some(parent_path) => {
+                lookup_directory_id_by_path_in_snapshot(parent_path, snapshot, batch)
+                    .or_else(|| Some(auto_directory_id(version_id, parent_path)))
+            }
             None => None,
         };
 
@@ -436,17 +709,10 @@ async fn resolve_directory_insert_target(
             })?
             .to_string();
         let parent_path = match explicit_parent_id {
-            Some(parent_id) => lookup_directory_path_by_id_in_insert_batch(
-                backend,
-                version_id,
-                parent_id,
-                lookup_scope,
-                batch,
-            )
-            .await?
-            .ok_or_else(|| FilesystemPlanningError {
-                message: format!("Parent directory does not exist for id {parent_id}"),
-            })?,
+            Some(parent_id) => lookup_directory_path_by_id_in_snapshot(parent_id, snapshot, batch)
+                .ok_or_else(|| FilesystemPlanningError {
+                    message: format!("Parent directory does not exist for id {parent_id}"),
+                })?,
             None => "/".to_string(),
         };
         let computed_path =
@@ -465,14 +731,7 @@ async fn resolve_directory_insert_target(
                 ),
             });
         }
-    } else if let Some(existing_id) = lookup_directory_id_by_path(
-        backend,
-        version_id,
-        &NormalizedDirectoryPath::from_normalized(normalized_path.clone()),
-        lookup_scope,
-    )
-    .await?
-    {
+    } else if let Some(existing_id) = snapshot.directory_id_by_path(&normalized_path) {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
             .unwrap_or(false);
@@ -485,14 +744,7 @@ async fn resolve_directory_insert_target(
             });
         }
     }
-    ensure_no_file_at_directory_path_in_insert_batch(
-        backend,
-        version_id,
-        &normalized_path,
-        lookup_scope,
-        batch,
-    )
-    .await?;
+    ensure_no_file_at_directory_path_in_snapshot(&normalized_path, snapshot, batch)?;
 
     Ok(ResolvedDirectoryInsertTarget {
         id: assignments
@@ -507,11 +759,10 @@ async fn resolve_directory_insert_target(
     })
 }
 
-async fn ensure_parent_directories_for_insert_batch(
-    backend: &dyn LixBackend,
+fn ensure_parent_directories_for_insert_batch(
     version_id: &str,
     directory_path: Option<&NormalizedDirectoryPath>,
-    lookup_scope: FilesystemProjectionScope,
+    snapshot: &FilesystemInsertSnapshot,
     batch: &mut PendingFilesystemInsertBatch,
 ) -> Result<Option<String>, FilesystemPlanningError> {
     let Some(directory_path) = directory_path else {
@@ -528,37 +779,20 @@ async fn ensure_parent_directories_for_insert_batch(
         {
             continue;
         }
-        if lookup_directory_id_by_path(
-            backend,
-            version_id,
-            &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
-            lookup_scope,
-        )
-        .await?
-        .is_some()
-        {
+        if snapshot.directory_id_by_path(&candidate_path).is_some() {
             continue;
         }
-        ensure_no_file_at_directory_path_in_insert_batch(
-            backend,
-            version_id,
-            &candidate_path,
-            lookup_scope,
-            batch,
-        )
-        .await?;
+        ensure_no_file_at_directory_path_in_snapshot(&candidate_path, snapshot, batch)?;
         batch.register_implicit_directory(version_id, &candidate_path)?;
     }
 
     Ok(Some(directory_path.as_str().to_string()))
 }
 
-async fn finalize_pending_directory_insert_batch(
-    backend: &dyn LixBackend,
+fn finalize_pending_directory_insert_batch(
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-    version_id: &str,
-    lookup_scope: FilesystemProjectionScope,
-) -> Result<Vec<PlannedDirectoryInsertTarget>, FilesystemPlanningError> {
+) -> Vec<PlannedDirectoryInsertTarget> {
     let mut pending_directories: Vec<_> = batch.directories_by_path.values().cloned().collect();
     pending_directories
         .sort_by_key(|pending| pending_directory_insert_sort_key(&pending.target.path));
@@ -567,14 +801,7 @@ async fn finalize_pending_directory_insert_batch(
     for pending in pending_directories {
         let parent_id = match pending.target.parent_path.as_deref() {
             Some(parent_path) => {
-                lookup_directory_id_by_path_in_insert_batch(
-                    backend,
-                    version_id,
-                    parent_path,
-                    lookup_scope,
-                    batch,
-                )
-                .await?
+                lookup_directory_id_by_path_in_snapshot(parent_path, snapshot, batch)
             }
             None => None,
         };
@@ -586,13 +813,13 @@ async fn finalize_pending_directory_insert_batch(
             metadata: pending.target.metadata,
         });
     }
-    Ok(directories)
+    directories
 }
 
 fn ensure_parent_directories_for_file_insert_batch(
     version_id: &str,
     directory_path: Option<&NormalizedDirectoryPath>,
-    preflight: &FileInsertPreflight,
+    snapshot: &FilesystemInsertSnapshot,
     batch: &mut PendingFilesystemInsertBatch,
 ) -> Result<Option<String>, FilesystemPlanningError> {
     let Some(directory_path) = directory_path else {
@@ -609,27 +836,30 @@ fn ensure_parent_directories_for_file_insert_batch(
         {
             continue;
         }
-        if preflight
-            .existing_directory_ids_by_path
-            .contains_key(&candidate_path)
-        {
+        if snapshot.directory_id_by_path(&candidate_path).is_some() {
             continue;
         }
-        ensure_no_file_at_directory_path_in_file_insert_preflight(
-            &candidate_path,
-            preflight,
-            batch,
-        )?;
+        ensure_no_file_at_directory_path_in_snapshot(&candidate_path, snapshot, batch)?;
         batch.register_implicit_directory(version_id, &candidate_path)?;
     }
 
     Ok(Some(directory_path.as_str().to_string()))
 }
 
-fn finalize_file_insert_directories_from_preflight(
+fn finalize_pending_file_insert_batch(
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-    preflight: &FileInsertPreflight,
-) -> Result<Vec<PlannedDirectoryInsertTarget>, FilesystemPlanningError> {
+) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
+    Ok(PlannedFileInsertBatch {
+        directories: finalize_file_insert_directories(snapshot, batch),
+        files: finalize_file_insert_files(snapshot, batch),
+    })
+}
+
+fn finalize_file_insert_directories(
+    snapshot: &FilesystemInsertSnapshot,
+    batch: &PendingFilesystemInsertBatch,
+) -> Vec<PlannedDirectoryInsertTarget> {
     let mut pending_directories: Vec<_> = batch.directories_by_path.values().cloned().collect();
     pending_directories
         .sort_by_key(|pending| pending_directory_insert_sort_key(&pending.target.path));
@@ -638,7 +868,7 @@ fn finalize_file_insert_directories_from_preflight(
     for pending in pending_directories {
         let parent_id = match pending.target.parent_path.as_deref() {
             Some(parent_path) => {
-                lookup_directory_id_by_path_in_preflight(parent_path, preflight, batch)
+                lookup_directory_id_by_path_in_snapshot(parent_path, snapshot, batch)
             }
             None => None,
         };
@@ -650,13 +880,13 @@ fn finalize_file_insert_directories_from_preflight(
             metadata: pending.target.metadata,
         });
     }
-    Ok(directories)
+    directories
 }
 
-fn finalize_file_insert_files_from_preflight(
+fn finalize_file_insert_files(
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-    preflight: &FileInsertPreflight,
-) -> Result<Vec<PlannedFileInsertTarget>, FilesystemPlanningError> {
+) -> Vec<PlannedFileInsertTarget> {
     let mut pending_files: Vec<_> = batch.files_by_path.values().cloned().collect();
     pending_files.sort_by_key(|pending| pending.target.path.clone());
 
@@ -664,7 +894,7 @@ fn finalize_file_insert_files_from_preflight(
     for pending in pending_files {
         let directory_id = match pending.target.directory_path.as_deref() {
             Some(directory_path) => {
-                lookup_directory_id_by_path_in_preflight(directory_path, preflight, batch)
+                lookup_directory_id_by_path_in_snapshot(directory_path, snapshot, batch)
             }
             None => None,
         };
@@ -678,64 +908,10 @@ fn finalize_file_insert_files_from_preflight(
             data: pending.data,
         });
     }
-    Ok(files)
+    files
 }
 
-fn finalize_pending_file_insert_batch(
-    batch: &PendingFilesystemInsertBatch,
-    preflight: &FileInsertPreflight,
-) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
-    Ok(PlannedFileInsertBatch {
-        directories: finalize_file_insert_directories_from_preflight(batch, preflight)?,
-        files: finalize_file_insert_files_from_preflight(batch, preflight)?,
-    })
-}
-
-async fn build_file_insert_preflight(
-    backend: &dyn LixBackend,
-    assignments: &[FileInsertAssignments],
-    version_id: &str,
-    lookup_scope: FilesystemProjectionScope,
-) -> Result<FileInsertPreflight, FilesystemPlanningError> {
-    let mut requested_directory_paths = BTreeSet::new();
-    let mut requested_file_paths = BTreeSet::new();
-
-    for assignments in assignments {
-        let file_path = assignments.path.normalized_path.as_str();
-        requested_file_paths.insert(file_path.to_string());
-        requested_directory_paths.insert(format!("{}/", file_path.trim_end_matches('/')));
-
-        if let Some(directory_path) = assignments.path.directory_path.as_ref() {
-            for ancestor in directory_ancestor_paths(directory_path.as_str()) {
-                requested_file_paths.insert(ancestor.trim_end_matches('/').to_string());
-                requested_directory_paths.insert(ancestor);
-            }
-            let directory_path = directory_path.as_str().to_string();
-            requested_file_paths.insert(directory_path.trim_end_matches('/').to_string());
-            requested_directory_paths.insert(directory_path);
-        }
-    }
-
-    let mut preflight = FileInsertPreflight::default();
-    preflight.existing_directory_ids_by_path = resolve_existing_directory_ids_by_path(
-        backend,
-        version_id,
-        &requested_directory_paths,
-        lookup_scope,
-    )
-    .await?;
-    preflight.existing_file_ids_by_path = resolve_existing_file_ids_by_path(
-        backend,
-        version_id,
-        &requested_file_paths,
-        &preflight.existing_directory_ids_by_path,
-        lookup_scope,
-    )
-    .await?;
-    Ok(preflight)
-}
-
-async fn resolve_existing_directory_ids_by_path(
+async fn resolve_committed_directory_ids_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     requested_paths: &BTreeSet<String>,
@@ -790,7 +966,7 @@ async fn resolve_existing_directory_ids_by_path(
     Ok(resolved)
 }
 
-async fn resolve_existing_file_ids_by_path(
+async fn resolve_committed_file_ids_by_path(
     backend: &dyn LixBackend,
     version_id: &str,
     requested_paths: &BTreeSet<String>,
@@ -842,56 +1018,29 @@ async fn resolve_existing_file_ids_by_path(
     Ok(resolved)
 }
 
-fn lookup_directory_id_by_path_in_preflight(
+fn lookup_directory_id_by_path_in_snapshot(
     path: &str,
-    preflight: &FileInsertPreflight,
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
 ) -> Option<String> {
     batch
         .pending_directory_id_by_path(path)
-        .or_else(|| preflight.existing_directory_ids_by_path.get(path).cloned())
+        .or_else(|| snapshot.directory_id_by_path(path))
 }
 
-async fn lookup_directory_id_by_path_in_insert_batch(
-    backend: &dyn LixBackend,
-    version_id: &str,
-    path: &str,
-    lookup_scope: FilesystemProjectionScope,
-    batch: &PendingFilesystemInsertBatch,
-) -> Result<Option<String>, FilesystemPlanningError> {
-    if let Some(directory_id) = batch.pending_directory_id_by_path(path) {
-        return Ok(Some(directory_id));
-    }
-    lookup_directory_id_by_path(
-        backend,
-        version_id,
-        &NormalizedDirectoryPath::from_normalized(path.to_string()),
-        lookup_scope,
-    )
-    .await
-    .map_err(Into::into)
-}
-
-async fn lookup_directory_path_by_id_in_insert_batch(
-    backend: &dyn LixBackend,
-    version_id: &str,
+fn lookup_directory_path_by_id_in_snapshot(
     directory_id: &str,
-    lookup_scope: FilesystemProjectionScope,
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-) -> Result<Option<String>, FilesystemPlanningError> {
-    if let Some(path) = batch.pending_directory_path_by_id(directory_id) {
-        return Ok(Some(path));
-    }
-    lookup_directory_path_by_id(backend, version_id, directory_id, lookup_scope)
-        .await
-        .map_err(Into::into)
+) -> Option<String> {
+    batch
+        .pending_directory_path_by_id(directory_id)
+        .or_else(|| snapshot.directory_path_by_id(directory_id))
 }
 
-async fn ensure_no_file_at_directory_path_in_insert_batch(
-    backend: &dyn LixBackend,
-    version_id: &str,
+fn ensure_no_file_at_directory_path_in_snapshot(
     directory_path: &str,
-    lookup_scope: FilesystemProjectionScope,
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
 ) -> Result<(), FilesystemPlanningError> {
     let file_path =
@@ -908,38 +1057,9 @@ async fn ensure_no_file_at_directory_path_in_insert_batch(
             ),
         });
     }
-    ensure_no_file_at_directory_path(
-        backend,
-        version_id,
-        &NormalizedDirectoryPath::from_normalized(directory_path.to_string()),
-        lookup_scope,
-    )
-    .await
-    .map_err(Into::into)
-}
-
-fn ensure_no_file_at_directory_path_in_file_insert_preflight(
-    directory_path: &str,
-    preflight: &FileInsertPreflight,
-    batch: &PendingFilesystemInsertBatch,
-) -> Result<(), FilesystemPlanningError> {
-    let file_path =
-        ParsedFilePath::from_normalized_path(directory_path.trim_end_matches('/').to_string())
-            .map_err(filesystem_path_error)?;
-    if batch
-        .pending_file_id_by_path(file_path.normalized_path.as_str())
+    if snapshot
+        .file_id_by_path(file_path.normalized_path.as_str())
         .is_some()
-    {
-        return Err(FilesystemPlanningError {
-            message: format!(
-                "Directory path collides with existing file path: {}",
-                file_path.normalized_path.as_str()
-            ),
-        });
-    }
-    if preflight
-        .existing_file_ids_by_path
-        .contains_key(file_path.normalized_path.as_str())
     {
         return Err(FilesystemPlanningError {
             message: format!(
@@ -951,9 +1071,9 @@ fn ensure_no_file_at_directory_path_in_file_insert_preflight(
     Ok(())
 }
 
-fn ensure_no_directory_at_file_path_in_file_insert_preflight(
+fn ensure_no_directory_at_file_path_in_snapshot(
     file_path: &str,
-    preflight: &FileInsertPreflight,
+    snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
 ) -> Result<(), FilesystemPlanningError> {
     let file_path = ParsedFilePath::from_normalized_path(file_path.to_string())
@@ -973,9 +1093,9 @@ fn ensure_no_directory_at_file_path_in_file_insert_preflight(
             ),
         });
     }
-    if preflight
-        .existing_directory_ids_by_path
-        .contains_key(directory_path.as_str())
+    if snapshot
+        .directory_id_by_path(directory_path.as_str())
+        .is_some()
     {
         return Err(FilesystemPlanningError {
             message: format!(
