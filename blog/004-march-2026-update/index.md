@@ -5,7 +5,7 @@ og:image: "./8x-faster.png"
 og:image:alt: "March 2026 update: the engine is proven fast, the semantic layer is next"
 ---
 
-# March 2026 Update: The Engine is Proven Fast. The Semantic Layer is Next.
+# March 2026 Update: Workload Testing Succeeded, Semantic Layer Too Slow
 
 **TL;DR**
 
