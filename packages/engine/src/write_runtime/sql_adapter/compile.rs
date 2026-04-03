@@ -10,10 +10,9 @@ use crate::sql::prepare::{
     prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
     PreparationPolicy,
 };
-use crate::sql::semantic_ir::validation::validate_batch_local_write;
 use crate::version::context::load_target_version_history_root_commit_id_with_backend;
-use crate::write_runtime::PendingTransactionView;
-use crate::{LixBackendTransaction, LixError, Value};
+use crate::write_runtime::{validate_batch_local_write, validate_inserts, PendingTransactionView};
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 use sqlparser::ast::Statement;
 
 use super::planned_write::materialize_prepared_public_write;
@@ -52,13 +51,17 @@ pub(super) async fn compile_sql_buffered_write_command(
         "active_version_id",
     )
     .await?;
+    let compiler_metadata =
+        crate::runtime::load_sql_compiler_metadata(&backend, &context.public_surface_registry)
+            .await?;
     let preparation_context = DefaultSqlPreparationContext {
-        backend: &backend,
+        dialect: backend.dialect(),
         cel_evaluator: engine.runtime().as_ref().cel_evaluator(),
         schema_cache: engine.runtime().as_ref().schema_cache(),
         functions: runtime_state.provider(),
+        surface_registry: &context.public_surface_registry,
+        compiler_metadata: &compiler_metadata,
         active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-        public_surface_registry_override: Some(&context.public_surface_registry),
     };
     let mut compiled_execution = match compile_execution_from_template_instance_with_context(
         &preparation_context,
@@ -84,6 +87,21 @@ pub(super) async fn compile_sql_buffered_write_command(
         }
     };
     if let Some(internal) = compiled_execution.internal_execution() {
+        if !internal.mutations.is_empty() {
+            validate_inserts(
+                &backend,
+                engine.runtime().as_ref().schema_cache(),
+                &internal.mutations,
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "compile_sql_buffered_write_command insert validation failed: {}",
+                    error.description
+                ),
+            })?;
+        }
         if !internal.update_validations.is_empty() {
             validate_update_plans(
                 &backend,
@@ -95,7 +113,7 @@ pub(super) async fn compile_sql_buffered_write_command(
             .map_err(|error| LixError {
                 code: error.code,
                 description: format!(
-                    "prepare_execution_with_backend update validation failed: {}",
+                    "compile_sql_buffered_write_command update validation failed: {}",
                     error.description
                 ),
             })?;
@@ -130,7 +148,7 @@ pub(super) async fn compile_sql_buffered_write_command(
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "prepare_execution_with_backend public batch-local validation failed: {}",
+                "compile_sql_buffered_write_command public batch-local validation failed: {}",
                 error.description
             ),
         })?;

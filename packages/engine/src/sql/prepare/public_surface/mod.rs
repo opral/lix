@@ -50,7 +50,9 @@ use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot, GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, Value};
+#[cfg(test)]
+use crate::LixBackend;
+use crate::{LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
@@ -213,8 +215,9 @@ pub(crate) async fn prepare_public_execution(
 }
 
 pub(crate) async fn prepare_public_execution_with_registry_context_and_functions(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
     registry: &SurfaceRegistry,
+    compiler_metadata: &super::compile::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -234,7 +237,7 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
             let target_name = public_write_target_name(registry, parsed_statements)
                 .expect("public write route must expose a target name");
             let prepared = try_prepare_public_write_with_registry_and_functions(
-                backend,
+                dialect,
                 registry,
                 parsed_statements,
                 params,
@@ -265,8 +268,9 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
             }
 
             read::try_prepare_public_read_with_registry_and_internal_access(
-                backend,
+                dialect,
                 registry,
+                compiler_metadata,
                 parsed_statements,
                 params,
                 active_version_id,
@@ -299,8 +303,14 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
-    prepare_public_execution_with_internal_access_and_functions(
-        backend,
+    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+        .await
+        .map_err(|error| LixError::new(error.code, error.description))?;
+    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
+    prepare_public_execution_with_registry_context_and_functions(
+        backend.dialect(),
+        &registry,
+        &compiler_metadata,
         parsed_statements,
         params,
         active_version_id,
@@ -313,77 +323,10 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     .await
 }
 
-pub(crate) async fn prepare_public_execution_with_internal_access_and_functions(
-    backend: &dyn LixBackend,
-    parsed_statements: &[Statement],
-    params: &[Value],
-    active_version_id: &str,
-    active_history_root_commit_id: Option<&str>,
-    active_account_ids: &[String],
-    writer_key: Option<&str>,
-    allow_internal_tables: bool,
-    parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicExecution>, LixError> {
-    let builtin_registry = SurfaceRegistry::with_builtin_surfaces();
-    if classify_public_execution_route_with_registry(&builtin_registry, parsed_statements).is_some()
-    {
-        return prepare_public_execution_with_registry_context_and_functions(
-            backend,
-            &builtin_registry,
-            parsed_statements,
-            params,
-            active_version_id,
-            active_history_root_commit_id,
-            active_account_ids,
-            writer_key,
-            allow_internal_tables,
-            parse_duration,
-        )
-        .await;
-    }
-
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
-    prepare_public_execution_with_registry_context_and_functions(
-        backend,
-        &registry,
-        parsed_statements,
-        params,
-        active_version_id,
-        active_history_root_commit_id,
-        active_account_ids,
-        writer_key,
-        allow_internal_tables,
-        parse_duration,
-    )
-    .await
-}
-
-pub(crate) fn statement_references_public_surface_with_builtin_registry(
-    statement: &Statement,
-) -> bool {
-    statement_references_public_surface(&SurfaceRegistry::with_builtin_surfaces(), statement)
-}
-
-pub(crate) async fn statement_references_public_surface_with_backend(
-    backend: &dyn LixBackend,
-    statement: &Statement,
-) -> bool {
-    if statement_references_public_surface_with_builtin_registry(statement) {
-        return true;
-    }
-
-    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
-        Ok(registry) => registry,
-        Err(_) => return statement_references_public_surface_with_builtin_registry(statement),
-    };
-    statement_references_public_surface(&registry, statement)
-}
-
 pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
     registry: &SurfaceRegistry,
+    compiler_metadata: &super::compile::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -393,8 +336,9 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     parse_duration: Option<Duration>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
     read::try_prepare_public_read_with_registry_and_internal_access(
-        backend,
+        dialect,
         registry,
+        compiler_metadata,
         parsed_statements,
         params,
         active_version_id,
@@ -556,7 +500,10 @@ pub(crate) fn classify_public_execution_route_with_registry(
     Some(PublicExecutionRoute::Read)
 }
 
-fn statement_references_public_surface(registry: &SurfaceRegistry, statement: &Statement) -> bool {
+pub(crate) fn statement_references_public_surface(
+    registry: &SurfaceRegistry,
+    statement: &Statement,
+) -> bool {
     match statement {
         Statement::Query(query) => query_references_public_surface(registry, query),
         Statement::Explain { statement, .. } => {
@@ -1126,37 +1073,8 @@ fn expr_string_literal(expr: &Expr) -> Option<&str> {
     }
 }
 
-pub(crate) async fn try_prepare_public_write_with_functions(
-    backend: &dyn LixBackend,
-    parsed_statements: &[Statement],
-    params: &[Value],
-    active_version_id: &str,
-    active_account_ids: &[String],
-    writer_key: Option<&str>,
-    parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicWrite>, LixError> {
-    if parsed_statements.len() != 1 {
-        return Ok(None);
-    }
-
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
-    try_prepare_public_write_with_registry_and_functions(
-        backend,
-        &registry,
-        parsed_statements,
-        params,
-        active_version_id,
-        active_account_ids,
-        writer_key,
-        parse_duration,
-    )
-    .await
-}
-
 pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
-    backend: &dyn LixBackend,
+    dialect: SqlDialect,
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
     params: &[Value],
@@ -1177,7 +1095,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         statement,
         params.to_vec(),
         ExecutionContext {
-            dialect: Some(backend.dialect()),
+            dialect: Some(dialect),
             writer_key: writer_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
             active_account_ids: active_account_ids.to_vec(),
@@ -2637,7 +2555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explain_specialized_registered_schema_reads_charge_layout_loading_to_capability_resolution(
+    async fn explain_specialized_registered_schema_reads_keep_layout_loading_outside_compiler_stages(
     ) {
         let delay = Duration::from_millis(150);
         let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
@@ -2673,17 +2591,17 @@ mod tests {
             .expect("specialized lowered read should record routing timing");
 
         assert!(
-            capability_resolution >= (delay.as_micros() / 2) as u64,
-            "capability_resolution should absorb the injected schema-load delay: {capability_resolution}us"
+            capability_resolution < (delay.as_micros() / 2) as u64,
+            "capability_resolution should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {capability_resolution}us"
         );
         assert!(
             routing < (delay.as_micros() / 2) as u64,
-            "routing should stay below the injected schema-load delay when capability loading is timed separately: {routing}us"
+            "routing should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {routing}us"
         );
     }
 
     #[tokio::test]
-    async fn explain_broad_registered_schema_reads_charge_layout_loading_to_capability_resolution()
+    async fn explain_broad_registered_schema_reads_keep_layout_loading_outside_compiler_stages()
     {
         let delay = Duration::from_millis(150);
         let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
@@ -2727,12 +2645,12 @@ mod tests {
             .expect("broad lowered read should record routing timing");
 
         assert!(
-            capability_resolution >= (delay.as_micros() / 2) as u64,
-            "capability_resolution should absorb the injected schema-load delay: {capability_resolution}us"
+            capability_resolution < (delay.as_micros() / 2) as u64,
+            "capability_resolution should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {capability_resolution}us"
         );
         assert!(
             routing < (delay.as_micros() / 2) as u64,
-            "routing should stay below the injected schema-load delay when capability loading is timed separately: {routing}us"
+            "routing should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {routing}us"
         );
     }
 
@@ -3787,10 +3705,14 @@ mod tests {
             &registry,
         )
         .expect("public read bind should succeed");
+        let compiler_metadata = crate::runtime::load_sql_compiler_metadata(&backend, &registry)
+            .await
+            .expect("compiler metadata should load for public-read broad lowering");
 
         let _binding_guard = forbid_broad_binding_for_test();
         let prepared = super::read::prepare_public_read_via_surface_lowering(
-            &backend,
+            backend.dialect(),
+            &compiler_metadata,
             bound.bound_statement,
             bound.broad_statement,
             None,

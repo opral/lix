@@ -14,7 +14,7 @@ pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::{LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
 use std::collections::BTreeMap;
@@ -78,8 +78,7 @@ impl From<NormalizedInternalStatements> for PlannedStatementSet {
     }
 }
 
-pub(crate) async fn rewrite_internal_statement_with_backend<P>(
-    _backend: &dyn LixBackend,
+pub(crate) async fn rewrite_internal_statement<P>(
     statement: Statement,
     _params: &[Value],
     _writer_key: Option<&str>,
@@ -141,8 +140,8 @@ fn validate_statement_output(output: &InternalStatementRewrite) -> Result<(), Li
     Ok(())
 }
 
-pub(crate) async fn prepare_internal_statements_with_backend_to_plan<P>(
-    backend: &dyn LixBackend,
+pub(crate) async fn prepare_internal_statements_to_plan<P>(
+    dialect: SqlDialect,
     _evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
@@ -155,18 +154,11 @@ where
     let mut statements = statements;
     normalize_statement_placeholders_in_batch(&mut statements)?;
     let mut provider = functions.clone();
-    prepare_rewritten_statements_with_backend(
-        backend,
-        statements,
-        params,
-        &mut provider,
-        writer_key,
-    )
-    .await
+    prepare_rewritten_statements(dialect, statements, params, &mut provider, writer_key).await
 }
 
-async fn prepare_rewritten_statements_with_backend<P>(
-    backend: &dyn LixBackend,
+async fn prepare_rewritten_statements<P>(
+    dialect: SqlDialect,
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
@@ -182,8 +174,7 @@ where
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for (statement_index, statement) in statements.into_iter().enumerate() {
-        let output = Box::pin(rewrite_internal_statement_with_backend(
-            backend,
+        let output = Box::pin(rewrite_internal_statement(
             statement,
             params,
             writer_key,
@@ -194,7 +185,7 @@ where
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "prepare_internal_statements_with_backend_to_plan backend rewrite failed for statement {}: {}",
+                "prepare_internal_statements_to_plan rewrite failed for statement {}: {}",
                 statement_index, error.description
             ),
         })?;
@@ -202,7 +193,7 @@ where
         accumulate_rewrite_output(
             from_internal_rewrite(output),
             provider,
-            backend.dialect(),
+            dialect,
             &mut rewritten,
             &mut live_table_requirements,
             &mut mutations,
@@ -217,7 +208,7 @@ where
     }
 
     let (normalized_sql, prepared_statements) =
-        render_statements_with_params(&rewritten, params, backend.dialect())?;
+        render_statements_with_params(&rewritten, params, dialect)?;
 
     Ok(NormalizedInternalStatements {
         sql: normalized_sql,
