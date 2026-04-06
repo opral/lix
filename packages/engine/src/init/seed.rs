@@ -1,6 +1,5 @@
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::engine::Engine;
-use crate::refs::load_committed_version_head_commit_id;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema::builtin::storage::{
@@ -8,6 +7,7 @@ use crate::schema::builtin::storage::{
 };
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::sql::parser::parse_sql;
+use crate::version::load_committed_version_head_commit_id;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::write_runtime::sql_adapter::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::write_runtime::BorrowedWriteTransaction;

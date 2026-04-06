@@ -1,6 +1,6 @@
+use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::artifacts::{CommitPreconditions, DomainChangeBatch, ReadTimeProjectionRead};
 use crate::contracts::surface::SurfaceBinding;
-use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};

@@ -1,9 +1,6 @@
 use crate::contracts::artifacts::PublicReadExecutionMode;
 use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
 use crate::engine::{DeferredTransactionSideEffects, Engine};
-use crate::filesystem::runtime::{
-    merge_filesystem_transaction_state, resolve_binary_blob_writes_in_transaction,
-};
 use crate::runtime::TransactionBackendAdapter;
 use crate::session::execution_context::ExecutionContext;
 use crate::sql::physical_plan::PublicWriteExecutionPartition;
@@ -14,7 +11,10 @@ use crate::sql::prepare::{
 use crate::write_runtime::buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
 };
-use crate::write_runtime::filesystem_state::filesystem_transaction_state_from_planned;
+use crate::write_runtime::filesystem::runtime::{
+    merge_filesystem_transaction_state, resolve_binary_blob_writes_in_transaction,
+};
+use crate::write_runtime::filesystem::state::filesystem_transaction_state_from_planned;
 use crate::write_runtime::{PendingTransactionView, TransactionCommitOutcome};
 use crate::{LixBackendTransaction, LixError};
 
@@ -216,7 +216,9 @@ pub(super) async fn complete_sql_command_execution(
             &command.compiled.execution().intent.filesystem_state,
         );
         let binary_blob_writes =
-            crate::filesystem::runtime::binary_blob_writes_from_filesystem_state(&filesystem_state);
+            crate::write_runtime::filesystem::runtime::binary_blob_writes_from_filesystem_state(
+                &filesystem_state,
+            );
         if !filesystem_payload_changes_already_committed {
             let resolved_binary_blob_writes =
                 resolve_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)

@@ -1,3 +1,4 @@
+use crate::annotations::writer_key::load_workspace_writer_key_annotation_for_state_row;
 use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head as load_exact_committed_state_row,
     ExactCommittedStateRow, ExactCommittedStateRowRequest,
@@ -17,7 +18,6 @@ use crate::sql::semantic_ir::semantics::surface_semantics::{
     overlay_lanes_for_version, OverlayLane,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::workspace::writer_key::load_workspace_writer_key_annotation_for_state_row;
 use crate::{LixBackend, LixError, Value};
 enum TrackedExactEffectiveRowLookup {
     Matched(ExactEffectiveStateRow),

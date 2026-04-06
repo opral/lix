@@ -101,7 +101,8 @@ impl Engine {
 
 #[derive(Default)]
 pub(crate) struct DeferredTransactionSideEffects {
-    pub(crate) filesystem_state: crate::filesystem::runtime::FilesystemTransactionState,
+    pub(crate) filesystem_state:
+        crate::write_runtime::filesystem::runtime::FilesystemTransactionState,
 }
 
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {

@@ -140,7 +140,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             }
             let commit_id = {
                 let mut backend = self.backend_adapter();
-                crate::refs::load_committed_version_head_commit_id(&mut backend, &version_id)
+                crate::version::load_committed_version_head_commit_id(&mut backend, &version_id)
                     .await?
                     .ok_or_else(|| {
                         LixError::new(

@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
+use crate::annotations::writer_key::WorkspaceWriterKeyReadView;
 use crate::contracts::artifacts::{
     matches_constraints, BatchRowRequest, RowIdentity, ScanRequest, TrackedRow,
     TrackedTombstoneMarker, UntrackedRow,
@@ -9,7 +10,6 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{
     LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
 };
-use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
 use crate::LixError;
 
 use crate::write_runtime::overlay::PendingWriteOverlay;

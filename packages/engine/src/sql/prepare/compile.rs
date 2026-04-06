@@ -148,7 +148,10 @@ async fn compile_execution_with_context(
     let functions = preparation_context.functions().clone();
 
     let mut statements = parsed_statements.to_vec();
-    crate::filesystem::ensure_generated_filesystem_insert_ids(&mut statements, &functions)?;
+    crate::sql::prepare::filesystem_insert_ids::ensure_generated_filesystem_insert_ids(
+        &mut statements,
+        &functions,
+    )?;
     let explained = if statements.len() == 1 {
         Some(unwrap_explain_statement(&statements[0])?)
     } else {

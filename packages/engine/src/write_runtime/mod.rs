@@ -4,7 +4,7 @@ mod contracts;
 mod deterministic_sequence;
 mod effective_state;
 mod execution;
-mod filesystem_state;
+pub(crate) mod filesystem;
 pub(crate) mod overlay;
 mod plugin_install;
 mod read_context;

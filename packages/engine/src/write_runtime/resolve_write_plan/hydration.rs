@@ -69,7 +69,8 @@ impl<'a> PublicWriteHydrator<'a> {
             return Ok(None);
         };
         let pointer_row =
-            crate::refs::load_committed_version_ref_with_backend(self.backend, version_id).await?;
+            crate::version::load_committed_version_ref_with_backend(self.backend, version_id)
+                .await?;
         let has_local_head = pointer_row.is_some();
         Ok(Some(HydratedVersionAdminRow {
             id: version_id.to_string(),

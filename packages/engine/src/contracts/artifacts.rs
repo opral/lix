@@ -131,6 +131,12 @@ pub(crate) enum SessionExecutionMode {
     WriteTransaction,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FilesystemProjectionScope {
+    ActiveVersion,
+    ExplicitVersion,
+}
+
 /// Projection execution lifecycle.
 ///
 /// The same projection definition can be evaluated in multiple lifecycles. The
@@ -1427,31 +1433,10 @@ pub(crate) struct UpdateValidationInput {
 
 #[derive(Debug, Clone)]
 pub(crate) struct PlannedStatementSet {
-    pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) mutations: Vec<MutationRow>,
     pub(crate) update_validations: Vec<UpdateValidationPlan>,
-}
-
-impl PlannedStatementSet {
-    pub(crate) fn single_statement_params(&self) -> Result<&[Value], LixError> {
-        match self.prepared_statements.as_slice() {
-            [statement] => Ok(statement.params.as_slice()),
-            [] => Ok(&[]),
-            statements
-                if statements
-                    .iter()
-                    .all(|statement| statement.params.is_empty()) =>
-            {
-                Ok(&[])
-            }
-            _ => Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "preprocess output expected a single prepared statement".to_string(),
-            }),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

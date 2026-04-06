@@ -1,6 +1,6 @@
 use crate::contracts::surface::SurfaceRegistry;
-use crate::refs::load_current_committed_version_frontier_with_backend;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
+use crate::version::load_current_committed_version_frontier_with_backend;
 use crate::{LixBackend, LixError};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;

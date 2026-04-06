@@ -32,6 +32,39 @@ const LIVE_STATE_INIT_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_registered_schema_bootstrap_live_vfe \
      ON lix_internal_registered_schema_bootstrap (version_id, file_id, entity_id) \
      WHERE is_tombstone = 0 AND snapshot_content IS NOT NULL",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_data_cache (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     data BYTEA NOT NULL,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_data_cache_version_id \
+     ON lix_internal_file_data_cache (version_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_path_cache (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     directory_id TEXT,\
+     name TEXT NOT NULL,\
+     extension TEXT,\
+     path TEXT NOT NULL,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_path_cache_version_path \
+     ON lix_internal_file_path_cache (version_id, path, file_id)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_file_path_cache_version_directory \
+     ON lix_internal_file_path_cache (version_id, directory_id)",
+    "CREATE TABLE IF NOT EXISTS lix_internal_file_lixcol_cache (\
+     file_id TEXT NOT NULL,\
+     version_id TEXT NOT NULL,\
+     latest_change_id TEXT,\
+     latest_commit_id TEXT,\
+     created_at TEXT,\
+     updated_at TEXT,\
+     writer_key TEXT,\
+     PRIMARY KEY (file_id, version_id)\
+     )",
+    "CREATE INDEX IF NOT EXISTS idx_file_lixcol_cache_lookup \
+     ON lix_internal_file_lixcol_cache (file_id, version_id)",
 ];
 
 pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {

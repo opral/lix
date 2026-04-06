@@ -6,7 +6,7 @@
 //! winner from canonical change order.
 
 use crate::backend::QueryExecutor;
-use crate::version::{
+use crate::version::ref_storage::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     load_local_version_ref_with_executor, LocalVersionRefRow,
 };

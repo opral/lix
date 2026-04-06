@@ -361,6 +361,7 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
+    use crate::annotations::writer_key::WorkspaceWriterKeyReadView;
     use crate::contracts::traits::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
     use crate::live_state::shared::identity::RowIdentity;
     use crate::live_state::tracked::{
@@ -371,7 +372,6 @@ mod tests {
         BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
         UntrackedWriteRow,
     };
-    use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
     use crate::write_runtime::buffered::prepare_materialization_plan;
 
     use super::*;

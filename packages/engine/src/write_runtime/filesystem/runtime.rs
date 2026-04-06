@@ -1,12 +1,15 @@
 use crate::binary_cas::codec::binary_blob_hash_hex;
 use crate::binary_cas::write::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
-use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow, OptionalTextPatch};
+use crate::contracts::artifacts::{
+    FilesystemPayloadDomainChange, FilesystemProjectionScope, MutationRow, OptionalTextPatch,
+};
 use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine};
-use crate::filesystem::live_projection::FilesystemProjectionScope;
-use crate::filesystem::queries::load_file_row_by_id_without_path;
 use crate::runtime::TransactionBackendAdapter;
 use crate::sql::storage::queries::state as state_queries;
+use crate::write_runtime::filesystem::query::{
+    load_file_row_by_id_without_path, resolve_file_id_by_path_in_version,
+};
 use crate::{LixBackendTransaction, LixError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -327,12 +330,7 @@ async fn resolve_binary_blob_write_in_transaction(
     };
     let resolved = {
         let backend = TransactionBackendAdapter::new(transaction);
-        crate::filesystem::live_projection::resolve_file_id_by_path_in_version(
-            &backend,
-            &write.version_id,
-            path,
-        )
-        .await?
+        resolve_file_id_by_path_in_version(&backend, &write.version_id, path).await?
     };
     let Some(file_id) = resolved else {
         return Err(LixError {

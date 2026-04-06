@@ -4,14 +4,14 @@ use crate::contracts::surface::{
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::errors::sql_unknown_column_error;
-use crate::filesystem::live_projection::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-};
 use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
     CanonicalStateScan, CanonicalWorkingChangesScan, FilesystemKind, ReadPlan,
     StructuredPublicRead, VersionScope,
+};
+use crate::sql::physical_plan::filesystem_projection_sql::{
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
 use crate::sql::physical_plan::plan::{
     compile_final_read_statement, compile_lowered_read_statement,

@@ -8,6 +8,7 @@
 use crate::contracts::artifacts::{ProjectionLifecycle, ProjectionRegistration};
 use crate::contracts::traits::ProjectionTrait;
 
+pub(crate) mod filesystem;
 pub(crate) mod version;
 
 /// Type-erased built-in projection registration for engine-owned enumeration.

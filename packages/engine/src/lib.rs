@@ -1,3 +1,4 @@
+mod annotations;
 mod api;
 mod backend;
 mod binary_cas;
@@ -12,15 +13,14 @@ mod error;
 mod errors;
 pub(crate) mod execution_effects;
 pub(crate) mod explain_output;
-mod filesystem;
 mod identity;
 mod init;
 pub(crate) mod live_schema_access;
 pub mod live_state;
 mod lix;
+mod paths;
 pub(crate) mod projections;
 pub(crate) mod read_runtime;
-pub(crate) mod refs;
 mod replay_cursor;
 mod runtime;
 mod schema;
@@ -34,7 +34,6 @@ mod transaction_mode;
 mod types;
 mod version;
 pub mod wire;
-pub(crate) mod workspace;
 pub(crate) mod write_runtime;
 
 pub mod image {

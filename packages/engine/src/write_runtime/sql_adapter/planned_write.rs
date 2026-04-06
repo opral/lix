@@ -7,10 +7,6 @@ use crate::contracts::artifacts::{
     RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
-use crate::filesystem::runtime::{
-    filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
-    FilesystemTransactionFileState, FilesystemTransactionState,
-};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::explain::{
@@ -29,7 +25,11 @@ use crate::sql::prepare::{
 use crate::sql::semantic_ir::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions,
 };
-use crate::write_runtime::filesystem_state::filesystem_transaction_state_from_planned;
+use crate::write_runtime::filesystem::runtime::{
+    filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
+    FilesystemTransactionFileState, FilesystemTransactionState,
+};
+use crate::write_runtime::filesystem::state::filesystem_transaction_state_from_planned;
 use crate::write_runtime::resolve_write_plan_with_functions;
 use crate::write_runtime::PendingTransactionView;
 use crate::LixError;

@@ -1,6 +1,6 @@
 use crate::contracts::artifacts::FilesystemPayloadDomainChange;
 use crate::engine::Engine;
-use crate::filesystem::runtime::{
+use crate::write_runtime::filesystem::runtime::{
     build_filesystem_payload_domain_changes_insert, resolve_binary_blob_writes_in_transaction,
 };
 use crate::{LixBackendTransaction, LixError};

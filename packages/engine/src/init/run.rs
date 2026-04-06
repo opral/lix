@@ -4,7 +4,6 @@ use crate::binary_cas;
 use crate::canonical;
 use crate::checkpoint;
 use crate::engine::Engine;
-use crate::filesystem;
 use crate::live_state;
 use crate::live_state::{
     load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
@@ -14,12 +13,13 @@ use crate::live_state::{
 };
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
+use crate::session::workspace;
 use crate::session::{observe, undo_redo};
 use crate::version;
-use crate::workspace;
 use crate::write_runtime::commit;
 use crate::{LixError, TransactionMode};
 
+use super::filesystem;
 use super::tables::prepare_backend_for_init;
 use super::InitExecutor;
 
@@ -57,9 +57,6 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             binary_cas::init(&backend)
                 .await
                 .map_err(|error| init_step_error("binary_cas::init", error))?;
-            filesystem::init(&backend)
-                .await
-                .map_err(|error| init_step_error("filesystem::init", error))?;
             checkpoint::init(&backend)
                 .await
                 .map_err(|error| init_step_error("checkpoint::init", error))?;
@@ -94,7 +91,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             .map_err(|error| init_step_error("version::seed_bootstrap", error))?;
         filesystem::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("filesystem::seed_bootstrap", error))?;
+            .map_err(|error| init_step_error("filesystem_bootstrap::seed_bootstrap", error))?;
         canonical::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("canonical::seed_bootstrap", error))?;

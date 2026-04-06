@@ -54,7 +54,6 @@ mod tests {
     #[test]
     fn ignores_legacy_active_version_mutations_for_session_deltas() {
         let preprocess = PlannedStatementSet {
-            sql: "UPDATE lix_active_version SET version_id = 'version-b'".to_string(),
             prepared_statements: vec![PreparedStatement {
                 sql: "UPDATE lix_active_version SET version_id = 'version-b'".to_string(),
                 params: Vec::new(),

@@ -14,8 +14,8 @@ use crate::canonical::graph::{
     build_version_commit_depth_map, build_version_head_map, collect_commit_edges,
     min_depth_by_commit, VersionCommitDepthMap, VersionHeadMap,
 };
-use crate::refs::load_all_version_head_commit_ids;
 use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::version::load_all_version_head_commit_ids;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{CanonicalJson, LixBackend, LixError, ReplayCursor};
 
