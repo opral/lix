@@ -80,7 +80,7 @@ impl BufferedWriteState {
 
     pub(crate) fn record_state_commit_stream_changes(
         &mut self,
-        changes: Vec<crate::runtime::streams::StateCommitStreamChange>,
+        changes: Vec<crate::contracts::artifacts::StateCommitStreamChange>,
     ) {
         self.commit_outcome
             .state_commit_stream_changes

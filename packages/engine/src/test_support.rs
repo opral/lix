@@ -593,12 +593,11 @@ mod tests {
             &backend,
             crate::live_state::LiveStateMode::Ready,
             Some(&ReplayCursor::new("change-1", "2026-03-30T00:00:00Z")),
-            Some(&CommittedVersionFrontier::from_version_ref_rows(vec![
-                crate::refs::VersionRefRow {
-                    version_id: "main".to_string(),
-                    commit_id: "commit-1".to_string(),
-                },
-            ])),
+            Some(&CommittedVersionFrontier {
+                version_heads: [("main".to_string(), "commit-1".to_string())]
+                    .into_iter()
+                    .collect(),
+            }),
             "2026-03-30T00:00:00Z",
         )
         .await

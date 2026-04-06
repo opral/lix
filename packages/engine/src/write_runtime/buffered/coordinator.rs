@@ -45,7 +45,7 @@ impl<'a> TransactionCoordinator<'a> {
         };
         let transaction = self.backend_transaction_mut()?;
         transaction
-            .apply_canonical_receipt_to_live_state(receipt)
+            .advance_live_state_replay_boundary(&receipt.replay_cursor)
             .await
     }
 

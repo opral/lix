@@ -381,7 +381,6 @@ fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
 mod tests {
     use super::{build_domain_change_batch, derive_commit_preconditions};
     use crate::contracts::artifacts::ExpectedHead;
-    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::WriteLane;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
@@ -408,7 +407,7 @@ mod tests {
             })
             .await
             .expect("test version should exist");
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = bind_statement(

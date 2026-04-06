@@ -1,6 +1,7 @@
 use crate::binary_cas::codec::binary_blob_hash_hex;
 use crate::binary_cas::write::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow, OptionalTextPatch};
+use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine};
 use crate::filesystem::live_projection::FilesystemProjectionScope;
 use crate::filesystem::queries::load_file_row_by_id_without_path;
@@ -55,6 +56,34 @@ pub(crate) struct FilesystemTransactionFileState {
     pub(crate) metadata_patch: OptionalTextPatch,
     pub(crate) data: Option<Vec<u8>>,
     pub(crate) deleted: bool,
+}
+
+impl From<&FilesystemDescriptorState> for PendingFilesystemDescriptorView {
+    fn from(value: &FilesystemDescriptorState) -> Self {
+        Self {
+            directory_id: value.directory_id.clone(),
+            name: value.name.clone(),
+            extension: value.extension.clone(),
+            metadata: value.metadata.clone(),
+            hidden: value.hidden,
+        }
+    }
+}
+
+impl From<&FilesystemTransactionFileState> for PendingFilesystemFileView {
+    fn from(value: &FilesystemTransactionFileState) -> Self {
+        Self {
+            file_id: value.file_id.clone(),
+            version_id: value.version_id.clone(),
+            untracked: value.untracked,
+            descriptor: value
+                .descriptor
+                .as_ref()
+                .map(PendingFilesystemDescriptorView::from),
+            metadata_patch: value.metadata_patch.clone(),
+            deleted: value.deleted,
+        }
+    }
 }
 
 pub(crate) fn binary_blob_writes_from_filesystem_state(

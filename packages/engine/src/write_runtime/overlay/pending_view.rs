@@ -1,4 +1,6 @@
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
+use crate::contracts::traits::{
+    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+};
 use crate::write_runtime::buffered::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingWorkspaceWriterKeyOverlay,
@@ -100,9 +102,14 @@ impl PendingView for PendingTransactionView {
             .unwrap_or_default()
     }
 
-    fn visible_files(&self) -> Vec<crate::filesystem::runtime::FilesystemTransactionFileState> {
+    fn visible_files(&self) -> Vec<PendingFilesystemFileView> {
         self.filesystem_overlay()
-            .map(|overlay| overlay.visible_files().cloned().collect())
+            .map(|overlay| {
+                overlay
+                    .visible_files()
+                    .map(PendingFilesystemFileView::from)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 

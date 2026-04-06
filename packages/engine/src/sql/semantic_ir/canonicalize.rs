@@ -1875,7 +1875,7 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
 #[cfg(test)]
 mod tests {
     use super::{canonicalize_read, canonicalize_write};
-    use crate::contracts::surface::{DynamicEntitySurfaceSpec, SurfaceRegistry};
+    use crate::contracts::surface::DynamicEntitySurfaceSpec;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::{
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
@@ -1908,7 +1908,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_state_surface_into_day_one_read_plan_shell() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_read(
             bound_statement(
                 "SELECT entity_id, schema_key \
@@ -1990,13 +1990,16 @@ mod tests {
 
     #[test]
     fn canonicalizes_dynamic_entity_surface_into_canonical_state_scan() {
-        let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
-            schema_key: "lix_key_value".to_string(),
-            visible_columns: vec!["key".to_string(), "value".to_string()],
-            column_types: BTreeMap::new(),
-            predicate_overrides: Vec::new(),
-        });
+        let mut registry = crate::schema::build_builtin_surface_registry();
+        crate::schema::public_surfaces::register_dynamic_entity_surface_spec(
+            &mut registry,
+            DynamicEntitySurfaceSpec {
+                schema_key: "lix_key_value".to_string(),
+                visible_columns: vec!["key".to_string(), "value".to_string()],
+                column_types: BTreeMap::new(),
+                predicate_overrides: Vec::new(),
+            },
+        );
 
         let canonicalized = canonicalize_read(
             bound_statement("SELECT key, value FROM lix_key_value WHERE key = 'hello'"),
@@ -2030,7 +2033,7 @@ mod tests {
 
     #[test]
     fn rejects_join_reads_for_day_one_shell() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let error = canonicalize_read(
             bound_statement(
                 "SELECT * FROM lix_state s JOIN lix_state_by_version b ON s.entity_id = b.entity_id",
@@ -2050,7 +2053,7 @@ mod tests {
 
     #[test]
     fn allows_nested_subqueries_for_day_one_shell() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_read(
             bound_statement(
                 "SELECT entity_id FROM lix_state WHERE entity_id IN (SELECT entity_id FROM lix_state_by_version)",
@@ -2067,7 +2070,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_state_insert_into_write_command() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_state_by_version (\
@@ -2110,7 +2113,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_state_insert_with_lix_active_version_id() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement_with_context(
                 "INSERT INTO lix_state_by_version (\
@@ -2141,7 +2144,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_parameterized_state_insert_select_into_write_command() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement_with_params(
                 "INSERT INTO lix_state_by_version (\
@@ -2191,7 +2194,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_multi_row_filesystem_insert_into_insert_rows() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_file (id, path, data) VALUES \
@@ -2215,7 +2218,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_multi_row_insert_with_mixed_trackedness_as_auto_mode() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_state_by_version (\
@@ -2242,7 +2245,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_insert_select_write_mode_from_payload() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_file (id, path, data, untracked) \
@@ -2267,7 +2270,7 @@ mod tests {
 
     #[test]
     fn rejects_table_backed_insert_select_sources_with_precise_error() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let error = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_state_by_version (\
@@ -2291,7 +2294,7 @@ mod tests {
 
     #[test]
     fn rejects_set_operation_insert_sources_with_precise_error() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let error = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_state_by_version (\
@@ -2315,13 +2318,16 @@ mod tests {
 
     #[test]
     fn canonicalizes_entity_writes_into_semantic_commands() {
-        let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
-            schema_key: "lix_key_value".to_string(),
-            visible_columns: vec!["key".to_string(), "value".to_string()],
-            column_types: BTreeMap::new(),
-            predicate_overrides: Vec::new(),
-        });
+        let mut registry = crate::schema::build_builtin_surface_registry();
+        crate::schema::public_surfaces::register_dynamic_entity_surface_spec(
+            &mut registry,
+            DynamicEntitySurfaceSpec {
+                schema_key: "lix_key_value".to_string(),
+                visible_columns: vec!["key".to_string(), "value".to_string()],
+                column_types: BTreeMap::new(),
+                predicate_overrides: Vec::new(),
+            },
+        );
 
         let canonicalized = canonicalize_write(
             bound_statement("INSERT INTO lix_key_value (key, value) VALUES ('k', 'v')"),
@@ -2345,7 +2351,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_registered_schema_insert_via_lix_json() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement(
                 "INSERT INTO lix_registered_schema (value) VALUES (lix_json('{\"x-lix-key\":\"test\",\"x-lix-version\":\"1\"}'))",
@@ -2371,13 +2377,16 @@ mod tests {
 
     #[test]
     fn canonicalizes_json_typed_entity_update_via_lix_json() {
-        let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
-            schema_key: "test_json_entity".to_string(),
-            visible_columns: vec!["key".to_string(), "payload".to_string()],
-            column_types: BTreeMap::new(),
-            predicate_overrides: Vec::new(),
-        });
+        let mut registry = crate::schema::build_builtin_surface_registry();
+        crate::schema::public_surfaces::register_dynamic_entity_surface_spec(
+            &mut registry,
+            DynamicEntitySurfaceSpec {
+                schema_key: "test_json_entity".to_string(),
+                visible_columns: vec!["key".to_string(), "payload".to_string()],
+                column_types: BTreeMap::new(),
+                predicate_overrides: Vec::new(),
+            },
+        );
         let canonicalized = canonicalize_write(
             bound_statement(
                 "UPDATE test_json_entity SET payload = lix_json('{\"enabled\":true}') WHERE key = 'a'",
@@ -2398,7 +2407,7 @@ mod tests {
     }
 
     fn assert_surface_write_is_rejected(surface: &str, sql: &str) {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let error = canonicalize_write(bound_statement(sql), &registry)
             .expect_err("derived builtin surface should not be writable");
         assert!(
@@ -2437,7 +2446,7 @@ mod tests {
 
     #[test]
     fn canonicalizes_singleton_in_selector_as_exact_filesystem_delete() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let canonicalized = canonicalize_write(
             bound_statement("DELETE FROM lix_file WHERE id IN ('file-1')"),
             &registry,

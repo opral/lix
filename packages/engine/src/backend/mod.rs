@@ -6,19 +6,13 @@ use async_trait::async_trait;
 
 use crate::backend::prepared::PreparedBatch;
 use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
+pub use crate::transaction_mode::TransactionMode;
 use crate::{LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlDialect {
     Sqlite,
     Postgres,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionMode {
-    Read,
-    Write,
-    Deferred,
 }
 
 #[async_trait(?Send)]

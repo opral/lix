@@ -1,14 +1,114 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
 };
-use crate::runtime::streams::StateCommitStreamChange;
-use crate::{CommittedVersionFrontier, LixError, ReplayCursor, Value};
+use crate::error::LixError;
+use crate::replay_cursor::ReplayCursor;
+use crate::transaction_mode::TransactionMode;
+use crate::types::Value;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedBatch {
+    pub steps: Vec<PreparedStatement>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SchemaKey {
+    pub schema_key: String,
+    pub schema_version: String,
+}
+
+impl SchemaKey {
+    pub fn new(schema_key: impl Into<String>, schema_version: impl Into<String>) -> Self {
+        Self {
+            schema_key: schema_key.into(),
+            schema_version: schema_version.into(),
+        }
+    }
+
+    pub fn entity_id(&self) -> String {
+        format!("{}~{}", self.schema_key, self.schema_version)
+    }
+
+    pub fn version_number(&self) -> Option<u64> {
+        self.schema_version.parse::<u64>().ok()
+    }
+}
+
+/// Semantic frontier for committed state selected by replica-local version
+/// heads.
+///
+/// The commit DAG remains canonical, but this mapping records which committed
+/// head each local engine instance currently chooses for each version id.
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub struct CommittedVersionFrontier {
+    pub version_heads: BTreeMap<String, String>,
+}
+
+impl CommittedVersionFrontier {
+    pub fn is_empty(&self) -> bool {
+        self.version_heads.is_empty()
+    }
+
+    pub fn describe(&self) -> String {
+        if self.version_heads.is_empty() {
+            return "(empty)".to_string();
+        }
+
+        self.version_heads
+            .iter()
+            .map(|(version_id, commit_id)| format!("{version_id}={commit_id}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub(crate) fn to_json_string(&self) -> String {
+        serde_json::to_string(self).expect("committed frontier serialization should succeed")
+    }
+
+    pub(crate) fn from_json_str(value: &str) -> Result<Self, LixError> {
+        serde_json::from_str(value).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("invalid committed frontier json: {error}"),
+            )
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StateCommitStreamOperation {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StateCommitStreamChange {
+    pub operation: StateCommitStreamOperation,
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub plugin_key: String,
+    pub snapshot_content: Option<JsonValue>,
+    pub untracked: bool,
+    /// Runtime notification metadata used for listener filtering and echo
+    /// suppression. This is not canonical committed state.
+    pub writer_key: Option<String>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct ExecuteOptions {
@@ -320,10 +420,10 @@ pub(crate) enum CommittedReadMode {
 }
 
 impl CommittedReadMode {
-    pub(crate) fn transaction_mode(self) -> crate::TransactionMode {
+    pub(crate) fn transaction_mode(self) -> TransactionMode {
         match self {
-            Self::CommittedOnly => crate::TransactionMode::Read,
-            Self::MaterializedState => crate::TransactionMode::Deferred,
+            Self::CommittedOnly => TransactionMode::Read,
+            Self::MaterializedState => TransactionMode::Deferred,
         }
     }
 }
@@ -842,7 +942,7 @@ pub(crate) enum PreparedReadArtifact {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct PreparedReadStep {
-    pub(crate) transaction_mode: crate::TransactionMode,
+    pub(crate) transaction_mode: TransactionMode,
     pub(crate) artifact: PreparedReadArtifact,
     pub(crate) diagnostic_context: ReadDiagnosticContext,
 }
@@ -850,7 +950,7 @@ pub(crate) struct PreparedReadStep {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct PreparedReadProgram {
-    pub(crate) transaction_mode: crate::TransactionMode,
+    pub(crate) transaction_mode: TransactionMode,
     pub(crate) steps: Vec<PreparedReadStep>,
 }
 
@@ -2022,17 +2122,16 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        DerivedRow, FileHistoryRequest, PreparedDirectPublicRead, PreparedExplainMode,
-        PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
+        DerivedRow, FileHistoryRequest, PreparedBatch, PreparedDirectPublicRead,
+        PreparedExplainMode, PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
         PreparedPublicReadArtifact, PreparedPublicReadContract,
         PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
-        PreparedReadStep, ProjectionHydratedRow, ProjectionInput, ProjectionInputRows,
-        ProjectionInputSpec, ProjectionLifecycle, ProjectionRegistration, ProjectionStorageKind,
-        ProjectionSurfaceSpec, ReadDiagnosticContext, ReadTimeProjectionRead,
-        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, ResultContract, RowIdentity,
-        TrackedRow, UntrackedRow,
+        PreparedReadStep, PreparedStatement, ProjectionHydratedRow, ProjectionInput,
+        ProjectionInputRows, ProjectionInputSpec, ProjectionLifecycle, ProjectionRegistration,
+        ProjectionStorageKind, ProjectionSurfaceSpec, ReadDiagnosticContext,
+        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
+        ResultContract, RowIdentity, TrackedRow, UntrackedRow,
     };
-    use crate::backend::prepared::{PreparedBatch, PreparedStatement};
     use crate::contracts::surface::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
     use crate::Value;
 

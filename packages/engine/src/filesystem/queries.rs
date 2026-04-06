@@ -1,10 +1,11 @@
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
+use crate::contracts::traits::{
+    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+};
 use crate::filesystem::live_projection::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
     FilesystemProjectionScope,
 };
 use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
-use crate::filesystem::runtime::FilesystemTransactionFileState;
 use crate::live_schema_access::tracked_relation_name;
 use crate::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
@@ -748,7 +749,7 @@ async fn build_pending_directory_row(
 async fn build_pending_file_row(
     backend: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
-    row: &FilesystemTransactionFileState,
+    row: &PendingFilesystemFileView,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
     let Some(descriptor) = row.descriptor.as_ref() else {

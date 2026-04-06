@@ -1,6 +1,5 @@
-use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::contracts::artifacts::{
-    PreparedDirectDirectoryHistoryField, PreparedDirectEntityHistoryField,
+    PreparedBatch, PreparedDirectDirectoryHistoryField, PreparedDirectEntityHistoryField,
     PreparedDirectFileHistoryField, PreparedDirectPublicRead, PreparedDirectStateHistoryField,
     PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryDirectReadPlan,
     PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryProjection,
@@ -13,8 +12,8 @@ use crate::contracts::artifacts::{
     PreparedStateHistoryAggregatePredicate, PreparedStateHistoryDirectReadPlan,
     PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
     PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
-    PreparedStateHistorySortValue, PublicReadResultColumn, PublicReadResultColumns,
-    ReadDiagnosticContext, SessionExecutionMode,
+    PreparedStateHistorySortValue, PreparedStatement, PublicReadResultColumn,
+    PublicReadResultColumns, ReadDiagnosticContext, SessionExecutionMode,
 };
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::normalize_sql_execution_error_with_backend;

@@ -1,8 +1,7 @@
 use crate::contracts::artifacts::{
-    SessionStateDelta, TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation,
-    UntrackedWriteRow,
+    SessionStateDelta, StateCommitStreamChange, TrackedWriteOperation, TrackedWriteRow,
+    UntrackedWriteOperation, UntrackedWriteRow,
 };
-use crate::runtime::streams::StateCommitStreamChange;
 use crate::LixError;
 
 use crate::write_runtime::buffered::{WriteDelta, WriteJournal};

@@ -223,7 +223,7 @@ fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) ->
     };
 
     relation.starts_with("lix_internal_")
-        || crate::contracts::surface::builtin_public_surface_names()
+        || crate::schema::builtin_public_surface_names()
             .iter()
             .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }
@@ -326,7 +326,7 @@ pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::{boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs};
-    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect, TransactionMode};
+    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
     use crate::runtime::wasm::NoopWasmRuntime;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
@@ -334,6 +334,7 @@ mod tests {
     use crate::sql::optimizer::optimize_state_resolution;
     use crate::sql::parser::parse_sql_statements;
     use crate::sql::parser::placeholders::PlaceholderState;
+    use crate::TransactionMode;
     use crate::{ExecuteOptions, LixError, QueryResult, Session, Value};
     use async_trait::async_trait;
     use sqlparser::ast::Statement;

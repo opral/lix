@@ -745,8 +745,10 @@ impl Session {
             self.runtime.invalidate_installed_plugins_cache()?;
         }
         if outcome.refresh_public_surface_registry {
-            let registry =
-                SurfaceRegistry::bootstrap_with_backend(self.runtime.backend().as_ref()).await?;
+            let registry = crate::schema::load_public_surface_registry_with_backend(
+                self.runtime.backend().as_ref(),
+            )
+            .await?;
             *self
                 .public_surface_registry
                 .write()
@@ -796,7 +798,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_state_commit_stream_changes(
         &mut self,
-        changes: Vec<crate::runtime::streams::StateCommitStreamChange>,
+        changes: Vec<crate::contracts::artifacts::StateCommitStreamChange>,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()

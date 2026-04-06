@@ -14,5 +14,5 @@ pub(crate) use roots::{
 pub(crate) use version_heads::{
     load_committed_version_head_commit_id, load_committed_version_ref_with_backend,
     load_committed_version_ref_with_executor, load_current_committed_version_frontier_with_backend,
-    load_current_committed_version_frontier_with_executor, VersionRefRow,
+    load_current_committed_version_frontier_with_executor,
 };

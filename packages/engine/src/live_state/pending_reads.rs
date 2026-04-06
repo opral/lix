@@ -2,17 +2,15 @@ use std::collections::BTreeMap;
 
 use crate::contracts::artifacts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery,
-    PendingViewReadStorage, PublicReadExecutionMode, PublicReadResultColumn,
-    PublicReadResultColumns,
+    PendingViewReadStorage, PreparedPublicReadArtifact, PublicReadExecutionMode,
+    PublicReadResultColumn, PublicReadResultColumns,
 };
 use crate::contracts::traits::{
-    PendingPublicReadBackend, PendingPublicReadTransaction, PendingSemanticRow,
-    PendingSemanticStorage, PendingView, PreparedPublicReadExecutor,
+    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
-use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use super::{scan_live_rows, LiveReadRow, LiveStorageLane};
@@ -39,11 +37,10 @@ impl<'a> TransactionReadModel<'a> {
         &self,
     ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
-            return crate::contracts::surface::SurfaceRegistry::bootstrap_with_backend(self.base)
-                .await;
+            return crate::schema::load_public_surface_registry_with_backend(self.base).await;
         }
 
-        let mut registry = crate::contracts::surface::SurfaceRegistry::with_builtin_surfaces();
+        let mut registry = crate::schema::build_builtin_surface_registry();
         for snapshot_content in self.visible_registered_schema_rows().await?.into_values() {
             let snapshot: JsonValue = serde_json::from_str(&snapshot_content).map_err(|error| {
                 LixError::new(
@@ -51,35 +48,35 @@ impl<'a> TransactionReadModel<'a> {
                     format!("registered schema snapshot_content invalid JSON: {error}"),
                 )
             })?;
-            registry.replace_dynamic_entity_surfaces_from_stored_snapshot(&snapshot)?;
+            crate::schema::apply_registered_schema_snapshot_to_surface_registry(
+                &mut registry,
+                &snapshot,
+            )?;
         }
         Ok(registry)
     }
 
     async fn execute_prepared_public_read(
         &self,
-        public_read: &dyn PreparedPublicReadExecutor,
+        public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError> {
-        if !self.has_pending_visibility() {
-            return public_read.execute(self.base).await;
-        }
-
-        let contract = public_read.contract();
-        match contract.execution_mode() {
+        match public_read.contract.execution_mode() {
             PublicReadExecutionMode::PendingView => {
-                let query = contract
+                let query = public_read
+                    .contract
                     .pending_view_query
                     .as_ref()
                     .expect("pending-view public reads must lower to a typed live-table query");
                 let result = self.execute_live_table_query(query).await?;
-                if let Some(result_columns) = contract.result_columns.as_ref() {
+                if let Some(result_columns) = public_read.contract.result_columns.as_ref() {
                     return Ok(decode_public_read_result_contract(result, result_columns));
                 }
                 Ok(result)
             }
-            PublicReadExecutionMode::Committed(_) => {
-                public_read.execute_without_freshness_check(self.base).await
-            }
+            PublicReadExecutionMode::Committed(_) => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "committed public read execution does not belong to live_state pending overlays",
+            )),
         }
     }
 
@@ -373,12 +370,9 @@ pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_v
 pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
     base: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
-    public_read: &dyn PreparedPublicReadExecutor,
+    public_read: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
-    let Some(pending_transaction_view) = pending_transaction_view else {
-        return public_read.execute(base).await;
-    };
-    TransactionReadModel::new(base, Some(pending_transaction_view))
+    TransactionReadModel::new(base, pending_transaction_view)
         .execute_prepared_public_read(public_read)
         .await
 }
@@ -386,24 +380,20 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
 pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     pending_transaction_view: Option<&dyn PendingView>,
-    public_read: &dyn PreparedPublicReadExecutor,
+    public_read: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
-    let execution_mode = public_read_execution_mode(public_read);
-    match (pending_transaction_view, execution_mode) {
-        (Some(pending_transaction_view), PublicReadExecutionMode::PendingView) => {
+    match public_read.contract.execution_mode() {
+        PublicReadExecutionMode::PendingView => {
             let backend = crate::runtime::TransactionBackendAdapter::new(transaction);
-            TransactionReadModel::new(&backend, Some(pending_transaction_view))
+            TransactionReadModel::new(&backend, pending_transaction_view)
                 .execute_prepared_public_read(public_read)
                 .await
         }
-        _ => public_read.execute_in_transaction(transaction).await,
+        PublicReadExecutionMode::Committed(_) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "committed public read execution does not belong to live_state pending overlays",
+        )),
     }
-}
-
-pub(crate) fn public_read_execution_mode(
-    public_read: &dyn PreparedPublicReadExecutor,
-) -> PublicReadExecutionMode {
-    public_read.execution_mode()
 }
 
 type LiveTableOverlayQuery = PendingViewReadQuery;
@@ -504,45 +494,6 @@ fn decode_boolean_value(value: &Value) -> Option<Value> {
     }
 }
 
-#[async_trait(?Send)]
-impl PendingPublicReadBackend for dyn LixBackend + '_ {
-    async fn bootstrap_public_surface_registry_with_pending_view(
-        &self,
-        pending_view: Option<&dyn PendingView>,
-    ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
-        bootstrap_public_surface_registry_with_pending_transaction_view(self, pending_view).await
-    }
-
-    async fn execute_prepared_public_read_with_pending_view(
-        &self,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &dyn PreparedPublicReadExecutor,
-    ) -> Result<QueryResult, LixError> {
-        execute_prepared_public_read_with_pending_transaction_view(self, pending_view, public_read)
-            .await
-    }
-}
-
-#[async_trait(?Send)]
-impl PendingPublicReadTransaction for dyn LixBackendTransaction + '_ {
-    async fn require_live_state_ready(&mut self) -> Result<(), LixError> {
-        crate::live_state::require_ready_in_transaction(self).await
-    }
-
-    async fn execute_prepared_public_read_with_pending_view(
-        &mut self,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &dyn PreparedPublicReadExecutor,
-    ) -> Result<QueryResult, LixError> {
-        execute_prepared_public_read_with_pending_transaction_view_in_transaction(
-            self,
-            pending_view,
-            public_read,
-        )
-        .await
-    }
-}
-
 fn overlay_filter_text(value: &Value) -> Option<String> {
     match value {
         Value::Text(text) => Some(text.clone()),
@@ -617,7 +568,7 @@ fn visible_live_row_from_pending(
 
 fn visible_live_row_from_pending_filesystem_state(
     access: &LiveReadContract,
-    pending: &crate::filesystem::runtime::FilesystemTransactionFileState,
+    pending: &PendingFilesystemFileView,
 ) -> Option<OverlayVisibleLiveRow> {
     let descriptor = pending.descriptor.as_ref()?;
     let snapshot_content = serde_json::json!({

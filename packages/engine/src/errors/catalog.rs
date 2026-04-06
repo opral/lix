@@ -1,4 +1,4 @@
-use crate::contracts::surface::builtin_public_surface_names;
+use crate::schema::builtin_public_surface_names;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

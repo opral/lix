@@ -4,48 +4,15 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::surface::SurfaceReadFreshness;
 use crate::contracts::traits::{
-    LiveStateQueryBackend, PendingPublicReadTransaction, PreparedPublicReadExecutor,
+    LiveStateQueryBackend, PendingPublicReadBackend, PendingPublicReadTransaction, PendingView,
 };
 use crate::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::runtime::TransactionBackendAdapter;
-use crate::sql::prepare::PreparedPublicRead;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
 use super::direct::execute_direct_public_read_with_backend;
 use super::execute_read_time_projection_read_with_backend;
-use super::prepare_public_read_artifact;
-
-#[async_trait(?Send)]
-impl PreparedPublicReadExecutor for PreparedPublicRead {
-    fn contract(&self) -> crate::contracts::artifacts::PreparedPublicReadContract {
-        self.public_read_contract()
-    }
-
-    async fn execute(&self, backend: &dyn LixBackend) -> Result<QueryResult, LixError> {
-        let artifact = prepare_public_read_artifact(self, backend.dialect())?;
-        execute_prepared_public_read_artifact_with_backend(backend, &artifact).await
-    }
-
-    async fn execute_without_freshness_check(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<QueryResult, LixError> {
-        let artifact = prepare_public_read_artifact(self, backend.dialect())?;
-        execute_prepared_public_read_artifact_without_freshness_check_with_backend(
-            backend, &artifact,
-        )
-        .await
-    }
-
-    async fn execute_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-    ) -> Result<QueryResult, LixError> {
-        let artifact = prepare_public_read_artifact(self, transaction.dialect())?;
-        execute_prepared_public_read_artifact_in_transaction(transaction, &artifact).await
-    }
-}
 
 pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
@@ -86,6 +53,67 @@ pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_chec
         }
     };
     Ok(finalize_prepared_public_read_result(result, artifact))
+}
+
+#[async_trait(?Send)]
+impl PendingPublicReadBackend for dyn LixBackend + '_ {
+    async fn bootstrap_public_surface_registry_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+    ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
+        crate::live_state::pending_reads::bootstrap_public_surface_registry_with_pending_transaction_view(
+            self,
+            pending_view,
+        )
+        .await
+    }
+
+    async fn execute_prepared_public_read_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+        public_read: &PreparedPublicReadArtifact,
+    ) -> Result<QueryResult, LixError> {
+        match public_read.contract.execution_mode() {
+            crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
+                crate::live_state::pending_reads::execute_prepared_public_read_with_pending_transaction_view(
+                    self,
+                    pending_view,
+                    public_read,
+                )
+                .await
+            }
+            crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
+                execute_prepared_public_read_artifact_with_backend(self, public_read).await
+            }
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl PendingPublicReadTransaction for dyn LixBackendTransaction + '_ {
+    async fn require_live_state_ready(&mut self) -> Result<(), LixError> {
+        crate::live_state::require_ready_in_transaction(self).await
+    }
+
+    async fn execute_prepared_public_read_with_pending_view(
+        &mut self,
+        pending_view: Option<&dyn PendingView>,
+        public_read: &PreparedPublicReadArtifact,
+    ) -> Result<QueryResult, LixError> {
+        match public_read.contract.execution_mode() {
+            crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
+                crate::live_state::pending_reads::execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+                    self,
+                    pending_view,
+                    public_read,
+                )
+                .await
+            }
+            crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
+                execute_prepared_public_read_artifact_in_transaction(self, public_read).await
+            }
+        }
+    }
 }
 
 fn finalize_prepared_public_read_result(
@@ -265,7 +293,7 @@ fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> Stri
 
 async fn execute_prepared_batch_with_backend(
     backend: &dyn LixBackend,
-    batch: &crate::PreparedBatch,
+    batch: &crate::contracts::artifacts::PreparedBatch,
 ) -> Result<QueryResult, LixError> {
     let mut result = QueryResult {
         rows: Vec::new(),

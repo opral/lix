@@ -1,6 +1,5 @@
 pub(crate) mod catalog;
 pub(crate) mod classification;
-mod r#type;
 
 pub(crate) use catalog::ErrorCode;
 pub(crate) use catalog::FILE_DATA_EXPECTS_BYTES_MESSAGE;
@@ -11,4 +10,3 @@ pub(crate) use catalog::{
     sql_unknown_column_error, sql_unknown_table_error, table_not_found_read_error,
     transaction_control_statement_denied_error, unexpected_statement_count_error,
 };
-pub use r#type::LixError;

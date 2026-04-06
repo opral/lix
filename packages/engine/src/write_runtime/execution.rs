@@ -1,6 +1,5 @@
-use crate::contracts::artifacts::SchemaRegistration;
+use crate::contracts::artifacts::{SchemaRegistration, StateCommitStreamChange};
 use crate::engine::Engine;
-use crate::runtime::streams::StateCommitStreamChange;
 use crate::write_runtime::buffered::{
     BufferedWriteState, LiveStateWriteState, TransactionCoordinator,
 };

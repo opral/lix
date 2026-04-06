@@ -3,21 +3,20 @@
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
 //! and compiler-owned explain payload/template generation.
 
-use crate::backend::prepared::PreparedStatement;
 use crate::backend::SqlDialect;
 use crate::contracts::artifacts::{
     CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PreparedExplainTemplate,
-    PublicDomainChange, ReadTimeProjectionRead, SemanticEffect, SessionDependency,
-    SessionStateDelta, StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder,
-    StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
+    PreparedStatement, PublicDomainChange, ReadTimeProjectionRead, SemanticEffect,
+    SessionDependency, SessionStateDelta, StateCommitStreamChange, StateHistoryContentMode,
+    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
 };
-use crate::runtime::streams::StateCommitStreamChange;
 use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::logical_plan::direct_reads::{

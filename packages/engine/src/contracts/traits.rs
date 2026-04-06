@@ -1,22 +1,20 @@
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use crate::contracts::artifacts::{
     EffectiveRowSet, EffectiveRowsRequest, ExactUntrackedLookupRequest, LiveFilter,
     LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
-    LiveStateProjectionStatus, PreparedPublicReadContract, PublicReadExecutionMode, ScanRequest,
-    SchemaRegistration, TrackedRow, TrackedTombstoneLookupRequest, TrackedTombstoneMarker,
-    TrackedWriteRow, UntrackedRow, UntrackedWriteRow,
+    LiveStateProjectionStatus, OptionalTextPatch, PreparedPublicReadArtifact, RowIdentity,
+    ScanRequest, SchemaKey, SchemaRegistration, TrackedRow, TrackedTombstoneLookupRequest,
+    TrackedTombstoneMarker, TrackedWriteRow, UntrackedRow, UntrackedWriteRow,
 };
 use crate::contracts::surface::SurfaceRegistry;
-use crate::filesystem::runtime::FilesystemTransactionFileState;
-use crate::schema::SchemaKey;
-use crate::workspace::writer_key::WorkspaceWriterKeyReadView;
-use crate::write_runtime::commit::CanonicalCommitReceipt;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, ReplayCursor, Value};
+use crate::error::LixError;
+use crate::replay_cursor::ReplayCursor;
+use crate::types::{QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {
@@ -38,6 +36,37 @@ pub(crate) struct PendingSemanticRow {
     pub(crate) tombstone: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingFilesystemDescriptorView {
+    pub(crate) directory_id: String,
+    pub(crate) name: String,
+    pub(crate) extension: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PendingFilesystemFileView {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) descriptor: Option<PendingFilesystemDescriptorView>,
+    pub(crate) metadata_patch: OptionalTextPatch,
+    pub(crate) deleted: bool,
+}
+
+#[async_trait(?Send)]
+pub(crate) trait WorkspaceWriterKeyReadView {
+    #[allow(dead_code)]
+    async fn load_annotation(&self, row_identity: &RowIdentity)
+        -> Result<Option<String>, LixError>;
+
+    async fn load_annotations(
+        &self,
+        row_identities: &BTreeSet<RowIdentity>,
+    ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError>;
+}
+
 pub(crate) trait PendingView {
     fn has_overlays(&self) -> bool {
         false
@@ -57,7 +86,7 @@ pub(crate) trait PendingView {
         schema_key: &str,
     ) -> Vec<PendingSemanticRow>;
 
-    fn visible_files(&self) -> Vec<FilesystemTransactionFileState>;
+    fn visible_files(&self) -> Vec<PendingFilesystemFileView>;
 
     fn workspace_writer_key_annotation_for_state_row(
         &self,
@@ -315,9 +344,9 @@ pub(crate) trait LiveStateTransactionBridge {
 
     async fn mark_live_state_projection_ready(&mut self) -> Result<ReplayCursor, LixError>;
 
-    async fn apply_canonical_receipt_to_live_state(
+    async fn advance_live_state_replay_boundary(
         &mut self,
-        receipt: &CanonicalCommitReceipt,
+        replay_cursor: &ReplayCursor,
     ) -> Result<(), LixError>;
 }
 
@@ -369,7 +398,7 @@ pub(crate) trait PendingPublicReadBackend {
     async fn execute_prepared_public_read_with_pending_view(
         &self,
         pending_view: Option<&dyn PendingView>,
-        public_read: &dyn PreparedPublicReadExecutor,
+        public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError>;
 }
 
@@ -380,28 +409,7 @@ pub(crate) trait PendingPublicReadTransaction {
     async fn execute_prepared_public_read_with_pending_view(
         &mut self,
         pending_view: Option<&dyn PendingView>,
-        public_read: &dyn PreparedPublicReadExecutor,
-    ) -> Result<QueryResult, LixError>;
-}
-
-#[async_trait(?Send)]
-pub(crate) trait PreparedPublicReadExecutor {
-    fn contract(&self) -> PreparedPublicReadContract;
-
-    fn execution_mode(&self) -> PublicReadExecutionMode {
-        self.contract().execution_mode()
-    }
-
-    async fn execute(&self, backend: &dyn LixBackend) -> Result<QueryResult, LixError>;
-
-    async fn execute_without_freshness_check(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<QueryResult, LixError>;
-
-    async fn execute_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
+        public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError>;
 }
 

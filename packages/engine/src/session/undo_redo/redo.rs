@@ -1,3 +1,4 @@
+use crate::contracts::artifacts::StateCommitStreamChange;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::version::context::{
     exact_current_head_preconditions, require_version_context_with_executor, ResolvedVersionTarget,
@@ -55,7 +56,7 @@ async fn redo_in_transaction(
         let mut state_commit_stream_changes = Vec::with_capacity(effects.len());
         for effect in &effects {
             let proposed = build_forward_proposed_change(&version_id, &effect.forward_change)?;
-            state_commit_stream_changes.push(crate::runtime::streams::StateCommitStreamChange {
+            state_commit_stream_changes.push(StateCommitStreamChange {
                 operation: effect.forward_operation,
                 entity_id: proposed.entity_id.to_string(),
                 schema_key: proposed.schema_key.to_string(),

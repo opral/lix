@@ -1,4 +1,3 @@
-use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
 use crate::read_runtime::{
     execute_prepared_public_read_artifact_with_backend, prepare_public_read_artifact,
@@ -22,7 +21,7 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
                 .bootstrap_public_surface_registry_with_pending_view(Some(pending_transaction_view))
                 .await?
         }
-        None => SurfaceRegistry::bootstrap_with_backend(backend).await?,
+        None => crate::schema::load_public_surface_registry_with_backend(backend).await?,
     };
     let statement = Statement::Query(Box::new(query));
     let active_history_root_commit_id = load_target_version_history_root_commit_id_with_backend(
@@ -51,18 +50,16 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
             "public write selector resolver expected a public read plan",
         ));
     };
+    let artifact = prepare_public_read_artifact(&public_read, backend.dialect())?;
     match pending_transaction_view {
         Some(pending_transaction_view) => {
             backend
                 .execute_prepared_public_read_with_pending_view(
                     Some(pending_transaction_view),
-                    &public_read,
+                    &artifact,
                 )
                 .await
         }
-        None => {
-            let artifact = prepare_public_read_artifact(&public_read, backend.dialect())?;
-            execute_prepared_public_read_artifact_with_backend(backend, &artifact).await
-        }
+        None => execute_prepared_public_read_artifact_with_backend(backend, &artifact).await,
     }
 }
