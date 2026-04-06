@@ -6,7 +6,7 @@ use crate::sql::prepare::execution_program::{
     BoundStatementTemplateInstance, StatementTemplate, StatementTemplateCacheKey,
 };
 use crate::sql::prepare::{
-    compile_execution_from_template_instance_with_context,
+    compile_execution_from_template_instance_with_context, load_sql_compiler_metadata,
     prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
     PreparationPolicy,
 };
@@ -40,9 +40,11 @@ pub(super) async fn compile_sql_buffered_write_command(
         .execution_runtime_state()
         .expect("write execution should install an execution runtime state before compilation");
     if runtime_state.settings().enabled {
-        runtime_state
-            .ensure_sequence_initialized_in_transaction(engine.runtime().as_ref(), transaction)
-            .await?;
+        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+            transaction,
+            runtime_state.provider(),
+        )
+        .await?;
     }
     let backend = TransactionBackendAdapter::new(transaction);
     let active_history_root_commit_id = load_target_version_history_root_commit_id_with_backend(
@@ -52,8 +54,7 @@ pub(super) async fn compile_sql_buffered_write_command(
     )
     .await?;
     let compiler_metadata =
-        crate::runtime::load_sql_compiler_metadata(&backend, &context.public_surface_registry)
-            .await?;
+        load_sql_compiler_metadata(&backend, &context.public_surface_registry).await?;
     let preparation_context = DefaultSqlPreparationContext {
         dialect: backend.dialect(),
         cel_evaluator: engine.runtime().as_ref().cel_evaluator(),

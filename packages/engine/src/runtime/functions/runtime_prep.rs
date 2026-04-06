@@ -1,13 +1,8 @@
-use crate::backend::program::WriteProgram;
-use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::runtime::deterministic_mode::{
     load_runtime_settings, DeterministicSettings, RuntimeFunctionProvider,
 };
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::write_runtime::{
-    build_persist_sequence_highest_batch, load_runtime_sequence_start_in_transaction,
-};
-use crate::{LixBackend, LixBackendTransaction, LixError};
+use crate::runtime::functions::SharedFunctionProvider;
+use crate::{LixBackend, LixError};
 
 use crate::runtime::Runtime;
 
@@ -35,45 +30,6 @@ impl Runtime {
 
         let functions = SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, None));
         Ok((settings, functions))
-    }
-
-    pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        if !functions.deterministic_sequence_enabled()
-            || functions.deterministic_sequence_initialized()
-        {
-            return Ok(());
-        }
-        let sequence_start = load_runtime_sequence_start_in_transaction(transaction).await?;
-        let mut functions = functions.clone();
-        functions.initialize_deterministic_sequence(sequence_start);
-        Ok(())
-    }
-
-    pub(crate) async fn persist_runtime_sequence_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        settings: DeterministicSettings,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        if settings.enabled {
-            let Some(sequence_start) = functions.with_lock(|provider| provider.sequence_start())
-            else {
-                return Ok(());
-            };
-            let sequence_end = functions.with_lock(|provider| provider.next_sequence());
-            if sequence_end > sequence_start {
-                let batch =
-                    build_persist_sequence_highest_batch(sequence_end - 1, transaction.dialect())?;
-                let mut program = WriteProgram::new();
-                program.push_batch(batch);
-                execute_write_program_with_transaction(transaction, program).await?;
-            }
-        }
-        Ok(())
     }
 }
 

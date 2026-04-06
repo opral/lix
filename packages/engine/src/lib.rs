@@ -38,7 +38,7 @@ pub(crate) mod workspace;
 pub(crate) mod write_runtime;
 
 pub mod image {
-    pub use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
+    pub use crate::backend::{ImageChunkReader, ImageChunkWriter};
 }
 
 pub mod streams {

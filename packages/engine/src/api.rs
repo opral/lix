@@ -1,12 +1,12 @@
 use crate::backend::program::WriteProgram;
 use crate::backend::program_runner::execute_write_program_with_transaction;
+use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::engine::Engine;
 use crate::errors;
 use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
-use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
 use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackendTransaction, LixError};
 
@@ -29,7 +29,7 @@ impl Engine {
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
-        self.refresh_public_surface_registry().await?;
+        crate::session::refresh_public_surface_registry_in_runtime(self.runtime().as_ref()).await?;
         Ok(())
     }
 
@@ -54,7 +54,8 @@ impl Engine {
         reader: &mut dyn ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend().restore_from_image(reader).await?;
-        self.refresh_public_surface_registry().await?;
+        crate::session::clear_public_surface_registry_in_runtime(self.runtime().as_ref());
+        crate::session::refresh_public_surface_registry_in_runtime(self.runtime().as_ref()).await?;
         self.invalidate_installed_plugins_cache()?;
         Ok(())
     }
@@ -84,9 +85,9 @@ impl Engine {
         let plan = crate::live_state::rebuild_plan(self.backend().as_ref(), req).await?;
         let apply = crate::live_state::apply_rebuild_plan(self.backend().as_ref(), &plan).await?;
 
-        if let Err(error) = crate::runtime::plugin::runtime::materialize_file_data_with_plugins(
+        if let Err(error) = crate::live_state::materialize_file_data_with_plugins(
             self.backend().as_ref(),
-            self.wasm_runtime_ref(),
+            self.runtime().as_ref(),
             &plan,
         )
         .await

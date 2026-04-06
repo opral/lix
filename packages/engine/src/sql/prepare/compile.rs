@@ -9,13 +9,12 @@ use crate::sql::explain::{
 };
 use crate::sql::physical_plan::PhysicalPlan;
 use crate::{LixError, SqlDialect, Value};
-use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
-use std::collections::BTreeMap;
 use std::time::Duration;
 use std::time::Instant;
 
 use super::compiled::{CompiledExecution, CompiledExecutionBody, CompiledInternalExecution};
+use super::compiler_metadata::SqlCompilerMetadata;
 use super::contracts::effects::PlanEffects;
 use super::contracts::planned_statement::PlannedStatementSet;
 use super::contracts::requirements::PlanRequirements;
@@ -38,12 +37,6 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
     pub(crate) skip_side_effect_collection: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-pub(crate) struct SqlCompilerMetadata {
-    pub(crate) known_live_schema_definitions: BTreeMap<String, JsonValue>,
-    pub(crate) current_version_heads: Option<BTreeMap<String, String>>,
 }
 
 pub(crate) trait SqlPreparationContext {

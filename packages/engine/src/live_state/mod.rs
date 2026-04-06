@@ -152,6 +152,14 @@ pub async fn apply_live_state_rebuild_plan(
     apply_rebuild_plan(backend, plan).await
 }
 
+pub(crate) async fn materialize_file_data_with_plugins(
+    backend: &dyn LixBackend,
+    runtime: &crate::runtime::Runtime,
+    plan: &LiveStateRebuildPlan,
+) -> Result<(), LixError> {
+    materialize::materialize_file_data_with_plugins(backend, runtime, plan).await
+}
+
 pub async fn rebuild(
     backend: &dyn LixBackend,
     request: &LiveStateRebuildRequest,

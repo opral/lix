@@ -1,3 +1,4 @@
+pub(crate) mod image;
 pub(crate) mod prepared;
 pub(crate) mod program;
 pub(crate) mod program_runner;
@@ -5,9 +6,9 @@ pub(crate) mod program_runner;
 use async_trait::async_trait;
 
 use crate::backend::prepared::PreparedBatch;
-use crate::runtime::image::{ImageChunkReader, ImageChunkWriter};
 pub use crate::transaction_mode::TransactionMode;
 use crate::{LixError, QueryResult, Value};
+pub use image::{ImageChunkReader, ImageChunkWriter};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlDialect {

@@ -6,6 +6,7 @@ mod effective_state;
 mod execution;
 mod filesystem_state;
 pub(crate) mod overlay;
+mod plugin_install;
 mod read_context;
 mod resolve_write_plan;
 mod selector_reads;
@@ -25,12 +26,13 @@ pub use contracts::{
     CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
 };
 pub(crate) use deterministic_sequence::{
-    build_ensure_runtime_sequence_row_sql, build_persist_sequence_highest_batch,
-    build_update_runtime_sequence_highest_sql, load_runtime_sequence_start_in_transaction,
+    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
+    ensure_runtime_sequence_initialized_in_transaction, persist_runtime_sequence_in_transaction,
 };
 pub(crate) use execution::BorrowedWriteTransaction;
 pub use execution::WriteTransaction;
 pub(crate) use overlay::PendingTransactionView;
+pub(crate) use plugin_install::install_plugin_archive_with_write_context;
 pub use read_context::ReadContext;
 #[cfg(test)]
 pub(crate) use resolve_write_plan::resolve_write_plan;

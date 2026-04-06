@@ -15,7 +15,7 @@ use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::session::execution_context::ExecutionContext;
 use crate::write_runtime::sql_adapter::execute_with_options_in_write_transaction;
 use crate::write_runtime::WriteTransaction;
-use crate::{ExecuteOptions, LixError, Session, Value};
+use crate::{LixError, Value};
 
 const INSTALL_REGISTERED_SCHEMA_SQL: &str =
     "INSERT INTO lix_registered_schema (value) VALUES (lix_json(?))";
@@ -30,41 +30,15 @@ struct ParsedSchema {
     normalized_schema_json: String,
 }
 
-pub(crate) async fn install_plugin_in_session(
-    session: &Session,
+pub(crate) async fn install_plugin_archive_with_write_context(
+    engine: &Engine,
+    transaction: &mut WriteTransaction<'_>,
     archive_bytes: &[u8],
+    context: &mut ExecutionContext,
 ) -> Result<(), LixError> {
     let parsed = parse_plugin_archive(archive_bytes)?;
     ensure_valid_wasm_binary(&parsed.wasm_bytes)?;
-
-    let transaction = session.runtime().begin_write_unit().await?;
-    let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
-    let mut context = session.new_execution_context(ExecuteOptions::default());
-
-    let install_result = install_plugin_in_transaction(
-        session.engine().as_ref(),
-        &mut write_transaction,
-        &parsed,
-        archive_bytes,
-        &mut context,
-    )
-    .await;
-
-    match install_result {
-        Ok(()) => {
-            write_transaction.mark_public_surface_registry_refresh_pending();
-            write_transaction.mark_installed_plugins_cache_invalidation_pending();
-            let outcome = write_transaction
-                .commit_buffered_write(session.engine().as_ref(), context)
-                .await?;
-            session.apply_transaction_commit_outcome(outcome).await?;
-        }
-        Err(error) => {
-            let _ = write_transaction.rollback_buffered_write().await;
-            return Err(error);
-        }
-    }
-    Ok(())
+    install_plugin_in_transaction(engine, transaction, &parsed, archive_bytes, context).await
 }
 
 async fn install_plugin_in_transaction(
@@ -279,18 +253,24 @@ fn normalize_archive_path(path: &str) -> Result<String, LixError> {
     for component in Path::new(path).components() {
         match component {
             Component::Normal(value) => {
-                let segment = value.to_str().ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
+                let segment = value.to_str().ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
                         "Plugin archive path '{path}' contains non-UTF-8 components"
                     ),
                 })?;
                 if segment.is_empty() {
-                    return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!("Plugin archive path '{path}' is invalid"),
+                    return Err(LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        description: format!("Plugin archive path '{path}' is invalid"),
                     });
                 }
                 segments.push(segment.to_string());
             }
             Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
                         "Plugin archive path '{path}' must not contain traversal or absolute components"
                     ),
                 })

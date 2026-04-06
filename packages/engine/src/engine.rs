@@ -6,7 +6,7 @@ use crate::runtime::streams::{
 };
 use crate::runtime::wasm::WasmRuntime;
 use crate::runtime::Runtime;
-use crate::{LixBackend, LixBackendTransaction, LixError};
+use crate::{LixBackend, LixError};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
 use std::collections::BTreeMap;
@@ -42,10 +42,6 @@ impl Engine {
         self.runtime.state_commit_stream(filter)
     }
 
-    pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
-        self.runtime.wasm_runtime_ref()
-    }
-
     pub(crate) fn deterministic_boot_pending(&self) -> bool {
         self.runtime.deterministic_boot_pending()
     }
@@ -56,10 +52,6 @@ impl Engine {
 
     pub(crate) fn public_surface_registry(&self) -> crate::contracts::surface::SurfaceRegistry {
         self.runtime.public_surface_registry()
-    }
-
-    pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        self.runtime.refresh_public_surface_registry().await
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
@@ -103,27 +95,6 @@ impl Engine {
     > {
         self.runtime
             .prepare_runtime_functions_with_backend(backend)
-            .await
-    }
-
-    pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        self.runtime
-            .ensure_runtime_sequence_initialized_in_transaction(transaction, functions)
-            .await
-    }
-
-    pub(crate) async fn persist_runtime_sequence_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        settings: DeterministicSettings,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        self.runtime
-            .persist_runtime_sequence_in_transaction(transaction, settings, functions)
             .await
     }
 }
@@ -247,6 +218,7 @@ impl Engine {
                 args.wasm_runtime,
                 args.access_to_internal,
                 boot_deterministic_settings,
+                crate::schema::build_builtin_surface_registry(),
             )),
             boot_key_values: args.key_values,
         }

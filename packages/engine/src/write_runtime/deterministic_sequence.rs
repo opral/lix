@@ -1,6 +1,12 @@
+use crate::backend::program::WriteProgram;
+use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::contracts::artifacts::PreparedBatch;
 use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
-use crate::runtime::deterministic_mode::{deterministic_sequence_key, load_runtime_sequence_start};
+use crate::runtime::deterministic_mode::{
+    deterministic_sequence_key, load_runtime_sequence_start, DeterministicSettings,
+    RuntimeFunctionProvider,
+};
+use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema::builtin::storage::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
@@ -34,6 +40,41 @@ pub(crate) async fn load_runtime_sequence_start_in_transaction(
         description: format!("deterministic sequence value_json invalid JSON: {err}"),
     })?;
     Ok(parsed.as_i64().unwrap_or(-1) + 1)
+}
+
+pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+) -> Result<(), LixError> {
+    if !functions.deterministic_sequence_enabled() || functions.deterministic_sequence_initialized()
+    {
+        return Ok(());
+    }
+    let sequence_start = load_runtime_sequence_start_in_transaction(transaction).await?;
+    let mut functions = functions.clone();
+    functions.initialize_deterministic_sequence(sequence_start);
+    Ok(())
+}
+
+pub(crate) async fn persist_runtime_sequence_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    settings: DeterministicSettings,
+    functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
+) -> Result<(), LixError> {
+    if settings.enabled {
+        let Some(sequence_start) = functions.with_lock(|provider| provider.sequence_start()) else {
+            return Ok(());
+        };
+        let sequence_end = functions.with_lock(|provider| provider.next_sequence());
+        if sequence_end > sequence_start {
+            let batch =
+                build_persist_sequence_highest_batch(sequence_end - 1, transaction.dialect())?;
+            let mut program = WriteProgram::new();
+            program.push_batch(batch);
+            execute_write_program_with_transaction(transaction, program).await?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn build_persist_sequence_highest_batch(

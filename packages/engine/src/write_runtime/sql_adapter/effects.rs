@@ -300,20 +300,19 @@ pub(super) async fn complete_sql_command_execution(
     }
 
     if !write_handled_by_planned_write {
-        engine
-            .persist_runtime_sequence_in_transaction(
-                transaction,
-                command.compiled.runtime_state().settings(),
-                command.compiled.runtime_state().provider(),
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "transaction runtime-sequence persistence failed: {}",
-                    error.description
-                ),
-            })?;
+        crate::write_runtime::persist_runtime_sequence_in_transaction(
+            transaction,
+            command.compiled.runtime_state().settings(),
+            command.compiled.runtime_state().provider(),
+        )
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "transaction runtime-sequence persistence failed: {}",
+                error.description
+            ),
+        })?;
     }
 
     Ok(BufferedWriteExecutionResult {

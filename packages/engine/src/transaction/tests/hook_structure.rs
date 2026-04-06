@@ -550,15 +550,27 @@ fn init_and_plugin_paths_use_write_runtime_owned_write_entrypoints() {
         "init/seed.rs should execute writes through write_runtime::sql_adapter"
     );
 
-    let plugin_source = read_engine_source("runtime/plugin/install.rs");
+    let plugin_session_source = read_engine_source("session/plugin.rs");
     assert!(
-        plugin_source.contains("WriteTransaction::new_buffered_write("),
-        "plugin/install.rs should use the write-runtime-owned buffered write lifecycle"
+        plugin_session_source.contains("WriteTransaction::new_buffered_write("),
+        "session/plugin.rs should use the write-runtime-owned buffered write lifecycle"
     );
+    assert!(
+        plugin_session_source.contains("use crate::write_runtime::{install_plugin_archive_with_write_context, WriteTransaction};"),
+        "session/plugin.rs should import the plugin install helper from write_runtime"
+    );
+
+    let plugin_source = read_engine_source("write_runtime/plugin_install.rs");
     assert!(
         plugin_source.contains("execute_with_options_in_write_transaction"),
-        "plugin/install.rs should execute statements through write_runtime::sql_adapter"
+        "write_runtime/plugin_install.rs should execute statements through write_runtime::sql_adapter"
     );
+    for forbidden in ["crate::runtime::plugin::install", "crate::session::plugin"] {
+        assert!(
+            !plugin_source.contains(forbidden),
+            "write_runtime/plugin_install.rs should not route plugin installation back through `{forbidden}`"
+        );
+    }
 }
 
 #[test]

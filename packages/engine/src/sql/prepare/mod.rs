@@ -5,6 +5,7 @@
 
 mod compile;
 mod compiled;
+mod compiler_metadata;
 pub(crate) mod contracts;
 pub(crate) mod dependency_spec;
 pub(crate) mod derive_effects;
@@ -17,11 +18,12 @@ mod public_surface;
 pub(crate) use compile::{
     compile_execution_from_template_instance_with_context,
     prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
-    PreparationPolicy, SqlCompilerMetadata, SqlPreparationContext,
+    PreparationPolicy, SqlPreparationContext,
 };
 pub(crate) use compiled::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
 };
+pub(crate) use compiler_metadata::{load_sql_compiler_metadata, SqlCompilerMetadata};
 pub(crate) use public_surface::{
     apply_public_surface_registry_mutations, build_public_write_execution,
     build_public_write_invariant_trace, classify_public_execution_route_with_registry,

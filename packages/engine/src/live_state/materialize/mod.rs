@@ -11,6 +11,7 @@
 mod apply;
 mod loader;
 mod plan;
+mod plugin;
 mod types;
 
 use std::collections::BTreeMap;
@@ -24,6 +25,7 @@ pub use types::{
 };
 
 use crate::live_state::shared::identity::RowIdentity;
+use crate::runtime::Runtime;
 use crate::runtime::TransactionBackendAdapter;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
@@ -60,6 +62,14 @@ pub(crate) async fn apply_rebuild_scope_with_writer_key_hints_in_transaction(
         writer_key_hints,
     )
     .await
+}
+
+pub(crate) async fn materialize_file_data_with_plugins(
+    backend: &dyn LixBackend,
+    runtime: &Runtime,
+    plan: &LiveStateRebuildPlan,
+) -> Result<(), LixError> {
+    plugin::materialize_file_data_with_plugins(backend, runtime, plan).await
 }
 
 pub async fn rebuild(

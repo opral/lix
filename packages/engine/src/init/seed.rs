@@ -89,23 +89,21 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
-        runtime_state
-            .ensure_sequence_initialized_in_transaction(
-                self.engine.runtime().as_ref(),
-                self.write_transaction.backend_transaction_mut(),
-            )
-            .await?;
+        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+            self.write_transaction.backend_transaction_mut(),
+            runtime_state.provider(),
+        )
+        .await?;
         Ok(runtime_state.provider().call_uuid_v7())
     }
 
     pub(crate) async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
-        runtime_state
-            .ensure_sequence_initialized_in_transaction(
-                self.engine.runtime().as_ref(),
-                self.write_transaction.backend_transaction_mut(),
-            )
-            .await?;
+        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+            self.write_transaction.backend_transaction_mut(),
+            runtime_state.provider(),
+        )
+        .await?;
         Ok(runtime_state.provider().call_timestamp())
     }
 
@@ -113,12 +111,12 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let Some(runtime_state) = self.context.execution_runtime_state().cloned() else {
             return Ok(());
         };
-        runtime_state
-            .flush_in_transaction(
-                self.engine.runtime().as_ref(),
-                self.write_transaction.backend_transaction_mut(),
-            )
-            .await
+        crate::write_runtime::persist_runtime_sequence_in_transaction(
+            self.write_transaction.backend_transaction_mut(),
+            runtime_state.settings(),
+            runtime_state.provider(),
+        )
+        .await
     }
 
     async fn ensure_runtime_state(&mut self) -> Result<ExecutionRuntimeState, LixError> {
