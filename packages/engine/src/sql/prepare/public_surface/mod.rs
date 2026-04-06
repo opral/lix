@@ -3,7 +3,7 @@
 use crate::change_view::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
-    PreparedPublicReadContract, SessionStateDelta,
+    PreparedPublicReadContract, SessionStateDelta, StateCommitStreamOperation,
 };
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
@@ -13,7 +13,7 @@ use crate::errors::{
 };
 use crate::runtime::streams::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
+    StateCommitStreamRuntimeMetadata,
 };
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
@@ -303,7 +303,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+    let registry = crate::schema::load_public_surface_registry_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
@@ -1373,10 +1373,12 @@ pub(crate) fn apply_public_surface_registry_mutations(
     for mutation in mutations {
         match mutation {
             PublicSurfaceRegistryMutation::UpsertRegisteredSchemaSnapshot { snapshot } => {
-                registry.replace_dynamic_entity_surfaces_from_stored_snapshot(snapshot)?;
+                crate::schema::apply_registered_schema_snapshot_to_surface_registry(
+                    registry, snapshot,
+                )?;
             }
             PublicSurfaceRegistryMutation::RemoveDynamicSchema { schema_key } => {
-                registry.remove_dynamic_entity_surfaces_for_schema_key(schema_key);
+                crate::schema::remove_dynamic_entity_surfaces_for_schema_key(registry, schema_key);
             }
         }
     }
@@ -1785,7 +1787,7 @@ mod tests {
     use crate::contracts::artifacts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
-    use crate::contracts::surface::{SurfaceReadFreshness, SurfaceRegistry};
+    use crate::contracts::surface::SurfaceReadFreshness;
     use crate::live_state::{self, mark_mode_with_backend};
     use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
     use crate::read_runtime::prepare_public_read_artifact;
@@ -3691,7 +3693,7 @@ mod tests {
         .into_iter()
         .next()
         .expect("statement should exist");
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let bound = bind_public_read_statement(
             statement,
             Vec::new(),

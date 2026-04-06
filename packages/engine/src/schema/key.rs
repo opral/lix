@@ -1,29 +1,7 @@
 use serde_json::Value as JsonValue;
 
+pub use crate::contracts::artifacts::SchemaKey;
 use crate::LixError;
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct SchemaKey {
-    pub schema_key: String,
-    pub schema_version: String,
-}
-
-impl SchemaKey {
-    pub fn new(schema_key: impl Into<String>, schema_version: impl Into<String>) -> Self {
-        Self {
-            schema_key: schema_key.into(),
-            schema_version: schema_version.into(),
-        }
-    }
-
-    pub fn entity_id(&self) -> String {
-        format!("{}~{}", self.schema_key, self.schema_version)
-    }
-
-    pub fn version_number(&self) -> Option<u64> {
-        self.schema_version.parse::<u64>().ok()
-    }
-}
 
 pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixError> {
     let object = schema.as_object().ok_or_else(|| LixError {

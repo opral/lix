@@ -5,6 +5,7 @@ mod init;
 mod key;
 mod overlay;
 mod provider;
+pub(crate) mod public_surfaces;
 #[cfg(test)]
 mod tests;
 
@@ -16,3 +17,8 @@ pub(crate) use init::{init, seed_bootstrap};
 pub use key::{schema_from_registered_snapshot, schema_key_from_definition, SchemaKey};
 pub use overlay::OverlaySchemaProvider;
 pub use provider::{SchemaProvider, SqlRegisteredSchemaProvider};
+pub(crate) use public_surfaces::{
+    apply_registered_schema_snapshot_to_surface_registry, build_builtin_surface_registry,
+    builtin_public_surface_columns, builtin_public_surface_names,
+    load_public_surface_registry_with_backend, remove_dynamic_entity_surfaces_for_schema_key,
+};

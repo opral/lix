@@ -45,7 +45,7 @@ fn direct_state_file_cache_refresh_targets(
 #[cfg(test)]
 mod tests {
     use super::derive_effects_from_state_resolution;
-    use crate::backend::prepared::PreparedStatement;
+    use crate::contracts::artifacts::PreparedStatement;
     use crate::sql::prepare::contracts::planned_statement::{
         MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan,
     };

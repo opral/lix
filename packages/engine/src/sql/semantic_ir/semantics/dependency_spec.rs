@@ -611,7 +611,7 @@ mod tests {
 
     #[test]
     fn derives_fixed_schema_dependency_for_entity_surface() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn derives_version_filter_from_placeholder_on_explicit_version_surface() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
             "SELECT entity_id FROM lix_state_by_version WHERE version_id = ? AND schema_key = ?",
@@ -664,7 +664,7 @@ mod tests {
 
     #[test]
     fn marks_non_representable_filter_shapes_as_conservative() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
             "SELECT entity_id FROM lix_state WHERE schema_key = 'a' OR entity_id = 'b'",

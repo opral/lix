@@ -1,15 +1,16 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use crate::backend::prepared::PreparedStatement;
-use crate::contracts::artifacts::{PlanEffects, ResultContract, SchemaRegistrationSet};
+use crate::contracts::artifacts::{
+    PlanEffects, PreparedStatement, ResultContract, SchemaRegistrationSet, StateCommitStreamChange,
+};
 use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::engine::Engine;
 use crate::explain_output::{render_analyzed_explain_result, render_plain_explain_result};
+use crate::read_runtime::prepare_public_read_artifact;
 use crate::runtime::deterministic_mode::RuntimeFunctionProvider;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::SharedFunctionProvider;
-use crate::runtime::streams::StateCommitStreamChange;
 use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::prepare::{
@@ -142,10 +143,12 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
         }
         CompiledExecutionRoute::PublicRead(public_read) => {
             let execution_started = Instant::now();
+            let public_read_artifact =
+                prepare_public_read_artifact(public_read, transaction.dialect())?;
             let public_result = match transaction
                 .execute_prepared_public_read_with_pending_view(
                     pending_transaction_view.map(|view| view as &dyn PendingView),
-                    public_read,
+                    &public_read_artifact,
                 )
                 .await
             {

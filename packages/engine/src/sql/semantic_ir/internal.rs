@@ -3,7 +3,7 @@
 //! This stage owns the front-end normalization output for internal SQL after
 //! parse/bind but before later planning and execution-specific wrapping.
 
-use crate::backend::prepared::PreparedStatement;
+use crate::contracts::artifacts::PreparedStatement;
 use crate::runtime::cel::CelEvaluator;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::functions::SharedFunctionProvider;

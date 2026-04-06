@@ -1,15 +1,7 @@
 //! Shared public surface registry contracts.
 
-use crate::runtime::cel::shared_runtime;
-use crate::schema::annotations::overrides::{collect_lixcol_overrides, LixcolOverrideValue};
-use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::schema::schema_from_registered_snapshot;
-use crate::schema::SqlRegisteredSchemaProvider;
-use crate::{LixBackend, LixError};
-use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct CatalogEpoch(u64);
@@ -177,27 +169,47 @@ impl SurfaceRegistry {
         Self::default()
     }
 
-    pub(crate) fn with_builtin_surfaces() -> Self {
-        let mut registry = Self::new();
-        for descriptor in builtin_surface_descriptors() {
-            registry.insert_descriptor(descriptor);
-        }
-        registry.register_builtin_entity_surfaces();
-        registry
+    pub(crate) fn catalog_epoch(&self) -> CatalogEpoch {
+        self.epoch
     }
 
-    pub(crate) async fn bootstrap_with_backend(backend: &dyn LixBackend) -> Result<Self, LixError> {
-        let mut registry = Self::with_builtin_surfaces();
-        let mut provider = SqlRegisteredSchemaProvider::new(backend);
-        for (_, schema) in provider.load_latest_schema_entries().await? {
-            let spec = entity_surface_spec_from_schema(&schema)?;
-            registry.register_dynamic_entity_surfaces(spec);
+    pub(crate) fn insert_descriptors(
+        &mut self,
+        descriptors: impl IntoIterator<Item = SurfaceDescriptor>,
+    ) -> bool {
+        let mut changed = false;
+        for descriptor in descriptors {
+            if !self.descriptor_name_available(&descriptor) {
+                continue;
+            }
+            self.insert_descriptor(descriptor);
+            changed = true;
         }
-        Ok(registry)
+        changed
     }
 
-    #[cfg(test)]
-    pub(crate) fn epoch(&self) -> CatalogEpoch {
+    pub(crate) fn remove_descriptors_matching(
+        &mut self,
+        mut predicate: impl FnMut(&SurfaceDescriptor) -> bool,
+    ) -> bool {
+        let descriptor_names = self
+            .descriptors
+            .iter()
+            .filter_map(|(name, descriptor)| predicate(descriptor).then_some(name.clone()))
+            .collect::<Vec<_>>();
+        if descriptor_names.is_empty() {
+            return false;
+        }
+
+        for name in descriptor_names {
+            self.descriptors.remove(&name);
+        }
+
+        true
+    }
+
+    pub(crate) fn advance_catalog_epoch(&mut self) -> CatalogEpoch {
+        self.epoch.bump();
         self.epoch
     }
 
@@ -273,106 +285,23 @@ impl SurfaceRegistry {
         self.registered_state_backed_schema_keys()
     }
 
-    pub(crate) fn register_dynamic_entity_surfaces(
-        &mut self,
-        spec: DynamicEntitySurfaceSpec,
-    ) -> CatalogEpoch {
-        let descriptors = entity_descriptors_from_spec(&spec, CatalogSource::Dynamic)
-            .into_iter()
-            .filter(|descriptor| self.entity_descriptor_name_available(&descriptor.public_name))
-            .collect::<Vec<_>>();
-        if descriptors.is_empty() {
-            return self.epoch;
-        }
-        self.epoch.bump();
-        for descriptor in descriptors {
-            self.insert_descriptor(descriptor);
-        }
-        self.epoch
-    }
-
-    pub(crate) fn remove_dynamic_entity_surfaces_for_schema_key(&mut self, schema_key: &str) {
-        let dynamic_descriptor_names = self
-            .descriptors
-            .iter()
-            .filter_map(|(name, descriptor)| {
-                (descriptor.catalog_source == CatalogSource::Dynamic
-                    && descriptor.implicit_overrides.fixed_schema_key.as_deref()
-                        == Some(schema_key))
-                .then_some(name.clone())
-            })
-            .collect::<Vec<_>>();
-        if dynamic_descriptor_names.is_empty() {
-            return;
-        }
-        self.epoch.bump();
-        for name in dynamic_descriptor_names {
-            self.descriptors.remove(&name);
-        }
-    }
-
-    pub(crate) fn replace_dynamic_entity_surfaces_from_stored_snapshot(
-        &mut self,
-        snapshot: &JsonValue,
-    ) -> Result<(), LixError> {
-        let (key, schema) = schema_from_registered_snapshot(snapshot)?;
-        self.remove_dynamic_entity_surfaces_for_schema_key(&key.schema_key);
-        let spec = entity_surface_spec_from_schema(&schema)?;
-        self.register_dynamic_entity_surfaces(spec);
-        Ok(())
-    }
-
     fn insert_descriptor(&mut self, descriptor: SurfaceDescriptor) {
         self.descriptors
             .insert(normalize_surface_name(&descriptor.public_name), descriptor);
     }
 
-    fn register_builtin_entity_surfaces(&mut self) {
-        for schema_key in builtin_schema_keys() {
-            if !builtin_schema_exposed_as_entity_surface(schema_key) {
-                continue;
-            }
-            let Some(schema) = builtin_schema_definition(schema_key) else {
-                continue;
-            };
-            let Ok(spec) = entity_surface_spec_from_schema(schema) else {
-                continue;
-            };
-            for descriptor in entity_descriptors_from_spec(&spec, CatalogSource::Builtin) {
-                if !self.entity_descriptor_name_available(&descriptor.public_name) {
-                    continue;
-                }
-                self.insert_descriptor(descriptor);
-            }
-        }
-    }
-
-    fn entity_descriptor_name_available(&self, public_name: &str) -> bool {
+    fn descriptor_name_available(&self, descriptor: &SurfaceDescriptor) -> bool {
         self.descriptors
-            .get(&normalize_surface_name(public_name))
-            .is_none_or(|descriptor| descriptor.surface_family == SurfaceFamily::Entity)
+            .get(&normalize_surface_name(&descriptor.public_name))
+            .is_none_or(|existing| {
+                descriptor.surface_family == SurfaceFamily::Entity
+                    && existing.surface_family == SurfaceFamily::Entity
+            })
     }
-}
-
-fn builtin_schema_exposed_as_entity_surface(schema_key: &str) -> bool {
-    !matches!(schema_key, "lix_active_version" | "lix_active_account")
 }
 
 fn normalize_surface_name(name: &str) -> String {
     name.trim().to_ascii_lowercase()
-}
-
-fn builtin_surface_registry() -> &'static SurfaceRegistry {
-    static BUILTIN_SURFACE_REGISTRY: OnceLock<SurfaceRegistry> = OnceLock::new();
-    BUILTIN_SURFACE_REGISTRY.get_or_init(SurfaceRegistry::with_builtin_surfaces)
-}
-
-pub(crate) fn builtin_public_surface_names() -> Vec<String> {
-    builtin_surface_registry().public_surface_names()
-}
-
-pub(crate) fn builtin_public_surface_columns(relation_name: &str) -> Option<Vec<String>> {
-    builtin_surface_registry().public_surface_columns(relation_name)
 }
 
 fn object_name_to_relation_name(name: &ObjectName) -> Option<String> {
@@ -382,7 +311,7 @@ fn object_name_to_relation_name(name: &ObjectName) -> Option<String> {
         .map(|ident| ident.value.clone())
 }
 
-fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
+pub(crate) fn builtin_surface_descriptors() -> Vec<SurfaceDescriptor> {
     vec![
         state_surface_descriptor("lix_state", SurfaceVariant::Default),
         state_surface_descriptor("lix_state_by_version", SurfaceVariant::ByVersion),
@@ -631,7 +560,7 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
     }
 }
 
-fn entity_descriptors_from_spec(
+pub(crate) fn entity_surface_descriptors(
     spec: &DynamicEntitySurfaceSpec,
     catalog_source: CatalogSource,
 ) -> Vec<SurfaceDescriptor> {
@@ -764,55 +693,6 @@ fn entity_surface_capability(schema_key: &str, variant: SurfaceVariant) -> Surfa
     }
 }
 
-fn entity_surface_spec_from_schema(
-    schema: &JsonValue,
-) -> Result<DynamicEntitySurfaceSpec, LixError> {
-    let schema_key = schema
-        .get("x-lix-key")
-        .and_then(JsonValue::as_str)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "schema is missing string x-lix-key".to_string(),
-        })?;
-
-    let mut visible_columns = schema
-        .get("properties")
-        .and_then(JsonValue::as_object)
-        .map(|properties| {
-            let mut columns = properties
-                .keys()
-                .filter(|key| !key.starts_with("lixcol_"))
-                .cloned()
-                .collect::<Vec<_>>();
-            columns.sort();
-            columns
-        })
-        .unwrap_or_default();
-    visible_columns.dedup();
-    let column_types = schema
-        .get("properties")
-        .and_then(JsonValue::as_object)
-        .map(|properties| {
-            properties
-                .iter()
-                .filter(|(key, _)| !key.starts_with("lixcol_"))
-                .filter_map(|(key, property_schema)| {
-                    surface_column_type_from_schema(property_schema).map(|kind| (key.clone(), kind))
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
-
-    let predicate_overrides = collect_override_predicates(schema, schema_key)?;
-
-    Ok(DynamicEntitySurfaceSpec {
-        schema_key: schema_key.to_string(),
-        visible_columns,
-        column_types,
-        predicate_overrides,
-    })
-}
-
 fn entity_override_predicates_for_variant(
     predicates: &[SurfaceOverridePredicate],
     variant: SurfaceVariant,
@@ -825,37 +705,6 @@ fn entity_override_predicates_for_variant(
         })
         .cloned()
         .collect()
-}
-
-fn collect_override_predicates(
-    schema: &JsonValue,
-    schema_key: &str,
-) -> Result<Vec<SurfaceOverridePredicate>, LixError> {
-    let mut predicates = Vec::new();
-    for override_entry in collect_lixcol_overrides(schema, schema_key, shared_runtime())? {
-        let Some(column) = (match override_entry.key.as_str() {
-            "lixcol_entity_id" => Some("entity_id"),
-            "lixcol_file_id" => Some("file_id"),
-            "lixcol_plugin_key" => Some("plugin_key"),
-            "lixcol_global" => Some("global"),
-            "lixcol_metadata" => Some("metadata"),
-            "lixcol_untracked" => Some("untracked"),
-            _ => None,
-        }) else {
-            continue;
-        };
-        let value = match override_entry.value {
-            LixcolOverrideValue::Null => SurfaceOverrideValue::Null,
-            LixcolOverrideValue::Boolean(value) => SurfaceOverrideValue::Boolean(value),
-            LixcolOverrideValue::Number(value) => SurfaceOverrideValue::Number(value),
-            LixcolOverrideValue::String(value) => SurfaceOverrideValue::String(value),
-        };
-        predicates.push(SurfaceOverridePredicate {
-            column: column.to_string(),
-            value,
-        });
-    }
-    Ok(predicates)
 }
 
 fn state_columns() -> Vec<String> {
@@ -1153,51 +1002,19 @@ fn entity_column_types(
     column_types
 }
 
-fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnType> {
-    let types = match schema.get("type") {
-        Some(JsonValue::String(kind)) => vec![kind.as_str()],
-        Some(JsonValue::Array(kinds)) => kinds
-            .iter()
-            .filter_map(JsonValue::as_str)
-            .collect::<Vec<_>>(),
-        _ => return None,
-    };
-
-    if types.iter().any(|kind| *kind == "boolean") {
-        return Some(SurfaceColumnType::Boolean);
-    }
-    if types.iter().any(|kind| *kind == "integer") {
-        return Some(SurfaceColumnType::Integer);
-    }
-    if types.iter().any(|kind| *kind == "number") {
-        return Some(SurfaceColumnType::Number);
-    }
-    if types.iter().any(|kind| *kind == "string") {
-        return Some(SurfaceColumnType::String);
-    }
-    if types.iter().any(|kind| matches!(*kind, "object" | "array")) {
-        return Some(SurfaceColumnType::Json);
-    }
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        builtin_public_surface_columns, builtin_public_surface_names,
-        entity_surface_spec_from_schema, CatalogEpoch, DefaultScopeSemantics,
-        DynamicEntitySurfaceSpec, SurfaceCapability, SurfaceFamily, SurfaceOverrideValue,
-        SurfaceReadSemantics, SurfaceRegistry, SurfaceVariant,
+        CatalogEpoch, DefaultScopeSemantics, DynamicEntitySurfaceSpec, SurfaceCapability,
+        SurfaceFamily, SurfaceReadSemantics, SurfaceVariant,
     };
-    use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
-    use async_trait::async_trait;
-    use serde_json::json;
+    use crate::schema::{builtin_public_surface_columns, builtin_public_surface_names};
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::{BTreeMap, HashSet};
 
     #[test]
     fn binds_builtin_state_surfaces() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_state_by_version")
             .expect("builtin surface should bind");
@@ -1220,7 +1037,7 @@ mod tests {
 
     #[test]
     fn surfaces_declare_committed_vs_workspace_overlay_semantics() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
 
         assert_eq!(
             registry
@@ -1261,15 +1078,18 @@ mod tests {
 
     #[test]
     fn dynamic_entity_registration_bumps_catalog_epoch_and_tracks_binding_epoch() {
-        let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        assert_eq!(registry.epoch(), CatalogEpoch::default());
+        let mut registry = crate::schema::build_builtin_surface_registry();
+        assert_eq!(registry.catalog_epoch(), CatalogEpoch::default());
 
-        let epoch = registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
-            schema_key: "lix_key_value".to_string(),
-            visible_columns: vec!["key".to_string(), "value".to_string()],
-            column_types: BTreeMap::new(),
-            predicate_overrides: Vec::new(),
-        });
+        let epoch = crate::schema::public_surfaces::register_dynamic_entity_surface_spec(
+            &mut registry,
+            DynamicEntitySurfaceSpec {
+                schema_key: "lix_key_value".to_string(),
+                visible_columns: vec!["key".to_string(), "value".to_string()],
+                column_types: BTreeMap::new(),
+                predicate_overrides: Vec::new(),
+            },
+        );
 
         assert_eq!(epoch.0, 1);
         let binding = registry
@@ -1284,7 +1104,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_bootstraps_builtin_entity_surfaces() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_key_value")
             .expect("builtin schema-derived entity surface should bind");
@@ -1298,7 +1118,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_exposes_registered_schema_by_version_entity_surface() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_registered_schema_by_version")
             .expect("registered schema by-version surface should bind");
@@ -1316,7 +1136,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_exposes_registered_schema_default_entity_surface() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_registered_schema")
             .expect("registered schema default surface should bind");
@@ -1331,7 +1151,7 @@ mod tests {
 
     #[test]
     fn derived_builtin_entity_surfaces_are_read_only() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         for surface in [
             "lix_commit",
             "lix_commit_by_version",
@@ -1427,70 +1247,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_surface_spec_is_derived_from_schema_properties() {
-        let spec = entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "project_message",
-            "properties": {
-                "message": { "type": "string" },
-                "id": { "type": "string" }
-            }
-        }))
-        .expect("schema spec should derive");
-
-        assert_eq!(spec.schema_key, "project_message");
-        assert_eq!(
-            spec.visible_columns,
-            vec!["id".to_string(), "message".to_string()]
-        );
-    }
-
-    #[test]
-    fn entity_surface_spec_evaluates_override_metadata() {
-        let spec = entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "message",
-            "x-lix-version": "1",
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\"",
-                "lixcol_global": "true"
-            },
-            "properties": {
-                "body": { "type": "string" },
-                "id": { "type": "string" }
-            }
-        }))
-        .expect("schema spec should derive");
-
-        assert_eq!(spec.predicate_overrides.len(), 3);
-        assert!(spec.predicate_overrides.iter().any(|predicate| {
-            predicate.column == "global" && predicate.value == SurfaceOverrideValue::Boolean(true)
-        }));
-    }
-
-    #[test]
-    fn entity_surface_spec_rejects_removed_lixcol_version_override() {
-        let err = entity_surface_spec_from_schema(&json!({
-            "x-lix-key": "message",
-            "x-lix-version": "1",
-            "x-lix-override-lixcols": {
-                "lixcol_version_id": "\"global\""
-            },
-            "properties": {
-                "id": { "type": "string" }
-            }
-        }))
-        .expect_err("removed lixcol_version_id override should be rejected");
-
-        assert!(
-            err.description
-                .contains("x-lix-override-lixcols.lixcol_version_id"),
-            "unexpected error: {err:?}"
-        );
-    }
-
-    #[test]
     fn binds_object_names_using_last_relation_segment() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let binding = registry
             .bind_object_name(&ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("main")),
@@ -1499,80 +1257,5 @@ mod tests {
             .expect("object name should bind");
 
         assert_eq!(binding.descriptor.public_name, "lix_state");
-    }
-
-    #[derive(Default)]
-    struct FakeBackend {
-        schema_rows: HashMap<String, String>,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackend for FakeBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
-                let rows = self
-                    .schema_rows
-                    .values()
-                    .cloned()
-                    .map(|snapshot| vec![Value::Text(snapshot)])
-                    .collect::<Vec<_>>();
-                return Ok(QueryResult {
-                    rows,
-                    columns: vec!["snapshot_content".to_string()],
-                });
-            }
-
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-            _mode: crate::TransactionMode,
-        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "transactions are not needed in this test backend".to_string(),
-            })
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "begin_savepoint not supported in test backend",
-            ))
-        }
-    }
-
-    #[tokio::test]
-    async fn bootstrap_with_backend_loads_dynamic_schema_surfaces() {
-        let mut backend = FakeBackend::default();
-        backend.schema_rows.insert(
-            "message".to_string(),
-            r#"{"value":{"x-lix-key":"message","x-lix-version":"1","type":"object","properties":{"id":{"type":"string"},"body":{"type":"string"}}}}"#.to_string(),
-        );
-
-        let registry = SurfaceRegistry::bootstrap_with_backend(&backend)
-            .await
-            .expect("registry should bootstrap");
-        let binding = registry
-            .bind_relation_name("message")
-            .expect("dynamic registered schema surface should bind");
-
-        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
-        assert!(binding.catalog_epoch.is_some());
-        assert_eq!(
-            binding.exposed_columns,
-            vec!["body".to_string(), "id".to_string()]
-        );
     }
 }

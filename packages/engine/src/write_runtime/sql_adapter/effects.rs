@@ -1,6 +1,5 @@
 use crate::contracts::artifacts::PublicReadExecutionMode;
-use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::traits::{PendingPublicReadBackend, PendingView, PreparedPublicReadExecutor};
+use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
 use crate::engine::{DeferredTransactionSideEffects, Engine};
 use crate::filesystem::runtime::{
     merge_filesystem_transaction_state, resolve_binary_blob_writes_in_transaction,
@@ -34,7 +33,7 @@ pub(super) fn command_metadata(
         CompiledExecutionRoute::Internal(_) => BufferedWriteExecutionRoute::Internal,
         CompiledExecutionRoute::PublicRead(public_read)
             if matches!(
-                public_read.execution_mode(),
+                public_read.public_read_contract().execution_mode(),
                 PublicReadExecutionMode::Committed(_)
             ) =>
         {
@@ -166,7 +165,8 @@ pub(super) async fn complete_sql_command_execution(
         }
     } else if prepared_execution_mutates_public_surface_registry(command.compiled.execution())? {
         let backend = TransactionBackendAdapter::new(transaction);
-        context.public_surface_registry = SurfaceRegistry::bootstrap_with_backend(&backend).await?;
+        context.public_surface_registry =
+            crate::schema::load_public_surface_registry_with_backend(&backend).await?;
         context.bump_public_surface_registry_generation();
         commit_outcome.refresh_public_surface_registry = true;
     }

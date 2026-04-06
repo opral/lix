@@ -1,6 +1,5 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF;
-use crate::contracts::surface::SurfaceRegistry;
 use crate::filesystem::live_projection::{
     build_filesystem_file_projection_sql, FilesystemProjectionScope,
 };
@@ -385,7 +384,7 @@ async fn load_file_paths_for_descriptors(
 
     let preprocessed = preprocess_sql(
         backend.dialect(),
-        &SurfaceRegistry::with_builtin_surfaces(),
+        &crate::schema::build_builtin_surface_registry(),
         shared_runtime(),
         &sql,
         &params,

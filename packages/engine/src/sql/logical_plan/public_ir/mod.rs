@@ -979,12 +979,12 @@ mod tests {
         CanonicalStateScan, EntityProjectionSpec, PlannedFilesystemFile, PlannedFilesystemState,
         VersionScope,
     };
-    use crate::contracts::surface::{DynamicEntitySurfaceSpec, SurfaceRegistry};
+    use crate::contracts::surface::DynamicEntitySurfaceSpec;
     use std::collections::BTreeMap;
 
     #[test]
     fn canonical_state_scan_tracks_explicit_version_visibility() {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let scan = CanonicalStateScan::from_surface_binding(
             registry
                 .bind_relation_name("lix_state_by_version")
@@ -999,13 +999,16 @@ mod tests {
 
     #[test]
     fn entity_surface_canonicalizes_with_projection_spec() {
-        let mut registry = SurfaceRegistry::with_builtin_surfaces();
-        registry.register_dynamic_entity_surfaces(DynamicEntitySurfaceSpec {
-            schema_key: "lix_key_value".to_string(),
-            visible_columns: vec!["key".to_string(), "value".to_string()],
-            column_types: BTreeMap::new(),
-            predicate_overrides: Vec::new(),
-        });
+        let mut registry = crate::schema::build_builtin_surface_registry();
+        crate::schema::public_surfaces::register_dynamic_entity_surface_spec(
+            &mut registry,
+            DynamicEntitySurfaceSpec {
+                schema_key: "lix_key_value".to_string(),
+                visible_columns: vec!["key".to_string(), "value".to_string()],
+                column_types: BTreeMap::new(),
+                predicate_overrides: Vec::new(),
+            },
+        );
 
         let binding = registry
             .bind_relation_name("lix_key_value")

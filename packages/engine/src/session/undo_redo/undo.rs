@@ -1,3 +1,4 @@
+use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::functions::LixFunctionProvider;
 use crate::version::context::{
     exact_current_head_preconditions, require_version_context_with_executor, ResolvedVersionTarget,
@@ -56,27 +57,25 @@ async fn undo_in_transaction(
         let mut state_commit_stream_changes = Vec::with_capacity(effects.len());
         for effect in &effects {
             match effect.forward_operation {
-                crate::runtime::streams::StateCommitStreamOperation::Insert => {
+                StateCommitStreamOperation::Insert => {
                     inverse_changes.push(build_tombstone_proposed_change(
                         &version_id,
                         &effect.forward_change,
                     )?);
-                    state_commit_stream_changes.push(
-                        crate::runtime::streams::StateCommitStreamChange {
-                            operation: crate::runtime::streams::StateCommitStreamOperation::Delete,
-                            entity_id: effect.forward_change.entity_id.clone(),
-                            schema_key: effect.forward_change.schema_key.clone(),
-                            schema_version: effect.forward_change.schema_version.clone(),
-                            file_id: effect.forward_change.file_id.clone(),
-                            version_id: version_id.clone(),
-                            plugin_key: effect.forward_change.plugin_key.clone(),
-                            snapshot_content: None,
-                            untracked: false,
-                            writer_key: None,
-                        },
-                    );
+                    state_commit_stream_changes.push(StateCommitStreamChange {
+                        operation: StateCommitStreamOperation::Delete,
+                        entity_id: effect.forward_change.entity_id.clone(),
+                        schema_key: effect.forward_change.schema_key.clone(),
+                        schema_version: effect.forward_change.schema_version.clone(),
+                        file_id: effect.forward_change.file_id.clone(),
+                        version_id: version_id.clone(),
+                        plugin_key: effect.forward_change.plugin_key.clone(),
+                        snapshot_content: None,
+                        untracked: false,
+                        writer_key: None,
+                    });
                 }
-                crate::runtime::streams::StateCommitStreamOperation::Update => {
+                StateCommitStreamOperation::Update => {
                     let previous_row = effect.previous_row.as_ref().ok_or_else(|| {
                         LixError::unknown(format!(
                             "undo for commit '{}' requires prior row for updated change '{}'",
@@ -84,44 +83,42 @@ async fn undo_in_transaction(
                         ))
                     })?;
                     let restored = build_restore_proposed_change(&version_id, previous_row)?;
-                    state_commit_stream_changes.push(
-                        crate::runtime::streams::StateCommitStreamChange {
-                            operation: crate::runtime::streams::StateCommitStreamOperation::Update,
-                            entity_id: restored.entity_id.to_string(),
-                            schema_key: restored.schema_key.to_string(),
-                            schema_version: restored
-                                .schema_version
-                                .clone()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            file_id: restored
-                                .file_id
-                                .clone()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            version_id: version_id.clone(),
-                            plugin_key: restored
-                                .plugin_key
-                                .clone()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            snapshot_content: restored
-                                .snapshot_content
-                                .as_deref()
-                                .map(serde_json::from_str)
-                                .transpose()
-                                .map_err(|error| {
-                                    LixError::unknown(format!(
-                                        "undo restored snapshot_content is invalid JSON: {error}"
-                                    ))
-                                })?,
-                            untracked: false,
-                            writer_key: None,
-                        },
-                    );
+                    state_commit_stream_changes.push(StateCommitStreamChange {
+                        operation: StateCommitStreamOperation::Update,
+                        entity_id: restored.entity_id.to_string(),
+                        schema_key: restored.schema_key.to_string(),
+                        schema_version: restored
+                            .schema_version
+                            .clone()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        file_id: restored
+                            .file_id
+                            .clone()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        version_id: version_id.clone(),
+                        plugin_key: restored
+                            .plugin_key
+                            .clone()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        snapshot_content: restored
+                            .snapshot_content
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()
+                            .map_err(|error| {
+                                LixError::unknown(format!(
+                                    "undo restored snapshot_content is invalid JSON: {error}"
+                                ))
+                            })?,
+                        untracked: false,
+                        writer_key: None,
+                    });
                     inverse_changes.push(restored);
                 }
-                crate::runtime::streams::StateCommitStreamOperation::Delete => {
+                StateCommitStreamOperation::Delete => {
                     let previous_row = effect.previous_row.as_ref().ok_or_else(|| {
                         LixError::unknown(format!(
                             "undo for commit '{}' requires prior row for deleted change '{}'",
@@ -129,41 +126,39 @@ async fn undo_in_transaction(
                         ))
                     })?;
                     let restored = build_restore_proposed_change(&version_id, previous_row)?;
-                    state_commit_stream_changes.push(
-                        crate::runtime::streams::StateCommitStreamChange {
-                            operation: crate::runtime::streams::StateCommitStreamOperation::Insert,
-                            entity_id: restored.entity_id.to_string(),
-                            schema_key: restored.schema_key.to_string(),
-                            schema_version: restored
-                                .schema_version
-                                .clone()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            file_id: restored
-                                .file_id
-                                .clone()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            version_id: version_id.clone(),
-                            plugin_key: restored
-                                .plugin_key
-                                .clone()
-                                .map(|value| value.to_string())
-                                .unwrap_or_default(),
-                            snapshot_content: restored
-                                .snapshot_content
-                                .as_deref()
-                                .map(serde_json::from_str)
-                                .transpose()
-                                .map_err(|error| {
-                                    LixError::unknown(format!(
-                                        "undo restored snapshot_content is invalid JSON: {error}"
-                                    ))
-                                })?,
-                            untracked: false,
-                            writer_key: None,
-                        },
-                    );
+                    state_commit_stream_changes.push(StateCommitStreamChange {
+                        operation: StateCommitStreamOperation::Insert,
+                        entity_id: restored.entity_id.to_string(),
+                        schema_key: restored.schema_key.to_string(),
+                        schema_version: restored
+                            .schema_version
+                            .clone()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        file_id: restored
+                            .file_id
+                            .clone()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        version_id: version_id.clone(),
+                        plugin_key: restored
+                            .plugin_key
+                            .clone()
+                            .map(|value| value.to_string())
+                            .unwrap_or_default(),
+                        snapshot_content: restored
+                            .snapshot_content
+                            .as_deref()
+                            .map(serde_json::from_str)
+                            .transpose()
+                            .map_err(|error| {
+                                LixError::unknown(format!(
+                                    "undo restored snapshot_content is invalid JSON: {error}"
+                                ))
+                            })?,
+                        untracked: false,
+                        writer_key: None,
+                    });
                     inverse_changes.push(restored);
                 }
             }

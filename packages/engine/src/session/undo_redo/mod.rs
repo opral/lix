@@ -12,7 +12,7 @@ use crate::canonical::read::{
     CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
     ExactCommittedStateRowRequest,
 };
-use crate::runtime::streams::StateCommitStreamOperation;
+use crate::contracts::artifacts::StateCommitStreamOperation;
 use crate::version::context::{
     load_version_context_with_executor, ResolvedVersionTarget, VersionContextSource,
 };

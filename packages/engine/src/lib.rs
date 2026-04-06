@@ -6,9 +6,9 @@ pub(crate) mod canonical;
 mod canonical_json;
 mod change_view;
 pub(crate) mod checkpoint;
-mod committed_frontier;
 pub(crate) mod contracts;
 mod engine;
+mod error;
 mod errors;
 pub(crate) mod execution_effects;
 pub(crate) mod explain_output;
@@ -30,6 +30,7 @@ pub(crate) mod sql;
 mod test_support;
 mod text;
 pub mod transaction;
+mod transaction_mode;
 mod types;
 mod version;
 pub mod wire;
@@ -64,15 +65,14 @@ pub use backend::prepared::{
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
 pub use backend::SqlDialect;
-pub use backend::TransactionMode;
 pub use canonical_json::CanonicalJson;
 pub use checkpoint::CreateCheckpointResult;
-pub use committed_frontier::CommittedVersionFrontier;
+pub use contracts::artifacts::CommittedVersionFrontier;
 pub use contracts::artifacts::ExecuteOptions;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootKeyValue, Engine};
-pub use errors::LixError;
+pub use error::LixError;
 pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
@@ -93,6 +93,7 @@ pub use session::{OpenSessionOptions, Session, SessionTransaction};
 pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
 #[doc(hidden)]
 pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
+pub use transaction_mode::TransactionMode;
 pub use types::{ExecuteResult, QueryResult, Value};
 pub use version::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,

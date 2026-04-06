@@ -78,7 +78,7 @@ impl Runtime {
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             in_init_transaction: AtomicBool::new(false),
             savepoint_counter: AtomicU64::new(0),
-            public_surface_registry: RwLock::new(SurfaceRegistry::with_builtin_surfaces()),
+            public_surface_registry: RwLock::new(crate::schema::build_builtin_surface_registry()),
             access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
@@ -118,7 +118,8 @@ impl Runtime {
     }
 
     pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        let registry = SurfaceRegistry::bootstrap_with_backend(self.backend.as_ref()).await?;
+        let registry =
+            crate::schema::load_public_surface_registry_with_backend(self.backend.as_ref()).await?;
         let mut guard = self
             .public_surface_registry
             .write()

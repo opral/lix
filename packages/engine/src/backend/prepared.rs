@@ -1,3 +1,4 @@
+pub use crate::contracts::artifacts::{PreparedBatch, PreparedStatement};
 use crate::sql::binder::bind_sql;
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
@@ -6,17 +7,6 @@ use sqlparser::ast::{Expr, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
 use std::ops::ControlFlow;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedStatement {
-    pub sql: String,
-    pub params: Vec<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedBatch {
-    pub steps: Vec<PreparedStatement>,
-}
 
 impl PreparedBatch {
     pub fn append_sql(&mut self, sql: impl AsRef<str>) {

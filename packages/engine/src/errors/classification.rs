@@ -1,6 +1,4 @@
-use crate::contracts::surface::{
-    builtin_public_surface_columns, builtin_public_surface_names, SurfaceRegistry,
-};
+use crate::schema::{builtin_public_surface_columns, builtin_public_surface_names};
 use crate::LixBackend;
 use crate::{errors, LixError};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
@@ -152,7 +150,7 @@ async fn resolve_available_columns(
         return Vec::new();
     };
 
-    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
+    let registry = match crate::schema::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry,
         Err(_) => return Vec::new(),
     };
@@ -162,7 +160,7 @@ async fn resolve_available_columns(
 }
 
 async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
-    match SurfaceRegistry::bootstrap_with_backend(backend).await {
+    match crate::schema::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry.public_surface_names(),
         Err(_) => builtin_public_surface_names(),
     }
@@ -173,7 +171,7 @@ async fn public_surfaces_in_statements_with_backend(
     statements: &[Statement],
 ) -> Vec<String> {
     let relation_names = relation_names_from_statements(statements);
-    let registry = match SurfaceRegistry::bootstrap_with_backend(backend).await {
+    let registry = match crate::schema::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry,
         Err(_) => return builtin_public_surfaces_in_statements(statements),
     };

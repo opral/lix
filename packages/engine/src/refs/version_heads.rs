@@ -62,9 +62,13 @@ pub(crate) async fn load_current_committed_version_frontier_with_backend(
 pub(crate) async fn load_current_committed_version_frontier_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<CommittedVersionFrontier, LixError> {
-    Ok(CommittedVersionFrontier::from_version_ref_rows(
-        load_all_committed_version_refs_with_executor(executor).await?,
-    ))
+    Ok(CommittedVersionFrontier {
+        version_heads: load_all_committed_version_refs_with_executor(executor)
+            .await?
+            .into_iter()
+            .map(|row| (row.version_id, row.commit_id))
+            .collect(),
+    })
 }
 
 fn version_ref_row_from_local(row: LocalVersionRefRow) -> VersionRefRow {

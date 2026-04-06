@@ -193,13 +193,6 @@ pub(crate) async fn load_latest_live_state_replay_cursor_with_backend(
     projection::replay::load_latest_live_state_replay_cursor_with_backend(backend).await
 }
 
-pub(crate) async fn apply_canonical_receipt_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    receipt: &crate::write_runtime::commit::CanonicalCommitReceipt,
-) -> Result<(), LixError> {
-    projection::apply_canonical_receipt_in_transaction(transaction, receipt).await
-}
-
 pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     receipt: &crate::write_runtime::commit::CanonicalCommitReceipt,
@@ -239,11 +232,15 @@ impl crate::contracts::traits::LiveStateTransactionBridge for dyn LixBackendTran
         mark_live_state_projection_ready_in_transaction(self).await
     }
 
-    async fn apply_canonical_receipt_to_live_state(
+    async fn advance_live_state_replay_boundary(
         &mut self,
-        receipt: &crate::write_runtime::commit::CanonicalCommitReceipt,
+        replay_cursor: &ReplayCursor,
     ) -> Result<(), LixError> {
-        apply_canonical_receipt_in_transaction(self, receipt).await
+        projection::replay::advance_live_state_projection_replay_boundary_to_cursor_in_transaction(
+            self,
+            replay_cursor,
+        )
+        .await
     }
 }
 

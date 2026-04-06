@@ -3567,7 +3567,7 @@ pub(super) async fn try_prepare_public_read(
     active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
-    let registry = SurfaceRegistry::bootstrap_with_backend(backend)
+    let registry = crate::schema::load_public_surface_registry_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;

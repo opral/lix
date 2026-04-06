@@ -2248,7 +2248,6 @@ mod tests {
         public_read_routing_pass_registry, route_broad_public_read_statement,
         route_public_read_execution_strategy,
     };
-    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::logical_plan::public_ir::{
         BroadPublicReadProjectionItemKind, BroadPublicReadRelation, BroadPublicReadSetExpr,
         BroadPublicReadStatement, BroadPublicReadTableFactor, BroadSqlExprKind,
@@ -2281,7 +2280,7 @@ mod tests {
             .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &SurfaceRegistry::with_builtin_surfaces(),
+            &crate::schema::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             Some("main"),
         )
@@ -2321,7 +2320,7 @@ mod tests {
             .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &SurfaceRegistry::with_builtin_surfaces(),
+            &crate::schema::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             None,
         )
@@ -2354,7 +2353,7 @@ mod tests {
         .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &SurfaceRegistry::with_builtin_surfaces(),
+            &crate::schema::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             Some("main"),
         )
@@ -2394,7 +2393,7 @@ mod tests {
 
     #[test]
     fn direct_history_strategy_records_trace() {
-        let binding = SurfaceRegistry::with_builtin_surfaces()
+        let binding = crate::schema::build_builtin_surface_registry()
             .bind_relation_name("lix_state_history")
             .expect("builtin history surface should bind");
         let decision = route_public_read_execution_strategy(&binding);

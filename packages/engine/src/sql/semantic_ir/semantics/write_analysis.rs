@@ -639,7 +639,6 @@ fn write_analysis_filesystem_assignments_error(
 #[cfg(test)]
 mod tests {
     use super::analyze_write;
-    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
@@ -651,7 +650,7 @@ mod tests {
         sql: &str,
         requested_version_id: &str,
     ) -> crate::sql::semantic_ir::canonicalize::CanonicalizedWrite {
-        let registry = SurfaceRegistry::with_builtin_surfaces();
+        let registry = crate::schema::build_builtin_surface_registry();
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = bind_statement(

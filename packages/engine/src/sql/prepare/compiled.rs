@@ -1,6 +1,5 @@
-use crate::backend::prepared::PreparedStatement;
 use crate::contracts::artifacts::{
-    coalesce_live_table_requirements, SchemaRegistration, SchemaRegistrationSet,
+    coalesce_live_table_requirements, PreparedStatement, SchemaRegistration, SchemaRegistrationSet,
 };
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;

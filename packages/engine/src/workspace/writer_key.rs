@@ -18,20 +18,10 @@ use async_trait::async_trait;
 use crate::backend::QueryExecutor;
 use crate::change_view::TrackedDomainChangeView;
 use crate::contracts::artifacts::RowIdentity;
+pub(crate) use crate::contracts::traits::WorkspaceWriterKeyReadView;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_WRITER_KEY_TABLE: &str = "lix_internal_workspace_writer_key";
-
-#[async_trait(?Send)]
-pub(crate) trait WorkspaceWriterKeyReadView {
-    async fn load_annotation(&self, row_identity: &RowIdentity)
-        -> Result<Option<String>, LixError>;
-
-    async fn load_annotations(
-        &self,
-        row_identities: &BTreeSet<RowIdentity>,
-    ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError>;
-}
 
 #[async_trait(?Send)]
 impl<T> WorkspaceWriterKeyReadView for T

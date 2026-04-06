@@ -248,7 +248,7 @@ mod tests {
 
         async fn execute_batch(
             &mut self,
-            _batch: &crate::backend::prepared::PreparedBatch,
+            _batch: &crate::contracts::artifacts::PreparedBatch,
         ) -> Result<QueryResult, LixError> {
             Ok(QueryResult {
                 rows: Vec::new(),

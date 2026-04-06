@@ -1,5 +1,6 @@
 use crate::change_view::TrackedDomainChangeView;
 use crate::contracts::artifacts::{MutationOperation, MutationRow, PlannedStateRow};
+pub use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
@@ -41,30 +42,7 @@ impl Default for StateCommitStreamFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-pub enum StateCommitStreamOperation {
-    Insert,
-    Update,
-    Delete,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct StateCommitStreamChange {
-    pub operation: StateCommitStreamOperation,
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub version_id: String,
-    pub plugin_key: String,
-    pub snapshot_content: Option<JsonValue>,
-    pub untracked: bool,
-    /// Runtime notification metadata used for listener filtering and echo
-    /// suppression. This is not canonical committed state.
-    pub writer_key: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct StateCommitStreamBatch {
     pub sequence: u64,
     pub changes: Vec<StateCommitStreamChange>,
