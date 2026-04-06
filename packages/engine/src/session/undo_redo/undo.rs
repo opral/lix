@@ -168,9 +168,11 @@ async fn undo_in_transaction(
         let (_settings, functions) = engine
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
-        engine
-            .ensure_runtime_sequence_initialized_in_transaction(transaction, &functions)
-            .await?;
+        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+            transaction,
+            &functions,
+        )
+        .await?;
         let mut functions = functions;
         let timestamp = functions.timestamp();
         let mut head_executor = crate::runtime::TransactionBackendAdapter::new(transaction);

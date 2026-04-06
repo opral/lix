@@ -1,52 +1,20 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF;
-use crate::filesystem::live_projection::{
-    build_filesystem_file_projection_sql, FilesystemProjectionScope,
-};
-use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
-use crate::runtime::cel::shared_runtime;
-use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::plugin::manifest::parse_plugin_manifest_json;
-use crate::runtime::plugin::matching::select_best_glob_match;
 use crate::runtime::plugin::storage::plugin_key_from_archive_path;
-use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType};
-use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
-use crate::sql::prepare::preprocess::preprocess_sql_to_plan_with_functions as preprocess_sql;
+use crate::runtime::plugin::types::InstalledPlugin;
+#[cfg(test)]
+use crate::runtime::wasm::WasmRuntime;
+use crate::runtime::wasm::{WasmComponentInstance, WasmLimits};
+use crate::runtime::Runtime;
 use crate::{LixBackend, LixError, Value};
-use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
 use std::sync::Arc;
 use zip::read::ZipArchive;
 
-const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-pub(crate) const BUILTIN_BINARY_FALLBACK_PLUGIN_KEY: &str = "lix_builtin_binary_fallback";
-const BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
-
-#[derive(Debug, Clone)]
-struct FileDescriptorRow {
-    file_id: String,
-    version_id: String,
-    path: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PluginFile {
-    id: String,
-    path: String,
-    data: Vec<u8>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct PluginEntityChange {
-    entity_id: String,
-    schema_key: String,
-    schema_version: String,
-    snapshot_content: Option<String>,
-}
 
 #[derive(Clone)]
 pub(crate) struct CachedPluginComponent {
@@ -54,21 +22,8 @@ pub(crate) struct CachedPluginComponent {
     pub instance: Arc<dyn WasmComponentInstance>,
 }
 
-#[derive(Debug, Serialize)]
-struct ApplyChangesRequest {
-    file: PluginFile,
-    changes: Vec<PluginEntityChange>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BuiltinBinaryBlobRefSnapshot {
-    pub(crate) id: String,
-    pub(crate) blob_hash: String,
-    pub(crate) size_bytes: u64,
-}
-
-async fn load_or_init_plugin_component(
+#[cfg(test)]
+async fn load_or_init_plugin_component_with_loaded_instances(
     runtime: &dyn WasmRuntime,
     loaded_instances: &mut BTreeMap<String, CachedPluginComponent>,
     plugin: &InstalledPlugin,
@@ -92,189 +47,85 @@ async fn load_or_init_plugin_component(
     Ok(loaded)
 }
 
-pub(crate) async fn materialize_file_data_with_plugins(
-    backend: &dyn LixBackend,
-    runtime: &dyn WasmRuntime,
-    plan: &LiveStateRebuildPlan,
-) -> Result<(), LixError> {
-    let installed_plugins = load_installed_plugins(backend).await?;
-
-    let mut descriptor_targets: BTreeSet<(String, String)> = BTreeSet::new();
-    let mut tombstoned_files: Vec<(String, String)> = Vec::new();
-    for write in &plan.writes {
-        if write.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY {
-            continue;
-        }
-        let key = (write.version_id.clone(), write.entity_id.clone());
-        if write.op == LiveStateWriteOp::Tombstone {
-            tombstoned_files.push((key.1.to_string(), key.0.to_string()));
-            continue;
-        }
-        let Some(_) = write.snapshot_content.as_deref() else {
-            continue;
-        };
-        descriptor_targets.insert((key.0.to_string(), key.1.to_string()));
-    }
-
-    for (file_id, version_id) in tombstoned_files {
-        delete_file_cache_data(backend, &file_id, &version_id).await?;
-    }
-
-    let descriptor_paths = load_file_paths_for_descriptors(backend, &descriptor_targets).await?;
-    let mut descriptors: BTreeMap<(String, String), FileDescriptorRow> = BTreeMap::new();
-    for ((version_id, file_id), path) in descriptor_paths {
-        descriptors.insert(
-            (version_id.clone(), file_id.clone()),
-            FileDescriptorRow {
-                file_id,
-                version_id,
-                path,
-            },
-        );
-    }
-
-    let mut writes_by_target: BTreeMap<(String, String, String), Vec<&LiveStateWrite>> =
-        BTreeMap::new();
-    for write in &plan.writes {
-        if write.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY {
-            continue;
-        }
-        writes_by_target
-            .entry((
-                write.version_id.to_string(),
-                write.file_id.to_string(),
-                write.plugin_key.to_string(),
-            ))
-            .or_default()
-            .push(write);
-    }
-
-    let mut loaded_instances: BTreeMap<String, CachedPluginComponent> = BTreeMap::new();
-
-    for descriptor in descriptors.values() {
-        let plugin = select_plugin_for_file(descriptor, &installed_plugins);
-        let target_plugin_key = plugin
-            .map(|entry| entry.key.clone())
-            .unwrap_or_else(|| BUILTIN_BINARY_FALLBACK_PLUGIN_KEY.to_string());
-        let Some(grouped_writes) = writes_by_target.get(&(
-            descriptor.version_id.clone(),
-            descriptor.file_id.clone(),
-            target_plugin_key.clone(),
-        )) else {
-            continue;
-        };
-
-        let mut seen_keys: BTreeSet<(String, String)> = BTreeSet::new();
-        let mut changes: Vec<PluginEntityChange> = Vec::new();
-        for write in grouped_writes {
-            let dedupe_key = (write.schema_key.to_string(), write.entity_id.to_string());
-            if !seen_keys.insert(dedupe_key.clone()) {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                        "plugin materialization: duplicate change key for plugin '{}' file '{}' version '{}': schema_key='{}' entity_id='{}'",
-                        target_plugin_key,
-                        descriptor.file_id,
-                        descriptor.version_id,
-                        dedupe_key.0,
-                        dedupe_key.1
-                    ),
-                });
+async fn load_or_init_plugin_component(
+    runtime: &Runtime,
+    plugin: &InstalledPlugin,
+) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
+    {
+        let guard = runtime
+            .plugin_component_cache
+            .lock()
+            .map_err(|_| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "plugin component cache lock poisoned".to_string(),
+            })?;
+        if let Some(cached) = guard.get(&plugin.key) {
+            if cached.wasm == plugin.wasm {
+                return Ok(cached.instance.clone());
             }
-
-            changes.push(PluginEntityChange {
-                entity_id: write.entity_id.to_string(),
-                schema_key: write.schema_key.to_string(),
-                schema_version: write.schema_version.to_string(),
-                snapshot_content: if write.op == LiveStateWriteOp::Tombstone {
-                    None
-                } else {
-                    write
-                        .snapshot_content
-                        .as_ref()
-                        .map(|value| value.to_string())
-                },
-            });
         }
+    }
 
-        if changes.is_empty() {
-            continue;
-        }
-
-        if plugin.is_none() {
-            let blob_ref = builtin_binary_blob_ref_from_changes(&changes, &descriptor.file_id)?;
-            if let Some(blob_ref) = blob_ref {
-                let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
-                    .await?
-                    .ok_or_else(|| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                            "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
-                            blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
-                        ),
-                    })?;
-                upsert_file_cache_data(
-                    backend,
-                    &descriptor.file_id,
-                    &descriptor.version_id,
-                    &blob_data,
-                )
-                .await?;
-            } else {
-                delete_file_cache_data(backend, &descriptor.file_id, &descriptor.version_id)
-                    .await?;
-            }
-            continue;
-        }
-        let plugin = plugin.expect("plugin must be present");
-
-        let previous_data =
-            load_file_cache_data(backend, &descriptor.file_id, &descriptor.version_id).await?;
-        let request_payload = ApplyChangesRequest {
-            file: PluginFile {
-                id: descriptor.file_id.clone(),
-                path: descriptor.path.clone(),
-                data: previous_data,
-            },
-            changes,
-        };
-        let payload = serde_json::to_vec(&request_payload).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: failed to encode apply-changes payload: {error}"
-            ),
-        })?;
-
-        let instance =
-            load_or_init_plugin_component(runtime, &mut loaded_instances, plugin).await?;
-        let output = call_apply_changes(instance.as_ref(), &payload).await?;
-        upsert_file_cache_data(
-            backend,
-            &descriptor.file_id,
-            &descriptor.version_id,
-            &output,
-        )
+    let initialized = runtime
+        .wasm_runtime_ref()
+        .init_component(plugin.wasm.clone(), WasmLimits::default())
         .await?;
+    let mut guard = runtime
+        .plugin_component_cache
+        .lock()
+        .map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "plugin component cache lock poisoned".to_string(),
+        })?;
+    if let Some(cached) = guard.get(&plugin.key) {
+        if cached.wasm == plugin.wasm {
+            return Ok(cached.instance.clone());
+        }
+    }
+    guard.insert(
+        plugin.key.clone(),
+        CachedPluginComponent {
+            wasm: plugin.wasm.clone(),
+            instance: initialized.clone(),
+        },
+    );
+    Ok(initialized)
+}
+
+pub(crate) async fn apply_changes_with_plugin(
+    runtime: &Runtime,
+    plugin: &InstalledPlugin,
+    payload: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let instance = load_or_init_plugin_component(runtime, plugin).await?;
+    call_apply_changes(instance.as_ref(), payload).await
+}
+
+pub(crate) async fn load_installed_plugins_with_runtime_cache(
+    runtime: &Runtime,
+) -> Result<Vec<InstalledPlugin>, LixError> {
+    if let Some(cached) = runtime
+        .installed_plugins_cache
+        .read()
+        .map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "installed plugin cache lock poisoned".to_string(),
+        })?
+        .clone()
+    {
+        return Ok(cached);
     }
 
-    Ok(())
-}
-
-fn select_plugin_for_file<'a>(
-    descriptor: &FileDescriptorRow,
-    plugins: &'a [InstalledPlugin],
-) -> Option<&'a InstalledPlugin> {
-    select_plugin_for_path(&descriptor.path, None, plugins)
-}
-
-fn select_plugin_for_path<'a>(
-    path: &str,
-    file_content_type: Option<PluginContentType>,
-    plugins: &'a [InstalledPlugin],
-) -> Option<&'a InstalledPlugin> {
-    select_best_glob_match(
-        path,
-        file_content_type,
-        plugins,
-        |plugin| plugin.path_glob.as_str(),
-        |plugin| plugin.content_type,
-    )
+    let plugins = load_installed_plugins_from_backend(runtime.backend().as_ref()).await?;
+    let mut guard = runtime
+        .installed_plugins_cache
+        .write()
+        .map_err(|_| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "installed plugin cache lock poisoned".to_string(),
+        })?;
+    *guard = Some(plugins.clone());
+    Ok(plugins)
 }
 
 async fn call_apply_changes(
@@ -298,114 +149,7 @@ async fn call_apply_changes(
     })
 }
 
-fn parse_builtin_binary_blob_ref_snapshot(
-    raw_snapshot: &str,
-) -> Result<BuiltinBinaryBlobRefSnapshot, LixError> {
-    serde_json::from_str(raw_snapshot).map_err(|error| LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-            "plugin materialization: builtin binary fallback snapshot_content is invalid JSON: {error}"
-        ),
-    })
-}
-
-fn builtin_binary_blob_ref_from_changes(
-    changes: &[PluginEntityChange],
-    file_id: &str,
-) -> Result<Option<BuiltinBinaryBlobRefSnapshot>, LixError> {
-    for change in changes {
-        if change.schema_key != BUILTIN_BINARY_BLOB_REF_SCHEMA_KEY {
-            continue;
-        }
-        if change.schema_version != BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                    "plugin materialization: builtin binary fallback schema version mismatch for file '{}' (got '{}', expected '{}')",
-                    file_id, change.schema_version, BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION
-                ),
-            });
-        }
-        let Some(raw_snapshot) = change.snapshot_content.as_deref() else {
-            continue;
-        };
-        let parsed = parse_builtin_binary_blob_ref_snapshot(raw_snapshot)?;
-        if parsed.id != file_id {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                    "plugin materialization: builtin binary fallback snapshot id '{}' does not match file_id '{}'",
-                    parsed.id, file_id
-                ),
-            });
-        }
-        return Ok(Some(parsed));
-    }
-    Ok(None)
-}
-
-async fn load_file_paths_for_descriptors(
-    backend: &dyn LixBackend,
-    targets: &BTreeSet<(String, String)>,
-) -> Result<BTreeMap<(String, String), String>, LixError> {
-    if targets.is_empty() {
-        return Ok(BTreeMap::new());
-    }
-
-    let file_projection_sql = build_filesystem_file_projection_sql(
-        FilesystemProjectionScope::ExplicitVersion,
-        None,
-        false,
-        backend.dialect(),
-    )?;
-    let mut sql = String::from("WITH requested(file_id, version_id) AS (VALUES ");
-    let mut params = Vec::with_capacity(targets.len() * 2);
-    for (index, (version_id, file_id)) in targets.iter().enumerate() {
-        if index > 0 {
-            sql.push_str(", ");
-        }
-        let file_placeholder = params.len() + 1;
-        params.push(Value::Text(file_id.clone()));
-        let version_placeholder = params.len() + 1;
-        params.push(Value::Text(version_id.clone()));
-        sql.push_str(&format!(
-            "(${}, ${})",
-            file_placeholder, version_placeholder
-        ));
-    }
-    sql.push_str(
-        ") \
-         SELECT f.id, f.lixcol_version_id, f.path \
-         FROM (",
-    );
-    sql.push_str(&file_projection_sql);
-    sql.push_str(
-        ") f \
-         JOIN requested r \
-           ON r.file_id = f.id \
-          AND r.version_id = f.lixcol_version_id \
-         WHERE f.path IS NOT NULL \
-         ORDER BY f.lixcol_version_id, f.id",
-    );
-
-    let preprocessed = preprocess_sql(
-        backend.dialect(),
-        &crate::schema::build_builtin_surface_registry(),
-        shared_runtime(),
-        &sql,
-        &params,
-        SharedFunctionProvider::new(SystemFunctionProvider),
-    )
-    .await?;
-    let rows = backend
-        .execute(&preprocessed.sql, preprocessed.single_statement_params()?)
-        .await?;
-
-    let mut out = BTreeMap::new();
-    for row in rows.rows {
-        let file_id = text_required(&row, 0, "id")?;
-        let version_id = text_required(&row, 1, "lixcol_version_id")?;
-        let path = text_required(&row, 2, "path")?;
-        out.insert((version_id, file_id), path);
-    }
-    Ok(out)
-}
-
-pub(crate) async fn load_installed_plugins(
+async fn load_installed_plugins_from_backend(
     backend: &dyn LixBackend,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
     let rows = backend
@@ -678,70 +422,6 @@ fn ensure_valid_plugin_wasm(wasm_bytes: &[u8]) -> Result<(), LixError> {
     Ok(())
 }
 
-async fn load_file_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Vec<u8>, LixError> {
-    let result = backend
-        .execute(
-            "SELECT data \
-             FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2 \
-             LIMIT 1",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-
-    let Some(row) = result.rows.first() else {
-        return Ok(Vec::new());
-    };
-    blob_required(row, 0, "data")
-}
-
-async fn upsert_file_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-    data: &[u8],
-) -> Result<(), LixError> {
-    backend
-        .execute(
-            "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (file_id, version_id) DO UPDATE SET \
-             data = EXCLUDED.data",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Blob(data.to_vec()),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn delete_file_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<(), LixError> {
-    backend
-        .execute(
-            "DELETE FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
 fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
     let Some(value) = row.get(index) else {
         return Err(LixError {
@@ -760,29 +440,10 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
     }
 }
 
-fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: row missing column '{column}' at index {index}"
-            ),
-        });
-    };
-    match value {
-        Value::Blob(bytes) => Ok(bytes.clone()),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: expected blob column '{column}' at index {index}, got {other:?}"
-            ),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{load_or_init_plugin_component, select_plugin_for_path, CachedPluginComponent};
-    use crate::runtime::plugin::matching::glob_matches_path;
-    use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
+    use super::{load_or_init_plugin_component_with_loaded_instances, CachedPluginComponent};
+    use crate::runtime::plugin::types::{InstalledPlugin, PluginRuntime};
     use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
     use crate::LixError;
     use async_trait::async_trait;
@@ -795,23 +456,6 @@ mod tests {
     }
 
     struct NoopComponent;
-
-    fn test_plugin(
-        key: &str,
-        path_glob: &str,
-        content_type: Option<PluginContentType>,
-    ) -> InstalledPlugin {
-        InstalledPlugin {
-            key: key.to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
-            path_glob: path_glob.to_string(),
-            content_type,
-            entry: "plugin.wasm".to_string(),
-            manifest_json: "{}".to_string(),
-            wasm: vec![1],
-        }
-    }
 
     #[async_trait(?Send)]
     impl WasmRuntime for CountingRuntime {
@@ -832,53 +476,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn match_path_glob_matches_paths() {
-        assert!(glob_matches_path("*.{md,mdx}", "/notes.md"));
-        assert!(glob_matches_path("*.{md,mdx}", "/notes.MDX"));
-        assert!(glob_matches_path("docs/**/*.md", "docs/nested/readme.md"));
-        assert!(glob_matches_path("**/*.mdx", "/docs/nested/readme.mdx"));
-        assert!(!glob_matches_path("*.{md,mdx}", "/notes.json"));
-        assert!(!glob_matches_path("docs/**/*.md", "notes/readme.md"));
-    }
-
-    #[test]
-    fn match_path_glob_invalid_pattern_does_not_match() {
-        assert!(!glob_matches_path("*.{md,mdx", "/notes.md"));
-    }
-
-    #[test]
-    fn select_plugin_prefers_specific_glob_over_catch_all() {
-        let plugins = vec![
-            test_plugin("text_plugin", "*", None),
-            test_plugin("plugin_md_v2", "*.{md,mdx}", None),
-        ];
-
-        let markdown_plugin = select_plugin_for_path("/docs/readme.md", None, &plugins)
-            .expect("markdown should match");
-        assert_eq!(markdown_plugin.key, "plugin_md_v2");
-
-        let fallback_plugin = select_plugin_for_path("/docs/data.json", None, &plugins)
-            .expect("catch-all should match non-markdown");
-        assert_eq!(fallback_plugin.key, "text_plugin");
-    }
-
-    #[test]
-    fn select_plugin_applies_content_type_filter_when_available() {
-        let plugins = vec![
-            test_plugin("text_plugin", "*", Some(PluginContentType::Text)),
-            test_plugin("binary_plugin", "*", Some(PluginContentType::Binary)),
-        ];
-
-        let selected = select_plugin_for_path(
-            "/images/logo.png",
-            Some(PluginContentType::Binary),
-            &plugins,
-        )
-        .expect("binary plugin should match");
-        assert_eq!(selected.key, "binary_plugin");
-    }
-
     #[tokio::test]
     async fn component_cache_reinitializes_when_same_key_wasm_changes() {
         let runtime = CountingRuntime::default();
@@ -894,16 +491,16 @@ mod tests {
             wasm: vec![1],
         };
 
-        load_or_init_plugin_component(&runtime, &mut loaded, &plugin)
+        load_or_init_plugin_component_with_loaded_instances(&runtime, &mut loaded, &plugin)
             .await
             .expect("first init should succeed");
-        load_or_init_plugin_component(&runtime, &mut loaded, &plugin)
+        load_or_init_plugin_component_with_loaded_instances(&runtime, &mut loaded, &plugin)
             .await
             .expect("second lookup should reuse cache");
         assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
 
         plugin.wasm = vec![2];
-        load_or_init_plugin_component(&runtime, &mut loaded, &plugin)
+        load_or_init_plugin_component_with_loaded_instances(&runtime, &mut loaded, &plugin)
             .await
             .expect("changed wasm should reinitialize instance");
         assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 2);

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::runtime::image::ImageChunkWriter;
+use crate::backend::ImageChunkWriter;
 use crate::runtime::wasm::WasmRuntime;
 use crate::session::observe::observe_owned_session;
 use crate::{

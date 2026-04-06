@@ -7,9 +7,7 @@ pub(crate) mod cel;
 pub(crate) mod deterministic_mode;
 pub(crate) mod execution_state;
 pub(crate) mod functions;
-pub mod image;
 pub(crate) mod plugin;
-mod sql_compiler_metadata;
 pub mod streams;
 pub mod wasm;
 
@@ -18,8 +16,7 @@ use crate::contracts::artifacts::MutationRow;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::runtime::cel::CelEvaluator;
-use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::runtime::functions::SharedFunctionProvider;
+use crate::runtime::deterministic_mode::DeterministicSettings;
 use crate::runtime::plugin::runtime::CachedPluginComponent;
 use crate::runtime::plugin::types::InstalledPlugin;
 use crate::runtime::streams::{
@@ -65,6 +62,7 @@ impl Runtime {
         wasm_runtime: Arc<dyn WasmRuntime>,
         access_to_internal: bool,
         boot_deterministic_settings: Option<DeterministicSettings>,
+        public_surface_registry: SurfaceRegistry,
     ) -> Self {
         let deterministic_boot_pending = boot_deterministic_settings.is_some();
         Self {
@@ -78,7 +76,7 @@ impl Runtime {
             init_state: AtomicU8::new(INIT_STATE_NOT_STARTED),
             in_init_transaction: AtomicBool::new(false),
             savepoint_counter: AtomicU64::new(0),
-            public_surface_registry: RwLock::new(crate::schema::build_builtin_surface_registry()),
+            public_surface_registry: RwLock::new(public_surface_registry),
             access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
@@ -117,15 +115,16 @@ impl Runtime {
             .clone()
     }
 
-    pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        let registry =
-            crate::schema::load_public_surface_registry_with_backend(self.backend.as_ref()).await?;
+    pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
         let mut guard = self
             .public_surface_registry
             .write()
             .expect("public surface registry lock poisoned");
         *guard = registry;
-        Ok(())
+    }
+
+    pub(crate) fn clear_public_surface_registry(&self) {
+        self.install_public_surface_registry(SurfaceRegistry::default());
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
@@ -283,68 +282,6 @@ impl CompiledSchemaCache for SchemaCache {
     }
 }
 
-#[async_trait(?Send)]
-pub(crate) trait RuntimeHost {
-    async fn prepare_runtime_functions_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    >;
-
-    async fn ensure_runtime_sequence_initialized_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError>;
-
-    async fn persist_runtime_sequence_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        settings: DeterministicSettings,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError>;
-}
-
-#[async_trait(?Send)]
-impl RuntimeHost for Runtime {
-    async fn prepare_runtime_functions_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    > {
-        Runtime::prepare_runtime_functions_with_backend(self, backend).await
-    }
-
-    async fn ensure_runtime_sequence_initialized_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        Runtime::ensure_runtime_sequence_initialized_in_transaction(self, transaction, functions)
-            .await
-    }
-
-    async fn persist_runtime_sequence_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        settings: DeterministicSettings,
-        functions: &SharedFunctionProvider<RuntimeFunctionProvider>,
-    ) -> Result<(), LixError> {
-        Runtime::persist_runtime_sequence_in_transaction(self, transaction, settings, functions)
-            .await
-    }
-}
-
 pub(crate) struct TransactionBackendAdapter<'a> {
     dialect: SqlDialect,
     transaction: Mutex<*mut (dyn LixBackendTransaction + 'a)>,
@@ -359,8 +296,6 @@ pub(crate) async fn normalize_sql_execution_error_with_backend(
     crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
         .await
 }
-
-pub(crate) use sql_compiler_metadata::load_sql_compiler_metadata;
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
 // Internal access to the raw transaction pointer is serialized with a mutex.

@@ -3059,7 +3059,7 @@ fn public_read_preparation_error(bindings: &[SurfaceBinding], message: &str) -> 
 
 async fn try_prepare_public_read_via_specialized_optimization(
     dialect: SqlDialect,
-    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
+    compiler_metadata: &super::super::SqlCompilerMetadata,
     bound_statement: BoundStatement,
     active_history_root_commit_id: Option<&str>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
@@ -3570,7 +3570,8 @@ pub(super) async fn try_prepare_public_read(
     let registry = crate::schema::load_public_surface_registry_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
+    let compiler_metadata =
+        crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
     try_prepare_public_read_with_registry_and_internal_access(
         backend.dialect(),
         &registry,
@@ -3589,7 +3590,7 @@ pub(super) async fn try_prepare_public_read(
 pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
-    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
+    compiler_metadata: &super::super::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -3616,7 +3617,7 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
 async fn try_prepare_public_read_with_internal_access(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
-    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
+    compiler_metadata: &super::super::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -3743,7 +3744,7 @@ async fn try_prepare_public_read_with_internal_access(
 
 pub(super) async fn prepare_public_read_via_surface_lowering(
     dialect: SqlDialect,
-    compiler_metadata: &super::super::compile::SqlCompilerMetadata,
+    compiler_metadata: &super::super::SqlCompilerMetadata,
     bound_statement: BoundStatement,
     broad_statement: Option<BroadPublicReadStatement>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,

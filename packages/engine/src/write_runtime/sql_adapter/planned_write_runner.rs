@@ -21,7 +21,6 @@ pub(crate) async fn execute_planned_write_delta(
         let outcome = match unit {
             PlannedWriteUnit::PublicTracked(tracked) => {
                 run_public_tracked_append_txn_with_transaction(
-                    engine,
                     transaction,
                     tracked,
                     pending_commit_session.as_deref_mut(),

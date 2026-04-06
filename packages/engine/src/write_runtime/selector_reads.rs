@@ -2,7 +2,9 @@ use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
 use crate::read_runtime::{
     execute_prepared_public_read_artifact_with_backend, prepare_public_read_artifact,
 };
-use crate::sql::prepare::try_prepare_public_read_with_registry_and_internal_access;
+use crate::sql::prepare::{
+    load_sql_compiler_metadata, try_prepare_public_read_with_registry_and_internal_access,
+};
 use crate::version::context::load_target_version_history_root_commit_id_with_backend;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::{Query, Statement};
@@ -30,7 +32,7 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
         "active_version_id",
     )
     .await?;
-    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
+    let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
     let prepared = try_prepare_public_read_with_registry_and_internal_access(
         backend.dialect(),
         &registry,

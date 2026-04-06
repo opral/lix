@@ -5,7 +5,6 @@ use crate::contracts::artifacts::{
     CommitPreconditions, DomainChangeBatch, ExpectedHead, PlanEffects, PublicDomainChange,
     WriteLane,
 };
-use crate::engine::Engine;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::{SchemaCache, TransactionBackendAdapter};
 use crate::sql::prepare::{
@@ -56,7 +55,6 @@ impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
 }
 
 pub(super) async fn run_public_tracked_append_txn_with_transaction(
-    engine: &Engine,
     transaction: &mut dyn LixBackendTransaction,
     unit: &TrackedTxnUnit,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
@@ -78,12 +76,11 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
         .is_some_and(|slot| slot.as_ref().is_some())
         && !unit.has_compiler_only_filesystem_changes()
     {
-        engine
-            .ensure_runtime_sequence_initialized_in_transaction(
-                transaction,
-                &create_commit_functions,
-            )
-            .await?;
+        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+            transaction,
+            &create_commit_functions,
+        )
+        .await?;
     }
 
     let mut invariant_checker = PublicCommitInvariantChecker::new(&unit.public_write.planned_write);
@@ -127,13 +124,12 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
             .deterministic_sequence_persist_highest_seen()
             .is_some()
     {
-        engine
-            .persist_runtime_sequence_in_transaction(
-                transaction,
-                unit.runtime_state.settings(),
-                &create_commit_functions,
-            )
-            .await?;
+        crate::write_runtime::persist_runtime_sequence_in_transaction(
+            transaction,
+            unit.runtime_state.settings(),
+            &create_commit_functions,
+        )
+        .await?;
     }
 
     if let Some(applied_output) = append_outcome.applied_output.as_ref() {

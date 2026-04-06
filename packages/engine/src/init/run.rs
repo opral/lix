@@ -153,7 +153,8 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             engine.clear_deterministic_boot_pending();
         }
         engine.mark_init_completed();
-        engine.refresh_public_surface_registry().await?;
+        crate::session::refresh_public_surface_registry_in_runtime(engine.runtime().as_ref())
+            .await?;
     } else {
         let _ = transaction.rollback().await;
         engine.reset_init_state();
@@ -167,7 +168,8 @@ pub(crate) async fn init_if_needed(engine: &Engine) -> Result<bool, LixError> {
         Ok(()) => Ok(true),
         Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
             engine.wait_for_concurrent_init_ready().await?;
-            engine.refresh_public_surface_registry().await?;
+            crate::session::refresh_public_surface_registry_in_runtime(engine.runtime().as_ref())
+                .await?;
             Ok(false)
         }
         Err(error) => Err(error),

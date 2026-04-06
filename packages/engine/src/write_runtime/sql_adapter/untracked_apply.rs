@@ -75,20 +75,19 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
             .await?;
     }
 
-    engine
-        .persist_runtime_sequence_in_transaction(
-            transaction,
-            plan.runtime_state.settings(),
-            plan.runtime_state.provider(),
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "public untracked runtime-sequence persistence failed inside write txn: {}",
-                error.description
-            ),
-        })?;
+    crate::write_runtime::persist_runtime_sequence_in_transaction(
+        transaction,
+        plan.runtime_state.settings(),
+        plan.runtime_state.provider(),
+    )
+    .await
+    .map_err(|error| LixError {
+        code: error.code,
+        description: format!(
+            "public untracked runtime-sequence persistence failed inside write txn: {}",
+            error.description
+        ),
+    })?;
 
     Ok(Some(SqlExecutionOutcome {
         public_result: QueryResult {

@@ -7,6 +7,7 @@
 
 pub(crate) mod execution_context;
 pub(crate) mod observe;
+pub(crate) mod plugin;
 pub(crate) mod undo_redo;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
+use crate::backend::ImageChunkWriter;
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
@@ -37,7 +39,7 @@ use crate::sql::internal::script::extract_explicit_transaction_script_from_state
 use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
 use crate::sql::prepare::execution_program::ExecutionProgram;
-use crate::sql::prepare::DefaultSqlPreparationContext;
+use crate::sql::prepare::{DefaultSqlPreparationContext, SqlCompilerMetadata};
 use crate::version::context::load_target_version_history_root_commit_id_with_backend;
 use crate::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
@@ -304,7 +306,7 @@ impl Session {
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        crate::runtime::plugin::install::install_plugin_in_session(self, archive_bytes).await
+        crate::session::plugin::install_plugin_in_session(self, archive_bytes).await
     }
 
     pub async fn register_schema(&self, schema: &serde_json::Value) -> Result<(), LixError> {
@@ -315,10 +317,7 @@ impl Session {
         transaction.commit().await
     }
 
-    pub async fn export_image(
-        &self,
-        writer: &mut dyn crate::runtime::image::ImageChunkWriter,
-    ) -> Result<(), LixError> {
+    pub async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
         self.runtime.backend().export_image(writer).await
     }
 
@@ -330,6 +329,37 @@ impl Session {
             self.active_version_id(),
             self.active_account_ids(),
         )
+    }
+
+    pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
+        self.replace_local_public_surface_registry(registry.clone());
+        if self.should_persist_workspace_selectors() {
+            install_public_surface_registry_in_runtime(self.runtime.as_ref(), registry);
+        }
+    }
+
+    fn replace_local_public_surface_registry(&self, registry: SurfaceRegistry) {
+        *self
+            .public_surface_registry
+            .write()
+            .expect("session public surface registry lock poisoned") = registry;
+        self.execution_runtime
+            .bump_public_surface_registry_generation();
+        self.bump_runtime_generation();
+    }
+
+    pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
+        let registry = load_public_surface_registry_for_runtime(self.runtime.as_ref()).await?;
+        self.install_public_surface_registry(registry);
+        Ok(())
+    }
+
+    pub(crate) async fn load_sql_compiler_metadata(
+        &self,
+        backend: &dyn LixBackend,
+        registry: &SurfaceRegistry,
+    ) -> Result<SqlCompilerMetadata, LixError> {
+        crate::sql::prepare::load_sql_compiler_metadata(backend, registry).await
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
@@ -395,11 +425,12 @@ impl Session {
                         "active_version_id",
                     )
                     .await?;
-                let compiler_metadata = crate::runtime::load_sql_compiler_metadata(
-                    self.runtime.backend().as_ref(),
-                    &context.public_surface_registry,
-                )
-                .await?;
+                let compiler_metadata = self
+                    .load_sql_compiler_metadata(
+                        self.runtime.backend().as_ref(),
+                        &context.public_surface_registry,
+                    )
+                    .await?;
                 let preparation_context = DefaultSqlPreparationContext {
                     dialect: self.runtime.backend().dialect(),
                     cel_evaluator: self.runtime.cel_evaluator(),
@@ -453,11 +484,12 @@ impl Session {
                             "active_version_id",
                         )
                         .await?;
-                    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(
-                        self.runtime.backend().as_ref(),
-                        &context.public_surface_registry,
-                    )
-                    .await?;
+                    let compiler_metadata = self
+                        .load_sql_compiler_metadata(
+                            self.runtime.backend().as_ref(),
+                            &context.public_surface_registry,
+                        )
+                        .await?;
                     let preparation_context = DefaultSqlPreparationContext {
                         dialect: self.runtime.backend().dialect(),
                         cel_evaluator: self.runtime.cel_evaluator(),
@@ -502,12 +534,11 @@ impl Session {
                         .runtime
                         .begin_read_unit(crate::TransactionMode::Write)
                         .await?;
-                    runtime_state
-                        .ensure_sequence_initialized_in_transaction(
-                            self.runtime.as_ref(),
-                            transaction.as_mut(),
-                        )
-                        .await?;
+                    crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+                        transaction.as_mut(),
+                        runtime_state.provider(),
+                    )
+                    .await?;
                     let prepared_committed_read = {
                         let backend = TransactionBackendAdapter::new(transaction.as_mut());
                         let active_history_root_commit_id =
@@ -517,11 +548,9 @@ impl Session {
                                 "active_version_id",
                             )
                             .await?;
-                        let compiler_metadata = crate::runtime::load_sql_compiler_metadata(
-                            &backend,
-                            &context.public_surface_registry,
-                        )
-                        .await?;
+                        let compiler_metadata = self
+                            .load_sql_compiler_metadata(&backend, &context.public_surface_registry)
+                            .await?;
                         let preparation_context = DefaultSqlPreparationContext {
                             dialect: backend.dialect(),
                             cel_evaluator: self.runtime.cel_evaluator(),
@@ -548,9 +577,12 @@ impl Session {
                     .await;
                     match result {
                         Ok(result) => {
-                            runtime_state
-                                .flush_in_transaction(self.runtime.as_ref(), transaction.as_mut())
-                                .await?;
+                            crate::write_runtime::persist_runtime_sequence_in_transaction(
+                                transaction.as_mut(),
+                                runtime_state.settings(),
+                                runtime_state.provider(),
+                            )
+                            .await?;
                             transaction.commit().await?;
                             context.clear_execution_runtime_state();
                             Ok(result)
@@ -745,18 +777,7 @@ impl Session {
             self.runtime.invalidate_installed_plugins_cache()?;
         }
         if outcome.refresh_public_surface_registry {
-            let registry = crate::schema::load_public_surface_registry_with_backend(
-                self.runtime.backend().as_ref(),
-            )
-            .await?;
-            *self
-                .public_surface_registry
-                .write()
-                .expect("session public surface registry lock poisoned") = registry.clone();
-            self.bump_runtime_generation();
-            if matches!(self.persistence, Persistence::Workspace) {
-                self.runtime.refresh_public_surface_registry().await?;
-            }
+            self.refresh_public_surface_registry().await?;
         }
         self.runtime
             .emit_state_commit_stream_changes(std::mem::take(
@@ -764,6 +785,31 @@ impl Session {
             ));
         Ok(())
     }
+}
+
+pub(crate) fn install_public_surface_registry_in_runtime(
+    runtime: &Runtime,
+    registry: SurfaceRegistry,
+) {
+    runtime.install_public_surface_registry(registry);
+}
+
+pub(crate) fn clear_public_surface_registry_in_runtime(runtime: &Runtime) {
+    runtime.clear_public_surface_registry();
+}
+
+pub(crate) async fn load_public_surface_registry_for_runtime(
+    runtime: &Runtime,
+) -> Result<SurfaceRegistry, LixError> {
+    crate::schema::load_public_surface_registry_with_backend(runtime.backend().as_ref()).await
+}
+
+pub(crate) async fn refresh_public_surface_registry_in_runtime(
+    runtime: &Runtime,
+) -> Result<SurfaceRegistry, LixError> {
+    let registry = load_public_surface_registry_for_runtime(runtime).await?;
+    install_public_surface_registry_in_runtime(runtime, registry.clone());
+    Ok(registry)
 }
 
 fn classify_session_execution_mode(

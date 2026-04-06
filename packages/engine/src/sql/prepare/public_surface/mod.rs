@@ -217,7 +217,7 @@ pub(crate) async fn prepare_public_execution(
 pub(crate) async fn prepare_public_execution_with_registry_context_and_functions(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
-    compiler_metadata: &super::compile::SqlCompilerMetadata,
+    compiler_metadata: &super::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -306,7 +306,8 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     let registry = crate::schema::load_public_surface_registry_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
-    let compiler_metadata = crate::runtime::load_sql_compiler_metadata(backend, &registry).await?;
+    let compiler_metadata =
+        crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
     prepare_public_execution_with_registry_context_and_functions(
         backend.dialect(),
         &registry,
@@ -326,7 +327,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
 pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
-    compiler_metadata: &super::compile::SqlCompilerMetadata,
+    compiler_metadata: &super::SqlCompilerMetadata,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -3706,9 +3707,10 @@ mod tests {
             &registry,
         )
         .expect("public read bind should succeed");
-        let compiler_metadata = crate::runtime::load_sql_compiler_metadata(&backend, &registry)
-            .await
-            .expect("compiler metadata should load for public-read broad lowering");
+        let compiler_metadata =
+            crate::sql::prepare::load_sql_compiler_metadata(&backend, &registry)
+                .await
+                .expect("compiler metadata should load for public-read broad lowering");
 
         let _binding_guard = forbid_broad_binding_for_test();
         let prepared = super::read::prepare_public_read_via_surface_lowering(

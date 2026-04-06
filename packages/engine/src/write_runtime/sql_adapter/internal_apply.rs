@@ -54,20 +54,19 @@ pub(super) async fn run_internal_write_txn_with_transaction(
             .await?;
     }
 
-    engine
-        .persist_runtime_sequence_in_transaction(
-            transaction,
-            plan.runtime_state.settings(),
-            plan.runtime_state.provider(),
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "internal write runtime-sequence persistence failed inside write txn: {}",
-                error.description
-            ),
-        })?;
+    crate::write_runtime::persist_runtime_sequence_in_transaction(
+        transaction,
+        plan.runtime_state.settings(),
+        plan.runtime_state.provider(),
+    )
+    .await
+    .map_err(|error| LixError {
+        code: error.code,
+        description: format!(
+            "internal write runtime-sequence persistence failed inside write txn: {}",
+            error.description
+        ),
+    })?;
 
     if execution.plan_effects_override.is_none() {
         execution.plan_effects_override = Some(plan.effects.clone());
