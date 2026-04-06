@@ -1,6 +1,5 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
-use crate::filesystem::live_projection::FilesystemProjectionScope;
-use crate::filesystem::queries::load_file_row_by_id;
+use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::runtime::plugin::matching::select_best_glob_match;
 use crate::runtime::plugin::runtime::{
@@ -8,6 +7,7 @@ use crate::runtime::plugin::runtime::{
 };
 use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::runtime::Runtime;
+use crate::write_runtime::filesystem::query::load_file_row_by_id;
 use crate::{LixBackend, LixError, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};

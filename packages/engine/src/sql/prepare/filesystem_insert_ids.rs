@@ -5,14 +5,6 @@ use sqlparser::ast::{
     Expr, ObjectName, ObjectNamePart, Statement, TableObject, Value as AstValue, ValueWithSpan,
 };
 
-pub(crate) mod history;
-mod init;
-pub(crate) mod live_projection;
-pub(crate) mod path;
-pub(crate) mod queries;
-pub(crate) mod runtime;
-pub(crate) use init::{init, seed_bootstrap};
-
 pub(crate) fn ensure_generated_filesystem_insert_ids<P: LixFunctionProvider>(
     statements: &mut [Statement],
     functions: &SharedFunctionProvider<P>,

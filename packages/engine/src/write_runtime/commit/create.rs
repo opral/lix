@@ -14,17 +14,17 @@ use crate::canonical::read::{
 };
 use crate::canonical_json::CanonicalJson;
 use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
-use crate::filesystem::runtime::{
+use crate::runtime::functions::LixFunctionProvider;
+use crate::version::load_committed_version_head_commit_id;
+use crate::version::version_ref_snapshot_content;
+use crate::version::GLOBAL_VERSION_ID;
+use crate::write_runtime::filesystem::runtime::{
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
     FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
     FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY, FILESYSTEM_FILE_SCHEMA_VERSION,
 };
-use crate::refs::load_committed_version_head_commit_id;
-use crate::runtime::functions::LixFunctionProvider;
-use crate::version::version_ref_snapshot_content;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::write_runtime::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
 };
@@ -1342,14 +1342,16 @@ mod tests {
     };
     use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
     use crate::contracts::artifacts::OptionalTextPatch;
-    use crate::filesystem::runtime::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::runtime::functions::LixFunctionProvider;
     use crate::test_support::{
-        init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
+        init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
     use crate::version::GLOBAL_VERSION_ID;
     use crate::write_runtime::commit::receipt::UpdatedVersionRef;
+    use crate::write_runtime::filesystem::runtime::{
+        FilesystemTransactionFileState, FilesystemTransactionState,
+    };
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
         LixBackend, LixBackendTransaction, LixError, Value, VersionId,
@@ -1359,18 +1361,9 @@ mod tests {
 
     async fn init_create_commit_backend() -> TestSqliteBackend {
         let backend = TestSqliteBackend::new();
-        init_test_backend_core(&backend)
+        init_test_backend_with_binary_cas(&backend)
             .await
             .expect("test backend init should succeed");
-        crate::binary_cas::init(&backend)
-            .await
-            .expect("binary cas tables should init");
-        crate::filesystem::init(&backend)
-            .await
-            .expect("filesystem tables should init");
-        crate::session::observe::init(&backend)
-            .await
-            .expect("observe tables should init");
         backend
     }
 

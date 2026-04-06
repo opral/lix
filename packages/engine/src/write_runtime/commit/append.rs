@@ -1,7 +1,7 @@
-use crate::filesystem::runtime::{
+use crate::runtime::functions::LixFunctionProvider;
+use crate::write_runtime::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
 };
-use crate::runtime::functions::LixFunctionProvider;
 use crate::{LixBackendTransaction, LixError};
 
 use super::create::create_commit;
@@ -64,12 +64,12 @@ async fn append_tracked_unchecked(
 
     if let Some(receipt) = result.receipt.as_ref() {
         let tracked_writer_key_annotations =
-            crate::workspace::writer_key::tracked_writer_key_annotations_from_changes(
+            crate::annotations::writer_key::tracked_writer_key_annotations_from_changes(
                 &result.applied_domain_changes,
                 execution_writer_key.as_deref(),
             );
         let mut executor = &mut *transaction;
-        crate::workspace::writer_key::apply_workspace_writer_key_annotations_with_executor(
+        crate::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
             &mut executor,
             &tracked_writer_key_annotations,
         )

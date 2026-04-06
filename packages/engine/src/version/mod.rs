@@ -10,12 +10,19 @@ use crate::LixError;
 #[allow(dead_code)]
 pub(crate) mod context;
 mod create_version;
+mod heads;
 mod init;
 mod merge_version;
 mod ref_storage;
+mod roots;
 
 pub(crate) use create_version::create_version_in_session;
 pub use create_version::{CreateVersionOptions, CreateVersionResult};
+pub(crate) use heads::{
+    load_committed_version_head_commit_id, load_committed_version_ref_with_backend,
+    load_committed_version_ref_with_executor, load_current_committed_version_frontier_with_backend,
+    load_current_committed_version_frontier_with_executor,
+};
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use merge_version::merge_version_in_session;
 pub use merge_version::{
@@ -23,8 +30,12 @@ pub use merge_version::{
 };
 pub(crate) use ref_storage::{
     build_local_version_ref_heads_source_sql, load_all_local_version_refs_with_executor,
-    load_local_version_head_commit_id_with_executor, load_local_version_ref_with_executor,
-    LocalVersionRefRow,
+    load_local_version_head_commit_id_with_executor,
+};
+pub(crate) use roots::{
+    load_all_version_head_commit_ids, resolve_history_root_facts_with_backend, HistoryRootFacts,
+    HistoryRootTraversal, RootCommitResolutionRequest, RootCommitScope, RootLineageScope,
+    RootVersionScope,
 };
 
 pub(crate) const GLOBAL_VERSION_ID: &str = "global";

@@ -12,7 +12,9 @@ use crate::contracts::artifacts::{
     PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
     PreparedStateHistorySortValue, StateHistoryRow,
 };
-use crate::filesystem::history::{load_directory_history_rows, load_file_history_rows};
+use crate::read_runtime::filesystem::history::{
+    load_directory_history_rows, load_file_history_rows,
+};
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;

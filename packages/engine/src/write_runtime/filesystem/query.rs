@@ -1,15 +1,15 @@
+use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
-use crate::filesystem::live_projection::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-    FilesystemProjectionScope,
-};
-use crate::filesystem::path::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::live_schema_access::tracked_relation_name;
+use crate::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
+use crate::sql::physical_plan::filesystem_projection_sql::{
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+};
 use crate::text::escape_sql_string;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackend, SqlDialect, Value};
+use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 
@@ -68,6 +68,25 @@ pub(crate) async fn lookup_file_id_by_path(
     Ok(load_file_row_by_path(backend, version_id, path, scope)
         .await?
         .map(|row| row.id))
+}
+
+pub(crate) async fn resolve_file_id_by_path_in_version(
+    backend: &dyn LixBackend,
+    version_id: &str,
+    path: &str,
+) -> Result<Option<String>, LixError> {
+    let path = ParsedFilePath::from_normalized_path(path.to_string())?;
+    lookup_file_id_by_path(
+        backend,
+        version_id,
+        &path,
+        FilesystemProjectionScope::ExplicitVersion,
+    )
+    .await
+    .map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error.message,
+    })
 }
 
 pub(crate) async fn lookup_directory_path_by_id(

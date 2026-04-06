@@ -1,5 +1,6 @@
 //! Compiler-owned public surface source SQL builders.
 
+use crate::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
 use crate::live_schema_access::{
@@ -13,7 +14,6 @@ use crate::sql::physical_plan::public_surface_sql_support::{
     split_effective_state_pushdown_predicates,
 };
 use crate::version::{version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID};
-use crate::workspace::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Expr;

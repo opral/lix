@@ -1,4 +1,5 @@
 mod direct;
+mod filesystem;
 mod prepare;
 mod public;
 mod rowset;

@@ -9,6 +9,7 @@ pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod plugin;
 pub(crate) mod undo_redo;
+pub(crate) mod workspace;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -34,6 +35,10 @@ use crate::runtime::{Runtime, TransactionBackendAdapter};
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
+use crate::session::workspace::{
+    load_workspace_active_account_ids, persist_workspace_selectors,
+    require_workspace_active_version_id,
+};
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 #[cfg(test)]
 use crate::sql::parser::parse_sql;
@@ -41,10 +46,6 @@ use crate::sql::parser::parse_sql_with_timing;
 use crate::sql::prepare::execution_program::ExecutionProgram;
 use crate::sql::prepare::{DefaultSqlPreparationContext, SqlCompilerMetadata};
 use crate::version::context::load_target_version_history_root_commit_id_with_backend;
-use crate::workspace::{
-    load_workspace_active_account_ids, persist_workspace_selectors,
-    require_workspace_active_version_id,
-};
 use crate::write_runtime::sql_adapter::{
     execute_execution_program_with_write_transaction,
     execute_parsed_statements_in_write_transaction,
@@ -73,7 +74,7 @@ pub struct Session {
     engine: Arc<Engine>,
     runtime: Arc<Runtime>,
     // Session-local runtime state. Workspace sessions persist these selectors
-    // through `crate::workspace`; extra sessions keep them ephemeral.
+    // through `crate::session::workspace`; extra sessions keep them ephemeral.
     active_version_id: RwLock<String>,
     active_account_ids: RwLock<Vec<String>>,
     public_surface_registry: RwLock<SurfaceRegistry>,

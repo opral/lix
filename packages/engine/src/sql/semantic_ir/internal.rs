@@ -69,7 +69,6 @@ impl From<NormalizedInternalStatements> for PlannedStatementSet {
     fn from(output: NormalizedInternalStatements) -> Self {
         let _ = output.semantic_statement();
         Self {
-            sql: output.sql,
             prepared_statements: output.prepared_statements,
             live_table_requirements: output.live_table_requirements,
             mutations: output.mutations,

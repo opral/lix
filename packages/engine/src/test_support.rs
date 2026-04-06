@@ -247,6 +247,14 @@ pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(
     Ok(())
 }
 
+pub(crate) async fn init_test_backend_with_binary_cas(
+    backend: &dyn LixBackend,
+) -> Result<(), LixError> {
+    init_test_backend_core(backend).await?;
+    crate::binary_cas::init(backend).await?;
+    Ok(())
+}
+
 pub(crate) async fn commit_untracked_rows(
     backend: &TestSqliteBackend,
     rows: Vec<crate::live_state::untracked::UntrackedWriteRow>,
@@ -603,9 +611,10 @@ mod tests {
         .await
         .expect("live-state status seed should succeed");
 
-        let frontier = crate::refs::load_current_committed_version_frontier_with_backend(&backend)
-            .await
-            .expect("frontier load should succeed");
+        let frontier =
+            crate::version::load_current_committed_version_frontier_with_backend(&backend)
+                .await
+                .expect("frontier load should succeed");
         assert_eq!(
             frontier.version_heads.get("main").map(String::as_str),
             Some("commit-1")

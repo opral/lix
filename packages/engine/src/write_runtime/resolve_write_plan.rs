@@ -1,6 +1,5 @@
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
-use crate::filesystem::queries::FilesystemQueryError;
 #[cfg(test)]
 use crate::runtime::functions::SystemFunctionProvider;
 use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
@@ -24,6 +23,7 @@ use crate::version::{
     version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
 use crate::write_runtime::execute_public_query_with_optional_pending_transaction_view;
+use crate::write_runtime::filesystem::query::FilesystemQueryError;
 use crate::{LixBackend, LixError, QueryResult, Value};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{

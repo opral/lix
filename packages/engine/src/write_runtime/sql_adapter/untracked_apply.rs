@@ -5,9 +5,9 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::engine::Engine;
-use crate::filesystem::runtime::resolve_binary_blob_writes_in_transaction;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::version::GLOBAL_VERSION_ID;
+use crate::write_runtime::filesystem::runtime::resolve_binary_blob_writes_in_transaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::planned_write::PlannedPublicUntrackedWriteUnit;

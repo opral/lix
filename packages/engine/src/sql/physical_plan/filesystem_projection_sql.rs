@@ -1,41 +1,15 @@
+use crate::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
-use crate::filesystem::path::ParsedFilePath;
-use crate::filesystem::queries::lookup_file_id_by_path;
+use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
 use crate::text::escape_sql_string;
 use crate::version::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
-use crate::workspace::writer_key::WORKSPACE_WRITER_KEY_TABLE;
-use crate::{LixBackend, LixError, SqlDialect};
+use crate::{LixError, SqlDialect};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FilesystemProjectionScope {
-    ActiveVersion,
-    ExplicitVersion,
-}
-
-pub(crate) async fn resolve_file_id_by_path_in_version(
-    backend: &dyn LixBackend,
-    version_id: &str,
-    path: &str,
-) -> Result<Option<String>, LixError> {
-    let path = ParsedFilePath::from_normalized_path(path.to_string())?;
-    lookup_file_id_by_path(
-        backend,
-        version_id,
-        &path,
-        FilesystemProjectionScope::ExplicitVersion,
-    )
-    .await
-    .map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: error.message,
-    })
-}
 
 pub(crate) fn build_filesystem_file_projection_sql(
     scope: FilesystemProjectionScope,

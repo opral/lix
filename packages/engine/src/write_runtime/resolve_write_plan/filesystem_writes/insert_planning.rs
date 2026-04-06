@@ -1,20 +1,20 @@
+use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::PendingView;
-use crate::filesystem::live_projection::FilesystemProjectionScope;
-use crate::filesystem::path::{
+use crate::paths::filesystem::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::filesystem::queries::{
+use crate::sql::semantic_ir::semantics::filesystem_assignments::{
+    DirectoryInsertAssignments, FileInsertAssignments,
+};
+use crate::version::GLOBAL_VERSION_ID;
+use crate::write_runtime::filesystem::query::{
     load_directory_descriptors_by_parent_name_pairs,
     load_file_descriptors_by_directory_name_extension_triplets,
     lookup_directory_id_by_path_with_pending_transaction_view,
     lookup_directory_path_by_id_with_pending_transaction_view,
     lookup_file_id_by_path_with_pending_transaction_view, FilesystemQueryError,
 };
-use crate::sql::semantic_ir::semantics::filesystem_assignments::{
-    DirectoryInsertAssignments, FileInsertAssignments,
-};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::LixBackend;
 use std::collections::{BTreeMap, BTreeSet};
 
