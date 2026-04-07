@@ -52,7 +52,7 @@ The bottleneck is write amplification. A single file write fans out into many en
   │ Table 1          │     │ validate, transform,│       │ ...          │
   │   Row 1          │     │ detect changes      │       │ INSERT row   │
   │   Row 2          │     │                     │       │   10,000     │
-  │ Image 1          │     │ 💥 too slow          │       │              │
+  │ Image 1          │     │ 💥 too slow         │       │              │
   │ ...              │     └─────────────────────┘       └──────────────┘
   │ Paragraph 4,291  │
   └──────────────────┘
