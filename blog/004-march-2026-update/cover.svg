@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 630" width="1200" height="630">
+  <!-- White background -->
+  <rect width="1200" height="630" fill="#ffffff"/>
+
+  <!-- Lix logo -->
+  <g transform="translate(60, 50) scale(2.8)">
+    <path d="M14.7618 5.74842L16.9208 9.85984L22.3675 0.358398H25.7133L19.0723 11.6284L22.5712 17.5085H19.2407L16.9208 13.443L14.6393 17.5085H11.2705L14.7618 11.6284L11.393 5.74842H14.7618Z" fill="#08B5D6"/>
+    <path d="M6.16211 17.5081V5.74805H9.42368V17.5081H6.16211Z" fill="#08B5D6"/>
+    <path d="M3.52112 0.393555V17.6416H0.287109V0.393555H3.52112Z" fill="#08B5D6"/>
+    <path d="M6.21582 0.393555H14.8399V3.08856H6.21582V0.393555Z" fill="#08B5D6"/>
+  </g>
+
+  <!-- Title -->
+  <text x="150" y="100" font-family="'Courier New', 'Courier', monospace" font-size="64" font-weight="bold" fill="#111111">March 2026 Update</text>
+
+  <!-- Terminal box - dark body -->
+  <rect x="40" y="130" width="1120" height="470" fill="#1a1a2e" stroke="#111111" stroke-width="3"/>
+
+  <!-- Top bar - light chrome from cover0 -->
+  <rect x="40" y="130" width="1120" height="50" fill="#f0f0f0" stroke="#111111" stroke-width="3"/>
+  <circle cx="80" cy="155" r="8" fill="#111111"/>
+  <circle cx="108" cy="155" r="8" fill="#111111"/>
+  <circle cx="136" cy="155" r="8" fill="#111111"/>
+
+  <!-- Command -->
+  <text x="80" y="230" font-family="'Courier New', 'Courier', monospace" font-size="28" fill="#666688">$ bench:workload-replay</text>
+
+  <!-- commits -->
+  <text x="80" y="300" font-family="'Courier New', 'Courier', monospace" font-size="36" fill="#c0c0d0">commits ........... 500</text>
+  <text x="900" y="300" font-family="'Courier New', 'Courier', monospace" font-size="40" font-weight="bold" fill="#4ade80">✓</text>
+
+  <!-- corruption -->
+  <text x="80" y="360" font-family="'Courier New', 'Courier', monospace" font-size="36" fill="#c0c0d0">corruption .......... 0</text>
+  <text x="900" y="360" font-family="'Courier New', 'Courier', monospace" font-size="40" font-weight="bold" fill="#4ade80">✓</text>
+
+  <!-- blob commit -->
+  <text x="80" y="420" font-family="'Courier New', 'Courier', monospace" font-size="36" fill="#c0c0d0">blob commit ....... 5ms</text>
+  <text x="900" y="420" font-family="'Courier New', 'Courier', monospace" font-size="40" font-weight="bold" fill="#4ade80">✓</text>
+
+  <!-- divider -->
+  <line x1="80" y1="450" x2="920" y2="450" stroke="#333355" stroke-width="2"/>
+
+  <!-- semantic write -->
+  <text x="80" y="510" font-family="'Courier New', 'Courier', monospace" font-size="36" fill="#c0c0d0">semantic write .. 500ms+</text>
+  <text x="900" y="510" font-family="'Courier New', 'Courier', monospace" font-size="40" font-weight="bold" fill="#f87171">✗</text>
+
+  <!-- annotation -->
+  <text x="80" y="570" font-family="'Courier New', 'Courier', monospace" font-size="28" fill="#f87171">↑ needs fixing</text>
+</svg>
