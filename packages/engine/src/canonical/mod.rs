@@ -38,6 +38,7 @@
 //!
 pub(crate) mod graph;
 mod init;
+pub(crate) mod json;
 pub(crate) mod journal;
 pub(crate) mod read;
 

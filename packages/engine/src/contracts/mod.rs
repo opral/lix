@@ -1,4 +1,5 @@
 pub(crate) mod artifacts;
+pub(crate) mod change;
 pub(crate) mod functions;
 pub(crate) mod plugin;
 pub(crate) mod projection;

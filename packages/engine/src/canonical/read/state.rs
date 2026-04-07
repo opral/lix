@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::errors::classification::is_missing_relation_error;
+use crate::common::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixCommit;
 use crate::version::load_local_version_head_commit_id_with_executor;
 use crate::{LixBackend, LixError, Value, VersionId};

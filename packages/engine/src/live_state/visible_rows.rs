@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::annotations::writer_key::load_workspace_writer_key_annotations_with_executor;
+use crate::schema::annotations::writer_key::load_workspace_writer_key_annotations_with_executor;
 use crate::canonical::read::CommitQueryExecutor;
 use crate::{LixBackend, LixError, Value};
 

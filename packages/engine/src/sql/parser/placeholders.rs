@@ -1,6 +1,6 @@
 #[cfg(test)]
-pub(crate) use crate::statement_support::PlaceholderRef;
-pub(crate) use crate::statement_support::{
+pub(crate) use crate::sql::support::PlaceholderRef;
+pub(crate) use crate::sql::support::{
     parse_placeholder_ref, resolve_placeholder_index, resolve_placeholder_ref, PlaceholderState,
 };
 

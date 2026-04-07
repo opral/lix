@@ -25,7 +25,7 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend};
-use crate::identity::{
+use crate::common::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
 use crate::schema::{
@@ -797,7 +797,7 @@ async fn validate_filesystem_snapshot_integrity(
         .is_some_and(|planned_binary_blob_hashes| planned_binary_blob_hashes.contains(blob_hash));
     if require_binary_blob_ref_cas
         && !is_planned_blob
-        && !crate::binary_blob_support::blob_exists(backend, blob_hash).await?
+        && !crate::binary_cas::support::blob_exists(backend, blob_hash).await?
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -822,7 +822,7 @@ fn collect_planned_binary_blob_hashes(
     let mut hashes = HashSet::new();
     for file in resolved.filesystem_state().files.values() {
         if let Some(data) = file.data.as_ref() {
-            hashes.insert(crate::content_fingerprint::stable_content_fingerprint_hex(
+            hashes.insert(crate::common::fingerprint::stable_content_fingerprint_hex(
                 data,
             ));
         }

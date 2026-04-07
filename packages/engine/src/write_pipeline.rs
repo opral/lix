@@ -30,11 +30,11 @@ use crate::contracts::traits::{
     CompiledSchemaCache, LiveReadShapeContract, LiveStateQueryBackend, PendingView,
     SqlPreparationMetadataReader,
 };
-use crate::errors::classification::normalize_sql_error_with_backend_and_relation_names;
+use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
 use crate::execution_runtime::ExecutionRuntimeState;
 use crate::session::execution_context::ExecutionContext;
 use crate::session::SessionWriteSelectorResolver;
-use crate::session_collaborators::WriteExecutionCollaborators;
+use crate::session::collaborators::WriteExecutionCollaborators;
 use crate::sql::binder::bind_sql;
 use crate::sql::explain::{
     build_public_write_explain_artifacts, prepare_analyzed_explain_template,

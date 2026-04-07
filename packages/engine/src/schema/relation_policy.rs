@@ -123,7 +123,7 @@ pub(crate) fn builtin_internal_exact_relation_names() -> &'static [&'static str]
         crate::canonical::TIMELINE_STATUS_TABLE,
         crate::version::undo_redo::UNDO_REDO_OPERATION_TABLE,
         crate::session::workspace::WORKSPACE_METADATA_TABLE,
-        crate::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE,
+        crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE,
     ]
 }
 

@@ -6,7 +6,7 @@ use crate::contracts::artifacts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
     StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
-use crate::text::escape_sql_string;
+use crate::common::text::escape_sql_string;
 use crate::version::context::resolve_target_version_with_backend;
 use crate::version::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,

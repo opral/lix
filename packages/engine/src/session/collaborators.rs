@@ -5,7 +5,7 @@ use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::engine::Engine;
-use crate::errors;
+use crate::common::errors;
 use crate::execution_runtime::ExecutionRuntimeState;
 use crate::image::ImageChunkWriter;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};

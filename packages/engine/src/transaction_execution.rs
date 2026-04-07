@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
-use crate::errors::classification::normalize_sql_error_with_backend_and_relation_names;
+use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
 use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
 pub(crate) use crate::backend::program::WriteProgram;
@@ -104,7 +104,7 @@ pub(crate) async fn apply_workspace_writer_key_annotations_in_transaction(
     >,
 ) -> Result<(), LixError> {
     let mut backend = TransactionExecutionBackend::new(transaction);
-    crate::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
+    crate::schema::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
         &mut backend,
         annotations,
     )

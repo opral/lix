@@ -1,6 +1,6 @@
 //! Compiler-owned preparation of public surface artifacts.
 
-use crate::change_view::TrackedDomainChangeView;
+use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
     SessionStateDelta, StateCommitStreamOperation,
@@ -14,7 +14,7 @@ use crate::contracts::surface::{
 };
 #[cfg(test)]
 use crate::contracts::traits::SqlPreparationMetadataReader;
-use crate::errors::{
+use crate::common::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
 use crate::schema::relation_policy::{classify_relation_name, RelationPolicy};
@@ -2327,7 +2327,7 @@ mod tests {
                     .expect_err("projection-backed state read should reject stale live_state");
                 assert_eq!(
                     stale_error.code,
-                    crate::errors::ErrorCode::LiveStateNotReady.as_str()
+                    crate::common::errors::ErrorCode::LiveStateNotReady.as_str()
                 );
                 assert!(
                     stale_error.description.contains("lix_key_value"),

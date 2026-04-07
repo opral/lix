@@ -8,7 +8,7 @@ use crate::contracts::surface::SurfaceReadFreshness;
 use crate::contracts::traits::{
     LiveStateQueryBackend, PendingPublicReadBackend, PendingPublicReadTransaction, PendingView,
 };
-use crate::errors::classification::sanitize_lowered_public_sql_error_description;
+use crate::common::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
@@ -302,7 +302,7 @@ fn public_read_projection_stale_error(
         format_optional_committed_frontier(status.applied_committed_frontier.as_ref());
     let current_frontier = format_committed_frontier(&status.current_committed_frontier);
     LixError::new(
-        crate::errors::ErrorCode::LiveStateNotReady.as_str(),
+        crate::common::errors::ErrorCode::LiveStateNotReady.as_str(),
         format!(
             "Public read for {surfaces} requires fresh live-state projections, but live_state is {:?}. Applied committed frontier: {applied_frontier}. Current committed frontier: {current_frontier}. Applied replay cursor: {applied}. Latest replay cursor: {latest}. Canonical history/change reads may proceed while stale, but current-state projection reads must wait for replay or rebuild.",
             status.mode

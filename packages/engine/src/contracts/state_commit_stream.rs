@@ -1,4 +1,4 @@
-use crate::change_view::TrackedDomainChangeView;
+use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     MutationOperation, MutationRow, PlannedStateRow, StateCommitStreamChange,
     StateCommitStreamOperation,

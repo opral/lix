@@ -3,7 +3,7 @@ use crate::contracts::artifacts::{
     PublicReadExecutionMode,
 };
 use crate::contracts::state_commit_stream::should_invalidate_deterministic_settings_cache;
-use crate::text::escape_sql_string;
+use crate::common::text::escape_sql_string;
 use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::write_runtime::buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
@@ -192,7 +192,7 @@ pub(crate) async fn complete_sql_command_execution(
                             error.description
                         ),
                     })?;
-            crate::binary_blob_support::persist_resolved_binary_blob_writes_in_transaction(
+            crate::binary_cas::support::persist_resolved_binary_blob_writes_in_transaction(
                 transaction,
                 &resolved_binary_blob_writes,
             )

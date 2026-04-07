@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::binary_blob_support::build_binary_blob_fastcdc_write_program;
+use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -11,7 +11,7 @@ use crate::canonical::read::{
     load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
     CommitQueryExecutor, ExactCommittedStateRowRequest, VersionInfo, VersionSnapshot,
 };
-use crate::canonical_json::CanonicalJson;
+use crate::canonical::json::CanonicalJson;
 use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
 use crate::contracts::functions::LixFunctionProvider;
 use crate::transaction_execution::execute_write_program_with_transaction;

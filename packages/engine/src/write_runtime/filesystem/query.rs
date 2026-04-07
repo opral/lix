@@ -5,9 +5,9 @@ use crate::contracts::traits::{
 use crate::filesystem_projection_sql::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
-use crate::live_storage_layout::tracked_relation_name;
-use crate::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
-use crate::text::escape_sql_string;
+use crate::live_state::storage::tracked_relation_name;
+use crate::common::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
+use crate::common::text::escape_sql_string;
 use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;

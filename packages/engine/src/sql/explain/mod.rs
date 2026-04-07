@@ -3,6 +3,8 @@
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
 //! and compiler-owned explain payload/template generation.
 
+pub(crate) mod output;
+
 use crate::contracts::artifacts::{
     CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
@@ -80,6 +82,8 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{AnalyzeFormatKind, DescribeAlias, Expr, Statement, UtilityOption};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
+
+pub(crate) use output::{render_analyzed_explain_result, render_plain_explain_result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]

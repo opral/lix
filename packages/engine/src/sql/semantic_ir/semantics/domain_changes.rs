@@ -1,5 +1,5 @@
-use crate::change_view::TrackedDomainChangeView;
-use crate::content_fingerprint::stable_content_fingerprint_hex;
+use crate::contracts::change::TrackedDomainChangeView;
+use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
     CommitPreconditions, DomainChangeBatch, ExpectedHead, IdempotencyKey, PublicDomainChange,
     SemanticEffect,

@@ -108,7 +108,7 @@ pub(crate) async fn live_storage_relation_exists_with_backend(
 }
 
 pub(crate) fn tracked_relation_name(schema_key: &str) -> String {
-    crate::live_schema_access::tracked_relation_name(schema_key)
+    crate::schema::access::tracked_relation_name(schema_key)
 }
 
 pub(crate) fn snapshot_select_expr_for_schema(
@@ -117,7 +117,7 @@ pub(crate) fn snapshot_select_expr_for_schema(
     dialect: SqlDialect,
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
-    crate::live_schema_access::snapshot_select_expr_for_schema(
+    crate::schema::access::snapshot_select_expr_for_schema(
         schema_key,
         schema_definition,
         dialect,

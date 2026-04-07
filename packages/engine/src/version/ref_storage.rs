@@ -1,5 +1,5 @@
 use crate::backend::QueryExecutor;
-use crate::errors::classification::is_missing_relation_error;
+use crate::common::errors::classification::is_missing_relation_error;
 use crate::{LixError, SqlDialect, Value};
 use std::collections::BTreeMap;
 

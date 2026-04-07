@@ -8,7 +8,7 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::PendingView;
 use crate::read_runtime::bootstrap_public_surface_registry_in_transaction;
 use crate::session::execution_context::ExecutionContext;
-use crate::session_collaborators::WriteExecutionCollaborators;
+use crate::session::collaborators::WriteExecutionCollaborators;
 #[cfg(test)]
 use crate::sql::parser::parse_sql_with_timing;
 #[cfg(test)]
@@ -620,7 +620,7 @@ mod tests {
 
     fn test_session(engine: &Arc<Engine>) -> Session {
         Session::new_for_test(
-            crate::session_collaborators::SessionCollaborators::new(Arc::clone(engine)),
+            crate::session::collaborators::SessionCollaborators::new(Arc::clone(engine)),
             "version-test".to_string(),
             Vec::new(),
         )

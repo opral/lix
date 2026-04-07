@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 use zip::read::ZipArchive;
 
-use crate::content_fingerprint::stable_content_fingerprint_hex;
+use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
     CommitPreconditions, DomainChangeBatch, IdempotencyKey, OptionalTextPatch, PlanEffects,
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
@@ -26,7 +26,7 @@ use crate::contracts::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, StateCommitStreamRuntimeMetadata,
 };
 use crate::contracts::surface::{SurfaceBinding, SurfaceRegistry};
-use crate::paths::filesystem::{NormalizedDirectoryPath, ParsedFilePath};
+use crate::common::paths::filesystem::{NormalizedDirectoryPath, ParsedFilePath};
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::write_runtime::sql_adapter::PreparedWriteExecutionStep;

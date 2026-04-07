@@ -7,8 +7,8 @@ use crate::contracts::artifacts::{
     PreparedReadArtifact, PreparedReadProgram, PreparedReadStep, ResultContract,
 };
 use crate::contracts::projection::ProjectionRegistry;
-use crate::errors::classification::normalize_sql_error_with_read_diagnostic_context;
-use crate::explain_output::{render_analyzed_explain_result, render_plain_explain_result};
+use crate::common::errors::classification::normalize_sql_error_with_read_diagnostic_context;
+use crate::sql::explain::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult};
 use std::time::Instant;
 

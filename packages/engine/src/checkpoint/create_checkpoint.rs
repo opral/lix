@@ -207,7 +207,7 @@ async fn checkpoint_runtime_state(
         .prepare_execution_runtime_state(&backend)
         .await?;
     let mut runtime_functions = runtime_state.provider().clone();
-    crate::deterministic_sequence::ensure_runtime_sequence_initialized_in_transaction(
+    crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut runtime_functions,
     )

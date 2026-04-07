@@ -1,9 +1,9 @@
 //! Compiler-owned public surface source SQL builders.
 
-use crate::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
+use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
-use crate::live_schema_access::{
+use crate::schema::access::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
     snapshot_select_expr_for_schema, tracked_relation_name,
 };

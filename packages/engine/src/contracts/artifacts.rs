@@ -7,10 +7,10 @@ use sqlparser::ast::{Expr, Statement};
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
 };
-use crate::error::LixError;
-use crate::replay_cursor::ReplayCursor;
+use crate::common::error::LixError;
+use crate::live_state::ReplayCursor;
 use crate::transaction_mode::TransactionMode;
-use crate::types::Value;
+use crate::common::types::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {

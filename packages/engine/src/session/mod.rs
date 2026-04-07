@@ -5,6 +5,7 @@
 //! or kept ephemeral for child sessions, but they are distinct from canonical
 //! version refs and committed graph state.
 
+pub(crate) mod collaborators;
 pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod plugin;
@@ -24,10 +25,11 @@ use sqlparser::ast::Statement;
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::errors;
+use crate::common::errors;
 use crate::execution_runtime::ExecutionRuntimeState;
 use crate::image::ImageChunkWriter;
 use crate::read_runtime::execute_prepared_read_program_in_committed_read_transaction;
+use crate::session::collaborators::SessionCollaborators;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
@@ -40,7 +42,6 @@ use crate::session::write_preparation::{
     execute_execution_program_with_write_transaction,
     execute_parsed_statements_in_write_transaction,
 };
-use crate::session_collaborators::SessionCollaborators;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 #[cfg(test)]
 use crate::sql::parser::parse_sql;
@@ -49,7 +50,7 @@ use crate::sql::prepare::{
     prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
     CommittedReadProgramContext, ExecutionProgram,
 };
-use crate::statement_support::{reject_internal_table_writes, reject_public_create_table};
+use crate::sql::support::{reject_internal_table_writes, reject_public_create_table};
 use crate::write_pipeline::{
     ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
 };
@@ -1214,7 +1215,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1234,7 +1235,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1266,7 +1267,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1364,7 +1365,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1392,7 +1393,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine),
                 "version-test".to_string(),
                 Vec::new(),
             );

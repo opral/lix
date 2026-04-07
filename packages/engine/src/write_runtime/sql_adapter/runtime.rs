@@ -9,7 +9,7 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
-use crate::explain_output::{render_analyzed_explain_result, render_plain_explain_result};
+use crate::sql::explain::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::transaction_execution::normalize_sql_error_with_transaction_and_relation_names;
 use crate::write_runtime::buffered::apply_schema_registrations_in_transaction;
 use crate::write_runtime::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};

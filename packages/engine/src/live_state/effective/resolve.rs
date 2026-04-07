@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::annotations::writer_key::WorkspaceWriterKeyReadView;
+use crate::schema::annotations::writer_key::WorkspaceWriterKeyReadView;
 #[cfg(test)]
 use crate::contracts::artifacts::{
     exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest,
