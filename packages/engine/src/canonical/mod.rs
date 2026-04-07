@@ -40,4 +40,9 @@ pub(crate) mod graph;
 mod init;
 pub(crate) mod journal;
 pub(crate) mod read;
+
+pub(crate) const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
+    "lix_internal_entity_state_timeline_breakpoint";
+pub(crate) const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
+
 pub(crate) use init::{init, seed_bootstrap};

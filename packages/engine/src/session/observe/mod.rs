@@ -16,6 +16,7 @@ use std::time::Duration;
 
 const OBSERVE_TICK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVE_FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(25);
+pub(crate) const OBSERVE_TICK_TABLE: &str = "lix_internal_observe_tick";
 mod init;
 
 pub(crate) use init::init;

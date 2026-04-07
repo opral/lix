@@ -7,6 +7,8 @@ use crate::ddl::execute_ddl_batch;
 use crate::text::escape_sql_string;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
+pub(crate) const LAST_CHECKPOINT_TABLE: &str = "lix_internal_last_checkpoint";
+
 const HISTORY_INIT_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_last_checkpoint (\
      version_id TEXT PRIMARY KEY,\

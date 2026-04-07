@@ -1,4 +1,5 @@
 use crate::contracts::surface::SurfaceRegistry;
+use crate::schema::relation_policy::{classify_relation_name, RelationPolicy};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadCte, BroadPublicReadDistinct, BroadPublicReadGroupBy,
     BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,
@@ -365,7 +366,10 @@ fn classify_broad_public_read_relation(
     if let Some(binding) = registry.bind_relation_name(relation_name) {
         return BroadPublicReadRelation::Public(binding);
     }
-    if normalized.starts_with("lix_internal_") {
+    if matches!(
+        classify_relation_name(relation_name, Some(registry)),
+        RelationPolicy::InternalStorage
+    ) {
         return BroadPublicReadRelation::Internal(normalized);
     }
     BroadPublicReadRelation::External(normalized)

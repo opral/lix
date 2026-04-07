@@ -1742,6 +1742,31 @@ fn phase_g_sql_uses_neutral_dialect_seam_instead_of_backend_owner() {
 }
 
 #[test]
+fn plan41_phase_d_keeps_relation_policy_out_of_session_sql_read_and_write_layers() {
+    for module in ["session", "sql", "read_runtime", "write_runtime"] {
+        for absolute_path in rust_files_for_top_level_module(module) {
+            let relative = absolute_path
+                .strip_prefix(src_root())
+                .expect("module source file should be inside src/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source =
+                fs::read_to_string(&absolute_path).expect("module source file should be readable");
+
+            for forbidden in [
+                "starts_with(\"lix_internal_\")",
+                "starts_with(\"lix_\") && !relation.starts_with(\"lix_internal_\")",
+            ] {
+                assert!(
+                    !source.contains(forbidden),
+                    "Plan 41 Phase D regression: {relative} should not recreate relation-protection policy via `{forbidden}`"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn prepared_write_execution_seam_stays_closed_over_runtime_inputs() {
     let contracts_source = read_engine_source("contracts/artifacts.rs");
     assert!(

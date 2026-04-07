@@ -12,8 +12,8 @@ use crate::{
     FileId, LixError, SqlDialect, Value,
 };
 
-const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
-const CHANGE_TABLE: &str = "lix_internal_change";
+pub(crate) const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
+pub(crate) const CHANGE_TABLE: &str = "lix_internal_change";
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
 const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
