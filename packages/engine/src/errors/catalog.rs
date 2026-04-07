@@ -1,4 +1,7 @@
-use crate::schema::builtin_public_surface_names;
+use crate::schema::relation_policy::{
+    builtin_relation_inventory, protected_builtin_public_surface_names,
+    relation_policy_choice_summary,
+};
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,7 +88,7 @@ pub(crate) fn live_state_not_ready_error() -> LixError {
 }
 
 pub(crate) fn table_not_found_read_error() -> LixError {
-    let available_tables = builtin_public_surface_names().join(", ");
+    let available_tables = protected_builtin_public_surface_names().join(", ");
     build_error(
         ErrorCode::TableNotFound,
         &format!(
@@ -156,11 +159,19 @@ pub(crate) fn sql_unknown_column_error(
 }
 
 pub(crate) fn internal_table_access_denied_error() -> LixError {
-    let available_tables = builtin_public_surface_names().join(", ");
+    let inventory = builtin_relation_inventory();
+    let available_tables = inventory.protected_builtin_public_surfaces.join(", ");
+    let internal_storage_namespaces = inventory
+        .internal_relation_families
+        .iter()
+        .map(|family| format!("`{}*`", family.prefix))
+        .collect::<Vec<_>>()
+        .join(", ");
     build_error(
         ErrorCode::InternalTableAccessDenied,
         &format!(
-            "Direct writes against `lix_internal_*` tables can lead to data corruption. DDL against `lix_internal_*` tables and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}."
+            "Direct writes against internal storage relations can lead to data corruption. {policy_choice} Protected internal storage includes exact built-in tables plus managed relation families such as {internal_storage_namespaces}. DDL against internal storage and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}.",
+            policy_choice = relation_policy_choice_summary(),
         ),
     )
 }
@@ -173,7 +184,7 @@ pub(crate) fn public_create_table_denied_error() -> LixError {
 }
 
 pub(crate) fn mixed_public_internal_query_error(internal_tables: &[String]) -> LixError {
-    let available_tables = builtin_public_surface_names().join(", ");
+    let available_tables = protected_builtin_public_surface_names().join(", ");
     let internal_tables = if internal_tables.is_empty() {
         "`lix_internal_*`".to_string()
     } else {

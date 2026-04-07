@@ -51,6 +51,11 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
+pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
+pub(crate) const FILE_DATA_CACHE_TABLE: &str = "lix_internal_file_data_cache";
+pub(crate) const FILE_PATH_CACHE_TABLE: &str = "lix_internal_file_path_cache";
+pub(crate) const FILE_LIXCOL_CACHE_TABLE: &str = "lix_internal_file_lixcol_cache";
+
 #[allow(unused_imports)]
 pub(crate) use crate::contracts::artifacts::{
     ExactUntrackedLookupRequest, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
@@ -65,6 +70,7 @@ pub use effective::{
 };
 pub use init::init;
 pub use lifecycle::LiveStateReadiness;
+pub(crate) use lifecycle::LIVE_STATE_STATUS_TABLE;
 pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,

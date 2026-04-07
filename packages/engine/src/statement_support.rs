@@ -1,6 +1,6 @@
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{
-    ObjectNamePart, Statement, TableFactor, TableObject, Value as SqlValue, VisitMut, VisitorMut,
+    Statement, TableFactor, TableObject, Value as SqlValue, VisitMut, VisitorMut,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
@@ -39,6 +39,9 @@ pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError
     parse_sql_statements_with_timing(sql).map(|parsed| parsed.statements)
 }
 
+/// Early safety/UX gate that stops obviously forbidden internal-storage writes
+/// before the session opens a transaction, compiles SQL, or touches backend
+/// execution owners.
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
     for statement in statements {
         if statement_mutates_protected_lix_relation(statement) {
@@ -48,6 +51,9 @@ pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(
     Ok(())
 }
 
+/// Early UX gate for unsupported public DDL. This stays at parser stage so a
+/// user gets a stable product-level error before the request reaches lower SQL
+/// preparation or backend execution layers.
 pub(crate) fn reject_public_create_table(statements: &[Statement]) -> Result<(), LixError> {
     if statements
         .iter()
@@ -267,11 +273,15 @@ fn dense_index_for_source(
 fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
     match statement {
         Statement::Insert(insert) => match &insert.table {
-            TableObject::TableName(name) => object_name_is_internal_storage_relation(name),
+            TableObject::TableName(name) => {
+                crate::schema::object_name_is_internal_storage_relation(name)
+            }
             _ => false,
         },
         Statement::Update(update) => match &update.table.relation {
-            TableFactor::Table { name, .. } => object_name_is_internal_storage_relation(name),
+            TableFactor::Table { name, .. } => {
+                crate::schema::object_name_is_internal_storage_relation(name)
+            }
             _ => false,
         },
         Statement::Delete(delete) => {
@@ -280,64 +290,46 @@ fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
                 | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
             };
             tables.iter().any(|table| match &table.relation {
-                TableFactor::Table { name, .. } => object_name_is_internal_storage_relation(name),
+                TableFactor::Table { name, .. } => {
+                    crate::schema::object_name_is_internal_storage_relation(name)
+                }
                 _ => false,
             })
         }
-        Statement::AlterTable(alter) => object_name_is_protected_lix_ddl_target(&alter.name),
+        Statement::AlterTable(alter) => {
+            crate::schema::object_name_is_protected_builtin_ddl_target(&alter.name)
+        }
         Statement::CreateIndex(create_index) => {
-            object_name_is_protected_lix_ddl_target(&create_index.table_name)
+            crate::schema::object_name_is_protected_builtin_ddl_target(&create_index.table_name)
         }
         Statement::CreateTrigger(create_trigger) => {
-            object_name_is_protected_lix_ddl_target(&create_trigger.table_name)
+            crate::schema::object_name_is_protected_builtin_ddl_target(&create_trigger.table_name)
                 || create_trigger
                     .referenced_table_name
                     .as_ref()
-                    .map(object_name_is_protected_lix_ddl_target)
+                    .map(crate::schema::object_name_is_protected_builtin_ddl_target)
                     .unwrap_or(false)
         }
         Statement::DropTrigger(drop_trigger) => drop_trigger
             .table_name
             .as_ref()
-            .map(object_name_is_protected_lix_ddl_target)
+            .map(crate::schema::object_name_is_protected_builtin_ddl_target)
             .unwrap_or(false),
         Statement::Drop { names, table, .. } => {
-            names.iter().any(object_name_is_protected_lix_ddl_target)
+            names
+                .iter()
+                .any(crate::schema::object_name_is_protected_builtin_ddl_target)
                 || table
                     .as_ref()
-                    .map(object_name_is_protected_lix_ddl_target)
+                    .map(crate::schema::object_name_is_protected_builtin_ddl_target)
                     .unwrap_or(false)
         }
         Statement::Truncate(truncate) => truncate
             .table_names
             .iter()
-            .any(|target| object_name_is_protected_lix_ddl_target(&target.name)),
+            .any(|target| crate::schema::object_name_is_protected_builtin_ddl_target(&target.name)),
         _ => false,
     }
-}
-
-fn object_name_to_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.to_ascii_lowercase())
-}
-
-fn object_name_is_internal_storage_relation(name: &sqlparser::ast::ObjectName) -> bool {
-    object_name_to_relation(name)
-        .map(|relation| relation.starts_with("lix_internal_"))
-        .unwrap_or(false)
-}
-
-fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) -> bool {
-    let Some(relation) = object_name_to_relation(name) else {
-        return false;
-    };
-
-    relation.starts_with("lix_internal_")
-        || crate::schema::builtin_public_surface_names()
-            .iter()
-            .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }
 
 fn clone_param_from_sources(

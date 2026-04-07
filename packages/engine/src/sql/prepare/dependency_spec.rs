@@ -9,6 +9,7 @@ use sqlparser::ast::{Visit, Visitor};
 
 use crate::contracts::artifacts::{is_untracked_live_table, SessionDependency};
 use crate::contracts::state_commit_stream::StateCommitStreamFilter;
+use crate::schema::relation_policy::{classify_builtin_relation_name, RelationPolicy};
 use crate::sql::binder::bind_sql_with_state;
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;
@@ -138,7 +139,10 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> DependencySpec {
                     uses_dynamic_state_relations = true;
                     continue;
                 }
-                if relation.starts_with("lix_") && !relation.starts_with("lix_internal_") {
+                if matches!(
+                    classify_builtin_relation_name(relation),
+                    RelationPolicy::ProtectedBuiltinPublicSurface
+                ) {
                     compiled_schema_keys.insert(normalize_relation_schema_key(relation));
                     depends_on_public_surface_registry = true;
                 }

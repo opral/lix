@@ -130,7 +130,10 @@ simulation_test!(
 
         assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
         assert!(error.description.contains(
-            "Direct writes against `lix_internal_*` tables can lead to data corruption."
+            "Direct writes against internal storage relations can lead to data corruption."
+        ));
+        assert!(error.description.contains(
+            "not as a public reserved SQL namespace"
         ));
     }
 );

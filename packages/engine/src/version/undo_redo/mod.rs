@@ -10,6 +10,8 @@ mod types;
 
 use crate::{ExecuteOptions, LixError, Session};
 
+pub(crate) const UNDO_REDO_OPERATION_TABLE: &str = "lix_internal_undo_redo_operation";
+
 pub(crate) use init::init;
 pub use types::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 

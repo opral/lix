@@ -17,6 +17,7 @@ use crate::contracts::traits::SqlPreparationMetadataReader;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
 };
+use crate::schema::relation_policy::{classify_relation_name, RelationPolicy};
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::backend::PushdownDecision;
@@ -514,7 +515,10 @@ fn summarize_bound_public_read_statement(
     for relation_name in collect_public_query_relation_names(query) {
         if let Some(binding) = registry.bind_relation_name(&relation_name) {
             bound_surface_bindings.push(binding);
-        } else if relation_name.starts_with("lix_internal_") {
+        } else if matches!(
+            classify_relation_name(&relation_name, Some(registry)),
+            RelationPolicy::InternalStorage
+        ) {
             internal_relations.push(relation_name);
         } else {
             external_relations.push(relation_name);

@@ -982,11 +982,13 @@ mod tests {
     struct RecordingBackend {
         connection: Arc<Mutex<rusqlite::Connection>>,
         modes: Arc<Mutex<Vec<crate::TransactionMode>>>,
+        executed_sql: Arc<Mutex<Vec<String>>>,
     }
 
     struct RecordingTransaction {
         connection: Arc<Mutex<rusqlite::Connection>>,
         mode: crate::TransactionMode,
+        executed_sql: Arc<Mutex<Vec<String>>>,
     }
 
     impl RecordingBackend {
@@ -996,6 +998,7 @@ mod tests {
                     rusqlite::Connection::open_in_memory().expect("open sqlite memory db"),
                 )),
                 modes: Arc::new(Mutex::new(Vec::new())),
+                executed_sql: Arc::new(Mutex::new(Vec::new())),
             }
         }
 
@@ -1005,6 +1008,13 @@ mod tests {
 
         fn clear_modes(&self) {
             self.modes.lock().expect("recorded modes lock").clear();
+        }
+
+        fn executed_sql(&self) -> Vec<String> {
+            self.executed_sql
+                .lock()
+                .expect("recorded sql lock")
+                .clone()
         }
     }
 
@@ -1039,6 +1049,10 @@ mod tests {
             sql: &str,
             params: &[crate::Value],
         ) -> Result<crate::QueryResult, crate::LixError> {
+            self.executed_sql
+                .lock()
+                .expect("recorded sql lock")
+                .push(sql.to_string());
             let connection = self.connection.lock().expect("sqlite connection lock");
             execute_sql(&connection, sql, params)
         }
@@ -1060,6 +1074,7 @@ mod tests {
             Ok(Box::new(RecordingTransaction {
                 connection: Arc::clone(&self.connection),
                 mode,
+                executed_sql: Arc::clone(&self.executed_sql),
             }))
         }
 
@@ -1080,6 +1095,7 @@ mod tests {
             Ok(Box::new(RecordingTransaction {
                 connection: Arc::clone(&self.connection),
                 mode: crate::TransactionMode::Write,
+                executed_sql: Arc::clone(&self.executed_sql),
             }))
         }
     }
@@ -1099,6 +1115,10 @@ mod tests {
             sql: &str,
             params: &[crate::Value],
         ) -> Result<crate::QueryResult, crate::LixError> {
+            self.executed_sql
+                .lock()
+                .expect("recorded sql lock")
+                .push(sql.to_string());
             let connection = self.connection.lock().expect("sqlite connection lock");
             execute_sql(&connection, sql, params)
         }
@@ -1335,6 +1355,62 @@ mod tests {
                     "lowered committed-only read should stay on TransactionMode::Read for `{sql}`",
                 );
             }
+        });
+    }
+
+    #[test]
+    fn parser_stage_internal_storage_guard_rejects_before_backend_execution() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
+
+            let error = session
+                .execute("INSERT INTO lix_internal_snapshot (id, content) VALUES ('x', NULL)", &[])
+                .await
+                .expect_err("internal storage write should be rejected before execution");
+
+            assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
+            assert!(
+                backend.modes().is_empty(),
+                "parser-stage guard should reject before opening a transaction"
+            );
+            assert!(
+                backend.executed_sql().is_empty(),
+                "parser-stage guard should reject before reaching backend execution"
+            );
+        });
+    }
+
+    #[test]
+    fn parser_stage_public_create_table_guard_rejects_before_backend_execution() {
+        run_with_large_stack(|| async move {
+            let backend = RecordingBackend::new();
+            let engine = test_engine(backend.clone());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
+
+            let error = session
+                .execute("CREATE TABLE user_data (id TEXT)", &[])
+                .await
+                .expect_err("public CREATE TABLE should be rejected before execution");
+
+            assert_eq!(error.code, "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED");
+            assert!(
+                backend.modes().is_empty(),
+                "parser-stage guard should reject before opening a transaction"
+            );
+            assert!(
+                backend.executed_sql().is_empty(),
+                "parser-stage guard should reject before reaching backend execution"
+            );
         });
     }
 }

@@ -41,9 +41,7 @@ use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
 };
-use super::{CanonicalCommitReceipt, UpdatedVersionRef};
-
-const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
+use super::{CanonicalCommitReceipt, UpdatedVersionRef, COMMIT_IDEMPOTENCY_TABLE};
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";

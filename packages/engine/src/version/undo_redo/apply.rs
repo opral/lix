@@ -20,9 +20,7 @@ use crate::write_runtime::commit::{
 };
 use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
 
-use super::{RedoResult, UndoResult};
-
-const UNDO_REDO_OPERATION_TABLE: &str = "lix_internal_undo_redo_operation";
+use super::{RedoResult, UndoResult, UNDO_REDO_OPERATION_TABLE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UndoRedoOperationKind {

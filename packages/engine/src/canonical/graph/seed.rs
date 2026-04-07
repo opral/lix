@@ -1,6 +1,5 @@
 use crate::SqlDialect;
-
-const COMMIT_GRAPH_NODE_TABLE: &str = "lix_internal_commit_graph_node";
+use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 
 pub(crate) fn build_commit_generation_seed_sql(dialect: SqlDialect) -> String {
     let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(
