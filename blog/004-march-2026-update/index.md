@@ -1,17 +1,18 @@
 ---
 date: "2026-04-03"
-og:description: "Real workload testing revealed the semantic layer is too slow. Here's why and how we'll fix it."
+og:description: "500 real commits replayed with no corruption bugs. Without the semantic layer, Lix is ~8x faster than Git, but semantic writes still bottleneck on write amplification."
 og:image: "./8x-faster.png"
-og:image:alt: "March 2026 update: workload testing succeeded, semantic layer too slow"
+og:image:alt: "March 2026 update: no corruption bugs, 8x faster than Git, semantic writes still too slow"
 ---
 
-# March 2026 Update: Workload Testing Succeeded, Semantic Layer Too Slow
+# March 2026 Update: No Corruption Bugs, 8x Faster Than Git, Semantic Writes Still Too Slow
 
 **TL;DR**
 
-- Workload testing revealed the semantic layer is too slow (500ms+ for large files)
-- Without the semantic layer, Lix commits are ~8x faster than Git
-- April goal: sub 100ms file writes for files with 10k entities via Prolly tree chunking
+- Workload testing worked: 500 real commits replayed with no state corruption bugs
+- Semantic writes still hit a write-amplification bottleneck on large files (500ms+)
+- Without the semantic layer, the file-write-plus-commit workflow is ~8x faster than Git
+- April goal: sub 100ms for 10k entity inserts
 
 ## Workload testing
 
@@ -19,49 +20,52 @@ og:image:alt: "March 2026 update: workload testing succeeded, semantic layer too
 
 The test replays 500 real commits from the [paraglide-js](https://github.com/opral/paraglide-js) repo. For each commit, it sets up the "before" state outside the timer, applies the same file changes, and measures how long Lix takes to commit. The simulated scenario: "I edited some files, now I'm committing."
 
-Two findings came out of this.
+Three findings came out of this.
 
-### Finding 1: The semantic layer is too slow
+### Finding 1: It works
+
+The best result from the workload replay is that it worked. Replaying 500 real commits did not reveal state corruption bugs. That matters more than the benchmark number because correctness is the prerequisite for everything else.
+
+### Finding 2: Semantic writes still bottleneck on write amplification
 
 > [!NOTE]
 > **Refresher: What is the semantic layer?**
 >
-> Lix's semantic layer parses files into structured entities. Instead of "binary files differ", Lix understands what actually changed inside a file. For example, a `.docx` becomes paragraphs, tables, images.
+> The semantic layer is the representation where a file stops being a blob and becomes entities and changes.
 >
 > ```
-> Git sees:                     Lix sees:
->
-> -Binary files differ          paragraph 3 in `contract.docx` changed:
->                               - "The contract expires on March 1st."
->                               + "The contract expires on April 1st."
+>   contract.docx
+>        ↓
+>   paragraphs / tables / images
+>        ↓
+>   diff / merge / history on those units
 > ```
 
-A file insert with N entities is translated to N direct SQL rows.
-
-Thus, inserting a file with, for example, 10k entities translates to one file write that triggers at least 10k rows being written to the SQL database. Testing revealed that writing Word files can quickly turn into 500ms+ operations where >80% of the time is spent writing SQL rows. Any interaction above 100ms is perceived as lag by humans, so this needs to come down.
+The bottleneck is write amplification. A single file write fans out into many entity rows. Inserting a file with 10k entities means the engine has to process 10k entity rows. On the current path, semantic writes are multi-second operations. Any interaction above 100ms stops feeling instantaneous, so this needs to come down.
 
 ```
-  contract.docx
-  ┌──────────────────┐
-  │ Paragraph 1      │        SQL database
-  │ Paragraph 2      │        ┌──────────────────────────┐
-  │ Paragraph 3      │───────►│ INSERT row 1 (paragraph) │
-  │ Table 1          │        │ INSERT row 2 (paragraph) │
-  │   Row 1          │        │ INSERT row 3 (paragraph) │
-  │   Row 2          │        │ INSERT row 4 (table)     │
-  │   Row 3          │        │ INSERT row 5 (row)       │
-  │ Image 1          │        │ INSERT row 6 (row)       │
-  │ ...              │        │ INSERT row 7 (row)       │
-  │ Paragraph 4,291  │        │ INSERT row 8 (image)     │
-  └──────────────────┘        │ ...                      │
-                              │ INSERT row 10,000        │
-  1 file write                └──────────────────────────┘
-                              💥 10,000 row inserts
+  contract.docx            Lix engine                    SQL database
+  ┌──────────────────┐     ┌─────────────────────┐       ┌──────────────┐
+  │ Paragraph 1      │     │ process 10,000      │       │              │
+  │ Paragraph 2      │     │ entity rows         │       │ INSERT row 1 │
+  │ Paragraph 3      │────►│                     │──────►│ INSERT row 2 │
+  │ Table 1          │     │ validate, transform,│       │ ...          │
+  │   Row 1          │     │ detect changes      │       │ INSERT row   │
+  │   Row 2          │     │                     │       │   10,000     │
+  │ Image 1          │     │ 💥 too slow          │       │              │
+  │ ...              │     └─────────────────────┘       └──────────────┘
+  │ Paragraph 4,291  │
+  └──────────────────┘
+  1 file write             N entities to process           N SQL row inserts
 ```
 
-### Finding 2: Without the semantic layer, Lix is ~8x faster than Git
+The engine is not fast enough to handle these large batches. The goal for April is to get 10k entity inserts under 100ms.
 
-Unexpected good news. Without the semantic layer (treating files as blobs), Lix commits in ~5 ms where Git takes ~39 ms for the same workloads.
+### Finding 3: Without the semantic layer, the file-write-plus-commit workflow is ~8x faster than Git
+
+Unexpected good news. Without the semantic layer (treating files as blobs), Lix completes the same file-write-plus-commit workload in ~5 ms where Git takes ~39 ms.[^1]
+
+[^1]: Measured on a MacBook Pro M5 Pro (18-core), SQLite in WAL mode.
 
 | Phase       | Git        | Lix       |
 | ----------- | ---------- | --------- |
@@ -69,45 +73,55 @@ Unexpected good news. Without the semantic layer (treating files as blobs), Lix 
 | Commit      | ~39 ms     | ~1 ms     |
 | **Total**   | **~39 ms** | **~5 ms** |
 
-The difference comes down to architecture. Lix applies mutations inside an open SQLite transaction. Committing is closing that transaction (~1 ms). Git's commit path runs `git add -A` and `git commit`, scanning the working tree, updating the index, and writing tree and commit objects.
+The difference comes down to architecture. Lix applies mutations inside an open SQLite transaction. Committing is closing that transaction (~1 ms). The comparison runs `git add -A` followed by `git commit`, which scans the working tree, updates the index, and writes tree and commit objects.
 
 This is encouraging, but it's the blob layer only. The semantic layer is what makes Lix useful for non-code files, and that's where the work is.
 
-## Making the semantic layer fast with Prolly trees
+### Why not skip the semantic layer entirely?
 
-The fix is chunking. Instead of inserting one row per entity, group entities into chunks and store each chunk as a single row. 10,000 entities become ~40 chunk inserts instead of 10,000 row inserts.
+If Lix is already fast without the semantic layer, why not just store blobs and diff on the fly?
 
-[Prolly trees](https://docs.dolthub.com/architecture/storage-engine/prolly-tree) are a chunking algorithm where chunk boundaries are determined by content hashes, not fixed positions. That's important because it also solves a second problem: cheap branching.
+This is really a source-of-truth decision, not a storage decision. Lix can keep both a blob and semantic state, but only one can be authoritative:
 
 ```
-  Before (naive):                     After (chunked):
+  Option A: Blob is source of truth, diffs computed on the fly
 
-  contract.docx                       contract.docx
-  ┌──────────────────┐                ┌──────────────────┐
-  │ Paragraph 1      │                │ Paragraph 1      │
-  │ Paragraph 2      │                │ Paragraph 2      │
-  │ Paragraph 3      │                │ Paragraph 3      │
-  │ Table 1          │                │ Table 1          │
-  │ ...              │                │ ...              │
-  │ Paragraph 4,291  │                │ Paragraph 4,291  │
-  └──────────────────┘                └──────────────────┘
-          │                                   │
-          ▼                                   ▼
-  ┌──────────────────┐                ┌──────────────────┐
-  │ INSERT row 1     │                │ INSERT chunk 1   │
-  │ INSERT row 2     │                │  (entities 1-256)│
-  │ INSERT row 3     │                │ INSERT chunk 2   │
-  │ INSERT row 4     │                │  (entities 257-  │
-  │ ...              │                │   512)           │
-  │ INSERT row 10,000│                │ ...              │
-  └──────────────────┘                │ INSERT chunk ~40 │
-                                      └──────────────────┘
-  💥 10,000 row inserts                ✅ ~40 row inserts
+  ┌──────────────┐       ┌──────────────┐
+  │ contract.docx│──────►│  re-parse    │──────► diffs (computed every time)
+  │   (blob)     │       │  on every op │
+  └──────────────┘       └──────────────┘
+
+
+  Option B: Diffs are source of truth, blob derived on demand
+
+  ┌──────────────┐       ┌──────────────┐
+  │    diffs     │──────►│  serialize   │──────► contract.docx (derived)
+  │  (stored)    │       │  on demand   │
+  └──────────────┘       └──────────────┘
 ```
 
-### Bonus: cheap branching
+If both are independently writable, they can drift.
 
-The content-based chunking also solves a (future) branching problem. Without deduplication, creating a new version (branch) means duplicating all entity data. A 10k-entity Word document across 5 versions = 50k rows stored.
+Git gets away with blob-first storage because its default diff and merge model is line-oriented and works well for ordinary text. For smaller structured text files like JSON, re-parsing on demand can still be acceptable. But as files grow, the cost per operation grows with them:
+
+| File type           | Size      | Rebuild cost per operation |
+| ------------------- | --------- | -------------------------- |
+| `.js` source file   | ~0.005 MB | trivial                    |
+| Large JSON config   | ~0.5 MB   | acceptable                 |
+| `.docx` with images | ~5 MB     | slow                       |
+| `.xlsx` spreadsheet | 5-20 MB   | 💥 too slow                |
+
+OOXML files like `.docx` and `.xlsx` are ZIP packages made of many XML parts, so rebuilding semantic state from the blob on every merge, history read, or sync means repeatedly paying unzip, parse, and tree-diff costs. A cache avoids repeated rebuilds, but now there are two representations to keep consistent — every write path must update both, and bugs in that synchronization are silent data corruption.
+
+So Lix makes semantic state canonical and materializes the blob on demand when someone actually needs the file bytes. The tradeoff is that blob writes pay an upfront parsing cost — which is the write-amplification bottleneck we're now fixing.
+
+Long term, most app and agent writes should bypass blob parsing entirely. They will write entities directly, so the hot path avoids both blob parsing and blob serialization.
+
+That means the semantic layer must be fast.
+
+## Prolly trees for cheap versioning
+
+Solving write speed alone isn't enough — storage also needs to scale across versions. Without content deduplication, creating a new version means duplicating all entity data. A 10k-entity Word document across 5 versions = 50k rows stored.
 
 ```
   Without deduplication:
@@ -119,7 +133,7 @@ The content-based chunking also solves a (future) branching problem. Without ded
   💥 10,000 rows              💥 10,000 rows (copied)
 ```
 
-Prolly trees fix this. If one paragraph changes, only the chunk containing that paragraph is new. The rest is shared across versions.
+[Prolly trees](https://docs.dolthub.com/architecture/storage-engine/prolly-tree) are the most promising fit for this. Entities are grouped into chunks with boundaries determined by content hashes. If one paragraph changes, only the chunk containing that paragraph is new. The rest is shared across versions.
 
 ```
   With Prolly trees:
@@ -147,48 +161,12 @@ Prolly trees fix this. If one paragraph changes, only the chunk containing that 
   ✅ Only changed chunks are stored separately
 ```
 
-### Why not skip the semantic layer entirely?
-
-If Lix is already fast without the semantic layer, why not just store blobs and diff on the fly?
-
-It's an either/or decision. Lix has to pick one source of truth:
-
-```
-  Option A: Blob is source of truth, diffs computed on the fly
-
-  ┌──────────────┐       ┌──────────────┐
-  │ contract.docx│──────►│  re-parse    │──────► diffs (computed every time)
-  │   (blob)     │       │  on every op │
-  └──────────────┘       └──────────────┘
-
-
-  Option B: Diffs are source of truth, blob derived on demand
-
-  ┌──────────────┐       ┌──────────────┐
-  │    diffs     │──────►│  serialize   │──────► contract.docx (derived)
-  │  (stored)    │       │  on demand   │
-  └──────────────┘       └──────────────┘
-```
-
-Trying to do both (blob and diffs as writable) leads to data corruption because they can diverge.
-
-Option A works for Git because source code files are small text. Re-parsing on every operation is cheap. For smaller files like a 300 KB `.docx` or JSON config, it's still acceptable. But as files grow, the cost per operation grows with them:
-
-| File type           | Size      | Re-parse per operation |
-| ------------------- | --------- | ---------------------- |
-| `.js` source file   | ~0.005 MB | trivial                |
-| Large JSON config   | ~0.5 MB   | acceptable             |
-| `.docx` with images | ~5 MB     | slow                   |
-| `.xlsx` spreadsheet | 5-20 MB   | 💥 too slow            |
-
-Every operation has to compute the diff from scratch: decompress the archive, parse XML, build the entity tree, then diff the two trees. A merge diffs three versions (base, ours, theirs). A history view diffs every version in the timeline. Parsing is fast, but diffing large entity trees is slow. For a 5 MB Word document, that adds up to seconds of wait time per operation. For real-time sync, it's a dealbreaker.
-
-Lix chose Option B. Parse once at write time, then every downstream operation is fast. The blob gets serialized on demand when someone actually needs the file.
-
-That means the semantic layer must be fast.
-
 ## What's next in April
 
-**Semantic layer: sub 100 ms for 10k entities.** With Prolly tree chunking, a file with 10,000 entities (a large JSON or a real-world `.docx`) must insert in under 100 ms.
+**1. Sub 100 ms for 10k entity inserts.** SQLite itself can insert 10,000 rows in under 10 ms. That means the raw database is not the bottleneck — the engine's per-row overhead is. The target is aggressive, but the headroom is there.
 
-Anything below 100 ms is not perceived as lag. 10,000 entities is the upper end of real-world Word documents we're testing against. This means deviating from the SQL database's standard B-tree storage and managing our own tree structure on top. Whether the tradeoff pays off in practice is what April will tell.
+**2. Prolly trees for cheap branching.** Branching and merging need content-deduplicated storage across versions. Without that, large semantic files get copied over and over again. With prolly trees, unchanged chunks are shared and only changed chunks are new.
+
+**3. Real workload testing with the semantic layer enabled.** March already showed that the replay workload works and did not surface corruption bugs on the blob path. April is about proving the same thing with semantic writes turned on.
+
+If April lands those three pieces, we can release Lix for broader testing.
