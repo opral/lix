@@ -7,15 +7,14 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
 use crate::engine::Engine;
 use crate::explain_output::{render_analyzed_explain_result, render_plain_explain_result};
-use crate::read_runtime::prepare_public_read_artifact;
 use crate::runtime::deterministic_mode::RuntimeFunctionProvider;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::SharedFunctionProvider;
 use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::prepare::{
-    schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
-    PreparedPublicRead,
+    prepare_public_read_artifact, schema_registrations_for_compiled_execution, CompiledExecution,
+    CompiledInternalExecution, PreparedPublicRead,
 };
 use crate::write_runtime::buffered::apply_schema_registrations_in_transaction;
 use crate::write_runtime::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
@@ -148,6 +147,7 @@ pub(crate) async fn execute_compiled_execution_step_with_transaction(
             let public_result = match transaction
                 .execute_prepared_public_read_with_pending_view(
                     pending_transaction_view.map(|view| view as &dyn PendingView),
+                    engine.projection_registry().as_ref(),
                     &public_read_artifact,
                 )
                 .await

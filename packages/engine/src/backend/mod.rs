@@ -2,13 +2,20 @@ pub(crate) mod image;
 pub(crate) mod prepared;
 pub(crate) mod program;
 pub(crate) mod program_runner;
+pub(crate) mod transaction_adapter;
 
 use async_trait::async_trait;
+use std::collections::BTreeMap;
 
 use crate::backend::prepared::PreparedBatch;
+use crate::contracts::traits::SqlPreparationMetadataReader;
 pub use crate::transaction_mode::TransactionMode;
+use crate::version::{
+    load_local_version_head_commit_id_with_executor, load_local_version_ref_heads_map_with_executor,
+};
 use crate::{LixError, QueryResult, Value};
 pub use image::{ImageChunkReader, ImageChunkWriter};
+pub(crate) use transaction_adapter::TransactionBackendAdapter;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SqlDialect {
@@ -108,6 +115,34 @@ where
 }
 
 #[async_trait(?Send)]
+impl<T> SqlPreparationMetadataReader for &T
+where
+    T: LixBackend + ?Sized,
+{
+    async fn execute_preparation_query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        (*self).execute(sql, params).await
+    }
+
+    async fn load_current_version_heads_for_preparation(
+        &mut self,
+    ) -> Result<Option<BTreeMap<String, String>>, LixError> {
+        load_current_version_heads_for_preparation_with_executor(self).await
+    }
+
+    async fn load_active_history_root_commit_id_for_preparation(
+        &mut self,
+        active_version_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        load_active_history_root_commit_id_for_preparation_with_executor(self, active_version_id)
+            .await
+    }
+}
+
+#[async_trait(?Send)]
 impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
     fn dialect(&self) -> SqlDialect {
         self.as_ref().dialect()
@@ -115,6 +150,31 @@ impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         self.as_mut().execute(sql, params).await
+    }
+}
+
+#[async_trait(?Send)]
+impl SqlPreparationMetadataReader for Box<dyn LixBackendTransaction + '_> {
+    async fn execute_preparation_query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        self.as_mut().execute(sql, params).await
+    }
+
+    async fn load_current_version_heads_for_preparation(
+        &mut self,
+    ) -> Result<Option<BTreeMap<String, String>>, LixError> {
+        load_current_version_heads_for_preparation_with_executor(self).await
+    }
+
+    async fn load_active_history_root_commit_id_for_preparation(
+        &mut self,
+        active_version_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        load_active_history_root_commit_id_for_preparation_with_executor(self, active_version_id)
+            .await
     }
 }
 
@@ -129,6 +189,67 @@ where
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         (**self).execute(sql, params).await
+    }
+}
+
+#[async_trait(?Send)]
+impl<T> SqlPreparationMetadataReader for &mut T
+where
+    T: LixBackendTransaction + ?Sized,
+{
+    async fn execute_preparation_query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError> {
+        (**self).execute(sql, params).await
+    }
+
+    async fn load_current_version_heads_for_preparation(
+        &mut self,
+    ) -> Result<Option<BTreeMap<String, String>>, LixError> {
+        load_current_version_heads_for_preparation_with_executor(self).await
+    }
+
+    async fn load_active_history_root_commit_id_for_preparation(
+        &mut self,
+        active_version_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        load_active_history_root_commit_id_for_preparation_with_executor(self, active_version_id)
+            .await
+    }
+}
+
+async fn load_current_version_heads_for_preparation_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<BTreeMap<String, String>>, LixError> {
+    match load_local_version_ref_heads_map_with_executor(executor).await {
+        Ok(heads) => Ok(heads),
+        Err(error)
+            if error
+                .description
+                .contains("schema 'lix_version' is not stored") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+async fn load_active_history_root_commit_id_for_preparation_with_executor(
+    executor: &mut dyn QueryExecutor,
+    active_version_id: &str,
+) -> Result<Option<String>, LixError> {
+    match load_local_version_head_commit_id_with_executor(executor, active_version_id).await {
+        Ok(commit_id) => Ok(commit_id),
+        Err(error)
+            if error
+                .description
+                .contains("schema 'lix_version' is not stored") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 

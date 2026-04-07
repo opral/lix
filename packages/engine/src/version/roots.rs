@@ -55,22 +55,6 @@ pub(crate) struct HistoryRootFacts {
     pub(crate) root_version_refs: Vec<ResolvedRootCommit>,
 }
 
-pub(crate) async fn load_all_version_head_commit_ids(
-    executor: &mut dyn QueryExecutor,
-) -> Result<Vec<ResolvedRootCommit>, LixError> {
-    let facts = resolve_history_root_facts_with_executor(
-        executor,
-        RootCommitResolutionRequest {
-            lineage_scope: RootLineageScope::Standard,
-            active_version_id: None,
-            root_scope: RootCommitScope::AllRoots,
-            version_scope: RootVersionScope::Any,
-        },
-    )
-    .await?;
-    Ok(facts.root_version_refs)
-}
-
 pub(crate) async fn resolve_history_root_facts_with_backend(
     backend: &dyn LixBackend,
     request: RootCommitResolutionRequest<'_>,

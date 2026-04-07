@@ -8,9 +8,11 @@ use crate::contracts::artifacts::{
     EffectiveRowSet, EffectiveRowsRequest, ExactUntrackedLookupRequest, LiveFilter,
     LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
     LiveStateProjectionStatus, OptionalTextPatch, PreparedPublicReadArtifact, RowIdentity,
-    ScanRequest, SchemaKey, SchemaRegistration, TrackedRow, TrackedTombstoneLookupRequest,
-    TrackedTombstoneMarker, TrackedWriteRow, UntrackedRow, UntrackedWriteRow,
+    ScanRequest, SchemaKey, SchemaRegistration, StateHistoryRequest, StateHistoryRow, TrackedRow,
+    TrackedTombstoneLookupRequest, TrackedTombstoneMarker, TrackedWriteRow, UntrackedRow,
+    UntrackedWriteRow,
 };
+use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::error::LixError;
 use crate::replay_cursor::ReplayCursor;
@@ -101,6 +103,24 @@ pub(crate) trait CompiledSchemaCache {
     fn get_compiled_schema(&self, key: &SchemaKey) -> Option<Arc<JSONSchema>>;
 
     fn insert_compiled_schema(&self, key: SchemaKey, schema: Arc<JSONSchema>);
+}
+
+#[async_trait(?Send)]
+pub(crate) trait SqlPreparationMetadataReader {
+    async fn execute_preparation_query(
+        &mut self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<QueryResult, LixError>;
+
+    async fn load_current_version_heads_for_preparation(
+        &mut self,
+    ) -> Result<Option<BTreeMap<String, String>>, LixError>;
+
+    async fn load_active_history_root_commit_id_for_preparation(
+        &mut self,
+        active_version_id: &str,
+    ) -> Result<Option<String>, LixError>;
 }
 
 pub(crate) trait PendingStateOverlay {
@@ -228,7 +248,7 @@ impl PendingStateOverlay for PendingStateOverlayRef<'_> {
 /// Lifecycle is intentionally not part of the trait. The same projection
 /// definition can be registered under different lifecycles.
 #[allow(dead_code)]
-pub(crate) trait ProjectionTrait {
+pub(crate) trait ProjectionTrait: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn inputs(&self) -> Vec<crate::contracts::artifacts::ProjectionInputSpec>;
@@ -336,6 +356,14 @@ pub(crate) trait EffectiveRowsResolver {
 }
 
 #[async_trait(?Send)]
+pub(crate) trait CommittedStateHistoryReader {
+    async fn load_committed_state_history_rows(
+        &self,
+        request: &StateHistoryRequest,
+    ) -> Result<Vec<StateHistoryRow>, LixError>;
+}
+
+#[async_trait(?Send)]
 pub(crate) trait LiveStateTransactionBridge {
     async fn register_live_state_schema(
         &mut self,
@@ -398,6 +426,7 @@ pub(crate) trait PendingPublicReadBackend {
     async fn execute_prepared_public_read_with_pending_view(
         &self,
         pending_view: Option<&dyn PendingView>,
+        projection_registry: &ProjectionRegistry,
         public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError>;
 }
@@ -409,6 +438,7 @@ pub(crate) trait PendingPublicReadTransaction {
     async fn execute_prepared_public_read_with_pending_view(
         &mut self,
         pending_view: Option<&dyn PendingView>,
+        projection_registry: &ProjectionRegistry,
         public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError>;
 }

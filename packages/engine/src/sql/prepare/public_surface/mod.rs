@@ -1790,9 +1790,10 @@ mod tests {
     };
     use crate::contracts::surface::SurfaceReadFreshness;
     use crate::live_state::{self, mark_mode_with_backend};
+    use crate::projections::builtin_projection_registry;
     use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
-    use crate::read_runtime::prepare_public_read_artifact;
     use crate::schema::builtin::types::LixCommit;
+    use crate::sql::prepare::prepare_public_read_artifact;
     use crate::sql::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
@@ -2187,10 +2188,13 @@ mod tests {
 
                     let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
                         .expect("descriptor-only lix_version read should convert");
-                    let actual =
-                        execute_prepared_public_read_artifact_with_backend(&backend, &artifact)
-                            .await
-                            .expect("descriptor-only lix_version read should execute");
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        builtin_projection_registry(),
+                        &artifact,
+                    )
+                    .await
+                    .expect("descriptor-only lix_version read should execute");
                     assert_eq!(
                         actual,
                         crate::QueryResult {
@@ -2256,10 +2260,13 @@ mod tests {
 
                     let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
                         .expect("descriptor+ref lix_version read should convert");
-                    let actual =
-                        execute_prepared_public_read_artifact_with_backend(&backend, &artifact)
-                            .await
-                            .expect("descriptor+ref lix_version read should execute");
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        builtin_projection_registry(),
+                        &artifact,
+                    )
+                    .await
+                    .expect("descriptor+ref lix_version read should execute");
                     assert_eq!(
                         actual,
                         crate::QueryResult {
@@ -2342,6 +2349,7 @@ mod tests {
                         .expect("multi-version lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
+                        builtin_projection_registry(),
                         &artifact,
                     )
                     .await

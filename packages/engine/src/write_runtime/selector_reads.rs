@@ -1,9 +1,9 @@
+use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
-use crate::read_runtime::{
-    execute_prepared_public_read_artifact_with_backend, prepare_public_read_artifact,
-};
+use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
 use crate::sql::prepare::{
-    load_sql_compiler_metadata, try_prepare_public_read_with_registry_and_internal_access,
+    load_sql_compiler_metadata, prepare_public_read_artifact,
+    try_prepare_public_read_with_registry_and_internal_access,
 };
 use crate::version::context::load_target_version_history_root_commit_id_with_backend;
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -11,6 +11,7 @@ use sqlparser::ast::{Query, Statement};
 
 pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     query: Query,
     params: &[Value],
     active_version_id: &str,
@@ -58,10 +59,18 @@ pub(crate) async fn execute_public_query_with_optional_pending_transaction_view(
             backend
                 .execute_prepared_public_read_with_pending_view(
                     Some(pending_transaction_view),
+                    projection_registry,
                     &artifact,
                 )
                 .await
         }
-        None => execute_prepared_public_read_artifact_with_backend(backend, &artifact).await,
+        None => {
+            execute_prepared_public_read_artifact_with_backend(
+                backend,
+                projection_registry,
+                &artifact,
+            )
+            .await
+        }
     }
 }

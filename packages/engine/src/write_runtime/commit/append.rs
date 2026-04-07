@@ -16,8 +16,8 @@ use super::pending::{
     merge_public_domain_change_batch_into_pending_commit, pending_session_matches_create_commit,
     PendingPublicCommitSession,
 };
-use super::receipt::CanonicalCommitReceipt;
 use super::types::ProposedDomainChange;
+use super::CanonicalCommitReceipt;
 
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,

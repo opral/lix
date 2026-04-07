@@ -2,6 +2,7 @@ use crate::contracts::artifacts::{
     DerivedRow, PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
     ReadTimeProjectionRead,
 };
+use crate::contracts::projection::ProjectionRegistry;
 use crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -9,11 +10,12 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 ///
 /// This runtime intentionally supports only the current compiled operator set:
 /// projection, filter, order, limit, and `COUNT(*)`.
-pub(crate) async fn execute_read_time_projection_read_with_backend(
+pub(crate) async fn execute_read_time_projection_read_with_registry(
     backend: &dyn LixBackend,
+    registry: &ProjectionRegistry,
     artifact: &ReadTimeProjectionRead,
 ) -> Result<QueryResult, LixError> {
-    let rows = derive_read_time_projection_rows_with_backend(backend).await?;
+    let rows = derive_read_time_projection_rows_with_backend(backend, registry).await?;
     execute_read_time_projection_rows(rows, artifact)
 }
 
@@ -243,7 +245,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        execute_read_time_projection_read_with_backend, execute_read_time_projection_rows,
+        execute_read_time_projection_read_with_registry, execute_read_time_projection_rows,
     };
     use crate::canonical::read::build_admin_version_source_sql_with_current_heads;
     use crate::contracts::artifacts::{
@@ -252,6 +254,7 @@ mod tests {
         RowIdentity,
     };
     use crate::live_state;
+    use crate::projections::builtin_projection_registry;
     use crate::schema::builtin::types::LixCommit;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend,
@@ -428,9 +431,13 @@ mod tests {
             },
         };
 
-        let actual = execute_read_time_projection_read_with_backend(&backend, &artifact)
-            .await
-            .expect("read-time projection query should execute");
+        let actual = execute_read_time_projection_read_with_registry(
+            &backend,
+            builtin_projection_registry(),
+            &artifact,
+        )
+        .await
+        .expect("read-time projection query should execute");
         let expected = current_admin_sql_query_result(
             &backend,
             &current_heads,
@@ -487,9 +494,13 @@ mod tests {
             },
         };
 
-        let actual = execute_read_time_projection_read_with_backend(&backend, &artifact)
-            .await
-            .expect("read-time projection count query should execute");
+        let actual = execute_read_time_projection_read_with_registry(
+            &backend,
+            builtin_projection_registry(),
+            &artifact,
+        )
+        .await
+        .expect("read-time projection count query should execute");
         let expected = current_admin_sql_query_result(
             &backend,
             &current_heads,

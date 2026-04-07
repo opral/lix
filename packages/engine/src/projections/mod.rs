@@ -2,63 +2,34 @@
 //!
 //! This module tree is the owner boundary introduced by Plan 31. It is where
 //! extracted surface derivation definitions live before `live_state` consumes
-//! registrations generically. The module intentionally stays free of runtime
-//! wiring beyond the internal built-in registry wrapper.
+//! registrations generically. Built-in registry assembly lives here, above the
+//! generic `live_state` executor.
 
-use crate::contracts::artifacts::{ProjectionLifecycle, ProjectionRegistration};
-use crate::contracts::traits::ProjectionTrait;
+use std::sync::OnceLock;
+
+use crate::contracts::projection::{ProjectionRegistry, RegisteredProjection};
 
 pub(crate) mod filesystem;
 pub(crate) mod version;
 
-/// Type-erased built-in projection registration for engine-owned enumeration.
-///
-/// The generic `ProjectionRegistration<P>` contract stays in `contracts/`.
-/// This wrapper only exists so the engine can hold heterogeneous built-in
-/// projections in one internal registry.
-#[allow(dead_code)]
-pub(crate) struct BuiltinProjectionRegistration {
-    projection: Box<dyn ProjectionTrait>,
-    lifecycle: ProjectionLifecycle,
-}
+static BUILTIN_PROJECTION_REGISTRY: OnceLock<ProjectionRegistry> = OnceLock::new();
 
-#[allow(dead_code)]
-impl BuiltinProjectionRegistration {
-    pub(crate) fn new<P>(registration: ProjectionRegistration<P>) -> Self
-    where
-        P: ProjectionTrait + 'static,
-    {
-        let (projection, lifecycle) = registration.into_parts();
-        Self {
-            projection: Box::new(projection),
-            lifecycle,
-        }
-    }
-
-    pub(crate) fn projection(&self) -> &dyn ProjectionTrait {
-        self.projection.as_ref()
-    }
-
-    pub(crate) fn lifecycle(&self) -> ProjectionLifecycle {
-        self.lifecycle
-    }
-}
-
-#[allow(dead_code)]
-pub(crate) fn builtin_projection_registrations() -> Vec<BuiltinProjectionRegistration> {
-    vec![BuiltinProjectionRegistration::new(
-        version::builtin_lix_version_registration(),
-    )]
+pub(crate) fn builtin_projection_registry() -> &'static ProjectionRegistry {
+    BUILTIN_PROJECTION_REGISTRY.get_or_init(|| {
+        ProjectionRegistry::new(vec![RegisteredProjection::new(
+            version::builtin_lix_version_registration(),
+        )])
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::builtin_projection_registrations;
+    use super::builtin_projection_registry;
     use crate::contracts::artifacts::ProjectionLifecycle;
 
     #[test]
     fn builtin_registry_exposes_lix_version_read_time_registration() {
-        let registrations = builtin_projection_registrations();
+        let registrations = builtin_projection_registry().registrations();
 
         assert_eq!(registrations.len(), 1);
         assert_eq!(registrations[0].projection().name(), "lix_version");

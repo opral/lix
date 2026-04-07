@@ -13,6 +13,7 @@ pub mod wasm;
 
 use crate::backend::QueryExecutor;
 use crate::contracts::artifacts::MutationRow;
+use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::runtime::cel::CelEvaluator;
@@ -50,6 +51,7 @@ pub(crate) struct Runtime {
     in_init_transaction: AtomicBool,
     savepoint_counter: AtomicU64,
     public_surface_registry: RwLock<SurfaceRegistry>,
+    projection_registry: Arc<ProjectionRegistry>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, CachedPluginComponent>>,
@@ -63,6 +65,7 @@ impl Runtime {
         access_to_internal: bool,
         boot_deterministic_settings: Option<DeterministicSettings>,
         public_surface_registry: SurfaceRegistry,
+        projection_registry: Arc<ProjectionRegistry>,
     ) -> Self {
         let deterministic_boot_pending = boot_deterministic_settings.is_some();
         Self {
@@ -77,6 +80,7 @@ impl Runtime {
             in_init_transaction: AtomicBool::new(false),
             savepoint_counter: AtomicU64::new(0),
             public_surface_registry: RwLock::new(public_surface_registry),
+            projection_registry,
             access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
@@ -113,6 +117,10 @@ impl Runtime {
             .read()
             .expect("public surface registry lock poisoned")
             .clone()
+    }
+
+    pub(crate) fn projection_registry(&self) -> &Arc<ProjectionRegistry> {
+        &self.projection_registry
     }
 
     pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {

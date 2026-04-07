@@ -13,6 +13,7 @@ mod error;
 mod errors;
 pub(crate) mod execution_effects;
 pub(crate) mod explain_output;
+mod filesystem_materialization;
 mod identity;
 mod init;
 pub(crate) mod live_schema_access;

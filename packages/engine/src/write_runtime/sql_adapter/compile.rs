@@ -58,7 +58,6 @@ pub(super) async fn compile_sql_buffered_write_command(
     let preparation_context = DefaultSqlPreparationContext {
         dialect: backend.dialect(),
         cel_evaluator: engine.runtime().as_ref().cel_evaluator(),
-        schema_cache: engine.runtime().as_ref().schema_cache(),
         functions: runtime_state.provider(),
         surface_registry: &context.public_surface_registry,
         compiler_metadata: &compiler_metadata,
@@ -124,6 +123,7 @@ pub(super) async fn compile_sql_buffered_write_command(
         let functions = runtime_state.provider().clone();
         let public_write = match materialize_prepared_public_write(
             &backend,
+            engine.projection_registry().as_ref(),
             pending_transaction_view,
             &public_write,
             functions,

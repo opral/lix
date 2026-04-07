@@ -1,3 +1,5 @@
+use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
+use crate::contracts::surface::SurfaceRegistry;
 use crate::schema::{builtin_public_surface_columns, builtin_public_surface_names};
 use crate::LixBackend;
 use crate::{errors, LixError};
@@ -62,8 +64,20 @@ pub(crate) async fn normalize_sql_error_with_backend(
     error: LixError,
     statements: &[Statement],
 ) -> LixError {
+    normalize_sql_error_with_backend_and_relation_names(
+        backend,
+        error,
+        &relation_names_from_statements(statements),
+    )
+    .await
+}
+
+pub(crate) async fn normalize_sql_error_with_backend_and_relation_names(
+    backend: &dyn LixBackend,
+    error: LixError,
+    relation_names: &[String],
+) -> LixError {
     if let Some(missing_column) = parse_unknown_column_name(&error.description) {
-        let relation_names = relation_names_from_statements(statements);
         let table_name = choose_table_for_unknown_column(&missing_column, &relation_names);
         let available_columns = if let Some(table_name) = table_name.as_deref() {
             resolve_available_columns(table_name, Some(backend)).await
@@ -83,11 +97,9 @@ pub(crate) async fn normalize_sql_error_with_backend(
     }
 
     if is_missing_relation_error(&error) {
-        if let Some(table_name) = parse_unknown_table_name(&error.description).or_else(|| {
-            relation_names_from_statements(statements)
-                .into_iter()
-                .next()
-        }) {
+        if let Some(table_name) =
+            parse_unknown_table_name(&error.description).or_else(|| relation_names.first().cloned())
+        {
             let available_tables = resolve_available_tables(backend).await;
             let available_table_refs = available_tables
                 .iter()
@@ -102,7 +114,8 @@ pub(crate) async fn normalize_sql_error_with_backend(
         return errors::table_not_found_read_error();
     }
 
-    let public_surfaces = public_surfaces_in_statements_with_backend(backend, statements).await;
+    let public_surfaces =
+        public_surfaces_in_relation_names_with_backend(backend, relation_names, None).await;
     if !public_surfaces.is_empty() {
         let sanitized =
             sanitize_lowered_public_sql_error_description(&error.description, &public_surfaces);
@@ -112,6 +125,54 @@ pub(crate) async fn normalize_sql_error_with_backend(
     }
 
     error
+}
+
+pub(crate) fn normalize_sql_error_with_read_diagnostic_context(
+    error: LixError,
+    diagnostic_context: &ReadDiagnosticContext,
+) -> LixError {
+    normalize_sql_error_with_relation_names_and_catalog_snapshot(
+        error,
+        &diagnostic_context.relation_names,
+        &diagnostic_context.catalog_snapshot,
+    )
+}
+
+pub(crate) fn build_read_diagnostic_catalog_snapshot(
+    surface_registry: &SurfaceRegistry,
+    relation_names: &[String],
+) -> ReadDiagnosticCatalogSnapshot {
+    let mut public_surfaces: Vec<String> = Vec::new();
+    let mut available_columns_by_relation = std::collections::BTreeMap::new();
+
+    for relation_name in relation_names {
+        let columns = builtin_public_surface_columns(relation_name)
+            .or_else(|| surface_registry.public_surface_columns(relation_name));
+        let Some(columns) = columns else {
+            continue;
+        };
+
+        if !public_surfaces
+            .iter()
+            .any(|surface| surface.eq_ignore_ascii_case(relation_name))
+        {
+            public_surfaces.push(relation_name.clone());
+        }
+        available_columns_by_relation
+            .entry(relation_name.clone())
+            .or_insert(columns);
+    }
+
+    let mut available_tables = builtin_public_surface_names();
+    available_tables.extend(surface_registry.public_surface_names());
+    available_tables.sort();
+    available_tables.dedup();
+
+    ReadDiagnosticCatalogSnapshot {
+        public_surfaces,
+        available_tables,
+        available_columns_by_relation,
+    }
 }
 
 pub(crate) fn sanitize_lowered_public_sql_error_description(
@@ -166,18 +227,23 @@ async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
     }
 }
 
-async fn public_surfaces_in_statements_with_backend(
+async fn public_surfaces_in_relation_names_with_backend(
     backend: &dyn LixBackend,
-    statements: &[Statement],
+    relation_names: &[String],
+    fallback_statements: Option<&[Statement]>,
 ) -> Vec<String> {
-    let relation_names = relation_names_from_statements(statements);
     let registry = match crate::schema::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry,
-        Err(_) => return builtin_public_surfaces_in_statements(statements),
+        Err(_) => {
+            return fallback_statements
+                .map(builtin_public_surfaces_in_statements)
+                .unwrap_or_default();
+        }
     };
     relation_names
-        .into_iter()
+        .iter()
         .filter(|name| registry.bind_relation_name(name).is_some())
+        .cloned()
         .collect()
 }
 
@@ -251,6 +317,76 @@ fn choose_table_for_unknown_column(
     }
 
     None
+}
+
+fn normalize_sql_error_with_relation_names_and_catalog_snapshot(
+    error: LixError,
+    relation_names: &[String],
+    catalog_snapshot: &ReadDiagnosticCatalogSnapshot,
+) -> LixError {
+    if let Some(missing_column) = parse_unknown_column_name(&error.description) {
+        let table_name = choose_table_for_unknown_column(&missing_column, relation_names);
+        let available_columns = table_name
+            .as_deref()
+            .map(|table_name| {
+                lookup_available_columns(catalog_snapshot, table_name).unwrap_or_default()
+            })
+            .unwrap_or_default();
+        let available_column_refs = available_columns
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        return errors::sql_unknown_column_error(
+            &missing_column,
+            table_name.as_deref(),
+            available_column_refs.as_slice(),
+            parse_sql_offset(&error.description),
+        );
+    }
+
+    if is_missing_relation_error(&error) {
+        if let Some(table_name) =
+            parse_unknown_table_name(&error.description).or_else(|| relation_names.first().cloned())
+        {
+            let available_table_refs = catalog_snapshot
+                .available_tables
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>();
+            return errors::sql_unknown_table_error(
+                &table_name,
+                available_table_refs.as_slice(),
+                parse_sql_offset(&error.description),
+            );
+        }
+        return errors::table_not_found_read_error();
+    }
+
+    if !catalog_snapshot.public_surfaces.is_empty() {
+        let sanitized = sanitize_lowered_public_sql_error_description(
+            &error.description,
+            &catalog_snapshot.public_surfaces,
+        );
+        if sanitized != error.description {
+            return LixError::new(&error.code, sanitized);
+        }
+    }
+
+    error
+}
+
+fn lookup_available_columns(
+    catalog_snapshot: &ReadDiagnosticCatalogSnapshot,
+    relation_name: &str,
+) -> Option<Vec<String>> {
+    catalog_snapshot
+        .available_columns_by_relation
+        .iter()
+        .find_map(|(candidate, columns)| {
+            candidate
+                .eq_ignore_ascii_case(relation_name)
+                .then(|| columns.clone())
+        })
 }
 
 fn parse_unknown_column_name(description: &str) -> Option<String> {
@@ -346,12 +482,16 @@ fn sanitize_name(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_missing_relation_error, normalize_sql_error,
+        build_read_diagnostic_catalog_snapshot, is_missing_relation_error, normalize_sql_error,
+        normalize_sql_error_with_read_diagnostic_context,
         sanitize_lowered_public_sql_error_description,
     };
+    use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
+    use crate::contracts::surface::{builtin_surface_descriptors, SurfaceRegistry};
     use crate::LixError;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
+    use std::collections::BTreeMap;
 
     #[test]
     fn classifies_missing_relation_messages() {
@@ -490,5 +630,61 @@ mod tests {
             error.description,
             "public read on lix_key_value execution failed after lowering"
         );
+    }
+
+    #[test]
+    fn read_diagnostic_context_preserves_lowered_public_sanitization_without_backend_registry() {
+        let context = ReadDiagnosticContext {
+            source_sql: vec!["SELECT * FROM lix_key_value".into()],
+            relation_names: vec!["lix_key_value".into()],
+            catalog_snapshot: ReadDiagnosticCatalogSnapshot {
+                public_surfaces: vec!["lix_key_value".into()],
+                available_tables: vec!["lix_key_value".into()],
+                available_columns_by_relation: BTreeMap::from([(
+                    "lix_key_value".into(),
+                    vec!["key".into(), "value".into()],
+                )]),
+            },
+            explain_mode: None,
+            plain_explain_template: None,
+            analyzed_explain_template: None,
+        };
+
+        let error = normalize_sql_error_with_read_diagnostic_context(
+            LixError {
+                code: "LIX_ERROR_UNKNOWN".into(),
+                description:
+                    "backend failed in SELECT * FROM (WITH target_versions AS (...) SELECT * FROM lix_internal_live_v1_lix_key_value)"
+                        .into(),
+            },
+            &context,
+        );
+
+        assert_eq!(
+            error.description,
+            "public read on lix_key_value execution failed after lowering"
+        );
+    }
+
+    #[test]
+    fn read_diagnostic_catalog_snapshot_captures_public_surface_columns_from_registry() {
+        let mut registry = SurfaceRegistry::default();
+        registry.insert_descriptors(builtin_surface_descriptors());
+
+        let snapshot =
+            build_read_diagnostic_catalog_snapshot(&registry, &["lix_registered_schema".into()]);
+
+        assert!(snapshot
+            .public_surfaces
+            .iter()
+            .any(|name| name == "lix_registered_schema"));
+        assert!(snapshot
+            .available_tables
+            .iter()
+            .any(|name| name == "lix_registered_schema"));
+        assert!(snapshot
+            .available_columns_by_relation
+            .get("lix_registered_schema")
+            .is_some_and(|columns| columns.iter().any(|column| column == "value")));
     }
 }

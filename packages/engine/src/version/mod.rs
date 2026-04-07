@@ -16,12 +16,13 @@ mod merge_version;
 mod ref_storage;
 mod roots;
 
+pub(crate) use crate::schema::builtin::{DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID};
 pub(crate) use create_version::create_version_in_session;
 pub use create_version::{CreateVersionOptions, CreateVersionResult};
+#[allow(unused_imports)]
 pub(crate) use heads::{
     load_committed_version_head_commit_id, load_committed_version_ref_with_backend,
     load_committed_version_ref_with_executor, load_current_committed_version_frontier_with_backend,
-    load_current_committed_version_frontier_with_executor,
 };
 pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use merge_version::merge_version_in_session;
@@ -31,15 +32,12 @@ pub use merge_version::{
 pub(crate) use ref_storage::{
     build_local_version_ref_heads_source_sql, load_all_local_version_refs_with_executor,
     load_local_version_head_commit_id_with_executor,
+    load_local_version_ref_heads_map_with_executor,
 };
 pub(crate) use roots::{
-    load_all_version_head_commit_ids, resolve_history_root_facts_with_backend, HistoryRootFacts,
-    HistoryRootTraversal, RootCommitResolutionRequest, RootCommitScope, RootLineageScope,
-    RootVersionScope,
+    resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
+    RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
-
-pub(crate) const GLOBAL_VERSION_ID: &str = "global";
-pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
 
 static ACTIVE_VERSION_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
@@ -69,31 +67,12 @@ pub(crate) fn active_version_schema_key() -> &'static str {
     &active_version_schema_metadata().schema_key
 }
 
-#[cfg(test)]
-pub(crate) fn active_version_schema_version() -> &'static str {
-    &active_version_schema_metadata().schema_version
-}
-
 pub(crate) fn active_version_file_id() -> &'static str {
     &active_version_schema_metadata().file_id
 }
 
-#[cfg(test)]
-pub(crate) fn active_version_plugin_key() -> &'static str {
-    &active_version_schema_metadata().plugin_key
-}
-
 pub(crate) fn active_version_storage_version_id() -> &'static str {
     &active_version_schema_metadata().storage_version_id
-}
-
-#[cfg(test)]
-pub(crate) fn active_version_snapshot_content(entity_id: &str, version_id: &str) -> String {
-    serde_json::to_string(&LixActiveVersion {
-        id: entity_id.to_string(),
-        version_id: version_id.to_string(),
-    })
-    .expect("lix_active_version snapshot serialization must succeed")
 }
 
 pub(crate) fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {

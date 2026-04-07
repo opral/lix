@@ -37,12 +37,11 @@ use super::preflight::{
     load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
     load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
 };
-use super::receipt::{
-    latest_replay_cursor_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
-};
+use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
 };
+use super::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -1348,7 +1347,7 @@ mod tests {
         CanonicalChangeSeed, TestSqliteBackend,
     };
     use crate::version::GLOBAL_VERSION_ID;
-    use crate::write_runtime::commit::receipt::UpdatedVersionRef;
+    use crate::write_runtime::commit::UpdatedVersionRef;
     use crate::write_runtime::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState,
     };

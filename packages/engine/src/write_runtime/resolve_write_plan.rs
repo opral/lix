@@ -1,3 +1,4 @@
+use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
 #[cfg(test)]
@@ -197,11 +198,13 @@ impl ResolvedWritePlanBuilder {
 #[cfg(test)]
 pub(crate) async fn resolve_write_plan(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     resolve_write_plan_with_functions(
         backend,
+        projection_registry,
         planned_write,
         pending_transaction_view,
         SharedFunctionProvider::new(SystemFunctionProvider),
@@ -211,6 +214,7 @@ pub(crate) async fn resolve_write_plan(
 
 pub(crate) async fn resolve_write_plan_with_functions<P>(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     functions: SharedFunctionProvider<P>,
@@ -228,13 +232,29 @@ where
     );
     let resolved = match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => {
-            resolve_state_write(&mut hydrator, planned_write, functions.clone()).await
+            resolve_state_write(
+                &mut hydrator,
+                projection_registry,
+                planned_write,
+                functions.clone(),
+            )
+            .await
         }
         SurfaceFamily::Entity => {
-            resolve_entity_write(&mut hydrator, planned_write, functions.clone()).await
+            resolve_entity_write(
+                &mut hydrator,
+                projection_registry,
+                planned_write,
+                functions.clone(),
+            )
+            .await
         }
-        SurfaceFamily::Admin => resolve_admin_write(&mut hydrator, planned_write).await,
-        SurfaceFamily::Filesystem => resolve_filesystem_write(&mut hydrator, planned_write).await,
+        SurfaceFamily::Admin => {
+            resolve_admin_write(&mut hydrator, projection_registry, planned_write).await
+        }
+        SurfaceFamily::Filesystem => {
+            resolve_filesystem_write(&mut hydrator, projection_registry, planned_write).await
+        }
         SurfaceFamily::Change => Err(WriteResolveError {
             message: format!(
                 "public write resolver does not support '{}' writes",
@@ -248,6 +268,7 @@ where
 
 async fn resolve_admin_write(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
@@ -256,7 +277,7 @@ async fn resolve_admin_write(
                 resolve_version_insert_write_plan(hydrator, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_version_write(hydrator, planned_write).await
+                resolve_existing_version_write(hydrator, projection_registry, planned_write).await
             }
         },
         other => Err(WriteResolveError {
@@ -326,10 +347,12 @@ async fn resolve_version_insert_write_plan(
 
 async fn resolve_existing_version_write(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_ids = query_text_selector_values_for_write_selector(
         hydrator.backend(),
+        projection_registry,
         planned_write,
         hydrator
             .pending_state_overlay()
@@ -1093,6 +1116,7 @@ fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
 
 pub(super) async fn query_text_selector_values_for_write_selector(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     selector_column: &str,
@@ -1101,6 +1125,7 @@ pub(super) async fn query_text_selector_values_for_write_selector(
     let selector = canonical_state_selector(planned_write);
     let query_result = execute_public_selector_query_strict(
         backend,
+        projection_registry,
         planned_write,
         pending_transaction_view,
         build_public_selector_query(
@@ -1150,6 +1175,7 @@ pub(super) fn canonical_state_selector(planned_write: &PlannedWrite) -> Canonica
 
 pub(super) async fn execute_public_selector_query_strict(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     query: Query,
@@ -1162,6 +1188,7 @@ pub(super) async fn execute_public_selector_query_strict(
         .unwrap_or(GLOBAL_VERSION_ID);
     execute_public_query_with_optional_pending_transaction_view(
         backend,
+        projection_registry,
         query,
         &planned_write.command.bound_parameters,
         active_version_id,

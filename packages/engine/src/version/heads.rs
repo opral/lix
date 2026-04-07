@@ -52,6 +52,7 @@ pub(crate) async fn load_all_committed_version_refs_with_executor(
         .collect())
 }
 
+#[allow(dead_code)]
 pub(crate) async fn load_current_committed_version_frontier_with_backend(
     backend: &dyn LixBackend,
 ) -> Result<CommittedVersionFrontier, LixError> {
@@ -59,6 +60,7 @@ pub(crate) async fn load_current_committed_version_frontier_with_backend(
     load_current_committed_version_frontier_with_executor(&mut executor).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn load_current_committed_version_frontier_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<CommittedVersionFrontier, LixError> {

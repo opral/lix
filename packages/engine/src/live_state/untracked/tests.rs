@@ -9,12 +9,9 @@ use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::schema::builtin::storage::builtin_schema_storage_metadata;
+use crate::schema::builtin::types::LixActiveVersion;
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use crate::version::{
-    active_version_file_id, active_version_plugin_key, active_version_schema_key,
-    active_version_schema_version, active_version_snapshot_content,
-    active_version_storage_version_id,
-};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
@@ -202,21 +199,45 @@ fn active_version_helper_write_row(
     version_id: &str,
     timestamp: &str,
 ) -> UntrackedWriteRow {
+    let metadata = builtin_schema_storage_metadata("lix_active_version")
+        .expect("lix_active_version metadata should exist");
     UntrackedWriteRow {
         entity_id: entity_id.to_string(),
-        schema_key: active_version_schema_key().to_string(),
-        schema_version: active_version_schema_version().to_string(),
-        file_id: active_version_file_id().to_string(),
-        version_id: active_version_storage_version_id().to_string(),
+        schema_key: metadata.schema_key,
+        schema_version: metadata.schema_version,
+        file_id: metadata.file_id,
+        version_id: crate::schema::builtin::GLOBAL_VERSION_ID.to_string(),
         global: true,
-        plugin_key: active_version_plugin_key().to_string(),
+        plugin_key: metadata.plugin_key,
         metadata: None,
         writer_key: None,
-        snapshot_content: Some(active_version_snapshot_content(entity_id, version_id)),
+        snapshot_content: Some(
+            serde_json::to_string(&LixActiveVersion {
+                id: entity_id.to_string(),
+                version_id: version_id.to_string(),
+            })
+            .expect("lix_active_version snapshot serialization must succeed"),
+        ),
         created_at: Some(timestamp.to_string()),
         updated_at: timestamp.to_string(),
         operation: UntrackedWriteOperation::Upsert,
     }
+}
+
+fn active_version_schema_key() -> String {
+    builtin_schema_storage_metadata("lix_active_version")
+        .expect("lix_active_version metadata should exist")
+        .schema_key
+}
+
+fn active_version_file_id() -> String {
+    builtin_schema_storage_metadata("lix_active_version")
+        .expect("lix_active_version metadata should exist")
+        .file_id
+}
+
+fn active_version_storage_version_id() -> String {
+    crate::schema::builtin::GLOBAL_VERSION_ID.to_string()
 }
 
 #[tokio::test]

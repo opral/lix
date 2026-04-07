@@ -15,6 +15,7 @@ pub(crate) mod status;
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::contracts::artifacts::{CanonicalCommitReceipt, UpdatedVersionRef};
 use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
@@ -24,17 +25,52 @@ use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
-use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_snapshot_content, version_ref_storage_version_id,
-};
-use crate::write_runtime::commit::{CanonicalCommitReceipt, UpdatedVersionRef};
+use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
+use crate::schema::builtin::types::LixVersionRef;
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, ReplayCursor,
     TransactionMode,
 };
 
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
+
+fn version_ref_schema_key() -> String {
+    version_ref_storage_metadata().schema_key
+}
+
+fn version_ref_schema_version() -> String {
+    version_ref_storage_metadata().schema_version
+}
+
+fn version_ref_file_id() -> String {
+    version_ref_storage_metadata().file_id
+}
+
+fn version_ref_plugin_key() -> String {
+    version_ref_storage_metadata().plugin_key
+}
+
+fn version_ref_storage_version_id() -> String {
+    match version_ref_storage_metadata().storage_lane {
+        BuiltinSchemaStorageLane::Global => crate::schema::builtin::GLOBAL_VERSION_ID.to_string(),
+        BuiltinSchemaStorageLane::Local => {
+            panic!("lix_version_ref must use the global storage lane")
+        }
+    }
+}
+
+fn version_ref_snapshot_content(version_id: &str, commit_id: &str) -> String {
+    serde_json::to_string(&LixVersionRef {
+        id: version_id.to_string(),
+        commit_id: commit_id.to_string(),
+    })
+    .expect("lix_version_ref snapshot serialization must succeed")
+}
+
+fn version_ref_storage_metadata() -> crate::schema::builtin::storage::BuiltinSchemaStorageMetadata {
+    builtin_schema_storage_metadata("lix_version_ref")
+        .expect("lix_version_ref builtin storage metadata should exist")
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DerivedProjectionId {
@@ -400,12 +436,12 @@ pub(crate) fn local_version_head_write_row(
 ) -> UntrackedWriteRow {
     UntrackedWriteRow {
         entity_id: version_id.to_string(),
-        schema_key: version_ref_schema_key().to_string(),
-        schema_version: version_ref_schema_version().to_string(),
-        file_id: version_ref_file_id().to_string(),
-        version_id: version_ref_storage_version_id().to_string(),
+        schema_key: version_ref_schema_key(),
+        schema_version: version_ref_schema_version(),
+        file_id: version_ref_file_id(),
+        version_id: version_ref_storage_version_id(),
         global: true,
-        plugin_key: version_ref_plugin_key().to_string(),
+        plugin_key: version_ref_plugin_key(),
         metadata: None,
         writer_key: None,
         snapshot_content: Some(version_ref_snapshot_content(version_id, commit_id)),
@@ -429,7 +465,8 @@ mod tests {
         apply_canonical_receipt_in_transaction,
         apply_commit_projections_best_effort_in_transaction,
         catch_up_live_state_to_current_frontier, projection_status, replay, status,
-        DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
+        version_ref_schema_key, CanonicalCommitReceipt, DerivedProjectionId,
+        ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
     };
     use crate::live_state::LiveStateMode;
     use crate::test_support::{
@@ -437,7 +474,6 @@ mod tests {
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
-    use crate::write_runtime::commit::CanonicalCommitReceipt;
     use crate::ReplayCursor;
     use crate::{CommittedVersionFrontier, LixBackend, LixError, TransactionMode};
     use crate::{CreateVersionOptions, VersionId};
@@ -578,9 +614,8 @@ mod tests {
     #[tokio::test]
     async fn local_version_head_writes_are_required_for_projection_application() {
         let backend = init_projection_backend().await;
-        let version_ref_table = crate::live_state::schema_access::tracked_relation_name(
-            crate::version::version_ref_schema_key(),
-        );
+        let version_ref_table =
+            crate::live_state::schema_access::tracked_relation_name(&version_ref_schema_key());
         backend.block_writes_to(
             &version_ref_table,
             LixError::new("LIX_ERROR_UNKNOWN", "local version-head write failed"),

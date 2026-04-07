@@ -5,8 +5,8 @@ use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
 
-use super::receipt::UpdatedVersionRef;
 use super::types::{DomainChangeInput, GenerateCommitArgs, GenerateCommitResult};
+use super::UpdatedVersionRef;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";

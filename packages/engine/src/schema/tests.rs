@@ -287,14 +287,14 @@ fn builtin_storage_metadata_parses_lix_account_from_schema_owner() {
 }
 
 #[test]
-fn builtin_storage_metadata_marks_non_global_builtins_as_versioned() {
+fn builtin_storage_metadata_marks_non_global_builtins_as_local() {
     let metadata = builtin_schema_storage_metadata("lix_key_value")
         .expect("lix_key_value builtin storage metadata should exist");
 
     assert_eq!(metadata.schema_key, "lix_key_value");
     assert_eq!(metadata.file_id, "lix");
     assert_eq!(metadata.plugin_key, "lix");
-    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Versioned);
+    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
 }
 
 #[test]

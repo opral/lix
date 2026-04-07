@@ -1,11 +1,11 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
-use crate::canonical::read::load_state_history_rows;
 use crate::contracts::artifacts::{
     DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
     StateHistoryVersionScope,
 };
+use crate::contracts::traits::CommittedStateHistoryReader;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
@@ -116,9 +116,8 @@ pub(crate) async fn load_file_history_rows(
     backend: &dyn LixBackend,
     request: &FileHistoryRequest,
 ) -> Result<Vec<FileHistoryRow>, LixError> {
-    let state_rows = load_state_history_rows(
-        backend,
-        &StateHistoryRequest {
+    let state_rows = backend
+        .load_committed_state_history_rows(&StateHistoryRequest {
             lineage_scope: match request.lineage_scope {
                 FileHistoryLineageScope::ActiveVersion => StateHistoryLineageScope::ActiveVersion,
                 FileHistoryLineageScope::Standard => StateHistoryLineageScope::Standard,
@@ -144,9 +143,8 @@ pub(crate) async fn load_file_history_rows(
             ],
             content_mode: StateHistoryContentMode::IncludeSnapshotContent,
             ..StateHistoryRequest::default()
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let mut file_descriptors = Vec::new();
     let mut directory_rows = Vec::new();
@@ -576,9 +574,8 @@ pub(crate) async fn load_directory_history_rows(
     backend: &dyn LixBackend,
     request: &DirectoryHistoryRequest,
 ) -> Result<Vec<DirectoryHistoryRow>, LixError> {
-    let state_rows = load_state_history_rows(
-        backend,
-        &StateHistoryRequest {
+    let state_rows = backend
+        .load_committed_state_history_rows(&StateHistoryRequest {
             lineage_scope: match request.lineage_scope {
                 FileHistoryLineageScope::ActiveVersion => StateHistoryLineageScope::ActiveVersion,
                 FileHistoryLineageScope::Standard => StateHistoryLineageScope::Standard,
@@ -599,9 +596,8 @@ pub(crate) async fn load_directory_history_rows(
             schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
             content_mode: StateHistoryContentMode::IncludeSnapshotContent,
             ..StateHistoryRequest::default()
-        },
-    )
-    .await?;
+        })
+        .await?;
 
     let mut directory_rows = Vec::new();
     for row in state_rows {

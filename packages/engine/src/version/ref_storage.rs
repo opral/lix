@@ -1,6 +1,7 @@
 use crate::backend::QueryExecutor;
 use crate::errors::classification::is_missing_relation_error;
 use crate::{LixError, SqlDialect, Value};
+use std::collections::BTreeMap;
 
 use super::{
     version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
@@ -143,6 +144,21 @@ pub(crate) async fn load_all_local_version_refs_with_executor(
     }
 
     Ok(rows)
+}
+
+pub(crate) async fn load_local_version_ref_heads_map_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<BTreeMap<String, String>>, LixError> {
+    if !local_version_ref_relation_exists_with_executor(executor).await? {
+        return Ok(None);
+    }
+
+    let rows = load_all_local_version_refs_with_executor(executor).await?;
+    Ok(Some(
+        rows.into_iter()
+            .map(|row| (row.version_id, row.commit_id))
+            .collect(),
+    ))
 }
 
 pub(crate) fn build_local_version_ref_heads_source_sql() -> String {

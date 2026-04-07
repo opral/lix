@@ -1,35 +1,34 @@
 mod direct;
 mod filesystem;
-mod prepare;
 mod public;
 mod rowset;
 
 use crate::contracts::artifacts::{
     PreparedReadArtifact, PreparedReadProgram, PreparedReadStep, ResultContract,
 };
+use crate::contracts::projection::ProjectionRegistry;
+use crate::errors::classification::normalize_sql_error_with_read_diagnostic_context;
 use crate::explain_output::{render_analyzed_explain_result, render_plain_explain_result};
-use crate::runtime::{normalize_sql_execution_error_with_backend, TransactionBackendAdapter};
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult};
-use sqlparser::ast::Statement;
 use std::time::Instant;
 
-pub(crate) use prepare::{
-    compile_committed_read_program_with_context, prepare_public_read_artifact,
-};
 pub(crate) use public::{
     execute_prepared_public_read_artifact_in_transaction,
     execute_prepared_public_read_artifact_with_backend,
 };
-pub(crate) use rowset::execute_read_time_projection_read_with_backend;
+pub(crate) use rowset::execute_read_time_projection_read_with_registry;
 
 pub(crate) async fn execute_prepared_read_program_in_committed_read_transaction(
     transaction: &mut dyn LixBackendTransaction,
+    projection_registry: &ProjectionRegistry,
     prepared: &PreparedReadProgram,
 ) -> Result<ExecuteResult, LixError> {
     let mut results = Vec::new();
 
     for step in &prepared.steps {
-        let result = execute_prepared_read_step_in_transaction(transaction, step).await?;
+        let result =
+            execute_prepared_read_step_in_transaction(transaction, projection_registry, step)
+                .await?;
         results.push(result);
     }
 
@@ -40,6 +39,7 @@ pub(crate) async fn execute_prepared_read_program_in_committed_read_transaction(
 
 async fn execute_prepared_read_step_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
+    projection_registry: &ProjectionRegistry,
     prepared: &PreparedReadStep,
 ) -> Result<QueryResult, LixError> {
     if let Some(template) = &prepared.diagnostic_context.plain_explain_template {
@@ -50,7 +50,12 @@ async fn execute_prepared_read_step_in_transaction(
 
     let result = match &prepared.artifact {
         PreparedReadArtifact::Public(public) => {
-            execute_prepared_public_read_artifact_in_transaction(transaction, public).await
+            execute_prepared_public_read_artifact_in_transaction(
+                transaction,
+                projection_registry,
+                public,
+            )
+            .await
         }
         PreparedReadArtifact::Internal(internal) => {
             execute_prepared_internal_read_artifact_in_transaction(transaction, internal).await
@@ -60,13 +65,10 @@ async fn execute_prepared_read_step_in_transaction(
     let result = match result {
         Ok(result) => result,
         Err(error) => {
-            let backend = TransactionBackendAdapter::new(transaction);
-            return Err(normalize_sql_execution_error_from_source_sql_with_backend(
-                &backend,
+            return Err(normalize_sql_error_with_read_diagnostic_context(
                 error,
-                &prepared.diagnostic_context.source_sql,
-            )
-            .await);
+                &prepared.diagnostic_context,
+            ));
         }
     };
 
@@ -109,21 +111,4 @@ fn public_result_from_contract(
             internal_result.clone()
         }
     }
-}
-
-async fn normalize_sql_execution_error_from_source_sql_with_backend(
-    backend: &dyn crate::LixBackend,
-    error: LixError,
-    source_sql: &[String],
-) -> LixError {
-    let mut statements = Vec::<Statement>::new();
-    for sql in source_sql {
-        match crate::sql::parser::parse_sql_statements(sql) {
-            Ok(mut parsed) => statements.append(&mut parsed),
-            Err(_) => {
-                return error;
-            }
-        }
-    }
-    normalize_sql_execution_error_with_backend(backend, error, &statements).await
 }

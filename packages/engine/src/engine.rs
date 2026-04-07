@@ -1,4 +1,5 @@
 use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
+use crate::contracts::projection::ProjectionRegistry;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::functions::SharedFunctionProvider;
 use crate::runtime::streams::{
@@ -52,6 +53,10 @@ impl Engine {
 
     pub(crate) fn public_surface_registry(&self) -> crate::contracts::surface::SurfaceRegistry {
         self.runtime.public_surface_registry()
+    }
+
+    pub(crate) fn projection_registry(&self) -> &Arc<ProjectionRegistry> {
+        self.runtime.projection_registry()
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
@@ -213,6 +218,8 @@ impl Engine {
         args: BootArgs,
         boot_deterministic_settings: Option<DeterministicSettings>,
     ) -> Self {
+        let projection_registry =
+            Arc::new(crate::projections::builtin_projection_registry().clone());
         Self {
             runtime: Arc::new(Runtime::new(
                 args.backend,
@@ -220,6 +227,7 @@ impl Engine {
                 args.access_to_internal,
                 boot_deterministic_settings,
                 crate::schema::build_builtin_surface_registry(),
+                projection_registry,
             )),
             boot_key_values: args.key_values,
         }
