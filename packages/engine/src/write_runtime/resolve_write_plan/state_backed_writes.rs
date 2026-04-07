@@ -25,6 +25,7 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
 
 async fn query_entity_selector_rows(
     hydrator: &PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
     let selector = canonical_state_selector(planned_write);
@@ -34,6 +35,7 @@ async fn query_entity_selector_rows(
     }
     let query_result = execute_public_selector_query_strict(
         hydrator.backend(),
+        projection_registry,
         planned_write,
         hydrator
             .pending_state_overlay()
@@ -75,6 +77,7 @@ async fn query_entity_selector_rows(
 
 async fn query_state_selector_rows(
     hydrator: &PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
     let selector = canonical_state_selector(planned_write);
@@ -86,6 +89,7 @@ async fn query_state_selector_rows(
     selector_columns.push("untracked");
     let query_result = execute_public_selector_query_strict(
         hydrator.backend(),
+        projection_registry,
         planned_write,
         hydrator
             .pending_state_overlay()
@@ -240,6 +244,7 @@ fn authoritative_pre_state_row_for_effective_row(
 
 pub(super) async fn resolve_state_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -252,6 +257,7 @@ where
         .map_err(write_resolve_backend_error)?;
     resolve_state_backed_write(
         hydrator,
+        projection_registry,
         planned_write,
         StateBackedSurface::State(state_schema.as_ref()),
         functions,
@@ -261,6 +267,7 @@ where
 
 pub(super) async fn resolve_entity_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -274,6 +281,7 @@ where
     reject_unsupported_entity_overrides(planned_write, &entity_schema)?;
     resolve_state_backed_write(
         hydrator,
+        projection_registry,
         planned_write,
         StateBackedSurface::Entity(&entity_schema),
         functions,
@@ -453,12 +461,21 @@ impl StateBackedSurface<'_> {
     async fn resolve_target_rows(
         self,
         hydrator: &PublicWriteHydrator<'_>,
+        projection_registry: &ProjectionRegistry,
         planned_write: &PlannedWrite,
     ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
         match self {
-            Self::State(_) => resolve_target_state_rows(hydrator, planned_write).await,
+            Self::State(_) => {
+                resolve_target_state_rows(hydrator, projection_registry, planned_write).await
+            }
             Self::Entity(entity_schema) => {
-                resolve_target_entity_rows(hydrator, planned_write, entity_schema).await
+                resolve_target_entity_rows(
+                    hydrator,
+                    projection_registry,
+                    planned_write,
+                    entity_schema,
+                )
+                .await
             }
         }
     }
@@ -466,6 +483,7 @@ impl StateBackedSurface<'_> {
 
 async fn resolve_state_backed_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     surface: StateBackedSurface<'_>,
     functions: SharedFunctionProvider<P>,
@@ -478,7 +496,13 @@ where
             resolve_state_backed_insert_write(hydrator, planned_write, surface, functions).await
         }
         WriteOperationKind::Update | WriteOperationKind::Delete => {
-            resolve_state_backed_existing_write(hydrator, planned_write, surface).await
+            resolve_state_backed_existing_write(
+                hydrator,
+                projection_registry,
+                planned_write,
+                surface,
+            )
+            .await
         }
     }
 }
@@ -563,6 +587,7 @@ where
 
 async fn resolve_state_backed_existing_write(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     surface: StateBackedSurface<'_>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
@@ -574,7 +599,11 @@ async fn resolve_state_backed_existing_write(
         {
             resolve_exact_state_target_rows(hydrator, planned_write).await?
         }
-        _ => surface.resolve_target_rows(hydrator, planned_write).await?,
+        _ => {
+            surface
+                .resolve_target_rows(hydrator, projection_registry, planned_write)
+                .await?
+        }
     };
     resolve_state_backed_existing_write_from_rows(surface, planned_write, current_rows)
 }
@@ -952,10 +981,12 @@ fn state_insert_row_key(row: &PlannedStateRow) -> CanonicalStateRowKey {
 
 async fn resolve_target_entity_rows(
     hydrator: &PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
-    let selector_rows = query_entity_selector_rows(hydrator, planned_write).await?;
+    let selector_rows =
+        query_entity_selector_rows(hydrator, projection_registry, planned_write).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
@@ -981,10 +1012,12 @@ async fn resolve_target_entity_rows(
 
 async fn resolve_target_state_rows(
     hydrator: &PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
-    let selector_rows = query_state_selector_rows(hydrator, planned_write).await?;
+    let selector_rows =
+        query_state_selector_rows(hydrator, projection_registry, planned_write).await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =

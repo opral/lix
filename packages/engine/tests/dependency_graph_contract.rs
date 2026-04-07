@@ -1223,6 +1223,28 @@ fn target_core_graph(graph: &EngineDependencyGraph) -> BTreeMap<String, BTreeSet
     filtered
 }
 
+fn production_source_files() -> Vec<(String, String)> {
+    let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
+    let top_level_modules = parse_top_level_modules(&lib_source);
+    let mut files = Vec::new();
+
+    for module_name in top_level_modules {
+        for absolute_path in rust_files_for_top_level_module(&module_name) {
+            let relative_path = absolute_path
+                .strip_prefix(src_root())
+                .expect("module source file should be inside src/")
+                .to_string_lossy()
+                .replace('\\', "/");
+            let source =
+                fs::read_to_string(&absolute_path).expect("module source file should be readable");
+            files.push((relative_path, strip_test_code(&source)));
+        }
+    }
+
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 #[test]
 fn analyzer_resolves_explicit_super_dependencies_to_the_top_level_scope() {
     let current_module_path = vec![
@@ -1247,6 +1269,65 @@ fn analyzer_resolves_explicit_super_dependencies_to_the_top_level_scope() {
             &deeper_module_path,
         ),
         Some("write_runtime".to_string()),
+    );
+}
+
+// Why this exists: new projections should extend the `projections/*` owner
+// boundary. If a production `ProjectionTrait` impl appears elsewhere, we have
+// pushed projection definition work back into execution or orchestration code.
+#[test]
+fn projection_trait_impls_are_owned_by_projections() {
+    let impl_paths: Vec<String> = production_source_files()
+        .into_iter()
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            sanitized
+                .contains("impl ProjectionTrait for")
+                .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        !impl_paths.is_empty(),
+        "expected at least one production `impl ProjectionTrait for ...` under src/",
+    );
+
+    let violations: Vec<String> = impl_paths
+        .iter()
+        .filter(|path| !path.starts_with("projections/"))
+        .cloned()
+        .collect();
+
+    assert!(
+        violations.is_empty(),
+        "production `ProjectionTrait` impls must live under `src/projections/*`; found stray impls in:\n{}",
+        violations.join("\n"),
+    );
+}
+
+// Why this exists: the registry seam only works if built-ins are assembled in
+// the registry owner and consumed from startup-owned state. Ad hoc lookups in
+// execution paths would silently reintroduce the fallback we just removed.
+#[test]
+fn builtin_projection_registry_is_only_used_at_registry_owners() {
+    let usage_paths: BTreeSet<String> = production_source_files()
+        .into_iter()
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            sanitized
+                .contains("builtin_projection_registry(")
+                .then_some(relative_path)
+        })
+        .collect();
+
+    let expected_paths: BTreeSet<String> = ["engine.rs", "projections/mod.rs"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    assert_eq!(
+        usage_paths, expected_paths,
+        "production `builtin_projection_registry()` usage must stay in the registry owner plus startup owner",
     );
 }
 
@@ -1353,4 +1434,88 @@ fn target_core_graph_lists_current_cycles() {
         "target core graph still has cycles: {:#?}",
         cyclic_components,
     );
+}
+
+#[test]
+fn phase_c_committed_read_handoff_stays_above_read_runtime() {
+    let read_runtime_prepare = src_root().join("read_runtime/prepare.rs");
+    assert!(
+        !read_runtime_prepare.exists(),
+        "Phase C regression: read_runtime-owned preparation file returned at {}",
+        read_runtime_prepare.display()
+    );
+
+    let session_source = fs::read_to_string(src_root().join("session/mod.rs"))
+        .expect("session/mod.rs should be readable");
+    assert!(
+        session_source.contains("prepare_committed_read_program_with_backend("),
+        "Phase C regression: session no longer owns committed-read preparation"
+    );
+    assert!(
+        session_source.contains("begin_read_unit(prepared_committed_read.transaction_mode)"),
+        "Phase C regression: session should begin the committed read transaction after preparation"
+    );
+    assert!(
+        session_source.contains("execute_prepared_read_program_in_committed_read_transaction("),
+        "Phase C regression: session should invoke read_runtime with a prepared read program"
+    );
+    assert!(
+        !session_source.contains("TransactionBackendAdapter"),
+        "Phase C regression: session should not construct backend adapters for committed-read preparation"
+    );
+
+    let read_runtime_source = fs::read_to_string(src_root().join("read_runtime/mod.rs"))
+        .expect("read_runtime/mod.rs should be readable");
+    assert!(
+        !read_runtime_source.contains("parse_sql_statements("),
+        "Phase C regression: read_runtime should not parse SQL during execution"
+    );
+    assert!(
+        !read_runtime_source.contains("compile_committed_read_program"),
+        "Phase C regression: read_runtime should not own committed-read compilation"
+    );
+    assert!(
+        !read_runtime_source.contains("TransactionBackendAdapter"),
+        "Phase C regression: read_runtime should normalize prepared-read errors from neutral diagnostic contracts, not backend adapters"
+    );
+}
+
+#[test]
+fn phase_c_read_preparation_stops_reaching_runtime_and_version_owners() {
+    let graph = analyze_engine_dependency_graph();
+
+    if let Some(sql_runtime_edge) = graph
+        .edges
+        .iter()
+        .find(|edge| edge.from == "sql" && edge.to == "runtime")
+    {
+        assert!(
+            !sql_runtime_edge
+                .via_files
+                .contains(&"sql/prepare/prepared_read.rs".to_string()),
+            "Phase C regression: sql -> runtime still flows through sql/prepare/prepared_read.rs: {:?}",
+            sql_runtime_edge.via_files,
+        );
+    }
+
+    if let Some(sql_version_edge) = graph
+        .edges
+        .iter()
+        .find(|edge| edge.from == "sql" && edge.to == "version")
+    {
+        assert!(
+            !sql_version_edge
+                .via_files
+                .contains(&"sql/prepare/prepared_read.rs".to_string()),
+            "Phase C regression: sql -> version still flows through sql/prepare/prepared_read.rs: {:?}",
+            sql_version_edge.via_files,
+        );
+        assert!(
+            !sql_version_edge
+                .via_files
+                .contains(&"sql/prepare/compiler_metadata.rs".to_string()),
+            "Phase C regression: sql -> version still flows through sql/prepare/compiler_metadata.rs: {:?}",
+            sql_version_edge.via_files,
+        );
+    }
 }

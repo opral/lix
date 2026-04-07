@@ -8,7 +8,7 @@ use crate::{
     FileId, VersionId,
 };
 
-use super::receipt::UpdatedVersionRef;
+use super::UpdatedVersionRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProposedDomainChange {

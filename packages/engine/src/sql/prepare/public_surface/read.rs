@@ -3120,12 +3120,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
         compiler_metadata
             .current_version_heads
             .as_ref()
-            .ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "compiler metadata is missing current version heads for lix_version",
-                )
-            })?
+            .unwrap_or(&empty_current_version_heads)
     } else {
         &empty_current_version_heads
     };

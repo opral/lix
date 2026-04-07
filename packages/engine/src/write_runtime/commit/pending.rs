@@ -24,12 +24,11 @@ use super::create::{
     CreateCommitPreconditions, CreateCommitWriteLane,
 };
 use super::generate::generate_commit;
-use super::receipt::{
-    latest_replay_cursor_from_change_rows, CanonicalCommitReceipt, UpdatedVersionRef,
-};
+use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{
     DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
 };
+use super::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingPublicCommitSession {

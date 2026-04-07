@@ -18,7 +18,6 @@ use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
-use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
 pub fn overlay_lanes(include_global: bool, include_untracked: bool) -> Vec<OverlayLane> {
@@ -41,7 +40,7 @@ pub fn overlay_lanes_for_version(
     include_untracked: bool,
 ) -> Vec<OverlayLane> {
     overlay_lanes(
-        include_global && version_id != GLOBAL_VERSION_ID,
+        include_global && version_id != crate::schema::builtin::GLOBAL_VERSION_ID,
         include_untracked,
     )
 }
@@ -389,7 +388,7 @@ fn tombstone_placeholder_row(
 
 fn storage_version_id(requested_version_id: &str, lane: OverlayLane) -> String {
     if lane.is_global() {
-        GLOBAL_VERSION_ID.to_string()
+        crate::schema::builtin::GLOBAL_VERSION_ID.to_string()
     } else {
         requested_version_id.to_string()
     }
@@ -400,7 +399,7 @@ fn projected_version_id(
     lane: OverlayLane,
     source_version_id: &str,
 ) -> String {
-    if lane.is_global() && source_version_id == GLOBAL_VERSION_ID {
+    if lane.is_global() && source_version_id == crate::schema::builtin::GLOBAL_VERSION_ID {
         requested_version_id.to_string()
     } else {
         source_version_id.to_string()

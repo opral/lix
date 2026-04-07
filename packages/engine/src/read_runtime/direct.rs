@@ -1,4 +1,3 @@
-use crate::canonical::read::load_state_history_rows;
 use crate::contracts::artifacts::{
     DirectoryHistoryRow, FileHistoryRow, PreparedDirectDirectoryHistoryField,
     PreparedDirectEntityHistoryField, PreparedDirectFileHistoryField, PreparedDirectPublicRead,
@@ -12,6 +11,7 @@ use crate::contracts::artifacts::{
     PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
     PreparedStateHistorySortValue, StateHistoryRow,
 };
+use crate::contracts::traits::CommittedStateHistoryReader;
 use crate::read_runtime::filesystem::history::{
     load_directory_history_rows, load_file_history_rows,
 };
@@ -43,7 +43,9 @@ async fn execute_direct_state_history_read(
     backend: &dyn LixBackend,
     plan: &PreparedStateHistoryDirectReadPlan,
 ) -> Result<QueryResult, LixError> {
-    let mut rows = load_state_history_rows(backend, &plan.request).await?;
+    let mut rows = backend
+        .load_committed_state_history_rows(&plan.request)
+        .await?;
     rows.retain(|row| state_history_row_matches_predicates(row, &plan.predicates));
 
     if state_history_plan_uses_grouping(plan) {
@@ -81,7 +83,9 @@ async fn execute_direct_entity_history_read(
     backend: &dyn LixBackend,
     plan: &PreparedEntityHistoryDirectReadPlan,
 ) -> Result<QueryResult, LixError> {
-    let rows = load_state_history_rows(backend, &plan.request).await?;
+    let rows = backend
+        .load_committed_state_history_rows(&plan.request)
+        .await?;
     let mut rows = rows
         .into_iter()
         .map(EntityHistoryRowView::try_from_state_row)

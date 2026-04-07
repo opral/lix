@@ -49,6 +49,7 @@ fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> Wr
 
 pub(super) async fn resolve_filesystem_write(
     hydrator: &mut PublicWriteHydrator<'_>,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
@@ -59,6 +60,7 @@ pub(super) async fn resolve_filesystem_write(
             WriteOperationKind::Update | WriteOperationKind::Delete => {
                 resolve_existing_file_write(
                     hydrator.backend(),
+                    projection_registry,
                     planned_write,
                     hydrator
                         .pending_state_overlay()
@@ -75,6 +77,7 @@ pub(super) async fn resolve_filesystem_write(
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
                     resolve_existing_directory_write(
                         hydrator.backend(),
+                        projection_registry,
                         planned_write,
                         hydrator
                             .pending_state_overlay()
@@ -261,6 +264,7 @@ async fn resolve_directory_insert_write_plan(
 
 async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
@@ -268,6 +272,7 @@ async fn resolve_existing_directory_write(
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let current_rows = load_target_directory_rows_for_selector(
         backend,
+        projection_registry,
         planned_write,
         pending_transaction_view,
         &version_id,
@@ -615,6 +620,7 @@ async fn resolve_file_insert_write_plan(
 
 async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
@@ -625,6 +631,7 @@ async fn resolve_existing_file_write(
             let assignments = file_update_assignments(planned_write)?;
             let current_rows = load_target_file_rows_for_selector(
                 backend,
+                projection_registry,
                 planned_write,
                 pending_transaction_view,
                 &version_id,
@@ -771,6 +778,7 @@ async fn resolve_existing_file_write(
         WriteOperationKind::Delete => {
             let current_rows = load_target_file_rows_for_selector(
                 backend,
+                projection_registry,
                 planned_write,
                 pending_transaction_view,
                 &version_id,
@@ -1440,6 +1448,7 @@ fn resolve_proposed_directory_path(
 
 async fn load_target_directory_rows_for_selector(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
@@ -1459,6 +1468,7 @@ async fn load_target_directory_rows_for_selector(
     }
     let directory_ids = query_text_selector_values_for_write_selector(
         backend,
+        projection_registry,
         planned_write,
         pending_transaction_view,
         "id",
@@ -1478,6 +1488,7 @@ async fn load_target_directory_rows_for_selector(
 
 async fn load_target_file_rows_for_selector(
     backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
@@ -1527,6 +1538,7 @@ async fn load_target_file_rows_for_selector(
     }
     let file_ids = query_text_selector_values_for_write_selector(
         backend,
+        projection_registry,
         planned_write,
         pending_transaction_view,
         "id",

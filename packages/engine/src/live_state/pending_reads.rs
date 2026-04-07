@@ -384,7 +384,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_i
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.execution_mode() {
         PublicReadExecutionMode::PendingView => {
-            let backend = crate::runtime::TransactionBackendAdapter::new(transaction);
+            let backend = crate::backend::TransactionBackendAdapter::new(transaction);
             TransactionReadModel::new(&backend, pending_transaction_view)
                 .execute_prepared_public_read(public_read)
                 .await

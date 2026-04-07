@@ -1,5 +1,4 @@
 use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::traits::CompiledSchemaCache;
 use crate::runtime::cel::CelEvaluator;
 use crate::runtime::deterministic_mode::RuntimeFunctionProvider;
 use crate::runtime::functions::SharedFunctionProvider;
@@ -39,12 +38,35 @@ pub(crate) struct PreparationPolicy {
     pub(crate) skip_side_effect_collection: bool,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SqlPreparationSeed<'a> {
+    pub(crate) dialect: SqlDialect,
+    pub(crate) cel_evaluator: &'a CelEvaluator,
+    pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) surface_registry: &'a SurfaceRegistry,
+}
+
+impl<'a> SqlPreparationSeed<'a> {
+    pub(crate) fn with_compiler_metadata(
+        self,
+        compiler_metadata: &'a SqlCompilerMetadata,
+        active_history_root_commit_id: Option<&'a str>,
+    ) -> DefaultSqlPreparationContext<'a> {
+        DefaultSqlPreparationContext {
+            dialect: self.dialect,
+            cel_evaluator: self.cel_evaluator,
+            functions: self.functions,
+            surface_registry: self.surface_registry,
+            compiler_metadata,
+            active_history_root_commit_id,
+        }
+    }
+}
+
 pub(crate) trait SqlPreparationContext {
     fn dialect(&self) -> SqlDialect;
 
     fn cel_evaluator(&self) -> &CelEvaluator;
-
-    fn schema_cache(&self) -> &dyn CompiledSchemaCache;
 
     fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider>;
 
@@ -60,7 +82,6 @@ pub(crate) trait SqlPreparationContext {
 pub(crate) struct DefaultSqlPreparationContext<'a> {
     pub(crate) dialect: SqlDialect,
     pub(crate) cel_evaluator: &'a CelEvaluator,
-    pub(crate) schema_cache: &'a dyn CompiledSchemaCache,
     pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
     pub(crate) surface_registry: &'a SurfaceRegistry,
     pub(crate) compiler_metadata: &'a SqlCompilerMetadata,
@@ -74,10 +95,6 @@ impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
 
     fn cel_evaluator(&self) -> &CelEvaluator {
         self.cel_evaluator
-    }
-
-    fn schema_cache(&self) -> &dyn CompiledSchemaCache {
-        self.schema_cache
     }
 
     fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider> {

@@ -6,6 +6,7 @@ use crate::contracts::artifacts::{
     OptionalTextPatch, PlanEffects, PlannedRowIdentity, PlannedStateRow, ResultContract,
     RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
+use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
@@ -85,6 +86,7 @@ fn build_tracked_txn_unit(
 
 pub(crate) async fn materialize_prepared_public_write<P>(
     backend: &dyn crate::LixBackend,
+    projection_registry: &ProjectionRegistry,
     pending_transaction_view: Option<&PendingTransactionView>,
     public_write: &PreparedPublicWrite,
     functions: SharedFunctionProvider<P>,
@@ -96,6 +98,7 @@ where
     let mut public_write = public_write.clone();
     let resolved_write_plan = resolve_write_plan_with_functions(
         backend,
+        projection_registry,
         &public_write.planned_write,
         pending_transaction_view.map(|view| view as &dyn PendingView),
         functions,

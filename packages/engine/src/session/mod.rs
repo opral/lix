@@ -20,18 +20,15 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
-use crate::backend::ImageChunkWriter;
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
 use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
-use crate::read_runtime::{
-    compile_committed_read_program_with_context,
-    execute_prepared_read_program_in_committed_read_transaction,
-};
+use crate::image::ImageChunkWriter;
+use crate::read_runtime::execute_prepared_read_program_in_committed_read_transaction;
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::{Runtime, TransactionBackendAdapter};
+use crate::runtime::Runtime;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
@@ -44,14 +41,16 @@ use crate::sql::internal::script::extract_explicit_transaction_script_from_state
 use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
 use crate::sql::prepare::execution_program::ExecutionProgram;
-use crate::sql::prepare::{DefaultSqlPreparationContext, SqlCompilerMetadata};
-use crate::version::context::load_target_version_history_root_commit_id_with_backend;
+use crate::sql::prepare::{
+    prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
+    CommittedReadProgramContext, SqlPreparationSeed,
+};
 use crate::write_runtime::sql_adapter::{
     execute_execution_program_with_write_transaction,
     execute_parsed_statements_in_write_transaction,
 };
 use crate::write_runtime::{TransactionCommitOutcome, WriteTransaction};
-use crate::{ExecuteResult, LixBackend, LixError, Value};
+use crate::{ExecuteResult, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct OpenSessionOptions {
@@ -355,14 +354,6 @@ impl Session {
         Ok(())
     }
 
-    pub(crate) async fn load_sql_compiler_metadata(
-        &self,
-        backend: &dyn LixBackend,
-        registry: &SurfaceRegistry,
-    ) -> Result<SqlCompilerMetadata, LixError> {
-        crate::sql::prepare::load_sql_compiler_metadata(backend, registry).await
-    }
-
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         self.execute_with_options(sql, params, ExecuteOptions::default())
             .await
@@ -419,35 +410,17 @@ impl Session {
 
         let result = match execution_mode {
             SessionExecutionMode::CommittedRead => {
-                let active_history_root_commit_id =
-                    load_target_version_history_root_commit_id_with_backend(
-                        self.runtime.backend().as_ref(),
-                        Some(context.active_version_id.as_str()),
-                        "active_version_id",
-                    )
-                    .await?;
-                let compiler_metadata = self
-                    .load_sql_compiler_metadata(
-                        self.runtime.backend().as_ref(),
-                        &context.public_surface_registry,
-                    )
-                    .await?;
-                let preparation_context = DefaultSqlPreparationContext {
-                    dialect: self.runtime.backend().dialect(),
-                    cel_evaluator: self.runtime.cel_evaluator(),
-                    schema_cache: self.runtime.schema_cache(),
-                    functions: runtime_state.provider(),
-                    surface_registry: &context.public_surface_registry,
-                    compiler_metadata: &compiler_metadata,
-                    active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-                };
-                let prepared_committed_read = compile_committed_read_program_with_context(
+                let committed_read_context = committed_read_program_context(
+                    &context,
+                    self.runtime.as_ref(),
+                    &runtime_state,
+                    execution_mode,
+                );
+                let prepared_committed_read = prepare_committed_read_program_with_backend(
                     self.runtime.backend().as_ref(),
-                    &preparation_context,
                     &program,
                     allow_internal_sql,
-                    &context,
-                    execution_mode,
+                    &committed_read_context,
                 )
                 .await?;
                 let mut transaction = self
@@ -456,6 +429,7 @@ impl Session {
                     .await?;
                 let result = execute_prepared_read_program_in_committed_read_transaction(
                     transaction.as_mut(),
+                    self.runtime.projection_registry().as_ref(),
                     &prepared_committed_read,
                 )
                 .await;
@@ -478,35 +452,17 @@ impl Session {
                 );
 
                 if !runtime_state.settings().enabled {
-                    let active_history_root_commit_id =
-                        load_target_version_history_root_commit_id_with_backend(
-                            self.runtime.backend().as_ref(),
-                            Some(context.active_version_id.as_str()),
-                            "active_version_id",
-                        )
-                        .await?;
-                    let compiler_metadata = self
-                        .load_sql_compiler_metadata(
-                            self.runtime.backend().as_ref(),
-                            &context.public_surface_registry,
-                        )
-                        .await?;
-                    let preparation_context = DefaultSqlPreparationContext {
-                        dialect: self.runtime.backend().dialect(),
-                        cel_evaluator: self.runtime.cel_evaluator(),
-                        schema_cache: self.runtime.schema_cache(),
-                        functions: runtime_state.provider(),
-                        surface_registry: &context.public_surface_registry,
-                        compiler_metadata: &compiler_metadata,
-                        active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-                    };
-                    let prepared_committed_read = compile_committed_read_program_with_context(
+                    let committed_read_context = committed_read_program_context(
+                        &context,
+                        self.runtime.as_ref(),
+                        runtime_state,
+                        execution_mode,
+                    );
+                    let prepared_committed_read = prepare_committed_read_program_with_backend(
                         self.runtime.backend().as_ref(),
-                        &preparation_context,
                         &program,
                         allow_internal_sql,
-                        &context,
-                        execution_mode,
+                        &committed_read_context,
                     )
                     .await?;
                     let mut transaction = self
@@ -515,6 +471,7 @@ impl Session {
                         .await?;
                     let result = execute_prepared_read_program_in_committed_read_transaction(
                         transaction.as_mut(),
+                        self.runtime.projection_registry().as_ref(),
                         &prepared_committed_read,
                     )
                     .await;
@@ -540,39 +497,24 @@ impl Session {
                         runtime_state.provider(),
                     )
                     .await?;
+                    let committed_read_context = committed_read_program_context(
+                        &context,
+                        self.runtime.as_ref(),
+                        runtime_state,
+                        execution_mode,
+                    );
                     let prepared_committed_read = {
-                        let backend = TransactionBackendAdapter::new(transaction.as_mut());
-                        let active_history_root_commit_id =
-                            load_target_version_history_root_commit_id_with_backend(
-                                &backend,
-                                Some(context.active_version_id.as_str()),
-                                "active_version_id",
-                            )
-                            .await?;
-                        let compiler_metadata = self
-                            .load_sql_compiler_metadata(&backend, &context.public_surface_registry)
-                            .await?;
-                        let preparation_context = DefaultSqlPreparationContext {
-                            dialect: backend.dialect(),
-                            cel_evaluator: self.runtime.cel_evaluator(),
-                            schema_cache: self.runtime.schema_cache(),
-                            functions: runtime_state.provider(),
-                            surface_registry: &context.public_surface_registry,
-                            compiler_metadata: &compiler_metadata,
-                            active_history_root_commit_id: active_history_root_commit_id.as_deref(),
-                        };
-                        compile_committed_read_program_with_context(
-                            &backend,
-                            &preparation_context,
+                        prepare_committed_read_program_in_transaction(
+                            transaction.as_mut(),
                             &program,
                             allow_internal_sql,
-                            &context,
-                            execution_mode,
+                            &committed_read_context,
                         )
                         .await?
                     };
                     let result = execute_prepared_read_program_in_committed_read_transaction(
                         transaction.as_mut(),
+                        self.runtime.projection_registry().as_ref(),
                         &prepared_committed_read,
                     )
                     .await;
@@ -811,6 +753,46 @@ pub(crate) async fn refresh_public_surface_registry_in_runtime(
     let registry = load_public_surface_registry_for_runtime(runtime).await?;
     install_public_surface_registry_in_runtime(runtime, registry.clone());
     Ok(registry)
+}
+
+fn baseline_committed_read_transaction_mode(
+    execution_mode: SessionExecutionMode,
+    runtime_state: &ExecutionRuntimeState,
+) -> crate::TransactionMode {
+    match execution_mode {
+        SessionExecutionMode::CommittedRead => crate::TransactionMode::Read,
+        SessionExecutionMode::CommittedRuntimeMutation => {
+            if runtime_state.settings().enabled {
+                crate::TransactionMode::Write
+            } else {
+                crate::TransactionMode::Read
+            }
+        }
+        SessionExecutionMode::WriteTransaction => crate::TransactionMode::Write,
+    }
+}
+
+fn committed_read_program_context<'a>(
+    context: &'a ExecutionContext,
+    runtime: &'a Runtime,
+    runtime_state: &'a ExecutionRuntimeState,
+    execution_mode: SessionExecutionMode,
+) -> CommittedReadProgramContext<'a> {
+    CommittedReadProgramContext {
+        active_version_id: context.active_version_id.as_str(),
+        active_account_ids: &context.active_account_ids,
+        writer_key: context.options.writer_key.as_deref(),
+        preparation_seed: SqlPreparationSeed {
+            dialect: runtime.backend().dialect(),
+            cel_evaluator: runtime.cel_evaluator(),
+            functions: runtime_state.provider(),
+            surface_registry: &context.public_surface_registry,
+        },
+        base_transaction_mode: baseline_committed_read_transaction_mode(
+            execution_mode,
+            runtime_state,
+        ),
+    }
 }
 
 fn classify_session_execution_mode(

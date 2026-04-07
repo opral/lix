@@ -13,6 +13,7 @@ pub(crate) mod preflight;
 pub(crate) mod receipt;
 pub(crate) mod types;
 
+pub(crate) use crate::contracts::artifacts::{CanonicalCommitReceipt, UpdatedVersionRef};
 pub(crate) use append::{
     append_tracked, append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
     CreateCommitAppliedOutput, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
@@ -21,5 +22,4 @@ pub(crate) use append::{
 };
 pub(crate) use init::init;
 pub(crate) use pending::PendingPublicCommitSession;
-pub(crate) use receipt::{CanonicalCommitReceipt, UpdatedVersionRef};
 pub(crate) use types::ProposedDomainChange;

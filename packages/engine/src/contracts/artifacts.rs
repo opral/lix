@@ -87,6 +87,26 @@ impl CommittedVersionFrontier {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UpdatedVersionRef {
+    pub version_id: crate::VersionId,
+    pub commit_id: String,
+    pub created_at: String,
+}
+
+/// Durable output of a canonical commit.
+///
+/// `commit_id`, `updated_version_refs`, and `affected_versions` describe the
+/// semantic outcome. `replay_cursor` is included so local derived projections
+/// can catch up without becoming canonical truth.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CanonicalCommitReceipt {
+    pub commit_id: String,
+    pub replay_cursor: ReplayCursor,
+    pub updated_version_refs: Vec<UpdatedVersionRef>,
+    pub affected_versions: Vec<String>,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum StateCommitStreamOperation {
     Insert,
@@ -194,12 +214,25 @@ pub(crate) enum ProjectionStorageKind {
     Untracked,
 }
 
+/// Version-scope contract for one projection input.
+///
+/// This keeps projection definitions declarative while allowing hydration to
+/// choose the right committed-state slice for global or local-lane inputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum ProjectionInputVersionScope {
+    SchemaDefault,
+    Global,
+    CurrentCommittedFrontier,
+}
+
 /// Declarative description of one schema-backed projection input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) struct ProjectionInputSpec {
     pub(crate) schema_key: String,
     pub(crate) storage: ProjectionStorageKind,
+    pub(crate) version_scope: ProjectionInputVersionScope,
 }
 
 #[allow(dead_code)]
@@ -208,6 +241,7 @@ impl ProjectionInputSpec {
         Self {
             schema_key: schema_key.into(),
             storage: ProjectionStorageKind::Tracked,
+            version_scope: ProjectionInputVersionScope::SchemaDefault,
         }
     }
 
@@ -215,7 +249,13 @@ impl ProjectionInputSpec {
         Self {
             schema_key: schema_key.into(),
             storage: ProjectionStorageKind::Untracked,
+            version_scope: ProjectionInputVersionScope::SchemaDefault,
         }
+    }
+
+    pub(crate) fn with_version_scope(mut self, version_scope: ProjectionInputVersionScope) -> Self {
+        self.version_scope = version_scope;
+        self
     }
 }
 
@@ -924,6 +964,14 @@ pub(crate) enum PreparedExplainTemplate {
     Json { base_json: JsonValue },
 }
 
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub(crate) struct ReadDiagnosticCatalogSnapshot {
+    pub(crate) public_surfaces: Vec<String>,
+    pub(crate) available_tables: Vec<String>,
+    pub(crate) available_columns_by_relation: BTreeMap<String, Vec<String>>,
+}
+
 /// Diagnostic context handed to read runtime alongside a prepared read step.
 ///
 /// The context is intentionally text-shaped so runtime can report/normalize
@@ -933,6 +981,8 @@ pub(crate) enum PreparedExplainTemplate {
 #[allow(dead_code)]
 pub(crate) struct ReadDiagnosticContext {
     pub(crate) source_sql: Vec<String>,
+    pub(crate) relation_names: Vec<String>,
+    pub(crate) catalog_snapshot: ReadDiagnosticCatalogSnapshot,
     pub(crate) explain_mode: Option<PreparedExplainMode>,
     pub(crate) plain_explain_template: Option<PreparedExplainTemplate>,
     pub(crate) analyzed_explain_template: Option<PreparedExplainTemplate>,
@@ -2112,10 +2162,11 @@ mod tests {
         PreparedPublicReadArtifact, PreparedPublicReadContract,
         PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
         PreparedReadStep, PreparedStatement, ProjectionHydratedRow, ProjectionInput,
-        ProjectionInputRows, ProjectionInputSpec, ProjectionLifecycle, ProjectionRegistration,
-        ProjectionStorageKind, ProjectionSurfaceSpec, ReadDiagnosticContext,
-        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
-        ResultContract, RowIdentity, TrackedRow, UntrackedRow,
+        ProjectionInputRows, ProjectionInputSpec, ProjectionInputVersionScope, ProjectionLifecycle,
+        ProjectionRegistration, ProjectionStorageKind, ProjectionSurfaceSpec,
+        ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext, ReadTimeProjectionRead,
+        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, ResultContract, RowIdentity,
+        TrackedRow, UntrackedRow,
     };
     use crate::contracts::surface::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
     use crate::Value;
@@ -2153,8 +2204,29 @@ mod tests {
 
         assert_eq!(tracked.storage, ProjectionStorageKind::Tracked);
         assert_eq!(tracked.schema_key, "lix_version_descriptor");
+        assert_eq!(
+            tracked.version_scope,
+            ProjectionInputVersionScope::SchemaDefault
+        );
         assert_eq!(untracked.storage, ProjectionStorageKind::Untracked);
         assert_eq!(untracked.schema_key, "lix_version_ref");
+        assert_eq!(
+            untracked.version_scope,
+            ProjectionInputVersionScope::SchemaDefault
+        );
+    }
+
+    #[test]
+    fn projection_input_spec_can_override_version_scope() {
+        let scoped = ProjectionInputSpec::tracked("demo_schema")
+            .with_version_scope(ProjectionInputVersionScope::CurrentCommittedFrontier);
+
+        assert_eq!(scoped.storage, ProjectionStorageKind::Tracked);
+        assert_eq!(scoped.schema_key, "demo_schema");
+        assert_eq!(
+            scoped.version_scope,
+            ProjectionInputVersionScope::CurrentCommittedFrontier
+        );
     }
 
     #[test]
@@ -2357,12 +2429,26 @@ mod tests {
     fn read_diagnostic_context_uses_text_and_explain_mode_not_statement_ast() {
         let context = ReadDiagnosticContext {
             source_sql: vec!["SELECT * FROM lix_version".into()],
+            relation_names: vec!["lix_version".into()],
+            catalog_snapshot: ReadDiagnosticCatalogSnapshot {
+                public_surfaces: vec!["lix_version".into()],
+                available_tables: vec!["lix_version".into()],
+                available_columns_by_relation: BTreeMap::from([(
+                    "lix_version".into(),
+                    vec!["id".into(), "name".into()],
+                )]),
+            },
             explain_mode: Some(PreparedExplainMode::Analyze),
             plain_explain_template: None,
             analyzed_explain_template: None,
         };
 
         assert_eq!(context.source_sql, vec!["SELECT * FROM lix_version"]);
+        assert_eq!(context.relation_names, vec!["lix_version"]);
+        assert_eq!(
+            context.catalog_snapshot.public_surfaces,
+            vec!["lix_version"]
+        );
         assert_eq!(context.explain_mode, Some(PreparedExplainMode::Analyze));
     }
 
@@ -2396,6 +2482,12 @@ mod tests {
             }),
             diagnostic_context: ReadDiagnosticContext {
                 source_sql: vec!["SELECT * FROM lix_file_history".into()],
+                relation_names: vec!["lix_file_history".into()],
+                catalog_snapshot: ReadDiagnosticCatalogSnapshot {
+                    public_surfaces: vec!["lix_file_history".into()],
+                    available_tables: vec!["lix_file_history".into()],
+                    available_columns_by_relation: BTreeMap::new(),
+                },
                 explain_mode: Some(PreparedExplainMode::Plain),
                 plain_explain_template: None,
                 analyzed_explain_template: None,
@@ -2414,6 +2506,8 @@ mod tests {
             }),
             diagnostic_context: ReadDiagnosticContext {
                 source_sql: vec!["SELECT 1".into()],
+                relation_names: Vec::new(),
+                catalog_snapshot: ReadDiagnosticCatalogSnapshot::default(),
                 explain_mode: None,
                 plain_explain_template: None,
                 analyzed_explain_template: None,

@@ -1,15 +1,13 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::version::GLOBAL_VERSION_ID;
-
-use super::{builtin_schema_definition, decode_lixcol_literal};
+use super::{builtin_schema_definition, decode_lixcol_literal, GLOBAL_VERSION_ID};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BuiltinSchemaStorageLane {
     Global,
-    Versioned,
+    Local,
 }
 
 #[allow(dead_code)]
@@ -43,7 +41,7 @@ pub(crate) fn builtin_schema_storage_metadata(
 
     let storage_lane = match overrides.get("lixcol_global").and_then(JsonValue::as_str) {
         Some("true") if GLOBAL_VERSION_ID == "global" => BuiltinSchemaStorageLane::Global,
-        _ => BuiltinSchemaStorageLane::Versioned,
+        _ => BuiltinSchemaStorageLane::Local,
     };
 
     Some(BuiltinSchemaStorageMetadata {

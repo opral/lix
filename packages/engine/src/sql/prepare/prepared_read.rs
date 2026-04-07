@@ -13,11 +13,12 @@ use crate::contracts::artifacts::{
     PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
     PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
     PreparedStateHistorySortValue, PreparedStatement, PublicReadResultColumn,
-    PublicReadResultColumns, ReadDiagnosticContext, SessionExecutionMode,
+    PublicReadResultColumns, ReadDiagnosticContext,
 };
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::normalize_sql_execution_error_with_backend;
-use crate::session::execution_context::ExecutionContext;
+use crate::contracts::traits::SqlPreparationMetadataReader;
+use crate::errors::classification::{
+    build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
+};
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
@@ -33,36 +34,99 @@ use crate::sql::logical_plan::direct_reads::{
 use crate::sql::physical_plan::{
     LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
 };
-use crate::sql::prepare::execution_program::{BoundStatementTemplateInstance, ExecutionProgram};
-use crate::sql::prepare::{
-    compile_execution_from_template_instance_with_context, CompiledExecution,
-    DefaultSqlPreparationContext, PreparationPolicy, PreparedPublicRead, SqlPreparationContext,
-};
-use crate::{LixBackend, LixError, TransactionMode, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
+use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
+use std::ops::ControlFlow;
 
-pub(crate) async fn compile_committed_read_program_with_context(
-    error_backend: &dyn LixBackend,
+use super::execution_program::{BoundStatementTemplateInstance, ExecutionProgram};
+use super::{
+    compile_execution_from_template_instance_with_context, load_sql_compiler_metadata_with_reader,
+    CompiledExecution, PreparationPolicy, PreparedPublicRead, SqlPreparationContext,
+    SqlPreparationSeed,
+};
+
+pub(crate) struct CommittedReadProgramContext<'a> {
+    pub(crate) active_version_id: &'a str,
+    pub(crate) active_account_ids: &'a [String],
+    pub(crate) writer_key: Option<&'a str>,
+    pub(crate) preparation_seed: SqlPreparationSeed<'a>,
+    pub(crate) base_transaction_mode: TransactionMode,
+}
+
+pub(crate) async fn prepare_committed_read_program_with_backend(
+    backend: &dyn LixBackend,
+    program: &ExecutionProgram,
+    allow_internal_tables: bool,
+    read_context: &CommittedReadProgramContext<'_>,
+) -> Result<PreparedReadProgram, LixError> {
+    let mut metadata_reader = backend;
+    prepare_committed_read_program_from_reader(
+        &mut metadata_reader,
+        program,
+        allow_internal_tables,
+        read_context,
+    )
+    .await
+}
+
+pub(crate) async fn prepare_committed_read_program_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    program: &ExecutionProgram,
+    allow_internal_tables: bool,
+    read_context: &CommittedReadProgramContext<'_>,
+) -> Result<PreparedReadProgram, LixError> {
+    let mut metadata_reader = transaction;
+    prepare_committed_read_program_from_reader(
+        &mut metadata_reader,
+        program,
+        allow_internal_tables,
+        read_context,
+    )
+    .await
+}
+
+async fn prepare_committed_read_program_from_reader(
+    metadata_reader: &mut dyn SqlPreparationMetadataReader,
+    program: &ExecutionProgram,
+    allow_internal_tables: bool,
+    read_context: &CommittedReadProgramContext<'_>,
+) -> Result<PreparedReadProgram, LixError> {
+    let active_history_root_commit_id = metadata_reader
+        .load_active_history_root_commit_id_for_preparation(read_context.active_version_id)
+        .await?;
+    let compiler_metadata = load_sql_compiler_metadata_with_reader(
+        metadata_reader,
+        read_context.preparation_seed.surface_registry,
+    )
+    .await?;
+    let preparation_context = read_context
+        .preparation_seed
+        .with_compiler_metadata(&compiler_metadata, active_history_root_commit_id.as_deref());
+
+    compile_committed_read_program(
+        &preparation_context,
+        program,
+        allow_internal_tables,
+        read_context,
+    )
+    .await
+}
+
+pub(crate) async fn compile_committed_read_program(
     preparation_context: &dyn SqlPreparationContext,
     program: &ExecutionProgram,
     allow_internal_tables: bool,
-    context: &ExecutionContext,
-    execution_mode: SessionExecutionMode,
+    read_context: &CommittedReadProgramContext<'_>,
 ) -> Result<PreparedReadProgram, LixError> {
-    let runtime_state = context.execution_runtime_state().expect(
-        "committed execution should install an execution runtime state before step preparation",
-    );
-    let mut mode =
-        baseline_transaction_mode_for_committed_read_program(execution_mode, runtime_state);
+    let mut mode = read_context.base_transaction_mode;
     let mut steps = Vec::new();
 
     for step in program.steps() {
-        let prepared_step = compile_committed_read_step_with_context(
-            error_backend,
+        let prepared_step = compile_committed_read_step(
             preparation_context,
             step,
             allow_internal_tables,
-            context,
-            runtime_state,
+            read_context,
         )
         .await?;
         mode = merge_committed_read_transaction_mode(mode, prepared_step.transaction_mode);
@@ -75,51 +139,44 @@ pub(crate) async fn compile_committed_read_program_with_context(
     })
 }
 
-pub(crate) async fn compile_committed_read_step_with_context(
-    error_backend: &dyn LixBackend,
+async fn compile_committed_read_step(
     preparation_context: &dyn SqlPreparationContext,
     bound_statement_template: &BoundStatementTemplateInstance,
     allow_internal_tables: bool,
-    context: &ExecutionContext,
-    runtime_state: &ExecutionRuntimeState,
+    read_context: &CommittedReadProgramContext<'_>,
 ) -> Result<PreparedReadStep, LixError> {
     let source_sql = vec![bound_statement_template.statement().to_string()];
-    let compiled = compile_committed_execution_step_with_context(
-        error_backend,
+    let relation_names = collect_statement_relation_names(bound_statement_template.statement());
+    let diagnostic_context =
+        base_read_diagnostic_context(preparation_context, source_sql, relation_names);
+    let compiled = compile_committed_execution_step(
+        &diagnostic_context,
         preparation_context,
         bound_statement_template,
         allow_internal_tables,
-        context,
-        runtime_state,
+        read_context,
     )
     .await?;
-    prepared_read_step_from_compiled_execution(preparation_context.dialect(), compiled, source_sql)
+    prepared_read_step_from_compiled_execution(
+        preparation_context.dialect(),
+        compiled,
+        diagnostic_context,
+    )
 }
 
-async fn compile_committed_execution_step_with_context(
-    error_backend: &dyn LixBackend,
+async fn compile_committed_execution_step(
+    diagnostic_context: &ReadDiagnosticContext,
     preparation_context: &dyn SqlPreparationContext,
     bound_statement_template: &BoundStatementTemplateInstance,
     allow_internal_tables: bool,
-    context: &ExecutionContext,
-    runtime_state: &ExecutionRuntimeState,
+    read_context: &CommittedReadProgramContext<'_>,
 ) -> Result<CompiledExecution, LixError> {
-    let parsed_statements = std::slice::from_ref(bound_statement_template.statement());
-    let step_context = DefaultSqlPreparationContext {
-        dialect: preparation_context.dialect(),
-        cel_evaluator: preparation_context.cel_evaluator(),
-        schema_cache: preparation_context.schema_cache(),
-        functions: runtime_state.provider(),
-        surface_registry: &context.public_surface_registry,
-        compiler_metadata: preparation_context.compiler_metadata(),
-        active_history_root_commit_id: preparation_context.active_history_root_commit_id(),
-    };
     match compile_execution_from_template_instance_with_context(
-        &step_context,
+        preparation_context,
         bound_statement_template,
-        context.active_version_id.as_str(),
-        &context.active_account_ids,
-        context.options.writer_key.as_deref(),
+        read_context.active_version_id,
+        read_context.active_account_ids,
+        read_context.writer_key,
         allow_internal_tables,
         PreparationPolicy {
             skip_side_effect_collection: false,
@@ -128,32 +185,30 @@ async fn compile_committed_execution_step_with_context(
     .await
     {
         Ok(compiled) => Ok(compiled),
-        Err(error) => {
-            Err(
-                normalize_sql_execution_error_with_backend(error_backend, error, parsed_statements)
-                    .await,
-            )
-        }
+        Err(error) => Err(normalize_sql_error_with_read_diagnostic_context(
+            error,
+            diagnostic_context,
+        )),
     }
 }
 
 fn prepared_read_step_from_compiled_execution(
     dialect: crate::SqlDialect,
     compiled: CompiledExecution,
-    source_sql: Vec<String>,
+    mut diagnostic_context: ReadDiagnosticContext,
 ) -> Result<PreparedReadStep, LixError> {
     let transaction_mode = transaction_mode_for_committed_read_execution(&compiled)?;
-    let plain_explain_template = compiled
+    diagnostic_context.plain_explain_template = compiled
         .plain_explain()
         .map(prepare_plain_explain_template)
         .transpose()?
         .flatten();
-    let analyzed_explain_template = compiled
+    diagnostic_context.analyzed_explain_template = compiled
         .analyzed_explain()
         .map(prepare_analyzed_explain_template)
         .transpose()?
         .flatten();
-    let explain_mode = compiled.explain().and_then(|explain| {
+    diagnostic_context.explain_mode = compiled.explain().and_then(|explain| {
         explain.request().map(|request| {
             if request.requires_execution() {
                 PreparedExplainMode::Analyze
@@ -182,20 +237,33 @@ fn prepared_read_step_from_compiled_execution(
     Ok(PreparedReadStep {
         transaction_mode,
         artifact,
-        diagnostic_context: ReadDiagnosticContext {
-            source_sql,
-            explain_mode,
-            plain_explain_template,
-            analyzed_explain_template,
-        },
+        diagnostic_context,
     })
+}
+
+fn base_read_diagnostic_context(
+    preparation_context: &dyn SqlPreparationContext,
+    source_sql: Vec<String>,
+    relation_names: Vec<String>,
+) -> ReadDiagnosticContext {
+    ReadDiagnosticContext {
+        source_sql,
+        relation_names: relation_names.clone(),
+        catalog_snapshot: build_read_diagnostic_catalog_snapshot(
+            preparation_context.surface_registry(),
+            &relation_names,
+        ),
+        explain_mode: None,
+        plain_explain_template: None,
+        analyzed_explain_template: None,
+    }
 }
 
 pub(crate) fn prepare_public_read_artifact(
     public_read: &PreparedPublicRead,
     dialect: crate::SqlDialect,
 ) -> Result<PreparedPublicReadArtifact, LixError> {
-    let mut contract = crate::sql::prepare::prepared_public_read_contract(public_read);
+    let mut contract = super::prepared_public_read_contract(public_read);
     if contract.result_columns.is_none() {
         contract.result_columns = result_columns_for_public_read_execution(&public_read.execution);
     }
@@ -855,23 +923,6 @@ fn prepared_directory_history_aggregate(
     }
 }
 
-fn baseline_transaction_mode_for_committed_read_program(
-    execution_mode: SessionExecutionMode,
-    runtime_state: &ExecutionRuntimeState,
-) -> TransactionMode {
-    match execution_mode {
-        SessionExecutionMode::CommittedRead => TransactionMode::Read,
-        SessionExecutionMode::CommittedRuntimeMutation => {
-            if runtime_state.settings().enabled {
-                TransactionMode::Write
-            } else {
-                TransactionMode::Read
-            }
-        }
-        SessionExecutionMode::WriteTransaction => TransactionMode::Write,
-    }
-}
-
 fn merge_committed_read_transaction_mode(
     current: TransactionMode,
     next: TransactionMode,
@@ -908,4 +959,25 @@ fn transaction_mode_for_committed_read_execution(
         "LIX_ERROR_UNKNOWN",
         "committed read routing compiled a public write unexpectedly",
     ))
+}
+
+fn collect_statement_relation_names(statement: &Statement) -> Vec<String> {
+    let mut result = Vec::<String>::new();
+    let _ = visit_relations(statement, |relation| {
+        if let Some(name) = relation
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .map(|ident| ident.value.clone())
+        {
+            let exists = result
+                .iter()
+                .any(|existing| existing.eq_ignore_ascii_case(&name));
+            if !exists {
+                result.push(name);
+            }
+        }
+        ControlFlow::<()>::Continue(())
+    });
+    result
 }

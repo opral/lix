@@ -19,7 +19,6 @@ use super::{
     load_exact_untracked_row_with_executor, scan_tracked_tombstones_with_executor, ScanConstraint,
     ScanField, ScanOperator,
 };
-use crate::version::GLOBAL_VERSION_ID;
 
 #[derive(Debug, Clone)]
 pub(crate) struct LiveReadShape {
@@ -328,7 +327,7 @@ fn projected_version_id(
     overlay_lane: LiveQueryOverlayLane,
     source_version_id: &str,
 ) -> String {
-    if overlay_lane.is_global() && source_version_id == GLOBAL_VERSION_ID {
+    if overlay_lane.is_global() && source_version_id == crate::schema::builtin::GLOBAL_VERSION_ID {
         requested_version_id.to_string()
     } else {
         source_version_id.to_string()

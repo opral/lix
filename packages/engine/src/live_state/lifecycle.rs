@@ -343,7 +343,7 @@ pub(crate) async fn mark_live_state_ready_with_backend(
     cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
     let frontier =
-        crate::version::load_current_committed_version_frontier_with_backend(backend).await?;
+        crate::live_state::shared::version_heads::load_current_committed_version_frontier_with_backend(backend).await?;
     backend
         .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
         .await?;
@@ -527,7 +527,7 @@ async fn load_live_state_snapshot_with_backend(
         status: load_nullable_live_state_status_with_backend(backend).await?,
         latest_replay_cursor: load_latest_replay_cursor(backend).await?,
         current_committed_frontier:
-            crate::version::load_current_committed_version_frontier_with_backend(backend).await?,
+            crate::live_state::shared::version_heads::load_current_committed_version_frontier_with_backend(backend).await?,
     })
 }
 
@@ -730,7 +730,10 @@ async fn load_current_committed_frontier_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<CommittedVersionFrontier, LixError> {
     let mut executor = transaction;
-    crate::version::load_current_committed_version_frontier_with_executor(&mut executor).await
+    crate::live_state::shared::version_heads::load_current_committed_version_frontier_with_executor(
+        &mut executor,
+    )
+    .await
 }
 
 async fn load_current_applied_frontier_in_transaction(

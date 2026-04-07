@@ -152,14 +152,6 @@ pub async fn apply_live_state_rebuild_plan(
     apply_rebuild_plan(backend, plan).await
 }
 
-pub(crate) async fn materialize_file_data_with_plugins(
-    backend: &dyn LixBackend,
-    runtime: &crate::runtime::Runtime,
-    plan: &LiveStateRebuildPlan,
-) -> Result<(), LixError> {
-    materialize::materialize_file_data_with_plugins(backend, runtime, plan).await
-}
-
 pub async fn rebuild(
     backend: &dyn LixBackend,
     request: &LiveStateRebuildRequest,
@@ -203,7 +195,7 @@ pub(crate) async fn load_latest_live_state_replay_cursor_with_backend(
 
 pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    receipt: &crate::write_runtime::commit::CanonicalCommitReceipt,
+    receipt: &crate::contracts::artifacts::CanonicalCommitReceipt,
     tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(), LixError> {
     projection::apply_commit_projections_best_effort_in_transaction(
@@ -333,7 +325,7 @@ pub(crate) async fn upsert_bootstrap_tracked_row_in_transaction(
         schema_version: schema_version.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
-        global: version_id == crate::version::GLOBAL_VERSION_ID,
+        global: version_id == crate::schema::builtin::GLOBAL_VERSION_ID,
         plugin_key: plugin_key.to_string(),
         metadata: None,
         change_id: change_id.to_string(),
@@ -363,7 +355,7 @@ pub(crate) async fn upsert_bootstrap_untracked_row_in_transaction(
         schema_version: schema_version.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
-        global: version_id == crate::version::GLOBAL_VERSION_ID,
+        global: version_id == crate::schema::builtin::GLOBAL_VERSION_ID,
         plugin_key: plugin_key.to_string(),
         metadata: None,
         writer_key: None,

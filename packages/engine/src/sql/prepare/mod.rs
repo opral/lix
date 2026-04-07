@@ -13,18 +13,25 @@ pub(crate) mod derive_requirements;
 pub(crate) mod execution_program;
 pub(crate) mod filesystem_insert_ids;
 pub(crate) mod intent;
+mod prepared_read;
 pub(crate) mod preprocess;
 mod public_surface;
 
 pub(crate) use compile::{
     compile_execution_from_template_instance_with_context,
     prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
-    PreparationPolicy, SqlPreparationContext,
+    PreparationPolicy, SqlPreparationContext, SqlPreparationSeed,
 };
 pub(crate) use compiled::{
     schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
 };
-pub(crate) use compiler_metadata::{load_sql_compiler_metadata, SqlCompilerMetadata};
+pub(crate) use compiler_metadata::{
+    load_sql_compiler_metadata, load_sql_compiler_metadata_with_reader, SqlCompilerMetadata,
+};
+pub(crate) use prepared_read::{
+    prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
+    prepare_public_read_artifact, CommittedReadProgramContext,
+};
 pub(crate) use public_surface::{
     apply_public_surface_registry_mutations, build_public_write_execution,
     build_public_write_invariant_trace, classify_public_execution_route_with_registry,
