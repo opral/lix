@@ -163,10 +163,8 @@ Solving write speed alone isn't enough — storage also needs to scale across ve
 
 ## What's next in April
 
-**1. Sub 100 ms for 10k entity inserts.** SQLite itself can insert 10,000 rows in under 10 ms. That means the raw database is not the bottleneck — the engine's per-row overhead is. The target is aggressive, but the headroom is there.
+**Get 10k entity inserts under 100 ms.** SQLite can insert 10k rows in under 10 ms. That gives us ~90 ms of headroom to work with.
 
-**2. Prolly trees for cheap branching.** Branching and merging need content-deduplicated storage across versions. Without that, large semantic files get copied over and over again. With prolly trees, unchanged chunks are shared and only changed chunks are new.
+**Prolly trees for cheap branching.** Without content deduplication, every branch copies all entity data. Prolly trees share unchanged chunks across versions, so branching a 10k-entity document is nearly free.
 
-**3. Real workload testing with the semantic layer enabled.** March already showed that the replay workload works and did not surface corruption bugs on the blob path. April is about proving the same thing with semantic writes turned on.
-
-If April lands those three pieces, we can release Lix for broader testing.
+**Workload testing with the semantic layer on.** March proved the blob path doesn't corrupt state across 500 real commits. April repeats that test with semantic writes enabled.
