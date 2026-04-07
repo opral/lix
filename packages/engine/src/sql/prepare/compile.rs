@@ -1,12 +1,9 @@
+use crate::contracts::functions::DynFunctionProvider;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::runtime::cel::CelEvaluator;
-use crate::runtime::deterministic_mode::RuntimeFunctionProvider;
-use crate::runtime::functions::SharedFunctionProvider;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
 };
-use crate::sql::physical_plan::PhysicalPlan;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::time::Duration;
@@ -19,43 +16,35 @@ use super::contracts::planned_statement::PlannedStatementSet;
 use super::contracts::requirements::PlanRequirements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
-use super::execution_program::{BoundStatementTemplateInstance, StatementTemplateOwnership};
+use super::execution_program::BoundStatementTemplateInstance;
 use super::intent::{collect_execution_intent, ExecutionIntent, IntentCollectionPolicy};
 use super::preprocess::preprocess_with_surfaces_to_logical_plan;
 use super::public_surface::{
     finalize_public_write_execution, prepare_public_execution_with_registry_context_and_functions,
-    prepared_public_write_mutates_public_surface_registry,
-    try_prepare_public_read_with_registry_and_internal_access,
-    try_prepare_public_write_with_registry_and_functions, PreparedPublicExecution,
-    PreparedPublicWrite,
+    PreparedPublicExecution, PreparedPublicWrite,
 };
 use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
-
-const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct PreparationPolicy {
     pub(crate) skip_side_effect_collection: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct SqlPreparationSeed<'a> {
     pub(crate) dialect: SqlDialect,
-    pub(crate) cel_evaluator: &'a CelEvaluator,
-    pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) functions: DynFunctionProvider,
     pub(crate) surface_registry: &'a SurfaceRegistry,
 }
 
 impl<'a> SqlPreparationSeed<'a> {
     pub(crate) fn with_compiler_metadata(
-        self,
+        &self,
         compiler_metadata: &'a SqlCompilerMetadata,
         active_history_root_commit_id: Option<&'a str>,
     ) -> DefaultSqlPreparationContext<'a> {
         DefaultSqlPreparationContext {
             dialect: self.dialect,
-            cel_evaluator: self.cel_evaluator,
-            functions: self.functions,
+            functions: self.functions.clone(),
             surface_registry: self.surface_registry,
             compiler_metadata,
             active_history_root_commit_id,
@@ -66,9 +55,7 @@ impl<'a> SqlPreparationSeed<'a> {
 pub(crate) trait SqlPreparationContext {
     fn dialect(&self) -> SqlDialect;
 
-    fn cel_evaluator(&self) -> &CelEvaluator;
-
-    fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider>;
+    fn functions(&self) -> &DynFunctionProvider;
 
     fn surface_registry(&self) -> &SurfaceRegistry;
 
@@ -81,8 +68,7 @@ pub(crate) trait SqlPreparationContext {
 
 pub(crate) struct DefaultSqlPreparationContext<'a> {
     pub(crate) dialect: SqlDialect,
-    pub(crate) cel_evaluator: &'a CelEvaluator,
-    pub(crate) functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+    pub(crate) functions: DynFunctionProvider,
     pub(crate) surface_registry: &'a SurfaceRegistry,
     pub(crate) compiler_metadata: &'a SqlCompilerMetadata,
     pub(crate) active_history_root_commit_id: Option<&'a str>,
@@ -93,12 +79,8 @@ impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
         self.dialect
     }
 
-    fn cel_evaluator(&self) -> &CelEvaluator {
-        self.cel_evaluator
-    }
-
-    fn functions(&self) -> &SharedFunctionProvider<RuntimeFunctionProvider> {
-        self.functions
+    fn functions(&self) -> &DynFunctionProvider {
+        &self.functions
     }
 
     fn surface_registry(&self) -> &SurfaceRegistry {
@@ -117,37 +99,7 @@ impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
 #[derive(Clone, Copy)]
 struct StaticCompilationArtifacts<'a> {
     parse_duration: Option<Duration>,
-    ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: Option<&'a PlanRequirements>,
-}
-
-pub(crate) fn prepared_execution_mutates_public_surface_registry(
-    prepared: &CompiledExecution,
-) -> Result<bool, LixError> {
-    if prepared.explain().is_some() {
-        return Ok(false);
-    }
-    if prepared.public_write().is_some() {
-        return prepared
-            .public_write()
-            .map(prepared_public_write_mutates_public_surface_registry)
-            .transpose()
-            .map(|value| value.unwrap_or(false));
-    }
-
-    let Some(internal) = prepared.internal_execution() else {
-        return Ok(false);
-    };
-
-    if internal.mutations.iter().any(|row| {
-        row.schema_key == REGISTERED_SCHEMA_KEY
-            && row.version_id == GLOBAL_VERSION_ID
-            && !row.untracked
-    }) {
-        return Ok(true);
-    }
-
-    Ok(false)
 }
 
 async fn compile_execution_with_context(
@@ -195,7 +147,6 @@ async fn compile_execution_with_context(
         writer_key,
         allow_internal_tables,
         static_artifacts.parse_duration,
-        static_artifacts.ownership_hint,
     )
     .await?;
     let (public_read, mut public_write) = match public_execution {
@@ -277,7 +228,6 @@ async fn compile_execution_with_context(
         let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
             dialect,
             preparation_context.surface_registry(),
-            preparation_context.cel_evaluator(),
             internal_source_statements,
             params,
             functions.clone(),
@@ -342,15 +292,6 @@ async fn compile_execution_with_context(
     if let Some(request) = explain_request.as_ref() {
         validate_explain_execution_support(request, &body, requirements.read_only_query)?;
     }
-    let physical_plan = match &body {
-        CompiledExecutionBody::PublicRead(read) => {
-            Some(PhysicalPlan::PublicRead(read.execution.clone()))
-        }
-        CompiledExecutionBody::PublicWrite(write) => {
-            Some(PhysicalPlan::PublicWrite(write.execution.clone()))
-        }
-        CompiledExecutionBody::Internal(_) => None,
-    };
     let explain = match &body {
         CompiledExecutionBody::PublicRead(read) => {
             read.explain.request.as_ref().map(|_| read.explain.clone())
@@ -365,7 +306,6 @@ async fn compile_execution_with_context(
 
     Ok(CompiledExecution {
         intent,
-        physical_plan,
         explain,
         result_contract,
         effects,
@@ -386,70 +326,21 @@ async fn prepare_public_execution_for_compile(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
     parse_duration: Option<Duration>,
-    ownership_hint: Option<StatementTemplateOwnership>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
-    let prepared = match ownership_hint {
-        Some(StatementTemplateOwnership::PublicRead) => {
-            try_prepare_public_read_with_registry_and_internal_access(
-                dialect,
-                registry,
-                compiler_metadata,
-                statements,
-                params,
-                active_version_id,
-                active_history_root_commit_id,
-                writer_key,
-                allow_internal_tables,
-                parse_duration,
-            )
-            .await?
-            .map(PreparedPublicExecution::Read)
-        }
-        Some(StatementTemplateOwnership::PublicWrite) => {
-            try_prepare_public_write_with_registry_and_functions(
-                dialect,
-                registry,
-                statements,
-                params,
-                active_version_id,
-                active_account_ids,
-                writer_key,
-                parse_duration,
-            )
-            .await?
-            .map(PreparedPublicExecution::Write)
-        }
-        Some(StatementTemplateOwnership::Internal) => None,
-        None => {
-            prepare_public_execution_with_registry_context_and_functions(
-                dialect,
-                registry,
-                compiler_metadata,
-                statements,
-                params,
-                active_version_id,
-                active_history_root_commit_id,
-                active_account_ids,
-                writer_key,
-                allow_internal_tables,
-                parse_duration,
-            )
-            .await?
-        }
-    };
-
-    if matches!(
-        ownership_hint,
-        Some(StatementTemplateOwnership::PublicRead | StatementTemplateOwnership::PublicWrite)
-    ) && prepared.is_none()
-    {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "statement template ownership hint no longer matches compile route",
-        ));
-    }
-
-    Ok(prepared)
+    prepare_public_execution_with_registry_context_and_functions(
+        dialect,
+        registry,
+        compiler_metadata,
+        statements,
+        params,
+        active_version_id,
+        active_history_root_commit_id,
+        active_account_ids,
+        writer_key,
+        allow_internal_tables,
+        parse_duration,
+    )
+    .await
 }
 
 pub(crate) async fn compile_execution_from_template_instance_with_context(
@@ -472,7 +363,6 @@ pub(crate) async fn compile_execution_from_template_instance_with_context(
         policy,
         StaticCompilationArtifacts {
             parse_duration: template_instance.parse_duration(),
-            ownership_hint: template_instance.ownership_hint(),
             plan_requirements: Some(template_instance.plan_requirements()),
         },
     )

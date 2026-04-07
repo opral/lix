@@ -4,28 +4,31 @@ use crate::contracts::surface::{
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::errors::sql_unknown_column_error;
+use crate::filesystem_projection_sql::{
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+};
+use crate::public_surface_source_sql::{
+    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
+};
 use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
     CanonicalStateScan, CanonicalWorkingChangesScan, FilesystemKind, ReadPlan,
     StructuredPublicRead, VersionScope,
 };
-use crate::sql::physical_plan::filesystem_projection_sql::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-};
 use crate::sql::physical_plan::plan::{
     compile_final_read_statement, compile_lowered_read_statement,
     compile_terminal_read_statement_from_template, FilesystemPublicSurface, LoweredReadProgram,
     LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
-};
-use crate::sql::physical_plan::public_surface_source_sql::{
-    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_has_live_payload_collisions, entity_surface_payload_alias,
     entity_surface_uses_payload_alias, escape_sql_string, render_identifier,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
+use crate::version_inventory_sql::{
+    build_admin_version_source_sql, build_admin_version_source_sql_with_current_heads,
+};
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -1000,9 +1003,7 @@ fn build_admin_source_sql(
     dialect: SqlDialect,
 ) -> Result<String, LixError> {
     Ok(match kind {
-        CanonicalAdminKind::Version => {
-            crate::canonical::read::build_admin_version_source_sql(dialect)
-        }
+        CanonicalAdminKind::Version => build_admin_version_source_sql(dialect),
     })
 }
 
@@ -1013,10 +1014,7 @@ fn build_admin_source_sql_with_current_heads(
 ) -> Result<String, LixError> {
     Ok(match kind {
         CanonicalAdminKind::Version => {
-            crate::canonical::read::build_admin_version_source_sql_with_current_heads(
-                dialect,
-                Some(current_version_heads),
-            )
+            build_admin_version_source_sql_with_current_heads(dialect, Some(current_version_heads))
         }
     })
 }

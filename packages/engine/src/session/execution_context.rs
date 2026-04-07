@@ -1,18 +1,24 @@
+#[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 
-use crate::contracts::artifacts::ExecuteOptions;
+use crate::contracts::artifacts::{ExecuteOptions, SessionStateDelta};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::runtime::execution_state::ExecutionRuntimeState;
+use crate::execution_runtime::ExecutionRuntimeState;
 use crate::sql::binder::RuntimeBindingValues;
+#[cfg(test)]
 use crate::sql::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};
+use crate::write_runtime::BufferedWriteExecutionInput;
 use crate::LixError;
 
 pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;
 
 pub(crate) struct SessionExecutionRuntime {
     public_surface_registry_generation: AtomicU64,
+    #[cfg(test)]
     statement_template_cache: Mutex<BTreeMap<StatementTemplateCacheKey, StatementTemplate>>,
 }
 
@@ -20,6 +26,7 @@ impl SessionExecutionRuntime {
     pub(crate) fn new() -> SessionExecutionRuntimeHandle {
         Arc::new(Self {
             public_surface_registry_generation: AtomicU64::new(0),
+            #[cfg(test)]
             statement_template_cache: Mutex::new(BTreeMap::new()),
         })
     }
@@ -34,6 +41,7 @@ impl SessionExecutionRuntime {
             .fetch_add(1, Ordering::SeqCst);
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_statement_template(
         &self,
         key: &StatementTemplateCacheKey,
@@ -45,6 +53,7 @@ impl SessionExecutionRuntime {
             .cloned()
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_statement_template(
         &self,
         key: StatementTemplateCacheKey,
@@ -89,10 +98,12 @@ impl ExecutionContext {
             .bump_public_surface_registry_generation();
     }
 
+    #[cfg(test)]
     pub(crate) fn public_surface_registry_generation(&self) -> u64 {
         self.session_runtime.public_surface_registry_generation()
     }
 
+    #[cfg(test)]
     pub(crate) fn cached_statement_template(
         &self,
         key: &StatementTemplateCacheKey,
@@ -100,16 +111,13 @@ impl ExecutionContext {
         self.session_runtime.cached_statement_template(key)
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_statement_template(
         &self,
         key: StatementTemplateCacheKey,
         template: StatementTemplate,
     ) {
         self.session_runtime.cache_statement_template(key, template);
-    }
-
-    pub(crate) fn session_runtime(&self) -> SessionExecutionRuntimeHandle {
-        Arc::clone(&self.session_runtime)
     }
 
     pub(crate) fn execution_runtime_state(&self) -> Option<&ExecutionRuntimeState> {
@@ -136,5 +144,30 @@ impl ExecutionContext {
                 },
             )?,
         })
+    }
+
+    pub(crate) fn buffered_write_execution_input(&self) -> BufferedWriteExecutionInput {
+        BufferedWriteExecutionInput::new(
+            self.options.writer_key.clone(),
+            self.active_version_id.clone(),
+            self.active_account_ids.clone(),
+        )
+    }
+
+    pub(crate) fn apply_buffered_write_execution_input(
+        &mut self,
+        input: &BufferedWriteExecutionInput,
+    ) {
+        self.active_version_id = input.active_version_id().to_string();
+        self.active_account_ids = input.active_account_ids().to_vec();
+    }
+
+    pub(crate) fn apply_session_state_delta(&mut self, delta: &SessionStateDelta) {
+        if let Some(version_id) = &delta.next_active_version_id {
+            self.active_version_id = version_id.clone();
+        }
+        if let Some(active_account_ids) = &delta.next_active_account_ids {
+            self.active_account_ids = active_account_ids.clone();
+        }
     }
 }

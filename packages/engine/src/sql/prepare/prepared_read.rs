@@ -263,7 +263,7 @@ pub(crate) fn prepare_public_read_artifact(
     public_read: &PreparedPublicRead,
     dialect: crate::SqlDialect,
 ) -> Result<PreparedPublicReadArtifact, LixError> {
-    let mut contract = super::prepared_public_read_contract(public_read);
+    let mut contract = super::public_surface::read::prepared_public_read_contract(public_read);
     if contract.result_columns.is_none() {
         contract.result_columns = result_columns_for_public_read_execution(&public_read.execution);
     }

@@ -10,14 +10,11 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{
     LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingStateOverlay,
 };
-use crate::sql::logical_plan::public_ir::CanonicalStateRowKey;
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
+use crate::prepared_write_artifacts::{
+    overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,
+    ExactEffectiveStateRowRequest, OverlayLane,
 };
-use crate::sql::semantic_ir::semantics::surface_semantics::{
-    overlay_lanes_for_version, OverlayLane,
-};
-use crate::version::GLOBAL_VERSION_ID;
+use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 enum TrackedExactEffectiveRowLookup {
     Matched(ExactEffectiveStateRow),

@@ -1,23 +1,16 @@
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
-pub(crate) async fn prepare_backend_for_init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    if backend.dialect() == SqlDialect::Sqlite {
-        backend.execute("PRAGMA foreign_keys = ON", &[]).await?;
-    }
-    Ok(())
-}
-
-pub(crate) async fn execute_init_statements(
+pub(crate) async fn execute_ddl_batch(
     backend: &dyn LixBackend,
-    owner: &str,
+    component: &str,
     statements: &[&str],
 ) -> Result<(), LixError> {
     for (index, statement) in statements.iter().enumerate() {
         backend.execute(statement, &[]).await.map_err(|error| {
             LixError::new(
                 &error.code,
-                &format!(
-                    "{owner} init statement #{index} failed: {} :: {}",
+                format!(
+                    "{component} init statement #{index} failed: {} :: {}",
                     compact_sql(statement),
                     error.description
                 ),

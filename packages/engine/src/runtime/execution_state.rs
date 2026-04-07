@@ -1,7 +1,5 @@
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::functions::SharedFunctionProvider;
-use crate::runtime::Runtime;
-use crate::{LixBackend, LixError};
 
 #[derive(Clone)]
 pub(crate) struct ExecutionRuntimeState {
@@ -18,16 +16,6 @@ impl ExecutionRuntimeState {
             settings,
             functions,
         }
-    }
-
-    pub(crate) async fn prepare(
-        runtime: &Runtime,
-        backend: &dyn LixBackend,
-    ) -> Result<Self, LixError> {
-        let (settings, functions) = runtime
-            .prepare_runtime_functions_with_backend(backend)
-            .await?;
-        Ok(Self::from_prepared_parts(settings, functions))
     }
 
     pub(crate) fn settings(&self) -> DeterministicSettings {

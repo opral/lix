@@ -3,7 +3,6 @@
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
 //! and compiler-owned explain payload/template generation.
 
-use crate::backend::SqlDialect;
 use crate::contracts::artifacts::{
     CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
@@ -75,7 +74,7 @@ use crate::sql::semantic_ir::{
     BoundPublicLeaf, PublicReadSemantics, PublicWriteInvariantTrace, PublicWriteSemantics,
     SemanticStatement,
 };
-use crate::{LixError, Value};
+use crate::{LixError, SqlDialect, Value};
 use serde::Serialize;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{AnalyzeFormatKind, DescribeAlias, Expr, Statement, UtilityOption};

@@ -2,6 +2,7 @@ use crate::contracts::artifacts::{
     SessionStateDelta, StateCommitStreamChange, TrackedWriteOperation, TrackedWriteRow,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
 use crate::write_runtime::buffered::{WriteDelta, WriteJournal};
@@ -130,10 +131,83 @@ impl TransactionCommitOutcome {
     }
 }
 
-pub(crate) trait BufferedWriteExecutionContext {
-    fn writer_key(&self) -> Option<&str>;
-    fn active_version_id(&self) -> &str;
-    fn active_account_ids(&self) -> &[String];
-    fn set_active_version_id(&mut self, version_id: String);
-    fn set_active_account_ids(&mut self, active_account_ids: Vec<String>);
+#[derive(Default)]
+pub(crate) struct DeferredTransactionSideEffects {
+    pub(crate) filesystem_state:
+        crate::write_runtime::filesystem::runtime::FilesystemTransactionState,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedWriteRuntimeState {
+    deterministic_mode_enabled: bool,
+    functions: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+}
+
+impl std::fmt::Debug for PreparedWriteRuntimeState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedWriteRuntimeState")
+            .field(
+                "deterministic_mode_enabled",
+                &self.deterministic_mode_enabled,
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedWriteRuntimeState {
+    pub(crate) fn new(
+        deterministic_mode_enabled: bool,
+        functions: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+    ) -> Self {
+        Self {
+            deterministic_mode_enabled,
+            functions,
+        }
+    }
+
+    pub(crate) fn functions(&self) -> &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>> {
+        &self.functions
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BufferedWriteExecutionInput {
+    writer_key: Option<String>,
+    active_version_id: String,
+    active_account_ids: Vec<String>,
+}
+
+impl BufferedWriteExecutionInput {
+    pub(crate) fn new(
+        writer_key: Option<String>,
+        active_version_id: impl Into<String>,
+        active_account_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            writer_key,
+            active_version_id: active_version_id.into(),
+            active_account_ids,
+        }
+    }
+
+    pub(crate) fn writer_key(&self) -> Option<&str> {
+        self.writer_key.as_deref()
+    }
+
+    pub(crate) fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    pub(crate) fn active_account_ids(&self) -> &[String] {
+        &self.active_account_ids
+    }
+
+    pub(crate) fn apply_session_delta(&mut self, delta: &SessionStateDelta) {
+        if let Some(version_id) = &delta.next_active_version_id {
+            self.active_version_id = version_id.clone();
+        }
+        if let Some(active_account_ids) = &delta.next_active_account_ids {
+            self.active_account_ids = active_account_ids.clone();
+        }
+    }
 }

@@ -324,8 +324,8 @@ mod tests {
 
     #[test]
     fn agent_entrypoints_use_error_catalog_constructors() {
-        let engine_src = include_str!("../engine.rs");
-        assert!(engine_src.contains("errors::internal_table_access_denied_error()"));
+        let statement_support_src = include_str!("../statement_support.rs");
+        assert!(statement_support_src.contains("errors::internal_table_access_denied_error()"));
 
         let classification_src = include_str!("classification.rs");
         assert!(classification_src.contains("errors::sql_unknown_table_error("));

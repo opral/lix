@@ -1,11 +1,11 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::contracts::artifacts::FilesystemProjectionScope;
+use crate::contracts::plugin::{InstalledPlugin, PluginContentType};
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::runtime::plugin::matching::select_best_glob_match;
 use crate::runtime::plugin::runtime::{
     apply_changes_with_plugin, load_installed_plugins_with_runtime_cache,
 };
-use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType};
 use crate::runtime::Runtime;
 use crate::write_runtime::filesystem::query::load_file_row_by_id;
 use crate::{LixBackend, LixError, Value};
@@ -391,8 +391,8 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
 #[cfg(test)]
 mod tests {
     use super::select_plugin_for_path;
+    use crate::contracts::plugin::{InstalledPlugin, PluginContentType, PluginRuntime};
     use crate::runtime::plugin::matching::glob_matches_path;
-    use crate::runtime::plugin::types::{InstalledPlugin, PluginContentType, PluginRuntime};
 
     fn test_plugin(
         key: &str,

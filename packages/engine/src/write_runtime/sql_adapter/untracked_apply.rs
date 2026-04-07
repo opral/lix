@@ -3,22 +3,24 @@ use std::collections::BTreeSet;
 use crate::contracts::artifacts::{
     PlannedStateRow, UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::contracts::functions::LixFunctionProvider;
 use crate::contracts::traits::UntrackedWriteParticipant;
-use crate::engine::Engine;
-use crate::runtime::functions::LixFunctionProvider;
-use crate::version::GLOBAL_VERSION_ID;
-use crate::write_runtime::filesystem::runtime::resolve_binary_blob_writes_in_transaction;
+use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::write_runtime::filesystem::runtime::{
+    compile_filesystem_finalization_from_state_in_transaction,
+    garbage_collect_unreachable_binary_cas_in_transaction,
+    resolve_binary_blob_writes_in_transaction,
+};
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::planned_write::PlannedPublicUntrackedWriteUnit;
 use super::runtime::SqlExecutionOutcome;
 
 pub(super) async fn run_public_untracked_write_txn_with_transaction(
-    engine: &Engine,
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedPublicUntrackedWriteUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut runtime_functions = plan.runtime_state.provider().clone();
+    let mut runtime_functions = plan.runtime_state.functions().clone();
     let timestamp = runtime_functions.timestamp();
 
     if plan.execution.persist_filesystem_payloads_before_write {
@@ -33,14 +35,13 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
     )?;
     transaction.apply_untracked_write_batch(&batch).await?;
 
-    let filesystem_finalization = engine
-        .compile_filesystem_finalization_from_state_in_transaction(
-            transaction,
-            &plan.filesystem_state,
-            plan.writer_key.as_deref(),
-            &[],
-        )
-        .await?;
+    let filesystem_finalization = compile_filesystem_finalization_from_state_in_transaction(
+        transaction,
+        &plan.filesystem_state,
+        plan.writer_key.as_deref(),
+        &[],
+    )
+    .await?;
     if plan.execution.persist_filesystem_payloads_before_write
         && !filesystem_finalization.binary_blob_writes.is_empty()
     {
@@ -56,7 +57,7 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
                 error.description
             ),
         })?;
-        crate::binary_cas::write::persist_resolved_binary_blob_writes_in_transaction(
+        crate::binary_blob_support::persist_resolved_binary_blob_writes_in_transaction(
             transaction,
             &resolved_binary_blob_writes,
         )
@@ -70,15 +71,12 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
         })?;
     }
     if filesystem_finalization.should_run_gc {
-        engine
-            .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-            .await?;
+        garbage_collect_unreachable_binary_cas_in_transaction(transaction).await?;
     }
 
     crate::write_runtime::persist_runtime_sequence_in_transaction(
         transaction,
-        plan.runtime_state.settings(),
-        plan.runtime_state.provider(),
+        plan.runtime_state.functions(),
     )
     .await
     .map_err(|error| LixError {

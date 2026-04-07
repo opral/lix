@@ -1,6 +1,6 @@
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::identity::{derive_entity_id_from_json_paths, EntityIdDerivationError};
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::schema::annotations::defaults::apply_schema_defaults;
+use crate::schema::annotations::defaults::apply_schema_defaults_with_shared_runtime;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateAssignments, MutationPayload, PlannedStateRow,
 };
@@ -358,10 +358,9 @@ where
             snapshot.insert(key.clone(), engine_value_to_json_value(value)?);
         }
     }
-    apply_schema_defaults(
+    apply_schema_defaults_with_shared_runtime(
         &mut snapshot,
         semantics.schema,
-        crate::runtime::cel::shared_runtime(),
         functions,
         semantics.schema_key,
         semantics.schema_version,

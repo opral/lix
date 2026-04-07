@@ -3,17 +3,19 @@
 use crate::change_view::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
-    PreparedPublicReadContract, SessionStateDelta, StateCommitStreamOperation,
+    SessionStateDelta, StateCommitStreamOperation,
+};
+use crate::contracts::state_commit_stream::{
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamRuntimeMetadata,
 };
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
+#[cfg(test)]
+use crate::contracts::traits::SqlPreparationMetadataReader;
 use crate::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
-};
-use crate::runtime::streams::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamRuntimeMetadata,
 };
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
@@ -46,14 +48,13 @@ use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
 };
-use crate::version::{
+use crate::version_artifacts::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot, GLOBAL_VERSION_ID,
+    parse_active_version_snapshot,
 };
 #[cfg(test)]
 use crate::LixBackend;
 use crate::{LixError, SqlDialect, Value};
-use serde_json::Value as JsonValue;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
     JoinConstraint, JoinOperator, LimitClause, ObjectNamePart, OrderBy, OrderByExpr, Query, Select,
@@ -113,10 +114,6 @@ impl PreparedPublicRead {
         read::committed_read_mode_from_prepared_public_read(self)
     }
 
-    pub(crate) fn public_read_contract(&self) -> PreparedPublicReadContract {
-        read::prepared_public_read_contract(self)
-    }
-
     #[cfg(test)]
     pub(crate) fn surface_bindings(&self) -> &[String] {
         &self.surface_bindings
@@ -142,25 +139,12 @@ pub(crate) struct PreparedPublicWriteExplainPlan {
 }
 
 impl PreparedPublicWrite {
-    pub(crate) fn materialization(&self) -> Option<&PublicWriteMaterialization> {
-        match &self.execution {
-            PreparedPublicWriteExecution::Noop => None,
-            PreparedPublicWriteExecution::Materialize(materialization) => Some(materialization),
-        }
-    }
-
     pub(crate) fn materialization_mut(&mut self) -> Option<&mut PublicWriteMaterialization> {
         match &mut self.execution {
             PreparedPublicWriteExecution::Noop => None,
             PreparedPublicWriteExecution::Materialize(materialization) => Some(materialization),
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PublicSurfaceRegistryMutation {
-    UpsertRegisteredSchemaSnapshot { snapshot: JsonValue },
-    RemoveDynamicSchema { schema_key: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,12 +178,9 @@ pub(crate) async fn prepare_public_execution(
     active_account_ids: &[String],
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
-    let active_history_root_commit_id =
-        crate::version::context::load_target_version_history_root_commit_id_with_backend(
-            backend,
-            Some(active_version_id),
-            "active_version_id",
-        )
+    let mut metadata_reader = backend;
+    let active_history_root_commit_id: Option<String> = metadata_reader
+        .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;
     prepare_public_execution_with_internal_access(
         backend,
@@ -433,12 +414,9 @@ pub(crate) async fn prepare_public_read(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Option<PreparedPublicRead> {
-    let active_history_root_commit_id =
-        crate::version::context::load_target_version_history_root_commit_id_with_backend(
-            backend,
-            Some(active_version_id),
-            "active_version_id",
-        )
+    let mut metadata_reader = backend;
+    let active_history_root_commit_id: Option<String> = metadata_reader
+        .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await
         .ok()
         .flatten();
@@ -461,12 +439,9 @@ pub(crate) async fn prepare_public_read_strict(
     active_version_id: &str,
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
-    let active_history_root_commit_id =
-        crate::version::context::load_target_version_history_root_commit_id_with_backend(
-            backend,
-            Some(active_version_id),
-            "active_version_id",
-        )
+    let mut metadata_reader = backend;
+    let active_history_root_commit_id: Option<String> = metadata_reader
+        .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;
     read::prepare_public_read_strict(
         backend,
@@ -1323,76 +1298,6 @@ fn schema_live_table_requirements_from_partition(
         .collect()
 }
 
-pub(crate) fn public_surface_registry_mutations(
-    prepared: &PreparedPublicWrite,
-) -> Result<Vec<PublicSurfaceRegistryMutation>, LixError> {
-    let Some(resolved) = prepared.planned_write.resolved_write_plan.as_ref() else {
-        return Ok(Vec::new());
-    };
-
-    let mut mutations = Vec::new();
-    for row in resolved.intended_post_state() {
-        if row.schema_key != "lix_registered_schema"
-            || row.version_id.as_deref() != Some(GLOBAL_VERSION_ID)
-        {
-            continue;
-        }
-
-        if row.tombstone {
-            if let Some((schema_key, _)) = row.entity_id.rsplit_once('~') {
-                mutations.push(PublicSurfaceRegistryMutation::RemoveDynamicSchema {
-                    schema_key: schema_key.to_string(),
-                });
-            }
-            continue;
-        }
-
-        let Some(snapshot_content) = planned_row_optional_json_text_value(row, "snapshot_content")
-        else {
-            continue;
-        };
-        let snapshot = serde_json::from_str(snapshot_content.as_ref()).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("registered schema snapshot_content invalid JSON: {error}"),
-            )
-        })?;
-        mutations.push(PublicSurfaceRegistryMutation::UpsertRegisteredSchemaSnapshot { snapshot });
-    }
-
-    Ok(mutations)
-}
-
-pub(crate) fn apply_public_surface_registry_mutations(
-    registry: &mut SurfaceRegistry,
-    mutations: &[PublicSurfaceRegistryMutation],
-) -> Result<bool, LixError> {
-    if mutations.is_empty() {
-        return Ok(false);
-    }
-
-    for mutation in mutations {
-        match mutation {
-            PublicSurfaceRegistryMutation::UpsertRegisteredSchemaSnapshot { snapshot } => {
-                crate::schema::apply_registered_schema_snapshot_to_surface_registry(
-                    registry, snapshot,
-                )?;
-            }
-            PublicSurfaceRegistryMutation::RemoveDynamicSchema { schema_key } => {
-                crate::schema::remove_dynamic_entity_surfaces_for_schema_key(registry, schema_key);
-            }
-        }
-    }
-
-    Ok(true)
-}
-
-pub(crate) fn prepared_public_write_mutates_public_surface_registry(
-    prepared: &PreparedPublicWrite,
-) -> Result<bool, LixError> {
-    Ok(!public_surface_registry_mutations(prepared)?.is_empty())
-}
-
 fn tracked_public_write_operation_supported(
     planned_write: &PlannedWrite,
     partition: &crate::sql::logical_plan::public_ir::ResolvedWritePartition,
@@ -1806,11 +1711,11 @@ mod tests {
         semantic_ir::ExecutionContext,
     };
     use crate::test_support::{seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend};
-    use crate::version::{
+    use crate::version_artifacts::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-        version_ref_schema_version, version_ref_snapshot_content,
+        version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
     };
     use crate::{LixBackend, LixError, Session, SqlDialect, Value};
     use async_trait::async_trait;
@@ -4087,7 +3992,7 @@ mod tests {
                 version_descriptor_schema_key(),
                 version_descriptor_schema_version(),
                 version_descriptor_file_id(),
-                crate::version::GLOBAL_VERSION_ID,
+                GLOBAL_VERSION_ID,
                 version_descriptor_plugin_key(),
                 &format!("change-public-{}", descriptor.id),
                 &public_version_descriptor_snapshot_json(descriptor),
@@ -4102,7 +4007,7 @@ mod tests {
                     version_ref_schema_key(),
                     version_ref_schema_version(),
                     version_ref_file_id(),
-                    crate::version::GLOBAL_VERSION_ID,
+                    GLOBAL_VERSION_ID,
                     version_ref_plugin_key(),
                     &version_ref_snapshot_content(descriptor.id, commit_id),
                     &format!("2026-04-02T00:01:0{}Z", index),

@@ -3,8 +3,8 @@ use std::ops::ControlFlow;
 use sqlparser::ast::{Expr, Statement};
 use sqlparser::ast::{VisitMut, VisitorMut};
 
-use crate::backend::SqlDialect;
 use crate::LixError;
+use crate::SqlDialect;
 
 use super::lower_json_fn::{
     lower_lix_empty_blob, lower_lix_json, lower_lix_json_extract, lower_lix_json_extract_boolean,

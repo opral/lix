@@ -1,11 +1,11 @@
 use crate::contracts::artifacts::SessionDependency;
 use crate::errors;
-use crate::runtime::streams::StateCommitStream;
 use crate::session::Session;
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::prepare::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
+use crate::streams::StateCommitStream;
 use crate::wire::WireValue;
 use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
@@ -426,7 +426,8 @@ impl ObserveState {
                 query,
                 session_dependency_generations,
             } => {
-                let latest_tick_seq = latest_observe_tick_seq(session.runtime().as_ref()).await?;
+                let latest_tick_seq =
+                    latest_observe_tick_seq(session.collaborators().backend().as_ref()).await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
@@ -473,8 +474,11 @@ impl ObserveState {
                 session_dependency_generations,
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
-                let observed_ticks =
-                    observe_ticks_since(session.runtime().as_ref(), last_seen_tick_seq).await?;
+                let observed_ticks = observe_ticks_since(
+                    session.collaborators().backend().as_ref(),
+                    last_seen_tick_seq,
+                )
+                .await?;
                 if observed_ticks.is_empty() {
                     PollOutcome {
                         maybe_rows: None,
@@ -766,7 +770,7 @@ fn build_shared_observe_source(
         include: filter.writer_keys.iter().cloned().collect(),
         exclude: filter.exclude_writer_keys.iter().cloned().collect(),
     };
-    let state_commits = session.runtime().state_commit_stream(filter);
+    let state_commits = session.collaborators().state_commit_stream(filter);
 
     Ok(SharedObserveSource::new(
         query,
@@ -847,10 +851,8 @@ async fn observe_poll_sleep(duration: Duration) {
     gloo_timers::future::TimeoutFuture::new(millis).await;
 }
 
-async fn latest_observe_tick_seq(
-    runtime: &crate::runtime::Runtime,
-) -> Result<Option<i64>, LixError> {
-    let result = Box::pin(runtime.backend().execute(
+async fn latest_observe_tick_seq(backend: &dyn crate::LixBackend) -> Result<Option<i64>, LixError> {
+    let result = Box::pin(backend.execute(
         "SELECT tick_seq \
          FROM lix_internal_observe_tick \
          ORDER BY tick_seq DESC \
@@ -868,11 +870,11 @@ async fn latest_observe_tick_seq(
 }
 
 async fn observe_ticks_since(
-    runtime: &crate::runtime::Runtime,
+    backend: &dyn crate::LixBackend,
     last_seen_tick_seq: Option<i64>,
 ) -> Result<Vec<ObserveTickRow>, LixError> {
     let result = if let Some(last_seen) = last_seen_tick_seq {
-        Box::pin(runtime.backend().execute(
+        Box::pin(backend.execute(
             "SELECT tick_seq, writer_key \
              FROM lix_internal_observe_tick \
              WHERE tick_seq > $1 \
@@ -881,7 +883,7 @@ async fn observe_ticks_since(
         ))
         .await?
     } else {
-        Box::pin(runtime.backend().execute(
+        Box::pin(backend.execute(
             "SELECT tick_seq, writer_key \
              FROM lix_internal_observe_tick \
              ORDER BY tick_seq ASC",
@@ -948,9 +950,11 @@ mod tests {
         build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery,
         OBSERVE_TICK_POLL_INTERVAL,
     };
-    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
     use crate::runtime::wasm::NoopWasmRuntime;
-    use crate::{boot, BootArgs, ExecuteOptions, LixError, QueryResult, Session, Value};
+    use crate::{
+        boot, BootArgs, ExecuteOptions, LixBackend, LixBackendTransaction, LixError, QueryResult,
+        Session, SqlDialect, Value,
+    };
     use async_trait::async_trait;
     use std::future::Future;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1085,8 +1089,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1123,8 +1130,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1226,8 +1236,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let mut state = build_observe_state(
                 &session,
@@ -1270,8 +1283,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let mut state = build_observe_state(
                 &session,

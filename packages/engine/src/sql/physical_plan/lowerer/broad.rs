@@ -1,4 +1,5 @@
 use super::*;
+use crate::public_surface_source_sql::build_working_changes_public_read_source_sql;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
@@ -12,7 +13,6 @@ use crate::sql::logical_plan::public_ir::{
     BroadSqlCaseWhen, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction, BroadSqlFunctionArg,
     BroadSqlFunctionArgExpr, BroadSqlFunctionArguments,
 };
-use crate::sql::physical_plan::public_surface_source_sql::build_working_changes_public_read_source_sql;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{

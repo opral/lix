@@ -26,6 +26,26 @@ where
     )
 }
 
+pub(crate) fn apply_schema_defaults_with_shared_runtime<P>(
+    snapshot: &mut JsonMap<String, JsonValue>,
+    schema: &JsonValue,
+    functions: SharedFunctionProvider<P>,
+    schema_key: &str,
+    schema_version: &str,
+) -> Result<bool, LixError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    apply_schema_defaults(
+        snapshot,
+        schema,
+        crate::runtime::cel::shared_runtime(),
+        functions,
+        schema_key,
+        schema_version,
+    )
+}
+
 pub(crate) fn apply_schema_defaults_with_context<P>(
     snapshot: &mut JsonMap<String, JsonValue>,
     schema: &JsonValue,

@@ -6,9 +6,9 @@ use crate::errors::classification::is_missing_relation_error;
 use crate::runtime::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::{LixBackend, LixError};
 use storage::load_persisted_key_value_payloads;
+pub(crate) use storage::PersistedKeyValueStorageScope;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
-const SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 const DETERMINISTIC_UUID_COUNTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;
 
 #[derive(Debug, Clone, Copy)]
@@ -17,14 +17,6 @@ pub struct DeterministicSettings {
     pub uuid_v7_enabled: bool,
     pub timestamp_enabled: bool,
     pub timestamp_shuffle_enabled: bool,
-}
-
-pub(crate) fn deterministic_mode_key() -> &'static str {
-    DETERMINISTIC_MODE_KEY
-}
-
-pub(crate) fn deterministic_sequence_key() -> &'static str {
-    SEQUENCE_KEY
 }
 
 impl DeterministicSettings {
@@ -53,14 +45,6 @@ impl RuntimeFunctionProvider {
             sequence_start,
             next_sequence,
         }
-    }
-
-    pub fn next_sequence(&self) -> i64 {
-        self.next_sequence
-    }
-
-    pub fn sequence_start(&self) -> Option<i64> {
-        self.sequence_start
     }
 
     fn take_sequence(&mut self) -> i64 {
@@ -171,36 +155,23 @@ pub(crate) fn parse_deterministic_settings_value(mode_value: &JsonValue) -> Dete
 
 pub(crate) async fn load_runtime_settings(
     backend: &dyn LixBackend,
+    storage_scope: &PersistedKeyValueStorageScope,
 ) -> Result<DeterministicSettings, LixError> {
-    let values = match load_persisted_key_value_payloads(backend, &[DETERMINISTIC_MODE_KEY]).await {
-        Ok(values) => values,
-        Err(err) if is_missing_relation_error(&err) => return Ok(DeterministicSettings::disabled()),
-        Err(err) => return Err(err),
-    };
+    let values =
+        match load_persisted_key_value_payloads(backend, storage_scope, &[DETERMINISTIC_MODE_KEY])
+            .await
+        {
+            Ok(values) => values,
+            Err(err) if is_missing_relation_error(&err) => {
+                return Ok(DeterministicSettings::disabled());
+            }
+            Err(err) => return Err(err),
+        };
 
     Ok(values
         .get(DETERMINISTIC_MODE_KEY)
         .map(parse_deterministic_settings_value)
         .unwrap_or_else(DeterministicSettings::disabled))
-}
-
-pub(crate) async fn load_runtime_sequence_start(backend: &dyn LixBackend) -> Result<i64, LixError> {
-    let values = match load_persisted_key_value_payloads(backend, &[SEQUENCE_KEY]).await {
-        Ok(values) => values,
-        Err(err) if is_missing_relation_error(&err) => return Ok(0),
-        Err(err) => return Err(err),
-    };
-
-    let highest_seen = values.get(SEQUENCE_KEY).and_then(parse_integer_value);
-    Ok(highest_seen.unwrap_or(-1) + 1)
-}
-
-fn parse_integer_value(value: &JsonValue) -> Option<i64> {
-    match value {
-        JsonValue::Number(number) => number.as_i64(),
-        JsonValue::String(text) => text.parse::<i64>().ok(),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

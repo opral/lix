@@ -247,7 +247,6 @@ mod tests {
     use super::{
         execute_read_time_projection_read_with_registry, execute_read_time_projection_rows,
     };
-    use crate::canonical::read::build_admin_version_source_sql_with_current_heads;
     use crate::contracts::artifacts::{
         DerivedRow, PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
         ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
@@ -265,6 +264,7 @@ mod tests {
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_snapshot_content,
     };
+    use crate::version_inventory_sql::build_admin_version_source_sql_with_current_heads;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
     #[derive(Debug, Clone)]

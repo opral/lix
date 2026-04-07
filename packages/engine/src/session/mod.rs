@@ -8,8 +8,9 @@
 pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod plugin;
-pub(crate) mod undo_redo;
+mod selector_reads;
 pub(crate) mod workspace;
+pub(crate) mod write_preparation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -23,31 +24,34 @@ use sqlparser::ast::Statement;
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::engine::{reject_internal_table_writes, reject_public_create_table, Engine};
 use crate::errors;
+use crate::execution_runtime::ExecutionRuntimeState;
 use crate::image::ImageChunkWriter;
 use crate::read_runtime::execute_prepared_read_program_in_committed_read_transaction;
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::Runtime;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
+pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
 };
+use crate::session::write_preparation::{
+    execute_execution_program_with_write_transaction,
+    execute_parsed_statements_in_write_transaction,
+};
+use crate::session_collaborators::SessionCollaborators;
 use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 #[cfg(test)]
 use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
-use crate::sql::prepare::execution_program::ExecutionProgram;
 use crate::sql::prepare::{
     prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
-    CommittedReadProgramContext, SqlPreparationSeed,
+    CommittedReadProgramContext, ExecutionProgram,
 };
-use crate::write_runtime::sql_adapter::{
-    execute_execution_program_with_write_transaction,
-    execute_parsed_statements_in_write_transaction,
+use crate::statement_support::{reject_internal_table_writes, reject_public_create_table};
+use crate::write_pipeline::{
+    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
 };
 use crate::write_runtime::{TransactionCommitOutcome, WriteTransaction};
 use crate::{ExecuteResult, LixError, Value};
@@ -70,8 +74,7 @@ enum Persistence {
 }
 
 pub struct Session {
-    engine: Arc<Engine>,
-    runtime: Arc<Runtime>,
+    collaborators: Arc<SessionCollaborators>,
     // Session-local runtime state. Workspace sessions persist these selectors
     // through `crate::session::workspace`; extra sessions keep them ephemeral.
     active_version_id: RwLock<String>,
@@ -88,28 +91,26 @@ pub struct Session {
 }
 
 pub struct SessionTransaction<'a> {
-    pub(crate) engine: &'a Engine,
-    pub(crate) runtime: &'a Runtime,
+    collaborators: &'a SessionCollaborators,
     session: &'a Session,
     pub(crate) write_transaction: Option<WriteTransaction<'a>>,
     pub(crate) context: ExecutionContext,
 }
 
 impl Session {
-    pub(crate) async fn open_workspace(engine: Arc<Engine>) -> Result<Self, LixError> {
-        if !engine.is_initialized().await? {
-            return Err(errors::not_initialized_error());
-        }
-        let runtime = Arc::clone(engine.runtime());
+    pub(crate) async fn open_workspace(
+        collaborators: Arc<SessionCollaborators>,
+    ) -> Result<Self, LixError> {
+        collaborators.ensure_initialized().await?;
         let active_version_id =
-            require_workspace_active_version_id(runtime.backend().as_ref()).await?;
-        let active_account_ids = load_workspace_active_account_ids(runtime.backend().as_ref())
-            .await?
-            .unwrap_or_default();
-        let registry = runtime.public_surface_registry();
+            require_workspace_active_version_id(collaborators.backend().as_ref()).await?;
+        let active_account_ids =
+            load_workspace_active_account_ids(collaborators.backend().as_ref())
+                .await?
+                .unwrap_or_default();
+        let registry = collaborators.public_surface_registry();
         Ok(Self {
-            engine,
-            runtime,
+            collaborators,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             public_surface_registry: RwLock::new(registry),
@@ -135,8 +136,7 @@ impl Session {
             .active_account_ids
             .unwrap_or_else(|| self.active_account_ids());
         Ok(Self {
-            engine: Arc::clone(&self.engine),
-            runtime: Arc::clone(&self.runtime),
+            collaborators: Arc::clone(&self.collaborators),
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             public_surface_registry: RwLock::new(self.public_surface_registry()),
@@ -151,14 +151,13 @@ impl Session {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        engine: Arc<Engine>,
+        collaborators: Arc<SessionCollaborators>,
         active_version_id: String,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
-            public_surface_registry: RwLock::new(engine.runtime().public_surface_registry()),
-            runtime: Arc::clone(engine.runtime()),
-            engine,
+            public_surface_registry: RwLock::new(collaborators.public_surface_registry()),
+            collaborators,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             execution_runtime: SessionExecutionRuntime::new(),
@@ -170,12 +169,8 @@ impl Session {
         }
     }
 
-    pub fn engine(&self) -> &Arc<Engine> {
-        &self.engine
-    }
-
-    pub(crate) fn runtime(&self) -> &Arc<Runtime> {
-        &self.runtime
+    pub(crate) fn collaborators(&self) -> &SessionCollaborators {
+        self.collaborators.as_ref()
     }
 
     pub fn active_version_id(&self) -> String {
@@ -259,7 +254,9 @@ impl Session {
         &self,
         options: crate::CreateVersionOptions,
     ) -> Result<crate::CreateVersionResult, LixError> {
-        crate::version::create_version_in_session(self, options).await
+        self.collaborators
+            .create_version_in_session(self, options)
+            .await
     }
 
     /// Creates a canonical checkpoint label on committed history for the
@@ -280,29 +277,39 @@ impl Session {
         &self,
         options: crate::MergeVersionOptions,
     ) -> Result<crate::MergeVersionResult, LixError> {
-        crate::version::merge_version_in_session(self, options).await
+        self.collaborators
+            .merge_version_in_session(self, options)
+            .await
     }
 
     pub async fn undo(&self) -> Result<crate::UndoResult, LixError> {
-        self.undo_with_options(crate::UndoOptions::default()).await
+        Box::pin(self.undo_with_options(crate::UndoOptions::default())).await
     }
 
     pub async fn undo_with_options(
         &self,
         options: crate::UndoOptions,
     ) -> Result<crate::UndoResult, LixError> {
-        crate::session::undo_redo::undo_with_options_in_session(self, options).await
+        Box::pin(
+            self.collaborators
+                .undo_with_options_in_session(self, options),
+        )
+        .await
     }
 
     pub async fn redo(&self) -> Result<crate::RedoResult, LixError> {
-        self.redo_with_options(crate::RedoOptions::default()).await
+        Box::pin(self.redo_with_options(crate::RedoOptions::default())).await
     }
 
     pub async fn redo_with_options(
         &self,
         options: crate::RedoOptions,
     ) -> Result<crate::RedoResult, LixError> {
-        crate::session::undo_redo::redo_with_options_in_session(self, options).await
+        Box::pin(
+            self.collaborators
+                .redo_with_options_in_session(self, options),
+        )
+        .await
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
@@ -318,7 +325,7 @@ impl Session {
     }
 
     pub async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        self.runtime.backend().export_image(writer).await
+        self.collaborators.export_image(writer).await
     }
 
     pub(crate) fn new_execution_context(&self, options: ExecuteOptions) -> ExecutionContext {
@@ -334,7 +341,7 @@ impl Session {
     pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
         self.replace_local_public_surface_registry(registry.clone());
         if self.should_persist_workspace_selectors() {
-            install_public_surface_registry_in_runtime(self.runtime.as_ref(), registry);
+            self.collaborators.install_public_surface_registry(registry);
         }
     }
 
@@ -349,7 +356,7 @@ impl Session {
     }
 
     pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        let registry = load_public_surface_registry_for_runtime(self.runtime.as_ref()).await?;
+        let registry = self.collaborators.load_public_surface_registry().await?;
         self.install_public_surface_registry(registry);
         Ok(())
     }
@@ -375,7 +382,7 @@ impl Session {
         options: ExecuteOptions,
         allow_internal_tables: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let allow_internal_sql = allow_internal_tables || self.runtime.access_to_internal();
+        let allow_internal_sql = allow_internal_tables || self.collaborators.access_to_internal();
 
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
@@ -398,38 +405,39 @@ impl Session {
         let program = ExecutionProgram::compile(
             parsed_statements,
             params,
-            self.runtime.backend().dialect(),
+            self.collaborators.backend().dialect(),
             &runtime_bindings,
             Some(parsed.parse_duration),
         )?;
         let execution_mode = classify_session_execution_mode(&program, explicit_transaction_script);
-        let runtime_state =
-            ExecutionRuntimeState::prepare(self.runtime.as_ref(), self.runtime.backend().as_ref())
-                .await?;
+        let runtime_state = self
+            .collaborators
+            .prepare_execution_runtime_state(self.collaborators.backend().as_ref())
+            .await?;
         context.set_execution_runtime_state(runtime_state.clone());
 
         let result = match execution_mode {
             SessionExecutionMode::CommittedRead => {
                 let committed_read_context = committed_read_program_context(
                     &context,
-                    self.runtime.as_ref(),
+                    self.collaborators.as_ref(),
                     &runtime_state,
                     execution_mode,
                 );
                 let prepared_committed_read = prepare_committed_read_program_with_backend(
-                    self.runtime.backend().as_ref(),
+                    self.collaborators.backend().as_ref(),
                     &program,
                     allow_internal_sql,
                     &committed_read_context,
                 )
                 .await?;
                 let mut transaction = self
-                    .runtime
+                    .collaborators
                     .begin_read_unit(prepared_committed_read.transaction_mode)
                     .await?;
                 let result = execute_prepared_read_program_in_committed_read_transaction(
                     transaction.as_mut(),
-                    self.runtime.projection_registry().as_ref(),
+                    self.collaborators.projection_registry(),
                     &prepared_committed_read,
                 )
                 .await;
@@ -454,24 +462,24 @@ impl Session {
                 if !runtime_state.settings().enabled {
                     let committed_read_context = committed_read_program_context(
                         &context,
-                        self.runtime.as_ref(),
+                        self.collaborators.as_ref(),
                         runtime_state,
                         execution_mode,
                     );
                     let prepared_committed_read = prepare_committed_read_program_with_backend(
-                        self.runtime.backend().as_ref(),
+                        self.collaborators.backend().as_ref(),
                         &program,
                         allow_internal_sql,
                         &committed_read_context,
                     )
                     .await?;
                     let mut transaction = self
-                        .runtime
+                        .collaborators
                         .begin_read_unit(prepared_committed_read.transaction_mode)
                         .await?;
                     let result = execute_prepared_read_program_in_committed_read_transaction(
                         transaction.as_mut(),
-                        self.runtime.projection_registry().as_ref(),
+                        self.collaborators.projection_registry(),
                         &prepared_committed_read,
                     )
                     .await;
@@ -489,17 +497,18 @@ impl Session {
                     }
                 } else {
                     let mut transaction = self
-                        .runtime
+                        .collaborators
                         .begin_read_unit(crate::TransactionMode::Write)
                         .await?;
+                    let mut runtime_functions = runtime_state.provider().clone();
                     crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
                         transaction.as_mut(),
-                        runtime_state.provider(),
+                        &mut runtime_functions,
                     )
                     .await?;
                     let committed_read_context = committed_read_program_context(
                         &context,
-                        self.runtime.as_ref(),
+                        self.collaborators.as_ref(),
                         runtime_state,
                         execution_mode,
                     );
@@ -514,7 +523,7 @@ impl Session {
                     };
                     let result = execute_prepared_read_program_in_committed_read_transaction(
                         transaction.as_mut(),
-                        self.runtime.projection_registry().as_ref(),
+                        self.collaborators.projection_registry(),
                         &prepared_committed_read,
                     )
                     .await;
@@ -522,7 +531,6 @@ impl Session {
                         Ok(result) => {
                             crate::write_runtime::persist_runtime_sequence_in_transaction(
                                 transaction.as_mut(),
-                                runtime_state.settings(),
                                 runtime_state.provider(),
                             )
                             .await?;
@@ -539,11 +547,11 @@ impl Session {
                 }
             }
             SessionExecutionMode::WriteTransaction => {
-                let transaction = self.runtime.begin_write_unit().await?;
+                let transaction = self.collaborators.begin_write_unit().await?;
                 let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
 
                 let result = execute_execution_program_with_write_transaction(
-                    self.engine.as_ref(),
+                    self.collaborators.as_ref(),
                     &mut write_transaction,
                     &program,
                     allow_internal_sql,
@@ -555,7 +563,7 @@ impl Session {
                     Ok(result) => {
                         context.clear_execution_runtime_state();
                         let outcome = write_transaction
-                            .commit_buffered_write(self.engine.as_ref(), context)
+                            .commit_buffered_write(context.buffered_write_execution_input())
                             .await?;
                         self.apply_transaction_commit_outcome(outcome).await?;
                         Ok(result)
@@ -575,10 +583,9 @@ impl Session {
         &self,
         options: ExecuteOptions,
     ) -> Result<SessionTransaction<'_>, LixError> {
-        let transaction = self.runtime.begin_write_unit().await?;
+        let transaction = self.collaborators.begin_write_unit().await?;
         Ok(SessionTransaction {
-            engine: self.engine.as_ref(),
-            runtime: self.runtime.as_ref(),
+            collaborators: self.collaborators.as_ref(),
             session: self,
             write_transaction: Some(WriteTransaction::new_buffered_write(transaction)),
             context: self.new_execution_context(options),
@@ -692,7 +699,7 @@ impl Session {
         }
         if persist_workspace {
             persist_workspace_selectors(
-                self.runtime.backend().as_ref(),
+                self.collaborators.backend().as_ref(),
                 next_active_version_id.as_deref(),
                 next_active_account_ids.as_deref(),
             )
@@ -714,45 +721,20 @@ impl Session {
         )
         .await?;
         if outcome.invalidate_deterministic_settings_cache {
-            self.runtime.invalidate_deterministic_settings_cache();
+            self.collaborators.invalidate_deterministic_settings_cache();
         }
         if outcome.invalidate_installed_plugins_cache {
-            self.runtime.invalidate_installed_plugins_cache()?;
+            self.collaborators.invalidate_installed_plugins_cache()?;
         }
         if outcome.refresh_public_surface_registry {
             self.refresh_public_surface_registry().await?;
         }
-        self.runtime
+        self.collaborators
             .emit_state_commit_stream_changes(std::mem::take(
                 &mut outcome.state_commit_stream_changes,
             ));
         Ok(())
     }
-}
-
-pub(crate) fn install_public_surface_registry_in_runtime(
-    runtime: &Runtime,
-    registry: SurfaceRegistry,
-) {
-    runtime.install_public_surface_registry(registry);
-}
-
-pub(crate) fn clear_public_surface_registry_in_runtime(runtime: &Runtime) {
-    runtime.clear_public_surface_registry();
-}
-
-pub(crate) async fn load_public_surface_registry_for_runtime(
-    runtime: &Runtime,
-) -> Result<SurfaceRegistry, LixError> {
-    crate::schema::load_public_surface_registry_with_backend(runtime.backend().as_ref()).await
-}
-
-pub(crate) async fn refresh_public_surface_registry_in_runtime(
-    runtime: &Runtime,
-) -> Result<SurfaceRegistry, LixError> {
-    let registry = load_public_surface_registry_for_runtime(runtime).await?;
-    install_public_surface_registry_in_runtime(runtime, registry.clone());
-    Ok(registry)
 }
 
 fn baseline_committed_read_transaction_mode(
@@ -774,7 +756,7 @@ fn baseline_committed_read_transaction_mode(
 
 fn committed_read_program_context<'a>(
     context: &'a ExecutionContext,
-    runtime: &'a Runtime,
+    collaborators: &'a SessionCollaborators,
     runtime_state: &'a ExecutionRuntimeState,
     execution_mode: SessionExecutionMode,
 ) -> CommittedReadProgramContext<'a> {
@@ -782,12 +764,8 @@ fn committed_read_program_context<'a>(
         active_version_id: context.active_version_id.as_str(),
         active_account_ids: &context.active_account_ids,
         writer_key: context.options.writer_key.as_deref(),
-        preparation_seed: SqlPreparationSeed {
-            dialect: runtime.backend().dialect(),
-            cel_evaluator: runtime.cel_evaluator(),
-            functions: runtime_state.provider(),
-            surface_registry: &context.public_surface_registry,
-        },
+        preparation_seed: collaborators
+            .sql_preparation_seed(runtime_state.provider(), &context.public_surface_registry),
         base_transaction_mode: baseline_committed_read_transaction_mode(
             execution_mode,
             runtime_state,
@@ -814,6 +792,10 @@ fn classify_session_execution_mode(
 }
 
 impl<'a> SessionTransaction<'a> {
+    pub(crate) fn collaborators(&self) -> &'a SessionCollaborators {
+        self.collaborators
+    }
+
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn mark_installed_plugins_cache_invalidation_pending(
         &mut self,
@@ -848,28 +830,33 @@ impl<'a> SessionTransaction<'a> {
     }
 
     pub async fn register_schema(&mut self, schema: &serde_json::Value) -> Result<(), LixError> {
-        let snapshot = serde_json::json!({ "value": schema });
-        let (schema_key, _) = crate::schema::schema_from_registered_snapshot(&snapshot)?;
-        self.write_transaction
+        let write_transaction = self
+            .write_transaction
             .as_mut()
-            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?
-            .register_schema(
-                crate::live_state::SchemaRegistration::with_registered_snapshot(
-                    schema_key.schema_key.clone(),
-                    snapshot,
-                ),
-            )?;
-        let schema_json = serde_json::to_string(schema).map_err(|error| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!("failed to serialize schema definition: {error}"),
-            )
-        })?;
-        self.execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
-            &[Value::Text(schema_json)],
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+        ensure_execution_runtime_state_for_write_scope(
+            self.collaborators,
+            write_transaction.backend_transaction_mut()?,
+            &mut self.context,
         )
         .await?;
+        let semantic_context = crate::write_runtime::SemanticWriteContext::new(
+            prepared_write_runtime_state_for_execution(
+                self.context
+                    .execution_runtime_state()
+                    .expect("register_schema should prepare write runtime state"),
+            ),
+            self.context.public_surface_registry.clone(),
+            self.context.active_account_ids.clone(),
+            self.context.options.writer_key.clone(),
+        );
+        let step =
+            crate::write_runtime::prepare_registered_schema_write_step(schema, &semantic_context)?;
+        let write_transaction = self
+            .write_transaction
+            .as_mut()
+            .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
+        crate::write_runtime::stage_prepared_write_step(write_transaction, step)?;
         Ok(())
     }
 
@@ -880,7 +867,7 @@ impl<'a> SessionTransaction<'a> {
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
-        if !self.runtime.access_to_internal() {
+        if !self.collaborators.access_to_internal() {
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
@@ -889,11 +876,11 @@ impl<'a> SessionTransaction<'a> {
             description: "transaction is no longer active".to_string(),
         })?;
         execute_parsed_statements_in_write_transaction(
-            self.engine,
+            self.collaborators,
             write_transaction,
             parsed_statements,
             params,
-            self.runtime.access_to_internal(),
+            self.collaborators.access_to_internal(),
             &mut self.context,
             Some(parsed.parse_duration),
         )
@@ -913,7 +900,7 @@ impl<'a> SessionTransaction<'a> {
             description: "transaction is no longer active".to_string(),
         })?;
         execute_parsed_statements_in_write_transaction(
-            self.engine,
+            self.collaborators,
             write_transaction,
             parsed_statements,
             params,
@@ -929,16 +916,8 @@ impl<'a> SessionTransaction<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        let placeholder = ExecutionContext::new(
-            ExecuteOptions::default(),
-            self.context.public_surface_registry.clone(),
-            self.context.session_runtime(),
-            self.context.active_version_id.clone(),
-            self.context.active_account_ids.clone(),
-        );
-        let context = std::mem::replace(&mut self.context, placeholder);
         let outcome = write_transaction
-            .commit_buffered_write(self.engine, context)
+            .commit_buffered_write(self.context.buffered_write_execution_input())
             .await?;
         self.session.apply_transaction_commit_outcome(outcome).await
     }
@@ -976,11 +955,10 @@ impl Drop for SessionTransaction<'_> {
 }
 
 async fn ensure_version_exists(session: &Session, version_id: &str) -> Result<(), LixError> {
-    crate::version::context::ensure_version_exists_with_backend(
-        session.runtime.backend().as_ref(),
-        version_id,
-    )
-    .await
+    session
+        .collaborators
+        .ensure_version_exists(version_id)
+        .await
 }
 
 fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
@@ -1136,7 +1114,7 @@ mod tests {
         }
     }
 
-    fn test_engine(backend: RecordingBackend) -> Arc<Engine> {
+    fn test_engine(backend: RecordingBackend) -> Arc<crate::Engine> {
         Arc::new(crate::boot(crate::BootArgs::new(
             Box::new(backend),
             Arc::new(crate::runtime::wasm::NoopWasmRuntime),
@@ -1215,7 +1193,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
-            let session = Session::new_for_test(engine, "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let result = session
                 .execute("SELECT 1", &[])
@@ -1231,7 +1213,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
-            let session = Session::new_for_test(engine, "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
             let parsed_statements =
                 parse_sql("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
             let runtime_bindings = session
@@ -1259,7 +1245,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
-            let session = Session::new_for_test(engine, "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                crate::session_collaborators::SessionCollaborators::new(engine),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let _ = session.execute("BEGIN; SELECT 1; COMMIT;", &[]).await;
             assert_eq!(backend.modes(), vec![crate::TransactionMode::Write]);

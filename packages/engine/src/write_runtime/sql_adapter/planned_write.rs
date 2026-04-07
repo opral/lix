@@ -1,38 +1,20 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::time::Instant;
 
 use crate::contracts::artifacts::{
     coalesce_live_table_requirements, DomainChangeBatch, ExpectedHead, MutationRow,
-    OptionalTextPatch, PlanEffects, PlannedRowIdentity, PlannedStateRow, ResultContract,
-    RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
+    OptionalTextPatch, PlanEffects, PlannedRowIdentity, PlannedStateRow,
+    PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
+    PreparedPublicWriteExecutionArtifact, PreparedPublicWriteExecutionPartition,
+    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteStep,
+    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
-use crate::contracts::projection::ProjectionRegistry;
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage, PendingView};
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::explain::{
-    build_public_write_explain_artifacts, stage_timing, ExplainStage, PublicWriteExplainBuildInput,
-};
-use crate::sql::physical_plan::{
-    PhysicalPlan, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
-    TrackedWriteExecution, UntrackedWriteExecution,
-};
-use crate::sql::prepare::{
-    build_public_write_execution, build_public_write_invariant_trace,
-    finalize_public_write_execution, public_authoritative_write_error,
-    public_write_preparation_error, CompiledExecution, CompiledInternalExecution,
-    PreparedPublicWrite,
-};
-use crate::sql::semantic_ir::semantics::domain_changes::{
-    build_domain_change_batch, derive_commit_preconditions,
-};
+use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
 use crate::write_runtime::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
 use crate::write_runtime::filesystem::state::filesystem_transaction_state_from_planned;
-use crate::write_runtime::resolve_write_plan_with_functions;
-use crate::write_runtime::PendingTransactionView;
+use crate::write_runtime::{PendingTransactionView, PreparedWriteRuntimeState};
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -40,11 +22,11 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Clone)]
 pub(crate) struct TrackedTxnUnit {
-    pub(crate) public_writes: Vec<PreparedPublicWrite>,
-    pub(crate) public_write: PreparedPublicWrite,
-    pub(crate) execution: TrackedWriteExecution,
+    pub(crate) public_writes: Vec<PreparedPublicWriteArtifact>,
+    pub(crate) public_write: PreparedPublicWriteArtifact,
+    pub(crate) execution: PreparedTrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) runtime_state: ExecutionRuntimeState,
+    pub(crate) runtime_state: PreparedWriteRuntimeState,
     pub(crate) writer_key: Option<String>,
 }
 
@@ -68,11 +50,10 @@ impl TrackedTxnUnit {
 }
 
 fn build_tracked_txn_unit(
-    public_write: &PreparedPublicWrite,
-    execution: &TrackedWriteExecution,
+    public_write: &PreparedPublicWriteArtifact,
+    execution: &PreparedTrackedWriteExecution,
     filesystem_state: &FilesystemTransactionState,
-    runtime_state: &ExecutionRuntimeState,
-    writer_key: Option<&str>,
+    runtime_state: &PreparedWriteRuntimeState,
 ) -> TrackedTxnUnit {
     TrackedTxnUnit {
         public_writes: vec![public_write.clone()],
@@ -80,113 +61,23 @@ fn build_tracked_txn_unit(
         execution: execution.clone(),
         filesystem_state: filesystem_state.clone(),
         runtime_state: runtime_state.clone(),
-        writer_key: writer_key.map(str::to_string),
+        writer_key: public_write.contract.writer_key.clone(),
     }
-}
-
-pub(crate) async fn materialize_prepared_public_write<P>(
-    backend: &dyn crate::LixBackend,
-    projection_registry: &ProjectionRegistry,
-    pending_transaction_view: Option<&PendingTransactionView>,
-    public_write: &PreparedPublicWrite,
-    functions: SharedFunctionProvider<P>,
-) -> Result<PreparedPublicWrite, LixError>
-where
-    P: LixFunctionProvider + Send + 'static,
-{
-    let physical_started = Instant::now();
-    let mut public_write = public_write.clone();
-    let resolved_write_plan = resolve_write_plan_with_functions(
-        backend,
-        projection_registry,
-        &public_write.planned_write,
-        pending_transaction_view.map(|view| view as &dyn PendingView),
-        functions,
-    )
-    .await
-    .map_err(|error| {
-        public_authoritative_write_error(&public_write.canonicalized, error.message.clone())
-            .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", error.message))
-    })?;
-
-    public_write.planned_write.resolved_write_plan = Some(resolved_write_plan);
-
-    let domain_change_batches =
-        build_domain_change_batch(&public_write.planned_write).map_err(|error| {
-            public_write_preparation_error(&public_write.canonicalized, &error.message)
-                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
-        })?;
-    let commit_preconditions =
-        derive_commit_preconditions(&public_write.planned_write).map_err(|error| {
-            public_write_preparation_error(&public_write.canonicalized, &error.message)
-                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
-        })?;
-    public_write.planned_write.commit_preconditions = commit_preconditions.clone();
-
-    let mut execution = build_public_write_execution(
-        &public_write.planned_write,
-        &domain_change_batches,
-        &commit_preconditions,
-    )?
-    .ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "public write target must route through explicit public materialization",
-        )
-    })?;
-    let filesystem_state = public_write
-        .planned_write
-        .resolved_write_plan
-        .as_ref()
-        .expect("public write materialization requires a resolved write plan")
-        .filesystem_state();
-    if let PreparedPublicWriteExecution::Materialize(materialization) = &mut execution {
-        finalize_public_write_execution(
-            materialization,
-            &public_write.planned_write,
-            &filesystem_state,
-        )?;
-    }
-
-    let mut stage_timings = public_write.explain_plan.stage_timings.clone();
-    stage_timings.push(stage_timing(
-        ExplainStage::PhysicalPlanning,
-        physical_started.elapsed(),
-    ));
-
-    public_write.domain_change_batches = domain_change_batches.clone();
-    public_write.execution = execution.clone();
-    public_write.explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
-        request: public_write.explain_plan.request.clone(),
-        semantics: public_write.explain_plan.semantics.clone(),
-        planned_write: public_write.planned_write.clone(),
-        execution,
-        domain_change_batches,
-        invariant_trace: Some(build_public_write_invariant_trace(
-            &public_write.planned_write,
-        )),
-        stage_timings,
-    });
-
-    Ok(public_write)
 }
 
 #[derive(Clone)]
 pub(crate) struct PlannedPublicUntrackedWriteUnit {
-    pub(crate) execution: UntrackedWriteExecution,
+    pub(crate) execution: PreparedUntrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) runtime_state: ExecutionRuntimeState,
+    pub(crate) runtime_state: PreparedWriteRuntimeState,
     pub(crate) writer_key: Option<String>,
 }
 
 #[derive(Clone)]
 pub(crate) struct PlannedInternalWriteUnit {
-    pub(crate) execution: CompiledInternalExecution,
-    pub(crate) effects: PlanEffects,
+    pub(crate) execution: PreparedInternalWriteArtifact,
     pub(crate) result_contract: ResultContract,
-    pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) runtime_state: ExecutionRuntimeState,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) runtime_state: PreparedWriteRuntimeState,
 }
 
 #[derive(Clone, Default)]
@@ -531,38 +422,41 @@ impl PendingSemanticOverlay {
 }
 
 pub(crate) fn build_planned_write_plan(
-    prepared: &CompiledExecution,
-    runtime_state: &ExecutionRuntimeState,
-    writer_key: Option<&str>,
+    prepared: &PreparedWriteStep,
+    runtime_state: &PreparedWriteRuntimeState,
 ) -> Option<PlannedWritePlan> {
     let mut units = Vec::new();
-    let filesystem_state =
-        filesystem_transaction_state_from_planned(&prepared.intent.filesystem_state);
 
     if let Some(public_write) = prepared.public_write() {
-        let Some(PhysicalPlan::PublicWrite(execution)) = prepared.physical_plan() else {
-            return None;
-        };
-        if let PreparedPublicWriteExecution::Materialize(materialization) = execution {
+        let filesystem_state = filesystem_transaction_state_from_planned(
+            &public_write
+                .contract
+                .resolved_write_plan
+                .as_ref()
+                .map(|resolved| resolved.filesystem_state())
+                .unwrap_or_default(),
+        );
+        if let PreparedPublicWriteExecutionArtifact::Materialize(materialization) =
+            &public_write.execution
+        {
             for partition in &materialization.partitions {
                 match partition {
-                    PublicWriteExecutionPartition::Tracked(tracked) => {
+                    PreparedPublicWriteExecutionPartition::Tracked(tracked) => {
                         let tracked_plan = build_tracked_txn_unit(
                             public_write,
                             tracked,
                             &filesystem_state,
                             runtime_state,
-                            writer_key,
                         );
                         units.push(PlannedWriteUnit::PublicTracked(tracked_plan));
                     }
-                    PublicWriteExecutionPartition::Untracked(untracked) => {
+                    PreparedPublicWriteExecutionPartition::Untracked(untracked) => {
                         units.push(PlannedWriteUnit::PublicUntracked(
                             PlannedPublicUntrackedWriteUnit {
                                 execution: untracked.clone(),
                                 filesystem_state: filesystem_state.clone(),
                                 runtime_state: runtime_state.clone(),
-                                writer_key: writer_key.map(str::to_string),
+                                writer_key: public_write.contract.writer_key.clone(),
                             },
                         ));
                     }
@@ -576,17 +470,14 @@ pub(crate) fn build_planned_write_plan(
                 workspace_writer_key_unit,
             ));
         }
-    } else if !prepared.read_only_query {
-        let Some(internal_execution) = prepared.internal_execution().cloned() else {
+    } else if let Some(internal_execution) = prepared.internal_write() {
+        if internal_execution.read_only_query {
             return None;
-        };
+        }
         units.push(PlannedWriteUnit::Internal(PlannedInternalWriteUnit {
-            execution: internal_execution,
-            effects: prepared.effects.clone(),
+            execution: internal_execution.clone(),
             result_contract: prepared.result_contract,
-            filesystem_state,
             runtime_state: runtime_state.clone(),
-            writer_key: writer_key.map(str::to_string),
         }));
     }
 
@@ -600,19 +491,18 @@ pub(crate) fn build_planned_write_plan(
 }
 
 pub(crate) fn build_planned_write_delta(
-    prepared: &CompiledExecution,
-    runtime_state: &ExecutionRuntimeState,
-    writer_key: Option<&str>,
+    prepared: &PreparedWriteStep,
+    runtime_state: &PreparedWriteRuntimeState,
 ) -> Result<Option<PlannedWriteDelta>, LixError> {
-    build_planned_write_plan(prepared, runtime_state, writer_key)
+    build_planned_write_plan(prepared, runtime_state)
         .map(PlannedWriteDelta::from_materialization_plan)
         .transpose()
 }
 
 fn planned_workspace_writer_key_unit_from_public_write(
-    public_write: &PreparedPublicWrite,
+    public_write: &PreparedPublicWriteArtifact,
 ) -> Option<PlannedWorkspaceWriterKeyUnit> {
-    let resolved = public_write.planned_write.resolved_write_plan.as_ref()?;
+    let resolved = public_write.contract.resolved_write_plan.as_ref()?;
     let mut annotations = BTreeMap::new();
     for partition in &resolved.partitions {
         annotations.extend(partition.workspace_writer_key_updates.iter().map(
@@ -700,8 +590,7 @@ pub(crate) fn pending_workspace_writer_key_overlay_for_planned_write_plan(
         match unit {
             PlannedWriteUnit::PublicTracked(tracked) => {
                 for public_write in &tracked.public_writes {
-                    let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref()
-                    else {
+                    let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
                         continue;
                     };
                     for partition in &resolved.partitions {
@@ -830,12 +719,12 @@ fn collect_semantic_overlay_from_planned_write_plan(
                     )?
             }
             PlannedWriteUnit::Internal(internal) => {
-                internal.filesystem_state.files.is_empty()
+                internal.execution.filesystem_state.files.is_empty()
                     && collect_semantic_overlay_from_mutation_rows(
                         &internal.execution.mutations,
                         overlay,
                     )?
-                    && internal.execution.update_validations.is_empty()
+                    && !internal.execution.has_update_validations
             }
             PlannedWriteUnit::WorkspaceWriterKey(_) => true,
         };
@@ -882,8 +771,7 @@ fn collect_filesystem_overlay_from_tracked_plan(
     if !matches!(
         tracked
             .public_write
-            .planned_write
-            .command
+            .contract
             .target
             .descriptor
             .public_name
@@ -894,7 +782,7 @@ fn collect_filesystem_overlay_from_tracked_plan(
     }
 
     for public_write in &tracked.public_writes {
-        let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref() else {
+        let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
             return false;
         };
         for partition in &resolved.partitions {
@@ -987,20 +875,14 @@ fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
 }
 
 fn collect_semantic_overlay_from_public_write(
-    public_write: &PreparedPublicWrite,
+    public_write: &PreparedPublicWriteArtifact,
     overlay: &mut PendingSemanticOverlay,
 ) -> Result<bool, LixError> {
-    let Some(resolved) = public_write.planned_write.resolved_write_plan.as_ref() else {
+    let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
         return Ok(false);
     };
     let skip_file_descriptor_rows = matches!(
-        public_write
-            .planned_write
-            .command
-            .target
-            .descriptor
-            .public_name
-            .as_str(),
+        public_write.contract.target.descriptor.public_name.as_str(),
         "lix_file" | "lix_file_by_version"
     );
     let mut saw_row = false;
@@ -1173,20 +1055,8 @@ fn filesystem_tracked_plans_are_buffer_compatible(
     {
         return false;
     }
-    current
-        .public_write
-        .planned_write
-        .command
-        .target
-        .descriptor
-        .public_name
-        == next
-            .public_write
-            .planned_write
-            .command
-            .target
-            .descriptor
-            .public_name
+    current.public_write.contract.target.descriptor.public_name
+        == next.public_write.contract.target.descriptor.public_name
         && current.execution.create_preconditions.write_lane
             == next.execution.create_preconditions.write_lane
         && create_commit_expected_head_compatible(
@@ -1200,8 +1070,7 @@ fn filesystem_tracked_plans_are_buffer_compatible(
 fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
     matches!(
         plan.public_write
-            .planned_write
-            .command
+            .contract
             .target
             .descriptor
             .public_name

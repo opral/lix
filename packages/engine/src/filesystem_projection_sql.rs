@@ -3,7 +3,7 @@ use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
 use crate::text::escape_sql_string;
-use crate::version::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
+use crate::version_artifacts::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";

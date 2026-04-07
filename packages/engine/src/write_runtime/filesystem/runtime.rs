@@ -1,12 +1,12 @@
-use crate::binary_cas::codec::binary_blob_hash_hex;
-use crate::binary_cas::write::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
+use crate::binary_blob_support::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
+use crate::content_fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
     FilesystemPayloadDomainChange, FilesystemProjectionScope, MutationRow, OptionalTextPatch,
 };
 use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
-use crate::engine::{dedupe_filesystem_payload_domain_changes, Engine};
-use crate::runtime::TransactionBackendAdapter;
-use crate::sql::storage::queries::state as state_queries;
+use crate::filesystem_payload_sql::insert_filesystem_payload_domain_changes_sql;
+use crate::transaction_execution::TransactionExecutionBackend;
+use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::write_runtime::filesystem::query::{
     load_file_row_by_id_without_path, resolve_file_id_by_path_in_version,
 };
@@ -153,7 +153,7 @@ pub(crate) fn compile_filesystem_finalization(
     CompiledFilesystemFinalization {
         binary_blob_writes,
         semantic_changes,
-        should_run_gc: crate::engine::should_run_binary_cas_gc(mutations, &payload_domain_changes),
+        should_run_gc: should_run_binary_cas_gc(mutations, &payload_domain_changes),
     }
 }
 
@@ -329,7 +329,7 @@ async fn resolve_binary_blob_write_in_transaction(
         });
     };
     let resolved = {
-        let backend = TransactionBackendAdapter::new(transaction);
+        let backend = TransactionExecutionBackend::new(transaction);
         resolve_file_id_by_path_in_version(&backend, &write.version_id, path).await?
     };
     let Some(file_id) = resolved else {
@@ -384,7 +384,7 @@ fn binary_blob_ref_change_for_bytes(
     })?;
     let snapshot_content = serde_json::json!({
         "id": file_id,
-        "blob_hash": binary_blob_hash_hex(data),
+        "blob_hash": stable_content_fingerprint_hex(data),
         "size_bytes": size_bytes,
     })
     .to_string();
@@ -472,100 +472,81 @@ fn binary_blob_ref_tombstone_change_for_target(
     }
 }
 
-impl Engine {
-    pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        changes: &[FilesystemPayloadDomainChange],
-    ) -> Result<(), LixError> {
-        self.persist_filesystem_payload_domain_changes_partitioned_in_transaction(
+pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    changes: &[FilesystemPayloadDomainChange],
+) -> Result<(), LixError> {
+    let tracked = changes
+        .iter()
+        .filter(|change| !change.untracked)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !tracked.is_empty() {
+        persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
             transaction,
-            changes,
+            &tracked,
+            false,
         )
+        .await?;
+    }
+
+    let untracked = changes
+        .iter()
+        .filter(|change| change.untracked)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !untracked.is_empty() {
+        persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+            transaction,
+            &untracked,
+            true,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    changes: &[FilesystemPayloadDomainChange],
+    untracked: bool,
+) -> Result<(), LixError> {
+    let deduped_changes = dedupe_filesystem_payload_domain_changes(changes);
+    if deduped_changes.is_empty() {
+        return Ok(());
+    }
+
+    let (sql, params) = build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
+    transaction.execute(&sql, &params).await?;
+
+    Ok(())
+}
+
+pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    filesystem_state: &FilesystemTransactionState,
+    writer_key: Option<&str>,
+    mutations: &[MutationRow],
+) -> Result<CompiledFilesystemFinalization, LixError> {
+    let state = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state) {
+        let exact_descriptors = load_exact_filesystem_descriptors_for_state_in_transaction(
+            transaction,
+            filesystem_state,
+        )
+        .await?;
+        with_exact_filesystem_descriptors(filesystem_state, &exact_descriptors)
+    } else {
+        filesystem_state.clone()
+    };
+    compile_filesystem_transaction_state_from_state(&state, writer_key, mutations)
+}
+
+pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    crate::binary_blob_support::garbage_collect_unreachable_binary_cas_in_transaction(transaction)
         .await
-    }
-
-    async fn persist_filesystem_payload_domain_changes_partitioned_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        changes: &[FilesystemPayloadDomainChange],
-    ) -> Result<(), LixError> {
-        let tracked = changes
-            .iter()
-            .filter(|change| !change.untracked)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !tracked.is_empty() {
-            self.persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
-                transaction,
-                &tracked,
-                false,
-            )
-            .await?;
-        }
-
-        let untracked = changes
-            .iter()
-            .filter(|change| change.untracked)
-            .cloned()
-            .collect::<Vec<_>>();
-        if !untracked.is_empty() {
-            self.persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
-                transaction,
-                &untracked,
-                true,
-            )
-            .await?;
-        }
-
-        Ok(())
-    }
-
-    pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        changes: &[FilesystemPayloadDomainChange],
-        untracked: bool,
-    ) -> Result<(), LixError> {
-        let deduped_changes = dedupe_filesystem_payload_domain_changes(changes);
-        if deduped_changes.is_empty() {
-            return Ok(());
-        }
-
-        let (sql, params) =
-            build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
-        transaction.execute(&sql, &params).await?;
-
-        Ok(())
-    }
-
-    pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        filesystem_state: &FilesystemTransactionState,
-        writer_key: Option<&str>,
-        mutations: &[MutationRow],
-    ) -> Result<CompiledFilesystemFinalization, LixError> {
-        let state = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state) {
-            let exact_descriptors = load_exact_filesystem_descriptors_for_state_in_transaction(
-                transaction,
-                filesystem_state,
-            )
-            .await?;
-            with_exact_filesystem_descriptors(filesystem_state, &exact_descriptors)
-        } else {
-            filesystem_state.clone()
-        };
-        compile_filesystem_transaction_state_from_state(&state, writer_key, mutations)
-    }
-
-    pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-    ) -> Result<(), LixError> {
-        crate::binary_cas::gc::garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-            .await
-    }
 }
 
 async fn load_exact_filesystem_descriptors_for_state_in_transaction(
@@ -583,7 +564,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
         .map(|file| (file.file_id.as_str(), file.version_id.as_str()))
         .collect::<BTreeSet<_>>();
     let mut loaded = BTreeMap::new();
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = TransactionExecutionBackend::new(transaction);
     for (file_id, version_id) in targets {
         let row = load_file_row_by_id_without_path(
             &backend,
@@ -596,12 +577,12 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: error.message,
         })?;
-        let row = if row.is_some() || version_id == crate::version::GLOBAL_VERSION_ID {
+        let row = if row.is_some() || version_id == GLOBAL_VERSION_ID {
             row
         } else {
             load_file_row_by_id_without_path(
                 &backend,
-                crate::version::GLOBAL_VERSION_ID,
+                GLOBAL_VERSION_ID,
                 file_id,
                 FilesystemProjectionScope::ExplicitVersion,
             )
@@ -629,6 +610,57 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
         );
     }
     Ok(loaded)
+}
+
+trait DedupableFilesystemPayloadChange {
+    fn dedupe_key(&self) -> (&str, &str, &str, &str, bool);
+}
+
+impl DedupableFilesystemPayloadChange for FilesystemPayloadDomainChange {
+    fn dedupe_key(&self) -> (&str, &str, &str, &str, bool) {
+        (
+            &self.file_id,
+            &self.version_id,
+            &self.schema_key,
+            &self.entity_id,
+            self.untracked,
+        )
+    }
+}
+
+fn dedupe_detected_changes<T>(changes: &[T]) -> Vec<T>
+where
+    T: DedupableFilesystemPayloadChange + Clone,
+{
+    let mut latest_by_key: BTreeMap<(&str, &str, &str, &str, bool), usize> = BTreeMap::new();
+    for (index, change) in changes.iter().enumerate() {
+        latest_by_key.insert(change.dedupe_key(), index);
+    }
+
+    let mut ordered_indexes = latest_by_key.into_values().collect::<Vec<_>>();
+    ordered_indexes.sort_unstable();
+    ordered_indexes
+        .into_iter()
+        .filter_map(|index| changes.get(index).cloned())
+        .collect()
+}
+
+fn dedupe_filesystem_payload_domain_changes(
+    changes: &[FilesystemPayloadDomainChange],
+) -> Vec<FilesystemPayloadDomainChange> {
+    dedupe_detected_changes(changes)
+}
+
+fn should_run_binary_cas_gc(
+    mutations: &[MutationRow],
+    filesystem_payload_domain_changes: &[FilesystemPayloadDomainChange],
+) -> bool {
+    mutations
+        .iter()
+        .any(|mutation| !mutation.untracked && mutation.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
+        || filesystem_payload_domain_changes
+            .iter()
+            .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
 pub(crate) fn build_filesystem_payload_domain_changes_insert(
@@ -664,8 +696,7 @@ pub(crate) fn build_filesystem_payload_domain_changes_insert(
         }
     }
 
-    let sql =
-        state_queries::insert_filesystem_payload_domain_changes_sql(&rows.join(", "), untracked);
+    let sql = insert_filesystem_payload_domain_changes_sql(&rows.join(", "), untracked);
     (sql, params)
 }
 

@@ -1,5 +1,5 @@
 use crate::binary_cas::schema::INTERNAL_BINARY_CHUNK_STORE;
-use crate::init::tables::{add_column_if_missing, execute_init_statements};
+use crate::ddl::{add_column_if_missing, execute_ddl_batch};
 use crate::{LixBackend, LixError};
 
 const BINARY_CAS_INIT_STATEMENTS: &[&str] = &[
@@ -52,7 +52,7 @@ const BINARY_CAS_INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_init_statements(backend, "binary_cas", BINARY_CAS_INIT_STATEMENTS).await?;
+    execute_ddl_batch(backend, "binary_cas", BINARY_CAS_INIT_STATEMENTS).await?;
     add_column_if_missing(
         backend,
         INTERNAL_BINARY_CHUNK_STORE,

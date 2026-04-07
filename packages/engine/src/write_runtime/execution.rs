@@ -1,5 +1,4 @@
 use crate::contracts::artifacts::{SchemaRegistration, StateCommitStreamChange};
-use crate::engine::Engine;
 use crate::write_runtime::buffered::{
     BufferedWriteState, LiveStateWriteState, TransactionCoordinator,
 };
@@ -8,7 +7,7 @@ use crate::write_runtime::overlay::PendingTransactionView;
 use crate::{LixBackendTransaction, LixError, ReplayCursor};
 
 use super::{
-    BufferedWriteExecutionContext, CommitOutcome, ReadContext, TransactionCommitOutcome,
+    BufferedWriteExecutionInput, CommitOutcome, ReadContext, TransactionCommitOutcome,
     TransactionDelta, TransactionJournal,
 };
 use crate::write_runtime::PlannedWriteDelta;
@@ -101,26 +100,25 @@ impl<'a> WriteTransaction<'a> {
         Ok(outcome)
     }
 
-    pub(crate) async fn commit_buffered_write<Context: BufferedWriteExecutionContext>(
+    pub(crate) async fn commit_buffered_write(
         mut self,
-        engine: &Engine,
-        mut context: Context,
+        mut execution_input: BufferedWriteExecutionInput,
     ) -> Result<TransactionCommitOutcome, LixError> {
-        let initial_active_version_id = context.active_version_id().to_string();
-        let initial_active_account_ids = context.active_account_ids().to_vec();
-        self.prepare_buffered_write_commit(engine, &mut context)
+        let initial_active_version_id = execution_input.active_version_id().to_string();
+        let initial_active_account_ids = execution_input.active_account_ids().to_vec();
+        self.prepare_buffered_write_commit(&mut execution_input)
             .await?;
         let mut outcome = self
             .buffered_write_state()
             .map(BufferedWriteState::commit_outcome)
             .unwrap_or_default();
-        if context.active_version_id() != initial_active_version_id {
+        if execution_input.active_version_id() != initial_active_version_id {
             outcome.session_delta.next_active_version_id =
-                Some(context.active_version_id().to_string());
+                Some(execution_input.active_version_id().to_string());
         }
-        if context.active_account_ids() != initial_active_account_ids {
+        if execution_input.active_account_ids() != initial_active_account_ids {
             outcome.session_delta.next_active_account_ids =
-                Some(context.active_account_ids().to_vec());
+                Some(execution_input.active_account_ids().to_vec());
         }
         self.finalize_live_state_for_commit().await?;
         self.coordinator.commit().await?;
@@ -187,10 +185,9 @@ impl<'a> WriteTransaction<'a> {
             .commit_outcome_mut()
     }
 
-    pub(crate) async fn flush_buffered_write_journal<Context: BufferedWriteExecutionContext>(
+    pub(crate) async fn flush_buffered_write_journal(
         &mut self,
-        engine: &Engine,
-        context: &mut Context,
+        execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         self.coordinator.register_staged_schemas().await?;
         let transaction = self.coordinator.backend_transaction_mut()?;
@@ -200,13 +197,12 @@ impl<'a> WriteTransaction<'a> {
                 "operation requires a buffered write state",
             )
         })?;
-        write_state.flush(transaction, engine, context).await
+        write_state.flush(transaction, execution_input).await
     }
 
-    pub(crate) async fn prepare_buffered_write_commit<Context: BufferedWriteExecutionContext>(
+    pub(crate) async fn prepare_buffered_write_commit(
         &mut self,
-        engine: &Engine,
-        context: &mut Context,
+        execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         self.coordinator.register_staged_schemas().await?;
         let transaction = self.coordinator.backend_transaction_mut()?;
@@ -217,7 +213,7 @@ impl<'a> WriteTransaction<'a> {
             )
         })?;
         write_state
-            .prepare_commit(transaction, engine, context)
+            .prepare_commit(transaction, execution_input)
             .await
     }
 
@@ -333,15 +329,14 @@ impl<'tx> BorrowedWriteTransaction<'tx> {
             .pending_public_commit_session_mut()
     }
 
-    pub(crate) async fn flush_buffered_write_journal<Context: BufferedWriteExecutionContext>(
+    pub(crate) async fn flush_buffered_write_journal(
         &mut self,
-        engine: &Engine,
-        context: &mut Context,
+        execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         let buffered_write_state = &mut self.buffered_write_state;
         let backend_txn = &mut *self.backend_txn;
         buffered_write_state
-            .flush(backend_txn, engine, context)
+            .flush(backend_txn, execution_input)
             .await
     }
 

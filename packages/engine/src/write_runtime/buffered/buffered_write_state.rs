@@ -1,8 +1,10 @@
-use crate::engine::Engine;
+use crate::contracts::state_commit_stream::should_invalidate_deterministic_settings_cache;
 use crate::write_runtime::commit::{CanonicalCommitReceipt, PendingPublicCommitSession};
 use crate::write_runtime::overlay::PendingTransactionView;
 use crate::write_runtime::sql_adapter::{execute_planned_write_delta, SqlExecutionOutcome};
-use crate::write_runtime::{BufferedWriteExecutionContext, TransactionCommitOutcome};
+use crate::write_runtime::{
+    append_observe_tick_in_transaction, BufferedWriteExecutionInput, TransactionCommitOutcome,
+};
 use crate::LixBackendTransaction;
 use crate::LixError;
 
@@ -87,11 +89,10 @@ impl BufferedWriteState {
             .extend(changes);
     }
 
-    pub(crate) async fn flush<Context: BufferedWriteExecutionContext>(
+    pub(crate) async fn flush(
         &mut self,
         transaction: &mut dyn LixBackendTransaction,
-        engine: &Engine,
-        context: &mut Context,
+        execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         let Some(delta) = self.journal.take_staged_delta() else {
             return Ok(());
@@ -100,39 +101,34 @@ impl BufferedWriteState {
             .await?;
         let mut pending_public_commit_session = self.pending_public_commit_session.take();
         let execution = execute_planned_write_delta(
-            engine,
             transaction,
             &delta,
             Some(&mut pending_public_commit_session),
         )
         .await?;
         self.pending_public_commit_session = pending_public_commit_session;
-        apply_buffered_write_execution_outcome(self, engine, context, execution);
+        apply_buffered_write_execution_outcome(self, execution_input, execution);
         Ok(())
     }
 
-    pub(crate) async fn prepare_commit<Context: BufferedWriteExecutionContext>(
+    pub(crate) async fn prepare_commit(
         &mut self,
         transaction: &mut dyn LixBackendTransaction,
-        engine: &Engine,
-        context: &mut Context,
+        execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
-        self.flush(transaction, engine, context).await?;
+        self.flush(transaction, execution_input).await?;
         if !self.observe_tick_emitted && !self.commit_outcome.state_commit_stream_changes.is_empty()
         {
-            engine
-                .append_observe_tick_in_transaction(transaction, context.writer_key())
-                .await?;
+            append_observe_tick_in_transaction(transaction, execution_input.writer_key()).await?;
             self.observe_tick_emitted = true;
         }
         Ok(())
     }
 }
 
-fn apply_buffered_write_execution_outcome<Context: BufferedWriteExecutionContext>(
+fn apply_buffered_write_execution_outcome(
     state: &mut BufferedWriteState,
-    engine: &Engine,
-    context: &mut Context,
+    execution_input: &mut BufferedWriteExecutionInput,
     execution: SqlExecutionOutcome,
 ) {
     let active_effects = execution
@@ -140,18 +136,15 @@ fn apply_buffered_write_execution_outcome<Context: BufferedWriteExecutionContext
         .as_ref()
         .cloned()
         .unwrap_or_default();
-    if let Some(version_id) = &active_effects.session_delta.next_active_version_id {
-        context.set_active_version_id(version_id.clone());
-    }
-    if let Some(active_account_ids) = &active_effects.session_delta.next_active_account_ids {
-        context.set_active_account_ids(active_account_ids.clone());
-    }
+    execution_input.apply_session_delta(&active_effects.session_delta);
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
     state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
     state.commit_outcome.merge(TransactionCommitOutcome {
         session_delta: active_effects.session_delta.clone(),
-        invalidate_deterministic_settings_cache: engine
-            .should_invalidate_deterministic_settings_cache(&[], &state_commit_stream_changes),
+        invalidate_deterministic_settings_cache: should_invalidate_deterministic_settings_cache(
+            &[],
+            &state_commit_stream_changes,
+        ),
         invalidate_installed_plugins_cache: execution.plugin_changes_committed,
         state_commit_stream_changes,
         ..TransactionCommitOutcome::default()

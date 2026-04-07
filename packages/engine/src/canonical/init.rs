@@ -1,5 +1,5 @@
+use crate::ddl::execute_ddl_batch;
 use crate::init::seed::read_scalar_count;
-use crate::init::tables::execute_init_statements;
 use crate::init::InitExecutor;
 use crate::Value;
 use crate::{LixBackend, LixError};
@@ -58,7 +58,7 @@ const CANONICAL_INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_init_statements(backend, "canonical", CANONICAL_INIT_STATEMENTS).await
+    execute_ddl_batch(backend, "canonical", CANONICAL_INIT_STATEMENTS).await
 }
 
 pub(crate) async fn seed_bootstrap(executor: &mut InitExecutor<'_, '_>) -> Result<(), LixError> {

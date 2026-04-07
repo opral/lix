@@ -1,4 +1,4 @@
-use crate::runtime::functions::LixFunctionProvider;
+use crate::contracts::functions::LixFunctionProvider;
 use crate::write_runtime::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
 };
@@ -186,7 +186,7 @@ mod tests {
         CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
         CreateCommitPreconditions, CreateCommitWriteLane, PendingPublicCommitSession,
     };
-    use crate::runtime::functions::LixFunctionProvider;
+    use crate::contracts::functions::LixFunctionProvider;
     use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value};
     use async_trait::async_trait;
 

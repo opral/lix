@@ -5,8 +5,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
+use crate::contracts::projection::ProjectionRegistry;
+use crate::contracts::traits::PendingView;
+use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
+use crate::session::SessionWriteSelectorResolver;
+use crate::sql::logical_plan::public_ir::{PlannedWrite, ResolvedWritePlan};
 use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::write_runtime::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::{
     boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
@@ -236,6 +242,28 @@ pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Engine>
     engine.initialize().await?;
     let session = engine.open_session().await?;
     Ok((backend, engine, session))
+}
+
+pub(crate) async fn resolve_write_plan_for_test(
+    backend: &dyn LixBackend,
+    projection_registry: &ProjectionRegistry,
+    planned_write: &PlannedWrite,
+    pending_transaction_view: Option<&dyn PendingView>,
+) -> Result<ResolvedWritePlan, WriteResolveError> {
+    let selector_resolver =
+        SessionWriteSelectorResolver::new(backend, projection_registry, pending_transaction_view)
+            .await
+            .map_err(|error| WriteResolveError {
+                message: error.description,
+            })?;
+    resolve_write_plan_with_functions(
+        backend,
+        planned_write,
+        pending_transaction_view,
+        SharedFunctionProvider::new(SystemFunctionProvider),
+        &selector_resolver,
+    )
+    .await
 }
 
 pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(), LixError> {

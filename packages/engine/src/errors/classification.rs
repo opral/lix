@@ -59,19 +59,6 @@ pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> 
     error
 }
 
-pub(crate) async fn normalize_sql_error_with_backend(
-    backend: &dyn LixBackend,
-    error: LixError,
-    statements: &[Statement],
-) -> LixError {
-    normalize_sql_error_with_backend_and_relation_names(
-        backend,
-        error,
-        &relation_names_from_statements(statements),
-    )
-    .await
-}
-
 pub(crate) async fn normalize_sql_error_with_backend_and_relation_names(
     backend: &dyn LixBackend,
     error: LixError,

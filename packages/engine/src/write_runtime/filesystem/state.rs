@@ -1,4 +1,4 @@
-use crate::sql::logical_plan::public_ir::{
+use crate::contracts::artifacts::{
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
 };
 use crate::write_runtime::filesystem::runtime::{

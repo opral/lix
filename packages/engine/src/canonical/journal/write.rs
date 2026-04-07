@@ -6,7 +6,7 @@
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::runtime::functions::LixFunctionProvider;
-use crate::sql::binder::bind_sql;
+use crate::statement_support::bind_sql;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, LixError, SqlDialect, Value,

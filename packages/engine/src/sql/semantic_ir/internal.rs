@@ -4,9 +4,7 @@
 //! parse/bind but before later planning and execution-specific wrapping.
 
 use crate::contracts::artifacts::PreparedStatement;
-use crate::runtime::cel::CelEvaluator;
-use crate::runtime::functions::LixFunctionProvider;
-use crate::runtime::functions::SharedFunctionProvider;
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::internal::inline_functions::inline_lix_functions_with_provider;
 use crate::sql::internal::param_context::normalize_statement_placeholders_in_batch;
@@ -141,7 +139,6 @@ fn validate_statement_output(output: &InternalStatementRewrite) -> Result<(), Li
 
 pub(crate) async fn prepare_internal_statements_to_plan<P>(
     dialect: SqlDialect,
-    _evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
     functions: SharedFunctionProvider<P>,

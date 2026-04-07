@@ -1,8 +1,8 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF;
-use crate::runtime::plugin::manifest::parse_plugin_manifest_json;
-use crate::runtime::plugin::storage::plugin_key_from_archive_path;
-use crate::runtime::plugin::types::InstalledPlugin;
+use crate::contracts::plugin::{
+    parse_plugin_manifest_json, plugin_key_from_archive_path, InstalledPlugin,
+};
 #[cfg(test)]
 use crate::runtime::wasm::WasmRuntime;
 use crate::runtime::wasm::{WasmComponentInstance, WasmLimits};
@@ -443,7 +443,7 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
 #[cfg(test)]
 mod tests {
     use super::{load_or_init_plugin_component_with_loaded_instances, CachedPluginComponent};
-    use crate::runtime::plugin::types::{InstalledPlugin, PluginRuntime};
+    use crate::contracts::plugin::{InstalledPlugin, PluginRuntime};
     use crate::runtime::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
     use crate::LixError;
     use async_trait::async_trait;

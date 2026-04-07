@@ -13,14 +13,13 @@ use crate::live_state::{
 };
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
+use crate::session::observe;
 use crate::session::workspace;
-use crate::session::{observe, undo_redo};
 use crate::version;
 use crate::write_runtime::commit;
-use crate::{LixError, TransactionMode};
+use crate::{LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;
-use super::tables::prepare_backend_for_init;
 use super::InitExecutor;
 
 pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
@@ -60,9 +59,6 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             checkpoint::init(&backend)
                 .await
                 .map_err(|error| init_step_error("checkpoint::init", error))?;
-            undo_redo::init(&backend)
-                .await
-                .map_err(|error| init_step_error("undo_redo::init", error))?;
             observe::init(&backend)
                 .await
                 .map_err(|error| init_step_error("observe::init", error))?;
@@ -150,8 +146,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             engine.clear_deterministic_boot_pending();
         }
         engine.mark_init_completed();
-        crate::session::refresh_public_surface_registry_in_runtime(engine.runtime().as_ref())
-            .await?;
+        engine.refresh_public_surface_registry().await?;
     } else {
         let _ = transaction.rollback().await;
         engine.reset_init_state();
@@ -165,8 +160,7 @@ pub(crate) async fn init_if_needed(engine: &Engine) -> Result<bool, LixError> {
         Ok(()) => Ok(true),
         Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
             engine.wait_for_concurrent_init_ready().await?;
-            crate::session::refresh_public_surface_registry_in_runtime(engine.runtime().as_ref())
-                .await?;
+            engine.refresh_public_surface_registry().await?;
             Ok(false)
         }
         Err(error) => Err(error),
@@ -252,4 +246,11 @@ fn is_init_locked_error(description: &str) -> bool {
     normalized.contains("database is locked")
         || normalized.contains("database schema is locked")
         || normalized.contains("database table is locked")
+}
+
+async fn prepare_backend_for_init(backend: &dyn LixBackend) -> Result<(), LixError> {
+    if backend.dialect() == SqlDialect::Sqlite {
+        backend.execute("PRAGMA foreign_keys = ON", &[]).await?;
+    }
+    Ok(())
 }

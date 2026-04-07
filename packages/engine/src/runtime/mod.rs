@@ -12,26 +12,22 @@ pub mod streams;
 pub mod wasm;
 
 use crate::backend::QueryExecutor;
-use crate::contracts::artifacts::MutationRow;
+use crate::contracts::plugin::InstalledPlugin;
 use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
-use crate::runtime::cel::CelEvaluator;
 use crate::runtime::deterministic_mode::DeterministicSettings;
 use crate::runtime::plugin::runtime::CachedPluginComponent;
-use crate::runtime::plugin::types::InstalledPlugin;
 use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::runtime::wasm::WasmRuntime;
-use crate::schema::builtin::storage::key_value_schema_key;
 use crate::schema::SchemaKey;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
-use sqlparser::ast::Statement;
 
 const INIT_STATE_NOT_STARTED: u8 = 0;
 const INIT_STATE_IN_PROGRESS: u8 = 1;
@@ -40,7 +36,6 @@ const INIT_STATE_COMPLETED: u8 = 2;
 pub(crate) struct Runtime {
     backend: Arc<dyn LixBackend + Send + Sync>,
     wasm_runtime: Arc<dyn WasmRuntime>,
-    cel_evaluator: CelEvaluator,
     schema_cache: SchemaCache,
     boot_deterministic_settings: Option<DeterministicSettings>,
     deterministic_boot_pending: AtomicBool,
@@ -71,7 +66,6 @@ impl Runtime {
         Self {
             backend: Arc::from(backend),
             wasm_runtime,
-            cel_evaluator: CelEvaluator::new(),
             schema_cache: SchemaCache::new(),
             boot_deterministic_settings,
             deterministic_boot_pending: AtomicBool::new(deterministic_boot_pending),
@@ -98,10 +92,6 @@ impl Runtime {
 
     pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
         self.wasm_runtime.as_ref()
-    }
-
-    pub(crate) fn cel_evaluator(&self) -> &CelEvaluator {
-        &self.cel_evaluator
     }
 
     pub(crate) fn schema_cache(&self) -> &SchemaCache {
@@ -133,6 +123,12 @@ impl Runtime {
 
     pub(crate) fn clear_public_surface_registry(&self) {
         self.install_public_surface_registry(SurfaceRegistry::default());
+    }
+
+    pub(crate) async fn load_public_surface_registry_from_backend(
+        &self,
+    ) -> Result<SurfaceRegistry, LixError> {
+        crate::schema::load_public_surface_registry_with_backend(self.backend().as_ref()).await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
@@ -217,20 +213,6 @@ impl Runtime {
         self.backend.begin_transaction(mode).await
     }
 
-    pub(crate) fn should_invalidate_deterministic_settings_cache(
-        &self,
-        mutations: &[MutationRow],
-        state_commit_stream_changes: &[StateCommitStreamChange],
-    ) -> bool {
-        mutations.iter().any(|row| {
-            row.schema_key == key_value_schema_key()
-                && row.entity_id == crate::runtime::deterministic_mode::deterministic_mode_key()
-        }) || state_commit_stream_changes.iter().any(|change| {
-            change.schema_key == key_value_schema_key()
-                && change.entity_id == crate::runtime::deterministic_mode::deterministic_mode_key()
-        })
-    }
-
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
         let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -294,15 +276,6 @@ pub(crate) struct TransactionBackendAdapter<'a> {
     dialect: SqlDialect,
     transaction: Mutex<*mut (dyn LixBackendTransaction + 'a)>,
     _lifetime: PhantomData<&'a ()>,
-}
-
-pub(crate) async fn normalize_sql_execution_error_with_backend(
-    backend: &dyn LixBackend,
-    error: LixError,
-    statements: &[Statement],
-) -> LixError {
-    crate::errors::classification::normalize_sql_error_with_backend(backend, error, statements)
-        .await
 }
 
 // SAFETY: `TransactionBackendAdapter` is only used inside a single async execution flow.
