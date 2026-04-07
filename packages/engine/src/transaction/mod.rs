@@ -4,7 +4,7 @@
 mod tests;
 
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::paths::filesystem::NormalizedDirectoryPath;
+use crate::common::paths::filesystem::NormalizedDirectoryPath;
 use crate::{LixBackendTransaction, LixError};
 
 pub use crate::write_runtime::{

@@ -14,9 +14,9 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::error::LixError;
-use crate::replay_cursor::ReplayCursor;
-use crate::types::{QueryResult, Value};
+use crate::common::error::LixError;
+use crate::live_state::ReplayCursor;
+use crate::common::types::{QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {

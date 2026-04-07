@@ -1,4 +1,4 @@
-use crate::ddl::execute_ddl_batch;
+use crate::backend::ddl::execute_ddl_batch;
 use crate::init::seed::read_scalar_count;
 use crate::init::InitExecutor;
 use crate::Value;

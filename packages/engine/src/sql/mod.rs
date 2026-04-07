@@ -35,3 +35,4 @@ pub(crate) mod prepare;
 pub(crate) mod routing;
 pub(crate) mod semantic_ir;
 pub(crate) mod storage;
+pub(crate) mod support;

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::paths::filesystem::NormalizedDirectoryPath;
+use crate::common::paths::filesystem::NormalizedDirectoryPath;
 use crate::transaction::lookup_directory_id_by_path_in_transaction;
 use crate::write_pipeline::{
     ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,

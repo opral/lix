@@ -1,6 +1,6 @@
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::engine::Engine;
-use crate::errors;
+use crate::common::errors;
 use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,

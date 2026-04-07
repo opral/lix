@@ -1,12 +1,12 @@
 use crate::contracts::artifacts::SessionDependency;
-use crate::errors;
+use crate::common::errors;
 use crate::session::Session;
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::prepare::dependency_spec::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
 };
 use crate::streams::StateCommitStream;
-use crate::wire::WireValue;
+use crate::common::wire::WireValue;
 use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
@@ -1091,7 +1091,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1132,7 +1132,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1238,7 +1238,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1285,7 +1285,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
                 "version-test".to_string(),
                 Vec::new(),
             );

@@ -1,5 +1,5 @@
 use crate::engine::builtin_schema_entity_id;
-use crate::errors;
+use crate::common::errors;
 use crate::init::InitExecutor;
 use crate::live_state::register_schema;
 use crate::Value;

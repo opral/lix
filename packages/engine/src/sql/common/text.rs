@@ -1,1 +1,1 @@
-pub(crate) use crate::text::escape_sql_string;
+pub(crate) use crate::common::text::escape_sql_string;

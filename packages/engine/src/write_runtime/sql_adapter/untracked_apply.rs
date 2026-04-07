@@ -57,7 +57,7 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
                 error.description
             ),
         })?;
-        crate::binary_blob_support::persist_resolved_binary_blob_writes_in_transaction(
+        crate::binary_cas::support::persist_resolved_binary_blob_writes_in_transaction(
             transaction,
             &resolved_binary_blob_writes,
         )

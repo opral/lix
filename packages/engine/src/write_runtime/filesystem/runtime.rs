@@ -1,5 +1,5 @@
-use crate::binary_blob_support::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
-use crate::content_fingerprint::stable_content_fingerprint_hex;
+use crate::binary_cas::support::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
+use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
     FilesystemPayloadDomainChange, FilesystemProjectionScope, MutationRow, OptionalTextPatch,
 };
@@ -545,7 +545,7 @@ pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
 pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
-    crate::binary_blob_support::garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+    crate::binary_cas::support::garbage_collect_unreachable_binary_cas_in_transaction(transaction)
         .await
 }
 

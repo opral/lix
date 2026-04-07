@@ -12,7 +12,7 @@ pub(crate) struct EncodedBinaryChunkPayload {
 }
 
 pub(crate) fn binary_blob_hash_hex(data: &[u8]) -> String {
-    crate::content_fingerprint::stable_content_fingerprint_hex(data)
+    crate::common::fingerprint::stable_content_fingerprint_hex(data)
 }
 
 pub(crate) fn encode_binary_chunk_payload(

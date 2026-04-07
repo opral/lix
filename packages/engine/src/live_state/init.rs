@@ -1,4 +1,4 @@
-use crate::ddl::execute_ddl_batch;
+use crate::backend::ddl::execute_ddl_batch;
 use crate::live_state::lifecycle;
 use crate::live_state::register_schema;
 use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};

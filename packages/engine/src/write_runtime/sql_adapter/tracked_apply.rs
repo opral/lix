@@ -1,7 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 
-use crate::change_view::TrackedDomainChangeView;
+use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     CommitPreconditions, DomainChangeBatch, ExpectedHead, PlanEffects, PreparedPublicWriteArtifact,
     PublicDomainChange, SchemaKey, SessionStateDelta, WriteLane,

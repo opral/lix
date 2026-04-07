@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::text::escape_sql_string;
+use crate::common::text::escape_sql_string;
 use crate::version::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::binary_blob_support::build_binary_blob_fastcdc_write_program;
+use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -8,7 +8,7 @@ use crate::canonical::journal::{
     build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
 };
 use crate::canonical::read::{load_version_info_for_versions, CommitQueryExecutor, VersionInfo};
-use crate::canonical_json::CanonicalJson;
+use crate::canonical::json::CanonicalJson;
 use crate::contracts::functions::LixFunctionProvider;
 use crate::transaction_execution::{execute_write_program_with_transaction, WriteProgram};
 use crate::write_runtime::filesystem::runtime::BinaryBlobWrite;
@@ -133,7 +133,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     timestamp: &str,
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let tracked_writer_key_annotations =
-        crate::annotations::writer_key::tracked_writer_key_annotations_from_changes(
+        crate::schema::annotations::writer_key::tracked_writer_key_annotations_from_changes(
             changes, writer_key,
         );
     let domain_changes = changes
@@ -388,7 +388,7 @@ async fn execute_generated_commit_result(
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     let mut executor = &mut *transaction;
-    crate::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
+    crate::schema::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
         &mut executor,
         tracked_writer_key_annotations,
     )

@@ -1,6 +1,6 @@
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::PendingView;
-use crate::paths::filesystem::{
+use crate::common::paths::filesystem::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };

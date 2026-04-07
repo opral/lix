@@ -335,7 +335,7 @@ mod tests {
 
     #[test]
     fn agent_entrypoints_use_error_catalog_constructors() {
-        let statement_support_src = include_str!("../statement_support.rs");
+        let statement_support_src = include_str!("../../sql/support.rs");
         assert!(statement_support_src.contains("errors::internal_table_access_denied_error()"));
 
         let classification_src = include_str!("classification.rs");
@@ -343,13 +343,13 @@ mod tests {
         assert!(classification_src.contains("errors::sql_unknown_column_error("));
         assert!(classification_src.contains("errors::table_not_found_read_error()"));
 
-        let state_history_write_src = include_str!("../sql/prepare/public_surface/mod.rs");
+        let state_history_write_src = include_str!("../../sql/prepare/public_surface/mod.rs");
         assert!(state_history_write_src.contains("read_only_view_write_error("));
 
-        let change_write_src = include_str!("../sql/prepare/public_surface/mod.rs");
+        let change_write_src = include_str!("../../sql/prepare/public_surface/mod.rs");
         assert!(change_write_src.contains("read_only_view_write_error("));
 
-        let session_src = include_str!("../session/mod.rs");
+        let session_src = include_str!("../../session/mod.rs");
         assert!(session_src.contains("errors::transaction_control_statement_denied_error()"));
         assert!(session_src.contains("reject_public_create_table("));
     }

@@ -1,6 +1,6 @@
 use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::deterministic_settings_scope::global_deterministic_settings_storage_scope;
+use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::functions::SharedFunctionProvider;
 use crate::runtime::streams::{StateCommitStream, StateCommitStreamFilter};
@@ -27,7 +27,7 @@ impl Engine {
     }
 
     pub async fn open_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
-        crate::Session::open_workspace(crate::session_collaborators::SessionCollaborators::new(
+        crate::Session::open_workspace(crate::session::collaborators::SessionCollaborators::new(
             Arc::clone(self),
         ))
         .await
@@ -331,7 +331,7 @@ mod tests {
                         Arc::new(NoopWasmRuntime),
                     )));
                     let session = Session::new_for_test(
-                        crate::session_collaborators::SessionCollaborators::new(Arc::clone(
+                        crate::session::collaborators::SessionCollaborators::new(Arc::clone(
                             &engine,
                         )),
                         "version-test".to_string(),
@@ -379,7 +379,7 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         )));
         let session = Session::new_for_test(
-            crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+            crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
             "version-test".to_string(),
             Vec::new(),
         );
@@ -436,7 +436,7 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         )));
         let session = Session::new_for_test(
-            crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+            crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
             "version-test".to_string(),
             Vec::new(),
         );

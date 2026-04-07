@@ -64,12 +64,12 @@ async fn append_tracked_unchecked(
 
     if let Some(receipt) = result.receipt.as_ref() {
         let tracked_writer_key_annotations =
-            crate::annotations::writer_key::tracked_writer_key_annotations_from_changes(
+            crate::schema::annotations::writer_key::tracked_writer_key_annotations_from_changes(
                 &result.applied_domain_changes,
                 execution_writer_key.as_deref(),
             );
         let mut executor = &mut *transaction;
-        crate::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
+        crate::schema::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
             &mut executor,
             &tracked_writer_key_annotations,
         )

@@ -34,7 +34,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
-            return Err(crate::errors::unexpected_statement_count_error(
+            return Err(crate::common::errors::unexpected_statement_count_error(
                 "default checkpoint label query",
                 1,
                 existing.statements.len(),
@@ -117,7 +117,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             )
             .await?;
         let [statement] = existing.statements.as_slice() else {
-            return Err(crate::errors::unexpected_statement_count_error(
+            return Err(crate::common::errors::unexpected_statement_count_error(
                 "checkpoint label bootstrap link existence query",
                 1,
                 existing.statements.len(),

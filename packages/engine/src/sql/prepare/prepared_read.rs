@@ -16,7 +16,7 @@ use crate::contracts::artifacts::{
     PublicReadResultColumns, ReadDiagnosticContext,
 };
 use crate::contracts::traits::SqlPreparationMetadataReader;
-use crate::errors::classification::{
+use crate::common::errors::classification::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};

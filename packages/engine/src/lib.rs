@@ -1,61 +1,40 @@
-mod annotations;
 mod api;
 mod backend;
-mod binary_blob_support;
 mod binary_cas;
 mod boot;
+mod common;
 pub(crate) mod canonical;
-mod canonical_json;
-mod change_view;
 pub(crate) mod checkpoint;
 mod checkpoint_artifacts;
 mod checkpoint_cache;
-mod content_fingerprint;
 pub(crate) mod contracts;
-mod ddl;
-mod deterministic_sequence;
-mod deterministic_settings_scope;
 mod engine;
-mod error;
-mod errors;
 pub(crate) mod execution_effects;
 mod execution_runtime;
-pub(crate) mod explain_output;
 mod filesystem_materialization;
 mod filesystem_payload_sql;
 mod filesystem_projection_sql;
-mod identity;
 mod init;
-pub(crate) mod live_schema_access;
 pub mod live_state;
-mod live_storage_layout;
 mod lix;
-mod paths;
 mod prepared_write_artifacts;
 pub(crate) mod projections;
 mod public_surface_source_sql;
 mod read_pipeline;
 pub(crate) mod read_runtime;
-mod replay_cursor;
 mod runtime;
 mod schema;
 pub mod session;
-mod session_collaborators;
 pub(crate) mod sql;
-mod sql_dialect;
 mod state_selector_rows;
-mod statement_support;
 #[cfg(test)]
 mod test_support;
-mod text;
 pub mod transaction;
 mod transaction_execution;
 mod transaction_mode;
-mod types;
 mod version;
 mod version_artifacts;
 mod version_inventory_sql;
-pub mod wire;
 mod write_pipeline;
 pub(crate) mod write_runtime;
 
@@ -86,17 +65,19 @@ pub use backend::prepared::{
 };
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
-pub use canonical_json::CanonicalJson;
+pub use canonical::json::CanonicalJson;
 pub use checkpoint::CreateCheckpointResult;
+pub use common::error::LixError;
+pub use common::identity::{
+    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
+};
+pub use common::types::{ExecuteResult, QueryResult, Value};
+pub use common::wire::{WireQueryResult, WireValue};
 pub use contracts::artifacts::CommittedVersionFrontier;
 pub use contracts::artifacts::ExecuteOptions;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootKeyValue, Engine};
-pub use error::LixError;
-pub use identity::{
-    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
-};
 pub use live_state::{
     apply_live_state_rebuild_plan, live_state_rebuild_plan, rebuild_live_state,
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
@@ -106,16 +87,15 @@ pub use live_state::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 pub use lix::{InitResult, Lix, LixConfig};
-pub use replay_cursor::ReplayCursor;
+pub use live_state::ReplayCursor;
 pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use session::{OpenSessionOptions, Session, SessionTransaction};
 #[doc(hidden)]
 pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
 #[doc(hidden)]
 pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
-pub use sql_dialect::SqlDialect;
+pub use sql::common::dialect::SqlDialect;
 pub use transaction_mode::TransactionMode;
-pub use types::{ExecuteResult, QueryResult, Value};
 pub use version::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult, RedoOptions, RedoResult, UndoOptions, UndoResult,

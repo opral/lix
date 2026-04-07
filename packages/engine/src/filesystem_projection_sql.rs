@@ -1,8 +1,8 @@
-use crate::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
+use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::live_schema_access::{payload_column_name_for_schema, tracked_relation_name};
-use crate::text::escape_sql_string;
+use crate::schema::access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::common::text::escape_sql_string;
 use crate::version_artifacts::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 

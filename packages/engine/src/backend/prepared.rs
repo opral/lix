@@ -1,5 +1,5 @@
 pub use crate::contracts::artifacts::{PreparedBatch, PreparedStatement};
-use crate::statement_support::{parse_sql_statements, resolve_placeholder_index, PlaceholderState};
+use crate::sql::support::{parse_sql_statements, resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Expr, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;

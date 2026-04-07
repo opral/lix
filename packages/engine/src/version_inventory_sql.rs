@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::text::escape_sql_string;
+use crate::common::text::escape_sql_string;
 use crate::version::build_local_version_ref_heads_source_sql;
 use crate::version_artifacts::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,

@@ -3,8 +3,8 @@ use std::collections::BTreeSet;
 use crate::contracts::artifacts::{
     DomainChangeBatch, PreparedPublicWriteArtifact, PreparedWriteOperationKind,
 };
-use crate::ddl::execute_ddl_batch;
-use crate::text::escape_sql_string;
+use crate::backend::ddl::execute_ddl_batch;
+use crate::common::text::escape_sql_string;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 pub(crate) const LAST_CHECKPOINT_TABLE: &str = "lix_internal_last_checkpoint";

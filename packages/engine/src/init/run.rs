@@ -27,7 +27,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
 
     if load_mode_with_backend(engine.backend().as_ref()).await? != LiveStateMode::Uninitialized {
         engine.reset_init_state();
-        return Err(crate::errors::already_initialized_error());
+        return Err(crate::common::errors::already_initialized_error());
     }
 
     let mut transaction = engine
@@ -72,7 +72,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
             if !try_claim_bootstrap_with_backend(&backend).await? {
-                return Err(crate::errors::already_initialized_error());
+                return Err(crate::common::errors::already_initialized_error());
             }
         }
         claimed_bootstrap = true;
@@ -158,7 +158,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
 pub(crate) async fn init_if_needed(engine: &Engine) -> Result<bool, LixError> {
     match init(engine).await {
         Ok(()) => Ok(true),
-        Err(error) if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() => {
+        Err(error) if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() => {
             engine.wait_for_concurrent_init_ready().await?;
             engine.refresh_public_surface_registry().await?;
             Ok(false)
@@ -187,14 +187,14 @@ impl Engine {
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
-        if error.code == crate::errors::ErrorCode::AlreadyInitialized.as_str() {
+        if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() {
             return error;
         }
         if is_init_conflict_error(&error.description) {
-            return crate::errors::already_initialized_error();
+            return crate::common::errors::already_initialized_error();
         }
         if is_init_locked_error(&error.description) {
-            return crate::errors::already_initialized_error();
+            return crate::common::errors::already_initialized_error();
         }
         error
     }
@@ -208,21 +208,21 @@ impl Engine {
                 LiveStateMode::Ready => return Ok(()),
                 LiveStateMode::Bootstrapping => {
                     if attempt + 1 == ATTEMPTS {
-                        return Err(crate::errors::live_state_not_ready_error());
+                        return Err(crate::common::errors::live_state_not_ready_error());
                     }
                 }
                 LiveStateMode::Uninitialized => {
                     if attempt + 1 == ATTEMPTS {
-                        return Err(crate::errors::not_initialized_error());
+                        return Err(crate::common::errors::not_initialized_error());
                     }
                 }
                 LiveStateMode::NeedsRebuild | LiveStateMode::Rebuilding => {
-                    return Err(crate::errors::live_state_not_ready_error())
+                    return Err(crate::common::errors::live_state_not_ready_error())
                 }
             }
             std::thread::sleep(Duration::from_millis(DELAY_MS));
         }
-        Err(crate::errors::live_state_not_ready_error())
+        Err(crate::common::errors::live_state_not_ready_error())
     }
 }
 

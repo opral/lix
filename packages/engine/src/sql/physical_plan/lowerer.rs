@@ -3,7 +3,7 @@ use crate::contracts::surface::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
-use crate::errors::sql_unknown_column_error;
+use crate::common::errors::sql_unknown_column_error;
 use crate::filesystem_projection_sql::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };

@@ -37,6 +37,7 @@ pub(crate) mod pending_reads;
 pub(crate) mod projection;
 mod query_contracts;
 pub(crate) mod raw;
+mod replay_cursor;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
 pub(crate) mod storage;
@@ -46,7 +47,7 @@ pub mod tracked;
 pub mod untracked;
 mod visible_rows;
 use crate::contracts::traits::{TrackedWriteParticipant, UntrackedWriteParticipant};
-use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -81,6 +82,7 @@ pub use materialize::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
+pub use replay_cursor::ReplayCursor;
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
 pub use tracked::{

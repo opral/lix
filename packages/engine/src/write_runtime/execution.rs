@@ -356,7 +356,7 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::annotations::writer_key::WorkspaceWriterKeyReadView;
+    use crate::schema::annotations::writer_key::WorkspaceWriterKeyReadView;
     use crate::contracts::traits::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
     use crate::live_state::shared::identity::RowIdentity;
     use crate::live_state::tracked::{

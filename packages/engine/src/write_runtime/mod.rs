@@ -12,7 +12,7 @@ mod resolve_write_plan;
 pub(crate) mod sql_adapter;
 mod validation;
 
-pub(crate) use crate::deterministic_sequence::{
+pub(crate) use crate::runtime::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
     deterministic_sequence_key, ensure_runtime_sequence_initialized_in_transaction,
     persist_runtime_sequence_in_transaction,

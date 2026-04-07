@@ -1,3 +1,4 @@
+pub(crate) mod ddl;
 pub(crate) mod image;
 pub(crate) mod prepared;
 pub(crate) mod program;
@@ -9,7 +10,7 @@ use std::collections::BTreeMap;
 
 use crate::backend::prepared::PreparedBatch;
 use crate::contracts::traits::SqlPreparationMetadataReader;
-use crate::sql_dialect::SqlDialect;
+use crate::sql::common::dialect::SqlDialect;
 pub use crate::transaction_mode::TransactionMode;
 use crate::version::{
     load_local_version_head_commit_id_with_executor, load_local_version_ref_heads_map_with_executor,

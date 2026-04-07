@@ -40,7 +40,7 @@ pub(super) async fn run_internal_write_txn_with_transaction(
             &filesystem_finalization.binary_blob_writes,
         )
         .await?;
-        crate::binary_blob_support::persist_resolved_binary_blob_writes_in_transaction(
+        crate::binary_cas::support::persist_resolved_binary_blob_writes_in_transaction(
             transaction,
             &resolved_binary_blob_writes,
         )

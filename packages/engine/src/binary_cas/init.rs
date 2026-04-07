@@ -1,5 +1,5 @@
 use crate::binary_cas::schema::INTERNAL_BINARY_CHUNK_STORE;
-use crate::ddl::{add_column_if_missing, execute_ddl_batch};
+use crate::backend::ddl::{add_column_if_missing, execute_ddl_batch};
 use crate::{LixBackend, LixError};
 
 const BINARY_CAS_INIT_STATEMENTS: &[&str] = &[
