@@ -17,13 +17,13 @@ where
 {
     std::thread::Builder::new()
         .name("session-workspace-boundary".to_string())
-        .stack_size(8 * 1024 * 1024)
+        .stack_size(64 * 1024 * 1024)
         .spawn(move || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("tokio runtime should build")
-                .block_on(factory());
+                .block_on(Box::pin(factory()));
         })
         .expect("session workspace thread should spawn")
         .join()

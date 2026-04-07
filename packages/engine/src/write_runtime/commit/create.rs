@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::program_runner::execute_write_program_with_transaction;
-use crate::binary_cas::write::build_binary_blob_fastcdc_write_program;
+use crate::binary_blob_support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -14,10 +13,11 @@ use crate::canonical::read::{
 };
 use crate::canonical_json::CanonicalJson;
 use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
-use crate::runtime::functions::LixFunctionProvider;
-use crate::version::load_committed_version_head_commit_id;
-use crate::version::version_ref_snapshot_content;
-use crate::version::GLOBAL_VERSION_ID;
+use crate::contracts::functions::LixFunctionProvider;
+use crate::transaction_execution::execute_write_program_with_transaction;
+use crate::version_artifacts::{
+    load_committed_version_head_commit_id, version_ref_snapshot_content, GLOBAL_VERSION_ID,
+};
 use crate::write_runtime::filesystem::runtime::{
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
@@ -1341,12 +1341,12 @@ mod tests {
     };
     use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
     use crate::contracts::artifacts::OptionalTextPatch;
-    use crate::runtime::functions::LixFunctionProvider;
+    use crate::contracts::functions::LixFunctionProvider;
     use crate::test_support::{
         init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::version::GLOBAL_VERSION_ID;
+    use crate::version_artifacts::GLOBAL_VERSION_ID;
     use crate::write_runtime::commit::UpdatedVersionRef;
     use crate::write_runtime::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState,
@@ -1495,22 +1495,24 @@ mod tests {
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
             file_id: Some(
-                crate::version::version_descriptor_file_id()
+                crate::version_artifacts::version_descriptor_file_id()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
             plugin_key: Some(
-                crate::version::version_descriptor_plugin_key()
+                crate::version_artifacts::version_descriptor_plugin_key()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
-            snapshot_content: Some(crate::version::version_descriptor_snapshot_content(
-                "version-a",
-                "Version A",
-                false,
-            )),
+            snapshot_content: Some(
+                crate::version_artifacts::version_descriptor_snapshot_content(
+                    "version-a",
+                    "Version A",
+                    false,
+                ),
+            ),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
@@ -1797,7 +1799,7 @@ mod tests {
             .to_string(),
             "current_head_fingerprint",
             "fp-1",
-            &crate::version::version_ref_snapshot_content("version-a", "commit-456"),
+            &crate::version_artifacts::version_ref_snapshot_content("version-a", "commit-456"),
             "commit-456",
         )
         .await;

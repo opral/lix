@@ -1,5 +1,6 @@
 use crate::runtime::deterministic_mode::{
-    load_runtime_settings, DeterministicSettings, RuntimeFunctionProvider,
+    load_runtime_settings, DeterministicSettings, PersistedKeyValueStorageScope,
+    RuntimeFunctionProvider,
 };
 use crate::runtime::functions::SharedFunctionProvider;
 use crate::{LixBackend, LixError};
@@ -10,6 +11,7 @@ impl Runtime {
     pub(crate) async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
+        storage_scope: &PersistedKeyValueStorageScope,
     ) -> Result<
         (
             DeterministicSettings,
@@ -23,7 +25,7 @@ impl Runtime {
         } else if let Some(settings) = self.cached_deterministic_settings() {
             settings
         } else {
-            let settings = load_runtime_settings(backend).await?;
+            let settings = load_runtime_settings(backend, storage_scope).await?;
             self.cache_deterministic_settings(settings);
             settings
         };
@@ -92,7 +94,6 @@ mod tests {
         let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
         let (settings, _) = engine
-            .runtime()
             .prepare_runtime_functions_with_backend(engine.backend().as_ref())
             .await
             .expect("first runtime preparation should succeed");
@@ -104,7 +105,6 @@ mod tests {
         );
 
         let (_settings, _) = engine
-            .runtime()
             .prepare_runtime_functions_with_backend(engine.backend().as_ref())
             .await
             .expect("second runtime preparation should succeed");
@@ -117,7 +117,6 @@ mod tests {
         engine.runtime().invalidate_deterministic_settings_cache();
 
         let (_settings, _) = engine
-            .runtime()
             .prepare_runtime_functions_with_backend(engine.backend().as_ref())
             .await
             .expect("runtime preparation after invalidation should succeed");

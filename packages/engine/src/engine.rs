@@ -1,21 +1,16 @@
-use crate::contracts::artifacts::{FilesystemPayloadDomainChange, MutationRow};
 use crate::contracts::projection::ProjectionRegistry;
+use crate::contracts::surface::SurfaceRegistry;
+use crate::deterministic_settings_scope::global_deterministic_settings_storage_scope;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::functions::SharedFunctionProvider;
-use crate::runtime::streams::{
-    StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
-};
+use crate::runtime::streams::{StateCommitStream, StateCommitStreamFilter};
 use crate::runtime::wasm::WasmRuntime;
 use crate::runtime::Runtime;
 use crate::{LixBackend, LixError};
 use serde_json::Value as JsonValue;
-use sqlparser::ast::{ObjectNamePart, Statement, TableFactor, TableObject};
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub use crate::boot::{boot, BootArgs, BootKeyValue};
-
-const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
 pub struct Engine {
     runtime: Arc<Runtime>,
@@ -32,7 +27,10 @@ impl Engine {
     }
 
     pub async fn open_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
-        crate::Session::open_workspace(Arc::clone(self)).await
+        crate::Session::open_workspace(crate::session_collaborators::SessionCollaborators::new(
+            Arc::clone(self),
+        ))
+        .await
     }
 
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -55,6 +53,28 @@ impl Engine {
         self.runtime.public_surface_registry()
     }
 
+    pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
+        self.runtime.install_public_surface_registry(registry);
+    }
+
+    pub(crate) fn clear_public_surface_registry(&self) {
+        self.runtime.clear_public_surface_registry();
+    }
+
+    pub(crate) async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
+        self.runtime
+            .load_public_surface_registry_from_backend()
+            .await
+    }
+
+    pub(crate) async fn refresh_public_surface_registry(
+        &self,
+    ) -> Result<SurfaceRegistry, LixError> {
+        let registry = self.load_public_surface_registry().await?;
+        self.install_public_surface_registry(registry.clone());
+        Ok(registry)
+    }
+
     pub(crate) fn projection_registry(&self) -> &Arc<ProjectionRegistry> {
         self.runtime.projection_registry()
     }
@@ -75,15 +95,6 @@ impl Engine {
         self.runtime.reset_init_state();
     }
 
-    pub(crate) fn should_invalidate_deterministic_settings_cache(
-        &self,
-        mutations: &[MutationRow],
-        state_commit_stream_changes: &[StateCommitStreamChange],
-    ) -> bool {
-        self.runtime
-            .should_invalidate_deterministic_settings_cache(mutations, state_commit_stream_changes)
-    }
-
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
         self.runtime.invalidate_installed_plugins_cache()
     }
@@ -98,111 +109,11 @@ impl Engine {
         ),
         LixError,
     > {
+        let storage_scope = global_deterministic_settings_storage_scope();
         self.runtime
-            .prepare_runtime_functions_with_backend(backend)
+            .prepare_runtime_functions_with_backend(backend, &storage_scope)
             .await
     }
-}
-
-#[derive(Default)]
-pub(crate) struct DeferredTransactionSideEffects {
-    pub(crate) filesystem_state:
-        crate::write_runtime::filesystem::runtime::FilesystemTransactionState,
-}
-
-pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
-    for statement in statements {
-        if statement_mutates_protected_lix_relation(statement) {
-            return Err(crate::errors::internal_table_access_denied_error());
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn reject_public_create_table(statements: &[Statement]) -> Result<(), LixError> {
-    if statements
-        .iter()
-        .any(|statement| matches!(statement, Statement::CreateTable(_)))
-    {
-        return Err(crate::errors::public_create_table_denied_error());
-    }
-    Ok(())
-}
-
-fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
-    match statement {
-        Statement::Insert(insert) => match &insert.table {
-            TableObject::TableName(name) => object_name_is_internal_storage_relation(name),
-            _ => false,
-        },
-        Statement::Update(update) => match &update.table.relation {
-            TableFactor::Table { name, .. } => object_name_is_internal_storage_relation(name),
-            _ => false,
-        },
-        Statement::Delete(delete) => {
-            let tables = match &delete.from {
-                sqlparser::ast::FromTable::WithFromKeyword(tables)
-                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-            };
-            tables.iter().any(|table| match &table.relation {
-                TableFactor::Table { name, .. } => object_name_is_internal_storage_relation(name),
-                _ => false,
-            })
-        }
-        Statement::AlterTable(alter) => object_name_is_protected_lix_ddl_target(&alter.name),
-        Statement::CreateIndex(create_index) => {
-            object_name_is_protected_lix_ddl_target(&create_index.table_name)
-        }
-        Statement::CreateTrigger(create_trigger) => {
-            object_name_is_protected_lix_ddl_target(&create_trigger.table_name)
-                || create_trigger
-                    .referenced_table_name
-                    .as_ref()
-                    .map(object_name_is_protected_lix_ddl_target)
-                    .unwrap_or(false)
-        }
-        Statement::DropTrigger(drop_trigger) => drop_trigger
-            .table_name
-            .as_ref()
-            .map(object_name_is_protected_lix_ddl_target)
-            .unwrap_or(false),
-        Statement::Drop { names, table, .. } => {
-            names.iter().any(object_name_is_protected_lix_ddl_target)
-                || table
-                    .as_ref()
-                    .map(object_name_is_protected_lix_ddl_target)
-                    .unwrap_or(false)
-        }
-        Statement::Truncate(truncate) => truncate
-            .table_names
-            .iter()
-            .any(|target| object_name_is_protected_lix_ddl_target(&target.name)),
-        _ => false,
-    }
-}
-
-fn object_name_to_relation(name: &sqlparser::ast::ObjectName) -> Option<String> {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.to_ascii_lowercase())
-}
-
-fn object_name_is_internal_storage_relation(name: &sqlparser::ast::ObjectName) -> bool {
-    object_name_to_relation(name)
-        .map(|relation| relation.starts_with("lix_internal_"))
-        .unwrap_or(false)
-}
-
-fn object_name_is_protected_lix_ddl_target(name: &sqlparser::ast::ObjectName) -> bool {
-    let Some(relation) = object_name_to_relation(name) else {
-        return false;
-    };
-
-    relation.starts_with("lix_internal_")
-        || crate::schema::builtin_public_surface_names()
-            .iter()
-            .any(|surface| surface.eq_ignore_ascii_case(&relation))
 }
 
 #[cfg(test)]
@@ -234,57 +145,6 @@ impl Engine {
     }
 }
 
-pub(crate) fn should_run_binary_cas_gc(
-    mutations: &[MutationRow],
-    filesystem_payload_domain_changes: &[FilesystemPayloadDomainChange],
-) -> bool {
-    mutations
-        .iter()
-        .any(|mutation| !mutation.untracked && mutation.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
-        || filesystem_payload_domain_changes
-            .iter()
-            .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
-}
-
-trait DedupableFilesystemPayloadChange {
-    fn dedupe_key(&self) -> (&str, &str, &str, &str, bool);
-}
-
-impl DedupableFilesystemPayloadChange for FilesystemPayloadDomainChange {
-    fn dedupe_key(&self) -> (&str, &str, &str, &str, bool) {
-        (
-            &self.file_id,
-            &self.version_id,
-            &self.schema_key,
-            &self.entity_id,
-            self.untracked,
-        )
-    }
-}
-
-fn dedupe_detected_changes<T>(changes: &[T]) -> Vec<T>
-where
-    T: DedupableFilesystemPayloadChange + Clone,
-{
-    let mut latest_by_key: BTreeMap<(&str, &str, &str, &str, bool), usize> = BTreeMap::new();
-    for (index, change) in changes.iter().enumerate() {
-        latest_by_key.insert(change.dedupe_key(), index);
-    }
-
-    let mut ordered_indexes = latest_by_key.into_values().collect::<Vec<_>>();
-    ordered_indexes.sort_unstable();
-    ordered_indexes
-        .into_iter()
-        .filter_map(|index| changes.get(index).cloned())
-        .collect()
-}
-
-pub(crate) fn dedupe_filesystem_payload_domain_changes(
-    changes: &[FilesystemPayloadDomainChange],
-) -> Vec<FilesystemPayloadDomainChange> {
-    dedupe_detected_changes(changes)
-}
-
 pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
     let schema_key = schema
         .get("x-lix-key")
@@ -307,7 +167,6 @@ pub(crate) fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::{boot, should_invalidate_installed_plugins_cache_for_sql, BootArgs};
-    use crate::backend::{LixBackend, LixBackendTransaction, SqlDialect};
     use crate::runtime::wasm::NoopWasmRuntime;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
@@ -316,7 +175,10 @@ mod tests {
     use crate::sql::parser::parse_sql_statements;
     use crate::sql::parser::placeholders::PlaceholderState;
     use crate::TransactionMode;
-    use crate::{ExecuteOptions, LixError, QueryResult, Session, Value};
+    use crate::{
+        ExecuteOptions, LixBackend, LixBackendTransaction, LixError, QueryResult, Session,
+        SqlDialect, Value,
+    };
     use async_trait::async_trait;
     use sqlparser::ast::Statement;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -469,7 +331,9 @@ mod tests {
                         Arc::new(NoopWasmRuntime),
                     )));
                     let session = Session::new_for_test(
-                        Arc::clone(&engine),
+                        crate::session_collaborators::SessionCollaborators::new(Arc::clone(
+                            &engine,
+                        )),
                         "version-test".to_string(),
                         Vec::new(),
                     );
@@ -514,8 +378,11 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session =
-            Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+        let session = Session::new_for_test(
+            crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+            "version-test".to_string(),
+            Vec::new(),
+        );
 
         {
             let mut cache = engine
@@ -568,8 +435,11 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session =
-            Session::new_for_test(Arc::clone(&engine), "version-test".to_string(), Vec::new());
+        let session = Session::new_for_test(
+            crate::session_collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+            "version-test".to_string(),
+            Vec::new(),
+        );
 
         {
             let mut cache = engine

@@ -11,10 +11,9 @@ use crate::paths::filesystem::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::semantic_ir::semantics::filesystem_assignments::{
-    DirectoryInsertAssignments, DirectoryUpdateAssignments, FileInsertAssignments,
-    FileUpdateAssignments, FilesystemWriteIntent,
+use crate::prepared_write_artifacts::{
+    resolve_placeholder_index, DirectoryInsertAssignments, DirectoryUpdateAssignments,
+    FileInsertAssignments, FileUpdateAssignments, FilesystemWriteIntent, PlaceholderState,
 };
 use crate::write_runtime::filesystem::query::{
     ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
@@ -49,8 +48,8 @@ fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> Wr
 
 pub(super) async fn resolve_filesystem_write(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_file" | "lix_file_by_version" => match planned_write.command.operation_kind {
@@ -60,11 +59,11 @@ pub(super) async fn resolve_filesystem_write(
             WriteOperationKind::Update | WriteOperationKind::Delete => {
                 resolve_existing_file_write(
                     hydrator.backend(),
-                    projection_registry,
                     planned_write,
                     hydrator
                         .pending_state_overlay()
                         .map(|overlay| overlay.as_pending_view()),
+                    selector_resolver,
                 )
                 .await
             }
@@ -77,11 +76,11 @@ pub(super) async fn resolve_filesystem_write(
                 WriteOperationKind::Update | WriteOperationKind::Delete => {
                     resolve_existing_directory_write(
                         hydrator.backend(),
-                        projection_registry,
                         planned_write,
                         hydrator
                             .pending_state_overlay()
                             .map(|overlay| overlay.as_pending_view()),
+                        selector_resolver,
                     )
                     .await
                 }
@@ -264,19 +263,19 @@ async fn resolve_directory_insert_write_plan(
 
 async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
     let current_rows = load_target_directory_rows_for_selector(
         backend,
-        projection_registry,
         planned_write,
         pending_transaction_view,
         &version_id,
         lookup_scope,
+        selector_resolver,
     )
     .await?;
     if current_rows.is_empty() {
@@ -620,9 +619,9 @@ async fn resolve_file_insert_write_plan(
 
 async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write);
@@ -631,12 +630,12 @@ async fn resolve_existing_file_write(
             let assignments = file_update_assignments(planned_write)?;
             let current_rows = load_target_file_rows_for_selector(
                 backend,
-                projection_registry,
                 planned_write,
                 pending_transaction_view,
                 &version_id,
                 lookup_scope,
                 assignments.path.is_some(),
+                selector_resolver,
             )
             .await?;
             if current_rows.is_empty() {
@@ -778,12 +777,12 @@ async fn resolve_existing_file_write(
         WriteOperationKind::Delete => {
             let current_rows = load_target_file_rows_for_selector(
                 backend,
-                projection_registry,
                 planned_write,
                 pending_transaction_view,
                 &version_id,
                 lookup_scope,
                 true,
+                selector_resolver,
             )
             .await?;
             if current_rows.is_empty() {
@@ -923,7 +922,7 @@ fn ensure_file_state_entry<'a>(
             version_id: version_id.to_string(),
             untracked,
             descriptor: None,
-            metadata_patch: crate::sql::logical_plan::public_ir::OptionalTextPatch::Unchanged,
+            metadata_patch: crate::contracts::artifacts::OptionalTextPatch::Unchanged,
             data: None,
             deleted: false,
         })
@@ -940,7 +939,7 @@ fn set_filesystem_descriptor_state(
     entry.untracked = untracked;
     entry.deleted = false;
     entry.descriptor = Some(descriptor);
-    entry.metadata_patch = crate::sql::logical_plan::public_ir::OptionalTextPatch::Unchanged;
+    entry.metadata_patch = crate::contracts::artifacts::OptionalTextPatch::Unchanged;
 }
 
 fn set_filesystem_data_state(
@@ -967,7 +966,7 @@ fn set_filesystem_deleted_state(
     entry.deleted = true;
     entry.descriptor = None;
     entry.data = None;
-    entry.metadata_patch = crate::sql::logical_plan::public_ir::OptionalTextPatch::Unchanged;
+    entry.metadata_patch = crate::contracts::artifacts::OptionalTextPatch::Unchanged;
 }
 
 async fn resolve_missing_directory_rows(
@@ -1448,11 +1447,11 @@ fn resolve_proposed_directory_path(
 
 async fn load_target_directory_rows_for_selector(
     backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
     if let Some(directory_id) = exact_id_selector_value(planned_write) {
         return Ok(load_directory_row_by_id_with_pending_transaction_view(
@@ -1466,15 +1465,13 @@ async fn load_target_directory_rows_for_selector(
         .into_iter()
         .collect());
     }
-    let directory_ids = query_text_selector_values_for_write_selector(
-        backend,
-        projection_registry,
-        planned_write,
-        pending_transaction_view,
-        "id",
-        "public filesystem directory selector resolver expected id text rows",
-    )
-    .await?;
+    let directory_ids = selector_resolver
+        .load_text_selector_values(
+            planned_write,
+            "id",
+            "public filesystem directory selector resolver expected id text rows",
+        )
+        .await?;
     let mut rows = Vec::new();
     for directory_id in directory_ids {
         if let Some(row) =
@@ -1488,12 +1485,12 @@ async fn load_target_directory_rows_for_selector(
 
 async fn load_target_file_rows_for_selector(
     backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
     require_paths: bool,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
     if let Some(file_id) = exact_id_selector_value(planned_write) {
         let row = if require_paths {
@@ -1536,15 +1533,13 @@ async fn load_target_file_rows_for_selector(
         }
         return Ok(rows);
     }
-    let file_ids = query_text_selector_values_for_write_selector(
-        backend,
-        projection_registry,
-        planned_write,
-        pending_transaction_view,
-        "id",
-        "public filesystem file selector resolver expected id text rows",
-    )
-    .await?;
+    let file_ids = selector_resolver
+        .load_text_selector_values(
+            planned_write,
+            "id",
+            "public filesystem file selector resolver expected id text rows",
+        )
+        .await?;
     let mut rows = Vec::new();
     for file_id in file_ids {
         let row = if require_paths {
@@ -1975,7 +1970,7 @@ fn binary_blob_ref_row(
     })?;
     let snapshot_content = json!({
         "id": file_id,
-        "blob_hash": crate::binary_cas::codec::binary_blob_hash_hex(data),
+        "blob_hash": crate::content_fingerprint::stable_content_fingerprint_hex(data),
         "size_bytes": size_bytes,
     })
     .to_string();

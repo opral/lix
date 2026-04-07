@@ -1,21 +1,36 @@
 use std::collections::BTreeMap;
 
-use crate::live_state::schema_access::tracked_relation_name;
-use crate::schema::builtin::storage::key_value_schema_key;
 use crate::text::escape_sql_string;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
 
+#[derive(Debug, Clone)]
+pub(crate) struct PersistedKeyValueStorageScope {
+    pub(crate) table_name: String,
+    pub(crate) version_id: String,
+}
+
+impl PersistedKeyValueStorageScope {
+    pub(crate) fn new(
+        table_name: impl Into<String>,
+        version_id: impl Into<String>,
+    ) -> PersistedKeyValueStorageScope {
+        PersistedKeyValueStorageScope {
+            table_name: table_name.into(),
+            version_id: version_id.into(),
+        }
+    }
+}
+
 pub(super) async fn load_persisted_key_value_payloads(
     backend: &dyn LixBackend,
+    scope: &PersistedKeyValueStorageScope,
     entity_ids: &[&str],
 ) -> Result<BTreeMap<String, JsonValue>, LixError> {
     if entity_ids.is_empty() {
         return Ok(BTreeMap::new());
     }
 
-    let table_name = tracked_relation_name(key_value_schema_key());
     let untracked_value_expr = "\"u\".\"value_json\"";
     let tracked_value_expr = "\"t\".\"value_json\"";
     let in_list = entity_ids
@@ -27,7 +42,7 @@ pub(super) async fn load_persisted_key_value_payloads(
         "SELECT entity_id, value_json, precedence \
          FROM (\
            SELECT u.entity_id, {untracked_value_expr} AS value_json, 0 AS precedence \
-           FROM {untracked_table} u \
+           FROM {table_name} u \
            WHERE entity_id IN ({in_list}) \
              AND version_id = '{version_id}' \
              AND u.untracked = true \
@@ -42,11 +57,10 @@ pub(super) async fn load_persisted_key_value_payloads(
              AND is_tombstone = 0\
          ) visible_key_values \
          ORDER BY entity_id ASC, precedence ASC",
-        untracked_table = tracked_relation_name(key_value_schema_key()),
         untracked_value_expr = untracked_value_expr,
         in_list = in_list,
-        version_id = escape_sql_string(GLOBAL_VERSION_ID),
-        table_name = table_name,
+        version_id = escape_sql_string(&scope.version_id),
+        table_name = scope.table_name,
         tracked_value_expr = tracked_value_expr,
     );
     let result = backend.execute(&sql, &[]).await?;

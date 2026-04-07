@@ -1,5 +1,3 @@
-use crate::backend::program::WriteProgram;
-use crate::backend::program_runner::execute_write_program_with_transaction;
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::engine::Engine;
 use crate::errors;
@@ -7,40 +5,15 @@ use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
-use crate::sql::common::text::escape_sql_string;
-use crate::{LixBackendTransaction, LixError};
+use crate::LixError;
 
 impl Engine {
-    pub(crate) fn build_observe_tick_insert_sql(&self, writer_key: Option<&str>) -> String {
-        match writer_key {
-            Some(writer_key) => format!(
-                "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                 VALUES (CURRENT_TIMESTAMP, '{}')",
-                escape_sql_string(writer_key)
-            ),
-            None => "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
-                      VALUES (CURRENT_TIMESTAMP, NULL)"
-                .to_string(),
-        }
-    }
-
     #[doc(hidden)]
     pub async fn open_existing(&self) -> Result<(), LixError> {
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
-        crate::session::refresh_public_surface_registry_in_runtime(self.runtime().as_ref()).await?;
-        Ok(())
-    }
-
-    pub(crate) async fn append_observe_tick_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        writer_key: Option<&str>,
-    ) -> Result<(), LixError> {
-        let mut program = WriteProgram::new();
-        program.push_statement(self.build_observe_tick_insert_sql(writer_key), Vec::new());
-        execute_write_program_with_transaction(transaction, program).await?;
+        self.refresh_public_surface_registry().await?;
         Ok(())
     }
 
@@ -54,8 +27,8 @@ impl Engine {
         reader: &mut dyn ImageChunkReader,
     ) -> Result<(), LixError> {
         self.backend().restore_from_image(reader).await?;
-        crate::session::clear_public_surface_registry_in_runtime(self.runtime().as_ref());
-        crate::session::refresh_public_surface_registry_in_runtime(self.runtime().as_ref()).await?;
+        self.clear_public_surface_registry();
+        self.refresh_public_surface_registry().await?;
         self.invalidate_installed_plugins_cache()?;
         Ok(())
     }

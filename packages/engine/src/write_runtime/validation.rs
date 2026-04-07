@@ -14,10 +14,14 @@ use std::sync::Arc;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
-use crate::checkpoint::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME};
+use crate::checkpoint_artifacts::{
+    CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
+};
 use crate::contracts::artifacts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
-    LiveSnapshotStorage, UpdateValidationInput,
+    LiveSnapshotStorage, MutationOperation, MutationRow, PlannedStateRow,
+    PreparedInsertOnConflictAction, PreparedPublicWriteArtifact, PreparedResolvedWritePlan,
+    PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
 };
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend};
@@ -28,17 +32,9 @@ use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
 };
-use crate::sql::logical_plan::public_ir::{
-    InsertOnConflictAction, PlannedStateRow, PlannedWrite, ResolvedWritePlan, WriteMode,
-    WriteOperationKind,
-};
-use crate::sql::prepare::contracts::planned_statement::{
-    MutationOperation, MutationRow, UpdateValidationPlan,
-};
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
-const CHECKPOINT_LABEL_SCHEMA_KEY: &str = "lix_label";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_FILE_ID: &str = "lix";
 const REGISTERED_SCHEMA_PLUGIN_KEY: &str = "lix";
@@ -287,26 +283,27 @@ pub(crate) async fn validate_update_inputs(
 pub(crate) async fn validate_batch_local_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
-    planned_write: &PlannedWrite,
+    public_write: &PreparedPublicWriteArtifact,
 ) -> Result<(), LixError> {
-    validate_planned_write(backend, cache, planned_write, false).await
+    validate_prepared_public_write(backend, cache, public_write, false).await
 }
 
 pub(crate) async fn validate_commit_time_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
-    planned_write: &PlannedWrite,
+    public_write: &PreparedPublicWriteArtifact,
 ) -> Result<(), LixError> {
-    validate_planned_write(backend, cache, planned_write, true).await
+    validate_prepared_public_write(backend, cache, public_write, true).await
 }
 
-async fn validate_planned_write(
+async fn validate_prepared_public_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
-    planned_write: &PlannedWrite,
+    public_write: &PreparedPublicWriteArtifact,
     require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
-    let resolved = planned_write
+    let resolved = public_write
+        .contract
         .resolved_write_plan
         .as_ref()
         .ok_or_else(|| LixError {
@@ -317,13 +314,13 @@ async fn validate_planned_write(
     remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
         collect_planned_binary_blob_hashes(resolved, require_binary_blob_ref_cas)?;
-    let shadows_committed_identity = planned_write.command.operation_kind
-        == WriteOperationKind::Update
-        || planned_write
-            .command
-            .on_conflict
+    let shadows_committed_identity = public_write.contract.operation_kind
+        == PreparedWriteOperationKind::Update
+        || public_write
+            .contract
+            .on_conflict_action
             .as_ref()
-            .is_some_and(|conflict| conflict.action == InsertOnConflictAction::DoUpdate);
+            .is_some_and(|action| *action == PreparedInsertOnConflictAction::DoUpdate);
     let pending_rows = collect_constraint_candidates(resolved, shadows_committed_identity)?;
     let deleted_rows = collect_delete_candidates(resolved)?;
     let updated_identities = resolved
@@ -348,7 +345,7 @@ async fn validate_planned_write(
         validate_checkpoint_label_mutation(&row.schema_key, snapshot.as_ref(), None)?;
     }
 
-    if planned_write.command.operation_kind == WriteOperationKind::Update {
+    if public_write.contract.operation_kind == PreparedWriteOperationKind::Update {
         for row in resolved.intended_post_state() {
             if row.tombstone {
                 continue;
@@ -362,7 +359,7 @@ async fn validate_planned_write(
             backend,
             &mut schema_provider,
             cache,
-            planned_write.command.operation_kind,
+            public_write.contract.operation_kind,
             row,
             require_binary_blob_ref_cas,
             Some(&planned_binary_blob_hashes),
@@ -371,7 +368,7 @@ async fn validate_planned_write(
     }
 
     if !matches!(
-        planned_write.command.target.descriptor.surface_family,
+        public_write.contract.target.descriptor.surface_family,
         SurfaceFamily::State | SurfaceFamily::Entity
     ) {
         return Ok(());
@@ -408,7 +405,7 @@ async fn validate_planned_write(
 
 async fn remember_pending_registered_schemas(
     provider: &mut OverlaySchemaProvider<'_>,
-    resolved: &ResolvedWritePlan,
+    resolved: &PreparedResolvedWritePlan,
 ) -> Result<(), LixError> {
     for row in resolved.intended_post_state() {
         if row.tombstone || row.schema_key != REGISTERED_SCHEMA_KEY {
@@ -459,7 +456,7 @@ fn collect_insert_constraint_candidates(mutations: &[MutationRow]) -> Vec<Constr
 }
 
 fn collect_constraint_candidates(
-    resolved: &ResolvedWritePlan,
+    resolved: &PreparedResolvedWritePlan,
     shadows_committed_identity: bool,
 ) -> Result<Vec<ConstraintCandidateRow>, LixError> {
     let mut rows = Vec::new();
@@ -495,7 +492,7 @@ fn collect_constraint_candidates(
 }
 
 fn collect_delete_candidates(
-    resolved: &ResolvedWritePlan,
+    resolved: &PreparedResolvedWritePlan,
 ) -> Result<Vec<ConstraintDeletedRow>, LixError> {
     let mut rows = Vec::new();
 
@@ -625,7 +622,7 @@ async fn validate_planned_row(
     backend: &dyn LixBackend,
     provider: &mut OverlaySchemaProvider<'_>,
     cache: &dyn CompiledSchemaCache,
-    operation_kind: WriteOperationKind,
+    operation_kind: PreparedWriteOperationKind,
     row: &PlannedStateRow,
     require_binary_blob_ref_cas: bool,
     planned_binary_blob_hashes: Option<&HashSet<String>>,
@@ -800,7 +797,7 @@ async fn validate_filesystem_snapshot_integrity(
         .is_some_and(|planned_binary_blob_hashes| planned_binary_blob_hashes.contains(blob_hash));
     if require_binary_blob_ref_cas
         && !is_planned_blob
-        && !crate::binary_cas::read::blob_exists(backend, blob_hash).await?
+        && !crate::binary_blob_support::blob_exists(backend, blob_hash).await?
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -815,7 +812,7 @@ async fn validate_filesystem_snapshot_integrity(
 }
 
 fn collect_planned_binary_blob_hashes(
-    resolved: &ResolvedWritePlan,
+    resolved: &PreparedResolvedWritePlan,
     require_binary_blob_ref_cas: bool,
 ) -> Result<HashSet<String>, LixError> {
     if !require_binary_blob_ref_cas {
@@ -825,7 +822,9 @@ fn collect_planned_binary_blob_hashes(
     let mut hashes = HashSet::new();
     for file in resolved.filesystem_state().files.values() {
         if let Some(data) = file.data.as_ref() {
-            hashes.insert(crate::binary_cas::codec::binary_blob_hash_hex(data));
+            hashes.insert(crate::content_fingerprint::stable_content_fingerprint_hex(
+                data,
+            ));
         }
     }
     Ok(hashes)

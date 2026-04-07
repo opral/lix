@@ -20,5 +20,5 @@ pub use provider::{SchemaProvider, SqlRegisteredSchemaProvider};
 pub(crate) use public_surfaces::{
     apply_registered_schema_snapshot_to_surface_registry, build_builtin_surface_registry,
     builtin_public_surface_columns, builtin_public_surface_names,
-    load_public_surface_registry_with_backend, remove_dynamic_entity_surfaces_for_schema_key,
+    load_public_surface_registry_with_backend,
 };

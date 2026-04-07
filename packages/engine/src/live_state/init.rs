@@ -1,4 +1,4 @@
-use crate::init::tables::execute_init_statements;
+use crate::ddl::execute_ddl_batch;
 use crate::live_state::lifecycle;
 use crate::live_state::register_schema;
 use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};
@@ -69,7 +69,7 @@ const LIVE_STATE_INIT_STATEMENTS: &[&str] = &[
 
 pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
     lifecycle::init(backend).await?;
-    execute_init_statements(backend, "live_state", LIVE_STATE_INIT_STATEMENTS).await?;
+    execute_ddl_batch(backend, "live_state", LIVE_STATE_INIT_STATEMENTS).await?;
     register_schema(backend, "lix_registered_schema").await?;
     seed_registered_schema_bootstrap_rows(backend).await?;
     Ok(())

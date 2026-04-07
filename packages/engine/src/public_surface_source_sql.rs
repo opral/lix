@@ -13,7 +13,9 @@ use crate::sql::physical_plan::public_surface_sql_support::{
     render_qualified_where_clause_sql, render_where_clause_sql,
     split_effective_state_pushdown_predicates,
 };
-use crate::version::{version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID};
+use crate::version_artifacts::{
+    version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID,
+};
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Expr;

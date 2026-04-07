@@ -1,4 +1,3 @@
-mod buffered_write_runner;
 mod buffered_write_state;
 pub(crate) mod commands;
 mod coordinator;
@@ -10,11 +9,10 @@ pub(crate) use crate::write_runtime::sql_adapter::{
     BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,
     PendingSemanticOverlay, PendingWorkspaceWriterKeyOverlay, PlannedWriteDelta,
 };
-pub(crate) use buffered_write_runner::execute_buffered_write_input;
 pub(crate) use buffered_write_state::BufferedWriteState;
 pub(crate) use commands::{
-    BufferedWriteAdapter, BufferedWriteCommandMetadata, BufferedWriteExecutionResult,
-    BufferedWriteExecutionRoute, BufferedWriteScope,
+    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
+    BufferedWriteSessionEffects,
 };
 pub(crate) use coordinator::{apply_schema_registrations_in_transaction, TransactionCoordinator};
 #[cfg(test)]

@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use crate::contracts::artifacts::{LiveStateMode, LiveStateProjectionStatus};
+use crate::ddl::add_column_if_missing;
 use crate::errors::classification::is_missing_relation_error;
-use crate::init::tables::add_column_if_missing;
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, QueryResult,
     ReplayCursor, Value,

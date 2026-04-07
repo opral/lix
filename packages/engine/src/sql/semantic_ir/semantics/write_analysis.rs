@@ -11,7 +11,7 @@ use crate::sql::semantic_ir::semantics::filesystem_assignments::{
     parse_file_insert_assignments, parse_file_update_assignments, FilesystemWriteIntent,
 };
 use crate::sql::semantic_ir::semantics::surface_semantics::canonical_filter_column_name;
-use crate::version::GLOBAL_VERSION_ID;
+use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::Value;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::BTreeSet;

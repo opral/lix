@@ -1,9 +1,6 @@
-use crate::contracts::artifacts::{
-    coalesce_live_table_requirements, PreparedStatement, SchemaRegistration, SchemaRegistrationSet,
-};
+use crate::contracts::artifacts::PreparedStatement;
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
-use crate::sql::physical_plan::PhysicalPlan;
 
 use super::contracts::effects::PlanEffects;
 use super::contracts::planned_statement::{
@@ -22,7 +19,6 @@ pub(crate) struct CompiledInternalExecution {
 
 pub(crate) struct CompiledExecution {
     pub(crate) intent: crate::sql::prepare::intent::ExecutionIntent,
-    pub(crate) physical_plan: Option<PhysicalPlan>,
     pub(crate) explain: Option<ExplainArtifacts>,
     pub(crate) result_contract: ResultContract,
     pub(crate) effects: PlanEffects,
@@ -65,10 +61,6 @@ impl CompiledExecution {
         }
     }
 
-    pub(crate) fn physical_plan(&self) -> Option<&PhysicalPlan> {
-        self.physical_plan.as_ref()
-    }
-
     pub(crate) fn explain(&self) -> Option<&ExplainArtifacts> {
         self.explain.as_ref()
     }
@@ -84,24 +76,4 @@ impl CompiledExecution {
             .as_ref()
             .filter(|explain| explain.requires_execution())
     }
-}
-
-pub(crate) fn schema_registrations_for_compiled_execution(
-    execution: &CompiledExecution,
-) -> SchemaRegistrationSet {
-    let mut registrations = SchemaRegistrationSet::default();
-    if let Some(internal) = execution.internal_execution() {
-        for requirement in coalesce_live_table_requirements(&internal.live_table_requirements) {
-            match requirement.schema_definition.as_ref() {
-                Some(schema_definition) => {
-                    registrations.insert(SchemaRegistration::with_schema_definition(
-                        requirement.schema_key.clone(),
-                        schema_definition.clone(),
-                    ))
-                }
-                None => registrations.insert(requirement.schema_key.clone()),
-            }
-        }
-    }
-    registrations
 }

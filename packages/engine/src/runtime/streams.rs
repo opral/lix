@@ -1,11 +1,12 @@
-use crate::change_view::TrackedDomainChangeView;
-use crate::contracts::artifacts::{MutationOperation, MutationRow, PlannedStateRow};
 pub use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOperation};
-use crate::{LixError, Value};
+pub use crate::contracts::state_commit_stream::StateCommitStreamFilter;
+#[cfg(test)]
+pub(crate) use crate::contracts::state_commit_stream::{
+    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamRuntimeMetadata,
+};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
-use serde::{Deserialize, Serialize};
-use serde_json::Value as JsonValue;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -13,52 +14,10 @@ use std::task::Poll;
 
 const MAX_PENDING_BATCHES_PER_LISTENER: usize = 256;
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct StateCommitStreamFilter {
-    // Matching semantics:
-    // - OR within each field list (e.g. schema_keys = ["a", "b"] matches a OR b)
-    // - AND across non-empty fields (e.g. schema_keys + entity_ids must both match)
-    // - Empty field means "no constraint" for that dimension
-    pub schema_keys: Vec<String>,
-    pub entity_ids: Vec<String>,
-    pub file_ids: Vec<String>,
-    pub version_ids: Vec<String>,
-    pub writer_keys: Vec<String>,
-    pub exclude_writer_keys: Vec<String>,
-    pub include_untracked: bool,
-}
-
-impl Default for StateCommitStreamFilter {
-    fn default() -> Self {
-        Self {
-            schema_keys: Vec::new(),
-            entity_ids: Vec::new(),
-            file_ids: Vec::new(),
-            version_ids: Vec::new(),
-            writer_keys: Vec::new(),
-            exclude_writer_keys: Vec::new(),
-            include_untracked: true,
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct StateCommitStreamBatch {
     pub sequence: u64,
     pub changes: Vec<StateCommitStreamChange>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StateCommitStreamRuntimeMetadata {
-    pub(crate) writer_key: Option<String>,
-}
-
-impl StateCommitStreamRuntimeMetadata {
-    pub(crate) fn from_runtime_writer_key(writer_key: Option<&str>) -> Self {
-        Self {
-            writer_key: writer_key.map(str::to_string),
-        }
-    }
 }
 
 pub struct StateCommitStream {
@@ -449,186 +408,6 @@ fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitStreamBatch) {
     queue_guard.push_back(batch);
     drop(queue_guard);
     queue.waker.wake();
-}
-
-pub(crate) fn state_commit_stream_changes_from_mutations(
-    mutations: &[MutationRow],
-    runtime_metadata: StateCommitStreamRuntimeMetadata,
-) -> Vec<StateCommitStreamChange> {
-    if mutations.is_empty() {
-        return Vec::new();
-    }
-
-    mutations
-        .iter()
-        .map(|mutation| StateCommitStreamChange {
-            operation: map_mutation_operation(&mutation.operation),
-            entity_id: mutation.entity_id.clone(),
-            schema_key: mutation.schema_key.clone(),
-            schema_version: mutation.schema_version.clone(),
-            file_id: mutation.file_id.clone(),
-            version_id: mutation.version_id.clone(),
-            plugin_key: mutation.plugin_key.clone(),
-            snapshot_content: mutation.snapshot_content.clone(),
-            untracked: mutation.untracked,
-            writer_key: runtime_metadata.writer_key.clone(),
-        })
-        .collect()
-}
-
-pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDomainChangeView>(
-    changes: &[Change],
-    operation: StateCommitStreamOperation,
-    runtime_metadata: StateCommitStreamRuntimeMetadata,
-) -> Result<Vec<StateCommitStreamChange>, LixError> {
-    if changes.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut resolved = Vec::with_capacity(changes.len());
-    for change in changes {
-        // State-commit-stream is a runtime notification surface rather than a
-        // canonical replay surface. When a tracked change has no row-level
-        // writer annotation, the event may still carry the runtime writer
-        // metadata for listener-side echo suppression.
-        let snapshot_content = match change.snapshot_content() {
-            Some(snapshot_content) => Some(
-                serde_json::from_str(snapshot_content).map_err(|error| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "domain change state commit stream expected JSON snapshot_content text: {error}"
-                    ),
-                })?,
-            ),
-            None => None,
-        };
-        resolved.push(StateCommitStreamChange {
-            operation,
-            entity_id: change.entity_id().to_string(),
-            schema_key: change.schema_key().to_string(),
-            schema_version: change
-                .schema_version()
-                .ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "domain change state commit stream requires schema_version"
-                        .to_string(),
-                })?
-                .to_string(),
-            file_id: change
-                .file_id()
-                .ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "domain change state commit stream requires file_id".to_string(),
-                })?
-                .to_string(),
-            version_id: change.version_id().to_string(),
-            plugin_key: change
-                .plugin_key()
-                .ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "domain change state commit stream requires plugin_key"
-                        .to_string(),
-                })?
-                .to_string(),
-            snapshot_content,
-            untracked: false,
-            writer_key: state_commit_stream_writer_key(change.writer_key(), &runtime_metadata),
-        });
-    }
-
-    Ok(resolved)
-}
-
-pub(crate) fn state_commit_stream_changes_from_planned_rows(
-    rows: &[PlannedStateRow],
-    operation: StateCommitStreamOperation,
-    untracked: bool,
-    runtime_metadata: StateCommitStreamRuntimeMetadata,
-) -> Result<Vec<StateCommitStreamChange>, LixError> {
-    if rows.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut resolved = Vec::with_capacity(rows.len());
-    for row in rows {
-        let file_id = planned_row_required_text(row, "file_id")?;
-        let plugin_key = planned_row_required_text(row, "plugin_key")?;
-        let schema_version = planned_row_required_text(row, "schema_version")?;
-        let snapshot_content = planned_row_snapshot_content(row)?;
-        let version_id = row
-            .version_id
-            .clone()
-            .or_else(|| planned_row_optional_text(row, "version_id"));
-
-        resolved.push(StateCommitStreamChange {
-            operation,
-            entity_id: row.entity_id.clone(),
-            schema_key: row.schema_key.clone(),
-            schema_version,
-            file_id,
-            version_id: version_id.ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "planned row state commit stream requires version_id".to_string(),
-            })?,
-            plugin_key,
-            snapshot_content,
-            untracked,
-            writer_key: runtime_metadata.writer_key.clone(),
-        });
-    }
-
-    Ok(resolved)
-}
-
-fn state_commit_stream_writer_key(
-    row_writer_key: Option<&str>,
-    runtime_metadata: &StateCommitStreamRuntimeMetadata,
-) -> Option<String> {
-    row_writer_key
-        .map(str::to_string)
-        .or_else(|| runtime_metadata.writer_key.clone())
-}
-
-fn planned_row_required_text(row: &PlannedStateRow, key: &str) -> Result<String, LixError> {
-    planned_row_optional_text(row, key).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("planned row state commit stream requires '{key}'"),
-    })
-}
-
-fn planned_row_optional_text(row: &PlannedStateRow, key: &str) -> Option<String> {
-    match row.values.get(key) {
-        Some(Value::Text(text)) => Some(text.clone()),
-        Some(Value::Integer(number)) => Some(number.to_string()),
-        _ => None,
-    }
-}
-
-fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixError> {
-    match row.values.get("snapshot_content") {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::Json(value)) => Ok(Some(value.clone())),
-        Some(Value::Text(text)) => {
-            let parsed = serde_json::from_str(text).map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "planned row state commit stream expected JSON snapshot_content text: {error}"
-                ),
-            })?;
-            Ok(Some(parsed))
-        }
-        Some(other) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "planned row state commit stream expected null/text snapshot_content, got {other:?}"
-            ),
-        }),
-    }
-}
-
-fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
-    match operation {
-        MutationOperation::Insert => StateCommitStreamOperation::Insert,
-    }
 }
 
 #[cfg(test)]

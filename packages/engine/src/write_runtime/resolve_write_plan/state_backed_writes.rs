@@ -1,18 +1,16 @@
 use super::*;
-use crate::runtime::cel::shared_runtime;
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::schema::annotations::defaults::apply_schema_defaults;
-use crate::schema::annotations::overrides::collect_state_column_overrides;
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::prepared_write_artifacts::build_entity_insert_rows_with_functions;
+use crate::prepared_write_artifacts::{
+    apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
+    build_state_insert_row, ensure_identity_columns_preserved, CanonicalStateAssignments,
+    CanonicalStateRowKey, EntityAssignmentsSemantics, EntityInsertSemantics,
+    InsertOnConflictAction,
+};
+use crate::schema::annotations::defaults::apply_schema_defaults_with_shared_runtime;
+use crate::schema::annotations::overrides::collect_state_column_overrides_with_shared_runtime;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::schema::{SchemaProvider, SqlRegisteredSchemaProvider};
-use crate::sql::logical_plan::public_ir::{
-    CanonicalStateAssignments, CanonicalStateRowKey, InsertOnConflictAction,
-};
-use crate::sql::semantic_ir::semantics::state_assignments::{
-    apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
-    build_entity_insert_rows_with_functions, build_state_insert_row,
-    ensure_identity_columns_preserved, EntityAssignmentsSemantics, EntityInsertSemantics,
-};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -21,121 +19,6 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
         OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked => GLOBAL_VERSION_ID.to_string(),
         OverlayLane::LocalTracked | OverlayLane::LocalUntracked => current_row.version_id.clone(),
     }
-}
-
-async fn query_entity_selector_rows(
-    hydrator: &PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
-    planned_write: &PlannedWrite,
-) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
-    let selector = canonical_state_selector(planned_write);
-    let mut selector_columns = vec!["lixcol_entity_id"];
-    if let Some(version_column) = selector.version_column.as_deref() {
-        selector_columns.push(version_column);
-    }
-    let query_result = execute_public_selector_query_strict(
-        hydrator.backend(),
-        projection_registry,
-        planned_write,
-        hydrator
-            .pending_state_overlay()
-            .map(|overlay| overlay.as_pending_view()),
-        build_public_selector_query(
-            &planned_write.command.target.descriptor.public_name,
-            &selector,
-            &selector_columns,
-        ),
-    )
-    .await
-    .map_err(write_resolve_backend_error)?;
-
-    let mut selector_rows = Vec::new();
-    for row in query_result.rows {
-        let selector_row = CanonicalStateRowKey {
-            entity_id: required_text_value_index(&row, 0, "lixcol_entity_id")?,
-            file_id: None,
-            plugin_key: None,
-            schema_version: None,
-            version_id: selector
-                .version_column
-                .as_deref()
-                .map(|version_column| required_text_value_index(&row, 1, version_column))
-                .transpose()?,
-            global: None,
-            untracked: None,
-            writer_key: None,
-        };
-        if !selector_rows
-            .iter()
-            .any(|existing| existing == &selector_row)
-        {
-            selector_rows.push(selector_row);
-        }
-    }
-    Ok(selector_rows)
-}
-
-async fn query_state_selector_rows(
-    hydrator: &PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
-    planned_write: &PlannedWrite,
-) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
-    let selector = canonical_state_selector(planned_write);
-    let mut selector_columns = vec!["entity_id", "file_id", "plugin_key", "schema_version"];
-    if let Some(version_column) = selector.version_column.as_deref() {
-        selector_columns.push(version_column);
-    }
-    selector_columns.push("global");
-    selector_columns.push("untracked");
-    let query_result = execute_public_selector_query_strict(
-        hydrator.backend(),
-        projection_registry,
-        planned_write,
-        hydrator
-            .pending_state_overlay()
-            .map(|overlay| overlay.as_pending_view()),
-        build_public_selector_query(
-            &planned_write.command.target.descriptor.public_name,
-            &selector,
-            &selector_columns,
-        ),
-    )
-    .await
-    .map_err(write_resolve_backend_error)?;
-
-    let mut selector_rows = Vec::new();
-    for row in query_result.rows {
-        let version_offset = usize::from(selector.version_column.is_some());
-        let selector_row = CanonicalStateRowKey {
-            entity_id: required_text_value_index(&row, 0, "entity_id")?,
-            file_id: Some(required_text_value_index(&row, 1, "file_id")?),
-            plugin_key: Some(required_text_value_index(&row, 2, "plugin_key")?),
-            schema_version: Some(required_text_value_index(&row, 3, "schema_version")?),
-            version_id: selector
-                .version_column
-                .as_deref()
-                .map(|version_column| required_text_value_index(&row, 4, version_column))
-                .transpose()?,
-            global: Some(required_bool_value_index(
-                &row,
-                4 + version_offset,
-                "global",
-            )?),
-            untracked: Some(required_bool_value_index(
-                &row,
-                5 + version_offset,
-                "untracked",
-            )?),
-            writer_key: None,
-        };
-        if !selector_rows
-            .iter()
-            .any(|existing| existing == &selector_row)
-        {
-            selector_rows.push(selector_row);
-        }
-    }
-    Ok(selector_rows)
 }
 
 fn assign_state_row_key_value(
@@ -244,9 +127,9 @@ fn authoritative_pre_state_row_for_effective_row(
 
 pub(super) async fn resolve_state_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -257,19 +140,19 @@ where
         .map_err(write_resolve_backend_error)?;
     resolve_state_backed_write(
         hydrator,
-        projection_registry,
         planned_write,
         StateBackedSurface::State(state_schema.as_ref()),
         functions,
+        selector_resolver,
     )
     .await
 }
 
 pub(super) async fn resolve_entity_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -281,10 +164,10 @@ where
     reject_unsupported_entity_overrides(planned_write, &entity_schema)?;
     resolve_state_backed_write(
         hydrator,
-        projection_registry,
         planned_write,
         StateBackedSurface::Entity(&entity_schema),
         functions,
+        selector_resolver,
     )
     .await
 }
@@ -461,19 +344,19 @@ impl StateBackedSurface<'_> {
     async fn resolve_target_rows(
         self,
         hydrator: &PublicWriteHydrator<'_>,
-        projection_registry: &ProjectionRegistry,
         planned_write: &PlannedWrite,
+        selector_resolver: &dyn WriteSelectorResolver,
     ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
         match self {
             Self::State(_) => {
-                resolve_target_state_rows(hydrator, projection_registry, planned_write).await
+                resolve_target_state_rows(hydrator, planned_write, selector_resolver).await
             }
             Self::Entity(entity_schema) => {
                 resolve_target_entity_rows(
                     hydrator,
-                    projection_registry,
                     planned_write,
                     entity_schema,
+                    selector_resolver,
                 )
                 .await
             }
@@ -483,10 +366,10 @@ impl StateBackedSurface<'_> {
 
 async fn resolve_state_backed_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     surface: StateBackedSurface<'_>,
     functions: SharedFunctionProvider<P>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -496,13 +379,8 @@ where
             resolve_state_backed_insert_write(hydrator, planned_write, surface, functions).await
         }
         WriteOperationKind::Update | WriteOperationKind::Delete => {
-            resolve_state_backed_existing_write(
-                hydrator,
-                projection_registry,
-                planned_write,
-                surface,
-            )
-            .await
+            resolve_state_backed_existing_write(hydrator, planned_write, surface, selector_resolver)
+                .await
         }
     }
 }
@@ -587,9 +465,9 @@ where
 
 async fn resolve_state_backed_existing_write(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     surface: StateBackedSurface<'_>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let _ = resolved_existing_version_ids(hydrator, planned_write).await?;
     let current_rows = match surface {
@@ -601,7 +479,7 @@ async fn resolve_state_backed_existing_write(
         }
         _ => {
             surface
-                .resolve_target_rows(hydrator, projection_registry, planned_write)
+                .resolve_target_rows(hydrator, planned_write, selector_resolver)
                 .await?
         }
     };
@@ -873,10 +751,9 @@ where
             });
         };
 
-        apply_schema_defaults(
+        apply_schema_defaults_with_shared_runtime(
             &mut snapshot,
             &schema.schema,
-            shared_runtime(),
             functions.clone(),
             &schema.schema_key,
             &schema.schema_version,
@@ -981,12 +858,13 @@ fn state_insert_row_key(row: &PlannedStateRow) -> CanonicalStateRowKey {
 
 async fn resolve_target_entity_rows(
     hydrator: &PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
-    let selector_rows =
-        query_entity_selector_rows(hydrator, projection_registry, planned_write).await?;
+    let selector_rows = selector_resolver
+        .load_entity_selector_rows(planned_write)
+        .await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
@@ -1012,12 +890,13 @@ async fn resolve_target_entity_rows(
 
 async fn resolve_target_state_rows(
     hydrator: &PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
     let schema_key = resolved_schema_key(planned_write)?;
-    let selector_rows =
-        query_state_selector_rows(hydrator, projection_registry, planned_write).await?;
+    let selector_rows = selector_resolver
+        .load_state_selector_rows(planned_write)
+        .await?;
     let mut rows = Vec::new();
     for selector_row in selector_rows {
         let version_id =
@@ -1144,10 +1023,9 @@ fn load_annotation_schema_from_json(
         "schema_version".to_string(),
         Value::Text(schema_version.clone()),
     );
-    state_defaults.extend(collect_state_column_overrides(
+    state_defaults.extend(collect_state_column_overrides_with_shared_runtime(
         &schema,
         &schema_key,
-        shared_runtime(),
     )?);
     Ok(LoadedAnnotationSchema {
         schema,

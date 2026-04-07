@@ -1,15 +1,17 @@
 use crate::contracts::artifacts::FilesystemPayloadDomainChange;
-use crate::engine::Engine;
 use crate::write_runtime::filesystem::runtime::{
-    build_filesystem_payload_domain_changes_insert, resolve_binary_blob_writes_in_transaction,
+    build_filesystem_payload_domain_changes_insert,
+    compile_filesystem_finalization_from_state_in_transaction,
+    garbage_collect_unreachable_binary_cas_in_transaction,
+    resolve_binary_blob_writes_in_transaction,
 };
+use crate::write_runtime::filesystem::state::filesystem_transaction_state_from_planned;
 use crate::{LixBackendTransaction, LixError};
 
 use super::planned_write::PlannedInternalWriteUnit;
 use super::runtime::{execute_internal_execution_with_transaction, SqlExecutionOutcome};
 
 pub(super) async fn run_internal_write_txn_with_transaction(
-    engine: &Engine,
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedInternalWriteUnit,
 ) -> Result<Option<SqlExecutionOutcome>, LixError> {
@@ -17,27 +19,28 @@ pub(super) async fn run_internal_write_txn_with_transaction(
         transaction,
         &plan.execution,
         plan.result_contract,
-        plan.runtime_state.provider(),
-        plan.writer_key.as_deref(),
+        plan.runtime_state.functions(),
+        plan.execution.writer_key.as_deref(),
     )
     .await
     .map_err(LixError::from)?;
 
-    let filesystem_finalization = engine
-        .compile_filesystem_finalization_from_state_in_transaction(
-            transaction,
-            &plan.filesystem_state,
-            plan.writer_key.as_deref(),
-            &plan.execution.mutations,
-        )
-        .await?;
+    let filesystem_state =
+        filesystem_transaction_state_from_planned(&plan.execution.filesystem_state);
+    let filesystem_finalization = compile_filesystem_finalization_from_state_in_transaction(
+        transaction,
+        &filesystem_state,
+        plan.execution.writer_key.as_deref(),
+        &plan.execution.mutations,
+    )
+    .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
         let resolved_binary_blob_writes = resolve_binary_blob_writes_in_transaction(
             transaction,
             &filesystem_finalization.binary_blob_writes,
         )
         .await?;
-        crate::binary_cas::write::persist_resolved_binary_blob_writes_in_transaction(
+        crate::binary_blob_support::persist_resolved_binary_blob_writes_in_transaction(
             transaction,
             &resolved_binary_blob_writes,
         )
@@ -49,15 +52,12 @@ pub(super) async fn run_internal_write_txn_with_transaction(
     )
     .await?;
     if filesystem_finalization.should_run_gc {
-        engine
-            .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-            .await?;
+        garbage_collect_unreachable_binary_cas_in_transaction(transaction).await?;
     }
 
     crate::write_runtime::persist_runtime_sequence_in_transaction(
         transaction,
-        plan.runtime_state.settings(),
-        plan.runtime_state.provider(),
+        plan.runtime_state.functions(),
     )
     .await
     .map_err(|error| LixError {
@@ -69,7 +69,7 @@ pub(super) async fn run_internal_write_txn_with_transaction(
     })?;
 
     if execution.plan_effects_override.is_none() {
-        execution.plan_effects_override = Some(plan.effects.clone());
+        execution.plan_effects_override = Some(plan.execution.effects.clone());
     }
 
     Ok(Some(execution))

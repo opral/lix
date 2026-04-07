@@ -1,4 +1,4 @@
-use crate::init::tables::execute_init_statements;
+use crate::ddl::execute_ddl_batch;
 use crate::{LixBackend, LixError};
 
 const WORKSPACE_INIT_STATEMENTS: &[&str] = &[
@@ -17,5 +17,5 @@ const WORKSPACE_INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_init_statements(backend, "workspace", WORKSPACE_INIT_STATEMENTS).await
+    execute_ddl_batch(backend, "workspace", WORKSPACE_INIT_STATEMENTS).await
 }

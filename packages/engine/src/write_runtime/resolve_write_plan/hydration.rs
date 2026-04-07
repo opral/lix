@@ -1,7 +1,6 @@
 use crate::contracts::traits::PendingStateOverlay;
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
-};
+use crate::prepared_write_artifacts::{ExactEffectiveStateRow, ExactEffectiveStateRowRequest};
+use crate::version_artifacts::{load_committed_version_ref_with_backend, GLOBAL_VERSION_ID};
 use crate::write_runtime::effective_state::resolve_exact_effective_state_row_with_pending_overlay;
 use crate::{LixBackend, LixError};
 use std::collections::{BTreeMap, BTreeSet};
@@ -68,9 +67,7 @@ impl<'a> PublicWriteHydrator<'a> {
         else {
             return Ok(None);
         };
-        let pointer_row =
-            crate::version::load_committed_version_ref_with_backend(self.backend, version_id)
-                .await?;
+        let pointer_row = load_committed_version_ref_with_backend(self.backend, version_id).await?;
         let has_local_head = pointer_row.is_some();
         Ok(Some(HydratedVersionAdminRow {
             id: version_id.to_string(),
@@ -89,7 +86,7 @@ impl<'a> PublicWriteHydrator<'a> {
         &mut self,
         version_id: &str,
     ) -> Result<(), LixError> {
-        if version_id == crate::version::GLOBAL_VERSION_ID
+        if version_id == GLOBAL_VERSION_ID
             || !self
                 .validated_version_targets
                 .insert(version_id.to_string())

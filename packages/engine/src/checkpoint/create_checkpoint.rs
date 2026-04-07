@@ -1,7 +1,10 @@
-use super::{checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot};
+use crate::backend::TransactionBackendAdapter;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::TransactionBackendAdapter;
+use crate::checkpoint_artifacts::{
+    checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
+    CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
+};
+use crate::execution_runtime::ExecutionRuntimeState;
 use crate::version::context::require_target_version_context_in_transaction;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
@@ -60,7 +63,7 @@ async fn create_checkpoint_in_transaction(
         ensure_checkpoint_label_on_commit(tx, &global_commit_id).await?;
     }
     // Keep the derived checkpoint-history cache warm for the active version.
-    super::history::upsert_last_checkpoint_for_version_in_transaction(
+    crate::checkpoint_cache::upsert_last_checkpoint_for_version_in_transaction(
         tx.backend_transaction_mut()?,
         &version_id,
         &local_commit_id,
@@ -68,7 +71,7 @@ async fn create_checkpoint_in_transaction(
     .await?;
     // The global lane mirrors the same derived cache contract and remains
     // rebuildable from canonical heads plus canonical checkpoint labels.
-    super::history::upsert_last_checkpoint_for_version_in_transaction(
+    crate::checkpoint_cache::upsert_last_checkpoint_for_version_in_transaction(
         tx.backend_transaction_mut()?,
         crate::version::GLOBAL_VERSION_ID,
         &global_commit_id,
@@ -110,11 +113,14 @@ async fn ensure_checkpoint_label_on_commit(
             "SELECT 1 \
              FROM lix_internal_change \
              WHERE entity_id = $1 \
-               AND schema_key = 'lix_entity_label' \
+               AND schema_key = $2 \
                AND file_id = 'lix' \
                AND plugin_key = 'lix' \
              LIMIT 1",
-            &[Value::Text(state_entity_id.clone())],
+            &[
+                Value::Text(state_entity_id.clone()),
+                Value::Text(CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string()),
+            ],
         )
         .await?;
     if !exists.rows.is_empty() {
@@ -127,7 +133,7 @@ async fn ensure_checkpoint_label_on_commit(
     crate::live_state::upsert_bootstrap_tracked_row_in_transaction(
         tx.backend_transaction_mut()?,
         &state_entity_id,
-        "lix_entity_label",
+        CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
         "1",
         "lix",
         crate::version::GLOBAL_VERSION_ID,
@@ -169,11 +175,14 @@ async fn insert_canonical_checkpoint_label_change(
         .await?;
     tx.backend_transaction_mut()?
         .execute(
-            "INSERT INTO lix_internal_change (\
+            &format!(
+                "INSERT INTO lix_internal_change (\
              id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
              ) \
-             SELECT $1, $2, 'lix_entity_label', '1', 'lix', 'lix', $3, NULL, $4 \
+             SELECT $1, $2, '{schema_key}', '1', 'lix', 'lix', $3, NULL, $4 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
+                schema_key = CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
+            ),
             &[
                 Value::Text(change_id.to_string()),
                 Value::Text(entity_id.to_string()),
@@ -192,12 +201,15 @@ async fn checkpoint_runtime_state(
         return Ok(runtime_state);
     }
 
-    let runtime = tx.runtime;
+    let collaborators = tx.collaborators();
     let backend = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let runtime_state = ExecutionRuntimeState::prepare(runtime, &backend).await?;
-    crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+    let runtime_state = collaborators
+        .prepare_execution_runtime_state(&backend)
+        .await?;
+    let mut runtime_functions = runtime_state.provider().clone();
+    crate::deterministic_sequence::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
-        runtime_state.provider(),
+        &mut runtime_functions,
     )
     .await?;
     tx.context

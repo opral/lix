@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 
 use crate::backend::prepared::PreparedBatch;
 use crate::contracts::traits::SqlPreparationMetadataReader;
+use crate::sql_dialect::SqlDialect;
 pub use crate::transaction_mode::TransactionMode;
 use crate::version::{
     load_local_version_head_commit_id_with_executor, load_local_version_ref_heads_map_with_executor,
@@ -16,12 +17,6 @@ use crate::version::{
 use crate::{LixError, QueryResult, Value};
 pub use image::{ImageChunkReader, ImageChunkWriter};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SqlDialect {
-    Sqlite,
-    Postgres,
-}
 
 #[async_trait(?Send)]
 pub trait LixBackend: Send + Sync {

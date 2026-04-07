@@ -5,8 +5,8 @@ use crate::live_state::{
 use crate::schema::builtin::types::LixCommit;
 use crate::{LixBackend, LixError, Value};
 
-pub(crate) async fn init(_backend: &dyn LixBackend) -> Result<(), LixError> {
-    Ok(())
+pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
+    super::undo_redo::init(backend).await
 }
 
 pub(crate) async fn seed_bootstrap(

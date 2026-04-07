@@ -1,5 +1,5 @@
 use crate::contracts::artifacts::PlanEffects;
-use crate::engine::Engine;
+use crate::transaction_execution::apply_workspace_writer_key_annotations_in_transaction;
 use crate::write_runtime::commit::PendingPublicCommitSession;
 use crate::{LixBackendTransaction, LixError};
 
@@ -10,7 +10,6 @@ use super::tracked_apply::run_public_tracked_append_txn_with_transaction;
 use super::untracked_apply::run_public_untracked_write_txn_with_transaction;
 
 pub(crate) async fn execute_planned_write_delta(
-    engine: &Engine,
     transaction: &mut dyn LixBackendTransaction,
     delta: &PlannedWriteDelta,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
@@ -28,16 +27,14 @@ pub(crate) async fn execute_planned_write_delta(
                 .await?
             }
             PlannedWriteUnit::PublicUntracked(untracked) => {
-                run_public_untracked_write_txn_with_transaction(engine, transaction, untracked)
-                    .await?
+                run_public_untracked_write_txn_with_transaction(transaction, untracked).await?
             }
             PlannedWriteUnit::Internal(internal) => {
-                run_internal_write_txn_with_transaction(engine, transaction, internal).await?
+                run_internal_write_txn_with_transaction(transaction, internal).await?
             }
             PlannedWriteUnit::WorkspaceWriterKey(workspace_writer_key) => {
-                let mut backend = crate::runtime::TransactionBackendAdapter::new(transaction);
-                crate::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
-                    &mut backend,
+                apply_workspace_writer_key_annotations_in_transaction(
+                    transaction,
                     &workspace_writer_key.annotations,
                 )
                 .await?;

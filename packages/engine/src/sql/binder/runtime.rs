@@ -6,17 +6,12 @@ use sqlparser::ast::{
     Expr, FunctionArguments, Insert, SetExpr, Statement, Value as SqlValue, VisitMut, VisitorMut,
 };
 
-use crate::sql::parser::parse_sql_statements;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::parser::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
+pub(crate) use crate::statement_support::{
+    bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params,
+};
 use crate::{LixError, SqlDialect, Value};
-
-#[derive(Debug, Clone)]
-pub(crate) struct BoundSql {
-    pub(crate) sql: String,
-    pub(crate) params: Vec<Value>,
-    pub(crate) state: PlaceholderState,
-}
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct BoundStatementAst {
@@ -53,67 +48,6 @@ pub(crate) enum StatementBindingSource {
 const ACTIVE_VERSION_FUNCTION_NAME: &str = "lix_active_version_id";
 const ACTIVE_ACCOUNT_IDS_FUNCTION_NAME: &str = "lix_active_account_ids";
 const RUNTIME_PLACEHOLDER_PREFIX: &str = "__lix_runtime_binding_";
-
-pub(crate) fn bind_sql(
-    sql: &str,
-    params: &[Value],
-    dialect: SqlDialect,
-) -> Result<BoundSql, LixError> {
-    bind_sql_with_state(sql, params, dialect, PlaceholderState::new())
-}
-
-pub(crate) fn bind_sql_with_state(
-    sql: &str,
-    params: &[Value],
-    dialect: SqlDialect,
-    state: PlaceholderState,
-) -> Result<BoundSql, LixError> {
-    bind_sql_with_state_and_appended_params(sql, params, &[], dialect, state)
-}
-
-pub(crate) fn bind_sql_with_state_and_appended_params(
-    sql: &str,
-    base_params: &[Value],
-    appended_params: &[Value],
-    dialect: SqlDialect,
-    mut state: PlaceholderState,
-) -> Result<BoundSql, LixError> {
-    let mut statements = parse_sql_statements(sql)?;
-    let mut used_bindings = Vec::new();
-    let mut source_to_dense: HashMap<StatementBindingSource, usize> = HashMap::new();
-    let total_params_len = base_params.len() + appended_params.len();
-
-    for statement in &mut statements {
-        let mut visitor = PlaceholderBinder {
-            params_len: total_params_len,
-            dialect,
-            state: &mut state,
-            source_to_dense: &mut source_to_dense,
-            used_bindings: &mut used_bindings,
-        };
-        if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
-            return Err(error);
-        }
-    }
-
-    let bound_params = used_bindings
-        .into_iter()
-        .map(|binding| match binding {
-            StatementBindingSource::UserParam(source_index) => {
-                clone_param_from_sources(source_index, base_params, appended_params)
-            }
-            StatementBindingSource::Runtime(_) => unreachable!(
-                "runtime bindings are not rewritten in bind_sql_with_state_and_appended_params"
-            ),
-        })
-        .collect();
-
-    Ok(BoundSql {
-        sql: statements_to_sql(&statements),
-        params: bound_params,
-        state,
-    })
-}
 
 pub(crate) fn compile_statement_binding_template_with_state(
     statement: &Statement,
@@ -207,18 +141,6 @@ pub(crate) fn insert_values_rows_mut(insert: &mut Insert) -> Option<&mut [Vec<Ex
         return None;
     };
     Some(values.rows.as_mut_slice())
-}
-
-fn clone_param_from_sources(
-    source_index: usize,
-    base_params: &[Value],
-    appended_params: &[Value],
-) -> Value {
-    if source_index < base_params.len() {
-        return base_params[source_index].clone();
-    }
-
-    appended_params[source_index - base_params.len()].clone()
 }
 
 struct PlaceholderBinder<'a> {
@@ -378,14 +300,6 @@ fn placeholder_for_dialect(dialect: SqlDialect, dense_index_1_based: usize) -> S
         SqlDialect::Sqlite => format!("?{dense_index_1_based}"),
         SqlDialect::Postgres => format!("${dense_index_1_based}"),
     }
-}
-
-fn statements_to_sql(statements: &[Statement]) -> String {
-    statements
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join("; ")
 }
 
 #[cfg(test)]

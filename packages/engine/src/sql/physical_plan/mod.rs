@@ -2,11 +2,9 @@
 //!
 //! Backend lowering hangs off this stage root.
 
-pub(crate) mod filesystem_projection_sql;
 pub(crate) mod lowerer;
 pub(crate) mod plan;
 mod public_read_artifacts;
-pub(crate) mod public_surface_source_sql;
 pub(crate) mod public_surface_sql_support;
 mod rowset_query;
 

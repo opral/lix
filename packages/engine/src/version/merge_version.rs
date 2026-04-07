@@ -168,15 +168,16 @@ async fn merge_version_in_transaction(
         .await?;
 
         {
-            let engine = tx.engine;
             let write_transaction = tx
                 .write_transaction
                 .as_mut()
                 .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
-            let context = &mut tx.context;
+            let mut execution_input = tx.context.buffered_write_execution_input();
             write_transaction
-                .prepare_buffered_write_commit(engine, context)
+                .prepare_buffered_write_commit(&mut execution_input)
                 .await?;
+            tx.context
+                .apply_buffered_write_execution_input(&execution_input);
         }
         let transaction = tx.backend_transaction_mut()?;
         let mut versions = BTreeSet::new();
@@ -306,20 +307,20 @@ async fn merge_version_in_transaction(
         ));
     }
 
-    let engine = tx.engine;
+    let collaborators = tx.collaborators();
     let active_account_ids = tx.context.active_account_ids.clone();
     let (target_head_after_commit_id, created_merge_commit_id, receipt) = {
         let transaction = tx.backend_transaction_mut()?;
         let backend = TransactionBackendAdapter::new(transaction);
-        let (_settings, functions) = engine
+        let (_settings, functions) = collaborators
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
+        let mut functions = functions;
         crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
             transaction,
-            &functions,
+            &mut functions,
         )
         .await?;
-        let mut functions = functions;
         let merge_result = append_tracked(
             transaction,
             CreateCommitArgs {

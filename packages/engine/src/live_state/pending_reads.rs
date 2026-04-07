@@ -161,7 +161,7 @@ impl<'a> TransactionReadModel<'a> {
             )
             .await?
             .into_iter()
-            .map(|row| visible_live_row_from_raw(&access, row))
+            .map(|row| visible_live_row_from_raw(&access, row, false))
             .collect::<Result<Vec<_>, _>>()?,
             PendingViewReadStorage::Untracked => scan_live_rows(
                 self.base,
@@ -173,7 +173,7 @@ impl<'a> TransactionReadModel<'a> {
             )
             .await?
             .into_iter()
-            .map(|row| visible_live_row_from_raw(&access, row))
+            .map(|row| visible_live_row_from_raw(&access, row, true))
             .collect::<Result<Vec<_>, _>>()?,
         };
         let mut by_identity = rows
@@ -415,6 +415,8 @@ struct OverlayVisibleLiveRow {
     schema_version: String,
     file_id: String,
     version_id: String,
+    global: bool,
+    untracked: bool,
     plugin_key: String,
     metadata: Option<String>,
     change_id: Option<String>,
@@ -530,6 +532,7 @@ fn scan_constraints_from_live_filters(filters: &[LiveFilter]) -> Vec<ScanConstra
 fn visible_live_row_from_raw(
     access: &LiveReadContract,
     row: LiveReadRow,
+    untracked: bool,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
     let snapshot_content = row.snapshot_text(access)?;
     Ok(OverlayVisibleLiveRow {
@@ -538,6 +541,8 @@ fn visible_live_row_from_raw(
         schema_version: row.schema_version().to_string(),
         file_id: row.file_id().to_string(),
         version_id: row.version_id().to_string(),
+        global: row.version_id() == GLOBAL_VERSION_ID,
+        untracked,
         plugin_key: row.plugin_key().to_string(),
         metadata: row.metadata().map(ToOwned::to_owned),
         change_id: row.change_id().map(ToOwned::to_owned),
@@ -557,6 +562,8 @@ fn visible_live_row_from_pending(
         schema_version: pending.schema_version.clone(),
         file_id: pending.file_id.clone(),
         version_id: pending.version_id.clone(),
+        global: pending.version_id == GLOBAL_VERSION_ID,
+        untracked: matches!(pending.storage, PendingSemanticStorage::Untracked),
         plugin_key: pending.plugin_key.clone(),
         metadata: pending.metadata.clone(),
         change_id: None,
@@ -590,6 +597,8 @@ fn visible_live_row_from_pending_filesystem_state(
         schema_version: "1".to_string(),
         file_id: "lix".to_string(),
         version_id: pending.version_id.clone(),
+        global: pending.version_id == GLOBAL_VERSION_ID,
+        untracked: pending.untracked,
         plugin_key: "lix".to_string(),
         metadata: descriptor.metadata.clone(),
         change_id: None,
@@ -641,14 +650,18 @@ fn live_filter_matches_row(filter: &LiveFilter, row: &OverlayVisibleLiveRow) -> 
 
 fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
     match column {
-        "entity_id" => Some(Value::Text(row.entity_id.clone())),
-        "schema_key" => Some(Value::Text(row.schema_key.clone())),
-        "schema_version" => Some(Value::Text(row.schema_version.clone())),
-        "file_id" => Some(Value::Text(row.file_id.clone())),
-        "version_id" => Some(Value::Text(row.version_id.clone())),
-        "plugin_key" => Some(Value::Text(row.plugin_key.clone())),
-        "metadata" => Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null)),
-        "change_id" => Some(
+        "entity_id" | "lixcol_entity_id" => Some(Value::Text(row.entity_id.clone())),
+        "schema_key" | "lixcol_schema_key" => Some(Value::Text(row.schema_key.clone())),
+        "schema_version" | "lixcol_schema_version" => Some(Value::Text(row.schema_version.clone())),
+        "file_id" | "lixcol_file_id" => Some(Value::Text(row.file_id.clone())),
+        "version_id" | "lixcol_version_id" => Some(Value::Text(row.version_id.clone())),
+        "global" | "lixcol_global" => Some(Value::Boolean(row.global)),
+        "untracked" | "lixcol_untracked" => Some(Value::Boolean(row.untracked)),
+        "plugin_key" | "lixcol_plugin_key" => Some(Value::Text(row.plugin_key.clone())),
+        "metadata" | "lixcol_metadata" => {
+            Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
+        }
+        "change_id" | "lixcol_change_id" => Some(
             row.change_id
                 .clone()
                 .map(Value::Text)

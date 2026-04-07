@@ -2,13 +2,13 @@ use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
-use crate::live_schema_access::tracked_relation_name;
-use crate::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
-use crate::sql::physical_plan::filesystem_projection_sql::{
+use crate::filesystem_projection_sql::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
+use crate::live_storage_layout::tracked_relation_name;
+use crate::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::text::escape_sql_string;
-use crate::version::GLOBAL_VERSION_ID;
+use crate::version_artifacts::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
@@ -1427,7 +1427,7 @@ fn filesystem_query_backend_error(error: crate::LixError) -> FilesystemQueryErro
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{LixBackendTransaction, SqlDialect};
+    use crate::{LixBackendTransaction, SqlDialect};
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;

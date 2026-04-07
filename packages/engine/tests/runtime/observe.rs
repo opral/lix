@@ -486,6 +486,47 @@ simulation_test!(
             .await
             .expect("switch to branch should succeed");
 
+        let debug_branch_version = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE entity_id = ?1 AND schema_key = 'lix_key_value' AND version_id = ?2",
+                &[
+                    Value::Text(entity_id.to_string()),
+                    Value::Text(branch.id.clone()),
+                ],
+            )
+            .await
+            .expect("branch direct query should succeed");
+        eprintln!(
+            "debug branch by version rows: {:?}",
+            debug_branch_version.statements[0].rows
+        );
+        let debug_active = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = ?1",
+                &[Value::Text(entity_id.to_string())],
+            )
+            .await
+            .expect("active query after switch should succeed");
+        eprintln!(
+            "debug active rows after switch: {:?}",
+            debug_active.statements[0].rows
+        );
+        let debug_version_head = engine
+            .execute(
+                "SELECT commit_id FROM lix_version WHERE id = ?1",
+                &[Value::Text(branch.id.clone())],
+            )
+            .await
+            .expect("version head query should succeed");
+        eprintln!(
+            "debug version head rows: {:?}",
+            debug_version_head.statements[0].rows
+        );
+
         let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
             .await
             .expect("observe next should not time out")

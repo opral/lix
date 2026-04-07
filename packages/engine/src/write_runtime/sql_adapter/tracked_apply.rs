@@ -1,14 +1,20 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::{Arc, RwLock};
 
-use crate::checkpoint::apply_public_version_last_checkpoint_side_effects;
+use crate::change_view::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
-    CommitPreconditions, DomainChangeBatch, ExpectedHead, PlanEffects, PublicDomainChange,
-    WriteLane,
+    CommitPreconditions, DomainChangeBatch, ExpectedHead, PlanEffects, PreparedPublicWriteArtifact,
+    PublicDomainChange, SchemaKey, SessionStateDelta, WriteLane,
 };
-use crate::runtime::functions::LixFunctionProvider;
-use crate::runtime::{SchemaCache, TransactionBackendAdapter};
-use crate::sql::prepare::{
-    semantic_plan_effects_from_domain_changes, state_commit_stream_operation, PreparedPublicWrite,
+use crate::contracts::functions::LixFunctionProvider;
+use crate::contracts::state_commit_stream::{
+    state_commit_stream_changes_from_domain_changes, StateCommitStreamRuntimeMetadata,
+};
+use crate::contracts::traits::CompiledSchemaCache;
+use crate::transaction_execution::TransactionExecutionBackend;
+use crate::version_artifacts::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
 };
 use crate::write_runtime::commit::ProposedDomainChange;
 use crate::write_runtime::commit::{
@@ -19,21 +25,51 @@ use crate::write_runtime::commit::{
 };
 use crate::write_runtime::validate_commit_time_write;
 use crate::{LixBackendTransaction, LixError, QueryResult};
+use jsonschema::JSONSchema;
 
 use super::effects::mirror_public_registered_schema_bootstrap_rows;
 use super::planned_write::TrackedTxnUnit;
 use super::runtime::{empty_public_write_execution_outcome, SqlExecutionOutcome};
 
+struct WriteCompiledSchemaCache {
+    inner: RwLock<HashMap<SchemaKey, Arc<JSONSchema>>>,
+}
+
+impl WriteCompiledSchemaCache {
+    fn new() -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl CompiledSchemaCache for WriteCompiledSchemaCache {
+    fn get_compiled_schema(&self, key: &SchemaKey) -> Option<Arc<JSONSchema>> {
+        self.inner
+            .read()
+            .expect("write compiled schema cache lock poisoned")
+            .get(key)
+            .cloned()
+    }
+
+    fn insert_compiled_schema(&self, key: SchemaKey, schema: Arc<JSONSchema>) {
+        self.inner
+            .write()
+            .expect("write compiled schema cache lock poisoned")
+            .insert(key, schema);
+    }
+}
+
 struct PublicCommitInvariantChecker<'a> {
-    planned_write: &'a crate::sql::logical_plan::public_ir::PlannedWrite,
-    schema_cache: SchemaCache,
+    public_write: &'a PreparedPublicWriteArtifact,
+    schema_cache: WriteCompiledSchemaCache,
 }
 
 impl<'a> PublicCommitInvariantChecker<'a> {
-    fn new(planned_write: &'a crate::sql::logical_plan::public_ir::PlannedWrite) -> Self {
+    fn new(public_write: &'a PreparedPublicWriteArtifact) -> Self {
         Self {
-            planned_write,
-            schema_cache: SchemaCache::new(),
+            public_write,
+            schema_cache: WriteCompiledSchemaCache::new(),
         }
     }
 }
@@ -44,8 +80,8 @@ impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
         &mut self,
         transaction: &mut dyn LixBackendTransaction,
     ) -> Result<(), CreateCommitError> {
-        let backend = TransactionBackendAdapter::new(transaction);
-        validate_commit_time_write(&backend, &self.schema_cache, self.planned_write)
+        let backend = TransactionExecutionBackend::new(transaction);
+        validate_commit_time_write(&backend, &self.schema_cache, self.public_write)
             .await
             .map_err(|error| CreateCommitError {
                 kind: CreateCommitErrorKind::Internal,
@@ -69,7 +105,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
         return Ok(Some(empty_public_write_execution_outcome()));
     }
 
-    let mut create_commit_functions = unit.runtime_state.provider().clone();
+    let mut create_commit_functions = unit.runtime_state.functions().clone();
     let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
     if pending_commit_session
         .as_ref()
@@ -78,12 +114,12 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
     {
         crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
             transaction,
-            &create_commit_functions,
+            &mut create_commit_functions,
         )
         .await?;
     }
 
-    let mut invariant_checker = PublicCommitInvariantChecker::new(&unit.public_write.planned_write);
+    let mut invariant_checker = PublicCommitInvariantChecker::new(&unit.public_write);
     let invariant_checker = if unit.is_merged_transaction_plan() {
         None
     } else {
@@ -102,13 +138,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                 .unwrap_or_default(),
             filesystem_state: unit.filesystem_state.clone(),
             preconditions: canonical_preconditions.clone(),
-            active_account_ids: unit
-                .public_write
-                .planned_write
-                .command
-                .execution_context
-                .active_account_ids
-                .clone(),
+            active_account_ids: unit.public_write.contract.active_account_ids.clone(),
             writer_key: unit.writer_key.clone(),
             should_emit_observe_tick: unit.should_emit_observe_tick(),
         },
@@ -126,7 +156,6 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
     {
         crate::write_runtime::persist_runtime_sequence_in_transaction(
             transaction,
-            unit.runtime_state.settings(),
             &create_commit_functions,
         )
         .await?;
@@ -171,21 +200,14 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
                     .domain_change_batch
                     .as_ref()
                     .and_then(|batch| batch.writer_key.clone())
-                    .or_else(|| {
-                        unit.public_write
-                            .planned_write
-                            .command
-                            .execution_context
-                            .writer_key
-                            .clone()
-                    }),
+                    .or_else(|| unit.public_write.contract.writer_key.clone()),
                 semantic_effects: Vec::new(),
             })
         } else {
             None
         };
     if let Some(applied_domain_change_batch) = applied_domain_change_batch.as_ref() {
-        apply_public_version_last_checkpoint_side_effects(
+        crate::checkpoint_cache::apply_public_version_last_checkpoint_side_effects(
             transaction,
             &unit.public_write,
             applied_domain_change_batch,
@@ -205,11 +227,12 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
 
     let plan_effects_override = if plugin_changes_committed {
         if unit.has_compiler_only_filesystem_changes() {
-            semantic_plan_effects_from_domain_changes(
+            plan_effects_from_tracked_domain_changes(
                 &append_outcome.applied_domain_changes,
-                state_commit_stream_operation(
-                    unit.public_write.planned_write.command.operation_kind,
-                ),
+                unit.public_write
+                    .contract
+                    .operation_kind
+                    .state_commit_stream_operation(),
                 unit.writer_key.as_deref(),
             )?
         } else {
@@ -233,6 +256,62 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
     }))
 }
 
+fn plan_effects_from_tracked_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
+    stream_operation: crate::contracts::artifacts::StateCommitStreamOperation,
+    writer_key: Option<&str>,
+) -> Result<PlanEffects, LixError> {
+    Ok(PlanEffects {
+        state_commit_stream_changes: state_commit_stream_changes_from_domain_changes(
+            changes,
+            stream_operation,
+            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+        )?,
+        session_delta: SessionStateDelta {
+            next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
+            next_active_account_ids: None,
+            persist_workspace: false,
+        },
+        file_cache_refresh_targets: file_cache_refresh_targets_from_domain_changes(changes),
+    })
+}
+
+fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
+) -> Result<Option<String>, LixError> {
+    for change in changes.iter().rev() {
+        if change.schema_key() != active_version_schema_key()
+            || change.file_id() != Some(active_version_file_id())
+            || change.version_id() != active_version_storage_version_id()
+        {
+            continue;
+        }
+
+        let Some(snapshot_content) = change.snapshot_content() else {
+            continue;
+        };
+        return parse_active_version_snapshot(snapshot_content).map(Some);
+    }
+
+    Ok(None)
+}
+
+fn file_cache_refresh_targets_from_domain_changes<Change: TrackedDomainChangeView>(
+    changes: &[Change],
+) -> BTreeSet<(String, String)> {
+    changes
+        .iter()
+        .filter(|change| change.file_id() != Some("lix"))
+        .filter(|change| change.schema_key() != "lix_file_descriptor")
+        .filter(|change| change.schema_key() != "lix_directory_descriptor")
+        .filter_map(|change| {
+            change
+                .file_id()
+                .map(|file_id| (file_id.to_string(), change.version_id().to_string()))
+        })
+        .collect()
+}
+
 fn canonical_create_commit_preconditions_for_tracked_unit(
     unit: &TrackedTxnUnit,
 ) -> Result<CreateCommitPreconditions, LixError> {
@@ -246,7 +325,7 @@ fn canonical_create_commit_preconditions_for_tracked_unit(
 fn canonical_create_commit_preconditions_from_public_write(
     commit_preconditions: &CommitPreconditions,
     batch: Option<&DomainChangeBatch>,
-    public_write: &PreparedPublicWrite,
+    public_write: &PreparedPublicWriteArtifact,
 ) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
         crate::contracts::artifacts::WriteLane::SingleVersion(version_id) => {
@@ -258,14 +337,7 @@ fn canonical_create_commit_preconditions_from_public_write(
                 .flat_map(|batch| batch.changes.first())
                 .map(|change| change.version_id.clone())
                 .next()
-                .or_else(|| {
-                    public_write
-                        .planned_write
-                        .command
-                        .execution_context
-                        .requested_version_id
-                        .clone()
-                })
+                .or_else(|| public_write.contract.requested_version_id.clone())
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",

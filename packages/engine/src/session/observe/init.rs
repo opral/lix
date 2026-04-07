@@ -1,4 +1,4 @@
-use crate::init::tables::execute_init_statements;
+use crate::ddl::execute_ddl_batch;
 use crate::{LixBackend, LixError, SqlDialect};
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
@@ -18,5 +18,5 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
              )"
         }
     };
-    execute_init_statements(backend, "observe", &[statement]).await
+    execute_ddl_batch(backend, "observe", &[statement]).await
 }

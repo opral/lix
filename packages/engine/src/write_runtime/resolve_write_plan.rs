@@ -1,37 +1,22 @@
-use crate::contracts::projection::ProjectionRegistry;
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
-#[cfg(test)]
-use crate::runtime::functions::SystemFunctionProvider;
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::logical_plan::public_ir::{
-    CanonicalStateSelector, MutationPayload, PlannedFilesystemDescriptor, PlannedFilesystemFile,
-    PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef,
-    ResolvedWritePartition, ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, TargetSetProof,
+use crate::prepared_write_artifacts::{
+    CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
+    OverlayLane, PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
+    PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef, ResolvedWritePartition,
+    ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
-};
-use crate::sql::semantic_ir::semantics::state_assignments::StateAssignmentsError;
-use crate::sql::semantic_ir::semantics::surface_semantics::{
-    public_selector_column_name, public_selector_version_column, OverlayLane,
-};
-use crate::version::{
+use crate::version_artifacts::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
     version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
     version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
-use crate::write_runtime::execute_public_query_with_optional_pending_transaction_view;
 use crate::write_runtime::filesystem::query::FilesystemQueryError;
-use crate::{LixBackend, LixError, QueryResult, Value};
-use sqlparser::ast::helpers::attached_token::AttachedToken;
-use sqlparser::ast::{
-    BinaryOperator, Expr, GroupByExpr, Ident, ObjectName, ObjectNamePart, Query, Select,
-    SelectFlavor, SelectItem, SetExpr, TableFactor, TableWithJoins, Value as SqlValue,
-    ValueWithSpan,
-};
+use crate::{LixBackend, Value};
+use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};
 
 mod filesystem_writes;
@@ -45,6 +30,26 @@ use state_backed_writes::{resolve_entity_write, resolve_state_write};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteResolveError {
     pub(crate) message: String,
+}
+
+#[async_trait(?Send)]
+pub(crate) trait WriteSelectorResolver {
+    async fn load_text_selector_values(
+        &self,
+        planned_write: &PlannedWrite,
+        selector_column: &str,
+        error_message: &str,
+    ) -> Result<Vec<String>, WriteResolveError>;
+
+    async fn load_entity_selector_rows(
+        &self,
+        planned_write: &PlannedWrite,
+    ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError>;
+
+    async fn load_state_selector_rows(
+        &self,
+        planned_write: &PlannedWrite,
+    ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError>;
 }
 
 impl From<FilesystemQueryError> for WriteResolveError {
@@ -138,7 +143,7 @@ impl ResolvedWritePartitionBuilder {
                     || file.data.is_some()
                     || !matches!(
                         file.metadata_patch,
-                        crate::sql::logical_plan::public_ir::OptionalTextPatch::Unchanged
+                        crate::contracts::artifacts::OptionalTextPatch::Unchanged
                     )
             });
         }
@@ -195,29 +200,12 @@ impl ResolvedWritePlanBuilder {
     }
 }
 
-#[cfg(test)]
-pub(crate) async fn resolve_write_plan(
-    backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
-    planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&dyn PendingView>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
-    resolve_write_plan_with_functions(
-        backend,
-        projection_registry,
-        planned_write,
-        pending_transaction_view,
-        SharedFunctionProvider::new(SystemFunctionProvider),
-    )
-    .await
-}
-
 pub(crate) async fn resolve_write_plan_with_functions<P>(
     backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
     functions: SharedFunctionProvider<P>,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -234,26 +222,26 @@ where
         SurfaceFamily::State => {
             resolve_state_write(
                 &mut hydrator,
-                projection_registry,
                 planned_write,
                 functions.clone(),
+                selector_resolver,
             )
             .await
         }
         SurfaceFamily::Entity => {
             resolve_entity_write(
                 &mut hydrator,
-                projection_registry,
                 planned_write,
                 functions.clone(),
+                selector_resolver,
             )
             .await
         }
         SurfaceFamily::Admin => {
-            resolve_admin_write(&mut hydrator, projection_registry, planned_write).await
+            resolve_admin_write(&mut hydrator, planned_write, selector_resolver).await
         }
         SurfaceFamily::Filesystem => {
-            resolve_filesystem_write(&mut hydrator, projection_registry, planned_write).await
+            resolve_filesystem_write(&mut hydrator, planned_write, selector_resolver).await
         }
         SurfaceFamily::Change => Err(WriteResolveError {
             message: format!(
@@ -268,8 +256,8 @@ where
 
 async fn resolve_admin_write(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     match planned_write.command.target.descriptor.public_name.as_str() {
         "lix_version" => match planned_write.command.operation_kind {
@@ -277,7 +265,7 @@ async fn resolve_admin_write(
                 resolve_version_insert_write_plan(hydrator, planned_write).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
-                resolve_existing_version_write(hydrator, projection_registry, planned_write).await
+                resolve_existing_version_write(hydrator, planned_write, selector_resolver).await
             }
         },
         other => Err(WriteResolveError {
@@ -347,20 +335,16 @@ async fn resolve_version_insert_write_plan(
 
 async fn resolve_existing_version_write(
     hydrator: &mut PublicWriteHydrator<'_>,
-    projection_registry: &ProjectionRegistry,
     planned_write: &PlannedWrite,
+    selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let version_ids = query_text_selector_values_for_write_selector(
-        hydrator.backend(),
-        projection_registry,
-        planned_write,
-        hydrator
-            .pending_state_overlay()
-            .map(|overlay| overlay.as_pending_view()),
-        "id",
-        "public version selector resolver expected id text rows",
-    )
-    .await?;
+    let version_ids = selector_resolver
+        .load_text_selector_values(
+            planned_write,
+            "id",
+            "public version selector resolver expected id text rows",
+        )
+        .await?;
     if version_ids.is_empty() {
         return Ok(noop_resolved_write_plan(
             default_execution_mode_for_request(planned_write.command.requested_mode),
@@ -1083,231 +1067,10 @@ fn value_as_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn required_text_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<String, WriteResolveError> {
-    row.get(index)
-        .and_then(text_from_value)
-        .ok_or_else(|| WriteResolveError {
-            message: format!("public filesystem resolver expected text {}", label),
-        })
-}
-
-fn required_bool_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<bool, WriteResolveError> {
-    row.get(index)
-        .and_then(value_as_bool)
-        .ok_or_else(|| WriteResolveError {
-            message: format!("public selector resolver expected bool {}", label),
-        })
-}
-
 fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
     crate::LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
-    }
-}
-
-pub(super) async fn query_text_selector_values_for_write_selector(
-    backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
-    planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&dyn PendingView>,
-    selector_column: &str,
-    error_message: &str,
-) -> Result<Vec<String>, WriteResolveError> {
-    let selector = canonical_state_selector(planned_write);
-    let query_result = execute_public_selector_query_strict(
-        backend,
-        projection_registry,
-        planned_write,
-        pending_transaction_view,
-        build_public_selector_query(
-            &planned_write.command.target.descriptor.public_name,
-            &selector,
-            &[selector_column],
-        ),
-    )
-    .await
-    .map_err(write_resolve_backend_error)?;
-
-    let mut values = Vec::new();
-    for row in query_result.rows {
-        let Some(value) = row.first().and_then(text_from_value) else {
-            return Err(WriteResolveError {
-                message: error_message.to_string(),
-            });
-        };
-        if !values.iter().any(|existing| existing == &value) {
-            values.push(value);
-        }
-    }
-    Ok(values)
-}
-
-pub(super) fn canonical_state_selector(planned_write: &PlannedWrite) -> CanonicalStateSelector {
-    let predicates = if planned_write.command.selector.exact_only {
-        exact_selector_predicates(planned_write)
-            .unwrap_or_else(|| planned_write.command.selector.residual_predicates.clone())
-    } else {
-        planned_write.command.selector.residual_predicates.clone()
-    };
-    let version_column = planned_write
-        .command
-        .target
-        .implicit_overrides
-        .expose_version_id
-        .then(|| {
-            public_selector_version_column(planned_write.command.target.descriptor.surface_family)
-                .to_string()
-        });
-    CanonicalStateSelector {
-        predicates,
-        version_column,
-    }
-}
-
-pub(super) async fn execute_public_selector_query_strict(
-    backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
-    planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&dyn PendingView>,
-    query: Query,
-) -> Result<QueryResult, LixError> {
-    let active_version_id = planned_write
-        .command
-        .execution_context
-        .requested_version_id
-        .as_deref()
-        .unwrap_or(GLOBAL_VERSION_ID);
-    execute_public_query_with_optional_pending_transaction_view(
-        backend,
-        projection_registry,
-        query,
-        &planned_write.command.bound_parameters,
-        active_version_id,
-        planned_write
-            .command
-            .execution_context
-            .writer_key
-            .as_deref(),
-        pending_transaction_view,
-    )
-    .await
-}
-
-fn exact_selector_predicates(planned_write: &PlannedWrite) -> Option<Vec<Expr>> {
-    let mut predicates = Vec::with_capacity(planned_write.command.selector.exact_filters.len());
-    for (column, value) in &planned_write.command.selector.exact_filters {
-        let public_column = public_selector_column_name(
-            planned_write.command.target.descriptor.surface_family,
-            column,
-        )?;
-        predicates.push(Expr::BinaryOp {
-            left: Box::new(Expr::Identifier(Ident::new(public_column))),
-            op: BinaryOperator::Eq,
-            right: Box::new(engine_value_to_sql_expr(value)),
-        });
-    }
-    Some(predicates)
-}
-
-fn engine_value_to_sql_expr(value: &Value) -> Expr {
-    match value {
-        Value::Null => Expr::Value(ValueWithSpan::from(SqlValue::Null)),
-        Value::Boolean(value) => Expr::Value(ValueWithSpan::from(SqlValue::Boolean(*value))),
-        Value::Text(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
-            value.clone(),
-        ))),
-        Value::Json(value) => Expr::Value(ValueWithSpan::from(SqlValue::SingleQuotedString(
-            value.to_string(),
-        ))),
-        Value::Integer(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
-            value.to_string(),
-            false,
-        ))),
-        Value::Real(value) => Expr::Value(ValueWithSpan::from(SqlValue::Number(
-            value.to_string(),
-            false,
-        ))),
-        Value::Blob(value) => Expr::Value(ValueWithSpan::from(
-            SqlValue::SingleQuotedByteStringLiteral(String::from_utf8_lossy(value).to_string()),
-        )),
-    }
-}
-
-fn build_public_selector_query(
-    surface_name: &str,
-    selector: &CanonicalStateSelector,
-    selector_columns: &[&str],
-) -> Query {
-    let selection = selector
-        .predicates
-        .iter()
-        .cloned()
-        .reduce(|left, right| Expr::BinaryOp {
-            left: Box::new(left),
-            op: BinaryOperator::And,
-            right: Box::new(right),
-        });
-
-    Query {
-        with: None,
-        body: Box::new(SetExpr::Select(Box::new(Select {
-            select_token: AttachedToken::empty(),
-            distinct: None,
-            top: None,
-            top_before_distinct: false,
-            projection: selector_columns
-                .iter()
-                .map(|column| SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(*column))))
-                .collect(),
-            exclude: None,
-            into: None,
-            from: vec![TableWithJoins {
-                relation: TableFactor::Table {
-                    name: ObjectName(vec![ObjectNamePart::Identifier(Ident::new(surface_name))]),
-                    alias: None,
-                    args: None,
-                    with_hints: vec![],
-                    version: None,
-                    with_ordinality: false,
-                    partitions: vec![],
-                    json_path: None,
-                    sample: None,
-                    index_hints: vec![],
-                },
-                joins: Vec::new(),
-            }],
-            lateral_views: Vec::new(),
-            prewhere: None,
-            selection,
-            group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
-            cluster_by: Vec::new(),
-            distribute_by: Vec::new(),
-            sort_by: Vec::new(),
-            having: None,
-            named_window: Vec::new(),
-            qualify: None,
-            window_before_qualify: false,
-            value_table_mode: None,
-            connect_by: None,
-            flavor: SelectFlavor::Standard,
-        }))),
-        order_by: None,
-        limit_clause: None,
-        fetch: None,
-        locks: Vec::new(),
-        for_clause: None,
-        settings: None,
-        format_clause: None,
-        pipe_operators: Vec::new(),
     }
 }
 

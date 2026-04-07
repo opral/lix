@@ -18,27 +18,23 @@ pub(crate) mod preprocess;
 mod public_surface;
 
 pub(crate) use compile::{
-    compile_execution_from_template_instance_with_context,
-    prepared_execution_mutates_public_surface_registry, DefaultSqlPreparationContext,
-    PreparationPolicy, SqlPreparationContext, SqlPreparationSeed,
+    compile_execution_from_template_instance_with_context, PreparationPolicy,
+    SqlPreparationContext, SqlPreparationSeed,
 };
-pub(crate) use compiled::{
-    schema_registrations_for_compiled_execution, CompiledExecution, CompiledInternalExecution,
-};
+pub(crate) use compiled::CompiledExecution;
 pub(crate) use compiler_metadata::{
     load_sql_compiler_metadata, load_sql_compiler_metadata_with_reader, SqlCompilerMetadata,
 };
+pub(crate) use contracts::planned_statement::UpdateValidationPlan;
+pub(crate) use execution_program::{BoundStatementTemplateInstance, ExecutionProgram};
 pub(crate) use prepared_read::{
     prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
     prepare_public_read_artifact, CommittedReadProgramContext,
 };
 pub(crate) use public_surface::{
-    apply_public_surface_registry_mutations, build_public_write_execution,
-    build_public_write_invariant_trace, classify_public_execution_route_with_registry,
+    build_public_write_execution, build_public_write_invariant_trace,
     finalize_public_write_execution, public_authoritative_write_error,
-    public_surface_registry_mutations, public_write_preparation_error,
-    read::prepared_public_read_contract, semantic_plan_effects_from_domain_changes,
-    state_commit_stream_operation, statement_references_public_surface,
+    public_write_preparation_error, statement_references_public_surface,
     try_prepare_public_read_with_registry_and_internal_access, PreparedPublicRead,
-    PreparedPublicWrite, PublicExecutionRoute,
+    PreparedPublicWrite,
 };

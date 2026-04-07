@@ -1,4 +1,4 @@
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::binder::insert_values_rows_mut;
 use crate::LixError;
 use sqlparser::ast::{

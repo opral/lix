@@ -12,9 +12,11 @@ use crate::explain_output::{render_analyzed_explain_result, render_plain_explain
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult};
 use std::time::Instant;
 
+#[cfg(test)]
+pub(crate) use public::execute_prepared_public_read_artifact_with_backend;
 pub(crate) use public::{
+    bootstrap_public_surface_registry_in_transaction,
     execute_prepared_public_read_artifact_in_transaction,
-    execute_prepared_public_read_artifact_with_backend,
 };
 pub(crate) use rowset::execute_read_time_projection_read_with_registry;
 

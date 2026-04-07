@@ -1,4 +1,4 @@
-use crate::init::tables::execute_init_statements;
+use crate::ddl::execute_ddl_batch;
 use crate::{LixBackend, LixError};
 
 const UNDO_REDO_INIT_STATEMENTS: &[&str] = &[
@@ -16,5 +16,5 @@ const UNDO_REDO_INIT_STATEMENTS: &[&str] = &[
 ];
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_init_statements(backend, "undo_redo", UNDO_REDO_INIT_STATEMENTS).await
+    execute_ddl_batch(backend, "version.undo_redo", UNDO_REDO_INIT_STATEMENTS).await
 }

@@ -1,5 +1,5 @@
 use crate::contracts::artifacts::SessionStateDelta;
-use crate::runtime::streams::{
+use crate::contracts::state_commit_stream::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
 

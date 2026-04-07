@@ -1011,6 +1011,272 @@ pub(crate) struct PreparedReadProgram {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedWriteStatementKind {
+    Query,
+    Explain,
+    Other,
+}
+
+#[allow(dead_code)]
+impl PreparedWriteStatementKind {
+    pub(crate) fn for_statement(statement: &Statement) -> Self {
+        match statement {
+            Statement::Query(_) => Self::Query,
+            Statement::Explain { .. } => Self::Explain,
+            _ => Self::Other,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedWriteOperationKind {
+    Insert,
+    Update,
+    Delete,
+}
+
+#[allow(dead_code)]
+impl PreparedWriteOperationKind {
+    pub(crate) fn state_commit_stream_operation(self) -> StateCommitStreamOperation {
+        match self {
+            Self::Insert => StateCommitStreamOperation::Insert,
+            Self::Update => StateCommitStreamOperation::Update,
+            Self::Delete => StateCommitStreamOperation::Delete,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedInsertOnConflictAction {
+    DoUpdate,
+    DoNothing,
+}
+
+/// Diagnostic context handed to write runtime alongside a prepared write step.
+///
+/// The context stays text-shaped and template-shaped so runtime can normalize
+/// backend errors and render EXPLAIN output without importing parser-owned or
+/// compiler-owned statement structures.
+#[derive(Debug, Clone, PartialEq, Default)]
+#[allow(dead_code)]
+pub(crate) struct PreparedWriteDiagnosticContext {
+    pub(crate) relation_names: Vec<String>,
+    pub(crate) explain_mode: Option<PreparedExplainMode>,
+    pub(crate) plain_explain_template: Option<PreparedExplainTemplate>,
+    pub(crate) analyzed_explain_template: Option<PreparedExplainTemplate>,
+}
+
+#[allow(dead_code)]
+impl PreparedWriteDiagnosticContext {
+    pub(crate) fn new(relation_names: Vec<String>) -> Self {
+        Self {
+            relation_names,
+            explain_mode: None,
+            plain_explain_template: None,
+            analyzed_explain_template: None,
+        }
+    }
+
+    pub(crate) fn relation_names(&self) -> &[String] {
+        &self.relation_names
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedPublicSurfaceRegistryMutation {
+    UpsertRegisteredSchemaSnapshot { snapshot: JsonValue },
+    RemoveDynamicSchema { schema_key: String },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedPublicSurfaceRegistryEffect {
+    None,
+    ApplyMutations(Vec<PreparedPublicSurfaceRegistryMutation>),
+    ReloadFromStorage,
+}
+
+#[allow(dead_code)]
+impl PreparedPublicSurfaceRegistryEffect {
+    pub(crate) fn is_none(&self) -> bool {
+        matches!(self, Self::None)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedResolvedWritePartition {
+    pub(crate) execution_mode: WriteMode,
+    pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
+    pub(crate) intended_post_state: Vec<PlannedStateRow>,
+    pub(crate) workspace_writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
+    pub(crate) filesystem_state: PlannedFilesystemState,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedResolvedWritePlan {
+    pub(crate) partitions: Vec<PreparedResolvedWritePartition>,
+}
+
+#[allow(dead_code)]
+impl PreparedResolvedWritePlan {
+    pub(crate) fn authoritative_pre_state_rows(&self) -> impl Iterator<Item = &PlannedStateRow> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.authoritative_pre_state_rows.iter())
+    }
+
+    pub(crate) fn intended_post_state(&self) -> impl Iterator<Item = &PlannedStateRow> {
+        self.partitions
+            .iter()
+            .flat_map(|partition| partition.intended_post_state.iter())
+    }
+
+    pub(crate) fn filesystem_state(&self) -> PlannedFilesystemState {
+        let mut merged = PlannedFilesystemState::default();
+        for partition in &self.partitions {
+            merged.merge_from(&partition.filesystem_state);
+        }
+        merged
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedPublicWriteContract {
+    pub(crate) operation_kind: PreparedWriteOperationKind,
+    pub(crate) target: SurfaceBinding,
+    pub(crate) on_conflict_action: Option<PreparedInsertOnConflictAction>,
+    pub(crate) requested_version_id: Option<String>,
+    pub(crate) active_account_ids: Vec<String>,
+    pub(crate) writer_key: Option<String>,
+    pub(crate) resolved_write_plan: Option<PreparedResolvedWritePlan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedTrackedWriteExecution {
+    pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
+    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) create_preconditions: CommitPreconditions,
+    pub(crate) semantic_effects: PlanEffects,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedUntrackedWriteExecution {
+    pub(crate) intended_post_state: Vec<PlannedStateRow>,
+    pub(crate) semantic_effects: PlanEffects,
+    pub(crate) persist_filesystem_payloads_before_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedPublicWriteExecutionPartition {
+    Tracked(PreparedTrackedWriteExecution),
+    Untracked(PreparedUntrackedWriteExecution),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedPublicWriteMaterialization {
+    pub(crate) partitions: Vec<PreparedPublicWriteExecutionPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedPublicWriteExecutionArtifact {
+    Noop,
+    Materialize(PreparedPublicWriteMaterialization),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedPublicWriteArtifact {
+    pub(crate) contract: PreparedPublicWriteContract,
+    pub(crate) execution: PreparedPublicWriteExecutionArtifact,
+}
+
+#[allow(dead_code)]
+impl PreparedPublicWriteArtifact {
+    pub(crate) fn materialization(&self) -> Option<&PreparedPublicWriteMaterialization> {
+        match &self.execution {
+            PreparedPublicWriteExecutionArtifact::Noop => None,
+            PreparedPublicWriteExecutionArtifact::Materialize(materialization) => {
+                Some(materialization)
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedInternalWriteArtifact {
+    pub(crate) prepared_batch: PreparedBatch,
+    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
+    pub(crate) mutations: Vec<MutationRow>,
+    pub(crate) has_update_validations: bool,
+    pub(crate) should_refresh_file_cache: bool,
+    pub(crate) read_only_query: bool,
+    pub(crate) filesystem_state: PlannedFilesystemState,
+    pub(crate) effects: PlanEffects,
+    pub(crate) writer_key: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) enum PreparedWriteArtifact {
+    PublicRead(PreparedPublicReadArtifact),
+    PublicWrite(PreparedPublicWriteArtifact),
+    Internal(PreparedInternalWriteArtifact),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedWriteStep {
+    pub(crate) statement_kind: PreparedWriteStatementKind,
+    pub(crate) result_contract: ResultContract,
+    pub(crate) artifact: PreparedWriteArtifact,
+    pub(crate) diagnostic_context: PreparedWriteDiagnosticContext,
+    pub(crate) public_surface_registry_effect: PreparedPublicSurfaceRegistryEffect,
+}
+
+#[allow(dead_code)]
+impl PreparedWriteStep {
+    pub(crate) fn public_read(&self) -> Option<&PreparedPublicReadArtifact> {
+        match &self.artifact {
+            PreparedWriteArtifact::PublicRead(read) => Some(read),
+            PreparedWriteArtifact::PublicWrite(_) | PreparedWriteArtifact::Internal(_) => None,
+        }
+    }
+
+    pub(crate) fn public_write(&self) -> Option<&PreparedPublicWriteArtifact> {
+        match &self.artifact {
+            PreparedWriteArtifact::PublicWrite(write) => Some(write),
+            PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::Internal(_) => None,
+        }
+    }
+
+    pub(crate) fn internal_write(&self) -> Option<&PreparedInternalWriteArtifact> {
+        match &self.artifact {
+            PreparedWriteArtifact::Internal(internal) => Some(internal),
+            PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::PublicWrite(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedWriteProgram {
+    pub(crate) steps: Vec<PreparedWriteStep>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PublicReadResultColumn {
     Untyped,
     Boolean,
@@ -1582,6 +1848,41 @@ pub(crate) struct PlannedStateRow {
     pub(crate) values: BTreeMap<String, Value>,
     pub(crate) writer_key: Option<String>,
     pub(crate) tombstone: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedFilesystemDescriptor {
+    pub(crate) directory_id: String,
+    pub(crate) name: String,
+    pub(crate) extension: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) hidden: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PlannedFilesystemFile {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) descriptor: Option<PlannedFilesystemDescriptor>,
+    pub(crate) metadata_patch: OptionalTextPatch,
+    pub(crate) data: Option<Vec<u8>>,
+    pub(crate) deleted: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct PlannedFilesystemState {
+    pub(crate) files: BTreeMap<(String, String), PlannedFilesystemFile>,
+}
+
+impl PlannedFilesystemState {
+    pub(crate) fn merge_from(&mut self, next: &Self) {
+        self.files.extend(next.files.clone());
+    }
+
+    pub(crate) fn has_binary_payloads(&self) -> bool {
+        self.files.values().any(|file| file.data.is_some())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

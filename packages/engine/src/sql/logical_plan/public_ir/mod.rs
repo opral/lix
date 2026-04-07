@@ -13,8 +13,8 @@ use sqlparser::ast::{
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use crate::contracts::artifacts::{
-    CommitPreconditions, OptionalTextPatch, PlannedRowIdentity, PlannedStateRow, WriteLane,
-    WriteMode,
+    CommitPreconditions, OptionalTextPatch, PlannedFilesystemDescriptor, PlannedFilesystemFile,
+    PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, WriteLane, WriteMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -764,12 +764,6 @@ pub(crate) struct WriteSelector {
     pub(crate) exact_only: bool,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct CanonicalStateSelector {
-    pub(crate) predicates: Vec<Expr>,
-    pub(crate) version_column: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalStateRowKey {
     pub(crate) entity_id: String,
@@ -872,41 +866,6 @@ pub(crate) struct RowLineage {
     pub(crate) source_commit_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedFilesystemDescriptor {
-    pub(crate) directory_id: String,
-    pub(crate) name: String,
-    pub(crate) extension: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) hidden: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedFilesystemFile {
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) untracked: bool,
-    pub(crate) descriptor: Option<PlannedFilesystemDescriptor>,
-    pub(crate) metadata_patch: OptionalTextPatch,
-    pub(crate) data: Option<Vec<u8>>,
-    pub(crate) deleted: bool,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PlannedFilesystemState {
-    pub(crate) files: BTreeMap<(String, String), PlannedFilesystemFile>,
-}
-
-impl PlannedFilesystemState {
-    pub(crate) fn merge_from(&mut self, next: &Self) {
-        self.files.extend(next.files.clone());
-    }
-
-    pub(crate) fn has_binary_payloads(&self) -> bool {
-        self.files.values().any(|file| file.data.is_some())
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
@@ -950,12 +909,6 @@ impl ResolvedWritePlan {
 
     pub(crate) fn from_partitions(partitions: Vec<ResolvedWritePartition>) -> Self {
         Self { partitions }
-    }
-
-    pub(crate) fn authoritative_pre_state_rows(&self) -> impl Iterator<Item = &PlannedStateRow> {
-        self.partitions
-            .iter()
-            .flat_map(|partition| partition.authoritative_pre_state_rows.iter())
     }
 
     pub(crate) fn intended_post_state(&self) -> impl Iterator<Item = &PlannedStateRow> {

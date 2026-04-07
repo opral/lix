@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use crate::contracts::surface::SurfaceRegistry;
 use crate::execution_effects::ExecutionRuntimeEffects;
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
@@ -12,7 +11,6 @@ use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
 use super::contracts::requirements::PlanRequirements;
-use super::{classify_public_execution_route_with_registry, PublicExecutionRoute};
 
 pub(crate) struct ExecutionProgram {
     source_statements: Vec<Statement>,
@@ -28,17 +26,9 @@ struct ExecutionProgramStatement {
     bound_template: BoundStatementTemplateInstance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatementTemplateOwnership {
-    PublicRead,
-    PublicWrite,
-    Internal,
-}
-
 #[derive(Clone)]
 pub(crate) struct StatementTemplate {
     binding_template: StatementBindingTemplate,
-    ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: PlanRequirements,
 }
 
@@ -49,38 +39,11 @@ impl StatementTemplate {
         params_len: usize,
         placeholder_state: PlaceholderState,
     ) -> Result<(Self, PlaceholderState), LixError> {
-        Self::build(statement, None, dialect, params_len, placeholder_state)
-    }
-
-    pub(crate) fn compile_with_registry(
-        statement: Statement,
-        registry: &SurfaceRegistry,
-        dialect: SqlDialect,
-        params_len: usize,
-    ) -> Result<Self, LixError> {
-        let ownership_hint = Some(
-            match classify_public_execution_route_with_registry(
-                registry,
-                std::slice::from_ref(&statement),
-            ) {
-                Some(PublicExecutionRoute::Read) => StatementTemplateOwnership::PublicRead,
-                Some(PublicExecutionRoute::Write) => StatementTemplateOwnership::PublicWrite,
-                None => StatementTemplateOwnership::Internal,
-            },
-        );
-        let (template, _) = Self::build(
-            statement,
-            ownership_hint,
-            dialect,
-            params_len,
-            PlaceholderState::new(),
-        )?;
-        Ok(template)
+        Self::build(statement, dialect, params_len, placeholder_state)
     }
 
     fn build(
         statement: Statement,
-        ownership_hint: Option<StatementTemplateOwnership>,
         dialect: SqlDialect,
         params_len: usize,
         placeholder_state: PlaceholderState,
@@ -99,7 +62,6 @@ impl StatementTemplate {
                     crate::sql::prepare::derive_requirements::derive_plan_requirements(
                         std::slice::from_ref(&statement),
                     ),
-                ownership_hint,
             },
             next_placeholder_state,
         ))
@@ -117,7 +79,6 @@ impl StatementTemplate {
             statement: bound.statement,
             params: bound.params,
             parse_duration,
-            ownership_hint: self.ownership_hint,
             plan_requirements: self.plan_requirements.clone(),
         })
     }
@@ -128,7 +89,6 @@ pub(crate) struct BoundStatementTemplateInstance {
     statement: Statement,
     params: Vec<Value>,
     parse_duration: Option<Duration>,
-    ownership_hint: Option<StatementTemplateOwnership>,
     plan_requirements: PlanRequirements,
 }
 
@@ -145,15 +105,12 @@ impl BoundStatementTemplateInstance {
         self.parse_duration
     }
 
-    pub(crate) fn ownership_hint(&self) -> Option<StatementTemplateOwnership> {
-        self.ownership_hint
-    }
-
     pub(crate) fn plan_requirements(&self) -> &PlanRequirements {
         &self.plan_requirements
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct StatementTemplateCacheKey {
     sql: String,
@@ -162,6 +119,7 @@ pub(crate) struct StatementTemplateCacheKey {
     public_surface_registry_generation: u64,
 }
 
+#[cfg(test)]
 impl StatementTemplateCacheKey {
     pub(crate) fn new(
         sql: &str,

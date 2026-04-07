@@ -1,7 +1,6 @@
 use super::statement_references_public_surface;
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::runtime::cel::CelEvaluator;
-use crate::runtime::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::{
     result_contract_for_statements, verify_logical_plan, InternalLogicalPlan, LogicalPlan,
 };
@@ -12,7 +11,6 @@ use sqlparser::ast::Statement;
 pub(crate) async fn preprocess_with_surfaces_to_logical_plan<P: LixFunctionProvider>(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
-    evaluator: &CelEvaluator,
     statements: Vec<Statement>,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
@@ -23,10 +21,9 @@ where
 {
     reject_public_surface_statements(registry, &statements)?;
     let result_contract = result_contract_for_statements(&statements);
-    let normalized_statements = prepare_internal_statements_to_plan(
-        dialect, evaluator, statements, params, functions, writer_key,
-    )
-    .await?;
+    let normalized_statements =
+        prepare_internal_statements_to_plan(dialect, statements, params, functions, writer_key)
+            .await?;
     let logical_plan = InternalLogicalPlan {
         normalized_statements,
         result_contract,

@@ -8,7 +8,7 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::contracts::artifacts::{is_untracked_live_table, SessionDependency};
-use crate::runtime::streams::StateCommitStreamFilter;
+use crate::contracts::state_commit_stream::StateCommitStreamFilter;
 use crate::sql::binder::bind_sql_with_state;
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;

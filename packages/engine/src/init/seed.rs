@@ -6,10 +6,10 @@ use crate::schema::builtin::storage::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
+use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parser::parse_sql;
 use crate::version::load_committed_version_head_commit_id;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::write_runtime::sql_adapter::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::write_runtime::BorrowedWriteTransaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -60,9 +60,12 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             None,
         )
         .await?;
+        let mut execution_input = self.context.buffered_write_execution_input();
         self.write_transaction
-            .flush_buffered_write_journal(self.engine, &mut self.context)
+            .flush_buffered_write_journal(&mut execution_input)
             .await?;
+        self.context
+            .apply_buffered_write_execution_input(&execution_input);
         Ok(result)
     }
 
@@ -89,9 +92,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
+        let mut runtime_functions = runtime_state.provider().clone();
         crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
-            runtime_state.provider(),
+            &mut runtime_functions,
         )
         .await?;
         Ok(runtime_state.provider().call_uuid_v7())
@@ -99,9 +103,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
     pub(crate) async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
+        let mut runtime_functions = runtime_state.provider().clone();
         crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
-            runtime_state.provider(),
+            &mut runtime_functions,
         )
         .await?;
         Ok(runtime_state.provider().call_timestamp())
@@ -113,7 +118,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         };
         crate::write_runtime::persist_runtime_sequence_in_transaction(
             self.write_transaction.backend_transaction_mut(),
-            runtime_state.settings(),
             runtime_state.provider(),
         )
         .await
@@ -125,8 +129,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         }
         let backend =
             TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
-        let runtime_state =
-            ExecutionRuntimeState::prepare(self.engine.runtime().as_ref(), &backend).await?;
+        let (settings, functions) = self
+            .engine
+            .prepare_runtime_functions_with_backend(&backend)
+            .await?;
+        let runtime_state = ExecutionRuntimeState::from_prepared_parts(settings, functions);
         self.context
             .set_execution_runtime_state(runtime_state.clone());
         Ok(runtime_state)

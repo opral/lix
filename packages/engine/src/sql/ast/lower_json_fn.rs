@@ -4,7 +4,7 @@ use sqlparser::ast::{
     Value as AstValue,
 };
 
-use crate::backend::SqlDialect;
+use crate::SqlDialect;
 
 use super::lower_logical_fn::{
     LixJsonCall, LixJsonExtractCall, LixJsonPathSegment, LixTextCodecCall,

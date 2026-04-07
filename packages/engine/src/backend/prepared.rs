@@ -1,7 +1,5 @@
 pub use crate::contracts::artifacts::{PreparedBatch, PreparedStatement};
-use crate::sql::binder::bind_sql;
-use crate::sql::parser::parse_sql_statements;
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::statement_support::{parse_sql_statements, resolve_placeholder_index, PlaceholderState};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Expr, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;
@@ -55,8 +53,7 @@ pub fn inline_prepared_statement_for_dialect(
         return Ok(statement.clone());
     }
 
-    let bound = bind_sql(&statement.sql, &statement.params, dialect)?;
-    let sql = inline_bound_statement(&bound.sql, &bound.params, dialect)?;
+    let sql = inline_bound_statement(&statement.sql, &statement.params, dialect)?;
     Ok(PreparedStatement {
         sql,
         params: Vec::new(),

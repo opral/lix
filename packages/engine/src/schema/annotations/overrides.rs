@@ -68,6 +68,13 @@ pub(crate) fn collect_state_column_overrides(
     Ok(out)
 }
 
+pub(crate) fn collect_state_column_overrides_with_shared_runtime(
+    schema: &JsonValue,
+    schema_key: &str,
+) -> Result<BTreeMap<String, Value>, LixError> {
+    collect_state_column_overrides(schema, schema_key, crate::runtime::cel::shared_runtime())
+}
+
 fn raw_lixcol_override_expression<'a>(schema: &'a JsonValue, key: &str) -> Option<&'a str> {
     schema
         .get("x-lix-override-lixcols")
