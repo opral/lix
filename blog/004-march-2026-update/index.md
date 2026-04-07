@@ -31,7 +31,7 @@ The best result from the workload replay is that it worked. Replaying 500 real c
 > [!NOTE]
 > **Refresher: What is the semantic layer?**
 >
-> The semantic layer is the representation where a file stops being a blob and becomes entities and changes.
+> Lix parses files into structured entities like paragraphs, tables, images so it can diff, merge, and sync at that level instead of treating files as opaque blobs.
 >
 > ```
 >   contract.docx
