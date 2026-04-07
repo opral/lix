@@ -12,6 +12,7 @@ og:image:alt: "February 2026 update cover showing the Lix Rust rewrite milestone
 - 33x faster file writes
 - GitHub stars grew from 70 to over 500
 - Real workload and AX (user) testing in March
+
 ## The Rust rewrite is complete
 
 [RFC 001](https://lix.dev/rfc/001-preprocess-writes) and [RFC 002](https://lix.dev/rfc/002-rewrite-in-rust) have been implemented in February, with two strong outcomes:
@@ -21,7 +22,7 @@ og:image:alt: "February 2026 update cover showing the Lix Rust rewrite milestone
 The rewrite significantly improves heavy write paths, with the largest gain on realistic plugin-based JSON file inserts (**33x median, ~40x p95**).
 
 | Benchmark                         | `v0.5`    | `next`    | Speedup    |
-|-----------------------------------|-----------|-----------|------------|
+| --------------------------------- | --------- | --------- | ---------- |
 | State single-row insert           | 17.43 ms  | 14.85 ms  | 1.17x      |
 | State 10-row insert               | 57.33 ms  | 46.53 ms  | 1.23x      |
 | State 100-row insert              | 460.27 ms | 193.30 ms | **2.38x**  |
@@ -34,7 +35,6 @@ The new architecture unlocks previously impossible optimizations. The SQL databa
 v0.5 and below could not optimize beyond what the vtable API of the database provides. Every write triggered per-row callbacks that crossed the JS-WASM boundary with ~10-25 internal SQL queries each. In SQLite's case, even batching mutations was not optimizable.
 
 Lix now intercepts and rewrites queries before they hit SQLite, batching what used to be per-row vtable callbacks into single bulk operations. For more information read [RFC 001](https://lix.dev/rfc/001-preprocess-writes).
-
 
 ```plain
          v0.5                           next
