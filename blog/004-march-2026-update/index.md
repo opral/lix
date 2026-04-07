@@ -1,11 +1,13 @@
 ---
 date: "2026-04-03"
 og:description: "500 real commits replayed with no corruption bugs. Without the semantic layer, Lix is ~8x faster than Git, but semantic writes still bottleneck on write amplification."
-og:image: "./8x-faster.png"
-og:image:alt: "March 2026 update: no corruption bugs, 8x faster than Git, semantic writes still too slow"
+og:image: "./cover.svg"
+og:image:alt: "Lix March 2026 Update: 500 commits with zero corruption, blob commit in 5ms, semantic writes need fixing"
 ---
 
 # March 2026 Update: No Corruption Bugs, 8x Faster Than Git, Semantic Writes Still Too Slow
+
+![Lix March 2026 Update](./cover.svg)
 
 **TL;DR**
 
@@ -163,8 +165,10 @@ Solving write speed alone isn't enough — storage also needs to scale across ve
 
 ## What's next in April
 
-**Get 10k entity inserts under 100 ms.** SQLite can insert 10k rows in under 10 ms. That gives us ~90 ms of headroom to work with.
+**Goal: Make Lix ready for people to try out.**
 
-**Prolly trees for cheap branching.** Without content deduplication, every branch copies all entity data. Prolly trees share unchanged chunks across versions, so branching a 10k-entity document is nearly free.
+March proved the blob path works. April is about closing the gap so the semantic layer is fast enough and correct enough for real use.
 
-**Workload testing with the semantic layer on.** March proved the blob path doesn't corrupt state across 500 real commits. April repeats that test with semantic writes enabled.
+1. **10k entity inserts under 100 ms.** SQLite can insert 10k rows in under 10 ms. That gives us ~90 ms of headroom to work with.
+2. **Prolly trees for cheap branching.** Without content deduplication, every branch copies all entity data. Prolly trees share unchanged chunks across versions, so branching a 10k-entity document is nearly free.
+3. **Workload testing with the semantic layer on.** March proved the blob path doesn't corrupt state across 500 real commits. April repeats that test with semantic writes enabled.
