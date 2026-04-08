@@ -26,7 +26,7 @@ use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_uses_payload_alias, escape_sql_string, render_identifier,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
-use crate::version_inventory_sql::{
+use crate::version_state::inventory::{
     build_admin_version_source_sql, build_admin_version_source_sql_with_current_heads,
 };
 use crate::{LixError, SqlDialect};

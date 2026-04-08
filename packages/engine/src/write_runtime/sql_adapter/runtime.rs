@@ -7,8 +7,9 @@ use crate::contracts::artifacts::{
     PreparedWriteStep, ResultContract, SchemaRegistration, SchemaRegistrationSet,
     StateCommitStreamChange,
 };
-use crate::contracts::projection::ProjectionRegistry;
-use crate::contracts::traits::{PendingPublicReadTransaction, PendingView};
+use crate::projections::ProjectionRegistry;
+use crate::contracts::traits::PendingView;
+use crate::read_runtime::PendingPublicReadExecutionTransaction;
 use crate::sql::explain::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::transaction_execution::normalize_sql_error_with_transaction_and_relation_names;
 use crate::write_runtime::buffered::apply_schema_registrations_in_transaction;

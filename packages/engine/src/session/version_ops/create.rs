@@ -1,6 +1,8 @@
-use crate::version::context::require_target_version_context_in_transaction;
 use crate::common::errors;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
+
+use super::context::require_target_version_context_in_transaction;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct CreateVersionOptions {
@@ -47,7 +49,7 @@ async fn create_version_in_transaction(
     let id =
         normalize_optional_non_empty_text(options.id, "id")?.unwrap_or(generate_uuid(tx).await?);
     let name = normalize_optional_non_empty_text(options.name, "name")?.unwrap_or(id.clone());
-    if id == crate::version::GLOBAL_VERSION_ID {
+    if id == GLOBAL_VERSION_ID {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "version id 'global' is reserved".to_string(),

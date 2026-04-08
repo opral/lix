@@ -4,9 +4,6 @@ mod binary_cas;
 mod boot;
 mod common;
 pub(crate) mod canonical;
-pub(crate) mod checkpoint;
-mod checkpoint_artifacts;
-mod checkpoint_cache;
 pub(crate) mod contracts;
 mod engine;
 pub(crate) mod execution_effects;
@@ -32,9 +29,7 @@ mod test_support;
 pub mod transaction;
 mod transaction_execution;
 mod transaction_mode;
-mod version;
-mod version_artifacts;
-mod version_inventory_sql;
+pub(crate) mod version_state;
 mod write_pipeline;
 pub(crate) mod write_runtime;
 
@@ -66,7 +61,7 @@ pub use backend::prepared::{
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
 pub use canonical::json::CanonicalJson;
-pub use checkpoint::CreateCheckpointResult;
+pub use session::checkpoint_ops::CreateCheckpointResult;
 pub use common::error::LixError;
 pub use common::identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
@@ -87,7 +82,7 @@ pub use live_state::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 pub use lix::{InitResult, Lix, LixConfig};
-pub use live_state::ReplayCursor;
+pub use contracts::ReplayCursor;
 pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use session::{OpenSessionOptions, Session, SessionTransaction};
 #[doc(hidden)]
@@ -96,7 +91,7 @@ pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuar
 pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
 pub use sql::common::dialect::SqlDialect;
 pub use transaction_mode::TransactionMode;
-pub use version::{
+pub use session::version_ops::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult, RedoOptions, RedoResult, UndoOptions, UndoResult,
 };

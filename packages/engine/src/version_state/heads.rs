@@ -6,7 +6,7 @@
 //! winner from canonical change order.
 
 use crate::backend::QueryExecutor;
-use crate::version::ref_storage::{
+use crate::version_state::refs::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     load_local_version_ref_with_executor, LocalVersionRefRow,
 };
@@ -88,7 +88,7 @@ mod tests {
         live_relation_name, live_schema_column_names, normalized_values_for_schema,
     };
     use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};
-    use crate::version::{
+    use crate::version_state::{
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_storage_version_id,
     };
@@ -147,9 +147,9 @@ mod tests {
         commit_id: &str,
         timestamp: &str,
     ) -> Result<(), LixError> {
-        let snapshot = crate::version::version_ref_snapshot_content(version_id, commit_id);
+        let snapshot = crate::version_state::version_ref_snapshot_content(version_id, commit_id);
         let normalized = normalized_values_for_schema(
-            crate::version::version_ref_schema_key(),
+            crate::version_state::version_ref_schema_key(),
             None,
             Some(&snapshot),
         )

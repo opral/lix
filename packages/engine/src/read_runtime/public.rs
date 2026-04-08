@@ -3,7 +3,7 @@ use crate::contracts::artifacts::{
     PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
-use crate::contracts::projection::ProjectionRegistry;
+use crate::projections::ProjectionRegistry;
 use crate::contracts::surface::SurfaceReadFreshness;
 use crate::contracts::traits::{
     LiveStateQueryBackend, PendingPublicReadBackend, PendingPublicReadTransaction, PendingView,
@@ -14,6 +14,26 @@ use async_trait::async_trait;
 
 use super::direct::execute_direct_public_read_with_backend;
 use super::execute_read_time_projection_read_with_registry;
+
+#[async_trait(?Send)]
+pub(crate) trait PendingPublicReadExecutionBackend {
+    async fn execute_prepared_public_read_with_pending_view(
+        &self,
+        pending_view: Option<&dyn PendingView>,
+        projection_registry: &ProjectionRegistry,
+        public_read: &PreparedPublicReadArtifact,
+    ) -> Result<QueryResult, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait PendingPublicReadExecutionTransaction {
+    async fn execute_prepared_public_read_with_pending_view(
+        &mut self,
+        pending_view: Option<&dyn PendingView>,
+        projection_registry: &ProjectionRegistry,
+        public_read: &PreparedPublicReadArtifact,
+    ) -> Result<QueryResult, LixError>;
+}
 
 pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
@@ -92,7 +112,10 @@ impl PendingPublicReadBackend for dyn LixBackend + '_ {
         )
         .await
     }
+}
 
+#[async_trait(?Send)]
+impl PendingPublicReadExecutionBackend for dyn LixBackend + '_ {
     async fn execute_prepared_public_read_with_pending_view(
         &self,
         pending_view: Option<&dyn PendingView>,
@@ -125,7 +148,10 @@ impl PendingPublicReadTransaction for dyn LixBackendTransaction + '_ {
     async fn require_live_state_ready(&mut self) -> Result<(), LixError> {
         crate::live_state::require_ready_in_transaction(self).await
     }
+}
 
+#[async_trait(?Send)]
+impl PendingPublicReadExecutionTransaction for dyn LixBackendTransaction + '_ {
     async fn execute_prepared_public_read_with_pending_view(
         &mut self,
         pending_view: Option<&dyn PendingView>,

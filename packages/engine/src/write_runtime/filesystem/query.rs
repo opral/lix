@@ -8,7 +8,7 @@ use crate::filesystem_projection_sql::{
 use crate::live_state::storage::tracked_relation_name;
 use crate::common::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::common::text::escape_sql_string;
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;

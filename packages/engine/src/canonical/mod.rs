@@ -36,6 +36,7 @@
 //! `lix_commit_edge` as read-only query surfaces for SQL/public reads, but it
 //! does not own the meaning of those facts.
 //!
+pub(crate) mod checkpoint_labels;
 pub(crate) mod graph;
 mod init;
 pub(crate) mod json;

@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use crate::binary_cas;
 use crate::canonical;
-use crate::checkpoint;
 use crate::engine::Engine;
 use crate::live_state;
 use crate::live_state::{
@@ -15,7 +14,8 @@ use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
 use crate::session::observe;
 use crate::session::workspace;
-use crate::version;
+use crate::session::version_ops;
+use crate::version_state;
 use crate::write_runtime::commit;
 use crate::{LixBackend, LixError, SqlDialect, TransactionMode};
 
@@ -56,15 +56,15 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             binary_cas::init(&backend)
                 .await
                 .map_err(|error| init_step_error("binary_cas::init", error))?;
-            checkpoint::init(&backend)
-                .await
-                .map_err(|error| init_step_error("checkpoint::init", error))?;
             observe::init(&backend)
                 .await
                 .map_err(|error| init_step_error("observe::init", error))?;
-            version::init(&backend)
+            version_state::checkpoints::cache::init(&backend)
                 .await
-                .map_err(|error| init_step_error("version::init", error))?;
+                .map_err(|error| init_step_error("version_state::checkpoints::cache::init", error))?;
+            version_ops::init(&backend)
+                .await
+                .map_err(|error| init_step_error("session::version_ops::init", error))?;
             workspace::init(&backend)
                 .await
                 .map_err(|error| init_step_error("workspace::init", error))?;
@@ -82,18 +82,32 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         schema::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("schema::seed_bootstrap", error))?;
-        let default_active_version_id = version::seed_bootstrap(&mut init)
+        let default_active_version_id = version_ops::seed_bootstrap(&mut init)
             .await
-            .map_err(|error| init_step_error("version::seed_bootstrap", error))?;
+            .map_err(|error| init_step_error("session::version_ops::seed_bootstrap", error))?;
         filesystem::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("filesystem_bootstrap::seed_bootstrap", error))?;
         canonical::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("canonical::seed_bootstrap", error))?;
-        checkpoint::seed_bootstrap(&mut init)
+        let checkpoint_version_heads = {
+            let mut backend = init.backend_adapter();
+            crate::session::version_ops::descriptors::load_checkpoint_version_heads_with_executor(
+                &mut backend,
+            )
             .await
-            .map_err(|error| init_step_error("checkpoint::seed_bootstrap", error))?;
+            .map_err(|error| init_step_error("session::version_ops::load_checkpoint_version_heads_with_executor", error))?
+            .into_iter()
+            .map(|head| crate::canonical::checkpoint_labels::CheckpointVersionHeadFact {
+                version_id: head.version_id,
+                head_commit_id: head.head_commit_id,
+            })
+            .collect::<Vec<_>>()
+        };
+        canonical::checkpoint_labels::seed_bootstrap(&mut init, &checkpoint_version_heads)
+            .await
+            .map_err(|error| init_step_error("canonical::checkpoint_labels::seed_bootstrap", error))?;
         init.seed_boot_config_key_values(&default_active_version_id)
             .await
             .map_err(|error| init_step_error("InitExecutor::seed_boot_config_key_values", error))?;

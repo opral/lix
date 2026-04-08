@@ -1,4 +1,4 @@
-use super::{
+use crate::canonical::read::{
     build_state_history_source_sql, CanonicalHistoryContentMode, CanonicalHistoryRootFacts,
     CanonicalHistoryRootSelection, CanonicalRootCommit,
 };
@@ -7,12 +7,13 @@ use crate::contracts::artifacts::{
     StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::common::text::escape_sql_string;
-use crate::version::context::resolve_target_version_with_backend;
-use crate::version::{
+use crate::version_state::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
 use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
+
+use super::context::resolve_target_version_with_backend;
 
 pub(crate) async fn load_state_history_rows(
     backend: &dyn LixBackend,

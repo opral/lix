@@ -19,8 +19,6 @@ fn root_rs_whitelist_matches_phase_a_layout_contract() {
     let allowed = BTreeSet::from([
         "api.rs".to_string(),
         "boot.rs".to_string(),
-        "checkpoint_artifacts.rs".to_string(),
-        "checkpoint_cache.rs".to_string(),
         "engine.rs".to_string(),
         "execution_effects.rs".to_string(),
         "execution_runtime.rs".to_string(),
@@ -36,8 +34,6 @@ fn root_rs_whitelist_matches_phase_a_layout_contract() {
         "test_support.rs".to_string(),
         "transaction_execution.rs".to_string(),
         "transaction_mode.rs".to_string(),
-        "version_artifacts.rs".to_string(),
-        "version_inventory_sql.rs".to_string(),
         "write_pipeline.rs".to_string(),
     ]);
 

@@ -33,7 +33,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .await?;
 
         let main_version_id = match self
-            .find_version_id_by_name(super::DEFAULT_ACTIVE_VERSION_NAME)
+            .find_version_id_by_name(crate::version_state::DEFAULT_ACTIVE_VERSION_NAME)
             .await?
         {
             Some(version_id) => version_id,
@@ -42,7 +42,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 self.seed_canonical_version_descriptor(
                     &bootstrap_commit_id,
                     &generated_main_id,
-                    super::DEFAULT_ACTIVE_VERSION_NAME,
+                    crate::version_state::DEFAULT_ACTIVE_VERSION_NAME,
                 )
                 .await?;
                 generated_main_id
@@ -51,11 +51,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
         self.seed_canonical_version_descriptor(
             &bootstrap_commit_id,
-            super::GLOBAL_VERSION_ID,
-            super::GLOBAL_VERSION_ID,
+            crate::version_state::GLOBAL_VERSION_ID,
+            crate::version_state::GLOBAL_VERSION_ID,
         )
         .await?;
-        self.seed_local_version_head(super::GLOBAL_VERSION_ID, &bootstrap_commit_id)
+        self.seed_local_version_head(crate::version_state::GLOBAL_VERSION_ID, &bootstrap_commit_id)
             .await?;
         self.seed_local_version_head(&main_version_id, &bootstrap_commit_id)
             .await?;
@@ -68,7 +68,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         name: &str,
     ) -> Result<Option<String>, LixError> {
         let mut executor = self.backend_adapter();
-        crate::canonical::read::find_version_id_by_name_with_executor(&mut executor, name).await
+        super::descriptors::find_version_id_by_name_with_executor(&mut executor, name).await
     }
 
     pub(crate) async fn assert_commit_change_set_integrity(
@@ -165,15 +165,18 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = UntrackedWriteRow {
             entity_id: version_id.to_string(),
-            schema_key: super::version_ref_schema_key().to_string(),
-            schema_version: super::version_ref_schema_version().to_string(),
-            file_id: super::version_ref_file_id().to_string(),
-            version_id: super::version_ref_storage_version_id().to_string(),
+            schema_key: crate::version_state::version_ref_schema_key().to_string(),
+            schema_version: crate::version_state::version_ref_schema_version().to_string(),
+            file_id: crate::version_state::version_ref_file_id().to_string(),
+            version_id: crate::version_state::version_ref_storage_version_id().to_string(),
             global: true,
-            plugin_key: super::version_ref_plugin_key().to_string(),
+            plugin_key: crate::version_state::version_ref_plugin_key().to_string(),
             metadata: None,
             writer_key: None,
-            snapshot_content: Some(super::version_ref_snapshot_content(version_id, commit_id)),
+            snapshot_content: Some(crate::version_state::version_ref_snapshot_content(
+                version_id,
+                commit_id,
+            )),
             created_at: Some(timestamp.clone()),
             updated_at: timestamp,
             operation: UntrackedWriteOperation::Upsert,

@@ -12,7 +12,7 @@ use crate::contracts::state_commit_stream::{
 };
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::transaction_execution::TransactionExecutionBackend;
-use crate::version_artifacts::{
+use crate::version_state::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
 };
@@ -207,7 +207,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
             None
         };
     if let Some(applied_domain_change_batch) = applied_domain_change_batch.as_ref() {
-        crate::checkpoint_cache::apply_public_version_last_checkpoint_side_effects(
+        crate::version_state::checkpoints::cache::apply_public_version_last_checkpoint_side_effects(
             transaction,
             &unit.public_write,
             applied_domain_change_batch,

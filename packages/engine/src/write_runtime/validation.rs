@@ -14,7 +14,7 @@ use std::sync::Arc;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
-use crate::checkpoint_artifacts::{
+use crate::canonical::checkpoint_labels::{
     CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
 };
 use crate::contracts::artifacts::{

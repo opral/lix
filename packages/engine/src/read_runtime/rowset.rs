@@ -1,8 +1,7 @@
 use crate::contracts::artifacts::{
-    DerivedRow, PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
-    ReadTimeProjectionRead,
+    PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
 };
-use crate::contracts::projection::ProjectionRegistry;
+use crate::projections::{DerivedRow, ProjectionRegistry};
 use crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
@@ -248,23 +247,22 @@ mod tests {
         execute_read_time_projection_read_with_registry, execute_read_time_projection_rows,
     };
     use crate::contracts::artifacts::{
-        DerivedRow, PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
-        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
-        RowIdentity,
+        PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
+        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
     };
     use crate::live_state;
-    use crate::projections::builtin_projection_registry;
+    use crate::projections::{builtin_projection_registry, DerivedRow};
     use crate::schema::builtin::types::LixCommit;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::version::{
+    use crate::version_state::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_snapshot_content,
     };
-    use crate::version_inventory_sql::build_admin_version_source_sql_with_current_heads;
+    use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
     #[derive(Debug, Clone)]
@@ -382,7 +380,7 @@ mod tests {
             &[
                 VersionCaseDescriptor {
                     id: "version-main",
-                    name: Some(crate::version::DEFAULT_ACTIVE_VERSION_NAME),
+                    name: Some(crate::version_state::DEFAULT_ACTIVE_VERSION_NAME),
                     hidden: false,
                     current_commit_id: Some("commit-main"),
                 },
@@ -461,7 +459,7 @@ mod tests {
             &[
                 VersionCaseDescriptor {
                     id: "version-main",
-                    name: Some(crate::version::DEFAULT_ACTIVE_VERSION_NAME),
+                    name: Some(crate::version_state::DEFAULT_ACTIVE_VERSION_NAME),
                     hidden: false,
                     current_commit_id: Some("commit-main"),
                 },
@@ -598,8 +596,8 @@ mod tests {
 
         let global_head_commit_id = "commit-global-head";
         let mut all_descriptors = vec![VersionCaseDescriptor {
-            id: crate::version::GLOBAL_VERSION_ID,
-            name: Some(crate::version::GLOBAL_VERSION_ID),
+            id: crate::version_state::GLOBAL_VERSION_ID,
+            name: Some(crate::version_state::GLOBAL_VERSION_ID),
             hidden: true,
             current_commit_id: Some(global_head_commit_id),
         }];
@@ -614,7 +612,7 @@ mod tests {
                 version_descriptor_schema_key(),
                 version_descriptor_schema_version(),
                 version_descriptor_file_id(),
-                crate::version::GLOBAL_VERSION_ID,
+                crate::version_state::GLOBAL_VERSION_ID,
                 version_descriptor_plugin_key(),
                 &format!("change-{}", descriptor.id),
                 &descriptor_snapshot_json(descriptor),
@@ -629,7 +627,7 @@ mod tests {
                     version_ref_schema_key(),
                     version_ref_schema_version(),
                     version_ref_file_id(),
-                    crate::version::GLOBAL_VERSION_ID,
+                    crate::version_state::GLOBAL_VERSION_ID,
                     version_ref_plugin_key(),
                     &version_ref_snapshot_content(descriptor.id, commit_id),
                     &format!("2026-04-01T00:00:1{}Z", index),
@@ -640,7 +638,7 @@ mod tests {
         transaction.commit().await?;
 
         let mut current_heads = BTreeMap::from([(
-            crate::version::GLOBAL_VERSION_ID.to_string(),
+            crate::version_state::GLOBAL_VERSION_ID.to_string(),
             global_head_commit_id.to_string(),
         )]);
         for descriptor in descriptors {

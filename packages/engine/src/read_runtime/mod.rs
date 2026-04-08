@@ -6,7 +6,7 @@ mod rowset;
 use crate::contracts::artifacts::{
     PreparedReadArtifact, PreparedReadProgram, PreparedReadStep, ResultContract,
 };
-use crate::contracts::projection::ProjectionRegistry;
+use crate::projections::ProjectionRegistry;
 use crate::common::errors::classification::normalize_sql_error_with_read_diagnostic_context;
 use crate::sql::explain::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult};
@@ -17,6 +17,7 @@ pub(crate) use public::execute_prepared_public_read_artifact_with_backend;
 pub(crate) use public::{
     bootstrap_public_surface_registry_in_transaction,
     execute_prepared_public_read_artifact_in_transaction,
+    PendingPublicReadExecutionBackend, PendingPublicReadExecutionTransaction,
 };
 pub(crate) use rowset::execute_read_time_projection_read_with_registry;
 

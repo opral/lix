@@ -6,7 +6,7 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::filesystem_payload_sql::insert_filesystem_payload_domain_changes_sql;
 use crate::transaction_execution::TransactionExecutionBackend;
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::filesystem::query::{
     load_file_row_by_id_without_path, resolve_file_id_by_path_in_version,
 };

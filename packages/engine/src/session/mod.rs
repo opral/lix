@@ -6,10 +6,12 @@
 //! version refs and committed graph state.
 
 pub(crate) mod collaborators;
+pub(crate) mod checkpoint_ops;
 pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod plugin;
 mod selector_reads;
+pub(crate) mod version_ops;
 pub(crate) mod workspace;
 pub(crate) mod write_preparation;
 
@@ -266,7 +268,7 @@ impl Session {
     /// Replay status remains local projection state; this API only mutates
     /// checkpoint label facts plus derived checkpoint-history helpers.
     pub async fn create_checkpoint(&self) -> Result<crate::CreateCheckpointResult, LixError> {
-        crate::checkpoint::create_checkpoint_in_session(self).await
+        crate::session::checkpoint_ops::create_checkpoint_in_session(self).await
     }
 
     /// Merges one committed version head into another.

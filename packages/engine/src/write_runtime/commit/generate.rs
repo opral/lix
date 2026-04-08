@@ -408,7 +408,7 @@ fn collapse_domain_changes_last_wins(changes: &[DomainChangeInput]) -> Vec<&Doma
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::read::{VersionInfo, VersionSnapshot};
+    use crate::session::version_ops::{VersionInfo, VersionSnapshot};
 
     fn domain_change(
         id: &str,

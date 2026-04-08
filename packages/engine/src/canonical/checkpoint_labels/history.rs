@@ -12,12 +12,19 @@ use std::collections::BTreeSet;
 use crate::backend::QueryExecutor;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
-use crate::checkpoint_artifacts::checkpoint_commit_label_entity_id;
 use crate::common::errors::classification::is_missing_relation_error;
-use crate::init::seed::text_value;
 use crate::init::InitExecutor;
+use crate::init::seed::text_value;
 use crate::common::text::escape_sql_string;
 use crate::{LixError, Value};
+
+use super::checkpoint_commit_label_entity_id;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CheckpointVersionHeadFact {
+    pub(crate) version_id: String,
+    pub(crate) head_commit_id: String,
+}
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn insert_last_checkpoint_for_version(
@@ -37,54 +44,26 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(())
     }
 
-    pub(crate) async fn rebuild_internal_last_checkpoint(&mut self) -> Result<(), LixError> {
-        let version_descriptors = {
-            let mut backend = self.backend_adapter();
-            crate::canonical::read::load_all_version_descriptors_with_executor(&mut backend).await?
-        };
-
+    pub(crate) async fn rebuild_internal_last_checkpoint_from_heads(
+        &mut self,
+        version_heads: &[CheckpointVersionHeadFact],
+    ) -> Result<(), LixError> {
         // `lix_internal_last_checkpoint` is derived checkpoint-history state.
         // Rebuild it from canonical version heads plus canonical checkpoint
         // labels attached to commits.
         self.execute_backend("DELETE FROM lix_internal_last_checkpoint", &[])
             .await?;
 
-        let global_commit_id = self.load_global_version_commit_id().await?;
-        let global_checkpoint_commit_id = {
-            let mut backend = self.backend_adapter();
-            resolve_last_checkpoint_commit_id_for_tip_with_executor(&mut backend, &global_commit_id)
-                .await?
-        }
-        .unwrap_or_else(|| global_commit_id.clone());
-        self.insert_last_checkpoint_for_version(
-            crate::version::GLOBAL_VERSION_ID,
-            &global_checkpoint_commit_id,
-        )
-        .await?;
-
-        for descriptor in &version_descriptors {
-            let version_id = descriptor.version_id.clone();
-            if version_id == crate::version::GLOBAL_VERSION_ID {
-                continue;
-            }
-            let commit_id = {
-                let mut backend = self.backend_adapter();
-                crate::version::load_committed_version_head_commit_id(&mut backend, &version_id)
-                    .await?
-                    .ok_or_else(|| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            format!("version '{version_id}' is missing a committed head"),
-                        )
-                    })?
-            };
+        for version_head in version_heads {
+            let version_id = version_head.version_id.as_str();
+            let commit_id = version_head.head_commit_id.as_str();
             let checkpoint_commit_id = {
                 let mut backend = self.backend_adapter();
                 resolve_last_checkpoint_commit_id_for_tip_with_executor(&mut backend, &commit_id)
                     .await?
             }
-            .unwrap_or_else(|| commit_id.clone());
-            self.insert_last_checkpoint_for_version(&version_id, &checkpoint_commit_id)
+            .unwrap_or_else(|| commit_id.to_string());
+            self.insert_last_checkpoint_for_version(version_id, &checkpoint_commit_id)
                 .await?;
         }
 
@@ -199,7 +178,7 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID;
+    use crate::canonical::checkpoint_labels::CHECKPOINT_LABEL_ID;
     use crate::{QueryResult, SqlDialect};
     use async_trait::async_trait;
     use std::collections::BTreeMap;

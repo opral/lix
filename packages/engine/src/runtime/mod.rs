@@ -13,9 +13,9 @@ pub mod wasm;
 
 use crate::backend::QueryExecutor;
 use crate::contracts::plugin::InstalledPlugin;
-use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
+use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::DeterministicSettings;
 use crate::runtime::plugin::runtime::CachedPluginComponent;
 use crate::runtime::streams::{

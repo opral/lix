@@ -114,19 +114,19 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         entity_id: &str,
         name: &str,
     ) -> Result<String, LixError> {
-        let snapshot_content = crate::version::version_descriptor_snapshot_content(
+        let snapshot_content = crate::version_state::version_descriptor_snapshot_content(
             entity_id,
             name,
-            entity_id == crate::version::GLOBAL_VERSION_ID,
+            entity_id == crate::version_state::GLOBAL_VERSION_ID,
         );
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
         self.insert_change_row_for_snapshot(
             entity_id,
-            crate::version::version_descriptor_schema_key(),
-            crate::version::version_descriptor_schema_version(),
-            crate::version::version_descriptor_file_id(),
-            crate::version::version_descriptor_plugin_key(),
+            crate::version_state::version_descriptor_schema_key(),
+            crate::version_state::version_descriptor_schema_version(),
+            crate::version_state::version_descriptor_file_id(),
+            crate::version_state::version_descriptor_plugin_key(),
             &snapshot_content,
             &change_id,
             &timestamp,

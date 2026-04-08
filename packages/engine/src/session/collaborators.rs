@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::contracts::functions::{clone_boxed_function_provider, SharedFunctionProvider};
-use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::engine::Engine;
@@ -13,6 +12,7 @@ use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::sql::prepare::SqlPreparationSeed;
+use crate::projections::ProjectionRegistry;
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode};
 use async_trait::async_trait;
 
@@ -136,7 +136,7 @@ impl SessionCollaborators {
     }
 
     pub(crate) async fn ensure_version_exists(&self, version_id: &str) -> Result<(), LixError> {
-        crate::version::context::ensure_version_exists_with_backend(
+        crate::session::version_ops::context::ensure_version_exists_with_backend(
             self.backend().as_ref(),
             version_id,
         )
@@ -148,7 +148,7 @@ impl SessionCollaborators {
         session: &crate::Session,
         options: crate::CreateVersionOptions,
     ) -> Result<crate::CreateVersionResult, LixError> {
-        crate::version::create_version_in_session(session, options).await
+        crate::session::version_ops::create_version_in_session(session, options).await
     }
 
     pub(crate) async fn merge_version_in_session(
@@ -156,7 +156,7 @@ impl SessionCollaborators {
         session: &crate::Session,
         options: crate::MergeVersionOptions,
     ) -> Result<crate::MergeVersionResult, LixError> {
-        crate::version::merge_version_in_session(session, options).await
+        crate::session::version_ops::merge_version_in_session(session, options).await
     }
 
     pub(crate) async fn undo_with_options_in_session(
@@ -164,7 +164,8 @@ impl SessionCollaborators {
         session: &crate::Session,
         options: crate::UndoOptions,
     ) -> Result<crate::UndoResult, LixError> {
-        crate::version::undo_redo::undo_with_options_in_session(session, options).await
+        crate::session::version_ops::undo_redo::undo_with_options_in_session(session, options)
+            .await
     }
 
     pub(crate) async fn redo_with_options_in_session(
@@ -172,7 +173,8 @@ impl SessionCollaborators {
         session: &crate::Session,
         options: crate::RedoOptions,
     ) -> Result<crate::RedoResult, LixError> {
-        crate::version::undo_redo::redo_with_options_in_session(session, options).await
+        crate::session::version_ops::undo_redo::redo_with_options_in_session(session, options)
+            .await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {

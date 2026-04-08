@@ -8,7 +8,7 @@ use crate::prepared_write_artifacts::{
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
-use crate::version_artifacts::{
+use crate::version_state::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
     version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,

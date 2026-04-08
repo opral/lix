@@ -25,7 +25,7 @@ use crate::contracts::artifacts::{
 use crate::contracts::functions::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
-use crate::contracts::projection::ProjectionRegistry;
+use crate::projections::ProjectionRegistry;
 use crate::contracts::traits::{
     CompiledSchemaCache, LiveReadShapeContract, LiveStateQueryBackend, PendingView,
     SqlPreparationMetadataReader,

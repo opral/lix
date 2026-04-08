@@ -23,7 +23,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &[
             "backend",
             "canonical",
-            "checkpoint",
             "engine",
             "live_state",
             "projections",
@@ -31,7 +30,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "runtime",
             "session",
             "sql",
-            "version",
+            "version_state",
             "write_runtime",
         ],
     },
@@ -43,19 +42,14 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "live_state",
             "session",
             "sql",
-            "version",
+            "version_state",
             "write_runtime",
         ],
     },
     ForbiddenDependencyRule {
         from_scope: "live_state",
-        reason: "live_state is the generic projection engine and must not depend on projection definitions or dissolved domain owners",
-        forbidden_scopes: &[
-            "projections",
-            "runtime",
-            "version",
-            "write_runtime",
-        ],
+        reason: "live_state is the generic projection engine and must not reacquire runtime sidecars or write orchestration owners",
+        forbidden_scopes: &["runtime", "version_state", "write_runtime"],
     },
     ForbiddenDependencyRule {
         from_scope: "projections",
@@ -69,13 +63,12 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "backend",
             "binary_cas",
             "canonical",
-            "live_schema_access",
             "live_state",
             "projections",
             "read_runtime",
             "runtime",
             "session",
-            "version",
+            "version_state",
             "write_runtime",
         ],
     },
@@ -87,7 +80,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "runtime",
             "session",
             "sql",
-            "version",
+            "version_state",
             "write_runtime",
         ],
     },
@@ -97,39 +90,26 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &[
             "backend",
             "binary_cas",
-            "checkpoint",
             "engine",
             "init",
-            "live_schema_access",
+            "schema",
             "read_runtime",
             "runtime",
             "session",
             "sql",
-            "version",
+            "version_state",
         ],
     },
     ForbiddenDependencyRule {
         from_scope: "session",
-        reason: "session is orchestration; it may call sql, read_runtime, write_runtime, and checkpoint convenience APIs but should not reach lower owners directly",
-        forbidden_scopes: &[
-            "backend",
-            "binary_cas",
-            "canonical",
-            "engine",
-            "init",
-            "live_schema_access",
-            "live_state",
-            "runtime",
-            "schema",
-            "version",
-        ],
+        reason: "session owns orchestration and workflow code, but should not couple itself to the root engine shell",
+        forbidden_scopes: &["engine"],
     },
 ];
 
 const TARGET_CORE_MODULES: &[&str] = &[
     "backend",
     "canonical",
-    "checkpoint",
     "contracts",
     "live_state",
     "projections",
@@ -137,6 +117,7 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "runtime",
     "session",
     "sql",
+    "version_state",
     "write_runtime",
 ];
 
@@ -1537,20 +1518,20 @@ fn phase_c_read_preparation_stops_reaching_runtime_and_version_owners() {
     if let Some(sql_version_edge) = graph
         .edges
         .iter()
-        .find(|edge| edge.from == "sql" && edge.to == "version")
+        .find(|edge| edge.from == "sql" && edge.to == "version_state")
     {
         assert!(
             !sql_version_edge
                 .via_files
                 .contains(&"sql/prepare/prepared_read.rs".to_string()),
-            "Phase C regression: sql -> version still flows through sql/prepare/prepared_read.rs: {:?}",
+            "Phase C regression: sql -> version_state still flows through sql/prepare/prepared_read.rs: {:?}",
             sql_version_edge.via_files,
         );
         assert!(
             !sql_version_edge
                 .via_files
                 .contains(&"sql/prepare/compiler_metadata.rs".to_string()),
-            "Phase C regression: sql -> version still flows through sql/prepare/compiler_metadata.rs: {:?}",
+            "Phase C regression: sql -> version_state still flows through sql/prepare/compiler_metadata.rs: {:?}",
             sql_version_edge.via_files,
         );
     }
@@ -1651,7 +1632,7 @@ fn phase_f_session_selector_reads_stays_as_orchestration_only() {
 #[test]
 fn phase_f_runtime_deterministic_storage_consumes_resolved_scope_only() {
     let storage_source = read_engine_source("runtime/deterministic_mode/storage.rs");
-    let scope_source = read_engine_source("deterministic_settings_scope.rs");
+    let scope_source = read_engine_source("runtime/deterministic_mode/scope.rs");
 
     for forbidden in [
         "key_value_schema_key(",
@@ -1718,7 +1699,7 @@ fn phase_g_session_mod_defers_version_convenience_to_request_collaborators() {
 
 #[test]
 fn phase_g_sql_uses_neutral_dialect_seam_instead_of_backend_owner() {
-    let dialect_source = read_engine_source("sql_dialect.rs");
+    let dialect_source = read_engine_source("sql/common/dialect.rs");
     assert!(
         dialect_source.contains("pub enum SqlDialect"),
         "sql_dialect.rs should own the neutral SqlDialect foundation type"
@@ -1941,4 +1922,133 @@ fn planned_write_runner_and_filesystem_resolution_stay_split_by_owner() {
             .exists(),
         "the standalone filesystem_insert_planning.rs owner split should stay removed"
     );
+}
+
+#[test]
+fn phase_b_canonical_owner_stays_free_of_session_imports() {
+    for absolute_path in rust_files_for_top_level_module("canonical") {
+        let relative_path = absolute_path
+            .strip_prefix(src_root())
+            .expect("canonical file should live under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = strip_test_code(
+            &fs::read_to_string(&absolute_path).expect("canonical source should be readable"),
+        );
+        for forbidden in ["use crate::session", "crate::session::"] {
+            assert!(
+                !source.contains(forbidden),
+                "{relative_path} should stay free of session-owner reach-through via `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase_b_canonical_read_exports_commit_addressed_apis_only() {
+    let canonical_read_mod = read_engine_source("canonical/read/mod.rs");
+    for forbidden in [
+        "load_exact_committed_state_row_at_version_head",
+        "load_version_info_for_versions",
+        "VersionInfo",
+        "VersionSnapshot",
+    ] {
+        assert!(
+            !canonical_read_mod.contains(forbidden),
+            "canonical/read/mod.rs should not re-export version-addressed helper `{forbidden}`"
+        );
+    }
+
+    let canonical_read_state = strip_test_code(&read_engine_source("canonical/read/state.rs"));
+    for forbidden in ["use crate::version_state", "crate::version_state::"] {
+        assert!(
+            !canonical_read_state.contains(forbidden),
+            "canonical/read/state.rs should stay commit-addressed without `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn phase_b_checkpoint_history_rebuild_uses_explicit_head_inputs() {
+    let history_source =
+        strip_test_code(&read_engine_source("canonical/checkpoint_labels/history.rs"));
+    assert!(
+        history_source.contains("struct CheckpointVersionHeadFact"),
+        "canonical/checkpoint_labels/history.rs should define explicit checkpoint rebuild inputs"
+    );
+    assert!(
+        history_source.contains("rebuild_internal_last_checkpoint_from_heads"),
+        "checkpoint history rebuild should accept resolved version-head facts from callers"
+    );
+    for forbidden in [
+        "use crate::session",
+        "crate::session::",
+        "use crate::version_state",
+        "crate::version_state::",
+    ] {
+        assert!(
+            !history_source.contains(forbidden),
+            "canonical/checkpoint_labels/history.rs should not resolve version ownership internally via `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn phase_b_contracts_stay_free_of_projection_registry_coupling() {
+    for absolute_path in rust_files_for_top_level_module("contracts") {
+        let relative_path = absolute_path
+            .strip_prefix(src_root())
+            .expect("contracts file should live under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = strip_test_code(
+            &fs::read_to_string(&absolute_path).expect("contracts source should be readable"),
+        );
+        for forbidden in ["use crate::projections", "crate::projections::", "ProjectionRegistry"] {
+            assert!(
+                !source.contains(forbidden),
+                "{relative_path} should stay free of projection-registry coupling via `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase_b_contracts_stay_free_of_live_state_imports() {
+    for absolute_path in rust_files_for_top_level_module("contracts") {
+        let relative_path = absolute_path
+            .strip_prefix(src_root())
+            .expect("contracts file should live under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = strip_test_code(
+            &fs::read_to_string(&absolute_path).expect("contracts source should be readable"),
+        );
+        for forbidden in ["use crate::live_state", "crate::live_state::"] {
+            assert!(
+                !source.contains(forbidden),
+                "{relative_path} should stay free of live_state imports via `{forbidden}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn phase_b_sql_stays_free_of_projection_owner_imports() {
+    for absolute_path in rust_files_for_top_level_module("sql") {
+        let relative_path = absolute_path
+            .strip_prefix(src_root())
+            .expect("sql file should live under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = strip_test_code(
+            &fs::read_to_string(&absolute_path).expect("sql source should be readable"),
+        );
+        for forbidden in ["use crate::projections", "crate::projections::"] {
+            assert!(
+                !source.contains(forbidden),
+                "{relative_path} should stay free of projection-owner imports via `{forbidden}`"
+            );
+        }
+    }
 }
