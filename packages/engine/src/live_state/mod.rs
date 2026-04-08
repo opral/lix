@@ -37,9 +37,8 @@ pub(crate) mod pending_reads;
 pub(crate) mod projection;
 mod query_contracts;
 pub(crate) mod raw;
-mod registered_schema_catalog;
+mod row_api;
 pub(crate) mod schema_access;
-mod schema_catalog;
 pub(crate) mod shared;
 pub(crate) mod storage;
 mod storage_metadata;
@@ -87,9 +86,11 @@ pub use materialize::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
-pub(crate) use registered_schema_catalog::SqlRegisteredSchemaCatalog;
+pub use row_api::{
+    decode_registered_schema_row, load_exact_row, scan_rows, ExactRowQuery, Row, RowQuery,
+    RowReadMode,
+};
 pub(crate) use schema_access::LiveReadContract;
-pub use schema_catalog::RegisteredSchemaCatalog;
 pub use shared::identity::RowIdentity;
 pub(crate) use storage_metadata::{
     builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,

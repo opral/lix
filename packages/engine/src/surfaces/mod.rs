@@ -8,11 +8,11 @@ use crate::contracts::surface::{
     DynamicEntitySurfaceSpec, SurfaceColumnType, SurfaceOverridePredicate, SurfaceOverrideValue,
     SurfaceRegistry,
 };
-use crate::live_state::SqlRegisteredSchemaCatalog;
+use crate::live_state::{decode_registered_schema_row, scan_rows, RowQuery, RowReadMode};
 use crate::runtime::cel::shared_runtime;
 use crate::schema::annotations::overrides::{collect_lixcol_overrides, LixcolOverrideValue};
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::schema::schema_from_registered_snapshot;
+use crate::schema::{schema_from_registered_snapshot, SchemaKey};
 use crate::{LixBackend, LixError};
 
 mod relation_policy;
@@ -71,12 +71,44 @@ pub(crate) async fn load_public_surface_registry_with_backend(
     backend: &dyn LixBackend,
 ) -> Result<SurfaceRegistry, LixError> {
     let mut registry = build_builtin_surface_registry();
-    let mut provider = SqlRegisteredSchemaCatalog::new(backend);
-    for (_, schema) in provider.load_latest_schema_entries().await? {
+    for (_, schema) in load_latest_registered_schemas(backend).await? {
         let spec = entity_surface_spec_from_schema(&schema)?;
         register_dynamic_entity_surface_spec(&mut registry, spec);
     }
     Ok(registry)
+}
+
+async fn load_latest_registered_schemas(
+    backend: &dyn LixBackend,
+) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
+    let rows = scan_rows(
+        backend,
+        &RowQuery {
+            schema_key: "lix_registered_schema".to_string(),
+            version_id: "global".to_string(),
+            mode: RowReadMode::Tracked,
+            constraints: Vec::new(),
+            include_tombstones: false,
+        },
+    )
+    .await?;
+
+    let mut latest_by_schema_key = BTreeMap::<String, (SchemaKey, JsonValue)>::new();
+    for row in &rows {
+        let Some((key, schema)) = decode_registered_schema_row(row)? else {
+            continue;
+        };
+
+        let should_replace = latest_by_schema_key
+            .get(&key.schema_key)
+            .map(|(existing, _)| schema_key_is_newer(&key, existing))
+            .unwrap_or(true);
+        if should_replace {
+            latest_by_schema_key.insert(key.schema_key.clone(), (key, schema));
+        }
+    }
+
+    Ok(latest_by_schema_key.into_values().collect())
 }
 
 fn builtin_surface_registry() -> &'static SurfaceRegistry {
@@ -158,6 +190,13 @@ fn entity_surface_spec_from_schema(
         column_types,
         predicate_overrides,
     })
+}
+
+fn schema_key_is_newer(candidate: &SchemaKey, existing: &SchemaKey) -> bool {
+    match (candidate.version_number(), existing.version_number()) {
+        (Some(candidate_version), Some(existing_version)) => candidate_version > existing_version,
+        _ => candidate.schema_version > existing.schema_version,
+    }
 }
 
 fn collect_override_predicates(
