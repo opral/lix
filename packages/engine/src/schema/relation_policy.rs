@@ -110,7 +110,7 @@ pub(crate) fn builtin_internal_exact_relation_names() -> &'static [&'static str]
         crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF,
         crate::canonical::journal::CHANGE_TABLE,
         crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE,
-        crate::write_runtime::commit::COMMIT_IDEMPOTENCY_TABLE,
+        crate::session::version_ops::commit::COMMIT_IDEMPOTENCY_TABLE,
         crate::canonical::ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,
         crate::live_state::FILE_DATA_CACHE_TABLE,
         crate::live_state::FILE_LIXCOL_CACHE_TABLE,

@@ -1091,7 +1091,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1132,7 +1132,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1238,7 +1238,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1285,7 +1285,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );

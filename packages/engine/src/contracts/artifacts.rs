@@ -9,7 +9,7 @@ use crate::contracts::surface::{
 };
 use crate::contracts::ReplayCursor;
 use crate::common::error::LixError;
-use crate::transaction_mode::TransactionMode;
+use crate::contracts::transaction_mode::TransactionMode;
 use crate::common::types::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +105,20 @@ pub struct CanonicalCommitReceipt {
     pub replay_cursor: ReplayCursor,
     pub updated_version_refs: Vec<UpdatedVersionRef>,
     pub affected_versions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PendingPublicCommitLane {
+    Version(String),
+    GlobalAdmin,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct PendingPublicCommitSession {
+    pub lane: PendingPublicCommitLane,
+    pub commit_id: String,
+    pub commit_change_snapshot_id: String,
+    pub commit_snapshot: JsonValue,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

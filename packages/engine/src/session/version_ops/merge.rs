@@ -14,7 +14,7 @@ use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::TransactionBackendAdapter;
 use crate::version_state::GLOBAL_VERSION_ID;
-use crate::write_runtime::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
+use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::context::{
@@ -175,7 +175,7 @@ async fn merge_version_in_transaction(
                 .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
             let mut execution_input = tx.context.buffered_write_execution_input();
             write_transaction
-                .prepare_buffered_write_commit(&mut execution_input)
+                .prepare_buffered_write_commit(tx.collaborators, &mut execution_input)
                 .await?;
             tx.context
                 .apply_buffered_write_execution_input(&execution_input);
@@ -317,7 +317,7 @@ async fn merge_version_in_transaction(
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
         let mut functions = functions;
-        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+        crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             transaction,
             &mut functions,
         )

@@ -418,7 +418,7 @@ mod tests {
         StateCommitStreamRuntimeMetadata,
     };
     use crate::contracts::artifacts::PlannedStateRow;
-    use crate::write_runtime::commit::ProposedDomainChange;
+    use crate::session::version_ops::commit::ProposedDomainChange;
     use crate::Value;
     use std::collections::BTreeMap;
 

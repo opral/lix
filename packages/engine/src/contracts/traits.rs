@@ -13,7 +13,6 @@ use crate::contracts::artifacts::{
     UntrackedWriteRow,
 };
 use crate::contracts::ReplayCursor;
-use crate::contracts::surface::SurfaceRegistry;
 use crate::common::error::LixError;
 use crate::common::types::{QueryResult, Value};
 
@@ -387,14 +386,14 @@ pub(crate) trait LiveStateQueryBackend {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait PendingPublicReadBackend {
-    async fn bootstrap_public_surface_registry_with_pending_view(
-        &self,
-        pending_view: Option<&dyn PendingView>,
-    ) -> Result<SurfaceRegistry, LixError>;
+pub(crate) trait PendingPublicReadTransaction {
+    async fn require_live_state_ready(&mut self) -> Result<(), LixError>;
 }
 
 #[async_trait(?Send)]
-pub(crate) trait PendingPublicReadTransaction {
-    async fn require_live_state_ready(&mut self) -> Result<(), LixError>;
+pub(crate) trait BlobDataReader {
+    async fn load_blob_data_by_hash(
+        &self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError>;
 }

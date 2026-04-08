@@ -3,7 +3,20 @@ use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE,
 };
+use async_trait::async_trait;
+
+use crate::contracts::traits::BlobDataReader;
 use crate::{LixBackend, LixError, Value};
+
+#[async_trait(?Send)]
+impl BlobDataReader for dyn LixBackend + '_ {
+    async fn load_blob_data_by_hash(
+        &self,
+        blob_hash: &str,
+    ) -> Result<Option<Vec<u8>>, LixError> {
+        load_binary_blob_data_by_hash(self, blob_hash).await
+    }
+}
 
 pub(crate) async fn blob_exists(
     backend: &dyn LixBackend,

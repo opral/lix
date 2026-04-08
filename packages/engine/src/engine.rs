@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
@@ -17,6 +18,229 @@ pub struct Engine {
     boot_key_values: Vec<BootKeyValue>,
 }
 
+struct EngineSessionServices {
+    engine: Arc<Engine>,
+}
+
+impl EngineSessionServices {
+    fn new(engine: Arc<Engine>) -> Self {
+        Self { engine }
+    }
+}
+
+#[async_trait(?Send)]
+impl crate::session::collaborators::SessionServices for EngineSessionServices {
+    async fn ensure_initialized(&self) -> Result<(), LixError> {
+        if !self.engine.is_initialized().await? {
+            return Err(crate::common::errors::not_initialized_error());
+        }
+        Ok(())
+    }
+
+    fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
+        self.engine.backend()
+    }
+
+    fn access_to_internal(&self) -> bool {
+        self.engine.runtime().access_to_internal()
+    }
+
+    async fn begin_write_unit(&self) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+        self.engine.runtime().begin_write_unit().await
+    }
+
+    async fn begin_read_unit(
+        &self,
+        mode: crate::TransactionMode,
+    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+        self.engine.runtime().begin_read_unit(mode).await
+    }
+
+    fn public_surface_registry(&self) -> SurfaceRegistry {
+        self.engine.public_surface_registry()
+    }
+
+    fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
+        self.engine.install_public_surface_registry(registry);
+    }
+
+    async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
+        self.engine.load_public_surface_registry().await
+    }
+
+    async fn export_image(
+        &self,
+        writer: &mut dyn crate::image::ImageChunkWriter,
+    ) -> Result<(), LixError> {
+        self.engine.backend().export_image(writer).await
+    }
+
+    fn projection_registry(&self) -> &ProjectionRegistry {
+        self.engine.projection_registry().as_ref()
+    }
+
+    fn compiled_schema_cache(&self) -> &dyn crate::contracts::traits::CompiledSchemaCache {
+        self.engine.runtime().schema_cache()
+    }
+
+    async fn prepare_runtime_functions_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<
+        (
+            DeterministicSettings,
+            SharedFunctionProvider<RuntimeFunctionProvider>,
+        ),
+        LixError,
+    > {
+        self.engine
+            .prepare_runtime_functions_with_backend(backend)
+            .await
+    }
+
+    fn state_commit_stream(
+        &self,
+        filter: crate::runtime::streams::StateCommitStreamFilter,
+    ) -> crate::runtime::streams::StateCommitStream {
+        self.engine.state_commit_stream(filter)
+    }
+
+    fn emit_state_commit_stream_changes(
+        &self,
+        changes: Vec<crate::runtime::streams::StateCommitStreamChange>,
+    ) {
+        self.engine
+            .runtime()
+            .emit_state_commit_stream_changes(changes);
+    }
+
+    fn invalidate_deterministic_settings_cache(&self) {
+        self.engine
+            .runtime()
+            .invalidate_deterministic_settings_cache();
+    }
+
+    fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
+        self.engine.invalidate_installed_plugins_cache()
+    }
+}
+
+#[async_trait(?Send)]
+impl crate::session::collaborators::WriteExecutionCollaborators for Engine {
+    fn projection_registry(&self) -> &ProjectionRegistry {
+        self.projection_registry().as_ref()
+    }
+
+    fn compiled_schema_cache(&self) -> &dyn crate::contracts::traits::CompiledSchemaCache {
+        self.runtime().schema_cache()
+    }
+
+    fn sql_preparation_seed<'a>(
+        &'a self,
+        functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+        surface_registry: &'a SurfaceRegistry,
+    ) -> crate::sql::prepare::SqlPreparationSeed<'a> {
+        crate::sql::prepare::SqlPreparationSeed {
+            dialect: self.backend().dialect(),
+            functions: crate::contracts::functions::clone_boxed_function_provider(functions),
+            surface_registry,
+        }
+    }
+
+    async fn prepare_execution_runtime_state(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<crate::runtime::execution_state::ExecutionRuntimeState, LixError> {
+        let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
+        Ok(crate::runtime::execution_state::ExecutionRuntimeState::from_prepared_parts(
+            settings, functions,
+        ))
+    }
+}
+
+#[async_trait(?Send)]
+impl crate::execution::write::WriteExecutionBindings for Engine {
+    async fn execute_prepared_public_read_with_pending_view(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        pending_view: Option<&dyn crate::contracts::traits::PendingView>,
+        public_read: &crate::contracts::artifacts::PreparedPublicReadArtifact,
+    ) -> Result<crate::QueryResult, LixError> {
+        crate::session::write_execution_bindings::execute_prepared_public_read_with_registry(
+            self.projection_registry().as_ref(),
+            transaction,
+            pending_view,
+            public_read,
+        )
+        .await
+    }
+
+    async fn persist_binary_blob_writes_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        writes: &[crate::execution::write::filesystem::runtime::BinaryBlobWrite],
+    ) -> Result<(), LixError> {
+        crate::session::write_execution_bindings::persist_binary_blob_writes(transaction, writes)
+            .await
+    }
+
+    async fn garbage_collect_unreachable_binary_cas_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+    ) -> Result<(), LixError> {
+        crate::session::write_execution_bindings::garbage_collect_unreachable_binary_cas(
+            transaction,
+        )
+        .await
+    }
+
+    async fn persist_runtime_sequence_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        functions: &SharedFunctionProvider<
+            Box<dyn crate::contracts::functions::LixFunctionProvider + Send>,
+        >,
+    ) -> Result<(), LixError> {
+        crate::session::write_execution_bindings::persist_runtime_sequence(
+            transaction,
+            functions,
+        )
+        .await
+    }
+
+    async fn execute_public_tracked_append_txn_with_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        unit: &crate::execution::write::buffered::TrackedTxnUnit,
+        pending_commit_session: Option<
+            &mut Option<crate::contracts::artifacts::PendingPublicCommitSession>,
+        >,
+    ) -> Result<crate::execution::write::TrackedCommitExecutionOutcome, LixError> {
+        crate::session::write_execution_bindings::execute_public_tracked_append(
+            transaction,
+            unit,
+            pending_commit_session,
+        )
+        .await
+    }
+
+    async fn apply_writer_key_annotations_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        annotations: &std::collections::BTreeMap<
+            crate::contracts::artifacts::RowIdentity,
+            Option<String>,
+        >,
+    ) -> Result<(), LixError> {
+        let mut executor = &mut *transaction;
+        crate::schema::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
+            &mut executor,
+            annotations,
+        )
+        .await
+    }
+}
+
 impl Engine {
     pub(crate) fn runtime(&self) -> &Arc<Runtime> {
         &self.runtime
@@ -28,9 +252,15 @@ impl Engine {
 
     pub async fn open_session(self: &Arc<Self>) -> Result<crate::Session, LixError> {
         crate::Session::open_workspace(crate::session::collaborators::SessionCollaborators::new(
-            Arc::clone(self),
+            self.session_services(),
         ))
         .await
+    }
+
+    pub(crate) fn session_services(
+        self: &Arc<Self>,
+    ) -> Arc<dyn crate::session::collaborators::SessionServices> {
+        Arc::new(EngineSessionServices::new(Arc::clone(self)))
     }
 
     pub fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
@@ -331,9 +561,9 @@ mod tests {
                         Arc::new(NoopWasmRuntime),
                     )));
                     let session = Session::new_for_test(
-                        crate::session::collaborators::SessionCollaborators::new(Arc::clone(
-                            &engine,
-                        )),
+                        crate::session::collaborators::SessionCollaborators::new(
+                            engine.session_services(),
+                        ),
                         "version-test".to_string(),
                         Vec::new(),
                     );
@@ -379,7 +609,7 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         )));
         let session = Session::new_for_test(
-            crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+            crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
             "version-test".to_string(),
             Vec::new(),
         );
@@ -436,7 +666,7 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         )));
         let session = Session::new_for_test(
-            crate::session::collaborators::SessionCollaborators::new(Arc::clone(&engine)),
+            crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
             "version-test".to_string(),
             Vec::new(),
         );

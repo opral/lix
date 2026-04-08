@@ -2,20 +2,21 @@ use async_trait::async_trait;
 
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::common::paths::filesystem::NormalizedDirectoryPath;
-use crate::transaction::lookup_directory_id_by_path_in_transaction;
-use crate::write_pipeline::{
-    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
-};
-use crate::write_runtime::{
+use crate::execution::write::{
     install_plugin_archive_with_writer, stage_prepared_write_step, PluginInstallWriteExecutor,
-    PreparedWriteExecutionStep, SemanticWriteContext, WriteTransaction,
+    PreparedWriteExecutionStep, SemanticWriteContext,
+};
+use crate::execution::write::transaction::lookup_directory_id_by_path_in_transaction;
+use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
+use crate::session::write_pipeline::{
+    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
 };
 use crate::{ExecuteOptions, LixError, Session};
 
 const GLOBAL_VERSION_ID: &str = "global";
 
 struct SessionPluginInstallWriter<'a, 'tx> {
-    transaction: &'a mut WriteTransaction<'tx>,
+    transaction: &'a mut BufferedWriteTransaction<'tx>,
     semantic_context: SemanticWriteContext,
 }
 
@@ -29,7 +30,7 @@ impl<'a, 'tx> PluginInstallWriteExecutor for SessionPluginInstallWriter<'a, 'tx>
         &mut self,
         step: PreparedWriteExecutionStep,
     ) -> Result<(), LixError> {
-        stage_prepared_write_step(self.transaction, step)
+        stage_prepared_write_step(&mut *self.transaction, step)
     }
 
     async fn resolve_directory_id(
@@ -51,7 +52,7 @@ pub(crate) async fn install_plugin_in_session(
     archive_bytes: &[u8],
 ) -> Result<(), LixError> {
     let transaction = session.collaborators().begin_write_unit().await?;
-    let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
+    let mut write_transaction = BufferedWriteTransaction::new(transaction);
     let mut context = session.new_execution_context(ExecuteOptions::default());
     ensure_execution_runtime_state_for_write_scope(
         session.collaborators(),
@@ -81,7 +82,7 @@ pub(crate) async fn install_plugin_in_session(
     match install_result {
         Ok(()) => {
             let outcome = write_transaction
-                .commit_buffered_write(context.buffered_write_execution_input())
+                .commit_buffered_write(session.collaborators.as_ref(), context.buffered_write_execution_input())
                 .await?;
             session.apply_transaction_commit_outcome(outcome).await?;
             Ok(())

@@ -6,19 +6,22 @@ use sqlparser::ast::{
     ValueWithSpan,
 };
 
+use crate::execution::read::{
+    PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
+};
 use crate::projections::ProjectionRegistry;
 use crate::contracts::traits::PendingView;
-use crate::read_runtime::PendingPublicReadExecutionBackend;
-use crate::read_pipeline::{
+use crate::session::read_preparation::{
     bootstrap_prepared_public_read_collaborators,
-    prepare_required_active_public_read_artifact_with_backend, PreparedPublicReadCollaborators,
+    prepare_required_active_public_read_artifact_with_backend,
+    PreparedPublicReadCollaborators,
 };
+use crate::session::state_selector::try_resolve_state_selector_rows_with_backend;
+use crate::session::write_resolution::{WriteResolveError, WriteSelectorResolver};
 use crate::sql::logical_plan::public_ir::{CanonicalStateRowKey, PlannedWrite, ScopeProof};
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     public_selector_column_name, public_selector_version_column,
 };
-use crate::state_selector_rows::try_resolve_state_selector_rows_with_backend;
-use crate::write_runtime::{WriteResolveError, WriteSelectorResolver};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";
@@ -71,11 +74,25 @@ impl<'a> SessionWriteSelectorResolver<'a> {
         .await?;
         self.backend
             .execute_prepared_public_read_with_pending_view(
+                self,
                 self.pending_view,
-                self.projection_registry,
                 &artifact,
             )
             .await
+    }
+}
+
+#[async_trait(?Send)]
+impl ReadExecutionBindings for SessionWriteSelectorResolver<'_> {
+    async fn derive_read_time_projection_rows(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
+        crate::session::read_execution_bindings::derive_read_time_projection_rows_with_registry(
+            self.projection_registry,
+            backend,
+        )
+        .await
     }
 }
 

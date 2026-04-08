@@ -7,11 +7,11 @@ use std::sync::Mutex;
 
 use crate::contracts::artifacts::{ExecuteOptions, SessionStateDelta};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::execution_runtime::ExecutionRuntimeState;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::binder::RuntimeBindingValues;
 #[cfg(test)]
 use crate::sql::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};
-use crate::write_runtime::BufferedWriteExecutionInput;
+use crate::execution::write::BufferedWriteExecutionInput;
 use crate::LixError;
 
 pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;
@@ -98,9 +98,13 @@ impl ExecutionContext {
             .bump_public_surface_registry_generation();
     }
 
-    #[cfg(test)]
     pub(crate) fn public_surface_registry_generation(&self) -> u64 {
         self.session_runtime.public_surface_registry_generation()
+    }
+
+    pub(crate) fn install_public_surface_registry(&mut self, registry: SurfaceRegistry) {
+        self.public_surface_registry = registry;
+        self.bump_public_surface_registry_generation();
     }
 
     #[cfg(test)]

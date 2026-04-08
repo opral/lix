@@ -4,7 +4,7 @@ use crate::canonical::checkpoint_labels::{
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
 use crate::canonical::read::load_commit_lineage_entry_by_id;
-use crate::execution_runtime::ExecutionRuntimeState;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 

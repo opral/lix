@@ -11,7 +11,7 @@ use crate::live_state::untracked::{
 };
 use crate::schema::builtin::storage::builtin_schema_storage_metadata;
 use crate::schema::builtin::types::LixActiveVersion;
-use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };

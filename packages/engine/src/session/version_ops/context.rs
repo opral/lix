@@ -2,7 +2,7 @@ use crate::backend::{LixBackend, QueryExecutor};
 use crate::runtime::TransactionBackendAdapter;
 use crate::session::workspace::require_workspace_active_version_id;
 use crate::version_state::load_committed_version_ref_with_executor;
-use crate::write_runtime::commit::{
+use crate::session::version_ops::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
     CreateCommitWriteLane,
 };

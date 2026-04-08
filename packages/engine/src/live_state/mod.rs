@@ -31,7 +31,7 @@ pub mod constraints;
 pub mod effective;
 mod init;
 mod lifecycle;
-mod materialize;
+pub(crate) mod materialize;
 pub(crate) mod pending_reads;
 #[allow(dead_code)]
 pub(crate) mod projection;
