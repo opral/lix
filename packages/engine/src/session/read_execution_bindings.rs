@@ -22,18 +22,15 @@ pub(crate) async fn derive_read_time_projection_rows_with_registry(
     backend: &dyn LixBackend,
 ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
     Ok(
-        crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend(
-            backend,
-            projection_registry,
-        )
-        .await?
-        .into_iter()
-        .map(|row| ReadTimeProjectionRow {
-            surface_name: row.surface_name,
-            identity: row.identity,
-            values: row.values,
-        })
-        .collect(),
+        crate::live_state::derive_read_time_surface_rows(backend, projection_registry)
+            .await?
+            .into_iter()
+            .map(|row| ReadTimeProjectionRow {
+                surface_name: row.surface_name,
+                identity: row.identity,
+                values: row.values,
+            })
+            .collect(),
     )
 }
 

@@ -3,9 +3,6 @@ use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::plugin::{select_best_glob_match, InstalledPlugin, PluginContentType};
 use crate::contracts::traits::FilesystemPluginMaterializer;
 use crate::execution::write::filesystem::query::load_file_row_by_id;
-use crate::live_state::materialize::filesystem::{
-    delete_file_payload_cache_data, load_file_payload_cache_data, upsert_file_payload_cache_data,
-};
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError};
 use serde::{Deserialize, Serialize};
@@ -77,7 +74,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
     }
 
     for (file_id, version_id) in tombstoned_files {
-        delete_file_payload_cache_data(backend, &file_id, &version_id).await?;
+        crate::live_state::delete_file_payload_cache_data(backend, &file_id, &version_id).await?;
     }
 
     let descriptors = load_file_descriptors(backend, &descriptor_targets).await?;
@@ -160,7 +157,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
                             blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
                         ),
                     })?;
-                upsert_file_payload_cache_data(
+                crate::live_state::upsert_file_payload_cache_data(
                     backend,
                     &descriptor.file_id,
                     &descriptor.version_id,
@@ -168,7 +165,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
                 )
                 .await?;
             } else {
-                delete_file_payload_cache_data(
+                crate::live_state::delete_file_payload_cache_data(
                     backend,
                     &descriptor.file_id,
                     &descriptor.version_id,
@@ -179,9 +176,12 @@ pub(crate) async fn materialize_file_data_with_plugins(
         }
         let plugin = plugin.expect("plugin must be present");
 
-        let previous_data =
-            load_file_payload_cache_data(backend, &descriptor.file_id, &descriptor.version_id)
-                .await?;
+        let previous_data = crate::live_state::load_file_payload_cache_data(
+            backend,
+            &descriptor.file_id,
+            &descriptor.version_id,
+        )
+        .await?;
         let request_payload = ApplyChangesRequest {
             file: PluginFile {
                 id: descriptor.file_id.clone(),
@@ -199,7 +199,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
         let output = plugin_materializer
             .apply_plugin_changes(plugin, &payload)
             .await?;
-        upsert_file_payload_cache_data(
+        crate::live_state::upsert_file_payload_cache_data(
             backend,
             &descriptor.file_id,
             &descriptor.version_id,

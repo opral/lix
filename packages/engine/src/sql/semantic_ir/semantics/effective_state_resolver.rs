@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn builds_effective_state_request_for_entity_surface() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
@@ -311,7 +311,7 @@ mod tests {
 
     #[test]
     fn history_surfaces_include_tombstones_and_version_columns() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
             "SELECT entity_id, version_id FROM lix_state_history WHERE schema_key = 'message'",
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn extracts_exact_state_pushdown_predicates_from_top_level_conjunctions() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
             "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND file_id = 'lix'",

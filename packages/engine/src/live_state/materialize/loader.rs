@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::schema::builtin::types::{LixCommit, LixVersionDescriptor};
+use crate::schema::{LixCommit, LixVersionDescriptor};
 
 use crate::{CanonicalJson, LixError, ReplayCursor, Value};
 

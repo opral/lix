@@ -29,12 +29,7 @@ pub(crate) async fn bootstrap_prepared_public_read_collaborators(
     backend: &dyn LixBackend,
     pending_view: Option<&dyn PendingView>,
 ) -> Result<PreparedPublicReadCollaborators, LixError> {
-    let registry =
-        crate::live_state::pending_reads::bootstrap_public_surface_registry_with_pending_transaction_view(
-            backend,
-            pending_view,
-        )
-        .await?;
+    let registry = crate::live_state::build_surface_registry(backend, pending_view).await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
     Ok(PreparedPublicReadCollaborators {
         registry,

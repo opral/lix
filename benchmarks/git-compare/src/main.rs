@@ -1,7 +1,7 @@
 use clap::Parser;
 use lix_engine::{
-    boot as boot_engine, BootArgs as EngineConfig, ExecuteOptions, Session,
-    SessionTransaction, Value,
+    boot as boot_engine, BootArgs as EngineConfig, ExecuteOptions, Session, SessionTransaction,
+    Value,
 };
 use lix_rs_sdk::{SqliteBackend, WasmRuntime, WasmtimeRuntime};
 use serde::Serialize;
@@ -984,7 +984,10 @@ fn verify_session_state(
     Ok(())
 }
 
-fn create_initialized_session(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> DynResult<Session> {
+fn create_initialized_session(
+    path: &Path,
+    wasm_runtime: Arc<dyn WasmRuntime>,
+) -> DynResult<Session> {
     if path.exists() {
         fs::remove_file(path)?;
     }

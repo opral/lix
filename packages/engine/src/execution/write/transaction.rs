@@ -12,9 +12,9 @@ use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
 #[cfg(test)]
-pub use super::execution::WriteTransaction;
-#[cfg(test)]
 pub use super::contracts::TransactionDelta;
+#[cfg(test)]
+pub use super::execution::WriteTransaction;
 #[cfg(test)]
 pub use super::read_context::ReadContext;
 pub(crate) use crate::backend::program::WriteProgram;

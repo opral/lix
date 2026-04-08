@@ -2,7 +2,7 @@ use crate::init::InitExecutor;
 use crate::live_state::{
     apply_untracked_write_batch_in_transaction, UntrackedWriteOperation, UntrackedWriteRow,
 };
-use crate::schema::builtin::types::LixCommit;
+use crate::schema::LixCommit;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {

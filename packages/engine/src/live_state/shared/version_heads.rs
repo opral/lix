@@ -2,7 +2,7 @@ use crate::backend::QueryExecutor;
 use crate::common::errors::classification::is_missing_relation_error;
 use crate::contracts::artifacts::CommittedVersionFrontier;
 use crate::live_state::schema_access::tracked_relation_name;
-use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
+use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,14 +96,14 @@ async fn load_all_version_head_refs_with_executor(
     Ok(rows)
 }
 
-fn version_ref_storage_metadata() -> crate::schema::builtin::storage::BuiltinSchemaStorageMetadata {
+fn version_ref_storage_metadata() -> crate::live_state::BuiltinSchemaStorageMetadata {
     builtin_schema_storage_metadata("lix_version_ref")
         .expect("lix_version_ref builtin storage metadata should exist")
 }
 
 fn version_ref_storage_version_id() -> String {
     match version_ref_storage_metadata().storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::schema::builtin::GLOBAL_VERSION_ID.to_string(),
+        BuiltinSchemaStorageLane::Global => crate::version_state::GLOBAL_VERSION_ID.to_string(),
         BuiltinSchemaStorageLane::Local => {
             panic!("lix_version_ref must use the global storage lane")
         }

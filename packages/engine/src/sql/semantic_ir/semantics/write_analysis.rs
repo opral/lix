@@ -1,5 +1,4 @@
 use crate::contracts::surface::SurfaceOverrideValue;
-use crate::schema::builtin::GLOBAL_VERSION_ID;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteModeRequest, WriteOperationKind,
@@ -12,6 +11,7 @@ use crate::sql::semantic_ir::semantics::filesystem_assignments::{
     parse_file_insert_assignments, parse_file_update_assignments, FilesystemWriteIntent,
 };
 use crate::sql::semantic_ir::semantics::surface_semantics::canonical_filter_column_name;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::Value;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::BTreeSet;
@@ -650,7 +650,7 @@ mod tests {
         sql: &str,
         requested_version_id: &str,
     ) -> crate::sql::semantic_ir::canonicalize::CanonicalizedWrite {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = bind_statement(

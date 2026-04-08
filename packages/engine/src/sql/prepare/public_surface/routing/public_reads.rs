@@ -15,8 +15,8 @@ use crate::sql::logical_plan::public_ir::{
 };
 use crate::sql::physical_plan::lowerer::broad_public_relation_supports_terminal_render;
 use crate::sql::prepare::public_surface::routing::registry::{
-    RoutingPassMetadata, RoutingPassOutcome, RoutingPassRegistry, RoutingPassSettings,
-    RoutingPassTrace, run_fallible_pass, run_infallible_pass,
+    run_fallible_pass, run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome,
+    RoutingPassRegistry, RoutingPassSettings, RoutingPassTrace,
 };
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
@@ -2280,7 +2280,7 @@ mod tests {
             .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &crate::schema::build_builtin_surface_registry(),
+            &crate::surfaces::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             Some("main"),
         )
@@ -2292,12 +2292,10 @@ mod tests {
             "public-read.route-lowerable-relations"
         );
         assert!(optimized.pass_traces[0].enabled);
-        assert!(
-            optimized.pass_traces[0]
-                .diagnostics
-                .iter()
-                .any(|line| line.contains("public relations"))
-        );
+        assert!(optimized.pass_traces[0]
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("public relations")));
         let BroadPublicReadStatement::Query(query) = &optimized.broad_statement else {
             panic!("routing should keep a broad query statement");
         };
@@ -2322,7 +2320,7 @@ mod tests {
             .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &crate::schema::build_builtin_surface_registry(),
+            &crate::surfaces::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             None,
         )
@@ -2355,19 +2353,17 @@ mod tests {
         .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &crate::schema::build_builtin_surface_registry(),
+            &crate::surfaces::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             Some("main"),
         )
         .expect("broad rewrite should succeed");
 
         assert!(optimized.pass_traces[0].changed);
-        assert!(
-            optimized.pass_traces[0]
-                .diagnostics
-                .iter()
-                .any(|line| line.contains("lix_directory"))
-        );
+        assert!(optimized.pass_traces[0]
+            .diagnostics
+            .iter()
+            .any(|line| line.contains("lix_directory")));
 
         let BroadPublicReadStatement::Query(query) = &optimized.broad_statement else {
             panic!("routing should keep a broad query statement");
@@ -2397,7 +2393,7 @@ mod tests {
 
     #[test]
     fn direct_history_strategy_records_trace() {
-        let binding = crate::schema::build_builtin_surface_registry()
+        let binding = crate::surfaces::build_builtin_surface_registry()
             .bind_relation_name("lix_state_history")
             .expect("builtin history surface should bind");
         let decision = route_public_read_execution_strategy(&binding);

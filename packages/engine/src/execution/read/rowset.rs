@@ -253,7 +253,7 @@ mod tests {
     };
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
-    use crate::schema::builtin::types::LixCommit;
+    use crate::schema::LixCommit;
     use crate::surface_sql::version::build_admin_version_source_sql_with_current_heads;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionBindings,

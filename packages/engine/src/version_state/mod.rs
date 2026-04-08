@@ -1,10 +1,10 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::builtin::types::{LixVersionDescriptor, LixVersionRef};
 use crate::schema::builtin::{
     builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
 };
+use crate::schema::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::LixError;
 
 pub(crate) mod checkpoints;
@@ -12,7 +12,8 @@ mod heads;
 mod refs;
 mod roots;
 
-pub(crate) use crate::schema::builtin::{DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID};
+pub(crate) const GLOBAL_VERSION_ID: &str = "global";
+pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
 #[allow(unused_imports)]
 pub(crate) use heads::load_current_committed_version_frontier_with_backend;
 pub(crate) use heads::{
@@ -30,6 +31,7 @@ pub(crate) use roots::{
 
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_REF_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
+static ACTIVE_VERSION_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 
 struct SchemaMetadata {
     schema_key: String,
@@ -113,6 +115,35 @@ pub(crate) fn version_ref_snapshot_content(id: &str, commit_id: &str) -> String 
     .expect("lix_version_ref snapshot serialization must succeed")
 }
 
+pub(crate) fn active_version_schema_key() -> &'static str {
+    &active_version_schema_metadata().schema_key
+}
+
+pub(crate) fn active_version_file_id() -> &'static str {
+    &active_version_schema_metadata().file_id
+}
+
+pub(crate) fn active_version_storage_version_id() -> &'static str {
+    &active_version_schema_metadata().storage_version_id
+}
+
+pub(crate) fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
+    let parsed: LixActiveVersion =
+        serde_json::from_str(snapshot_content).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("active version snapshot_content invalid JSON: {error}"),
+        })?;
+
+    if parsed.version_id.is_empty() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "active version must not be empty".to_string(),
+        });
+    }
+
+    Ok(parsed.version_id)
+}
+
 fn version_descriptor_schema_metadata() -> &'static SchemaMetadata {
     VERSION_DESCRIPTOR_SCHEMA_METADATA
         .get_or_init(|| parse_schema_metadata("lix_version_descriptor"))
@@ -120,6 +151,10 @@ fn version_descriptor_schema_metadata() -> &'static SchemaMetadata {
 
 fn version_ref_schema_metadata() -> &'static SchemaMetadata {
     VERSION_REF_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_version_ref"))
+}
+
+fn active_version_schema_metadata() -> &'static SchemaMetadata {
+    ACTIVE_VERSION_SCHEMA_METADATA.get_or_init(|| parse_schema_metadata("lix_active_version"))
 }
 
 fn parse_schema_metadata(schema_key: &str) -> SchemaMetadata {

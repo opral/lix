@@ -1,9 +1,9 @@
 use super::*;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::live_state::RegisteredSchemaCatalog;
 use crate::schema::annotations::defaults::apply_schema_defaults_with_shared_runtime;
 use crate::schema::annotations::overrides::collect_state_column_overrides_with_shared_runtime;
-use crate::schema::builtin::builtin_schema_definition;
-use crate::schema::{OverlaySchemaProvider, SchemaProvider};
+use crate::schema::builtin_schema_definition;
 use crate::session::write_resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
 use crate::session::write_resolution::prepared_artifacts::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
@@ -11,6 +11,7 @@ use crate::session::write_resolution::prepared_artifacts::{
     CanonicalStateRowKey, EntityAssignmentsSemantics, EntityInsertSemantics,
     InsertOnConflictAction,
 };
+use crate::session::SessionSchemaCatalog;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -135,7 +136,7 @@ pub(super) async fn resolve_state_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut provider = OverlaySchemaProvider::from_backend(hydrator.backend());
+    let mut provider = SessionSchemaCatalog::from_backend(hydrator.backend());
     provider
         .remember_pending_registered_schemas_from_view(pending_view)
         .map_err(write_resolve_backend_error)?;
@@ -162,7 +163,7 @@ pub(super) async fn resolve_entity_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut provider = OverlaySchemaProvider::from_backend(hydrator.backend());
+    let mut provider = SessionSchemaCatalog::from_backend(hydrator.backend());
     provider
         .remember_pending_registered_schemas_from_view(pending_view)
         .map_err(write_resolve_backend_error)?;
@@ -941,7 +942,7 @@ fn selector_row_version_id(
 }
 
 async fn load_optional_annotation_schema(
-    provider: &mut dyn SchemaProvider,
+    provider: &mut dyn RegisteredSchemaCatalog,
     planned_write: &PlannedWrite,
 ) -> Result<Option<LoadedAnnotationSchema>, crate::LixError> {
     let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
@@ -960,7 +961,7 @@ async fn load_optional_annotation_schema(
 }
 
 async fn load_entity_schema(
-    provider: &mut dyn SchemaProvider,
+    provider: &mut dyn RegisteredSchemaCatalog,
     planned_write: &PlannedWrite,
 ) -> Result<EntityWriteSchema, crate::LixError> {
     let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;

@@ -27,13 +27,10 @@ use crate::contracts::artifacts::{
     PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
 };
 use crate::contracts::surface::SurfaceFamily;
-use crate::contracts::traits::{
-    CompiledSchemaCache, LiveStateQueryBackend, PendingView,
-};
-use crate::schema::{
-    schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
-    SchemaKey, SchemaProvider,
-};
+use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend, PendingView};
+use crate::live_state::RegisteredSchemaCatalog;
+use crate::schema::{schema_from_registered_snapshot, validate_lix_schema_definition, SchemaKey};
+use crate::session::SessionSchemaCatalog;
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -118,7 +115,7 @@ pub async fn validate_inserts(
     mutations: &[MutationRow],
     pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
-    let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+    let mut schema_provider = SessionSchemaCatalog::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
 
     for row in mutations {
@@ -174,7 +171,7 @@ pub(crate) async fn validate_update_inputs(
     inputs: &[UpdateValidationInput],
     pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
-    let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+    let mut schema_provider = SessionSchemaCatalog::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
     let mut pending_rows = Vec::new();
     let mut deleted_rows = Vec::new();
@@ -318,7 +315,7 @@ async fn validate_prepared_public_write(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "planned write validation requires a resolved write plan".to_string(),
         })?;
-    let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+    let mut schema_provider = SessionSchemaCatalog::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
     remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
@@ -413,7 +410,7 @@ async fn validate_prepared_public_write(
 }
 
 async fn remember_pending_registered_schemas(
-    provider: &mut OverlaySchemaProvider<'_>,
+    provider: &mut SessionSchemaCatalog<'_>,
     resolved: &PreparedResolvedWritePlan,
 ) -> Result<(), LixError> {
     for row in resolved.intended_post_state() {
@@ -567,7 +564,7 @@ fn storage_kind_for_table(table: &str) -> ConstraintStorageKind {
     }
 }
 
-async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
+async fn validate_snapshot_content<P: RegisteredSchemaCatalog + ?Sized>(
     provider: &mut P,
     cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
@@ -605,7 +602,7 @@ async fn validate_snapshot_content<P: SchemaProvider + ?Sized>(
 }
 
 async fn validate_update_is_mutable(
-    provider: &mut OverlaySchemaProvider<'_>,
+    provider: &mut SessionSchemaCatalog<'_>,
     row: &PlannedStateRow,
 ) -> Result<(), LixError> {
     let key = SchemaKey::new(
@@ -629,7 +626,7 @@ async fn validate_update_is_mutable(
 
 async fn validate_planned_row(
     backend: &dyn LixBackend,
-    provider: &mut OverlaySchemaProvider<'_>,
+    provider: &mut SessionSchemaCatalog<'_>,
     cache: &dyn CompiledSchemaCache,
     operation_kind: PreparedWriteOperationKind,
     row: &PlannedStateRow,
@@ -770,7 +767,7 @@ fn validate_checkpoint_label_mutation(
     Ok(())
 }
 
-async fn validate_registered_schema_snapshot<P: SchemaProvider + ?Sized>(
+async fn validate_registered_schema_snapshot<P: RegisteredSchemaCatalog + ?Sized>(
     provider: &mut P,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
@@ -839,7 +836,7 @@ fn collect_planned_binary_blob_hashes(
     Ok(hashes)
 }
 
-async fn validate_registered_schema_insert<P: SchemaProvider + ?Sized>(
+async fn validate_registered_schema_insert<P: RegisteredSchemaCatalog + ?Sized>(
     provider: &mut P,
     row: &MutationRow,
 ) -> Result<(), LixError> {
@@ -852,7 +849,7 @@ async fn validate_registered_schema_insert<P: SchemaProvider + ?Sized>(
     Ok(())
 }
 
-async fn validate_foreign_key_reference_targets<P: SchemaProvider + ?Sized>(
+async fn validate_foreign_key_reference_targets<P: RegisteredSchemaCatalog + ?Sized>(
     provider: &mut P,
     schema: &JsonValue,
 ) -> Result<(), LixError> {
@@ -950,7 +947,7 @@ fn collect_unique_key_groups(schema: &JsonValue) -> Vec<Vec<String>> {
     keys
 }
 
-async fn validate_row_constraints<P: SchemaProvider + ?Sized>(
+async fn validate_row_constraints<P: RegisteredSchemaCatalog + ?Sized>(
     backend: &dyn LixBackend,
     provider: &mut P,
     context: &mut ConstraintContext,
@@ -1234,7 +1231,7 @@ async fn validate_foreign_key_constraints(
     Ok(())
 }
 
-async fn validate_delete_constraints<P: SchemaProvider + ?Sized>(
+async fn validate_delete_constraints<P: RegisteredSchemaCatalog + ?Sized>(
     backend: &dyn LixBackend,
     provider: &mut P,
     context: &mut ConstraintContext,
@@ -1802,7 +1799,7 @@ fn shadowed_committed_identities(
     identities
 }
 
-async fn load_compiled_schema<P: SchemaProvider + ?Sized>(
+async fn load_compiled_schema<P: RegisteredSchemaCatalog + ?Sized>(
     provider: &mut P,
     cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
@@ -1923,7 +1920,7 @@ fn apply_snapshot_patch(
     Ok(())
 }
 
-async fn validate_entity_id_matches_primary_key<P: SchemaProvider + ?Sized>(
+async fn validate_entity_id_matches_primary_key<P: RegisteredSchemaCatalog + ?Sized>(
     provider: &mut P,
     key: &SchemaKey,
     entity_id: &str,

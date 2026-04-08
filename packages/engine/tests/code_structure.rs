@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -35,20 +36,13 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "runtime",
-        reason: "runtime is a sidecar and must not reacquire semantic owners or the live-state engine",
-        forbidden_scopes: &[
-            "execution",
-            "engine",
-            "live_state",
-            "session",
-            "sql",
-            "version_state",
-        ],
+        reason: "runtime is a sidecar and must not reacquire execution, engine-shell, workflow, or compiler owners; sealed live_state root APIs are allowed",
+        forbidden_scopes: &["execution", "engine", "session", "sql"],
     },
     ForbiddenDependencyRule {
         from_scope: "live_state",
         reason: "live_state is the generic projection engine and must not reacquire runtime sidecars or write orchestration owners",
-        forbidden_scopes: &["execution", "runtime", "version_state"],
+        forbidden_scopes: &["execution", "runtime"],
     },
     ForbiddenDependencyRule {
         from_scope: "projections",
@@ -57,17 +51,15 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "sql",
-        reason: "sql is the compiler and should depend on contracts and foundation only, never state owners or dissolved domains directly",
+        reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or history owners directly; sealed live_state root query-contract APIs are allowed",
         forbidden_scopes: &[
             "backend",
             "binary_cas",
             "canonical",
             "execution",
-            "live_state",
             "projections",
             "runtime",
             "session",
-            "version_state",
         ],
     },
     ForbiddenDependencyRule {
@@ -103,6 +95,8 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "version_state",
 ];
 
+const SEALED_OWNER_SNAPSHOT_PATH: &str = "tests/sealed_owner_violations.txt";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
     module_source: String,
@@ -129,6 +123,12 @@ struct StronglyConnectedComponent {
 struct ModuleAdjacency {
     incoming: Vec<String>,
     outgoing: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct SealedOwnerViolation {
+    importer_file: String,
+    imported_path: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1218,6 +1218,9 @@ fn production_source_files() -> Vec<(String, String)> {
                 .expect("module source file should be inside src/")
                 .to_string_lossy()
                 .replace('\\', "/");
+            if is_test_support_relative_path(&relative_path) {
+                continue;
+            }
             let source =
                 fs::read_to_string(&absolute_path).expect("module source file should be readable");
             files.push((relative_path, strip_test_code(&source)));
@@ -1226,6 +1229,413 @@ fn production_source_files() -> Vec<(String, String)> {
 
     files.sort_by(|left, right| left.0.cmp(&right.0));
     files
+}
+
+fn is_test_support_relative_path(relative_path: &str) -> bool {
+    let parts: Vec<&str> = relative_path.split('/').collect();
+    parts.iter().any(|part| {
+        *part == "tests"
+            || *part == "test"
+            || part
+                .strip_suffix(".rs")
+                .is_some_and(|stem| stem.ends_with("_tests"))
+            || part.ends_with("_tests")
+    })
+}
+
+fn root_module_entry_relative_path(module_name: &str) -> Option<String> {
+    let module_file = src_root().join(format!("{module_name}.rs"));
+    if module_file.exists() {
+        return Some(format!("{module_name}.rs"));
+    }
+
+    let module_mod_file = src_root().join(module_name).join("mod.rs");
+    if module_mod_file.exists() {
+        return Some(format!("{module_name}/mod.rs"));
+    }
+
+    None
+}
+
+fn parse_declared_modules(source: &str) -> Vec<String> {
+    let mut modules = Vec::new();
+    let mut pending_attributes = Vec::new();
+
+    for line in source.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            pending_attributes.push(trimmed.to_string());
+            continue;
+        }
+
+        let mut cursor = trimmed;
+        if let Some(rest) = cursor.strip_prefix("pub(crate) ") {
+            cursor = rest;
+        } else if let Some(rest) = cursor.strip_prefix("pub ") {
+            cursor = rest;
+        } else if cursor.starts_with("pub(") {
+            if let Some(idx) = cursor.find(") ") {
+                cursor = &cursor[idx + 2..];
+            }
+        }
+
+        if let Some(rest) = cursor.strip_prefix("mod ") {
+            if let Some(module_name) = rest.strip_suffix(';') {
+                let is_test_only = pending_attributes
+                    .iter()
+                    .any(|attribute| attribute.contains("cfg(test)"));
+                if !is_test_only {
+                    let name = module_name.trim();
+                    if !name.is_empty() {
+                        modules.push(name.to_string());
+                    }
+                }
+            }
+        }
+
+        pending_attributes.clear();
+    }
+
+    modules
+}
+
+fn sealed_owner_child_modules() -> BTreeMap<String, BTreeSet<String>> {
+    let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
+    let top_level_modules = parse_top_level_modules(&lib_source);
+    let mut child_modules = BTreeMap::new();
+
+    for module_name in top_level_modules {
+        let Some(relative_path) = root_module_entry_relative_path(&module_name) else {
+            continue;
+        };
+        let source = read_engine_source(&relative_path);
+        let declared_modules = parse_declared_modules(&strip_test_code(&source));
+        child_modules.insert(module_name, declared_modules.into_iter().collect());
+    }
+
+    child_modules
+}
+
+fn collect_module_paths_from_source(
+    source: &str,
+    current_module_path: &[String],
+    module_set: &HashSet<String>,
+) -> BTreeSet<Vec<String>> {
+    let without_tests = strip_test_code(source);
+    let sanitized = mask_rust_source(&without_tests);
+    let mut paths = BTreeSet::new();
+
+    paths.extend(collect_use_paths_from_source(
+        &sanitized,
+        current_module_path,
+        module_set,
+    ));
+    paths.extend(collect_explicit_paths_from_source(
+        &sanitized,
+        current_module_path,
+        module_set,
+    ));
+
+    paths
+}
+
+fn collect_use_paths_from_source(
+    source: &str,
+    current_module_path: &[String],
+    module_set: &HashSet<String>,
+) -> BTreeSet<Vec<String>> {
+    let bytes = source.as_bytes();
+    let mut paths = BTreeSet::new();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        if let Some((_, after_use)) = match_keyword(bytes, index, b"use") {
+            let mut cursor = after_use;
+            while cursor < bytes.len() && bytes[cursor] != b';' {
+                cursor += 1;
+            }
+            if cursor < bytes.len() {
+                let spec = &source[after_use..cursor];
+                paths.extend(resolve_use_paths(spec, current_module_path, module_set));
+                index = cursor + 1;
+                continue;
+            }
+        }
+        index += 1;
+    }
+
+    paths
+}
+
+fn resolve_use_paths(
+    spec: &str,
+    current_module_path: &[String],
+    module_set: &HashSet<String>,
+) -> BTreeSet<Vec<String>> {
+    let tokens = tokenize_use_spec(spec);
+    let mut paths = BTreeSet::new();
+    let mut index = 0usize;
+
+    while index < tokens.len() {
+        index = parse_use_tree_paths(
+            &tokens,
+            index,
+            current_module_path,
+            None,
+            module_set,
+            &mut paths,
+        );
+        if matches!(tokens.get(index), Some(UseToken::Comma)) {
+            index += 1;
+        } else {
+            break;
+        }
+    }
+
+    paths
+}
+
+fn parse_use_tree_paths(
+    tokens: &[UseToken],
+    index: usize,
+    current_module_path: &[String],
+    base_context: Option<&[String]>,
+    module_set: &HashSet<String>,
+    paths: &mut BTreeSet<Vec<String>>,
+) -> usize {
+    let (path_parts, next_index) = parse_use_path(tokens, index);
+    if path_parts.is_empty() {
+        return skip_until_boundary(tokens, index);
+    }
+
+    let resolved_path = resolve_use_path(&path_parts, current_module_path, base_context);
+    if resolved_path
+        .first()
+        .is_some_and(|dependency| module_set.contains(dependency))
+    {
+        paths.insert(resolved_path.clone());
+    }
+
+    let mut cursor = next_index;
+    if matches!(tokens.get(cursor), Some(UseToken::DblColon))
+        && matches!(tokens.get(cursor + 1), Some(UseToken::LBrace))
+    {
+        cursor += 2;
+        while cursor < tokens.len() && !matches!(tokens.get(cursor), Some(UseToken::RBrace)) {
+            cursor = parse_use_tree_paths(
+                tokens,
+                cursor,
+                current_module_path,
+                Some(&resolved_path),
+                module_set,
+                paths,
+            );
+            if matches!(tokens.get(cursor), Some(UseToken::Comma)) {
+                cursor += 1;
+            }
+        }
+        if matches!(tokens.get(cursor), Some(UseToken::RBrace)) {
+            cursor += 1;
+        }
+        return cursor;
+    }
+
+    if matches!(tokens.get(cursor), Some(UseToken::DblColon))
+        && matches!(tokens.get(cursor + 1), Some(UseToken::Star))
+    {
+        return cursor + 2;
+    }
+
+    if matches!(tokens.get(cursor), Some(UseToken::As)) {
+        return cursor
+            + if matches!(tokens.get(cursor + 1), Some(UseToken::Ident(_))) {
+                2
+            } else {
+                1
+            };
+    }
+
+    cursor
+}
+
+fn collect_explicit_paths_from_source(
+    source: &str,
+    current_module_path: &[String],
+    module_set: &HashSet<String>,
+) -> BTreeSet<Vec<String>> {
+    let bytes = source.as_bytes();
+    let mut paths = BTreeSet::new();
+    let mut index = 0usize;
+
+    while index < bytes.len() {
+        let Some((prefix, after_prefix)) = parse_explicit_prefix(bytes, index) else {
+            index += 1;
+            continue;
+        };
+
+        let after_separator = skip_whitespace(bytes, after_prefix);
+        if bytes.get(after_separator..after_separator + 2) != Some(&b"::"[..]) {
+            index += 1;
+            continue;
+        }
+
+        let mut cursor = skip_whitespace(bytes, after_separator + 2);
+        let mut segments = Vec::new();
+
+        loop {
+            let Some((segment, after_segment)) = parse_identifier(bytes, cursor) else {
+                break;
+            };
+            segments.push(normalize_identifier(&segment));
+            let after_whitespace = skip_whitespace(bytes, after_segment);
+            if bytes.get(after_whitespace..after_whitespace + 2) == Some(&b"::"[..]) {
+                cursor = skip_whitespace(bytes, after_whitespace + 2);
+                continue;
+            }
+            cursor = after_segment;
+            break;
+        }
+
+        if segments.is_empty() {
+            index += 1;
+            continue;
+        }
+
+        let resolved_path = resolve_explicit_path(&prefix, &segments, current_module_path);
+        if resolved_path
+            .first()
+            .is_some_and(|dependency| module_set.contains(dependency))
+        {
+            paths.insert(resolved_path);
+        }
+
+        index = cursor.max(index + 1);
+    }
+
+    paths
+}
+
+fn resolve_explicit_path(
+    prefix: &[String],
+    segments: &[String],
+    current_module_path: &[String],
+) -> Vec<String> {
+    match prefix.first().map(String::as_str) {
+        Some("crate") => segments.to_vec(),
+        Some("self") => {
+            let mut result = current_module_path.to_vec();
+            result.extend(segments.iter().cloned());
+            result
+        }
+        Some("super") => {
+            let super_count = prefix.iter().filter(|segment| *segment == "super").count();
+            let mut result: Vec<String> = current_module_path
+                .iter()
+                .take(current_module_path.len().saturating_sub(super_count))
+                .cloned()
+                .collect();
+            result.extend(segments.iter().cloned());
+            result
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
+    let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
+    let top_level_modules = parse_top_level_modules(&lib_source);
+    let module_set: HashSet<String> = top_level_modules.iter().cloned().collect();
+    let child_modules = sealed_owner_child_modules();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        let current_module_path = module_path_for_file(&relative_path);
+        let Some(current_root) = current_module_path.first() else {
+            continue;
+        };
+
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path.len() < 2 {
+                continue;
+            }
+            let owner_root = &imported_path[0];
+            if owner_root == current_root {
+                continue;
+            }
+
+            let Some(owner_child_modules) = child_modules.get(owner_root) else {
+                continue;
+            };
+            if !owner_child_modules.contains(&imported_path[1]) {
+                continue;
+            }
+
+            violations.insert(SealedOwnerViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {
+    let mut grouped: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
+
+    for violation in violations {
+        let owner_root = violation
+            .imported_path
+            .split("::")
+            .next()
+            .expect("imported path should include an owner root");
+        grouped
+            .entry(owner_root)
+            .or_default()
+            .entry(violation.importer_file.as_str())
+            .or_default()
+            .push(violation.imported_path.as_str());
+    }
+
+    let mut rendered = String::new();
+    for (owner_root, files) in grouped {
+        let _ = writeln!(&mut rendered, "{owner_root}:");
+        for (file, imported_paths) in files {
+            let _ = writeln!(&mut rendered, "  {file}:");
+            for imported_path in imported_paths {
+                let _ = writeln!(&mut rendered, "    - {imported_path}");
+            }
+        }
+    }
+
+    rendered
+}
+
+#[test]
+fn sealed_owner_import_rule_lists_current_violations() {
+    let actual_violations = current_sealed_owner_violations();
+    let actual = render_grouped_sealed_owner_violations(&actual_violations);
+    let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
+
+    if std::env::var_os("LIX_WRITE_SEALED_OWNER_SNAPSHOT").is_some() {
+        fs::write(&snapshot_path, &actual).expect("sealed-owner snapshot should be writable");
+        return;
+    }
+
+    let expected =
+        fs::read_to_string(&snapshot_path).expect("sealed-owner snapshot should be readable");
+
+    assert_eq!(
+        actual, expected,
+        "sealed-owner violations changed; update {} if this was intentional.\n\nCurrent violations:\n{}",
+        SEALED_OWNER_SNAPSHOT_PATH,
+        actual,
+    );
 }
 
 #[test]
@@ -1606,6 +2016,7 @@ fn phase_f_session_selector_reads_stays_as_orchestration_only() {
 
     for forbidden in [
         "bootstrap_public_surface_registry_with_pending_transaction_view(",
+        "build_surface_registry(",
         "load_sql_compiler_metadata(",
         "load_active_history_root_commit_id_for_preparation(",
         "try_prepare_public_read_with_registry_and_internal_access(",
@@ -1618,7 +2029,7 @@ fn phase_f_session_selector_reads_stays_as_orchestration_only() {
     }
 
     for required in [
-        "bootstrap_public_surface_registry_with_pending_transaction_view(",
+        "build_surface_registry(",
         "load_sql_compiler_metadata(",
         "load_active_history_root_commit_id_for_preparation(",
         "try_prepare_public_read_with_registry_and_internal_access(",

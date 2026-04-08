@@ -8,12 +8,20 @@ use crate::contracts::surface::{
     DynamicEntitySurfaceSpec, SurfaceColumnType, SurfaceOverridePredicate, SurfaceOverrideValue,
     SurfaceRegistry,
 };
+use crate::live_state::SqlRegisteredSchemaCatalog;
 use crate::runtime::cel::shared_runtime;
 use crate::schema::annotations::overrides::{collect_lixcol_overrides, LixcolOverrideValue};
 use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
+use crate::schema::schema_from_registered_snapshot;
 use crate::{LixBackend, LixError};
 
-use super::{schema_from_registered_snapshot, SqlRegisteredSchemaProvider};
+mod relation_policy;
+
+pub(crate) use relation_policy::{
+    builtin_relation_inventory, classify_builtin_relation_name, classify_relation_name,
+    object_name_is_internal_storage_relation, object_name_is_protected_builtin_ddl_target,
+    protected_builtin_public_surface_names, relation_policy_choice_summary, RelationPolicy,
+};
 
 pub(crate) fn build_builtin_surface_registry() -> SurfaceRegistry {
     let mut registry = SurfaceRegistry::new();
@@ -63,7 +71,7 @@ pub(crate) async fn load_public_surface_registry_with_backend(
     backend: &dyn LixBackend,
 ) -> Result<SurfaceRegistry, LixError> {
     let mut registry = build_builtin_surface_registry();
-    let mut provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut provider = SqlRegisteredSchemaCatalog::new(backend);
     for (_, schema) in provider.load_latest_schema_entries().await? {
         let spec = entity_surface_spec_from_schema(&schema)?;
         register_dynamic_entity_surface_spec(&mut registry, spec);

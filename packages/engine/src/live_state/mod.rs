@@ -37,9 +37,12 @@ pub(crate) mod pending_reads;
 pub(crate) mod projection;
 mod query_contracts;
 pub(crate) mod raw;
+mod registered_schema_catalog;
 pub(crate) mod schema_access;
+mod schema_catalog;
 pub(crate) mod shared;
 pub(crate) mod storage;
+mod storage_metadata;
 #[cfg(test)]
 pub(crate) mod testing;
 pub mod tracked;
@@ -56,6 +59,7 @@ pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str =
 pub(crate) const FILE_DATA_CACHE_TABLE: &str = "lix_internal_file_data_cache";
 pub(crate) const FILE_PATH_CACHE_TABLE: &str = "lix_internal_file_path_cache";
 pub(crate) const FILE_LIXCOL_CACHE_TABLE: &str = "lix_internal_file_lixcol_cache";
+pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;
 
 #[allow(unused_imports)]
 pub(crate) use crate::contracts::artifacts::{
@@ -83,8 +87,14 @@ pub use materialize::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
+pub(crate) use registered_schema_catalog::SqlRegisteredSchemaCatalog;
 pub(crate) use schema_access::LiveReadContract;
+pub use schema_catalog::RegisteredSchemaCatalog;
 pub use shared::identity::RowIdentity;
+pub(crate) use storage_metadata::{
+    builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,
+    key_value_schema_version, BuiltinSchemaStorageLane, BuiltinSchemaStorageMetadata,
+};
 pub use tracked::{
     load_exact_row_with_backend as load_exact_tracked_row_with_backend,
     load_exact_rows_with_backend as load_exact_tracked_rows_with_backend,
@@ -112,6 +122,50 @@ pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
 
 pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionStatus, LixError> {
     projection::projection_status(backend).await
+}
+
+pub(crate) async fn build_surface_registry(
+    backend: &dyn LixBackend,
+    pending_view: Option<&dyn crate::contracts::traits::PendingView>,
+) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
+    pending_reads::bootstrap_public_surface_registry_with_pending_transaction_view(
+        backend,
+        pending_view,
+    )
+    .await
+}
+
+pub(crate) async fn execute_prepared_public_read(
+    backend: &dyn LixBackend,
+    pending_view: Option<&dyn crate::contracts::traits::PendingView>,
+    public_read: &crate::contracts::artifacts::PreparedPublicReadArtifact,
+) -> Result<crate::QueryResult, LixError> {
+    pending_reads::execute_prepared_public_read_with_pending_transaction_view(
+        backend,
+        pending_view,
+        public_read,
+    )
+    .await
+}
+
+pub(crate) async fn execute_prepared_public_read_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    pending_view: Option<&dyn crate::contracts::traits::PendingView>,
+    public_read: &crate::contracts::artifacts::PreparedPublicReadArtifact,
+) -> Result<crate::QueryResult, LixError> {
+    pending_reads::execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+        transaction,
+        pending_view,
+        public_read,
+    )
+    .await
+}
+
+pub(crate) async fn derive_read_time_surface_rows(
+    backend: &dyn LixBackend,
+    registry: &crate::projections::ProjectionRegistry,
+) -> Result<Vec<crate::projections::DerivedRow>, LixError> {
+    projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry).await
 }
 
 pub(crate) async fn load_live_state_projection_status_with_backend(
@@ -284,11 +338,98 @@ pub(crate) async fn load_live_read_contract_for_table_name(
     schema_access::load_schema_read_contract_for_table_name(backend, table_name).await
 }
 
+pub(crate) fn read_contract_from_definition(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+) -> Result<LiveReadContract, LixError> {
+    schema_access::read_contract_from_definition(schema_key, schema_definition)
+}
+
+pub(crate) fn payload_column_name_for_schema(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+    property_name: &str,
+) -> Result<String, LixError> {
+    read_contract_from_definition(schema_key, schema_definition)?
+        .payload_column_name(property_name)
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "live schema '{}' does not include property '{}'",
+                    schema_key, property_name
+                ),
+            )
+        })
+}
+
+pub(crate) fn normalized_projection_sql_for_schema(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+    table_alias: Option<&str>,
+) -> Result<String, LixError> {
+    Ok(
+        read_contract_from_definition(schema_key, schema_definition)?
+            .normalized_projection_sql(table_alias),
+    )
+}
+
+pub(crate) fn snapshot_select_expr_for_schema(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+    dialect: crate::SqlDialect,
+    table_alias: Option<&str>,
+) -> Result<String, LixError> {
+    Ok(
+        read_contract_from_definition(schema_key, schema_definition)?
+            .snapshot_select_expr(dialect, table_alias),
+    )
+}
+
 pub(crate) async fn live_storage_relation_exists_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
 ) -> Result<bool, LixError> {
     schema_access::live_storage_relation_exists_with_backend(backend, schema_key).await
+}
+
+pub(crate) fn tracked_relation_name(schema_key: &str) -> String {
+    schema_access::tracked_relation_name(schema_key)
+}
+
+pub(crate) fn schema_key_for_internal_relation_name(relation_name: &str) -> Option<&str> {
+    storage::live_schema_key_for_table_name(relation_name)
+}
+
+pub(crate) fn is_internal_relation_name(relation_name: &str) -> bool {
+    schema_key_for_internal_relation_name(relation_name).is_some()
+}
+
+pub(crate) async fn load_file_payload_cache_data(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+) -> Result<Vec<u8>, LixError> {
+    materialize::filesystem::load_file_payload_cache_data(backend, file_id, version_id).await
+}
+
+pub(crate) async fn upsert_file_payload_cache_data(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+    data: &[u8],
+) -> Result<(), LixError> {
+    materialize::filesystem::upsert_file_payload_cache_data(backend, file_id, version_id, data)
+        .await
+}
+
+pub(crate) async fn delete_file_payload_cache_data(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+) -> Result<(), LixError> {
+    materialize::filesystem::delete_file_payload_cache_data(backend, file_id, version_id).await
 }
 
 pub(crate) async fn apply_tracked_write_batch_in_transaction(
@@ -323,7 +464,7 @@ pub(crate) async fn upsert_bootstrap_tracked_row_in_transaction(
         schema_version: schema_version.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
-        global: version_id == crate::schema::builtin::GLOBAL_VERSION_ID,
+        global: version_id == crate::version_state::GLOBAL_VERSION_ID,
         plugin_key: plugin_key.to_string(),
         metadata: None,
         change_id: change_id.to_string(),
@@ -353,7 +494,7 @@ pub(crate) async fn upsert_bootstrap_untracked_row_in_transaction(
         schema_version: schema_version.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
-        global: version_id == crate::schema::builtin::GLOBAL_VERSION_ID,
+        global: version_id == crate::version_state::GLOBAL_VERSION_ID,
         plugin_key: plugin_key.to_string(),
         metadata: None,
         writer_key: None,
@@ -432,7 +573,7 @@ fn snapshot_text_from_values(
 
 #[cfg(test)]
 pub(crate) fn live_relation_name(schema_key: &str) -> String {
-    schema_access::tracked_relation_name(schema_key)
+    tracked_relation_name(schema_key)
 }
 
 #[cfg(test)]

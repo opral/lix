@@ -3,12 +3,9 @@ use std::sync::OnceLock;
 
 use crate::schema::lix_schema_definition;
 
-pub(crate) mod storage;
-pub(crate) mod types;
-pub(crate) mod versioning;
+mod types;
 
-pub(crate) const GLOBAL_VERSION_ID: &str = "global";
-pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
+pub(crate) use types::{LixActiveVersion, LixCommit, LixVersionDescriptor, LixVersionRef};
 
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";

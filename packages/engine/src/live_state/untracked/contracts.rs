@@ -8,9 +8,9 @@ pub use crate::contracts::artifacts::{
 #[cfg(test)]
 pub(crate) use crate::contracts::traits::UntrackedReadView;
 pub(crate) use crate::contracts::traits::UntrackedWriteParticipant;
-use crate::{LixBackendTransaction, LixError};
 #[cfg(test)]
 use crate::LixBackend;
+use crate::{LixBackendTransaction, LixError};
 
 #[cfg(test)]
 #[async_trait(?Send)]

@@ -17,11 +17,11 @@ pub(crate) use buffered::PlannedWriteDelta;
 pub(crate) use buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionRoute, BufferedWriteSessionEffects,
 };
+pub use contracts::TransactionCommitOutcome;
 pub(crate) use contracts::{
     BufferedWriteExecutionInput, DeferredTransactionSideEffects, PreparedWriteRuntimeState,
     TrackedCommitExecutionOutcome, WriteExecutionBindings,
 };
-pub use contracts::TransactionCommitOutcome;
 #[cfg(test)]
 pub use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 pub(crate) use observe_tick::append_observe_tick_in_transaction;

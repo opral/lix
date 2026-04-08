@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingSemanticStorage, PendingView, SqlPreparationMetadataReader};
-use crate::schema::builtin::builtin_schema_definition;
+use crate::schema::builtin_schema_definition;
 use crate::schema::{schema_from_registered_snapshot, SchemaKey};
 use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};

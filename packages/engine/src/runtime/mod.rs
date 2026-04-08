@@ -128,7 +128,7 @@ impl Runtime {
     pub(crate) async fn load_public_surface_registry_from_backend(
         &self,
     ) -> Result<SurfaceRegistry, LixError> {
-        crate::schema::load_public_surface_registry_with_backend(self.backend().as_ref()).await
+        crate::surfaces::load_public_surface_registry_with_backend(self.backend().as_ref()).await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {

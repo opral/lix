@@ -127,8 +127,8 @@ pub(crate) fn builtin_internal_exact_relation_names() -> &'static [&'static str]
 
 pub(crate) fn builtin_internal_relation_families() -> &'static [InternalRelationFamily] {
     &[InternalRelationFamily {
-        owner: "live_state.storage.sql",
-        prefix: crate::live_state::storage::sql::TRACKED_LIVE_TABLE_PREFIX,
+        owner: "live_state",
+        prefix: crate::live_state::TRACKED_RELATION_PREFIX,
     }]
 }
 
@@ -157,8 +157,7 @@ fn is_internal_storage_relation_name(normalized_relation_name: &str) -> bool {
     builtin_internal_exact_relation_names()
         .iter()
         .any(|name| *name == normalized_relation_name)
-        || crate::live_state::storage::sql::live_schema_key_for_table_name(normalized_relation_name)
-            .is_some()
+        || crate::live_state::is_internal_relation_name(normalized_relation_name)
 }
 
 fn normalize_relation_name(relation_name: &str) -> String {
@@ -179,7 +178,7 @@ mod tests {
     use crate::contracts::surface::{
         entity_surface_descriptors, CatalogSource, DynamicEntitySurfaceSpec, SurfaceRegistry,
     };
-    use crate::live_state::schema_access::tracked_relation_name;
+    use crate::live_state::tracked_relation_name;
 
     use super::{
         builtin_internal_exact_relation_names, builtin_internal_relation_families,
@@ -268,10 +267,10 @@ mod tests {
     fn inventory_lists_internal_relation_families_explicitly() {
         let families = builtin_internal_relation_families();
         assert_eq!(families.len(), 1);
-        assert_eq!(families[0].owner, "live_state.storage.sql");
+        assert_eq!(families[0].owner, "live_state");
         assert_eq!(
             families[0].prefix,
-            crate::live_state::storage::sql::TRACKED_LIVE_TABLE_PREFIX
+            crate::live_state::TRACKED_RELATION_PREFIX
         );
     }
 

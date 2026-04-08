@@ -1,5 +1,4 @@
 use super::*;
-use crate::SqlDialect;
 use crate::contracts::artifacts::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryVersionScope, PendingViewReadQuery, PendingViewReadStorage,
@@ -8,40 +7,39 @@ use crate::contracts::artifacts::{
     StateHistoryVersionScope,
 };
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
-use crate::sql::binder::{RuntimeBindingValues, bind_public_read_statement};
+use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::explain::{
-    ExplainStage, ExplainTimingCollector, PublicReadExplainBuildInput,
-    PublicReadExplainCompiledArtifacts, build_public_read_explain_artifacts,
-    unwrap_explain_statement,
+    build_public_read_explain_artifacts, unwrap_explain_statement, ExplainStage,
+    ExplainTimingCollector, PublicReadExplainBuildInput, PublicReadExplainCompiledArtifacts,
 };
 use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::logical_plan::{
-    DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
-    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
-    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
-    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate, FileHistoryDirectReadPlan,
-    FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey, LogicalPlan,
-    PublicReadLogicalPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    verify_logical_plan, DirectDirectoryHistoryField, DirectEntityHistoryField,
+    DirectFileHistoryField, DirectPublicReadPlan, DirectStateHistoryField,
+    DirectoryHistoryAggregate, DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate,
+    DirectoryHistoryProjection, DirectoryHistorySortKey, EntityHistoryDirectReadPlan,
+    EntityHistoryPredicate, EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate,
+    FileHistoryDirectReadPlan, FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey,
+    LogicalPlan, PublicReadLogicalPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
     StateHistoryDirectReadPlan, StateHistoryPredicate, StateHistoryProjection,
-    StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue, verify_logical_plan,
+    StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue,
 };
-use crate::sql::parser::placeholders::{PlaceholderState, resolve_placeholder_index};
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::physical_plan::lowerer::lower_broad_public_read_for_execution_with_layouts;
 use crate::sql::physical_plan::{
+    compile_public_rowset_query, select_specialized_public_read_artifact,
     CompilerOwnedPublicReadExecutionSelection, LoweredReadProgram, LoweredResultColumn,
     LoweredResultColumns, PreparedPublicReadExecution, SpecializedPublicReadArtifactSelection,
-    compile_public_rowset_query, select_specialized_public_read_artifact,
 };
 use crate::sql::prepare::public_surface::routing::{
     route_broad_public_read_statement_with_known_live_layouts, route_public_read_execution_strategy,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_bound_public_surface_bindings;
 use crate::sql::semantic_ir::{
-    PublicReadSemantics, StructuredPublicReadPreparation,
     augment_dependency_spec_for_broad_public_read, prepare_structured_public_read_analysis,
-    unknown_public_state_schema_error,
+    unknown_public_state_schema_error, PublicReadSemantics, StructuredPublicReadPreparation,
 };
+use crate::SqlDialect;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value as SqlValue,
@@ -3564,7 +3562,7 @@ pub(super) async fn try_prepare_public_read(
     active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
-    let registry = crate::schema::load_public_surface_registry_with_backend(backend)
+    let registry = crate::surfaces::load_public_surface_registry_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata =

@@ -21,12 +21,12 @@ use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::untracked::{
     UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
-use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-use crate::schema::builtin::types::LixVersionRef;
+use crate::schema::LixVersionRef;
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, ReplayCursor,
     TransactionMode,
@@ -52,7 +52,7 @@ fn version_ref_plugin_key() -> String {
 
 fn version_ref_storage_version_id() -> String {
     match version_ref_storage_metadata().storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::schema::builtin::GLOBAL_VERSION_ID.to_string(),
+        BuiltinSchemaStorageLane::Global => crate::version_state::GLOBAL_VERSION_ID.to_string(),
         BuiltinSchemaStorageLane::Local => {
             panic!("lix_version_ref must use the global storage lane")
         }
@@ -67,7 +67,7 @@ fn version_ref_snapshot_content(version_id: &str, commit_id: &str) -> String {
     .expect("lix_version_ref snapshot serialization must succeed")
 }
 
-fn version_ref_storage_metadata() -> crate::schema::builtin::storage::BuiltinSchemaStorageMetadata {
+fn version_ref_storage_metadata() -> crate::live_state::BuiltinSchemaStorageMetadata {
     builtin_schema_storage_metadata("lix_version_ref")
         .expect("lix_version_ref builtin storage metadata should exist")
 }

@@ -20,7 +20,6 @@ use crate::execution::write::filesystem::runtime::{
 use crate::execution::write::transaction::TransactionExecutionBackend;
 use crate::execution::write::{TrackedCommitExecutionOutcome, WriteExecutionBindings};
 use crate::projections::ProjectionRegistry;
-use crate::schema::builtin::types::LixActiveVersion;
 use crate::session::collaborators::SessionCollaborators;
 use crate::session::read_execution_bindings::ProjectionRegistryReadExecutionBindings;
 use crate::session::version_ops::commit::{
@@ -30,6 +29,7 @@ use crate::session::version_ops::commit::{
     CreateCommitPreconditions, CreateCommitWriteLane, ProposedDomainChange,
 };
 use crate::session::write_validation::validate_commit_time_write;
+use crate::version_state::parse_active_version_snapshot;
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
@@ -173,7 +173,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.execution_mode() {
         crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
-            crate::live_state::pending_reads::execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+            crate::live_state::execute_prepared_public_read_in_transaction(
                 transaction,
                 pending_view,
                 public_read,
@@ -528,19 +528,4 @@ fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
     }
 
     Ok(None)
-}
-
-fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
-    let parsed: LixActiveVersion =
-        serde_json::from_str(snapshot_content).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("active version snapshot_content invalid JSON: {error}"),
-        })?;
-    if parsed.version_id.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "active version must not be empty",
-        ));
-    }
-    Ok(parsed.version_id)
 }
