@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::execution_effects::ExecutionRuntimeEffects;
+use crate::contracts::execution_effects::ExecutionRuntimeEffects;
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,

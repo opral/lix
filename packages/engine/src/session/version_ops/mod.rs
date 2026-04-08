@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 
+pub(crate) mod commit;
 pub(crate) mod committed_state;
 pub(crate) mod context;
 mod bootstrap;

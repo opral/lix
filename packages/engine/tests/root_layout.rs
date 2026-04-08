@@ -14,27 +14,20 @@ fn root_rs_whitelist_matches_phase_a_layout_contract() {
         })
         .collect::<BTreeSet<_>>();
 
-    // Phase A keeps only root entrypoints/test helpers plus files explicitly
+    // Phase C keeps only root entrypoints/test helpers plus files explicitly
     // deferred to later ownership cuts.
     let allowed = BTreeSet::from([
         "api.rs".to_string(),
         "boot.rs".to_string(),
         "engine.rs".to_string(),
-        "execution_effects.rs".to_string(),
-        "execution_runtime.rs".to_string(),
         "filesystem_materialization.rs".to_string(),
         "filesystem_payload_sql.rs".to_string(),
         "filesystem_projection_sql.rs".to_string(),
         "lib.rs".to_string(),
         "lix.rs".to_string(),
-        "prepared_write_artifacts.rs".to_string(),
         "public_surface_source_sql.rs".to_string(),
-        "read_pipeline.rs".to_string(),
-        "state_selector_rows.rs".to_string(),
         "test_support.rs".to_string(),
-        "transaction_execution.rs".to_string(),
         "transaction_mode.rs".to_string(),
-        "write_pipeline.rs".to_string(),
     ]);
 
     let unexpected = actual.difference(&allowed).cloned().collect::<Vec<_>>();

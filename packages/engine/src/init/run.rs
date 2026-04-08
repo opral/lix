@@ -16,7 +16,7 @@ use crate::session::observe;
 use crate::session::workspace;
 use crate::session::version_ops;
 use crate::version_state;
-use crate::write_runtime::commit;
+use crate::session::version_ops::commit;
 use crate::{LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;

@@ -9,7 +9,7 @@ use crate::live_state::tracked::{
     TrackedWriteRow,
 };
 use crate::session::workspace::init as init_workspace;
-use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };

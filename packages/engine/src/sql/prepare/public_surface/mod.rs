@@ -1699,8 +1699,7 @@ mod tests {
     };
     use crate::contracts::surface::SurfaceReadFreshness;
     use crate::live_state::{self, mark_mode_with_backend};
-    use crate::projections::builtin_projection_registry;
-    use crate::read_runtime::execute_prepared_public_read_artifact_with_backend;
+    use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
     use crate::schema::builtin::types::LixCommit;
     use crate::sql::prepare::prepare_public_read_artifact;
     use crate::sql::routing::delay_broad_routing_for_test;
@@ -1714,7 +1713,10 @@ mod tests {
         logical_plan::{DependencyPrecision, DirectPublicReadPlan},
         semantic_ir::ExecutionContext,
     };
-    use crate::test_support::{seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend};
+    use crate::test_support::{
+        seed_canonical_change_row, BuiltinReadExecutionBindings, CanonicalChangeSeed,
+        TestSqliteBackend,
+    };
     use crate::version_state::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
@@ -2099,7 +2101,7 @@ mod tests {
                         .expect("descriptor-only lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
-                        builtin_projection_registry(),
+                        &BuiltinReadExecutionBindings,
                         &artifact,
                     )
                     .await
@@ -2171,7 +2173,7 @@ mod tests {
                         .expect("descriptor+ref lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
-                        builtin_projection_registry(),
+                        &BuiltinReadExecutionBindings,
                         &artifact,
                     )
                     .await
@@ -2258,7 +2260,7 @@ mod tests {
                         .expect("multi-version lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
-                        builtin_projection_registry(),
+                        &BuiltinReadExecutionBindings,
                         &artifact,
                     )
                     .await

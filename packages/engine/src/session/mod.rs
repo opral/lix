@@ -10,10 +10,17 @@ pub(crate) mod checkpoint_ops;
 pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod plugin;
+pub(crate) mod read_execution_bindings;
+pub(crate) mod read_preparation;
 mod selector_reads;
+pub(crate) mod state_selector;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
 pub(crate) mod write_preparation;
+pub(crate) mod write_pipeline;
+pub(crate) mod write_resolution;
+pub(crate) mod write_validation;
+pub(crate) mod write_execution_bindings;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -28,14 +35,22 @@ use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
 use crate::common::errors;
-use crate::execution_runtime::ExecutionRuntimeState;
+use crate::execution::read::execute_prepared_read_program_in_committed_read_transaction;
+use crate::execution::write::{
+    prepare_registered_schema_write_step, stage_prepared_write_step, SemanticWriteContext,
+    TransactionCommitOutcome,
+};
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::image::ImageChunkWriter;
-use crate::read_runtime::execute_prepared_read_program_in_committed_read_transaction;
 use crate::session::collaborators::SessionCollaborators;
+use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
+use crate::session::write_pipeline::{
+    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
+};
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
@@ -53,10 +68,6 @@ use crate::sql::prepare::{
     CommittedReadProgramContext, ExecutionProgram,
 };
 use crate::sql::support::{reject_internal_table_writes, reject_public_create_table};
-use crate::write_pipeline::{
-    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
-};
-use crate::write_runtime::{TransactionCommitOutcome, WriteTransaction};
 use crate::{ExecuteResult, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -96,7 +107,7 @@ pub struct Session {
 pub struct SessionTransaction<'a> {
     collaborators: &'a SessionCollaborators,
     session: &'a Session,
-    pub(crate) write_transaction: Option<WriteTransaction<'a>>,
+    pub(crate) write_transaction: Option<BufferedWriteTransaction<'a>>,
     pub(crate) context: ExecutionContext,
 }
 
@@ -440,7 +451,7 @@ impl Session {
                     .await?;
                 let result = execute_prepared_read_program_in_committed_read_transaction(
                     transaction.as_mut(),
-                    self.collaborators.projection_registry(),
+                    self.collaborators.as_ref(),
                     &prepared_committed_read,
                 )
                 .await;
@@ -482,7 +493,7 @@ impl Session {
                         .await?;
                     let result = execute_prepared_read_program_in_committed_read_transaction(
                         transaction.as_mut(),
-                        self.collaborators.projection_registry(),
+                        self.collaborators.as_ref(),
                         &prepared_committed_read,
                     )
                     .await;
@@ -504,7 +515,7 @@ impl Session {
                         .begin_read_unit(crate::TransactionMode::Write)
                         .await?;
                     let mut runtime_functions = runtime_state.provider().clone();
-                    crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+                    crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
                         transaction.as_mut(),
                         &mut runtime_functions,
                     )
@@ -526,13 +537,13 @@ impl Session {
                     };
                     let result = execute_prepared_read_program_in_committed_read_transaction(
                         transaction.as_mut(),
-                        self.collaborators.projection_registry(),
+                        self.collaborators.as_ref(),
                         &prepared_committed_read,
                     )
                     .await;
                     match result {
                         Ok(result) => {
-                            crate::write_runtime::persist_runtime_sequence_in_transaction(
+                            crate::runtime::deterministic_mode::persist_runtime_sequence_in_transaction(
                                 transaction.as_mut(),
                                 runtime_state.provider(),
                             )
@@ -551,7 +562,7 @@ impl Session {
             }
             SessionExecutionMode::WriteTransaction => {
                 let transaction = self.collaborators.begin_write_unit().await?;
-                let mut write_transaction = WriteTransaction::new_buffered_write(transaction);
+                let mut write_transaction = BufferedWriteTransaction::new(transaction);
 
                 let result = execute_execution_program_with_write_transaction(
                     self.collaborators.as_ref(),
@@ -566,7 +577,10 @@ impl Session {
                     Ok(result) => {
                         context.clear_execution_runtime_state();
                         let outcome = write_transaction
-                            .commit_buffered_write(context.buffered_write_execution_input())
+                            .commit_buffered_write(
+                                self.collaborators.as_ref(),
+                                context.buffered_write_execution_input(),
+                            )
                             .await?;
                         self.apply_transaction_commit_outcome(outcome).await?;
                         Ok(result)
@@ -590,7 +604,7 @@ impl Session {
         Ok(SessionTransaction {
             collaborators: self.collaborators.as_ref(),
             session: self,
-            write_transaction: Some(WriteTransaction::new_buffered_write(transaction)),
+            write_transaction: Some(BufferedWriteTransaction::new(transaction)),
             context: self.new_execution_context(options),
         })
     }
@@ -823,7 +837,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_canonical_commit_receipt(
         &mut self,
-        receipt: crate::write_runtime::commit::CanonicalCommitReceipt,
+        receipt: crate::session::version_ops::commit::CanonicalCommitReceipt,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()
@@ -843,7 +857,7 @@ impl<'a> SessionTransaction<'a> {
             &mut self.context,
         )
         .await?;
-        let semantic_context = crate::write_runtime::SemanticWriteContext::new(
+        let semantic_context = SemanticWriteContext::new(
             prepared_write_runtime_state_for_execution(
                 self.context
                     .execution_runtime_state()
@@ -853,13 +867,12 @@ impl<'a> SessionTransaction<'a> {
             self.context.active_account_ids.clone(),
             self.context.options.writer_key.clone(),
         );
-        let step =
-            crate::write_runtime::prepare_registered_schema_write_step(schema, &semantic_context)?;
+        let step = prepare_registered_schema_write_step(schema, &semantic_context)?;
         let write_transaction = self
             .write_transaction
             .as_mut()
             .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
-        crate::write_runtime::stage_prepared_write_step(write_transaction, step)?;
+        stage_prepared_write_step(write_transaction, step)?;
         Ok(())
     }
 
@@ -920,7 +933,10 @@ impl<'a> SessionTransaction<'a> {
             description: "transaction is no longer active".to_string(),
         })?;
         let outcome = write_transaction
-            .commit_buffered_write(self.context.buffered_write_execution_input())
+            .commit_buffered_write(
+                self.session.collaborators.as_ref(),
+                self.context.buffered_write_execution_input(),
+            )
             .await?;
         self.session.apply_transaction_commit_outcome(outcome).await
     }
@@ -941,7 +957,9 @@ impl<'a> SessionTransaction<'a> {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn write_transaction_mut(&mut self) -> Result<&mut WriteTransaction<'a>, LixError> {
+    pub(crate) fn write_transaction_mut(
+        &mut self,
+    ) -> Result<&mut BufferedWriteTransaction<'a>, LixError> {
         match self.write_transaction.as_mut() {
             Some(transaction) => Ok(transaction),
             None => Err(LixError::unknown("transaction is no longer active")),
@@ -1217,7 +1235,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1237,7 +1255,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1269,7 +1287,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1367,7 +1385,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1395,7 +1413,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let engine = test_engine(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine),
+                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );

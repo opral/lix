@@ -11,8 +11,8 @@ use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::logical_plan::public_ir::{PlannedWrite, ResolvedWritePlan};
-use crate::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use crate::write_runtime::{resolve_write_plan_with_functions, WriteResolveError};
+use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::{
     boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
@@ -244,6 +244,33 @@ pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Engine>
     Ok((backend, engine, session))
 }
 
+#[cfg(test)]
+pub(crate) struct BuiltinReadExecutionBindings;
+
+#[cfg(test)]
+#[async_trait(?Send)]
+impl crate::execution::read::ReadExecutionBindings for BuiltinReadExecutionBindings {
+    async fn derive_read_time_projection_rows(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<Vec<crate::execution::read::ReadTimeProjectionRow>, LixError> {
+        Ok(
+            crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend(
+                backend,
+                crate::projections::builtin_projection_registry(),
+            )
+            .await?
+            .into_iter()
+            .map(|row| crate::execution::read::ReadTimeProjectionRow {
+                surface_name: row.surface_name,
+                identity: row.identity,
+                values: row.values,
+            })
+            .collect(),
+        )
+    }
+}
+
 pub(crate) async fn resolve_write_plan_for_test(
     backend: &dyn LixBackend,
     projection_registry: &ProjectionRegistry,
@@ -270,7 +297,7 @@ pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(
     crate::live_state::init(backend).await?;
     crate::schema::init(backend).await?;
     crate::canonical::init(backend).await?;
-    crate::write_runtime::commit::init(backend).await?;
+    crate::session::version_ops::commit::init(backend).await?;
     crate::session::version_ops::init(backend).await?;
     Ok(())
 }

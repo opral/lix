@@ -58,7 +58,7 @@ impl Engine {
         let plan = crate::live_state::rebuild_plan(self.backend().as_ref(), req).await?;
         let apply = crate::live_state::apply_rebuild_plan(self.backend().as_ref(), &plan).await?;
 
-        if let Err(error) = crate::filesystem_materialization::materialize_file_data_with_plugins(
+        if let Err(error) = crate::live_state::materialize::filesystem_materialization::materialize_file_data_with_plugins(
             self.backend().as_ref(),
             self.runtime().as_ref(),
             &plan,

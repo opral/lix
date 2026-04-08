@@ -23,33 +23,32 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &[
             "backend",
             "canonical",
+            "execution",
             "engine",
             "live_state",
             "projections",
-            "read_runtime",
             "runtime",
             "session",
             "sql",
             "version_state",
-            "write_runtime",
         ],
     },
     ForbiddenDependencyRule {
         from_scope: "runtime",
         reason: "runtime is a sidecar and must not reacquire semantic owners or the live-state engine",
         forbidden_scopes: &[
+            "execution",
             "engine",
             "live_state",
             "session",
             "sql",
             "version_state",
-            "write_runtime",
         ],
     },
     ForbiddenDependencyRule {
         from_scope: "live_state",
         reason: "live_state is the generic projection engine and must not reacquire runtime sidecars or write orchestration owners",
-        forbidden_scopes: &["runtime", "version_state", "write_runtime"],
+        forbidden_scopes: &["execution", "runtime", "version_state"],
     },
     ForbiddenDependencyRule {
         from_scope: "projections",
@@ -63,37 +62,21 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "backend",
             "binary_cas",
             "canonical",
+            "execution",
             "live_state",
             "projections",
-            "read_runtime",
             "runtime",
             "session",
             "version_state",
-            "write_runtime",
         ],
     },
     ForbiddenDependencyRule {
-        from_scope: "read_runtime",
-        reason: "read_runtime should consume contracts and live_state, not compiler internals, session orchestration, or dissolved domain owners",
+        from_scope: "execution",
+        reason: "execution should consume contracts, live_state, and backend; compiler access must come through prepared artifacts rather than direct owner imports",
         forbidden_scopes: &[
             "canonical",
-            "runtime",
-            "session",
-            "sql",
-            "version_state",
-            "write_runtime",
-        ],
-    },
-    ForbiddenDependencyRule {
-        from_scope: "write_runtime",
-        reason: "write_runtime should consume contracts, live_state, and canonical; compiler access must come through artifacts rather than direct owner imports",
-        forbidden_scopes: &[
-            "backend",
-            "binary_cas",
             "engine",
             "init",
-            "schema",
-            "read_runtime",
             "runtime",
             "session",
             "sql",
@@ -111,14 +94,13 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "backend",
     "canonical",
     "contracts",
+    "execution",
     "live_state",
     "projections",
-    "read_runtime",
     "runtime",
     "session",
     "sql",
     "version_state",
-    "write_runtime",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1259,17 +1241,14 @@ fn analyzer_resolves_explicit_super_dependencies_to_the_top_level_scope() {
     );
 
     let deeper_module_path = vec![
-        "write_runtime".to_string(),
+        "execution".to_string(),
+        "write".to_string(),
         "sql_adapter".to_string(),
-        "execute".to_string(),
+        "runtime".to_string(),
     ];
     assert_eq!(
-        resolve_explicit_dependency(
-            &["super".to_string(), "super".to_string()],
-            "runtime",
-            &deeper_module_path,
-        ),
-        Some("write_runtime".to_string()),
+        resolve_explicit_dependency(&["super".to_string(), "super".to_string()], "buffered", &deeper_module_path),
+        Some("execution".to_string()),
     );
 }
 
@@ -1400,17 +1379,17 @@ fn architecture_rules_list_current_failures() {
 }
 
 #[test]
-fn write_runtime_forbidden_rule_covers_closed_handoff_edges() {
+fn execution_forbidden_rule_covers_closed_handoff_edges() {
     let forbidden_lookup = forbidden_dependency_lookup();
     let rule = forbidden_lookup
-        .get("write_runtime")
-        .expect("write_runtime should have an explicit forbidden dependency rule");
+        .get("execution")
+        .expect("execution should have an explicit forbidden dependency rule");
     let forbidden_scopes: BTreeSet<&str> = rule.forbidden_scopes.iter().copied().collect();
 
-    for forbidden_scope in ["session", "sql", "read_runtime", "engine"] {
+    for forbidden_scope in ["session", "sql", "runtime", "engine"] {
         assert!(
             forbidden_scopes.contains(forbidden_scope),
-            "write_runtime forbidden dependency rule should explicitly forbid `{forbidden_scope}`",
+            "execution forbidden dependency rule should explicitly forbid `{forbidden_scope}`",
         );
     }
 }
@@ -1455,7 +1434,7 @@ fn target_core_graph_lists_current_cycles() {
 
 #[test]
 fn phase_c_committed_read_handoff_stays_above_read_runtime() {
-    let read_runtime_prepare = src_root().join("read_runtime/prepare.rs");
+    let read_runtime_prepare = src_root().join("execution/read/prepare.rs");
     assert!(
         !read_runtime_prepare.exists(),
         "Phase C regression: read_runtime-owned preparation file returned at {}",
@@ -1481,8 +1460,8 @@ fn phase_c_committed_read_handoff_stays_above_read_runtime() {
         "Phase C regression: session should not construct backend adapters for committed-read preparation"
     );
 
-    let read_runtime_source = fs::read_to_string(src_root().join("read_runtime/mod.rs"))
-        .expect("read_runtime/mod.rs should be readable");
+    let read_runtime_source = fs::read_to_string(src_root().join("execution/read/mod.rs"))
+        .expect("execution/read/mod.rs should be readable");
     assert!(
         !read_runtime_source.contains("parse_sql_statements("),
         "Phase C regression: read_runtime should not parse SQL during execution"
@@ -1552,27 +1531,51 @@ fn phase_f_session_write_preparation_stays_as_orchestration_only() {
     );
 
     let write_preparation_source = read_engine_source("session/write_preparation.rs");
-    let write_pipeline_source = read_engine_source("write_pipeline.rs");
+    let write_pipeline_source = read_engine_source("session/write_pipeline.rs");
+
+    assert!(
+        !src_root().join("session/write_execution").exists(),
+        "Phase F regression: session/write_execution/ should stay removed once write execution is execution-owned"
+    );
 
     for forbidden in [
         "load_sql_compiler_metadata_with_reader(",
         "compile_execution_from_template_instance_with_context(",
         "PreparedWriteExecutionStep::build(",
+        "run_public_tracked_append_txn_with_transaction(",
+        "run_public_untracked_write_txn_with_transaction(",
+        "run_internal_write_txn_with_transaction(",
+        "execute_planned_write_delta(",
     ] {
         assert!(
             !write_preparation_source.contains(forbidden),
-            "Phase F regression: session/write_preparation.rs should not reacquire lower-level write preparation via `{forbidden}`"
+            "Phase F regression: session/write_preparation.rs should not reacquire lower-level write preparation or write apply via `{forbidden}`"
+        );
+    }
+
+    for forbidden in [
+        "run_public_tracked_append_txn_with_transaction(",
+        "run_public_untracked_write_txn_with_transaction(",
+        "run_internal_write_txn_with_transaction(",
+        "execute_planned_write_delta(",
+    ] {
+        assert!(
+            !write_pipeline_source.contains(forbidden),
+            "Phase F regression: session/write_pipeline.rs should not reacquire execution-owned write apply via `{forbidden}`"
         );
     }
 
     for required in [
+        "PreparedWritePreparationContext",
+        "PreparedWriteContextStamp",
         "load_sql_compiler_metadata_with_reader(",
         "compile_execution_from_template_instance_with_context(",
+        "PreparedWriteExecutionBoundary",
         "PreparedWriteExecutionStep::build(",
     ] {
         assert!(
             write_pipeline_source.contains(required),
-            "Phase F regression: write_pipeline.rs should own write preparation step `{required}`"
+            "Phase F regression: session/write_pipeline.rs should own write preparation step `{required}`"
         );
     }
 
@@ -1580,6 +1583,7 @@ fn phase_f_session_write_preparation_stays_as_orchestration_only() {
         "session/write_preparation.rs",
         &write_preparation_source,
         &[
+            "bootstrap_prepared_write_preparation_context(",
             "prepare_buffered_write_execution_step(",
             "execute_prepared_write_execution_step_with_transaction(",
         ],
@@ -1589,10 +1593,15 @@ fn phase_f_session_write_preparation_stays_as_orchestration_only() {
 #[test]
 fn phase_f_session_selector_reads_stays_as_orchestration_only() {
     let selector_reads_source = read_engine_source("session/selector_reads.rs");
-    let read_pipeline_source = read_engine_source("read_pipeline.rs");
+    let read_preparation_source = read_engine_source("session/read_preparation.rs");
+
+    assert!(
+        !src_root().join("session/read_execution.rs").exists(),
+        "Phase F regression: session/read_execution.rs should stay removed once committed read execution lives under execution/read/"
+    );
 
     for forbidden in [
-        "bootstrap_public_surface_registry_with_pending_view(",
+        "bootstrap_public_surface_registry_with_pending_transaction_view(",
         "load_sql_compiler_metadata(",
         "load_active_history_root_commit_id_for_preparation(",
         "try_prepare_public_read_with_registry_and_internal_access(",
@@ -1605,15 +1614,15 @@ fn phase_f_session_selector_reads_stays_as_orchestration_only() {
     }
 
     for required in [
-        "bootstrap_public_surface_registry_with_pending_view(",
+        "bootstrap_public_surface_registry_with_pending_transaction_view(",
         "load_sql_compiler_metadata(",
         "load_active_history_root_commit_id_for_preparation(",
         "try_prepare_public_read_with_registry_and_internal_access(",
         "prepare_public_read_artifact(",
     ] {
         assert!(
-            read_pipeline_source.contains(required),
-            "Phase F regression: read_pipeline.rs should own selector-read preparation step `{required}`"
+            read_preparation_source.contains(required),
+            "Phase F regression: session/read_preparation.rs should own selector-read preparation step `{required}`"
         );
     }
 
@@ -1724,7 +1733,7 @@ fn phase_g_sql_uses_neutral_dialect_seam_instead_of_backend_owner() {
 
 #[test]
 fn plan41_phase_d_keeps_relation_policy_out_of_session_sql_read_and_write_layers() {
-    for module in ["session", "sql", "read_runtime", "write_runtime"] {
+    for module in ["execution", "session", "sql"] {
         for absolute_path in rust_files_for_top_level_module(module) {
             let relative = absolute_path
                 .strip_prefix(src_root())
@@ -1760,9 +1769,10 @@ fn prepared_write_execution_seam_stays_closed_over_runtime_inputs() {
     );
 
     for relative in [
-        "write_runtime/sql_adapter/runtime.rs",
-        "write_runtime/sql_adapter/planned_write.rs",
-        "write_runtime/sql_adapter/mod.rs",
+        "execution/write/sql_adapter/runtime.rs",
+        "execution/write/buffered/planned_write.rs",
+        "execution/write/sql_adapter/mod.rs",
+        "execution/write/sql_adapter/planned_write_runner.rs",
     ] {
         let source = read_engine_source(relative);
         for forbidden in [
@@ -1785,7 +1795,7 @@ fn prepared_write_execution_seam_stays_closed_over_runtime_inputs() {
         }
     }
 
-    let runtime_source = read_engine_source("write_runtime/sql_adapter/runtime.rs");
+    let runtime_source = read_engine_source("execution/write/sql_adapter/runtime.rs");
     for required in [
         "PreparedWriteStep",
         "PreparedWriteExecutionStep",
@@ -1793,19 +1803,20 @@ fn prepared_write_execution_seam_stays_closed_over_runtime_inputs() {
     ] {
         assert!(
             runtime_source.contains(required),
-            "write_runtime/sql_adapter/runtime.rs should execute from prepared seam item `{required}`"
+            "execution/write/sql_adapter/runtime.rs should execute from prepared seam item `{required}`"
         );
     }
 
-    let planned_write_source = read_engine_source("write_runtime/sql_adapter/planned_write.rs");
+    let planned_write_source = read_engine_source("execution/write/buffered/planned_write.rs");
     for required in [
         "PreparedWriteStep",
         "PreparedPublicWriteArtifact",
         "PreparedInternalWriteArtifact",
+        "PreparedWriteRuntimeState",
     ] {
         assert!(
             planned_write_source.contains(required),
-            "write_runtime/sql_adapter/planned_write.rs should plan from prepared artifact `{required}`"
+            "execution/write/buffered/planned_write.rs should plan from prepared artifact `{required}`"
         );
     }
 }
@@ -1818,16 +1829,16 @@ fn pending_transaction_view_is_write_runtime_owned() {
         "executor compile ownership should not define PendingTransactionView once write_runtime owns pending visibility"
     );
 
-    let overlay_mod_source = read_engine_source("write_runtime/overlay/mod.rs");
+    let overlay_mod_source = read_engine_source("execution/write/overlay/mod.rs");
     assert!(
         overlay_mod_source.contains("mod pending_view;"),
-        "write_runtime/overlay/mod.rs should compile the pending_view module"
+        "execution/write/overlay/mod.rs should compile the pending_view module"
     );
 
-    let pending_view_source = read_engine_source("write_runtime/overlay/pending_view.rs");
+    let pending_view_source = read_engine_source("execution/write/overlay/pending_view.rs");
     assert!(
         pending_view_source.contains("struct PendingTransactionView"),
-        "write_runtime/overlay/pending_view.rs should own PendingTransactionView"
+        "execution/write/overlay/pending_view.rs should own PendingTransactionView"
     );
 }
 
@@ -1835,8 +1846,8 @@ fn pending_transaction_view_is_write_runtime_owned() {
 fn plugin_install_path_uses_write_runtime_owned_write_entrypoints() {
     let init_source = read_engine_source("init/seed.rs");
     assert!(
-        init_source.contains("BorrowedWriteTransaction"),
-        "init/seed.rs should route its borrowed backend transaction through the write-runtime wrapper"
+        init_source.contains("BorrowedBufferedWriteTransaction"),
+        "init/seed.rs should route its borrowed backend transaction through the buffered write-runtime wrapper"
     );
     assert!(
         init_source.contains("execute_parsed_statements_in_borrowed_write_transaction"),
@@ -1845,8 +1856,12 @@ fn plugin_install_path_uses_write_runtime_owned_write_entrypoints() {
 
     let plugin_session_source = read_engine_source("session/plugin.rs");
     assert!(
-        plugin_session_source.contains("WriteTransaction::new_buffered_write("),
+        plugin_session_source.contains("BufferedWriteTransaction::new("),
         "session/plugin.rs should use the write-runtime-owned buffered write lifecycle"
+    );
+    assert!(
+        plugin_session_source.contains("commit_buffered_write("),
+        "session/plugin.rs should finish plugin installation through the buffered write-runtime commit seam"
     );
     assert!(
         plugin_session_source.contains("install_plugin_archive_with_writer")
@@ -1854,10 +1869,10 @@ fn plugin_install_path_uses_write_runtime_owned_write_entrypoints() {
         "session/plugin.rs should adapt plugin installation through the write-runtime plugin writer seam"
     );
 
-    let plugin_source = read_engine_source("write_runtime/plugin_install.rs");
+    let plugin_source = read_engine_source("execution/write/plugin_install.rs");
     assert!(
         plugin_source.contains("trait PluginInstallWriteExecutor"),
-        "write_runtime/plugin_install.rs should define a narrow write executor seam"
+        "execution/write/plugin_install.rs should define a narrow write executor seam"
     );
     for forbidden in [
         "execute_with_options_in_write_transaction",
@@ -1866,14 +1881,14 @@ fn plugin_install_path_uses_write_runtime_owned_write_entrypoints() {
     ] {
         assert!(
             !plugin_source.contains(forbidden),
-            "write_runtime/plugin_install.rs should stay free of session-owned write execution through `{forbidden}`"
+            "execution/write/plugin_install.rs should stay free of session-owned write execution through `{forbidden}`"
         );
     }
 }
 
 #[test]
 fn planned_write_runner_and_filesystem_resolution_stay_split_by_owner() {
-    let runner_source = read_engine_source("write_runtime/sql_adapter/planned_write_runner.rs");
+    let runner_source = read_engine_source("execution/write/sql_adapter/planned_write_runner.rs");
     assert!(
         runner_source.contains("run_public_tracked_append_txn_with_transaction("),
         "planned_write_runner.rs should delegate tracked append apply"
@@ -1894,31 +1909,30 @@ fn planned_write_runner_and_filesystem_resolution_stay_split_by_owner() {
         );
     }
 
-    let resolve_source = read_engine_source("write_runtime/resolve_write_plan.rs");
+    let resolve_source = read_engine_source("session/write_resolution/mod.rs");
     assert!(
         resolve_source.contains("mod filesystem_writes;"),
-        "resolve_write_plan.rs should compile the filesystem_writes runtime owner"
+        "session/write_resolution/mod.rs should compile the filesystem_writes owner"
     );
     assert!(
         !resolve_source.contains("mod filesystem_insert_planning;"),
-        "resolve_write_plan.rs should not compile a sibling filesystem_insert_planning module"
+        "session/write_resolution/mod.rs should not compile a sibling filesystem_insert_planning module"
     );
 
-    let filesystem_source =
-        read_engine_source("write_runtime/resolve_write_plan/filesystem_writes.rs");
+    let filesystem_source = read_engine_source("session/write_resolution/filesystem_writes.rs");
     assert!(
         filesystem_source.contains("mod insert_planning;"),
-        "filesystem_writes.rs should compile its insert planning as an internal runtime submodule"
+        "session/write_resolution/filesystem_writes.rs should compile its insert planning as an internal owner submodule"
     );
     assert!(
         src_root()
-            .join("write_runtime/resolve_write_plan/filesystem_writes/insert_planning.rs")
+            .join("session/write_resolution/filesystem_writes/insert_planning.rs")
             .exists(),
         "insert planning should live under the filesystem_writes runtime owner area"
     );
     assert!(
         !src_root()
-            .join("write_runtime/resolve_write_plan/filesystem_insert_planning.rs")
+            .join("session/write_resolution/filesystem_insert_planning.rs")
             .exists(),
         "the standalone filesystem_insert_planning.rs owner split should stay removed"
     );

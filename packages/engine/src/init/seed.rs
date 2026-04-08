@@ -5,12 +5,12 @@ use crate::runtime::TransactionBackendAdapter;
 use crate::schema::builtin::storage::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
+use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parser::parse_sql;
 use crate::version_state::load_committed_version_head_commit_id;
 use crate::version_state::GLOBAL_VERSION_ID;
-use crate::write_runtime::BorrowedWriteTransaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
@@ -18,7 +18,7 @@ pub(crate) const LIX_ID_KEY: &str = "lix_id";
 
 pub(crate) struct InitExecutor<'engine, 'tx> {
     engine: &'engine Engine,
-    write_transaction: BorrowedWriteTransaction<'tx>,
+    write_transaction: BorrowedBufferedWriteTransaction<'tx>,
     context: ExecutionContext,
 }
 
@@ -29,7 +29,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<Self, LixError> {
         Ok(Self {
             engine,
-            write_transaction: BorrowedWriteTransaction::new(transaction),
+            write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
             context: ExecutionContext::new(
                 ExecuteOptions::default(),
                 engine.public_surface_registry(),
@@ -62,7 +62,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         let mut execution_input = self.context.buffered_write_execution_input();
         self.write_transaction
-            .flush_buffered_write_journal(&mut execution_input)
+            .flush_buffered_write_journal(self.engine, &mut execution_input)
             .await?;
         self.context
             .apply_buffered_write_execution_input(&execution_input);
@@ -93,7 +93,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
         let mut runtime_functions = runtime_state.provider().clone();
-        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+        crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
@@ -104,7 +104,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
         let mut runtime_functions = runtime_state.provider().clone();
-        crate::write_runtime::ensure_runtime_sequence_initialized_in_transaction(
+        crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
@@ -116,7 +116,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let Some(runtime_state) = self.context.execution_runtime_state().cloned() else {
             return Ok(());
         };
-        crate::write_runtime::persist_runtime_sequence_in_transaction(
+        crate::runtime::deterministic_mode::persist_runtime_sequence_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             runtime_state.provider(),
         )

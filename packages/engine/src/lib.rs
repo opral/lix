@@ -6,32 +6,21 @@ mod common;
 pub(crate) mod canonical;
 pub(crate) mod contracts;
 mod engine;
-pub(crate) mod execution_effects;
-mod execution_runtime;
-mod filesystem_materialization;
+pub(crate) mod execution;
 mod filesystem_payload_sql;
 mod filesystem_projection_sql;
 mod init;
 pub mod live_state;
 mod lix;
-mod prepared_write_artifacts;
 pub(crate) mod projections;
 mod public_surface_source_sql;
-mod read_pipeline;
-pub(crate) mod read_runtime;
 mod runtime;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
-mod state_selector_rows;
 #[cfg(test)]
 mod test_support;
-pub mod transaction;
-mod transaction_execution;
-mod transaction_mode;
 pub(crate) mod version_state;
-mod write_pipeline;
-pub(crate) mod write_runtime;
 
 pub mod image {
     pub use crate::backend::{ImageChunkReader, ImageChunkWriter};
@@ -90,7 +79,7 @@ pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuar
 #[doc(hidden)]
 pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
 pub use sql::common::dialect::SqlDialect;
-pub use transaction_mode::TransactionMode;
+pub use contracts::transaction_mode::TransactionMode;
 pub use session::version_ops::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult, RedoOptions, RedoResult, UndoOptions, UndoResult,
