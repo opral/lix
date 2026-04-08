@@ -8,6 +8,7 @@ use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::execution::write::filesystem::runtime::compile_filesystem_finalization_from_state_in_transaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
+use super::registered_schema_bootstrap::mirror_registered_schema_planned_rows_in_transaction;
 use super::runtime::SqlExecutionOutcome;
 use crate::execution::write::buffered::PlannedPublicUntrackedWriteUnit;
 use crate::execution::write::WriteExecutionBindings;
@@ -33,6 +34,12 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
         plan.writer_key.as_deref(),
     )?;
     transaction.apply_untracked_write_batch(&batch).await?;
+    mirror_registered_schema_planned_rows_in_transaction(
+        transaction,
+        &plan.execution.intended_post_state,
+        true,
+    )
+    .await?;
 
     let filesystem_finalization = compile_filesystem_finalization_from_state_in_transaction(
         transaction,

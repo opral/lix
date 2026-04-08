@@ -5,11 +5,16 @@ pub use crate::contracts::artifacts::{
     ScanRequest as TrackedScanRequest, TrackedRow, TrackedTombstoneMarker, TrackedWriteBatch,
     TrackedWriteOperation, TrackedWriteRow,
 };
-pub(crate) use crate::contracts::traits::{
-    TrackedReadView, TrackedTombstoneView, TrackedWriteParticipant,
-};
-use crate::{LixBackend, LixBackendTransaction, LixError};
+#[cfg(test)]
+pub(crate) use crate::contracts::traits::TrackedReadView;
+pub(crate) use crate::contracts::traits::TrackedWriteParticipant;
+#[cfg(test)]
+pub(crate) use crate::contracts::traits::TrackedTombstoneView;
+use crate::{LixBackendTransaction, LixError};
+#[cfg(test)]
+use crate::LixBackend;
 
+#[cfg(test)]
 #[async_trait(?Send)]
 impl<T> TrackedReadView for T
 where
@@ -23,12 +28,14 @@ where
         super::read::load_exact_rows_with_executor(&mut executor, request).await
     }
 
+    #[cfg(test)]
     async fn scan_rows(&self, request: &TrackedScanRequest) -> Result<Vec<TrackedRow>, LixError> {
         let mut executor = self;
         super::read::scan_rows_with_executor(&mut executor, request).await
     }
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 impl<T> TrackedTombstoneView for T
 where

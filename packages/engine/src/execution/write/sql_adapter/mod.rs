@@ -1,6 +1,7 @@
 mod effects;
 mod internal_apply;
 mod planned_write_runner;
+mod registered_schema_bootstrap;
 mod runtime;
 mod tracked_apply;
 mod untracked_apply;

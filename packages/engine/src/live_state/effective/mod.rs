@@ -1,5 +1,6 @@
 //! Overlay precedence resolution over tracked and untracked live state.
 
+#[cfg(test)]
 mod resolve;
 
 pub use crate::contracts::artifacts::{

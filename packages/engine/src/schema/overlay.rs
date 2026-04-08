@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use crate::contracts::traits::{PendingSemanticStorage, PendingView};
 use crate::{LixBackend, LixError};
 
 use super::key::{schema_from_registered_snapshot, SchemaKey};
@@ -36,6 +37,50 @@ impl<'a> OverlaySchemaProvider<'a> {
     ) -> Result<(), LixError> {
         let (key, schema) = schema_from_registered_snapshot(snapshot)?;
         self.pending.insert(key, schema);
+        Ok(())
+    }
+
+    pub fn remember_pending_registered_schemas_from_view(
+        &mut self,
+        pending_view: Option<&dyn PendingView>,
+    ) -> Result<(), LixError> {
+        let Some(pending_view) = pending_view else {
+            return Ok(());
+        };
+
+        for (_, snapshot_content) in pending_view.visible_registered_schema_entries() {
+            let Some(snapshot_content) = snapshot_content else {
+                continue;
+            };
+            let snapshot =
+                serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("registered schema snapshot_content invalid JSON: {error}"),
+                    )
+                })?;
+            self.remember_pending_schema_from_snapshot(&snapshot)?;
+        }
+
+        for storage in [
+            PendingSemanticStorage::Tracked,
+            PendingSemanticStorage::Untracked,
+        ] {
+            for row in pending_view.visible_semantic_rows(storage, "lix_registered_schema") {
+                let Some(snapshot_content) = row.snapshot_content else {
+                    continue;
+                };
+                let snapshot =
+                    serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("registered schema snapshot_content invalid JSON: {error}"),
+                        )
+                    })?;
+                self.remember_pending_schema_from_snapshot(&snapshot)?;
+            }
+        }
+
         Ok(())
     }
 

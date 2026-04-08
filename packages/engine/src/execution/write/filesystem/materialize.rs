@@ -1,14 +1,13 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::contracts::plugin::{InstalledPlugin, PluginContentType};
+use crate::contracts::plugin::{select_best_glob_match, InstalledPlugin, PluginContentType};
+use crate::contracts::traits::FilesystemPluginMaterializer;
 use crate::execution::write::filesystem::query::load_file_row_by_id;
-use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
-use crate::runtime::plugin::matching::select_best_glob_match;
-use crate::runtime::plugin::runtime::{
-    apply_changes_with_plugin, load_installed_plugins_with_runtime_cache,
+use crate::live_state::materialize::filesystem::{
+    delete_file_payload_cache_data, load_file_payload_cache_data, upsert_file_payload_cache_data,
 };
-use crate::runtime::Runtime;
-use crate::{LixBackend, LixError, Value};
+use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
+use crate::{LixBackend, LixError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -55,10 +54,10 @@ struct BuiltinBinaryBlobRefSnapshot {
 
 pub(crate) async fn materialize_file_data_with_plugins(
     backend: &dyn LixBackend,
-    runtime: &Runtime,
+    plugin_materializer: &dyn FilesystemPluginMaterializer,
     plan: &LiveStateRebuildPlan,
 ) -> Result<(), LixError> {
-    let installed_plugins = load_installed_plugins_with_runtime_cache(runtime).await?;
+    let installed_plugins = plugin_materializer.load_installed_plugins().await?;
 
     let mut descriptor_targets: BTreeSet<(String, String)> = BTreeSet::new();
     let mut tombstoned_files: Vec<(String, String)> = Vec::new();
@@ -78,7 +77,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
     }
 
     for (file_id, version_id) in tombstoned_files {
-        delete_file_cache_data(backend, &file_id, &version_id).await?;
+        delete_file_payload_cache_data(backend, &file_id, &version_id).await?;
     }
 
     let descriptors = load_file_descriptors(backend, &descriptor_targets).await?;
@@ -161,7 +160,7 @@ pub(crate) async fn materialize_file_data_with_plugins(
                             blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
                         ),
                     })?;
-                upsert_file_cache_data(
+                upsert_file_payload_cache_data(
                     backend,
                     &descriptor.file_id,
                     &descriptor.version_id,
@@ -169,15 +168,20 @@ pub(crate) async fn materialize_file_data_with_plugins(
                 )
                 .await?;
             } else {
-                delete_file_cache_data(backend, &descriptor.file_id, &descriptor.version_id)
-                    .await?;
+                delete_file_payload_cache_data(
+                    backend,
+                    &descriptor.file_id,
+                    &descriptor.version_id,
+                )
+                .await?;
             }
             continue;
         }
         let plugin = plugin.expect("plugin must be present");
 
         let previous_data =
-            load_file_cache_data(backend, &descriptor.file_id, &descriptor.version_id).await?;
+            load_file_payload_cache_data(backend, &descriptor.file_id, &descriptor.version_id)
+                .await?;
         let request_payload = ApplyChangesRequest {
             file: PluginFile {
                 id: descriptor.file_id.clone(),
@@ -192,8 +196,10 @@ pub(crate) async fn materialize_file_data_with_plugins(
                 "plugin materialization: failed to encode apply-changes payload: {error}"
             ),
         })?;
-        let output = apply_changes_with_plugin(runtime, plugin, &payload).await?;
-        upsert_file_cache_data(
+        let output = plugin_materializer
+            .apply_plugin_changes(plugin, &payload)
+            .await?;
+        upsert_file_payload_cache_data(
             backend,
             &descriptor.file_id,
             &descriptor.version_id,
@@ -304,95 +310,11 @@ async fn load_file_descriptors(
     Ok(descriptors)
 }
 
-async fn load_file_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<Vec<u8>, LixError> {
-    let result = backend
-        .execute(
-            "SELECT data \
-             FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2 \
-             LIMIT 1",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-
-    let Some(row) = result.rows.first() else {
-        return Ok(Vec::new());
-    };
-    blob_required(row, 0, "data")
-}
-
-async fn upsert_file_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-    data: &[u8],
-) -> Result<(), LixError> {
-    backend
-        .execute(
-            "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (file_id, version_id) DO UPDATE SET \
-             data = EXCLUDED.data",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Blob(data.to_vec()),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
-async fn delete_file_cache_data(
-    backend: &dyn LixBackend,
-    file_id: &str,
-    version_id: &str,
-) -> Result<(), LixError> {
-    backend
-        .execute(
-            "DELETE FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
-    Ok(())
-}
-
-fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: row missing column '{column}' at index {index}"
-            ),
-        });
-    };
-    match value {
-        Value::Blob(bytes) => Ok(bytes.clone()),
-        other => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: expected blob column '{column}' at index {index}, got {other:?}"
-            ),
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::select_plugin_for_path;
+    use crate::contracts::plugin::glob_matches_path;
     use crate::contracts::plugin::{InstalledPlugin, PluginContentType, PluginRuntime};
-    use crate::runtime::plugin::matching::glob_matches_path;
 
     fn test_plugin(
         key: &str,

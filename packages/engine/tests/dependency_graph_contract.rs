@@ -1572,7 +1572,7 @@ fn phase_f_session_write_preparation_stays_as_orchestration_only() {
     for required in [
         "PreparedWritePreparationContext",
         "PreparedWriteContextStamp",
-        "load_sql_compiler_metadata_with_reader(",
+        "load_sql_compiler_metadata_with_reader_and_pending_view(",
         "compile_execution_from_template_instance_with_context(",
         "PreparedWriteExecutionBoundary",
         "PreparedWriteExecutionStep::build(",

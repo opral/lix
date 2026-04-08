@@ -1,20 +1,25 @@
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+#[cfg(test)]
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use crate::common::error::LixError;
 use crate::common::types::{QueryResult, Value};
 use crate::contracts::artifacts::{
-    EffectiveRowSet, EffectiveRowsRequest, ExactUntrackedLookupRequest, LiveFilter,
-    LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
-    LiveStateProjectionStatus, OptionalTextPatch, RowIdentity, ScanRequest, SchemaKey,
-    SchemaRegistration, StateHistoryRequest, StateHistoryRow, TrackedRow,
-    TrackedTombstoneLookupRequest, TrackedTombstoneMarker, TrackedWriteRow, UntrackedRow,
-    UntrackedWriteRow,
+    ExactUntrackedLookupRequest, LiveFilter, LiveQueryEffectiveRow, LiveQueryOverlayLane,
+    LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, OptionalTextPatch,
+    SchemaKey, SchemaRegistration, StateHistoryRequest, StateHistoryRow,
+    TrackedTombstoneLookupRequest, TrackedWriteRow, UntrackedWriteRow,
 };
-use crate::contracts::ReplayCursor;
+#[cfg(test)]
+use crate::contracts::artifacts::{
+    EffectiveRowSet, EffectiveRowsRequest, RowIdentity, ScanRequest, TrackedRow,
+    TrackedTombstoneMarker, UntrackedRow,
+};
+use crate::contracts::plugin::InstalledPlugin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {
@@ -55,6 +60,7 @@ pub(crate) struct PendingFilesystemFileView {
     pub(crate) deleted: bool,
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 pub(crate) trait WorkspaceWriterKeyReadView {
     #[allow(dead_code)]
@@ -95,6 +101,17 @@ pub(crate) trait PendingView {
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait FilesystemPluginMaterializer {
+    async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError>;
+
+    async fn apply_plugin_changes(
+        &self,
+        plugin: &InstalledPlugin,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, LixError>;
 }
 
 pub(crate) trait CompiledSchemaCache {
@@ -242,6 +259,7 @@ pub(crate) trait LiveReadShapeContract {
     ) -> Result<Option<JsonValue>, LixError>;
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 pub(crate) trait TrackedReadView {
     async fn load_exact_rows(
@@ -249,9 +267,11 @@ pub(crate) trait TrackedReadView {
         request: &crate::contracts::artifacts::BatchRowRequest,
     ) -> Result<Vec<TrackedRow>, LixError>;
 
+    #[cfg(test)]
     async fn scan_rows(&self, request: &ScanRequest) -> Result<Vec<TrackedRow>, LixError>;
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 pub(crate) trait TrackedTombstoneView {
     async fn scan_tombstones(
@@ -268,6 +288,7 @@ pub(crate) trait TrackedWriteParticipant {
     ) -> Result<(), LixError>;
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 pub(crate) trait UntrackedReadView {
     async fn load_exact_rows(
@@ -275,6 +296,7 @@ pub(crate) trait UntrackedReadView {
         request: &crate::contracts::artifacts::BatchRowRequest,
     ) -> Result<Vec<UntrackedRow>, LixError>;
 
+    #[cfg(test)]
     async fn scan_rows(&self, request: &ScanRequest) -> Result<Vec<UntrackedRow>, LixError>;
 }
 
@@ -286,6 +308,7 @@ pub(crate) trait UntrackedWriteParticipant {
     ) -> Result<(), LixError>;
 }
 
+#[cfg(test)]
 pub(crate) struct LiveReadContext<'a> {
     pub(crate) tracked: &'a dyn TrackedReadView,
     pub(crate) untracked: &'a dyn UntrackedReadView,
@@ -293,6 +316,7 @@ pub(crate) struct LiveReadContext<'a> {
     pub(crate) workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
 }
 
+#[cfg(test)]
 impl<'a> LiveReadContext<'a> {
     pub(crate) fn new(
         tracked: &'a dyn TrackedReadView,
@@ -316,6 +340,7 @@ impl<'a> LiveReadContext<'a> {
     }
 }
 
+#[cfg(test)]
 #[async_trait(?Send)]
 pub(crate) trait EffectiveRowsResolver {
     async fn resolve_effective_rows(
@@ -339,11 +364,9 @@ pub(crate) trait LiveStateTransactionBridge {
         registration: &SchemaRegistration,
     ) -> Result<(), LixError>;
 
-    async fn mark_live_state_projection_ready(&mut self) -> Result<ReplayCursor, LixError>;
-
     async fn advance_live_state_replay_boundary(
         &mut self,
-        replay_cursor: &ReplayCursor,
+        replay_cursor: &crate::contracts::ReplayCursor,
     ) -> Result<(), LixError>;
 }
 

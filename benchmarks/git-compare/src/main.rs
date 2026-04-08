@@ -1,6 +1,7 @@
 use clap::Parser;
 use lix_engine::{
-    boot as boot_engine, BootArgs as EngineConfig, Engine, EngineTransaction, ExecuteOptions, Value,
+    boot as boot_engine, BootArgs as EngineConfig, ExecuteOptions, Session,
+    SessionTransaction, Value,
 };
 use lix_rs_sdk::{SqliteBackend, WasmRuntime, WasmtimeRuntime};
 use serde::Serialize;
@@ -494,7 +495,7 @@ fn select_workloads(
 
 fn prepare_workloads(
     repo_path: &Path,
-    args: &Args,
+    _args: &Args,
     tmp_root: &Path,
     workloads: &[Workload],
 ) -> DynResult<PreparedBenchmark> {
@@ -652,10 +653,10 @@ fn run_lix_trial(
     if db_path.exists() {
         fs::remove_file(&db_path)?;
     }
-    let engine = create_initialized_engine(&db_path, wasm_runtime)?;
+    let session = create_initialized_session(&db_path, wasm_runtime)?;
     if !workload.lix_template.seed_rows.is_empty() {
         let seed_rows = workload.lix_template.seed_rows.clone();
-        pollster::block_on(engine.transaction(ExecuteOptions::default(), |tx| {
+        pollster::block_on(session.transaction(ExecuteOptions::default(), |tx| {
             Box::pin(async move {
                 for row in seed_rows {
                     tx.execute(
@@ -675,7 +676,7 @@ fn run_lix_trial(
     let mut path_to_id = workload.lix_template.path_to_id.clone();
     let mut next_file_id = next_file_id_from_map(&path_to_id);
     let mut transaction =
-        pollster::block_on(engine.begin_transaction_with_options(ExecuteOptions::default()))?;
+        pollster::block_on(session.begin_transaction_with_options(ExecuteOptions::default()))?;
 
     let write_started = Instant::now();
     for operation in &workload.workload.operations {
@@ -693,13 +694,13 @@ fn run_lix_trial(
     let commit_ms = elapsed_ms(commit_started);
 
     let verified = if verify_state {
-        verify_engine_state(&engine, &workload.workload.expected_files)?;
+        verify_session_state(&session, &workload.workload.expected_files)?;
         true
     } else {
         false
     };
 
-    drop(engine);
+    drop(session);
     let _ = fs::remove_file(&db_path);
     let _ = fs::remove_file(format!("{}-journal", db_path.display()));
     let _ = fs::remove_file(format!("{}-wal", db_path.display()));
@@ -847,7 +848,7 @@ fn set_executable_if_needed(path: &Path, executable: bool) -> DynResult<()> {
 }
 
 fn execute_engine_operation(
-    transaction: &mut EngineTransaction<'_>,
+    transaction: &mut SessionTransaction<'_>,
     operation: &FileOperation,
     path_to_id: &mut BTreeMap<String, String>,
     next_file_id: &mut u64,
@@ -959,12 +960,12 @@ fn execute_engine_operation(
     Ok(())
 }
 
-fn verify_engine_state(
-    engine: &Engine,
+fn verify_session_state(
+    session: &Session,
     expected_files: &BTreeMap<String, Vec<u8>>,
 ) -> DynResult<()> {
     let result =
-        pollster::block_on(engine.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))?;
+        pollster::block_on(session.execute("SELECT path, data FROM lix_file ORDER BY path", &[]))?;
     let mut actual = BTreeMap::new();
     for row in &result.statements[0].rows {
         let path = expect_text(&row[0])?;
@@ -983,18 +984,18 @@ fn verify_engine_state(
     Ok(())
 }
 
-fn create_initialized_engine(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> DynResult<Engine> {
+fn create_initialized_session(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> DynResult<Session> {
     if path.exists() {
         fs::remove_file(path)?;
     }
     let init_backend = SqliteBackend::from_path(path)?;
-    let engine = boot_engine(EngineConfig::new(
+    let engine = Arc::new(boot_engine(EngineConfig::new(
         Box::new(init_backend),
         Arc::clone(&wasm_runtime),
-    ));
+    )));
     let _ = pollster::block_on(engine.initialize_if_needed())?;
     pollster::block_on(engine.open_existing())?;
-    Ok(engine)
+    Ok(pollster::block_on(engine.open_session())?)
 }
 
 fn expect_text(value: &Value) -> DynResult<String> {

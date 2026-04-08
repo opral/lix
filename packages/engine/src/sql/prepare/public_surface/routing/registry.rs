@@ -123,7 +123,7 @@ fn trace_from_outcome(
 #[cfg(test)]
 mod tests {
     use super::{
-        run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome, RoutingPassSettings,
+        RoutingPassMetadata, RoutingPassOutcome, RoutingPassSettings, run_infallible_pass,
     };
 
     #[test]

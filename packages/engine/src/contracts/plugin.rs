@@ -1,6 +1,6 @@
 use std::sync::OnceLock;
 
-use globset::Glob;
+use globset::{Glob, GlobBuilder};
 use jsonschema::JSONSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -191,6 +191,66 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
     })
 }
 
+pub(crate) fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
+    path: &str,
+    file_content_type: Option<C>,
+    candidates: &'a [T],
+    glob: impl Fn(&T) -> &str,
+    required_content_type: impl Fn(&T) -> Option<C>,
+) -> Option<&'a T> {
+    let mut selected: Option<&T> = None;
+    let mut selected_rank: Option<(u8, i32)> = None;
+
+    for candidate in candidates {
+        let pattern = glob(candidate);
+        if !glob_matches_path(pattern, path) {
+            continue;
+        }
+        if let (Some(actual_type), Some(required_type)) =
+            (file_content_type, required_content_type(candidate))
+        {
+            if actual_type != required_type {
+                continue;
+            }
+        }
+
+        let rank = glob_specificity_rank(pattern);
+        match selected_rank {
+            None => {
+                selected = Some(candidate);
+                selected_rank = Some(rank);
+            }
+            Some(existing_rank) if rank > existing_rank => {
+                selected = Some(candidate);
+                selected_rank = Some(rank);
+            }
+            _ => {
+                // Keep the existing winner on equal rank to preserve candidate-order tie-break.
+            }
+        }
+    }
+
+    selected
+}
+
+pub(crate) fn glob_matches_path(glob: &str, path: &str) -> bool {
+    let normalized_glob = glob.trim();
+    let normalized_path = path.trim();
+    if normalized_glob.is_empty() || normalized_path.is_empty() {
+        return false;
+    }
+    if is_catch_all_glob(normalized_glob) {
+        return true;
+    }
+
+    GlobBuilder::new(normalized_glob)
+        .literal_separator(false)
+        .case_insensitive(true)
+        .build()
+        .map(|compiled| compiled.compile_matcher().is_match(normalized_path))
+        .unwrap_or(false)
+}
+
 fn validate_path_glob(glob: &str) -> Result<(), LixError> {
     Glob::new(glob).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -209,6 +269,30 @@ fn validate_plugin_manifest_json(manifest: &JsonValue) -> Result<(), LixError> {
         });
     }
     Ok(())
+}
+
+fn glob_specificity_rank(glob: &str) -> (u8, i32) {
+    let normalized = glob.trim();
+    if is_catch_all_glob(normalized) {
+        return (0, i32::MIN);
+    }
+    (1, glob_specificity_score(normalized))
+}
+
+fn glob_specificity_score(glob: &str) -> i32 {
+    let mut literal_chars = 0i32;
+    let mut wildcard_chars = 0i32;
+    for ch in glob.chars() {
+        match ch {
+            '*' | '?' | '[' | ']' | '{' | '}' => wildcard_chars += 1,
+            _ => literal_chars += 1,
+        }
+    }
+    literal_chars - wildcard_chars
+}
+
+fn is_catch_all_glob(glob: &str) -> bool {
+    glob == "*" || glob == "**/*" || glob == "**"
 }
 
 fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {

@@ -1,3 +1,5 @@
+mod boot;
+
 use crate::contracts::surface::SurfaceRegistry;
 use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
@@ -11,7 +13,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
-pub use crate::boot::{boot, BootArgs, BootKeyValue};
+pub use boot::{boot, BootArgs, BootKeyValue, EngineConfig};
 
 pub struct Engine {
     runtime: Arc<Runtime>,

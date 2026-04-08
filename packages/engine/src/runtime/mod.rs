@@ -14,7 +14,7 @@ pub mod wasm;
 use crate::backend::QueryExecutor;
 use crate::contracts::plugin::InstalledPlugin;
 use crate::contracts::surface::SurfaceRegistry;
-use crate::contracts::traits::CompiledSchemaCache;
+use crate::contracts::traits::{CompiledSchemaCache, FilesystemPluginMaterializer};
 use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::DeterministicSettings;
 use crate::runtime::plugin::runtime::CachedPluginComponent;
@@ -230,6 +230,21 @@ impl Runtime {
     #[cfg(test)]
     pub(crate) fn installed_plugins_cache(&self) -> &RwLock<Option<Vec<InstalledPlugin>>> {
         &self.installed_plugins_cache
+    }
+}
+
+#[async_trait(?Send)]
+impl FilesystemPluginMaterializer for Runtime {
+    async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError> {
+        crate::runtime::plugin::runtime::load_installed_plugins_with_runtime_cache(self).await
+    }
+
+    async fn apply_plugin_changes(
+        &self,
+        plugin: &InstalledPlugin,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, LixError> {
+        crate::runtime::plugin::runtime::apply_changes_with_plugin(self, plugin, payload).await
     }
 }
 

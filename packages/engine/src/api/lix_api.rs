@@ -4,13 +4,14 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::backend::ImageChunkWriter;
+use crate::engine::EngineConfig;
 use crate::runtime::wasm::WasmRuntime;
 use crate::session::observe::observe_owned_session;
 use crate::{
-    boot::EngineConfig, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
-    CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LixBackend, LixError,
-    MergeVersionOptions, MergeVersionResult, ObserveEventsOwned, ObserveQuery, OpenSessionOptions,
-    RedoOptions, RedoResult, Session, UndoOptions, UndoResult, Value,
+    BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult, Engine,
+    ExecuteOptions, ExecuteResult, LixBackend, LixError, MergeVersionOptions, MergeVersionResult,
+    ObserveEventsOwned, ObserveQuery, OpenSessionOptions, RedoOptions, RedoResult, Session,
+    UndoOptions, UndoResult, Value,
 };
 
 pub struct LixConfig {
@@ -92,10 +93,6 @@ impl Lix {
         observe_owned_session(Arc::clone(&self.session), query)
     }
 
-    /// Opens a child session with optional workspace-selector overrides.
-    ///
-    /// This changes workspace selection for the child session only; it does
-    /// not mutate replica-local version heads or committed history.
     pub async fn open_child_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
         let session = self.session.open_child_session(options).await?;
         Ok(Self {
@@ -110,8 +107,6 @@ impl Lix {
         self.session.create_version(options).await
     }
 
-    /// Updates the active workspace version selector without moving committed
-    /// version heads.
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
         self.session.switch_version(version_id).await
     }
@@ -123,8 +118,6 @@ impl Lix {
         self.session.merge_version(options).await
     }
 
-    /// Creates a canonical checkpoint label for the current workspace-selected
-    /// version. Replay progress remains separate replica-local state.
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
         self.session.create_checkpoint().await
     }

@@ -7,18 +7,12 @@ use crate::schema::builtin::{
 };
 use crate::LixError;
 
-pub(crate) mod artifacts;
 pub(crate) mod checkpoints;
 mod heads;
-pub(crate) mod inventory;
 mod refs;
 mod roots;
 
 pub(crate) use crate::schema::builtin::{DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID};
-pub(crate) use artifacts::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
-};
 #[allow(unused_imports)]
 pub(crate) use heads::load_current_committed_version_frontier_with_backend;
 pub(crate) use heads::{
@@ -26,8 +20,7 @@ pub(crate) use heads::{
     load_committed_version_ref_with_executor,
 };
 pub(crate) use refs::{
-    build_local_version_ref_heads_source_sql, load_all_local_version_refs_with_executor,
-    load_local_version_head_commit_id_with_executor,
+    load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     load_local_version_ref_heads_map_with_executor,
 };
 pub(crate) use roots::{

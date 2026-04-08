@@ -161,30 +161,6 @@ pub(crate) async fn load_local_version_ref_heads_map_with_executor(
     ))
 }
 
-pub(crate) fn build_local_version_ref_heads_source_sql() -> String {
-    format!(
-        "SELECT \
-            entity_id AS version_id, \
-            commit_id AS commit_id \
-         FROM {table} \
-         WHERE schema_key = '{ref_schema_key}' \
-           AND schema_version = '{ref_schema_version}' \
-           AND file_id = '{ref_file_id}' \
-           AND plugin_key = '{ref_plugin_key}' \
-           AND version_id = '{storage_version_id}' \
-           AND untracked = true \
-           AND is_tombstone = 0 \
-           AND commit_id IS NOT NULL \
-           AND commit_id <> ''",
-        table = local_version_ref_relation_name(),
-        ref_schema_key = escape_sql_string(version_ref_schema_key()),
-        ref_schema_version = escape_sql_string(version_ref_schema_version()),
-        ref_file_id = escape_sql_string(version_ref_file_id()),
-        ref_plugin_key = escape_sql_string(version_ref_plugin_key()),
-        storage_version_id = escape_sql_string(version_ref_storage_version_id()),
-    )
-}
-
 fn local_version_ref_relation_name() -> String {
     format!(
         "{}{}",
@@ -256,8 +232,4 @@ fn required_text_cell(row: &[Value], index: usize, column_name: &str) -> Result<
             format!("local version-ref row is missing text column '{column_name}'"),
         )),
     }
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }

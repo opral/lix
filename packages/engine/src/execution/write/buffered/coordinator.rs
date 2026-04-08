@@ -1,10 +1,11 @@
 use crate::contracts::artifacts::CanonicalCommitReceipt;
 use crate::contracts::artifacts::{SchemaRegistration, SchemaRegistrationSet};
 use crate::contracts::traits::LiveStateTransactionBridge;
-use crate::{LixBackendTransaction, LixError, ReplayCursor};
+use crate::{LixBackendTransaction, LixError};
 
 pub(crate) struct TransactionCoordinator<'a> {
     backend_txn: Option<Box<dyn LixBackendTransaction + 'a>>,
+    #[cfg(test)]
     registered_schemas: SchemaRegistrationSet,
 }
 
@@ -12,10 +13,12 @@ impl<'a> TransactionCoordinator<'a> {
     pub(crate) fn new(backend_txn: Box<dyn LixBackendTransaction + 'a>) -> Self {
         Self {
             backend_txn: Some(backend_txn),
+            #[cfg(test)]
             registered_schemas: SchemaRegistrationSet::default(),
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn register_schema(
         &mut self,
         registration: impl Into<SchemaRegistration>,
@@ -25,15 +28,11 @@ impl<'a> TransactionCoordinator<'a> {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn register_staged_schemas(&mut self) -> Result<(), LixError> {
         let registrations = self.registered_schemas.clone();
         let transaction = self.backend_transaction_mut()?;
         apply_schema_registrations_in_transaction(transaction, &registrations).await
-    }
-
-    pub(crate) async fn finalize_live_state(&mut self) -> Result<ReplayCursor, LixError> {
-        let transaction = self.backend_transaction_mut()?;
-        transaction.mark_live_state_projection_ready().await
     }
 
     pub(crate) async fn advance_live_state_replay_boundary_for_commit(

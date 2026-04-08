@@ -181,7 +181,12 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
             write_transaction.buffered_write_pending_transaction_view()?;
         let prepared_context = {
             let transaction = write_transaction.backend_transaction_mut()?;
-            bootstrap_prepared_write_preparation_context(transaction, context).await?
+            bootstrap_prepared_write_preparation_context(
+                transaction,
+                pending_transaction_view.as_ref(),
+                context,
+            )
+            .await?
         };
         let command = {
             let transaction = write_transaction.backend_transaction_mut()?;

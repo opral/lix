@@ -1,11 +1,13 @@
-use crate::engine::Engine;
+use serde_json::Value as JsonValue;
+use std::sync::Arc;
+
 use crate::runtime::deterministic_mode::{
     parse_deterministic_settings_value, DeterministicSettings,
 };
 use crate::runtime::wasm::WasmRuntime;
 use crate::{LixBackend, LixError};
-use serde_json::Value as JsonValue;
-use std::sync::Arc;
+
+use super::Engine;
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
 

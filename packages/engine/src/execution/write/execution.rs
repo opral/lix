@@ -1,6 +1,6 @@
 use crate::contracts::artifacts::SchemaRegistration;
 use crate::execution::write::buffered::{LiveStateWriteState, TransactionCoordinator};
-use crate::{LixBackendTransaction, LixError, ReplayCursor};
+use crate::{LixBackendTransaction, LixError};
 
 use super::{CommitOutcome, ReadContext, TransactionDelta, TransactionJournal};
 
@@ -56,10 +56,6 @@ impl<'a> WriteTransaction<'a> {
         write_state.execute(coordinator).await
     }
 
-    pub async fn finalize_live_state(&mut self) -> Result<ReplayCursor, LixError> {
-        self.coordinator.finalize_live_state().await
-    }
-
     pub async fn commit(mut self) -> Result<CommitOutcome, LixError> {
         self.execute().await?;
         let outcome = self.live_state_write_state()?.outcome();
@@ -69,12 +65,6 @@ impl<'a> WriteTransaction<'a> {
 
     pub async fn rollback(mut self) -> Result<(), LixError> {
         self.coordinator.rollback().await
-    }
-
-    pub(crate) fn backend_transaction_mut(
-        &mut self,
-    ) -> Result<&mut dyn LixBackendTransaction, LixError> {
-        self.coordinator.backend_transaction_mut()
     }
 
     fn live_state_write_state(&self) -> Result<&LiveStateWriteState<'a>, LixError> {

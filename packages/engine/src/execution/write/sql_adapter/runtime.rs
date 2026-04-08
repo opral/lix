@@ -19,6 +19,7 @@ use crate::execution::write::{
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::planned_write_runner::execute_planned_write_delta;
+use super::registered_schema_bootstrap::mirror_registered_schema_mutations_in_transaction;
 use crate::execution::write::buffered::{build_planned_write_delta, PlannedWriteDelta};
 
 pub(crate) struct PreparedWriteExecutionStep {
@@ -277,6 +278,7 @@ pub(crate) async fn execute_internal_execution_with_transaction(
     let _ = (functions, writer_key, internal.should_refresh_file_cache);
     let internal_result =
         execute_prepared_with_transaction(transaction, &internal.prepared_batch).await?;
+    mirror_registered_schema_mutations_in_transaction(transaction, &internal.mutations).await?;
     let public_result = public_result_from_contract(result_contract, &internal_result);
 
     Ok(SqlExecutionOutcome {

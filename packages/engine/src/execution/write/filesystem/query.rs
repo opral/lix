@@ -7,7 +7,7 @@ use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
-use crate::filesystem_projection_sql::{
+use crate::surface_sql::filesystem::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};

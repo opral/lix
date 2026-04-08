@@ -24,16 +24,6 @@ pub(crate) trait PendingPublicReadExecutionBackend {
     ) -> Result<QueryResult, LixError>;
 }
 
-#[async_trait(?Send)]
-pub(crate) trait PendingPublicReadExecutionTransaction {
-    async fn execute_prepared_public_read_with_pending_view(
-        &mut self,
-        bindings: &dyn ReadExecutionBindings,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &PreparedPublicReadArtifact,
-    ) -> Result<QueryResult, LixError>;
-}
-
 pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     bindings: &dyn ReadExecutionBindings,
@@ -123,31 +113,6 @@ impl PendingPublicReadExecutionBackend for dyn LixBackend + '_ {
 impl PendingPublicReadTransaction for dyn LixBackendTransaction + '_ {
     async fn require_live_state_ready(&mut self) -> Result<(), LixError> {
         crate::live_state::require_ready_in_transaction(self).await
-    }
-}
-
-#[async_trait(?Send)]
-impl PendingPublicReadExecutionTransaction for dyn LixBackendTransaction + '_ {
-    async fn execute_prepared_public_read_with_pending_view(
-        &mut self,
-        bindings: &dyn ReadExecutionBindings,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &PreparedPublicReadArtifact,
-    ) -> Result<QueryResult, LixError> {
-        match public_read.contract.execution_mode() {
-            crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
-                crate::live_state::pending_reads::execute_prepared_public_read_with_pending_transaction_view_in_transaction(
-                    self,
-                    pending_view,
-                    public_read,
-                )
-                .await
-            }
-            crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
-                execute_prepared_public_read_artifact_in_transaction(self, bindings, public_read)
-                    .await
-            }
-        }
     }
 }
 

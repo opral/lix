@@ -15,8 +15,8 @@ use crate::sql::logical_plan::public_ir::{
 };
 use crate::sql::physical_plan::lowerer::broad_public_relation_supports_terminal_render;
 use crate::sql::prepare::public_surface::routing::registry::{
-    run_fallible_pass, run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome,
-    RoutingPassRegistry, RoutingPassSettings, RoutingPassTrace,
+    RoutingPassMetadata, RoutingPassOutcome, RoutingPassRegistry, RoutingPassSettings,
+    RoutingPassTrace, run_fallible_pass, run_infallible_pass,
 };
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
@@ -2292,10 +2292,12 @@ mod tests {
             "public-read.route-lowerable-relations"
         );
         assert!(optimized.pass_traces[0].enabled);
-        assert!(optimized.pass_traces[0]
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("public relations")));
+        assert!(
+            optimized.pass_traces[0]
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("public relations"))
+        );
         let BroadPublicReadStatement::Query(query) = &optimized.broad_statement else {
             panic!("routing should keep a broad query statement");
         };
@@ -2360,10 +2362,12 @@ mod tests {
         .expect("broad rewrite should succeed");
 
         assert!(optimized.pass_traces[0].changed);
-        assert!(optimized.pass_traces[0]
-            .diagnostics
-            .iter()
-            .any(|line| line.contains("lix_directory")));
+        assert!(
+            optimized.pass_traces[0]
+                .diagnostics
+                .iter()
+                .any(|line| line.contains("lix_directory"))
+        );
 
         let BroadPublicReadStatement::Query(query) = &optimized.broad_statement else {
             panic!("routing should keep a broad query statement");

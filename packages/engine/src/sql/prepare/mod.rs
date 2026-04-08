@@ -25,7 +25,8 @@ pub(crate) use compile::{
 };
 pub(crate) use compiled::CompiledExecution;
 pub(crate) use compiler_metadata::{
-    load_sql_compiler_metadata, load_sql_compiler_metadata_with_reader, SqlCompilerMetadata,
+    load_sql_compiler_metadata, load_sql_compiler_metadata_with_reader,
+    load_sql_compiler_metadata_with_reader_and_pending_view, SqlCompilerMetadata,
 };
 pub(crate) use contracts::planned_statement::UpdateValidationPlan;
 pub(crate) use execution_program::{BoundStatementTemplateInstance, ExecutionProgram};

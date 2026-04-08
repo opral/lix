@@ -1,4 +1,5 @@
 use super::*;
+use crate::SqlDialect;
 use crate::contracts::artifacts::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryVersionScope, PendingViewReadQuery, PendingViewReadStorage,
@@ -7,39 +8,40 @@ use crate::contracts::artifacts::{
     StateHistoryVersionScope,
 };
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
-use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
+use crate::sql::binder::{RuntimeBindingValues, bind_public_read_statement};
 use crate::sql::explain::{
-    build_public_read_explain_artifacts, unwrap_explain_statement, ExplainStage,
-    ExplainTimingCollector, PublicReadExplainBuildInput, PublicReadExplainCompiledArtifacts,
+    ExplainStage, ExplainTimingCollector, PublicReadExplainBuildInput,
+    PublicReadExplainCompiledArtifacts, build_public_read_explain_artifacts,
+    unwrap_explain_statement,
 };
 use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::logical_plan::{
-    verify_logical_plan, DirectDirectoryHistoryField, DirectEntityHistoryField,
-    DirectFileHistoryField, DirectPublicReadPlan, DirectStateHistoryField,
-    DirectoryHistoryAggregate, DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate,
-    DirectoryHistoryProjection, DirectoryHistorySortKey, EntityHistoryDirectReadPlan,
-    EntityHistoryPredicate, EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate,
-    FileHistoryDirectReadPlan, FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey,
-    LogicalPlan, PublicReadLogicalPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
+    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
+    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
+    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
+    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate, FileHistoryDirectReadPlan,
+    FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey, LogicalPlan,
+    PublicReadLogicalPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
     StateHistoryDirectReadPlan, StateHistoryPredicate, StateHistoryProjection,
-    StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue,
+    StateHistoryProjectionValue, StateHistorySortKey, StateHistorySortValue, verify_logical_plan,
 };
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::parser::placeholders::{PlaceholderState, resolve_placeholder_index};
 use crate::sql::physical_plan::lowerer::lower_broad_public_read_for_execution_with_layouts;
 use crate::sql::physical_plan::{
-    compile_public_rowset_query, select_specialized_public_read_artifact,
     CompilerOwnedPublicReadExecutionSelection, LoweredReadProgram, LoweredResultColumn,
     LoweredResultColumns, PreparedPublicReadExecution, SpecializedPublicReadArtifactSelection,
+    compile_public_rowset_query, select_specialized_public_read_artifact,
 };
 use crate::sql::prepare::public_surface::routing::{
     route_broad_public_read_statement_with_known_live_layouts, route_public_read_execution_strategy,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_bound_public_surface_bindings;
 use crate::sql::semantic_ir::{
+    PublicReadSemantics, StructuredPublicReadPreparation,
     augment_dependency_spec_for_broad_public_read, prepare_structured_public_read_analysis,
-    unknown_public_state_schema_error, PublicReadSemantics, StructuredPublicReadPreparation,
+    unknown_public_state_schema_error,
 };
-use crate::SqlDialect;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, Ident,
     LimitClause, OrderByKind, Query, Select, SelectItem, SetExpr, Statement, Value as SqlValue,
@@ -1106,7 +1108,7 @@ fn direct_directory_history_field_from_select_item(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "wildcard projection should be handled before direct directory-history field extraction",
-            ))
+            ));
         }
     };
     direct_directory_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
@@ -1604,7 +1606,7 @@ fn direct_file_history_field_from_select_item(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "wildcard projection should be handled before direct file-history field extraction",
-            ))
+            ));
         }
     };
     direct_file_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
@@ -2181,7 +2183,7 @@ fn direct_entity_history_field_from_select_item(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "wildcard projection should be handled before direct entity-history field extraction",
-            ))
+            ));
         }
     };
     direct_entity_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
@@ -2203,7 +2205,7 @@ fn direct_state_history_projection_value(
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "wildcard projection should be handled before direct state-history projection parsing",
-            ))
+            ));
         }
     };
     if let Some(aggregate) = direct_state_history_aggregate_from_expr(expr)? {
@@ -3142,7 +3144,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
             return Ok(SpecializedPublicReadPreparation::Declined {
                 reason: error.description,
                 bound_statement: analysis.bound_statement,
-            })
+            });
         }
     };
 
@@ -3165,16 +3167,16 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             structured_read.surface_binding.descriptor.public_name
                         ),
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
                 Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
+                    return Err(error);
                 }
                 Err(error) => {
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: error.description,
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
             }
         }
@@ -3196,16 +3198,16 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             structured_read.surface_binding.descriptor.public_name
                         ),
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
                 Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
+                    return Err(error);
                 }
                 Err(error) => {
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: error.description,
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
             }
         }
@@ -3227,16 +3229,16 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             structured_read.surface_binding.descriptor.public_name
                         ),
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
                 Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
+                    return Err(error);
                 }
                 Err(error) => {
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: error.description,
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
             }
         }
@@ -3258,16 +3260,16 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             structured_read.surface_binding.descriptor.public_name
                         ),
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
                 Err(error) if specialized_public_read_error_is_semantic(&error) => {
-                    return Err(error)
+                    return Err(error);
                 }
                 Err(error) => {
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: error.description,
                         bound_statement: analysis.bound_statement,
-                    })
+                    });
                 }
             }
         }
@@ -3284,7 +3286,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     structured_read.surface_binding.descriptor.public_name
                 ),
                 bound_statement: analysis.bound_statement,
-            })
+            });
         }
     };
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
@@ -3594,6 +3596,10 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     allow_internal_tables: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PreparedPublicRead>, LixError> {
+    if let Some(surface_name) = first_removed_builtin_surface_reference(parsed_statements) {
+        return Err(removed_builtin_surface_unknown_table_error(&surface_name));
+    }
+
     try_prepare_public_read_with_internal_access(
         dialect,
         registry,
