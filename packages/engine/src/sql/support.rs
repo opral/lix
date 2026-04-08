@@ -274,13 +274,13 @@ fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
     match statement {
         Statement::Insert(insert) => match &insert.table {
             TableObject::TableName(name) => {
-                crate::schema::object_name_is_internal_storage_relation(name)
+                crate::surfaces::object_name_is_internal_storage_relation(name)
             }
             _ => false,
         },
         Statement::Update(update) => match &update.table.relation {
             TableFactor::Table { name, .. } => {
-                crate::schema::object_name_is_internal_storage_relation(name)
+                crate::surfaces::object_name_is_internal_storage_relation(name)
             }
             _ => false,
         },
@@ -291,43 +291,42 @@ fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
             };
             tables.iter().any(|table| match &table.relation {
                 TableFactor::Table { name, .. } => {
-                    crate::schema::object_name_is_internal_storage_relation(name)
+                    crate::surfaces::object_name_is_internal_storage_relation(name)
                 }
                 _ => false,
             })
         }
         Statement::AlterTable(alter) => {
-            crate::schema::object_name_is_protected_builtin_ddl_target(&alter.name)
+            crate::surfaces::object_name_is_protected_builtin_ddl_target(&alter.name)
         }
         Statement::CreateIndex(create_index) => {
-            crate::schema::object_name_is_protected_builtin_ddl_target(&create_index.table_name)
+            crate::surfaces::object_name_is_protected_builtin_ddl_target(&create_index.table_name)
         }
         Statement::CreateTrigger(create_trigger) => {
-            crate::schema::object_name_is_protected_builtin_ddl_target(&create_trigger.table_name)
+            crate::surfaces::object_name_is_protected_builtin_ddl_target(&create_trigger.table_name)
                 || create_trigger
                     .referenced_table_name
                     .as_ref()
-                    .map(crate::schema::object_name_is_protected_builtin_ddl_target)
+                    .map(crate::surfaces::object_name_is_protected_builtin_ddl_target)
                     .unwrap_or(false)
         }
         Statement::DropTrigger(drop_trigger) => drop_trigger
             .table_name
             .as_ref()
-            .map(crate::schema::object_name_is_protected_builtin_ddl_target)
+            .map(crate::surfaces::object_name_is_protected_builtin_ddl_target)
             .unwrap_or(false),
         Statement::Drop { names, table, .. } => {
             names
                 .iter()
-                .any(crate::schema::object_name_is_protected_builtin_ddl_target)
+                .any(crate::surfaces::object_name_is_protected_builtin_ddl_target)
                 || table
                     .as_ref()
-                    .map(crate::schema::object_name_is_protected_builtin_ddl_target)
+                    .map(crate::surfaces::object_name_is_protected_builtin_ddl_target)
                     .unwrap_or(false)
         }
-        Statement::Truncate(truncate) => truncate
-            .table_names
-            .iter()
-            .any(|target| crate::schema::object_name_is_protected_builtin_ddl_target(&target.name)),
+        Statement::Truncate(truncate) => truncate.table_names.iter().any(|target| {
+            crate::surfaces::object_name_is_protected_builtin_ddl_target(&target.name)
+        }),
         _ => false,
     }
 }

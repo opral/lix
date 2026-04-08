@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::live_state::builtin_schema_storage_metadata;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
 use crate::live_state::projection::local_version_head_write_row;
@@ -10,8 +11,7 @@ use crate::live_state::untracked::{
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
-use crate::schema::builtin::storage::builtin_schema_storage_metadata;
-use crate::schema::builtin::types::LixActiveVersion;
+use crate::schema::LixActiveVersion;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
@@ -206,7 +206,7 @@ fn active_version_helper_write_row(
         schema_key: metadata.schema_key,
         schema_version: metadata.schema_version,
         file_id: metadata.file_id,
-        version_id: crate::schema::builtin::GLOBAL_VERSION_ID.to_string(),
+        version_id: crate::version_state::GLOBAL_VERSION_ID.to_string(),
         global: true,
         plugin_key: metadata.plugin_key,
         metadata: None,
@@ -237,7 +237,7 @@ fn active_version_file_id() -> String {
 }
 
 fn active_version_storage_version_id() -> String {
-    crate::schema::builtin::GLOBAL_VERSION_ID.to_string()
+    crate::version_state::GLOBAL_VERSION_ID.to_string()
 }
 
 #[tokio::test]

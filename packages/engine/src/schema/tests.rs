@@ -1,5 +1,5 @@
-use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-use crate::schema::builtin::storage::{
+use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
+use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
 use crate::{validate_lix_schema, validate_lix_schema_definition};

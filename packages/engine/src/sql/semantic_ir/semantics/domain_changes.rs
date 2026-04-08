@@ -407,7 +407,7 @@ mod tests {
             })
             .await
             .expect("test version should exist");
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = bind_statement(

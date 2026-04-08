@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::common::errors::classification::is_missing_relation_error;
-use crate::schema::builtin::types::LixCommit;
+use crate::schema::LixCommit;
 use crate::{LixError, Value};
 
 /// Canonical committed row resolved from commit-graph facts plus local

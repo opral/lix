@@ -1,5 +1,5 @@
 use super::*;
-use crate::schema::builtin::builtin_schema_definition;
+use crate::schema::builtin_schema_definition;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
     BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,

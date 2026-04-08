@@ -1008,13 +1008,13 @@ mod tests {
         CatalogEpoch, DefaultScopeSemantics, DynamicEntitySurfaceSpec, SurfaceCapability,
         SurfaceFamily, SurfaceReadSemantics, SurfaceVariant,
     };
-    use crate::schema::{builtin_public_surface_columns, builtin_public_surface_names};
+    use crate::surfaces::{builtin_public_surface_columns, builtin_public_surface_names};
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
     use std::collections::{BTreeMap, HashSet};
 
     #[test]
     fn binds_builtin_state_surfaces() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_state_by_version")
             .expect("builtin surface should bind");
@@ -1037,7 +1037,7 @@ mod tests {
 
     #[test]
     fn surfaces_declare_committed_vs_workspace_overlay_semantics() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
 
         assert_eq!(
             registry
@@ -1078,10 +1078,10 @@ mod tests {
 
     #[test]
     fn dynamic_entity_registration_bumps_catalog_epoch_and_tracks_binding_epoch() {
-        let mut registry = crate::schema::build_builtin_surface_registry();
+        let mut registry = crate::surfaces::build_builtin_surface_registry();
         assert_eq!(registry.catalog_epoch(), CatalogEpoch::default());
 
-        let epoch = crate::schema::public_surfaces::register_dynamic_entity_surface_spec(
+        let epoch = crate::surfaces::register_dynamic_entity_surface_spec(
             &mut registry,
             DynamicEntitySurfaceSpec {
                 schema_key: "lix_key_value".to_string(),
@@ -1104,7 +1104,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_bootstraps_builtin_entity_surfaces() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_key_value")
             .expect("builtin schema-derived entity surface should bind");
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_exposes_registered_schema_by_version_entity_surface() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_registered_schema_by_version")
             .expect("registered schema by-version surface should bind");
@@ -1136,7 +1136,7 @@ mod tests {
 
     #[test]
     fn builtin_registry_exposes_registered_schema_default_entity_surface() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let binding = registry
             .bind_relation_name("lix_registered_schema")
             .expect("registered schema default surface should bind");
@@ -1151,7 +1151,7 @@ mod tests {
 
     #[test]
     fn derived_builtin_entity_surfaces_are_read_only() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         for surface in [
             "lix_commit",
             "lix_commit_by_version",
@@ -1248,7 +1248,7 @@ mod tests {
 
     #[test]
     fn binds_object_names_using_last_relation_segment() {
-        let registry = crate::schema::build_builtin_surface_registry();
+        let registry = crate::surfaces::build_builtin_surface_registry();
         let binding = registry
             .bind_object_name(&ObjectName(vec![
                 ObjectNamePart::Identifier(Ident::new("main")),

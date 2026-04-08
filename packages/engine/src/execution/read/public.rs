@@ -42,11 +42,7 @@ pub(crate) async fn bootstrap_public_surface_registry_in_transaction(
     pending_view: Option<&dyn PendingView>,
 ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
     let backend = TransactionBackendAdapter::new(transaction);
-    crate::live_state::pending_reads::bootstrap_public_surface_registry_with_pending_transaction_view(
-        &backend,
-        pending_view,
-    )
-    .await
+    crate::live_state::build_surface_registry(&backend, pending_view).await
 }
 
 pub(crate) async fn execute_prepared_public_read_artifact_with_backend(
@@ -94,12 +90,8 @@ impl PendingPublicReadExecutionBackend for dyn LixBackend + '_ {
     ) -> Result<QueryResult, LixError> {
         match public_read.contract.execution_mode() {
             crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
-                crate::live_state::pending_reads::execute_prepared_public_read_with_pending_transaction_view(
-                    self,
-                    pending_view,
-                    public_read,
-                )
-                .await
+                crate::live_state::execute_prepared_public_read(self, pending_view, public_read)
+                    .await
             }
             crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
                 execute_prepared_public_read_artifact_with_backend(self, bindings, public_read)

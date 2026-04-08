@@ -4,7 +4,7 @@ use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
-use crate::schema::builtin::builtin_schema_definition;
+use crate::schema::builtin_schema_definition;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 use super::registry::{compile_registered_live_layout, load_live_table_layout_with_backend};

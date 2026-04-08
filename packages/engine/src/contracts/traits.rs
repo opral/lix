@@ -8,16 +8,16 @@ use std::sync::Arc;
 
 use crate::common::error::LixError;
 use crate::common::types::{QueryResult, Value};
-use crate::contracts::artifacts::{
-    ExactUntrackedLookupRequest, LiveFilter, LiveQueryEffectiveRow, LiveQueryOverlayLane,
-    LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, OptionalTextPatch,
-    SchemaKey, SchemaRegistration, StateHistoryRequest, StateHistoryRow,
-    TrackedTombstoneLookupRequest, TrackedWriteRow, UntrackedWriteRow,
-};
 #[cfg(test)]
 use crate::contracts::artifacts::{
     EffectiveRowSet, EffectiveRowsRequest, RowIdentity, ScanRequest, TrackedRow,
     TrackedTombstoneMarker, UntrackedRow,
+};
+use crate::contracts::artifacts::{
+    ExactUntrackedLookupRequest, LiveFilter, LiveQueryEffectiveRow, LiveQueryOverlayLane,
+    LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, OptionalTextPatch, SchemaKey,
+    SchemaRegistration, StateHistoryRequest, StateHistoryRow, TrackedTombstoneLookupRequest,
+    TrackedWriteRow, UntrackedWriteRow,
 };
 use crate::contracts::plugin::InstalledPlugin;
 

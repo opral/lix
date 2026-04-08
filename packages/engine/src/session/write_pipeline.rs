@@ -374,14 +374,14 @@ async fn validate_compiled_write_preparation(
                 params,
                 pending_view,
             )
-                .await
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "prepare_buffered_write_execution_step update validation failed: {}",
-                        error.description
-                    ),
-                })?;
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "prepare_buffered_write_execution_step update validation failed: {}",
+                    error.description
+                ),
+            })?;
         }
     }
 

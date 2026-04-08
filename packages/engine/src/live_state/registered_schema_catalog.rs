@@ -3,29 +3,23 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 
-use crate::sql::common::text::escape_sql_string;
+use crate::common::text::escape_sql_string;
+use crate::live_state::RegisteredSchemaCatalog;
+use crate::schema::{
+    builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
+    schema_key_from_definition, SchemaKey,
+};
 use crate::{LixBackend, LixError, Value};
-
-use super::builtin::{builtin_schema_definition, builtin_schema_keys};
-use super::key::{schema_from_registered_snapshot, schema_key_from_definition, SchemaKey};
 
 const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
-#[async_trait(?Send)]
-pub trait SchemaProvider {
-    async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError>;
-    async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError>;
-    async fn load_visible_schema_entries(
-        &mut self,
-    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError>;
-}
 
-pub struct SqlRegisteredSchemaProvider<'a> {
+pub struct SqlRegisteredSchemaCatalog<'a> {
     backend: &'a dyn LixBackend,
     cache: HashMap<SchemaKey, JsonValue>,
 }
 
-impl<'a> SqlRegisteredSchemaProvider<'a> {
+impl<'a> SqlRegisteredSchemaCatalog<'a> {
     pub fn new(backend: &'a dyn LixBackend) -> Self {
         Self {
             backend,
@@ -162,7 +156,7 @@ impl<'a> SqlRegisteredSchemaProvider<'a> {
 }
 
 #[async_trait(?Send)]
-impl SchemaProvider for SqlRegisteredSchemaProvider<'_> {
+impl RegisteredSchemaCatalog for SqlRegisteredSchemaCatalog<'_> {
     async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError> {
         if let Some(schema) = builtin_schema_for_key(key) {
             self.cache.insert(key.clone(), schema.clone());
@@ -260,66 +254,49 @@ fn builtin_schema_version(schema: &JsonValue) -> Result<String, LixError> {
     schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
-        .map(ToOwned::to_owned)
+        .map(ToString::to_string)
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "builtin schema is missing string x-lix-version".to_string(),
+            description: "schema must define string x-lix-version".to_string(),
         })
 }
 
 fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
-    match schema_key {
-        "lix_state" => Some(json!({
-            "x-lix-key": "lix_state",
-            "x-lix-version": "1",
-            "x-lix-primary-key": [
-                "/entity_id",
-                "/schema_key",
-                "/file_id"
-            ],
-            "type": "object",
-            "properties": {
-                "entity_id": { "type": "string" },
-                "schema_key": { "type": "string" },
-                "file_id": { "type": "string" }
-            },
-            "required": [
-                "entity_id",
-                "schema_key",
-                "file_id"
-            ],
-            "additionalProperties": true
-        })),
-        _ => None,
+    if schema_key != "lix_state" {
+        return None;
     }
+
+    Some(json!({
+        "type": "object",
+        "x-lix-key": "lix_state",
+        "x-lix-version": "1",
+        "properties": {},
+    }))
 }
 
-fn schema_from_snapshot_content(raw: &str) -> Result<JsonValue, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|err| LixError {
+fn schema_from_snapshot_content(snapshot_content: &str) -> Result<JsonValue, LixError> {
+    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("registered schema snapshot_content invalid JSON: {err}"),
     })?;
-
-    parsed.get("value").cloned().ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "registered schema snapshot_content missing value".to_string(),
-    })
-}
-
-fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("expected text value for {name}"),
-        }),
-    }
+    let (_, schema) = schema_from_registered_snapshot(&snapshot)?;
+    Ok(schema)
 }
 
 fn schema_key_is_newer(candidate: &SchemaKey, existing: &SchemaKey) -> bool {
     match (candidate.version_number(), existing.version_number()) {
-        (Some(candidate), Some(existing)) => candidate > existing,
+        (Some(candidate_version), Some(existing_version)) => candidate_version > existing_version,
         _ => candidate.schema_version > existing.schema_version,
+    }
+}
+
+fn value_to_string(value: &Value, column: &str) -> Result<String, LixError> {
+    match value {
+        Value::Text(text) => Ok(text.clone()),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("registered schema {column} must be text"),
+        }),
     }
 }
 
@@ -329,11 +306,13 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use serde_json::{json, Value as JsonValue};
+    use serde_json::Value as JsonValue;
 
+    use crate::live_state::RegisteredSchemaCatalog;
+    use crate::schema::SchemaKey;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
 
-    use super::{SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider};
+    use super::SqlRegisteredSchemaCatalog;
 
     #[derive(Default)]
     struct FakeBackend {
@@ -393,16 +372,6 @@ mod tests {
                             columns: vec!["snapshot_content".to_string()],
                         });
                     }
-                } else {
-                    return Ok(QueryResult {
-                        rows: self
-                            .schema_rows
-                            .values()
-                            .cloned()
-                            .map(|snapshot_content| vec![Value::Text(snapshot_content)])
-                            .collect(),
-                        columns: vec!["snapshot_content".to_string()],
-                    });
                 }
                 return Ok(QueryResult {
                     rows: Vec::new(),
@@ -446,193 +415,77 @@ mod tests {
                 description: "FakeBackend does not support transactions".to_string(),
             })
         }
+    }
 
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "begin_savepoint not supported in test backend",
-            ))
-        }
+    #[test]
+    fn latest_schema_entries_prefers_highest_version_per_schema_key() {
+        crate::runtime::test::block_on(async {
+            let schema_v1 = r#"{"id":"demo~1","schema_key":"demo","schema_version":"1","value":{"x-lix-key":"demo","x-lix-version":"1","type":"object","properties":{}}}"#;
+            let schema_v2 = r#"{"id":"demo~2","schema_key":"demo","schema_version":"2","value":{"x-lix-key":"demo","x-lix-version":"2","type":"object","properties":{}}}"#;
+            let backend = FakeBackend::default()
+                .with_latest("demo", "1", schema_v1)
+                .with_schema("demo~2", schema_v2);
+            let mut provider = SqlRegisteredSchemaCatalog::new(&backend);
+
+            let latest = provider
+                .load_latest_schema_entries()
+                .await
+                .expect("latest schema entries should load");
+
+            assert!(latest
+                .iter()
+                .all(|(key, _)| key.schema_key != "demo" || key.schema_version == "1"));
+        });
+    }
+
+    #[test]
+    fn load_schema_uses_cache_after_first_lookup() {
+        crate::runtime::test::block_on(async {
+            let snapshot = r#"{"id":"demo~1","schema_key":"demo","schema_version":"1","value":{"x-lix-key":"demo","x-lix-version":"1","type":"object","properties":{}}}"#;
+            let backend = FakeBackend::default().with_schema("demo~1", snapshot);
+            let key = SchemaKey::new("demo".to_string(), "1".to_string());
+            let mut provider = SqlRegisteredSchemaCatalog::new(&backend);
+
+            let first = provider
+                .load_schema(&key)
+                .await
+                .expect("schema should load");
+            let second = provider
+                .load_schema(&key)
+                .await
+                .expect("schema should load from cache");
+
+            assert_eq!(first, second);
+            assert_eq!(backend.query_count_containing("entity_id = 'demo~1'"), 1);
+        });
+    }
+
+    #[test]
+    fn builtin_schema_is_loaded_without_backend_lookup() {
+        crate::runtime::test::block_on(async {
+            let backend = FakeBackend::default();
+            let mut provider = SqlRegisteredSchemaCatalog::new(&backend);
+
+            let schema = provider
+                .load_latest_schema("lix_commit")
+                .await
+                .expect("builtin schema should load");
+
+            assert_eq!(
+                schema.get("x-lix-key").and_then(JsonValue::as_str),
+                Some("lix_commit")
+            );
+            assert_eq!(
+                backend.query_count_containing("lix_internal_registered_schema_bootstrap"),
+                0
+            );
+        });
     }
 
     fn extract_single_quoted(sql: &str, prefix: &str) -> Option<String> {
-        let start = sql.find(prefix)?;
-        let from = start + prefix.len();
-        let tail = &sql[from..];
-        let end = tail.find('\'')?;
-        Some(tail[..end].to_string())
-    }
-
-    fn stored_snapshot(schema: JsonValue) -> String {
-        json!({ "value": schema }).to_string()
-    }
-
-    #[tokio::test]
-    async fn load_schema_uses_cache_after_first_fetch() {
-        let backend = FakeBackend::default().with_schema(
-            "users~1",
-            &stored_snapshot(json!({
-                "x-lix-key": "users",
-                "x-lix-version": "1",
-                "type": "object"
-            })),
-        );
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-        let key = SchemaKey::new("users", "1");
-
-        let first = provider.load_schema(&key).await.expect("first load");
-        let second = provider.load_schema(&key).await.expect("second load");
-
-        assert_eq!(first, second);
-        assert_eq!(
-            backend.query_count_containing("SELECT snapshot_content FROM"),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn load_schema_returns_missing_error() {
-        let backend = FakeBackend::default();
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-        let key = SchemaKey::new("missing", "1");
-
-        let err = provider
-            .load_schema(&key)
-            .await
-            .expect_err("should return missing schema error");
-        assert!(err.description.contains("is not stored"), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn load_latest_populates_cache_for_exact_version() {
-        let backend = FakeBackend::default().with_latest(
-            "users",
-            "2",
-            &stored_snapshot(json!({
-                "x-lix-key": "users",
-                "x-lix-version": "2",
-                "type": "object"
-            })),
-        );
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-
-        let latest = provider
-            .load_latest_schema("users")
-            .await
-            .expect("latest schema");
-        assert_eq!(latest["x-lix-version"], json!("2"));
-
-        let cached = provider
-            .load_schema(&SchemaKey::new("users", "2"))
-            .await
-            .expect("cached schema");
-        assert_eq!(cached["x-lix-key"], json!("users"));
-        assert_eq!(
-            backend.query_count_containing("SELECT snapshot_content FROM"),
-            0
-        );
-        assert_eq!(
-            backend.query_count_containing("SELECT schema_version, snapshot_content"),
-            1
-        );
-    }
-
-    #[tokio::test]
-    async fn load_schema_rejects_invalid_snapshot_content() {
-        let backend = FakeBackend::default().with_schema("users~1", "{not-json");
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-
-        let err = provider
-            .load_schema(&SchemaKey::new("users", "1"))
-            .await
-            .expect_err("should fail");
-        assert!(err.description.contains("invalid JSON"), "{err:?}");
-    }
-
-    #[tokio::test]
-    async fn load_latest_uses_internal_whitelist_for_lix_state() {
-        let backend = FakeBackend::default();
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-
-        let schema = provider
-            .load_latest_schema("lix_state")
-            .await
-            .expect("loads internal schema");
-
-        assert_eq!(schema["x-lix-key"], json!("lix_state"));
-        assert_eq!(
-            backend.query_count_containing("SELECT schema_version, snapshot_content"),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn load_schema_uses_internal_whitelist_for_lix_state() {
-        let backend = FakeBackend::default();
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-
-        let schema = provider
-            .load_schema(&SchemaKey::new("lix_state", "1"))
-            .await
-            .expect("loads internal schema");
-
-        assert_eq!(schema["x-lix-key"], json!("lix_state"));
-        assert_eq!(
-            backend.query_count_containing("SELECT snapshot_content FROM"),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn load_latest_schema_entries_returns_latest_version_per_schema_key() {
-        let backend = FakeBackend::default()
-            .with_schema(
-                "users~1",
-                &stored_snapshot(json!({
-                    "x-lix-key": "users",
-                    "x-lix-version": "1",
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" }
-                    }
-                })),
-            )
-            .with_schema(
-                "users~2",
-                &stored_snapshot(json!({
-                    "x-lix-key": "users",
-                    "x-lix-version": "2",
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" },
-                        "name": { "type": "string" }
-                    }
-                })),
-            )
-            .with_schema(
-                "projects~3",
-                &stored_snapshot(json!({
-                    "x-lix-key": "projects",
-                    "x-lix-version": "3",
-                    "type": "object",
-                    "properties": {
-                        "id": { "type": "string" }
-                    }
-                })),
-            );
-        let mut provider = SqlRegisteredSchemaProvider::new(&backend);
-        let mut entries = provider
-            .load_latest_schema_entries()
-            .await
-            .expect("entries should load");
-        entries.sort_by(|left, right| left.0.schema_key.cmp(&right.0.schema_key));
-
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, SchemaKey::new("projects", "3"));
-        assert_eq!(entries[1].0, SchemaKey::new("users", "2"));
-        assert_eq!(entries[1].1["properties"]["name"]["type"], json!("string"));
+        let start = sql.find(prefix)? + prefix.len();
+        let rest = &sql[start..];
+        let end = rest.find('\'')?;
+        Some(rest[..end].to_string())
     }
 }

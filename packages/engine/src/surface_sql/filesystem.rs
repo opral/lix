@@ -1,10 +1,9 @@
 use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::schema::access::{payload_column_name_for_schema, tracked_relation_name};
+use crate::live_state;
 use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
-use crate::schema::builtin::versioning::version_descriptor_schema_key;
-use crate::schema::builtin::GLOBAL_VERSION_ID;
+use crate::version_state::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";
@@ -39,8 +38,8 @@ pub(crate) fn build_filesystem_file_projection_sql(
     } else {
         String::new()
     };
-    let live_commit_table = tracked_relation_name("lix_commit");
-    let live_cse_table = tracked_relation_name("lix_change_set_element");
+    let live_commit_table = live_state::tracked_relation_name("lix_commit");
+    let live_cse_table = live_state::tracked_relation_name("lix_change_set_element");
 
     Ok(format!(
         "WITH RECURSIVE \
@@ -313,8 +312,8 @@ pub(crate) fn build_filesystem_directory_projection_sql(
         }
         FilesystemProjectionScope::ExplicitVersion => "d.lixcol_commit_id".to_string(),
     };
-    let live_commit_table = tracked_relation_name("lix_commit");
-    let live_cse_table = tracked_relation_name("lix_change_set_element");
+    let live_commit_table = live_state::tracked_relation_name("lix_commit");
+    let live_cse_table = live_state::tracked_relation_name("lix_change_set_element");
     Ok(format!(
         "WITH RECURSIVE \
            {target_versions_cte}, \
@@ -466,7 +465,7 @@ fn target_versions_cte_sql(
             let union_rows = schema_keys
                 .iter()
                 .flat_map(|schema_key| {
-                    let quoted = quote_ident(&tracked_relation_name(schema_key));
+                    let quoted = quote_ident(&live_state::tracked_relation_name(schema_key));
                     [
                         format!(
                             "SELECT DISTINCT version_id \
@@ -481,7 +480,8 @@ fn target_versions_cte_sql(
                              FROM {untracked_table} \
                     WHERE version_id <> '{global_version}' \
                       AND untracked = true",
-                            untracked_table = quote_ident(&tracked_relation_name(schema_key)),
+                            untracked_table =
+                                quote_ident(&live_state::tracked_relation_name(schema_key)),
                             global_version = escape_sql_string(GLOBAL_VERSION_ID),
                         ),
                     ]
@@ -492,7 +492,8 @@ fn target_versions_cte_sql(
             } else {
                 format!(" UNION {}", union_rows.join(" UNION "))
             };
-            let live_version_descriptor_table = tracked_relation_name("lix_version_descriptor");
+            let live_version_descriptor_table =
+                live_state::tracked_relation_name("lix_version_descriptor");
             Ok(format!(
                 "all_target_versions AS ( \
                    SELECT '{global_version}' AS version_id \
@@ -520,8 +521,8 @@ fn effective_state_candidates_sql(
     schema_key: &str,
     payload_columns: &[(&str, String, String)],
 ) -> String {
-    let table_name = quote_ident(&tracked_relation_name(schema_key));
-    let untracked_table = quote_ident(&tracked_relation_name(schema_key));
+    let table_name = quote_ident(&live_state::tracked_relation_name(schema_key));
+    let untracked_table = quote_ident(&live_state::tracked_relation_name(schema_key));
     let workspace_writer_key_table = quote_ident(WORKSPACE_WRITER_KEY_TABLE);
     let tracked_payload_projection = payload_columns
         .iter()
@@ -765,7 +766,7 @@ fn active_version_commit_id_sql(active_version_id: &str) -> Result<String, LixEr
     // head row for the active version.
     let version_ref_commit_id_column =
         quote_ident(&live_payload_column_name("lix_version_ref", "commit_id"));
-    let live_version_ref_table = tracked_relation_name("lix_version_ref");
+    let live_version_ref_table = live_state::tracked_relation_name("lix_version_ref");
     Ok(format!(
         "(\
          SELECT {version_ref_commit_id_column} \
@@ -803,12 +804,14 @@ fn required_active_version_id(
 }
 
 fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    payload_column_name_for_schema(schema_key, None, property_name).unwrap_or_else(|error| {
-        panic!(
-            "builtin live schema '{schema_key}' must include '{property_name}': {}",
-            error.description
-        )
-    })
+    live_state::payload_column_name_for_schema(schema_key, None, property_name).unwrap_or_else(
+        |error| {
+            panic!(
+                "builtin live schema '{schema_key}' must include '{property_name}': {}",
+                error.description
+            )
+        },
+    )
 }
 
 fn qualified_column_ref(table_alias: &str, column_name: &str) -> String {

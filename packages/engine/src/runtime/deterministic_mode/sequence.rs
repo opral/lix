@@ -1,13 +1,12 @@
 use crate::common::errors::classification::is_missing_relation_error;
-use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::PreparedBatch;
 use crate::contracts::functions::LixFunctionProvider;
-use crate::schema::access::payload_column_name_for_schema;
-use crate::schema::builtin::storage::{
+use crate::live_state;
+use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
-use crate::schema::builtin::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
@@ -59,10 +58,12 @@ pub(crate) fn build_ensure_runtime_sequence_row_sql(
     _dialect: SqlDialect,
 ) -> String {
     let sequence_key = deterministic_sequence_key();
-    let key_column = payload_column_name_for_schema(key_value_schema_key(), None, "key")
-        .expect("key-value live schema should include key");
-    let value_column = payload_column_name_for_schema(key_value_schema_key(), None, "value")
-        .expect("key-value live schema should include value");
+    let key_column =
+        live_state::payload_column_name_for_schema(key_value_schema_key(), None, "key")
+            .expect("key-value live schema should include key");
+    let value_column =
+        live_state::payload_column_name_for_schema(key_value_schema_key(), None, "value")
+            .expect("key-value live schema should include value");
     let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
         .expect("deterministic highest-seen JSON serialization should succeed");
 
@@ -71,7 +72,7 @@ pub(crate) fn build_ensure_runtime_sequence_row_sql(
          (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
          VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
          ON CONFLICT (entity_id, file_id, version_id, untracked) DO NOTHING",
-        table_name = tracked_relation_name(key_value_schema_key()),
+        table_name = live_state::tracked_relation_name(key_value_schema_key()),
         key_column = key_column,
         value_column = value_column,
         entity_id = escape_sql_string(sequence_key),
@@ -113,8 +114,9 @@ pub(crate) fn build_update_runtime_sequence_highest_sql(
     highest_seen: i64,
     _dialect: SqlDialect,
 ) -> String {
-    let value_column = payload_column_name_for_schema(key_value_schema_key(), None, "value")
-        .expect("key-value live schema should include value");
+    let value_column =
+        live_state::payload_column_name_for_schema(key_value_schema_key(), None, "value")
+            .expect("key-value live schema should include value");
     let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
         .expect("deterministic highest-seen JSON serialization should succeed");
 
@@ -126,7 +128,7 @@ pub(crate) fn build_update_runtime_sequence_highest_sql(
            AND file_id = '{file_id}' \
            AND version_id = '{version_id}' \
            AND untracked = true",
-        table_name = tracked_relation_name(key_value_schema_key()),
+        table_name = live_state::tracked_relation_name(key_value_schema_key()),
         value_column = value_column,
         value_json = escape_sql_string(&value_json),
         entity_id = escape_sql_string(deterministic_sequence_key()),
@@ -159,7 +161,7 @@ async fn load_visible_runtime_sequence_start_in_transaction(
          ) visible_key_values \
          ORDER BY precedence ASC \
          LIMIT 1",
-        table_name = tracked_relation_name(key_value_schema_key()),
+        table_name = live_state::tracked_relation_name(key_value_schema_key()),
         entity_id = escape_sql_string(deterministic_sequence_key()),
         version_id = escape_sql_string(GLOBAL_VERSION_ID),
     );
@@ -183,8 +185,9 @@ async fn load_visible_runtime_sequence_start_in_transaction(
 }
 
 fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String {
-    let value_column = payload_column_name_for_schema(key_value_schema_key(), None, "value")
-        .expect("key-value live schema should include value");
+    let value_column =
+        live_state::payload_column_name_for_schema(key_value_schema_key(), None, "value")
+            .expect("key-value live schema should include value");
     let for_update = match dialect {
         SqlDialect::Postgres => " FOR UPDATE",
         SqlDialect::Sqlite => "",
@@ -200,7 +203,7 @@ fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String {
            AND untracked = true \
          LIMIT 1{for_update}",
         value_column = value_column,
-        table_name = tracked_relation_name(key_value_schema_key()),
+        table_name = live_state::tracked_relation_name(key_value_schema_key()),
         entity_id = escape_sql_string(deterministic_sequence_key()),
         schema_key = escape_sql_string(key_value_schema_key()),
         file_id = escape_sql_string(key_value_file_id()),

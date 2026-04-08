@@ -1,5 +1,5 @@
 use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
-use crate::schema::builtin::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

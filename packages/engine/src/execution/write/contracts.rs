@@ -14,10 +14,10 @@ use crate::contracts::traits::PendingView;
 use crate::LixError;
 use crate::{LixBackendTransaction, QueryResult};
 
-#[cfg(test)]
-use crate::execution::write::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal};
 #[cfg(not(test))]
 use crate::execution::write::buffered::TrackedTxnUnit;
+#[cfg(test)]
+use crate::execution::write::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal};
 use crate::execution::write::filesystem::runtime::BinaryBlobWrite;
 
 #[cfg(test)]

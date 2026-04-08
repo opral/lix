@@ -25,6 +25,22 @@ impl LiveReadContract {
         self.access.normalized_projection_sql(table_alias)
     }
 
+    pub(crate) fn payload_column_name(&self, property_name: &str) -> Option<&str> {
+        self.access.payload_column_name(property_name)
+    }
+
+    pub(crate) fn snapshot_select_expr(
+        &self,
+        dialect: SqlDialect,
+        table_alias: Option<&str>,
+    ) -> String {
+        super::shared::snapshot_sql::live_snapshot_select_expr(
+            self.access.layout(),
+            dialect,
+            table_alias,
+        )
+    }
+
     pub(crate) fn normalized_values(
         &self,
         snapshot_content: Option<&str>,
@@ -65,6 +81,14 @@ pub(crate) async fn load_schema_read_contract_for_table_name(
     super::storage::load_live_row_access_for_table_name(backend, table_name)
         .await
         .map(|access| access.map(read_contract_from_storage))
+}
+
+pub(crate) fn read_contract_from_definition(
+    schema_key: &str,
+    schema_definition: Option<&JsonValue>,
+) -> Result<LiveReadContract, LixError> {
+    schema_layout(schema_key, schema_definition)
+        .map(|layout| read_contract_from_storage(super::storage::LiveRowAccess::new(layout)))
 }
 
 pub(super) fn live_read_contract_from_layout(
@@ -108,7 +132,7 @@ pub(crate) async fn live_storage_relation_exists_with_backend(
 }
 
 pub(crate) fn tracked_relation_name(schema_key: &str) -> String {
-    crate::schema::access::tracked_relation_name(schema_key)
+    super::storage::tracked_live_table_name(schema_key)
 }
 
 pub(crate) fn snapshot_select_expr_for_schema(
@@ -117,11 +141,9 @@ pub(crate) fn snapshot_select_expr_for_schema(
     dialect: SqlDialect,
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
-    crate::schema::access::snapshot_select_expr_for_schema(
-        schema_key,
-        schema_definition,
-        dialect,
-        table_alias,
+    Ok(
+        read_contract_from_definition(schema_key, schema_definition)?
+            .snapshot_select_expr(dialect, table_alias),
     )
 }
 
@@ -165,7 +187,6 @@ pub(crate) fn schema_column_names(
         .collect())
 }
 
-#[cfg(test)]
 fn schema_layout(
     schema_key: &str,
     schema_definition: Option<&JsonValue>,

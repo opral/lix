@@ -37,10 +37,10 @@ impl<'a> TransactionReadModel<'a> {
         &self,
     ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
-            return crate::schema::load_public_surface_registry_with_backend(self.base).await;
+            return crate::surfaces::load_public_surface_registry_with_backend(self.base).await;
         }
 
-        let mut registry = crate::schema::build_builtin_surface_registry();
+        let mut registry = crate::surfaces::build_builtin_surface_registry();
         for snapshot_content in self.visible_registered_schema_rows().await?.into_values() {
             let snapshot: JsonValue = serde_json::from_str(&snapshot_content).map_err(|error| {
                 LixError::new(
@@ -48,7 +48,7 @@ impl<'a> TransactionReadModel<'a> {
                     format!("registered schema snapshot_content invalid JSON: {error}"),
                 )
             })?;
-            crate::schema::apply_registered_schema_snapshot_to_surface_registry(
+            crate::surfaces::apply_registered_schema_snapshot_to_surface_registry(
                 &mut registry,
                 &snapshot,
             )?;

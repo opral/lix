@@ -485,7 +485,7 @@ fn bool_from_value(value: &Value) -> Option<bool> {
 mod tests {
     use super::ensure_schema_live_table_sql_statements;
     use crate::live_state::storage::layout::live_table_layout_from_schema;
-    use crate::schema::builtin::builtin_schema_definition;
+    use crate::schema::builtin_schema_definition;
     use crate::SqlDialect;
     use std::collections::BTreeMap;
 
