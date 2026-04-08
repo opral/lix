@@ -1,3 +1,4 @@
+pub(crate) mod dialect;
 pub(crate) mod error;
 pub(crate) mod errors;
 pub(crate) mod fingerprint;

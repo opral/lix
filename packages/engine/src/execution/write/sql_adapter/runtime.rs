@@ -4,22 +4,22 @@ use std::time::Instant;
 use crate::contracts::artifacts::{
     coalesce_live_table_requirements, CanonicalCommitReceipt, PendingPublicCommitSession,
     PlanEffects, PreparedBatch, PreparedInternalWriteArtifact, PreparedPublicReadArtifact,
-    PreparedWriteDiagnosticContext, PreparedWriteStatementKind, PreparedWriteStep,
-    ResultContract, SchemaRegistration, SchemaRegistrationSet, StateCommitStreamChange,
+    PreparedWriteDiagnosticContext, PreparedWriteStatementKind, PreparedWriteStep, ResultContract,
+    SchemaRegistration, SchemaRegistrationSet, StateCommitStreamChange,
 };
 use crate::contracts::explain_output::{
     render_analyzed_explain_result, render_plain_explain_result,
 };
 use crate::contracts::traits::PendingView;
-use crate::execution::write::transaction::normalize_sql_error_with_transaction_and_relation_names;
 use crate::execution::write::buffered::apply_schema_registrations_in_transaction;
+use crate::execution::write::transaction::normalize_sql_error_with_transaction_and_relation_names;
 use crate::execution::write::{
     PendingTransactionView, PreparedWriteRuntimeState, WriteExecutionBindings,
 };
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
-use crate::execution::write::buffered::{build_planned_write_delta, PlannedWriteDelta};
 use super::planned_write_runner::execute_planned_write_delta;
+use crate::execution::write::buffered::{build_planned_write_delta, PlannedWriteDelta};
 
 pub(crate) struct PreparedWriteExecutionStep {
     prepared: PreparedWriteStep,

@@ -1,5 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use crate::backend::ddl::execute_ddl_batch;
+use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
 };
@@ -7,9 +9,7 @@ use crate::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
     UntrackedWriteRow,
 };
-use crate::backend::ddl::execute_ddl_batch;
 use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
-use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };

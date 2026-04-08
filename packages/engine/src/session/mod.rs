@@ -5,8 +5,8 @@
 //! or kept ephemeral for child sessions, but they are distinct from canonical
 //! version refs and committed graph state.
 
-pub(crate) mod collaborators;
 pub(crate) mod checkpoint_ops;
+pub(crate) mod collaborators;
 pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod plugin;
@@ -16,11 +16,11 @@ mod selector_reads;
 pub(crate) mod state_selector;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
-pub(crate) mod write_preparation;
+pub(crate) mod write_execution_bindings;
 pub(crate) mod write_pipeline;
+pub(crate) mod write_preparation;
 pub(crate) mod write_resolution;
 pub(crate) mod write_validation;
-pub(crate) mod write_execution_bindings;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -31,38 +31,38 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
+use crate::common::errors;
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
 use crate::contracts::surface::SurfaceRegistry;
-use crate::common::errors;
 use crate::execution::read::execute_prepared_read_program_in_committed_read_transaction;
+use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
 use crate::execution::write::{
     prepare_registered_schema_write_step, stage_prepared_write_step, SemanticWriteContext,
     TransactionCommitOutcome,
 };
-use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::image::ImageChunkWriter;
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::session::collaborators::SessionCollaborators;
-use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
-use crate::session::write_pipeline::{
-    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
-};
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
+};
+use crate::session::write_pipeline::{
+    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
 };
 use crate::session::write_preparation::{
     execute_execution_program_with_write_transaction,
     execute_parsed_statements_in_write_transaction,
 };
-use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
 #[cfg(test)]
 use crate::sql::parser::parse_sql;
 use crate::sql::parser::parse_sql_with_timing;
+use crate::sql::prepare::script::extract_explicit_transaction_script_from_statements;
 use crate::sql::prepare::{
     prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
     CommittedReadProgramContext, ExecutionProgram,
@@ -1032,10 +1032,7 @@ mod tests {
         }
 
         fn executed_sql(&self) -> Vec<String> {
-            self.executed_sql
-                .lock()
-                .expect("recorded sql lock")
-                .clone()
+            self.executed_sql.lock().expect("recorded sql lock").clone()
         }
     }
 
@@ -1391,7 +1388,10 @@ mod tests {
             );
 
             let error = session
-                .execute("INSERT INTO lix_internal_snapshot (id, content) VALUES ('x', NULL)", &[])
+                .execute(
+                    "INSERT INTO lix_internal_snapshot (id, content) VALUES ('x', NULL)",
+                    &[],
+                )
                 .await
                 .expect_err("internal storage write should be rejected before execution");
 

@@ -1,13 +1,13 @@
 use async_trait::async_trait;
 
-use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::common::paths::filesystem::NormalizedDirectoryPath;
+use crate::contracts::artifacts::FilesystemProjectionScope;
+use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
+use crate::execution::write::transaction::lookup_directory_id_by_path_in_transaction;
 use crate::execution::write::{
     install_plugin_archive_with_writer, stage_prepared_write_step, PluginInstallWriteExecutor,
     PreparedWriteExecutionStep, SemanticWriteContext,
 };
-use crate::execution::write::transaction::lookup_directory_id_by_path_in_transaction;
-use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
 use crate::session::write_pipeline::{
     ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
 };
@@ -82,7 +82,10 @@ pub(crate) async fn install_plugin_in_session(
     match install_result {
         Ok(()) => {
             let outcome = write_transaction
-                .commit_buffered_write(session.collaborators.as_ref(), context.buffered_write_execution_input())
+                .commit_buffered_write(
+                    session.collaborators.as_ref(),
+                    context.buffered_write_execution_input(),
+                )
                 .await?;
             session.apply_transaction_commit_outcome(outcome).await?;
             Ok(())

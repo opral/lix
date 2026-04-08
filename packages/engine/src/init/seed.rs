@@ -1,11 +1,11 @@
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::engine::Engine;
+use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema::builtin::storage::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
-use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parser::parse_sql;

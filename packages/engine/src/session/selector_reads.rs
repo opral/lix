@@ -6,15 +6,14 @@ use sqlparser::ast::{
     ValueWithSpan,
 };
 
+use crate::contracts::traits::PendingView;
 use crate::execution::read::{
     PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
 };
 use crate::projections::ProjectionRegistry;
-use crate::contracts::traits::PendingView;
 use crate::session::read_preparation::{
     bootstrap_prepared_public_read_collaborators,
-    prepare_required_active_public_read_artifact_with_backend,
-    PreparedPublicReadCollaborators,
+    prepare_required_active_public_read_artifact_with_backend, PreparedPublicReadCollaborators,
 };
 use crate::session::state_selector::try_resolve_state_selector_rows_with_backend;
 use crate::session::write_resolution::{WriteResolveError, WriteSelectorResolver};
@@ -73,11 +72,7 @@ impl<'a> SessionWriteSelectorResolver<'a> {
         )
         .await?;
         self.backend
-            .execute_prepared_public_read_with_pending_view(
-                self,
-                self.pending_view,
-                &artifact,
-            )
+            .execute_prepared_public_read_with_pending_view(self, self.pending_view, &artifact)
             .await
     }
 }

@@ -2,8 +2,8 @@ mod api;
 mod backend;
 mod binary_cas;
 mod boot;
-mod common;
 pub(crate) mod canonical;
+mod common;
 pub(crate) mod contracts;
 mod engine;
 pub(crate) mod execution;
@@ -13,7 +13,6 @@ mod init;
 pub mod live_state;
 mod lix;
 pub(crate) mod projections;
-mod public_surface_source_sql;
 mod runtime;
 mod schema;
 pub mod session;
@@ -44,13 +43,11 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
-pub use backend::prepared::{
-    collapse_prepared_batch_for_dialect, PreparedBatch, PreparedStatement,
-};
+pub use backend::prepared::{PreparedBatch, PreparedStatement};
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
 pub use canonical::json::CanonicalJson;
-pub use session::checkpoint_ops::CreateCheckpointResult;
+pub use common::dialect::SqlDialect;
 pub use common::error::LixError;
 pub use common::identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
@@ -59,6 +56,8 @@ pub use common::types::{ExecuteResult, QueryResult, Value};
 pub use common::wire::{WireQueryResult, WireValue};
 pub use contracts::artifacts::CommittedVersionFrontier;
 pub use contracts::artifacts::ExecuteOptions;
+pub use contracts::transaction_mode::TransactionMode;
+pub use contracts::ReplayCursor;
 #[doc(hidden)]
 pub use engine::{boot, BootArgs};
 pub use engine::{BootKeyValue, Engine};
@@ -71,16 +70,17 @@ pub use live_state::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 pub use lix::{InitResult, Lix, LixConfig};
-pub use contracts::ReplayCursor;
+pub use session::checkpoint_ops::CreateCheckpointResult;
 pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
-pub use session::{OpenSessionOptions, Session, SessionTransaction};
-#[doc(hidden)]
-pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
-#[doc(hidden)]
-pub use sql::routing::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
-pub use sql::common::dialect::SqlDialect;
-pub use contracts::transaction_mode::TransactionMode;
 pub use session::version_ops::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult, RedoOptions, RedoResult, UndoOptions, UndoResult,
+};
+pub use session::{OpenSessionOptions, Session, SessionTransaction};
+#[doc(hidden)]
+pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
+pub use sql::prepare::prepared_batch::collapse_prepared_batch_for_dialect;
+#[doc(hidden)]
+pub use sql::prepare::public_surface::routing::{
+    delay_broad_routing_for_test, BroadRoutingDelayForTestGuard,
 };

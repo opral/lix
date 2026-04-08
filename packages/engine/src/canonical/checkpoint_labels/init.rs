@@ -1,6 +1,6 @@
 use crate::init::InitExecutor;
-use crate::Value;
 use crate::LixError;
+use crate::Value;
 
 pub(crate) async fn seed_bootstrap(
     executor: &mut InitExecutor<'_, '_>,
@@ -53,8 +53,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 })?;
             let id = parsed.get("id").and_then(serde_json::Value::as_str);
             let name = parsed.get("name").and_then(serde_json::Value::as_str);
-            if id != Some(super::CHECKPOINT_LABEL_ID)
-                || name != Some(super::CHECKPOINT_LABEL_NAME)
+            if id != Some(super::CHECKPOINT_LABEL_ID) || name != Some(super::CHECKPOINT_LABEL_NAME)
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",

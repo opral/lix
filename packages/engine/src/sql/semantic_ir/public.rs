@@ -3,11 +3,11 @@ use super::canonicalize::{
 };
 use super::internal::NormalizedInternalStatements;
 use super::statement::BoundStatement;
+use crate::common::errors::schema_not_registered_error;
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
-use crate::common::errors::schema_not_registered_error;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract,
     ReadPlan, StructuredPublicRead,

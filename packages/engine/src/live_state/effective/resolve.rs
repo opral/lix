@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::schema::annotations::writer_key::WorkspaceWriterKeyReadView;
 #[cfg(test)]
 use crate::contracts::artifacts::{
     exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest,
@@ -18,6 +17,7 @@ use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
+use crate::schema::annotations::writer_key::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
 
 pub fn overlay_lanes(include_global: bool, include_untracked: bool) -> Vec<OverlayLane> {

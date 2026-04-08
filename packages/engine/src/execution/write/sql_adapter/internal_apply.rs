@@ -6,9 +6,9 @@ use crate::execution::write::filesystem::runtime::{
 use crate::execution::write::filesystem::state::filesystem_transaction_state_from_planned;
 use crate::{LixBackendTransaction, LixError};
 
+use super::runtime::{execute_internal_execution_with_transaction, SqlExecutionOutcome};
 use crate::execution::write::buffered::PlannedInternalWriteUnit;
 use crate::execution::write::WriteExecutionBindings;
-use super::runtime::{execute_internal_execution_with_transaction, SqlExecutionOutcome};
 
 pub(super) async fn run_internal_write_txn_with_transaction(
     bindings: &dyn WriteExecutionBindings,
@@ -35,11 +35,12 @@ pub(super) async fn run_internal_write_txn_with_transaction(
     )
     .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
-        bindings.persist_binary_blob_writes_in_transaction(
-            transaction,
-            &filesystem_finalization.binary_blob_writes,
-        )
-        .await?;
+        bindings
+            .persist_binary_blob_writes_in_transaction(
+                transaction,
+                &filesystem_finalization.binary_blob_writes,
+            )
+            .await?;
     }
     persist_filesystem_payload_domain_changes_direct(
         transaction,
@@ -52,18 +53,16 @@ pub(super) async fn run_internal_write_txn_with_transaction(
             .await?;
     }
 
-    bindings.persist_runtime_sequence_in_transaction(
-        transaction,
-        plan.runtime_state.functions(),
-    )
-    .await
-    .map_err(|error| LixError {
-        code: error.code,
-        description: format!(
-            "internal write runtime-sequence persistence failed inside write txn: {}",
-            error.description
-        ),
-    })?;
+    bindings
+        .persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.functions())
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "internal write runtime-sequence persistence failed inside write txn: {}",
+                error.description
+            ),
+        })?;
 
     if execution.plan_effects_override.is_none() {
         execution.plan_effects_override = Some(plan.execution.effects.clone());

@@ -1,3 +1,8 @@
+use crate::common::naming::tracked_relation_name;
+use crate::common::paths::filesystem::{
+    compose_directory_path, NormalizedDirectoryPath, ParsedFilePath,
+};
+use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
@@ -5,9 +10,6 @@ use crate::contracts::traits::{
 use crate::filesystem_projection_sql::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
-use crate::common::naming::tracked_relation_name;
-use crate::common::paths::filesystem::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
-use crate::common::text::escape_sql_string;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;

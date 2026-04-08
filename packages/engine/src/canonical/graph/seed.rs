@@ -1,5 +1,5 @@
-use crate::SqlDialect;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
+use crate::SqlDialect;
 
 pub(crate) fn build_commit_generation_seed_sql(dialect: SqlDialect) -> String {
     let (parent_join_sql, parent_value_expr) = json_array_text_join_sql(

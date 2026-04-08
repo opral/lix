@@ -7,8 +7,8 @@ use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::image::ImageChunkWriter;
 use crate::projections::ProjectionRegistry;
-use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
+use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
 };
@@ -63,7 +63,9 @@ pub(crate) trait SessionServices: Send + Sync {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait WriteExecutionCollaborators: crate::execution::write::WriteExecutionBindings {
+pub(crate) trait WriteExecutionCollaborators:
+    crate::execution::write::WriteExecutionBindings
+{
     fn projection_registry(&self) -> &ProjectionRegistry;
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
@@ -207,8 +209,7 @@ impl SessionCollaborators {
         session: &crate::Session,
         options: crate::UndoOptions,
     ) -> Result<crate::UndoResult, LixError> {
-        crate::session::version_ops::undo_redo::undo_with_options_in_session(session, options)
-            .await
+        crate::session::version_ops::undo_redo::undo_with_options_in_session(session, options).await
     }
 
     pub(crate) async fn redo_with_options_in_session(
@@ -216,8 +217,7 @@ impl SessionCollaborators {
         session: &crate::Session,
         options: crate::RedoOptions,
     ) -> Result<crate::RedoResult, LixError> {
-        crate::session::version_ops::undo_redo::redo_with_options_in_session(session, options)
-            .await
+        crate::session::version_ops::undo_redo::redo_with_options_in_session(session, options).await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {

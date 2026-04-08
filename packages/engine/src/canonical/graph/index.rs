@@ -5,7 +5,6 @@ use serde_json::Value as JsonValue;
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::canonical::journal::CanonicalCommitOutput;
 use crate::canonical::read::CommitQueryExecutor;
-use crate::sql::support::bind_sql;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 
@@ -68,19 +67,18 @@ pub(crate) fn build_commit_graph_node_prepared_batch(
 ) -> Result<PreparedBatch, LixError> {
     let mut batch = PreparedBatch { steps: Vec::new() };
     for row in rows {
-        let bound = bind_sql(
-            "INSERT INTO lix_internal_commit_graph_node (commit_id, generation) \
-             VALUES (?1, ?2) \
-             ON CONFLICT (commit_id) DO UPDATE SET generation = excluded.generation",
-            &[
+        let p1 = dialect.placeholder(1);
+        let p2 = dialect.placeholder(2);
+        batch.push_statement(PreparedStatement {
+            sql: format!(
+                "INSERT INTO lix_internal_commit_graph_node (commit_id, generation) \
+                 VALUES ({p1}, {p2}) \
+                 ON CONFLICT (commit_id) DO UPDATE SET generation = excluded.generation"
+            ),
+            params: vec![
                 EngineValue::Text(row.commit_id.clone()),
                 EngineValue::Integer(row.generation),
             ],
-            dialect,
-        )?;
-        batch.push_statement(PreparedStatement {
-            sql: bound.sql,
-            params: bound.params,
         });
     }
     Ok(batch)
@@ -131,15 +129,14 @@ async fn load_commit_graph_generation_with_executor(
     executor: &mut dyn CommitQueryExecutor,
     commit_id: &str,
 ) -> Result<Option<i64>, LixError> {
-    let bound = bind_sql(
-        &format!(
-            "SELECT generation FROM {table} WHERE commit_id = ?1",
-            table = COMMIT_GRAPH_NODE_TABLE
-        ),
-        &[EngineValue::Text(commit_id.to_string())],
-        executor.dialect(),
-    )?;
-    let result = executor.execute(&bound.sql, &bound.params).await?;
+    let dialect = executor.dialect();
+    let p1 = dialect.placeholder(1);
+    let sql = format!(
+        "SELECT generation FROM {table} WHERE commit_id = {p1}",
+        table = COMMIT_GRAPH_NODE_TABLE
+    );
+    let params = vec![EngineValue::Text(commit_id.to_string())];
+    let result = executor.execute(&sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };

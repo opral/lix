@@ -24,7 +24,9 @@ pub(crate) async fn execute_prepared_read_program_in_committed_read_transaction(
         results.push(result);
     }
 
-    Ok(ExecuteResult { statements: results })
+    Ok(ExecuteResult {
+        statements: results,
+    })
 }
 
 async fn execute_prepared_read_step_in_transaction(
@@ -74,7 +76,9 @@ async fn execute_prepared_internal_read_artifact_in_transaction(
         columns: Vec::new(),
     };
     for statement in &internal.prepared_batch.steps {
-        internal_result = transaction.execute(&statement.sql, &statement.params).await?;
+        internal_result = transaction
+            .execute(&statement.sql, &statement.params)
+            .await?;
     }
     Ok(public_result_from_contract(
         internal.result_contract,

@@ -70,7 +70,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let graph_count_result = self
             .execute_backend(
                 &format!(
-                "SELECT COUNT(*) FROM {}",
+                    "SELECT COUNT(*) FROM {}",
                     crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE
                 ),
                 &[],

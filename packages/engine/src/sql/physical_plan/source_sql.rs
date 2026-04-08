@@ -1,12 +1,12 @@
 //! Compiler-owned public surface source SQL builders.
 
-use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
 use crate::schema::access::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
     snapshot_select_expr_for_schema, tracked_relation_name,
 };
+use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_payload_alias, entity_surface_uses_payload_alias, escape_sql_string,
     expr_contains_string_literal, json_array_text_join_sql, quote_ident, render_identifier,

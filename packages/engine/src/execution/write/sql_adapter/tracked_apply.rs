@@ -1,17 +1,15 @@
 use std::collections::BTreeSet;
 
+use crate::contracts::artifacts::{PendingPublicCommitSession, PlanEffects, SessionStateDelta};
 use crate::contracts::change::TrackedDomainChangeView;
-use crate::contracts::artifacts::{
-    PendingPublicCommitSession, PlanEffects, SessionStateDelta,
-};
 use crate::contracts::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, StateCommitStreamRuntimeMetadata,
 };
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
+use super::runtime::{empty_public_write_execution_outcome, SqlExecutionOutcome};
 use crate::execution::write::buffered::TrackedTxnUnit;
 use crate::execution::write::WriteExecutionBindings;
-use super::runtime::{empty_public_write_execution_outcome, SqlExecutionOutcome};
 
 pub(super) async fn run_public_tracked_append_txn_with_transaction(
     bindings: &dyn WriteExecutionBindings,

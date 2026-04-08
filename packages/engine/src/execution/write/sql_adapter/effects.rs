@@ -8,8 +8,7 @@ use crate::execution::write::buffered::{
     BufferedWriteSessionEffects,
 };
 use crate::execution::write::filesystem::runtime::{
-    compile_filesystem_finalization_from_state_in_transaction,
-    merge_filesystem_transaction_state,
+    compile_filesystem_finalization_from_state_in_transaction, merge_filesystem_transaction_state,
     persist_filesystem_payload_domain_changes_in_transaction,
 };
 use crate::execution::write::filesystem::state::filesystem_transaction_state_from_planned;
@@ -119,18 +118,16 @@ pub(crate) async fn complete_sql_command_execution(
                 &filesystem_state,
             );
         if !filesystem_payload_changes_already_committed {
-            bindings.persist_binary_blob_writes_in_transaction(
-                transaction,
-                &binary_blob_writes,
-            )
-            .await
-            .map_err(|error| LixError {
-                code: error.code,
-                description: format!(
-                    "transaction pending filesystem payload persistence failed: {}",
-                    error.description
-                ),
-            })?;
+            bindings
+                .persist_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
+                .await
+                .map_err(|error| LixError {
+                    code: error.code,
+                    description: format!(
+                        "transaction pending filesystem payload persistence failed: {}",
+                        error.description
+                    ),
+                })?;
         }
         let filesystem_finalization = if filesystem_payload_changes_already_committed {
             None
@@ -187,18 +184,16 @@ pub(crate) async fn complete_sql_command_execution(
     }
 
     if !write_handled_by_planned_write {
-        bindings.persist_runtime_sequence_in_transaction(
-            transaction,
-            step.runtime_state().functions(),
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "transaction runtime-sequence persistence failed: {}",
-                error.description
-            ),
-        })?;
+        bindings
+            .persist_runtime_sequence_in_transaction(transaction, step.runtime_state().functions())
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "transaction runtime-sequence persistence failed: {}",
+                    error.description
+                ),
+            })?;
     }
 
     Ok(BufferedWriteExecutionResult {

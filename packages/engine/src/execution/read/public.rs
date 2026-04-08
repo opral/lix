@@ -1,13 +1,11 @@
 use crate::backend::TransactionBackendAdapter;
+use crate::common::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::contracts::artifacts::{
     PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
 use crate::contracts::surface::SurfaceReadFreshness;
-use crate::contracts::traits::{
-    LiveStateQueryBackend, PendingPublicReadTransaction, PendingView,
-};
-use crate::common::errors::classification::sanitize_lowered_public_sql_error_description;
+use crate::contracts::traits::{LiveStateQueryBackend, PendingPublicReadTransaction, PendingView};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
@@ -44,9 +42,7 @@ pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     ensure_surface_read_freshness_in_transaction(transaction, artifact).await?;
     let backend = TransactionBackendAdapter::new(transaction);
     execute_prepared_public_read_artifact_without_freshness_check_with_backend(
-        &backend,
-        bindings,
-        artifact,
+        &backend, bindings, artifact,
     )
     .await
 }
@@ -70,9 +66,7 @@ pub(crate) async fn execute_prepared_public_read_artifact_with_backend(
 ) -> Result<QueryResult, LixError> {
     ensure_surface_read_freshness(backend, artifact).await?;
     execute_prepared_public_read_artifact_without_freshness_check_with_backend(
-        backend,
-        bindings,
-        artifact,
+        backend, bindings, artifact,
     )
     .await
 }

@@ -13,8 +13,8 @@ use crate::live_state::{
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::TransactionBackendAdapter;
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::context::{
@@ -100,8 +100,7 @@ async fn merge_version_in_transaction(
         normalize_required_text(options.source_version_id, "source_version_id")?;
     let target_version_id =
         normalize_required_text(options.target_version_id, "target_version_id")?;
-    if source_version_id == GLOBAL_VERSION_ID || target_version_id == GLOBAL_VERSION_ID
-    {
+    if source_version_id == GLOBAL_VERSION_ID || target_version_id == GLOBAL_VERSION_ID {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "merge_version does not support the reserved 'global' version",

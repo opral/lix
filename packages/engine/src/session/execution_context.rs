@@ -7,11 +7,11 @@ use std::sync::Mutex;
 
 use crate::contracts::artifacts::{ExecuteOptions, SessionStateDelta};
 use crate::contracts::surface::SurfaceRegistry;
+use crate::execution::write::BufferedWriteExecutionInput;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::binder::RuntimeBindingValues;
 #[cfg(test)]
 use crate::sql::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};
-use crate::execution::write::BufferedWriteExecutionInput;
 use crate::LixError;
 
 pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;

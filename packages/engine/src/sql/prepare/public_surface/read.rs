@@ -31,7 +31,7 @@ use crate::sql::physical_plan::{
     CompilerOwnedPublicReadExecutionSelection, LoweredReadProgram, LoweredResultColumn,
     LoweredResultColumns, PreparedPublicReadExecution, SpecializedPublicReadArtifactSelection,
 };
-use crate::sql::routing::{
+use crate::sql::prepare::public_surface::routing::{
     route_broad_public_read_statement_with_known_live_layouts, route_public_read_execution_strategy,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_bound_public_surface_bindings;

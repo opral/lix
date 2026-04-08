@@ -34,12 +34,12 @@ mod tests {
     use super::ProjectionTrait;
     use crate::projections::{
         DerivedRow, ProjectionHydratedRow, ProjectionInput, ProjectionInputRows,
-        ProjectionInputSpec, ProjectionLifecycle, ProjectionRegistration,
-        ProjectionSurfaceSpec,
+        ProjectionInputSpec, ProjectionLifecycle, ProjectionRegistration, ProjectionSurfaceSpec,
     };
     use crate::Value;
     use crate::{
-        contracts::artifacts::RowIdentity, contracts::artifacts::UntrackedRow,
+        contracts::artifacts::RowIdentity,
+        contracts::artifacts::UntrackedRow,
         contracts::surface::{SurfaceFamily, SurfaceVariant},
     };
 
@@ -154,10 +154,7 @@ mod tests {
             metadata: None,
             writer_key: None,
             created_at: "2026-01-01T00:00:00.000Z".into(),
-            values: BTreeMap::from([(
-                "version_id".to_string(),
-                Value::Text("version-1".into()),
-            )]),
+            values: BTreeMap::from([("version_id".to_string(), Value::Text("version-1".into()))]),
             updated_at: "2026-01-01T00:00:00.000Z".into(),
         }
     }

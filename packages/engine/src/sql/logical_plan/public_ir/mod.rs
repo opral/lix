@@ -181,7 +181,6 @@ impl CanonicalAdminScan {
     }
 }
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PredicateSpec {
     pub(crate) sql: String,

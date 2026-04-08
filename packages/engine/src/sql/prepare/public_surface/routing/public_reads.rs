@@ -14,7 +14,7 @@ use crate::sql::logical_plan::public_ir::{
     BroadSqlFunctionArguments,
 };
 use crate::sql::physical_plan::lowerer::broad_public_relation_supports_terminal_render;
-use crate::sql::routing::registry::{
+use crate::sql::prepare::public_surface::routing::registry::{
     run_fallible_pass, run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome,
     RoutingPassRegistry, RoutingPassSettings, RoutingPassTrace,
 };

@@ -1,8 +1,8 @@
+use crate::backend::storage_sql::tables;
 use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE, INTERNAL_BINARY_FILE_VERSION_REF,
 };
-use crate::sql::storage::tables;
 use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 
 #[async_trait::async_trait(?Send)]

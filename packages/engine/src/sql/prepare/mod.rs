@@ -13,9 +13,11 @@ pub(crate) mod derive_requirements;
 pub(crate) mod execution_program;
 pub(crate) mod filesystem_insert_ids;
 pub(crate) mod intent;
+pub(crate) mod prepared_batch;
 mod prepared_read;
 pub(crate) mod preprocess;
-mod public_surface;
+pub(crate) mod public_surface;
+pub(crate) mod script;
 
 pub(crate) use compile::{
     compile_execution_from_template_instance_with_context, PreparationPolicy,

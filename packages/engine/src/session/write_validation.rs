@@ -17,6 +17,9 @@ use serde_json::Value as JsonValue;
 use crate::canonical::checkpoint_labels::{
     CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
 };
+use crate::common::identity::{
+    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
+};
 use crate::contracts::artifacts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
     LiveSnapshotStorage, MutationOperation, MutationRow, PlannedStateRow,
@@ -25,9 +28,6 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend};
-use crate::common::identity::{
-    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
-};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
     SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,

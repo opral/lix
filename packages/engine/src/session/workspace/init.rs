@@ -1,5 +1,5 @@
-use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::backend::ddl::execute_ddl_batch;
+use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {

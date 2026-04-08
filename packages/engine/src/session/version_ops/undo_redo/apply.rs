@@ -15,12 +15,12 @@ use crate::session::version_ops::commit::{
 };
 use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
 
-use super::{RedoResult, UndoResult, UNDO_REDO_OPERATION_TABLE};
 use super::super::context::{
     exact_current_head_preconditions, load_version_context_with_executor,
     require_target_version_context_in_transaction, resolve_target_version_in_transaction,
     ResolvedVersionTarget, VersionContextSource,
 };
+use super::{RedoResult, UndoResult, UNDO_REDO_OPERATION_TABLE};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UndoRedoOperationKind {

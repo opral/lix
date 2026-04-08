@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
-use crate::contracts::artifacts::{LiveStateMode, LiveStateProjectionStatus};
 use crate::backend::ddl::add_column_if_missing;
 use crate::common::errors::classification::is_missing_relation_error;
+use crate::contracts::artifacts::{LiveStateMode, LiveStateProjectionStatus};
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, QueryResult,
     ReplayCursor, Value,
@@ -179,7 +179,9 @@ pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
     match evaluate_live_state_snapshot(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
         LiveStateReadiness::Uninitialized => Err(crate::common::errors::not_initialized_error()),
-        LiveStateReadiness::NeedsRebuild => Err(crate::common::errors::live_state_not_ready_error()),
+        LiveStateReadiness::NeedsRebuild => {
+            Err(crate::common::errors::live_state_not_ready_error())
+        }
     }
 }
 
@@ -190,7 +192,9 @@ pub(crate) async fn require_ready_in_transaction(
     match evaluate_live_state_transaction_eligibility(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
         LiveStateReadiness::Uninitialized => Err(crate::common::errors::not_initialized_error()),
-        LiveStateReadiness::NeedsRebuild => Err(crate::common::errors::live_state_not_ready_error()),
+        LiveStateReadiness::NeedsRebuild => {
+            Err(crate::common::errors::live_state_not_ready_error())
+        }
     }
 }
 

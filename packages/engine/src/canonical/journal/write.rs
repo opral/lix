@@ -6,7 +6,6 @@
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
 use crate::runtime::functions::LixFunctionProvider;
-use crate::sql::support::bind_sql;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, LixError, SqlDialect, Value,
@@ -100,10 +99,13 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
     let mut prepared = PreparedBatch { steps: Vec::new() };
 
     if ensure_no_content {
+        let p1 = dialect.placeholder(1);
         push_bound_statement(
             &mut prepared,
-            "INSERT INTO lix_internal_snapshot (id, content) VALUES (?1, NULL) \
-             ON CONFLICT (id) DO UPDATE SET content = excluded.content",
+            &format!(
+                "INSERT INTO lix_internal_snapshot (id, content) VALUES ({p1}, NULL) \
+                 ON CONFLICT (id) DO UPDATE SET content = excluded.content"
+            ),
             vec![Value::Text("no-content".to_string())],
             dialect,
         )?;
@@ -119,8 +121,8 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
         dialect,
         |row, next_placeholder, params| {
             vec![
-                text_param_value(&row.id, next_placeholder, params),
-                text_param_value(&row.content, next_placeholder, params),
+                text_param_value(&row.id, next_placeholder, params, dialect),
+                text_param_value(&row.content, next_placeholder, params, dialect),
             ]
         },
     )?;
@@ -145,15 +147,20 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
         dialect,
         |row, next_placeholder, params| {
             vec![
-                text_param_value(&row.id, next_placeholder, params),
-                text_param_value(&row.entity_id, next_placeholder, params),
-                text_param_value(&row.schema_key, next_placeholder, params),
-                text_param_value(&row.schema_version, next_placeholder, params),
-                text_param_value(&row.file_id, next_placeholder, params),
-                text_param_value(&row.plugin_key, next_placeholder, params),
-                text_param_value(&row.snapshot_id, next_placeholder, params),
-                optional_text_param_value(row.metadata.as_deref(), next_placeholder, params),
-                text_param_value(&row.created_at, next_placeholder, params),
+                text_param_value(&row.id, next_placeholder, params, dialect),
+                text_param_value(&row.entity_id, next_placeholder, params, dialect),
+                text_param_value(&row.schema_key, next_placeholder, params, dialect),
+                text_param_value(&row.schema_version, next_placeholder, params, dialect),
+                text_param_value(&row.file_id, next_placeholder, params, dialect),
+                text_param_value(&row.plugin_key, next_placeholder, params, dialect),
+                text_param_value(&row.snapshot_id, next_placeholder, params, dialect),
+                optional_text_param_value(
+                    row.metadata.as_deref(),
+                    next_placeholder,
+                    params,
+                    dialect,
+                ),
+                text_param_value(&row.created_at, next_placeholder, params, dialect),
             ]
         },
     )?;
@@ -222,30 +229,35 @@ fn push_bound_statement(
     prepared: &mut PreparedBatch,
     sql: &str,
     params: Vec<Value>,
-    dialect: SqlDialect,
+    _dialect: SqlDialect,
 ) -> Result<(), LixError> {
-    let bound = bind_sql(sql, &params, dialect)?;
     prepared.push_statement(PreparedStatement {
-        sql: bound.sql,
-        params: bound.params,
+        sql: sql.to_string(),
+        params,
     });
     Ok(())
 }
 
-fn text_param_value(value: &str, next_placeholder: &mut usize, params: &mut Vec<Value>) -> String {
+fn text_param_value(
+    value: &str,
+    next_placeholder: &mut usize,
+    params: &mut Vec<Value>,
+    dialect: SqlDialect,
+) -> String {
     let index = *next_placeholder;
     *next_placeholder += 1;
     params.push(Value::Text(value.to_string()));
-    format!("?{index}")
+    dialect.placeholder(index)
 }
 
 fn optional_text_param_value(
     value: Option<&str>,
     next_placeholder: &mut usize,
     params: &mut Vec<Value>,
+    dialect: SqlDialect,
 ) -> String {
     match value {
-        Some(value) => text_param_value(value, next_placeholder, params),
+        Some(value) => text_param_value(value, next_placeholder, params, dialect),
         None => "NULL".to_string(),
     }
 }

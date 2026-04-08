@@ -7,9 +7,9 @@ use crate::execution::write::buffered::{
     TransactionCoordinator,
 };
 use crate::execution::write::{
-    append_observe_tick_in_transaction, BufferedWriteExecutionInput, PendingTransactionView,
-    PreparedWriteStepStager, SqlExecutionOutcome, TransactionCommitOutcome,
-    execute_planned_write_delta, WriteExecutionBindings,
+    append_observe_tick_in_transaction, execute_planned_write_delta, BufferedWriteExecutionInput,
+    PendingTransactionView, PreparedWriteStepStager, SqlExecutionOutcome, TransactionCommitOutcome,
+    WriteExecutionBindings,
 };
 use crate::{LixBackendTransaction, LixError};
 
@@ -116,7 +116,8 @@ impl<'a> BufferedWriteTransaction<'a> {
             return Ok(());
         };
         let transaction = self.coordinator.backend_transaction_mut()?;
-        apply_schema_registrations_in_transaction(transaction, delta.schema_registrations()).await?;
+        apply_schema_registrations_in_transaction(transaction, delta.schema_registrations())
+            .await?;
         let execution = execute_planned_write_delta(
             bindings,
             transaction,

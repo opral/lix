@@ -5,8 +5,8 @@
 //! registrations generically. Built-in registry assembly lives here, above the
 //! generic `live_state` executor.
 
-use std::sync::OnceLock;
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 pub(crate) mod artifacts;
 pub(crate) mod filesystem;

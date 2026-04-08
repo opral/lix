@@ -79,9 +79,7 @@ pub(crate) fn object_name_is_internal_storage_relation(name: &ObjectName) -> boo
 pub(crate) fn object_name_is_protected_builtin_ddl_target(name: &ObjectName) -> bool {
     matches!(
         classify_builtin_object_name(name),
-        Some(
-            RelationPolicy::InternalStorage | RelationPolicy::ProtectedBuiltinPublicSurface
-        )
+        Some(RelationPolicy::InternalStorage | RelationPolicy::ProtectedBuiltinPublicSurface)
     )
 }
 
@@ -186,8 +184,8 @@ mod tests {
     use super::{
         builtin_internal_exact_relation_names, builtin_internal_relation_families,
         builtin_relation_inventory, classify_builtin_relation_name, classify_relation_name,
-        protected_builtin_public_surface_names, relation_policy_choice_summary,
-        RelationPolicy, RelationPolicyModel, RELATION_POLICY_MODEL,
+        protected_builtin_public_surface_names, relation_policy_choice_summary, RelationPolicy,
+        RelationPolicyModel, RELATION_POLICY_MODEL,
     };
 
     #[test]
@@ -259,7 +257,10 @@ mod tests {
         assert!(exact_relations.contains(&crate::canonical::journal::SNAPSHOT_TABLE));
         assert!(exact_relations.contains(&crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE));
 
-        let unique = exact_relations.iter().copied().collect::<std::collections::BTreeSet<_>>();
+        let unique = exact_relations
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(unique.len(), exact_relations.len());
     }
 
@@ -291,8 +292,7 @@ mod tests {
             RelationPolicyModel::SemanticInternalObjects
         );
         assert!(
-            relation_policy_choice_summary()
-                .contains("not as a public reserved SQL namespace"),
+            relation_policy_choice_summary().contains("not as a public reserved SQL namespace"),
             "relation policy owner should document the semantic internal-object model"
         );
     }
