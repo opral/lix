@@ -1,5 +1,4 @@
-use crate::contracts::artifacts::{DerivedRow, ProjectionLifecycle};
-use crate::contracts::projection::{ProjectionRegistry, RegisteredProjection};
+use crate::projections::{DerivedRow, ProjectionLifecycle, ProjectionRegistry, RegisteredProjection};
 use crate::live_state::projection::hydration::hydrate_projection_input_with_backend;
 use crate::{LixBackend, LixError};
 

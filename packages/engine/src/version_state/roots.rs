@@ -1,7 +1,7 @@
 //! Replica-local root resolution over committed version-head state.
 //!
 //! This module maps requested lineage scopes and version scopes onto the local
-//! committed heads selected by `version/heads.rs`.
+//! committed heads selected by `version_state/heads.rs`.
 
 use crate::backend::QueryExecutor;
 use crate::{LixBackend, LixError};

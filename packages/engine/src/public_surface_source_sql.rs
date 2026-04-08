@@ -13,7 +13,7 @@ use crate::sql::physical_plan::public_surface_sql_support::{
     render_qualified_where_clause_sql, render_where_clause_sql,
     split_effective_state_pushdown_predicates,
 };
-use crate::version_artifacts::{
+use crate::version_state::{
     version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, SqlDialect};

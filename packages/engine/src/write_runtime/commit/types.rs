@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::journal::CanonicalCommitOutput;
-use crate::canonical::read::VersionInfo;
 use crate::contracts::change::TrackedDomainChangeView;
+use crate::session::version_ops::VersionInfo;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, VersionId,

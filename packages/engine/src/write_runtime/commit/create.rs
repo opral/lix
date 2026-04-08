@@ -8,14 +8,17 @@ use crate::canonical::journal::{
     build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
 };
 use crate::canonical::read::{
-    load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
-    CommitQueryExecutor, ExactCommittedStateRowRequest, VersionInfo, VersionSnapshot,
+    CommitQueryExecutor, ExactCommittedStateRowRequest,
 };
 use crate::canonical::json::CanonicalJson;
 use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
 use crate::contracts::functions::LixFunctionProvider;
 use crate::transaction_execution::execute_write_program_with_transaction;
-use crate::version_artifacts::{
+use crate::session::version_ops::{
+    load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
+    VersionInfo, VersionSnapshot,
+};
+use crate::version_state::{
     load_committed_version_head_commit_id, version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
 use crate::write_runtime::filesystem::runtime::{
@@ -1344,7 +1347,7 @@ mod tests {
         init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::version_artifacts::GLOBAL_VERSION_ID;
+    use crate::version_state::GLOBAL_VERSION_ID;
     use crate::write_runtime::commit::UpdatedVersionRef;
     use crate::write_runtime::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState,
@@ -1493,19 +1496,19 @@ mod tests {
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
             file_id: Some(
-                crate::version_artifacts::version_descriptor_file_id()
+                crate::version_state::version_descriptor_file_id()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
             plugin_key: Some(
-                crate::version_artifacts::version_descriptor_plugin_key()
+                crate::version_state::version_descriptor_plugin_key()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
             snapshot_content: Some(
-                crate::version_artifacts::version_descriptor_snapshot_content(
+                crate::version_state::version_descriptor_snapshot_content(
                     "version-a",
                     "Version A",
                     false,
@@ -1797,7 +1800,7 @@ mod tests {
             .to_string(),
             "current_head_fingerprint",
             "fp-1",
-            &crate::version_artifacts::version_ref_snapshot_content("version-a", "commit-456"),
+            &crate::version_state::version_ref_snapshot_content("version-a", "commit-456"),
             "commit-456",
         )
         .await;

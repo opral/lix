@@ -49,7 +49,7 @@ use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
 };
-use crate::version_artifacts::{
+use crate::version_state::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
 };
@@ -1715,7 +1715,7 @@ mod tests {
         semantic_ir::ExecutionContext,
     };
     use crate::test_support::{seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend};
-    use crate::version_artifacts::{
+    use crate::version_state::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,

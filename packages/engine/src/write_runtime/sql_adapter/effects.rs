@@ -4,7 +4,7 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::state_commit_stream::should_invalidate_deterministic_settings_cache;
 use crate::common::text::escape_sql_string;
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
     BufferedWriteSessionEffects,

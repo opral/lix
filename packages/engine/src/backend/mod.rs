@@ -10,11 +10,10 @@ use std::collections::BTreeMap;
 
 use crate::backend::prepared::PreparedBatch;
 use crate::contracts::traits::SqlPreparationMetadataReader;
+use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
 use crate::sql::common::dialect::SqlDialect;
+use crate::version_state::load_local_version_ref_heads_map_with_executor;
 pub use crate::transaction_mode::TransactionMode;
-use crate::version::{
-    load_local_version_head_commit_id_with_executor, load_local_version_ref_heads_map_with_executor,
-};
 use crate::{LixError, QueryResult, Value};
 pub use image::{ImageChunkReader, ImageChunkWriter};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
@@ -236,7 +235,13 @@ async fn load_active_history_root_commit_id_for_preparation_with_executor(
     executor: &mut dyn QueryExecutor,
     active_version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    match load_local_version_head_commit_id_with_executor(executor, active_version_id).await {
+    match load_target_version_history_root_commit_id_with_executor(
+        executor,
+        Some(active_version_id),
+        "active_version_id",
+    )
+    .await
+    {
         Ok(commit_id) => Ok(commit_id),
         Err(error)
             if error

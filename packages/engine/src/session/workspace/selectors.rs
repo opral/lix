@@ -1,4 +1,4 @@
-use crate::version_inventory_sql::build_admin_version_source_sql;
+use crate::version_state::inventory::build_admin_version_source_sql;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";

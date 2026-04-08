@@ -1,13 +1,14 @@
 use crate::backend::{LixBackend, QueryExecutor};
-use crate::canonical::read::{version_exists_with_backend, version_exists_with_executor};
 use crate::runtime::TransactionBackendAdapter;
 use crate::session::workspace::require_workspace_active_version_id;
-use crate::version::load_committed_version_ref_with_executor;
+use crate::version_state::load_committed_version_ref_with_executor;
 use crate::write_runtime::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
     CreateCommitWriteLane,
 };
 use crate::{LixError, SessionTransaction};
+
+use super::descriptors::{version_exists_with_backend, version_exists_with_executor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VersionContextSource {
@@ -44,6 +45,7 @@ impl VersionContext {
         &self.head_commit_id
     }
 
+    #[allow(dead_code)]
     pub(crate) fn history_root_commit_id(&self) -> &str {
         &self.history_root_commit_id
     }
@@ -189,6 +191,7 @@ pub(crate) async fn require_target_version_context_in_transaction(
     require_version_context_with_executor(&mut executor, target, subject).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn require_target_version_context_with_backend(
     backend: &dyn LixBackend,
     requested_version_id: Option<&str>,
@@ -201,6 +204,7 @@ pub(crate) async fn require_target_version_context_with_backend(
     require_version_context_with_executor(&mut executor, target, subject).await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn load_target_version_context_with_backend(
     backend: &dyn LixBackend,
     requested_version_id: Option<&str>,
@@ -212,16 +216,42 @@ pub(crate) async fn load_target_version_context_with_backend(
     load_version_context_with_executor(&mut executor, target).await
 }
 
+pub(crate) async fn load_target_version_history_root_commit_id_with_executor(
+    executor: &mut dyn QueryExecutor,
+    requested_version_id: Option<&str>,
+    field_name: &str,
+) -> Result<Option<String>, LixError> {
+    let target = match normalize_optional_version_id(requested_version_id, field_name)? {
+        Some(version_id) => ResolvedVersionTarget {
+            version_id,
+            source: VersionContextSource::ExplicitArgument,
+        },
+        None => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("{field_name} must be provided"),
+            ));
+        }
+    };
+
+    Ok(load_version_context_with_executor(executor, target)
+        .await?
+        .map(|context| context.history_root_commit_id().to_string()))
+}
+
+#[allow(dead_code)]
 pub(crate) async fn load_target_version_history_root_commit_id_with_backend(
     backend: &dyn LixBackend,
     requested_version_id: Option<&str>,
     field_name: &str,
 ) -> Result<Option<String>, LixError> {
-    Ok(
-        load_target_version_context_with_backend(backend, requested_version_id, field_name)
-            .await?
-            .map(|context| context.history_root_commit_id().to_string()),
+    let mut executor = backend;
+    load_target_version_history_root_commit_id_with_executor(
+        &mut executor,
+        requested_version_id,
+        field_name,
     )
+    .await
 }
 
 pub(crate) async fn require_version_context_pair_in_transaction(

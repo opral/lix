@@ -9,8 +9,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::common::errors::classification::is_missing_relation_error;
 use crate::schema::builtin::types::LixCommit;
-use crate::version::load_local_version_head_commit_id_with_executor;
-use crate::{LixBackend, LixError, Value, VersionId};
+use crate::{LixError, Value};
 
 /// Canonical committed row resolved from commit-graph facts plus local
 /// version-head selection.
@@ -57,79 +56,7 @@ pub(crate) struct ExactCommittedStateRowRequest {
     pub(crate) exact_filters: BTreeMap<String, Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionSnapshot {
-    pub id: VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VersionInfo {
-    pub parent_commit_ids: Vec<String>,
-    pub snapshot: VersionSnapshot,
-}
-
 pub(crate) use crate::backend::QueryExecutor as CommitQueryExecutor;
-
-pub(crate) async fn load_version_info_for_versions(
-    executor: &mut dyn CommitQueryExecutor,
-    version_ids: &BTreeSet<String>,
-) -> Result<BTreeMap<String, VersionInfo>, LixError> {
-    let mut versions = BTreeMap::new();
-    if version_ids.is_empty() {
-        return Ok(versions);
-    }
-
-    for version_id in version_ids {
-        versions.insert(
-            version_id.clone(),
-            VersionInfo {
-                parent_commit_ids: Vec::new(),
-                snapshot: VersionSnapshot {
-                    id: VersionId::new(version_id.clone())?,
-                },
-            },
-        );
-    }
-    for version_id in version_ids {
-        if let Some(commit_id) =
-            load_local_version_head_commit_id_with_executor(executor, version_id).await?
-        {
-            versions.insert(
-                version_id.clone(),
-                VersionInfo {
-                    parent_commit_ids: vec![commit_id],
-                    snapshot: VersionSnapshot {
-                        id: VersionId::new(version_id.clone())?,
-                    },
-                },
-            );
-        }
-    }
-
-    Ok(versions)
-}
-
-pub(crate) async fn load_exact_committed_state_row_at_version_head(
-    backend: &dyn LixBackend,
-    request: &ExactCommittedStateRowRequest,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let mut executor = backend;
-    load_exact_committed_state_row_at_version_head_with_executor(&mut executor, request).await
-}
-
-pub(crate) async fn load_exact_committed_state_row_at_version_head_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
-    request: &ExactCommittedStateRowRequest,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let Some(head_commit_id) =
-        load_local_version_head_commit_id_with_executor(executor, &request.version_id).await?
-    else {
-        return Ok(None);
-    };
-
-    load_exact_committed_state_row_from_commit_with_executor(executor, &head_commit_id, request)
-        .await
-}
 
 pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
     executor: &mut dyn CommitQueryExecutor,
@@ -429,6 +356,8 @@ mod tests {
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::session::version_ops::committed_state::load_exact_committed_state_row_at_version_head;
+    use crate::version_state::load_local_version_head_commit_id_with_executor;
     use std::collections::BTreeMap;
 
     async fn init_state_source_backend() -> TestSqliteBackend {

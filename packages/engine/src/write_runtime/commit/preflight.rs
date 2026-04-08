@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
 use crate::schema::builtin::storage::key_value_schema_key;
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::deterministic_sequence_key;
 use crate::write_runtime::filesystem::runtime::{
     ExactFilesystemDescriptorState, FilesystemDescriptorState, FILESYSTEM_DESCRIPTOR_FILE_ID,
@@ -10,10 +10,8 @@ use crate::write_runtime::filesystem::runtime::{
 };
 use crate::{LixError, Value};
 
-use crate::canonical::read::{
-    load_exact_committed_state_row_at_version_head_with_executor, CommitQueryExecutor,
-    ExactCommittedStateRowRequest,
-};
+use crate::canonical::read::{CommitQueryExecutor, ExactCommittedStateRowRequest};
+use crate::session::version_ops::load_exact_committed_state_row_at_version_head_with_executor;
 
 pub(crate) async fn load_create_commit_deterministic_sequence_start(
     executor: &mut dyn CommitQueryExecutor,

@@ -8,12 +8,12 @@
 
 use std::collections::BTreeMap;
 
-use crate::contracts::artifacts::{
-    DerivedRow, ProjectionHydratedRow, ProjectionInput, ProjectionInputSpec, ProjectionLifecycle,
-    ProjectionRegistration, ProjectionSurfaceSpec, RowIdentity, UntrackedRow,
-};
+use crate::contracts::artifacts::{RowIdentity, UntrackedRow};
 use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
-use crate::contracts::traits::ProjectionTrait;
+use crate::projections::{
+    DerivedRow, ProjectionHydratedRow, ProjectionInput, ProjectionInputSpec, ProjectionLifecycle,
+    ProjectionRegistration, ProjectionSurfaceSpec, ProjectionTrait,
+};
 use crate::{LixError, Value};
 
 const VERSION_SURFACE_NAME: &str = "lix_version";
@@ -123,11 +123,11 @@ mod tests {
         builtin_lix_version_registration, LixVersionProjection, VERSION_DESCRIPTOR_SCHEMA_KEY,
         VERSION_REF_SCHEMA_KEY, VERSION_SURFACE_NAME,
     };
-    use crate::contracts::artifacts::{
+    use crate::contracts::artifacts::{TrackedRow, UntrackedRow};
+    use crate::projections::{
         ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
-        ProjectionLifecycle, ProjectionRegistration, TrackedRow, UntrackedRow,
+        ProjectionLifecycle, ProjectionRegistration, ProjectionTrait,
     };
-    use crate::contracts::traits::ProjectionTrait;
     use crate::Value;
 
     #[test]

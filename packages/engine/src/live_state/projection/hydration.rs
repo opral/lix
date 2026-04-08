@@ -1,12 +1,11 @@
-use crate::contracts::artifacts::{
-    ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
-    ProjectionInputVersionScope, ProjectionStorageKind,
-};
-use crate::contracts::traits::ProjectionTrait;
 use crate::live_state::shared::version_heads::load_current_committed_version_frontier_with_backend;
 use crate::live_state::{
     scan_tracked_rows_with_backend, scan_untracked_rows_with_backend, TrackedScanRequest,
     UntrackedScanRequest,
+};
+use crate::projections::{
+    ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
+    ProjectionInputVersionScope, ProjectionStorageKind, ProjectionTrait,
 };
 use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::{LixBackend, LixError};
@@ -120,12 +119,11 @@ fn schema_default_version_ids(
 #[cfg(test)]
 mod tests {
     use super::hydrate_projection_input_with_backend;
-    use crate::contracts::artifacts::{
-        DerivedRow, ProjectionInput, ProjectionInputSpec, ProjectionSurfaceSpec,
-    };
     use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
-    use crate::contracts::traits::ProjectionTrait;
     use crate::live_state;
+    use crate::projections::{
+        DerivedRow, ProjectionInput, ProjectionInputSpec, ProjectionSurfaceSpec, ProjectionTrait,
+    };
     use crate::schema::builtin::storage::builtin_schema_storage_metadata;
     use crate::schema::builtin::types::{LixVersionDescriptor, LixVersionRef};
     use crate::test_support::{init_test_backend_core, TestSqliteBackend};

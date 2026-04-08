@@ -6,11 +6,60 @@
 //! generic `live_state` executor.
 
 use std::sync::OnceLock;
+use std::sync::Arc;
 
-use crate::contracts::projection::{ProjectionRegistry, RegisteredProjection};
-
+pub(crate) mod artifacts;
 pub(crate) mod filesystem;
+pub(crate) mod traits;
 pub(crate) mod version;
+pub(crate) use artifacts::{
+    DerivedRow, ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
+    ProjectionInputVersionScope, ProjectionLifecycle, ProjectionRegistration,
+    ProjectionStorageKind, ProjectionSurfaceSpec,
+};
+pub(crate) use traits::ProjectionTrait;
+
+#[derive(Clone)]
+pub(crate) struct RegisteredProjection {
+    projection: Arc<dyn ProjectionTrait>,
+    lifecycle: ProjectionLifecycle,
+}
+
+impl RegisteredProjection {
+    pub(crate) fn new<P>(registration: ProjectionRegistration<P>) -> Self
+    where
+        P: ProjectionTrait + 'static,
+    {
+        let (projection, lifecycle) = registration.into_parts();
+        Self {
+            projection: Arc::new(projection),
+            lifecycle,
+        }
+    }
+
+    pub(crate) fn projection(&self) -> &dyn ProjectionTrait {
+        self.projection.as_ref()
+    }
+
+    pub(crate) fn lifecycle(&self) -> ProjectionLifecycle {
+        self.lifecycle
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProjectionRegistry {
+    registrations: Vec<RegisteredProjection>,
+}
+
+impl ProjectionRegistry {
+    pub(crate) fn new(registrations: Vec<RegisteredProjection>) -> Self {
+        Self { registrations }
+    }
+
+    pub(crate) fn registrations(&self) -> &[RegisteredProjection] {
+        &self.registrations
+    }
+}
 
 static BUILTIN_PROJECTION_REGISTRY: OnceLock<ProjectionRegistry> = OnceLock::new();
 
@@ -25,7 +74,7 @@ pub(crate) fn builtin_projection_registry() -> &'static ProjectionRegistry {
 #[cfg(test)]
 mod tests {
     use super::builtin_projection_registry;
-    use crate::contracts::artifacts::ProjectionLifecycle;
+    use crate::projections::ProjectionLifecycle;
 
     #[test]
     fn builtin_registry_exposes_lix_version_read_time_registration() {

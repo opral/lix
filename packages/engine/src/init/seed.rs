@@ -8,8 +8,8 @@ use crate::schema::builtin::storage::{
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parser::parse_sql;
-use crate::version::load_committed_version_head_commit_id;
-use crate::version::GLOBAL_VERSION_ID;
+use crate::version_state::load_committed_version_head_commit_id;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::BorrowedWriteTransaction;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;

@@ -6,8 +6,9 @@ use sqlparser::ast::{
     ValueWithSpan,
 };
 
-use crate::contracts::projection::ProjectionRegistry;
-use crate::contracts::traits::{PendingPublicReadBackend, PendingView};
+use crate::projections::ProjectionRegistry;
+use crate::contracts::traits::PendingView;
+use crate::read_runtime::PendingPublicReadExecutionBackend;
 use crate::read_pipeline::{
     bootstrap_prepared_public_read_collaborators,
     prepare_required_active_public_read_artifact_with_backend, PreparedPublicReadCollaborators,

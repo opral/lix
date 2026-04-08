@@ -1,5 +1,5 @@
-use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::surface::SurfaceRegistry;
+use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::functions::SharedFunctionProvider;

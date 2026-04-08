@@ -7,8 +7,9 @@
 //! Post-Plan-20 dependency rules:
 //!
 //! - compiler-core SQL may depend on owner-owned contracts from
-//!   `canonical/read/*`, `refs/*`, `version/*`, root-level `live_state`, and
-//!   `workspace::writer_key::*` where workspace-owned facts are required
+//!   `canonical/read/*`, `version_state/*`, `session/version_ops/*`,
+//!   root-level `live_state`, and `workspace::writer_key::*` where
+//!   workspace-owned facts are required
 //! - compiler-core SQL must not depend on `commit/*`
 //! - compiler-core SQL must not depend on `canonical/journal/*` or
 //!   `canonical/graph/*` implementation details

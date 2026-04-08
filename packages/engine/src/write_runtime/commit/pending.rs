@@ -7,9 +7,10 @@ use crate::canonical::graph::{
 use crate::canonical::journal::{
     build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
 };
-use crate::canonical::read::{load_version_info_for_versions, CommitQueryExecutor, VersionInfo};
+use crate::canonical::read::CommitQueryExecutor;
 use crate::canonical::json::CanonicalJson;
 use crate::contracts::functions::LixFunctionProvider;
+use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
 use crate::transaction_execution::{execute_write_program_with_transaction, WriteProgram};
 use crate::write_runtime::filesystem::runtime::BinaryBlobWrite;
 use crate::{

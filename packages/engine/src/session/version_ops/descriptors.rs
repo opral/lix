@@ -1,18 +1,17 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
+use crate::canonical::read::{
+    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
+};
 use crate::common::text::escape_sql_string;
-use crate::version::{
+use crate::version_state::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
 };
-use crate::version_inventory_sql::build_admin_version_source_sql_with_current_heads;
+use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
 use crate::{LixBackend, LixError, Value};
-
-use super::state::{
-    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
-};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VersionDescriptorRow {
@@ -20,6 +19,12 @@ pub(crate) struct VersionDescriptorRow {
     pub(crate) name: String,
     pub(crate) hidden: bool,
     pub(crate) change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct VersionHeadFact {
+    pub(crate) version_id: String,
+    pub(crate) head_commit_id: String,
 }
 
 pub(crate) async fn load_version_descriptor_with_backend(
@@ -100,6 +105,50 @@ pub(crate) async fn find_version_id_by_name_with_executor(
         }
     }
     Ok(None)
+}
+
+pub(crate) async fn load_checkpoint_version_heads_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Vec<VersionHeadFact>, LixError> {
+    let mut heads = Vec::new();
+
+    let Some(global_head_commit_id) =
+        load_local_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
+    else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "global version is missing a committed head",
+        ));
+    };
+    heads.push(VersionHeadFact {
+        version_id: GLOBAL_VERSION_ID.to_string(),
+        head_commit_id: global_head_commit_id,
+    });
+
+    for descriptor in load_all_version_descriptors_with_executor(executor).await? {
+        if descriptor.version_id == GLOBAL_VERSION_ID {
+            continue;
+        }
+        let Some(head_commit_id) =
+            load_local_version_head_commit_id_with_executor(executor, &descriptor.version_id)
+                .await?
+        else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "version '{}' is missing a committed head",
+                    descriptor.version_id
+                ),
+            ));
+        };
+        heads.push(VersionHeadFact {
+            version_id: descriptor.version_id,
+            head_commit_id,
+        });
+    }
+
+    heads.sort_by(|left, right| left.version_id.cmp(&right.version_id));
+    Ok(heads)
 }
 
 pub(crate) async fn version_exists_with_backend(

@@ -88,6 +88,7 @@ impl CanonicalChangeScan {
         if binding.descriptor.surface_family != SurfaceFamily::Change {
             return None;
         }
+
         Some(Self { binding })
     }
 }
@@ -149,6 +150,7 @@ impl CanonicalWorkingChangesScan {
         if binding.descriptor.public_name != "lix_working_changes" {
             return None;
         }
+
         Some(Self { binding })
     }
 }
@@ -178,6 +180,7 @@ impl CanonicalAdminScan {
         Some(Self { binding, kind })
     }
 }
+
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PredicateSpec {

@@ -37,7 +37,6 @@ pub(crate) mod pending_reads;
 pub(crate) mod projection;
 mod query_contracts;
 pub(crate) mod raw;
-mod replay_cursor;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
 pub(crate) mod storage;
@@ -82,7 +81,7 @@ pub use materialize::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
-pub use replay_cursor::ReplayCursor;
+use crate::contracts::ReplayCursor;
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
 pub use tracked::{

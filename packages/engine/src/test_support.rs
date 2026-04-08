@@ -5,8 +5,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
-use crate::contracts::projection::ProjectionRegistry;
 use crate::contracts::traits::PendingView;
+use crate::projections::ProjectionRegistry;
 use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
 use crate::session::SessionWriteSelectorResolver;
@@ -271,7 +271,7 @@ pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(
     crate::schema::init(backend).await?;
     crate::canonical::init(backend).await?;
     crate::write_runtime::commit::init(backend).await?;
-    crate::version::init(backend).await?;
+    crate::session::version_ops::init(backend).await?;
     Ok(())
 }
 
@@ -640,7 +640,7 @@ mod tests {
         .expect("live-state status seed should succeed");
 
         let frontier =
-            crate::version::load_current_committed_version_frontier_with_backend(&backend)
+            crate::version_state::load_current_committed_version_frontier_with_backend(&backend)
                 .await
                 .expect("frontier load should succeed");
         assert_eq!(

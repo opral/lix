@@ -7,30 +7,25 @@ use crate::schema::builtin::{
 };
 use crate::LixError;
 
-#[allow(dead_code)]
-pub(crate) mod context;
-mod create_version;
+pub(crate) mod artifacts;
+pub(crate) mod checkpoints;
 mod heads;
-mod init;
-mod merge_version;
-mod ref_storage;
+pub(crate) mod inventory;
+mod refs;
 mod roots;
-pub(crate) mod undo_redo;
 
 pub(crate) use crate::schema::builtin::{DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID};
-pub(crate) use create_version::create_version_in_session;
-pub use create_version::{CreateVersionOptions, CreateVersionResult};
-#[allow(unused_imports)]
+pub(crate) use artifacts::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 pub(crate) use heads::{
     load_committed_version_head_commit_id, load_committed_version_ref_with_backend,
-    load_committed_version_ref_with_executor, load_current_committed_version_frontier_with_backend,
+    load_committed_version_ref_with_executor,
 };
-pub(crate) use init::{init, seed_bootstrap};
-pub(crate) use merge_version::merge_version_in_session;
-pub use merge_version::{
-    ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, MergeVersionResult,
-};
-pub(crate) use ref_storage::{
+#[allow(unused_imports)]
+pub(crate) use heads::load_current_committed_version_frontier_with_backend;
+pub(crate) use refs::{
     build_local_version_ref_heads_source_sql, load_all_local_version_refs_with_executor,
     load_local_version_head_commit_id_with_executor,
     load_local_version_ref_heads_map_with_executor,
@@ -39,7 +34,6 @@ pub(crate) use roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
-pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_REF_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();

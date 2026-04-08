@@ -28,7 +28,7 @@ use crate::contracts::state_commit_stream::{
 use crate::contracts::surface::{SurfaceBinding, SurfaceRegistry};
 use crate::common::paths::filesystem::{NormalizedDirectoryPath, ParsedFilePath};
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::sql_adapter::PreparedWriteExecutionStep;
 use crate::write_runtime::{PreparedWriteRuntimeState, WriteTransaction};
 use crate::{LixError, Value};

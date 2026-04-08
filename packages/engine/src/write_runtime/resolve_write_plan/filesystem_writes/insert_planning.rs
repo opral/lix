@@ -5,7 +5,7 @@ use crate::common::paths::filesystem::{
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::prepared_write_artifacts::{DirectoryInsertAssignments, FileInsertAssignments};
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::filesystem::query::{
     load_directory_descriptors_by_parent_name_pairs,
     load_file_descriptors_by_directory_name_extension_triplets,

@@ -1,14 +1,15 @@
 use crate::init::InitExecutor;
 use crate::Value;
-use crate::{LixBackend, LixError};
+use crate::LixError;
 
-pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    crate::checkpoint_cache::init(backend).await
-}
-
-pub(crate) async fn seed_bootstrap(executor: &mut InitExecutor<'_, '_>) -> Result<(), LixError> {
+pub(crate) async fn seed_bootstrap(
+    executor: &mut InitExecutor<'_, '_>,
+    version_heads: &[super::CheckpointVersionHeadFact],
+) -> Result<(), LixError> {
     executor.seed_default_checkpoint_label().await?;
-    executor.rebuild_internal_last_checkpoint().await
+    executor
+        .rebuild_internal_last_checkpoint_from_heads(version_heads)
+        .await
 }
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
@@ -26,10 +27,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  ORDER BY updated_at DESC, created_at DESC, change_id DESC \
                  LIMIT 1",
                 &[
-                    Value::Text(crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID.to_string()),
-                    Value::Text(
-                        crate::checkpoint_artifacts::CHECKPOINT_LABEL_SCHEMA_KEY.to_string(),
-                    ),
+                    Value::Text(super::CHECKPOINT_LABEL_ID.to_string()),
+                    Value::Text(super::CHECKPOINT_LABEL_SCHEMA_KEY.to_string()),
                 ],
             )
             .await?;
@@ -54,8 +53,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 })?;
             let id = parsed.get("id").and_then(serde_json::Value::as_str);
             let name = parsed.get("name").and_then(serde_json::Value::as_str);
-            if id != Some(crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID)
-                || name != Some(crate::checkpoint_artifacts::CHECKPOINT_LABEL_NAME)
+            if id != Some(super::CHECKPOINT_LABEL_ID)
+                || name != Some(super::CHECKPOINT_LABEL_NAME)
             {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -64,17 +63,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             }
             self.ensure_checkpoint_label_on_bootstrap_commit(
                 &bootstrap_commit_id,
-                crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID,
+                super::CHECKPOINT_LABEL_ID,
             )
             .await?;
             return Ok(());
         }
 
-        let snapshot_content = crate::checkpoint_artifacts::checkpoint_label_snapshot();
+        let snapshot_content = super::checkpoint_label_snapshot();
         self.insert_bootstrap_tracked_row(
             Some(&bootstrap_commit_id),
-            crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID,
-            crate::checkpoint_artifacts::CHECKPOINT_LABEL_SCHEMA_KEY,
+            super::CHECKPOINT_LABEL_ID,
+            super::CHECKPOINT_LABEL_SCHEMA_KEY,
             "1",
             "lix",
             "global",
@@ -85,7 +84,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
         self.ensure_checkpoint_label_on_bootstrap_commit(
             &bootstrap_commit_id,
-            crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID,
+            super::CHECKPOINT_LABEL_ID,
         )
         .await?;
         Ok(())
@@ -96,8 +95,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         bootstrap_commit_id: &str,
         label_id: &str,
     ) -> Result<(), LixError> {
-        let entity_label_id =
-            crate::checkpoint_artifacts::checkpoint_commit_label_entity_id(bootstrap_commit_id);
+        let entity_label_id = super::checkpoint_commit_label_entity_id(bootstrap_commit_id);
         let existing = self
             .execute_internal(
                 "SELECT 1 \
@@ -110,9 +108,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  LIMIT 1",
                 &[
                     Value::Text(entity_label_id.clone()),
-                    Value::Text(
-                        crate::checkpoint_artifacts::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string(),
-                    ),
+                    Value::Text(super::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string()),
                 ],
             )
             .await?;
@@ -127,18 +123,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         }
 
-        if label_id != crate::checkpoint_artifacts::CHECKPOINT_LABEL_ID {
+        if label_id != super::CHECKPOINT_LABEL_ID {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("unexpected checkpoint label id '{label_id}'"),
             ));
         }
-        let snapshot_content =
-            crate::checkpoint_artifacts::checkpoint_commit_label_snapshot(bootstrap_commit_id);
+        let snapshot_content = super::checkpoint_commit_label_snapshot(bootstrap_commit_id);
         self.insert_bootstrap_tracked_row(
             Some(bootstrap_commit_id),
             &entity_label_id,
-            crate::checkpoint_artifacts::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
+            super::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
             "1",
             "lix",
             "global",

@@ -1,12 +1,14 @@
 use crate::backend::TransactionBackendAdapter;
-use crate::canonical::read::load_commit_lineage_entry_by_id;
-use crate::checkpoint_artifacts::{
+use crate::canonical::checkpoint_labels::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
+use crate::canonical::read::load_commit_lineage_entry_by_id;
 use crate::execution_runtime::ExecutionRuntimeState;
-use crate::version::context::require_target_version_context_in_transaction;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
+
+use super::super::version_ops::context::require_target_version_context_in_transaction;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CreateCheckpointResult {
@@ -36,7 +38,7 @@ async fn create_checkpoint_in_transaction(
     .await?;
     let global_context = require_target_version_context_in_transaction(
         tx,
-        Some(crate::version::GLOBAL_VERSION_ID),
+        Some(GLOBAL_VERSION_ID),
         "version_id",
         "global version",
     )
@@ -63,7 +65,7 @@ async fn create_checkpoint_in_transaction(
         ensure_checkpoint_label_on_commit(tx, &global_commit_id).await?;
     }
     // Keep the derived checkpoint-history cache warm for the active version.
-    crate::checkpoint_cache::upsert_last_checkpoint_for_version_in_transaction(
+    crate::version_state::checkpoints::cache::upsert_last_checkpoint_for_version_in_transaction(
         tx.backend_transaction_mut()?,
         &version_id,
         &local_commit_id,
@@ -71,9 +73,9 @@ async fn create_checkpoint_in_transaction(
     .await?;
     // The global lane mirrors the same derived cache contract and remains
     // rebuildable from canonical heads plus canonical checkpoint labels.
-    crate::checkpoint_cache::upsert_last_checkpoint_for_version_in_transaction(
+    crate::version_state::checkpoints::cache::upsert_last_checkpoint_for_version_in_transaction(
         tx.backend_transaction_mut()?,
-        crate::version::GLOBAL_VERSION_ID,
+        GLOBAL_VERSION_ID,
         &global_commit_id,
     )
     .await?;
@@ -136,7 +138,7 @@ async fn ensure_checkpoint_label_on_commit(
         CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
         "1",
         "lix",
-        crate::version::GLOBAL_VERSION_ID,
+        GLOBAL_VERSION_ID,
         "lix",
         &change_id,
         &snapshot_content,

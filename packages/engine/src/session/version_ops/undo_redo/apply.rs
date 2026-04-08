@@ -10,17 +10,17 @@ use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOper
 use crate::execution_runtime::ExecutionRuntimeState;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::TransactionBackendAdapter;
-use crate::version::context::{
-    exact_current_head_preconditions, load_version_context_with_executor,
-    require_target_version_context_in_transaction, resolve_target_version_in_transaction,
-    ResolvedVersionTarget, VersionContextSource,
-};
 use crate::write_runtime::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, ProposedDomainChange,
 };
 use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
 
 use super::{RedoResult, UndoResult, UNDO_REDO_OPERATION_TABLE};
+use super::super::context::{
+    exact_current_head_preconditions, load_version_context_with_executor,
+    require_target_version_context_in_transaction, resolve_target_version_in_transaction,
+    ResolvedVersionTarget, VersionContextSource,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UndoRedoOperationKind {
@@ -430,7 +430,11 @@ async fn ensure_version_exists_with_transaction(
     version_id: &str,
 ) -> Result<(), LixError> {
     let mut executor = TransactionBackendAdapter::new(transaction);
-    crate::version::context::ensure_version_exists_with_executor(&mut executor, version_id).await
+    crate::session::version_ops::context::ensure_version_exists_with_executor(
+        &mut executor,
+        version_id,
+    )
+    .await
 }
 
 async fn rebuild_semantic_undo_redo_stacks(

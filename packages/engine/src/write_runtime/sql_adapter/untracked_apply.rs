@@ -5,7 +5,7 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::functions::LixFunctionProvider;
 use crate::contracts::traits::UntrackedWriteParticipant;
-use crate::version_artifacts::GLOBAL_VERSION_ID;
+use crate::version_state::GLOBAL_VERSION_ID;
 use crate::write_runtime::filesystem::runtime::{
     compile_filesystem_finalization_from_state_in_transaction,
     garbage_collect_unreachable_binary_cas_in_transaction,
