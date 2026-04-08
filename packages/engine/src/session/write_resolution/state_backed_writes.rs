@@ -1,9 +1,11 @@
 use super::*;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::live_state::RegisteredSchemaCatalog;
+use crate::contracts::traits::{PendingSemanticStorage, PendingView};
+use crate::live_state::{decode_registered_schema_row, scan_rows, RowQuery, RowReadMode};
 use crate::schema::annotations::defaults::apply_schema_defaults_with_shared_runtime;
 use crate::schema::annotations::overrides::collect_state_column_overrides_with_shared_runtime;
 use crate::schema::builtin_schema_definition;
+use crate::schema::{schema_from_registered_snapshot, SchemaKey};
 use crate::session::write_resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
 use crate::session::write_resolution::prepared_artifacts::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
@@ -11,7 +13,6 @@ use crate::session::write_resolution::prepared_artifacts::{
     CanonicalStateRowKey, EntityAssignmentsSemantics, EntityInsertSemantics,
     InsertOnConflictAction,
 };
-use crate::session::SessionSchemaCatalog;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
@@ -19,6 +20,106 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
     match current_row.overlay_lane {
         OverlayLane::GlobalTracked | OverlayLane::GlobalUntracked => GLOBAL_VERSION_ID.to_string(),
         OverlayLane::LocalTracked | OverlayLane::LocalUntracked => current_row.version_id.clone(),
+    }
+}
+
+const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
+const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
+
+async fn load_latest_registered_schema(
+    backend: &dyn LixBackend,
+    pending_view: Option<&dyn PendingView>,
+    schema_key: &str,
+) -> Result<Option<JsonValue>, crate::LixError> {
+    let mut latest = None::<(SchemaKey, JsonValue)>;
+
+    let rows = scan_rows(
+        backend,
+        &RowQuery {
+            schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+            version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
+            mode: RowReadMode::Tracked,
+            constraints: Vec::new(),
+            include_tombstones: false,
+        },
+    )
+    .await?;
+
+    for row in &rows {
+        let Some((key, schema)) = decode_registered_schema_row(row)? else {
+            continue;
+        };
+        if key.schema_key != schema_key {
+            continue;
+        }
+        if should_replace_latest_schema(latest.as_ref().map(|(key, _)| key), &key) {
+            latest = Some((key, schema));
+        }
+    }
+
+    if let Some(pending_view) = pending_view {
+        for (_, snapshot_content) in pending_view.visible_registered_schema_entries() {
+            let Some(snapshot_content) = snapshot_content else {
+                continue;
+            };
+            remember_latest_registered_schema_from_snapshot_content(
+                &mut latest,
+                schema_key,
+                &snapshot_content,
+            )?;
+        }
+
+        for storage in [
+            PendingSemanticStorage::Tracked,
+            PendingSemanticStorage::Untracked,
+        ] {
+            for row in pending_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+                let Some(snapshot_content) = row.snapshot_content else {
+                    continue;
+                };
+                remember_latest_registered_schema_from_snapshot_content(
+                    &mut latest,
+                    schema_key,
+                    &snapshot_content,
+                )?;
+            }
+        }
+    }
+
+    Ok(latest.map(|(_, schema)| schema))
+}
+
+fn remember_latest_registered_schema_from_snapshot_content(
+    latest: &mut Option<(SchemaKey, JsonValue)>,
+    schema_key: &str,
+    snapshot_content: &str,
+) -> Result<(), crate::LixError> {
+    let snapshot = serde_json::from_str::<JsonValue>(snapshot_content).map_err(|error| {
+        crate::LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("registered schema snapshot_content invalid JSON: {error}"),
+        )
+    })?;
+    let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
+    if key.schema_key != schema_key {
+        return Ok(());
+    }
+    if should_replace_latest_schema(latest.as_ref().map(|(key, _)| key), &key) {
+        *latest = Some((key, schema));
+    }
+    Ok(())
+}
+
+fn should_replace_latest_schema(existing: Option<&SchemaKey>, candidate: &SchemaKey) -> bool {
+    existing
+        .map(|existing| compare_schema_keys(candidate, existing).is_ge())
+        .unwrap_or(true)
+}
+
+fn compare_schema_keys(left: &SchemaKey, right: &SchemaKey) -> std::cmp::Ordering {
+    match (left.version_number(), right.version_number()) {
+        (Some(left_version), Some(right_version)) => left_version.cmp(&right_version),
+        _ => left.schema_version.cmp(&right.schema_version),
     }
 }
 
@@ -136,13 +237,10 @@ pub(super) async fn resolve_state_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut provider = SessionSchemaCatalog::from_backend(hydrator.backend());
-    provider
-        .remember_pending_registered_schemas_from_view(pending_view)
-        .map_err(write_resolve_backend_error)?;
-    let state_schema = load_optional_annotation_schema(&mut provider, planned_write)
-        .await
-        .map_err(write_resolve_backend_error)?;
+    let state_schema =
+        load_optional_annotation_schema(hydrator.backend(), pending_view, planned_write)
+            .await
+            .map_err(write_resolve_backend_error)?;
     resolve_state_backed_write(
         hydrator,
         planned_write,
@@ -163,11 +261,7 @@ pub(super) async fn resolve_entity_write<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let mut provider = SessionSchemaCatalog::from_backend(hydrator.backend());
-    provider
-        .remember_pending_registered_schemas_from_view(pending_view)
-        .map_err(write_resolve_backend_error)?;
-    let entity_schema = load_entity_schema(&mut provider, planned_write)
+    let entity_schema = load_entity_schema(hydrator.backend(), pending_view, planned_write)
         .await
         .map_err(write_resolve_backend_error)?;
     reject_unsupported_entity_overrides(planned_write, &entity_schema)?;
@@ -942,33 +1036,41 @@ fn selector_row_version_id(
 }
 
 async fn load_optional_annotation_schema(
-    provider: &mut dyn RegisteredSchemaCatalog,
+    backend: &dyn LixBackend,
+    pending_view: Option<&dyn PendingView>,
     planned_write: &PlannedWrite,
 ) -> Result<Option<LoadedAnnotationSchema>, crate::LixError> {
     let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        match provider.load_latest_schema(&schema_key).await {
-            Ok(schema) => schema,
-            Err(error) if error.description == format!("schema '{}' is not stored", schema_key) => {
+        match load_latest_registered_schema(backend, pending_view, &schema_key).await? {
+            Some(schema) => schema,
+            None => {
                 return Ok(None);
             }
-            Err(error) => return Err(error),
         }
     };
     load_annotation_schema_from_json(schema_key, schema).map(Some)
 }
 
 async fn load_entity_schema(
-    provider: &mut dyn RegisteredSchemaCatalog,
+    backend: &dyn LixBackend,
+    pending_view: Option<&dyn PendingView>,
     planned_write: &PlannedWrite,
 ) -> Result<EntityWriteSchema, crate::LixError> {
     let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        provider.load_latest_schema(&schema_key).await?
+        load_latest_registered_schema(backend, pending_view, &schema_key)
+            .await?
+            .ok_or_else(|| {
+                crate::LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("schema '{}' is not stored", schema_key),
+                )
+            })?
     };
     let annotations = load_annotation_schema_from_json(schema_key.clone(), schema)?;
     let mut property_columns = annotations

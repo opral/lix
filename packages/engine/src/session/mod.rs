@@ -12,7 +12,6 @@ pub(crate) mod observe;
 pub(crate) mod plugin;
 pub(crate) mod read_execution_bindings;
 pub(crate) mod read_preparation;
-mod schema_catalog;
 mod selector_reads;
 pub(crate) mod state_selector;
 pub(crate) mod version_ops;
@@ -48,7 +47,6 @@ use crate::session::collaborators::SessionCollaborators;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
-pub(crate) use crate::session::schema_catalog::SessionSchemaCatalog;
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,

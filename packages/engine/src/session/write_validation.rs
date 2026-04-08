@@ -6,6 +6,7 @@
 //! - binary CAS existence checks
 //! - commit-time revalidation of tracked writes
 
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -28,9 +29,13 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend, PendingView};
-use crate::live_state::RegisteredSchemaCatalog;
-use crate::schema::{schema_from_registered_snapshot, validate_lix_schema_definition, SchemaKey};
-use crate::session::SessionSchemaCatalog;
+use crate::live_state::{
+    decode_registered_schema_row, load_exact_row, scan_rows, ExactRowQuery, RowQuery, RowReadMode,
+};
+use crate::schema::{
+    builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
+    schema_key_from_definition, validate_lix_schema_definition, SchemaKey,
+};
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -109,13 +114,215 @@ struct ConstraintRowView<'a> {
     snapshot: &'a JsonValue,
 }
 
+struct WriteValidationSchemaLookup<'a> {
+    backend: &'a dyn LixBackend,
+    pending: HashMap<SchemaKey, JsonValue>,
+    visible_entries: Option<Vec<(SchemaKey, JsonValue)>>,
+}
+
+impl<'a> WriteValidationSchemaLookup<'a> {
+    fn from_backend(backend: &'a dyn LixBackend) -> Self {
+        Self {
+            backend,
+            pending: HashMap::new(),
+            visible_entries: None,
+        }
+    }
+
+    fn remember_pending_schema(&mut self, key: SchemaKey, schema: JsonValue) {
+        self.pending.insert(key, schema);
+        self.visible_entries = None;
+    }
+
+    fn remember_pending_schema_from_snapshot(
+        &mut self,
+        snapshot: &JsonValue,
+    ) -> Result<(), LixError> {
+        let (key, schema) = schema_from_registered_snapshot(snapshot)?;
+        self.remember_pending_schema(key, schema);
+        Ok(())
+    }
+
+    fn remember_pending_registered_schemas_from_view(
+        &mut self,
+        pending_view: Option<&dyn PendingView>,
+    ) -> Result<(), LixError> {
+        let Some(pending_view) = pending_view else {
+            return Ok(());
+        };
+
+        for (_, snapshot_content) in pending_view.visible_registered_schema_entries() {
+            let Some(snapshot_content) = snapshot_content else {
+                continue;
+            };
+            let snapshot =
+                serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("registered schema snapshot_content invalid JSON: {error}"),
+                    )
+                })?;
+            self.remember_pending_schema_from_snapshot(&snapshot)?;
+        }
+
+        for storage in [
+            crate::contracts::traits::PendingSemanticStorage::Tracked,
+            crate::contracts::traits::PendingSemanticStorage::Untracked,
+        ] {
+            for row in pending_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+                let Some(snapshot_content) = row.snapshot_content else {
+                    continue;
+                };
+                let snapshot =
+                    serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!("registered schema snapshot_content invalid JSON: {error}"),
+                        )
+                    })?;
+                self.remember_pending_schema_from_snapshot(&snapshot)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError> {
+        if let Some(schema) = self.pending.get(key) {
+            return Ok(schema.clone());
+        }
+
+        if let Some(schema) = builtin_schema_for_key(key) {
+            return Ok(schema);
+        }
+
+        let row = load_exact_row(
+            self.backend,
+            &ExactRowQuery {
+                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
+                entity_id: key.entity_id(),
+                file_id: REGISTERED_SCHEMA_FILE_ID.to_string(),
+                mode: RowReadMode::Tracked,
+                include_tombstones: false,
+            },
+        )
+        .await?;
+
+        let Some(row) = row else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "schema '{}' ({}) is not stored",
+                    key.schema_key, key.schema_version
+                ),
+            ));
+        };
+
+        let Some((decoded_key, schema)) = decode_registered_schema_row(&row)? else {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "schema '{}' ({}) is not stored",
+                    key.schema_key, key.schema_version
+                ),
+            ));
+        };
+        if &decoded_key != key {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "schema row '{}' decoded to unexpected key '{}~{}'",
+                    key.entity_id(),
+                    decoded_key.schema_key,
+                    decoded_key.schema_version
+                ),
+            ));
+        }
+        Ok(schema)
+    }
+
+    async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError> {
+        if let Some(schema) = whitelisted_internal_schema(schema_key) {
+            return Ok(schema);
+        }
+
+        if let Some(schema) = builtin_schema_definition(schema_key) {
+            return Ok(schema.clone());
+        }
+
+        let visible_entries = self.load_visible_schema_entries().await?;
+        visible_entries
+            .into_iter()
+            .filter(|(key, _)| key.schema_key == schema_key)
+            .max_by(|(left, _), (right, _)| compare_schema_keys(left, right))
+            .map(|(_, schema)| schema)
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("schema '{}' is not stored", schema_key),
+                )
+            })
+    }
+
+    async fn load_visible_schema_entries(
+        &mut self,
+    ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
+        if let Some(entries) = &self.visible_entries {
+            return Ok(entries.clone());
+        }
+
+        let mut entries_by_key = HashMap::<SchemaKey, JsonValue>::new();
+
+        if let Some(schema) = whitelisted_internal_schema("lix_state") {
+            let key = schema_key_from_definition(&schema)?;
+            entries_by_key.insert(key, schema);
+        }
+
+        for schema_key in builtin_schema_keys() {
+            let Some(schema) = builtin_schema_definition(schema_key) else {
+                continue;
+            };
+            let key = schema_key_from_definition(schema)?;
+            entries_by_key.insert(key, schema.clone());
+        }
+
+        let rows = scan_rows(
+            self.backend,
+            &RowQuery {
+                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
+                mode: RowReadMode::Tracked,
+                constraints: Vec::new(),
+                include_tombstones: false,
+            },
+        )
+        .await?;
+
+        for row in &rows {
+            let Some((key, schema)) = decode_registered_schema_row(row)? else {
+                continue;
+            };
+            entries_by_key.insert(key, schema);
+        }
+
+        for (key, schema) in &self.pending {
+            entries_by_key.insert(key.clone(), schema.clone());
+        }
+
+        let entries = entries_by_key.into_iter().collect::<Vec<_>>();
+        self.visible_entries = Some(entries.clone());
+        Ok(entries)
+    }
+}
+
 pub async fn validate_inserts(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     mutations: &[MutationRow],
     pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
-    let mut schema_provider = SessionSchemaCatalog::from_backend(backend);
+    let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
 
     for row in mutations {
@@ -171,7 +378,7 @@ pub(crate) async fn validate_update_inputs(
     inputs: &[UpdateValidationInput],
     pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
-    let mut schema_provider = SessionSchemaCatalog::from_backend(backend);
+    let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
     let mut pending_rows = Vec::new();
     let mut deleted_rows = Vec::new();
@@ -315,7 +522,7 @@ async fn validate_prepared_public_write(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "planned write validation requires a resolved write plan".to_string(),
         })?;
-    let mut schema_provider = SessionSchemaCatalog::from_backend(backend);
+    let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
     remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
@@ -410,7 +617,7 @@ async fn validate_prepared_public_write(
 }
 
 async fn remember_pending_registered_schemas(
-    provider: &mut SessionSchemaCatalog<'_>,
+    provider: &mut WriteValidationSchemaLookup<'_>,
     resolved: &PreparedResolvedWritePlan,
 ) -> Result<(), LixError> {
     for row in resolved.intended_post_state() {
@@ -564,8 +771,8 @@ fn storage_kind_for_table(table: &str) -> ConstraintStorageKind {
     }
 }
 
-async fn validate_snapshot_content<P: RegisteredSchemaCatalog + ?Sized>(
-    provider: &mut P,
+async fn validate_snapshot_content(
+    provider: &mut WriteValidationSchemaLookup<'_>,
     cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
     snapshot: &JsonValue,
@@ -602,7 +809,7 @@ async fn validate_snapshot_content<P: RegisteredSchemaCatalog + ?Sized>(
 }
 
 async fn validate_update_is_mutable(
-    provider: &mut SessionSchemaCatalog<'_>,
+    provider: &mut WriteValidationSchemaLookup<'_>,
     row: &PlannedStateRow,
 ) -> Result<(), LixError> {
     let key = SchemaKey::new(
@@ -626,7 +833,7 @@ async fn validate_update_is_mutable(
 
 async fn validate_planned_row(
     backend: &dyn LixBackend,
-    provider: &mut SessionSchemaCatalog<'_>,
+    provider: &mut WriteValidationSchemaLookup<'_>,
     cache: &dyn CompiledSchemaCache,
     operation_kind: PreparedWriteOperationKind,
     row: &PlannedStateRow,
@@ -767,8 +974,8 @@ fn validate_checkpoint_label_mutation(
     Ok(())
 }
 
-async fn validate_registered_schema_snapshot<P: RegisteredSchemaCatalog + ?Sized>(
-    provider: &mut P,
+async fn validate_registered_schema_snapshot(
+    provider: &mut WriteValidationSchemaLookup<'_>,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
     let schema_value = extract_registered_schema_value(snapshot)?;
@@ -836,8 +1043,8 @@ fn collect_planned_binary_blob_hashes(
     Ok(hashes)
 }
 
-async fn validate_registered_schema_insert<P: RegisteredSchemaCatalog + ?Sized>(
-    provider: &mut P,
+async fn validate_registered_schema_insert(
+    provider: &mut WriteValidationSchemaLookup<'_>,
     row: &MutationRow,
 ) -> Result<(), LixError> {
     let snapshot = row.snapshot_content.as_ref().ok_or_else(|| LixError {
@@ -849,8 +1056,8 @@ async fn validate_registered_schema_insert<P: RegisteredSchemaCatalog + ?Sized>(
     Ok(())
 }
 
-async fn validate_foreign_key_reference_targets<P: RegisteredSchemaCatalog + ?Sized>(
-    provider: &mut P,
+async fn validate_foreign_key_reference_targets(
+    provider: &mut WriteValidationSchemaLookup<'_>,
     schema: &JsonValue,
 ) -> Result<(), LixError> {
     let Some(foreign_keys) = schema.get("x-lix-foreign-keys").and_then(|v| v.as_array()) else {
@@ -947,9 +1154,9 @@ fn collect_unique_key_groups(schema: &JsonValue) -> Vec<Vec<String>> {
     keys
 }
 
-async fn validate_row_constraints<P: RegisteredSchemaCatalog + ?Sized>(
+async fn validate_row_constraints(
     backend: &dyn LixBackend,
-    provider: &mut P,
+    provider: &mut WriteValidationSchemaLookup<'_>,
     context: &mut ConstraintContext,
     row: &ConstraintCandidateRow,
 ) -> Result<(), LixError> {
@@ -1231,9 +1438,9 @@ async fn validate_foreign_key_constraints(
     Ok(())
 }
 
-async fn validate_delete_constraints<P: RegisteredSchemaCatalog + ?Sized>(
+async fn validate_delete_constraints(
     backend: &dyn LixBackend,
-    provider: &mut P,
+    provider: &mut WriteValidationSchemaLookup<'_>,
     context: &mut ConstraintContext,
     deleted_rows: &[ConstraintDeletedRow],
 ) -> Result<(), LixError> {
@@ -1799,8 +2006,8 @@ fn shadowed_committed_identities(
     identities
 }
 
-async fn load_compiled_schema<P: RegisteredSchemaCatalog + ?Sized>(
-    provider: &mut P,
+async fn load_compiled_schema(
+    provider: &mut WriteValidationSchemaLookup<'_>,
     cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
 ) -> Result<Arc<JSONSchema>, LixError> {
@@ -1821,6 +2028,42 @@ async fn load_compiled_schema<P: RegisteredSchemaCatalog + ?Sized>(
     cache.insert_compiled_schema(key.clone(), compiled.clone());
 
     Ok(compiled)
+}
+
+fn compare_schema_keys(left: &SchemaKey, right: &SchemaKey) -> Ordering {
+    match (left.version_number(), right.version_number()) {
+        (Some(left_version), Some(right_version)) => left_version.cmp(&right_version),
+        _ => left.schema_version.cmp(&right.schema_version),
+    }
+}
+
+fn builtin_schema_for_key(key: &SchemaKey) -> Option<JsonValue> {
+    if let Some(schema) = whitelisted_internal_schema(&key.schema_key) {
+        let schema_version = schema.get("x-lix-version").and_then(JsonValue::as_str)?;
+        if schema_version == key.schema_version {
+            return Some(schema);
+        }
+    }
+
+    let schema = builtin_schema_definition(&key.schema_key)?;
+    let schema_version = schema.get("x-lix-version").and_then(JsonValue::as_str)?;
+    if schema_version != key.schema_version {
+        return None;
+    }
+    Some(schema.clone())
+}
+
+fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
+    if schema_key != "lix_state" {
+        return None;
+    }
+
+    Some(serde_json::json!({
+        "type": "object",
+        "x-lix-key": "lix_state",
+        "x-lix-version": "1",
+        "properties": {},
+    }))
 }
 
 fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String, LixError> {
@@ -1920,8 +2163,8 @@ fn apply_snapshot_patch(
     Ok(())
 }
 
-async fn validate_entity_id_matches_primary_key<P: RegisteredSchemaCatalog + ?Sized>(
-    provider: &mut P,
+async fn validate_entity_id_matches_primary_key(
+    provider: &mut WriteValidationSchemaLookup<'_>,
     key: &SchemaKey,
     entity_id: &str,
     snapshot: &JsonValue,
