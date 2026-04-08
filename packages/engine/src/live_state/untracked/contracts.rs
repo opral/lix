@@ -5,9 +5,14 @@ pub use crate::contracts::artifacts::{
     ScanRequest as UntrackedScanRequest, UntrackedRow, UntrackedWriteBatch,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
-pub(crate) use crate::contracts::traits::{UntrackedReadView, UntrackedWriteParticipant};
-use crate::{LixBackend, LixBackendTransaction, LixError};
+#[cfg(test)]
+pub(crate) use crate::contracts::traits::UntrackedReadView;
+pub(crate) use crate::contracts::traits::UntrackedWriteParticipant;
+use crate::{LixBackendTransaction, LixError};
+#[cfg(test)]
+use crate::LixBackend;
 
+#[cfg(test)]
 #[async_trait(?Send)]
 impl<T> UntrackedReadView for T
 where
@@ -21,6 +26,7 @@ where
         super::read::load_exact_rows_with_executor(&mut executor, request).await
     }
 
+    #[cfg(test)]
     async fn scan_rows(
         &self,
         request: &UntrackedScanRequest,

@@ -44,10 +44,6 @@ harness = false
 name = "lix_file_insert_history"
 harness = false
 
-[[bench]]
-name = "live_tracked_state_foundation"
-harness = false
-
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 zstd = "0.13"
 futures-timer = "3"

@@ -214,12 +214,6 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
     .await
 }
 
-pub(crate) async fn mark_live_state_projection_ready_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<ReplayCursor, LixError> {
-    projection::mark_live_state_projection_ready_in_transaction(transaction).await
-}
-
 pub(crate) async fn mark_live_state_projection_ready_with_backend(
     backend: &dyn LixBackend,
     cursor: &ReplayCursor,
@@ -234,10 +228,6 @@ impl crate::contracts::traits::LiveStateTransactionBridge for dyn LixBackendTran
         registration: &crate::contracts::artifacts::SchemaRegistration,
     ) -> Result<(), LixError> {
         register_schema_in_transaction(self, registration.clone()).await
-    }
-
-    async fn mark_live_state_projection_ready(&mut self) -> Result<ReplayCursor, LixError> {
-        mark_live_state_projection_ready_in_transaction(self).await
     }
 
     async fn advance_live_state_replay_boundary(

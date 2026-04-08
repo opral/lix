@@ -2,8 +2,11 @@
 
 pub(crate) mod routing;
 
+#[cfg(test)]
+use crate::LixBackend;
 use crate::common::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
+    sql_unknown_table_error,
 };
 use crate::contracts::artifacts::{
     CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
@@ -11,8 +14,8 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::state_commit_stream::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamRuntimeMetadata,
+    StateCommitStreamRuntimeMetadata, state_commit_stream_changes_from_domain_changes,
+    state_commit_stream_changes_from_planned_rows,
 };
 use crate::contracts::surface::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
@@ -20,20 +23,25 @@ use crate::contracts::surface::{
 #[cfg(test)]
 use crate::contracts::traits::SqlPreparationMetadataReader;
 use crate::schema::builtin::builtin_schema_definition;
-use crate::schema::relation_policy::{classify_relation_name, RelationPolicy};
+use crate::schema::builtin::versioning::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
+use crate::schema::relation_policy::{
+    RelationPolicy, classify_relation_name, protected_builtin_public_surface_names,
+};
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
-use crate::sql::binder::{bind_statement, RuntimeBindingValues};
+use crate::sql::binder::{RuntimeBindingValues, bind_statement};
 use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::explain::{
-    build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts,
-    ExplainRequest, ExplainStage, ExplainStageTiming, ExplainTimingCollector,
-    PublicWriteExplainBuildInput,
+    ExplainArtifacts, ExplainRequest, ExplainStage, ExplainStageTiming, ExplainTimingCollector,
+    PublicWriteExplainBuildInput, build_public_write_explain_artifacts, unwrap_explain_statement,
 };
-use crate::sql::logical_plan::public_ir::PlannedFilesystemState;
-use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, WriteOperationKind};
 #[cfg(test)]
 use crate::sql::logical_plan::DependencySpec;
-use crate::sql::logical_plan::{verify_logical_plan, LogicalPlan, PublicReadLogicalPlan};
+use crate::sql::logical_plan::public_ir::PlannedFilesystemState;
+use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, WriteOperationKind};
+use crate::sql::logical_plan::{LogicalPlan, PublicReadLogicalPlan, verify_logical_plan};
 use crate::sql::physical_plan::{
     LoweredReadProgram, PreparedPublicReadExecution, PreparedPublicWriteExecution,
     PublicWriteExecutionPartition, PublicWriteMaterialization, TrackedWriteExecution,
@@ -48,15 +56,9 @@ use crate::sql::prepare::intent::{
 use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::sql::semantic_ir::{
-    analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
-    PublicWriteSemantics,
+    BoundStatement, ExecutionContext, PublicWriteInvariantTrace, PublicWriteSemantics,
+    analyze_public_write_semantics,
 };
-use crate::version_state::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
-};
-#[cfg(test)]
-use crate::LixBackend;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,
@@ -211,6 +213,10 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
     allow_internal_tables: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
+    if let Some(surface_name) = first_removed_builtin_surface_reference(parsed_statements) {
+        return Err(removed_builtin_surface_unknown_table_error(&surface_name));
+    }
+
     let Some(route) = classify_public_execution_route_with_registry(registry, parsed_statements)
     else {
         return Ok(None);
@@ -366,6 +372,47 @@ fn public_read_preflight_error(
         "LIX_ERROR_UNKNOWN",
         "lix_state does not expose version_id; use lix_state_by_version for explicit version filters",
     ))
+}
+
+const REMOVED_BUILTIN_PUBLIC_SURFACES: &[&str] = &["lix_active_account", "lix_active_version"];
+
+pub(super) fn first_removed_builtin_surface_reference(
+    parsed_statements: &[Statement],
+) -> Option<String> {
+    parsed_statements
+        .iter()
+        .find_map(removed_builtin_surface_reference_in_statement)
+}
+
+fn removed_builtin_surface_reference_in_statement(statement: &Statement) -> Option<String> {
+    match statement {
+        Statement::Query(query) => collect_public_query_relation_names(query)
+            .into_iter()
+            .find(|name| is_removed_builtin_public_surface_name(name)),
+        Statement::Explain { statement, .. } => {
+            removed_builtin_surface_reference_in_statement(statement.as_ref())
+        }
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
+            top_level_write_target_name(statement)
+                .filter(|name| is_removed_builtin_public_surface_name(name))
+        }
+        _ => None,
+    }
+}
+
+fn is_removed_builtin_public_surface_name(name: &str) -> bool {
+    REMOVED_BUILTIN_PUBLIC_SURFACES
+        .iter()
+        .any(|surface_name| name.eq_ignore_ascii_case(surface_name))
+}
+
+pub(super) fn removed_builtin_surface_unknown_table_error(surface_name: &str) -> LixError {
+    let available_tables = protected_builtin_public_surface_names();
+    let available_table_refs = available_tables
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    sql_unknown_table_error(surface_name, &available_table_refs, None)
 }
 
 fn query_references_any_column(query: &Query, columns: &[&str]) -> bool {
@@ -1693,8 +1740,8 @@ pub(crate) fn build_public_write_invariant_trace(
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_public_execution, prepare_public_read, prepare_public_read_strict,
-        PreparedPublicExecution, PreparedPublicReadExecution,
+        PreparedPublicExecution, PreparedPublicReadExecution, prepare_public_execution,
+        prepare_public_read, prepare_public_read_strict,
     };
     use crate::contracts::artifacts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
@@ -1716,14 +1763,14 @@ mod tests {
         semantic_ir::ExecutionContext,
     };
     use crate::test_support::{
-        seed_canonical_change_row, BuiltinReadExecutionBindings, CanonicalChangeSeed,
-        TestSqliteBackend,
+        BuiltinReadExecutionBindings, CanonicalChangeSeed, TestSqliteBackend,
+        seed_canonical_change_row,
     };
     use crate::version_state::{
-        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-        version_descriptor_schema_version, version_descriptor_snapshot_content,
-        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-        version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
+        GLOBAL_VERSION_ID, version_descriptor_file_id, version_descriptor_plugin_key,
+        version_descriptor_schema_key, version_descriptor_schema_version,
+        version_descriptor_snapshot_content, version_ref_file_id, version_ref_plugin_key,
+        version_ref_schema_key, version_ref_schema_version, version_ref_snapshot_content,
     };
     use crate::{LixBackend, LixError, Session, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1733,8 +1780,8 @@ mod tests {
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     };
     use std::time::Duration;
     use tokio::time::sleep;
@@ -2058,8 +2105,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_only_lix_version_read_matches_current_admin_sql_through_public_surface_preparation(
-    ) {
+    fn descriptor_only_lix_version_read_matches_current_admin_sql_through_public_surface_preparation()
+     {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2130,8 +2177,8 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_and_ref_lix_version_read_matches_current_admin_sql_through_public_surface_preparation(
-    ) {
+    fn descriptor_and_ref_lix_version_read_matches_current_admin_sql_through_public_surface_preparation()
+     {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2394,11 +2441,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["lix_key_value".to_string()]
         );
-        assert!(prepared
-            .dependency_spec()
-            .expect("dependency spec should be derived")
-            .session_dependencies
-            .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion));
+        assert!(
+            prepared
+                .dependency_spec()
+                .expect("dependency spec should be derived")
+                .session_dependencies
+                .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion)
+        );
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -2479,8 +2528,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn explain_specialized_registered_schema_reads_keep_layout_loading_outside_compiler_stages(
-    ) {
+    async fn explain_specialized_registered_schema_reads_keep_layout_loading_outside_compiler_stages()
+     {
         let delay = Duration::from_millis(150);
         let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
         backend
@@ -2957,11 +3006,13 @@ mod tests {
                 "lix_file_descriptor".to_string(),
             ]
         );
-        assert!(prepared
-            .dependency_spec()
-            .expect("filesystem dependency spec should be recorded")
-            .session_dependencies
-            .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion));
+        assert!(
+            prepared
+                .dependency_spec()
+                .expect("filesystem dependency spec should be recorded")
+                .session_dependencies
+                .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion)
+        );
         assert_eq!(
             prepared
                 .explain

@@ -27,10 +27,12 @@ use crate::contracts::artifacts::{
     PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
 };
 use crate::contracts::surface::SurfaceFamily;
-use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend};
+use crate::contracts::traits::{
+    CompiledSchemaCache, LiveStateQueryBackend, PendingView,
+};
 use crate::schema::{
     schema_from_registered_snapshot, validate_lix_schema_definition, OverlaySchemaProvider,
-    SchemaKey, SchemaProvider, SqlRegisteredSchemaProvider,
+    SchemaKey, SchemaProvider,
 };
 use crate::{LixBackend, LixError, Value};
 
@@ -114,8 +116,10 @@ pub async fn validate_inserts(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     mutations: &[MutationRow],
+    pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+    schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
 
     for row in mutations {
         if row.operation == MutationOperation::Insert && row.schema_key == REGISTERED_SCHEMA_KEY {
@@ -168,8 +172,10 @@ pub(crate) async fn validate_update_inputs(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     inputs: &[UpdateValidationInput],
+    pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
-    let mut schema_provider = SqlRegisteredSchemaProvider::new(backend);
+    let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+    schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
     let mut pending_rows = Vec::new();
     let mut deleted_rows = Vec::new();
 
@@ -284,8 +290,9 @@ pub(crate) async fn validate_batch_local_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     public_write: &PreparedPublicWriteArtifact,
+    pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
-    validate_prepared_public_write(backend, cache, public_write, false).await
+    validate_prepared_public_write(backend, cache, public_write, pending_view, false).await
 }
 
 pub(crate) async fn validate_commit_time_write(
@@ -293,13 +300,14 @@ pub(crate) async fn validate_commit_time_write(
     cache: &dyn CompiledSchemaCache,
     public_write: &PreparedPublicWriteArtifact,
 ) -> Result<(), LixError> {
-    validate_prepared_public_write(backend, cache, public_write, true).await
+    validate_prepared_public_write(backend, cache, public_write, None, true).await
 }
 
 async fn validate_prepared_public_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     public_write: &PreparedPublicWriteArtifact,
+    pending_view: Option<&dyn PendingView>,
     require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
     let resolved = public_write
@@ -311,6 +319,7 @@ async fn validate_prepared_public_write(
             description: "planned write validation requires a resolved write plan".to_string(),
         })?;
     let mut schema_provider = OverlaySchemaProvider::from_backend(backend);
+    schema_provider.remember_pending_registered_schemas_from_view(pending_view)?;
     remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
         collect_planned_binary_blob_hashes(resolved, require_binary_blob_ref_cas)?;

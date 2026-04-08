@@ -1807,6 +1807,7 @@ pub(crate) fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstr
     constraints
 }
 
+#[cfg(test)]
 pub(crate) fn entity_id_in_constraint<I>(entity_ids: I) -> ScanConstraint
 where
     I: IntoIterator<Item = String>,
@@ -2128,6 +2129,7 @@ pub struct EffectiveRowSet {
     pub rows: Vec<EffectiveRow>,
 }
 
+#[cfg(test)]
 pub(crate) fn values_from_snapshot_content(
     snapshot_content: Option<&str>,
 ) -> Result<BTreeMap<String, Value>, LixError> {
@@ -2152,6 +2154,7 @@ pub(crate) fn values_from_snapshot_content(
         .collect())
 }
 
+#[cfg(test)]
 fn value_from_json(value: JsonValue) -> Value {
     match value {
         JsonValue::Null => Value::Null,

@@ -7,14 +7,13 @@ use crate::schema::access::{
     snapshot_select_expr_for_schema, tracked_relation_name,
 };
 use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
+use crate::schema::builtin::versioning::{version_descriptor_schema_key, version_ref_schema_key};
+use crate::schema::builtin::GLOBAL_VERSION_ID;
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_payload_alias, entity_surface_uses_payload_alias, escape_sql_string,
     expr_contains_string_literal, json_array_text_join_sql, quote_ident, render_identifier,
     render_qualified_where_clause_sql, render_where_clause_sql,
     split_effective_state_pushdown_predicates,
-};
-use crate::version_state::{
-    version_descriptor_schema_key, version_ref_schema_key, GLOBAL_VERSION_ID,
 };
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;

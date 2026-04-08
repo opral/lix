@@ -13,16 +13,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
 use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
 use crate::contracts::artifacts::RowIdentity;
 use crate::contracts::change::TrackedDomainChangeView;
+#[cfg(test)]
 pub(crate) use crate::contracts::traits::WorkspaceWriterKeyReadView;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_WRITER_KEY_TABLE: &str = "lix_internal_workspace_writer_key";
 
+#[cfg(test)]
 #[async_trait(?Send)]
 impl<T> WorkspaceWriterKeyReadView for T
 where

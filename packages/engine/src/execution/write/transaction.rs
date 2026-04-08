@@ -11,13 +11,11 @@ use crate::common::paths::filesystem::NormalizedDirectoryPath;
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
-#[allow(unused_imports)]
-pub use super::contracts::{
-    CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
-};
-#[allow(unused_imports)]
+#[cfg(test)]
 pub use super::execution::WriteTransaction;
-#[allow(unused_imports)]
+#[cfg(test)]
+pub use super::contracts::TransactionDelta;
+#[cfg(test)]
 pub use super::read_context::ReadContext;
 pub(crate) use crate::backend::program::WriteProgram;
 

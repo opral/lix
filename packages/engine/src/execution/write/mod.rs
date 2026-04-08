@@ -1,11 +1,13 @@
 pub(crate) mod buffered;
 pub(crate) mod buffered_write_transaction;
 mod contracts;
+#[cfg(test)]
 mod execution;
 pub(crate) mod filesystem;
 mod observe_tick;
 pub(crate) mod overlay;
 mod plugin_install;
+#[cfg(test)]
 mod read_context;
 mod sql_adapter;
 pub(crate) mod transaction;
@@ -19,9 +21,9 @@ pub(crate) use contracts::{
     BufferedWriteExecutionInput, DeferredTransactionSideEffects, PreparedWriteRuntimeState,
     TrackedCommitExecutionOutcome, WriteExecutionBindings,
 };
-pub use contracts::{
-    CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
-};
+pub use contracts::TransactionCommitOutcome;
+#[cfg(test)]
+pub use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 pub(crate) use observe_tick::append_observe_tick_in_transaction;
 pub(crate) use overlay::PendingTransactionView;
 pub(crate) use plugin_install::{
@@ -29,6 +31,7 @@ pub(crate) use plugin_install::{
     stage_prepared_write_step, PluginInstallWriteExecutor, PreparedWriteStepStager,
     SemanticWriteContext,
 };
+#[cfg(test)]
 pub use read_context::ReadContext;
 pub(crate) use sql_adapter::{
     command_metadata, complete_sql_command_execution, execute_planned_write_delta,

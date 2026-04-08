@@ -52,7 +52,7 @@ use crate::sql::explain::{
 use crate::sql::prepare::{
     build_public_write_execution, build_public_write_invariant_trace,
     compile_execution_from_template_instance_with_context, finalize_public_write_execution,
-    load_sql_compiler_metadata_with_reader, prepare_public_read_artifact,
+    load_sql_compiler_metadata_with_reader_and_pending_view, prepare_public_read_artifact,
     public_authoritative_write_error, public_write_preparation_error,
     BoundStatementTemplateInstance, CompiledExecution, PreparationPolicy, SqlCompilerMetadata,
     UpdateValidationPlan,
@@ -164,6 +164,7 @@ impl PreparedWriteExecutionBoundary {
 
 pub(crate) async fn bootstrap_prepared_write_preparation_context(
     mut transaction: &mut dyn LixBackendTransaction,
+    pending_transaction_view: Option<&PendingTransactionView>,
     context: &ExecutionContext,
 ) -> Result<PreparedWritePreparationContext, LixError> {
     let active_history_root_commit_id = transaction
@@ -171,8 +172,12 @@ pub(crate) async fn bootstrap_prepared_write_preparation_context(
         .await?;
     let compiler_metadata = {
         let metadata_reader = &mut transaction;
-        load_sql_compiler_metadata_with_reader(metadata_reader, &context.public_surface_registry)
-            .await?
+        load_sql_compiler_metadata_with_reader_and_pending_view(
+            metadata_reader,
+            &context.public_surface_registry,
+            pending_transaction_view.map(|view| view as &dyn PendingView),
+        )
+        .await?
     };
     Ok(PreparedWritePreparationContext {
         stamp: PreparedWriteContextStamp::capture(context),
@@ -234,6 +239,7 @@ pub(crate) async fn prepare_buffered_write_execution_step(
         &backend,
         collaborators.compiled_schema_cache(),
         bound_statement_template.params(),
+        pending_transaction_view.map(|view| view as &dyn PendingView),
         compiled,
     )
     .await?;
@@ -260,6 +266,7 @@ pub(crate) async fn prepare_buffered_write_execution_step(
     validate_prepared_write_execution_boundary(
         &backend,
         collaborators.compiled_schema_cache(),
+        pending_transaction_view.map(|view| view as &dyn PendingView),
         &boundary,
     )
     .await?;
@@ -344,11 +351,12 @@ async fn validate_compiled_write_preparation(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     params: &[Value],
+    pending_view: Option<&dyn PendingView>,
     compiled: CompiledWritePreparation,
 ) -> Result<ValidatedWritePreparation, LixError> {
     if let Some(internal) = compiled.payload.compiled_execution.internal_execution() {
         if !internal.mutations.is_empty() {
-            validate_inserts(backend, cache, &internal.mutations)
+            validate_inserts(backend, cache, &internal.mutations, pending_view)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -359,7 +367,13 @@ async fn validate_compiled_write_preparation(
                 })?;
         }
         if !internal.update_validations.is_empty() {
-            validate_update_plans(backend, cache, &internal.update_validations, params)
+            validate_update_plans(
+                backend,
+                cache,
+                &internal.update_validations,
+                params,
+                pending_view,
+            )
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -437,10 +451,11 @@ fn assemble_prepared_write_execution_boundary(
 async fn validate_prepared_write_execution_boundary(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
+    pending_view: Option<&dyn PendingView>,
     boundary: &PreparedWriteExecutionBoundary,
 ) -> Result<(), LixError> {
     if let Some(public_write) = boundary.prepared_step.public_write() {
-        validate_batch_local_write(backend, cache, public_write)
+        validate_batch_local_write(backend, cache, public_write, pending_view)
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -479,12 +494,13 @@ async fn validate_update_plans(
     cache: &dyn CompiledSchemaCache,
     plans: &[UpdateValidationPlan],
     params: &[Value],
+    pending_view: Option<&dyn PendingView>,
 ) -> Result<(), LixError> {
     let mut inputs = Vec::with_capacity(plans.len());
     for plan in plans {
         inputs.push(load_update_validation_input(backend, plan, params).await?);
     }
-    validate_update_inputs(backend, cache, &inputs).await
+    validate_update_inputs(backend, cache, &inputs, pending_view).await
 }
 
 async fn load_update_validation_input(

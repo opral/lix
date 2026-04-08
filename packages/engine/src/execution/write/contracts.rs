@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use crate::contracts::artifacts::{
     CanonicalCommitReceipt, PendingPublicCommitSession, PreparedPublicReadArtifact,
     PublicDomainChange, RowIdentity, SessionStateDelta, StateCommitStreamChange,
+};
+#[cfg(test)]
+use crate::contracts::artifacts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
@@ -11,9 +14,13 @@ use crate::contracts::traits::PendingView;
 use crate::LixError;
 use crate::{LixBackendTransaction, QueryResult};
 
+#[cfg(test)]
 use crate::execution::write::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal};
+#[cfg(not(test))]
+use crate::execution::write::buffered::TrackedTxnUnit;
 use crate::execution::write::filesystem::runtime::BinaryBlobWrite;
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct TransactionDelta {
     #[serde(default)]
@@ -22,17 +29,13 @@ pub struct TransactionDelta {
     pub untracked_writes: Vec<UntrackedWriteRow>,
 }
 
-impl TransactionDelta {
-    pub fn is_empty(&self) -> bool {
-        self.tracked_writes.is_empty() && self.untracked_writes.is_empty()
-    }
-}
-
+#[cfg(test)]
 #[derive(Clone, Default)]
 pub struct TransactionJournal {
     inner: WriteJournal,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for TransactionJournal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TransactionJournal")
@@ -43,17 +46,14 @@ impl std::fmt::Debug for TransactionJournal {
     }
 }
 
+#[cfg(test)]
 impl TransactionJournal {
     pub fn stage(&mut self, delta: TransactionDelta) -> Result<(), LixError> {
-        if delta.is_empty() {
+        if delta.tracked_writes.is_empty() && delta.untracked_writes.is_empty() {
             return Ok(());
         }
         self.inner
             .stage_delta(WriteDelta::from_public_delta(delta)?)
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
     }
 
     pub fn staged_count(&self) -> usize {
@@ -73,6 +73,7 @@ impl TransactionJournal {
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct CommitOutcome {
     pub tracked_upserts: usize,
@@ -81,6 +82,7 @@ pub struct CommitOutcome {
     pub untracked_deletes: usize,
 }
 
+#[cfg(test)]
 impl CommitOutcome {
     pub fn merge(&mut self, other: CommitOutcome) {
         self.tracked_upserts += other.tracked_upserts;

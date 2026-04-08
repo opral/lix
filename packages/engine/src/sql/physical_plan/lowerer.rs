@@ -4,9 +4,6 @@ use crate::contracts::surface::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
-use crate::filesystem_projection_sql::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
@@ -26,7 +23,10 @@ use crate::sql::physical_plan::source_sql::{
     build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
-use crate::version_state::inventory::{
+use crate::surface_sql::filesystem::{
+    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
+};
+use crate::surface_sql::version::{
     build_admin_version_source_sql, build_admin_version_source_sql_with_current_heads,
 };
 use crate::{LixError, SqlDialect};

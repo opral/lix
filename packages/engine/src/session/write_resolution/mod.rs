@@ -226,6 +226,7 @@ where
             resolve_state_write(
                 &mut hydrator,
                 planned_write,
+                pending_transaction_view,
                 functions.clone(),
                 selector_resolver,
             )
@@ -235,6 +236,7 @@ where
             resolve_entity_write(
                 &mut hydrator,
                 planned_write,
+                pending_transaction_view,
                 functions.clone(),
                 selector_resolver,
             )

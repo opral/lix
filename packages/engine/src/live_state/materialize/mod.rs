@@ -9,7 +9,7 @@
 //! must not change committed semantics.
 
 mod apply;
-pub(crate) mod filesystem_materialization;
+pub(crate) mod filesystem;
 mod loader;
 mod plan;
 mod types;

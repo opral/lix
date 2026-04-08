@@ -254,11 +254,11 @@ mod tests {
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
     use crate::schema::builtin::types::LixCommit;
+    use crate::surface_sql::version::build_admin_version_source_sql_with_current_heads;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionBindings,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
     use crate::version_state::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,

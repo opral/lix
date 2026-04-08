@@ -9,7 +9,8 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 
 pub(crate) mod artifacts;
-pub(crate) mod filesystem;
+pub(crate) mod directory;
+pub(crate) mod file;
 pub(crate) mod traits;
 pub(crate) mod version;
 pub(crate) use artifacts::{

@@ -1,8 +1,8 @@
-use crate::version_state::inventory::build_admin_version_source_sql;
+use crate::schema::builtin::DEFAULT_ACTIVE_VERSION_NAME;
+use crate::surface_sql::version::build_admin_version_source_sql;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";
-const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
 const WORKSPACE_ACTIVE_VERSION_ID_KEY: &str = "active_version_id";
 const WORKSPACE_ACTIVE_ACCOUNT_IDS_KEY: &str = "active_account_ids";
 

@@ -1,8 +1,8 @@
 use crate::common::errors::classification::is_missing_relation_error;
+use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::PreparedBatch;
 use crate::contracts::functions::LixFunctionProvider;
-use crate::common::naming::tracked_relation_name;
 use crate::schema::access::payload_column_name_for_schema;
 use crate::schema::builtin::storage::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,

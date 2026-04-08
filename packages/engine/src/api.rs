@@ -1,3 +1,5 @@
+mod lix_api;
+
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::common::errors;
 use crate::engine::Engine;
@@ -6,6 +8,8 @@ use crate::live_state::{
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
 use crate::LixError;
+
+pub use lix_api::{InitResult, Lix, LixConfig};
 
 impl Engine {
     #[doc(hidden)]
@@ -58,12 +62,13 @@ impl Engine {
         let plan = crate::live_state::rebuild_plan(self.backend().as_ref(), req).await?;
         let apply = crate::live_state::apply_rebuild_plan(self.backend().as_ref(), &plan).await?;
 
-        if let Err(error) = crate::live_state::materialize::filesystem_materialization::materialize_file_data_with_plugins(
-            self.backend().as_ref(),
-            self.runtime().as_ref(),
-            &plan,
-        )
-        .await
+        if let Err(error) =
+            crate::execution::write::filesystem::materialize::materialize_file_data_with_plugins(
+                self.backend().as_ref(),
+                self.runtime().as_ref(),
+                &plan,
+            )
+            .await
         {
             let _ =
                 mark_mode_with_backend(self.backend().as_ref(), LiveStateMode::NeedsRebuild).await;

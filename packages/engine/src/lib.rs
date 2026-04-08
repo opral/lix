@@ -1,22 +1,19 @@
 mod api;
 mod backend;
 mod binary_cas;
-mod boot;
 pub(crate) mod canonical;
 mod common;
 pub(crate) mod contracts;
 mod engine;
 pub(crate) mod execution;
-mod filesystem_payload_sql;
-mod filesystem_projection_sql;
 mod init;
 pub mod live_state;
-mod lix;
 pub(crate) mod projections;
 mod runtime;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
+mod surface_sql;
 #[cfg(test)]
 mod test_support;
 pub(crate) mod version_state;
@@ -43,6 +40,7 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
+pub use api::{InitResult, Lix, LixConfig};
 pub use backend::prepared::{PreparedBatch, PreparedStatement};
 pub use backend::LixBackend;
 pub use backend::LixBackendTransaction;
@@ -69,7 +67,6 @@ pub use live_state::{
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
-pub use lix::{InitResult, Lix, LixConfig};
 pub use session::checkpoint_ops::CreateCheckpointResult;
 pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
 pub use session::version_ops::{

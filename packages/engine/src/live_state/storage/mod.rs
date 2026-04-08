@@ -2,7 +2,6 @@ pub(crate) mod layout;
 pub(crate) mod registry;
 pub(crate) mod sql;
 
-pub(crate) use crate::schema::access::{payload_column_name_for_schema, tracked_relation_name};
 #[allow(unused_imports)]
 pub(crate) use layout::{
     builtin_live_table_layout, json_value_from_live_row_cell, live_column_name_for_property,
