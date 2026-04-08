@@ -1,6 +1,6 @@
 use crate::backend::QueryExecutor;
-use crate::contracts::artifacts::CommittedVersionFrontier;
 use crate::common::errors::classification::is_missing_relation_error;
+use crate::contracts::artifacts::CommittedVersionFrontier;
 use crate::live_state::schema_access::tracked_relation_name;
 use crate::schema::builtin::storage::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::{LixBackend, LixError, Value};

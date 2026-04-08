@@ -16,8 +16,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
-use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::artifacts::RowIdentity;
+use crate::contracts::change::TrackedDomainChangeView;
 pub(crate) use crate::contracts::traits::WorkspaceWriterKeyReadView;
 use crate::{LixBackend, LixError, Value};
 

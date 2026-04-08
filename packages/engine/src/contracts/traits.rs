@@ -4,6 +4,8 @@ use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use crate::common::error::LixError;
+use crate::common::types::{QueryResult, Value};
 use crate::contracts::artifacts::{
     EffectiveRowSet, EffectiveRowsRequest, ExactUntrackedLookupRequest, LiveFilter,
     LiveQueryEffectiveRow, LiveQueryOverlayLane, LiveSnapshotRow, LiveSnapshotStorage,
@@ -13,8 +15,6 @@ use crate::contracts::artifacts::{
     UntrackedWriteRow,
 };
 use crate::contracts::ReplayCursor;
-use crate::common::error::LixError;
-use crate::common::types::{QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum PendingSemanticStorage {
@@ -392,8 +392,5 @@ pub(crate) trait PendingPublicReadTransaction {
 
 #[async_trait(?Send)]
 pub(crate) trait BlobDataReader {
-    async fn load_blob_data_by_hash(
-        &self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError>;
+    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError>;
 }

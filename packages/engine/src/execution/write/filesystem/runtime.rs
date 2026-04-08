@@ -3,10 +3,10 @@ use crate::contracts::artifacts::{
     FilesystemPayloadDomainChange, FilesystemProjectionScope, MutationRow, OptionalTextPatch,
 };
 use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
-use crate::execution::write::transaction::TransactionExecutionBackend;
 use crate::execution::write::filesystem::query::{
     load_file_row_by_id_without_path, resolve_file_id_by_path_in_version,
 };
+use crate::execution::write::transaction::TransactionExecutionBackend;
 use crate::{LixBackendTransaction, LixError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 

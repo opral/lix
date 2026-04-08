@@ -1,5 +1,7 @@
-use crate::projections::{DerivedRow, ProjectionLifecycle, ProjectionRegistry, RegisteredProjection};
 use crate::live_state::projection::hydration::hydrate_projection_input_with_backend;
+use crate::projections::{
+    DerivedRow, ProjectionLifecycle, ProjectionRegistry, RegisteredProjection,
+};
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn derive_read_time_projection_rows_with_backend(

@@ -4,8 +4,8 @@ use crate::contracts::artifacts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
     StateHistoryVersionScope,
 };
-use crate::contracts::traits::CommittedStateHistoryReader;
 use crate::contracts::traits::BlobDataReader;
+use crate::contracts::traits::CommittedStateHistoryReader;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;

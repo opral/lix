@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::common::text::escape_sql_string;
 use crate::version_state::{
-    build_local_version_ref_heads_source_sql,
-    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    build_local_version_ref_heads_source_sql, version_descriptor_file_id,
+    version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, GLOBAL_VERSION_ID,
 };
 use crate::SqlDialect;

@@ -39,8 +39,8 @@
 pub(crate) mod checkpoint_labels;
 pub(crate) mod graph;
 mod init;
-pub(crate) mod json;
 pub(crate) mod journal;
+pub(crate) mod json;
 pub(crate) mod read;
 
 pub(crate) const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =

@@ -1,4 +1,3 @@
-use async_trait::async_trait;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
@@ -8,6 +7,7 @@ use crate::runtime::streams::{StateCommitStream, StateCommitStreamFilter};
 use crate::runtime::wasm::WasmRuntime;
 use crate::runtime::Runtime;
 use crate::{LixBackend, LixError};
+use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
@@ -45,7 +45,9 @@ impl crate::session::collaborators::SessionServices for EngineSessionServices {
         self.engine.runtime().access_to_internal()
     }
 
-    async fn begin_write_unit(&self) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+    async fn begin_write_unit(
+        &self,
+    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
         self.engine.runtime().begin_write_unit().await
     }
 
@@ -152,9 +154,11 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Engine {
         backend: &dyn LixBackend,
     ) -> Result<crate::runtime::execution_state::ExecutionRuntimeState, LixError> {
         let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(crate::runtime::execution_state::ExecutionRuntimeState::from_prepared_parts(
-            settings, functions,
-        ))
+        Ok(
+            crate::runtime::execution_state::ExecutionRuntimeState::from_prepared_parts(
+                settings, functions,
+            ),
+        )
     }
 }
 
@@ -201,11 +205,8 @@ impl crate::execution::write::WriteExecutionBindings for Engine {
             Box<dyn crate::contracts::functions::LixFunctionProvider + Send>,
         >,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_bindings::persist_runtime_sequence(
-            transaction,
-            functions,
-        )
-        .await
+        crate::session::write_execution_bindings::persist_runtime_sequence(transaction, functions)
+            .await
     }
 
     async fn execute_public_tracked_append_txn_with_transaction(
@@ -400,10 +401,10 @@ mod tests {
     use crate::runtime::wasm::NoopWasmRuntime;
     use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
     use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
-    use crate::sql::internal::script::extract_explicit_transaction_script_from_statements;
     use crate::sql::optimizer::optimize_state_resolution;
     use crate::sql::parser::parse_sql_statements;
     use crate::sql::parser::placeholders::PlaceholderState;
+    use crate::sql::prepare::script::extract_explicit_transaction_script_from_statements;
     use crate::TransactionMode;
     use crate::{
         ExecuteOptions, LixBackend, LixBackendTransaction, LixError, QueryResult, Session,

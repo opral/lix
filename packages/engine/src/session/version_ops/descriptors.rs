@@ -5,12 +5,12 @@ use crate::canonical::read::{
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
 use crate::common::text::escape_sql_string;
+use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
 use crate::version_state::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
 };
-use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

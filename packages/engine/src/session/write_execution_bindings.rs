@@ -20,12 +20,12 @@ use crate::execution::write::filesystem::runtime::{
 use crate::execution::write::transaction::TransactionExecutionBackend;
 use crate::execution::write::{TrackedCommitExecutionOutcome, WriteExecutionBindings};
 use crate::projections::ProjectionRegistry;
-use crate::session::read_execution_bindings::ProjectionRegistryReadExecutionBindings;
 use crate::schema::builtin::types::LixActiveVersion;
 use crate::session::collaborators::SessionCollaborators;
+use crate::session::read_execution_bindings::ProjectionRegistryReadExecutionBindings;
 use crate::session::version_ops::commit::{
-    append_tracked_with_pending_public_session, BufferedTrackedAppendArgs, CreateCommitAppliedOutput,
-    CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
+    append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
+    CreateCommitAppliedOutput, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
     CreateCommitPreconditions, CreateCommitWriteLane, ProposedDomainChange,
 };
@@ -144,12 +144,8 @@ impl WriteExecutionBindings for SessionCollaborators {
         unit: &TrackedTxnUnit,
         mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
     ) -> Result<TrackedCommitExecutionOutcome, LixError> {
-        execute_public_tracked_append(
-            transaction,
-            unit,
-            pending_commit_session.as_deref_mut(),
-        )
-        .await
+        execute_public_tracked_append(transaction, unit, pending_commit_session.as_deref_mut())
+            .await
     }
 
     async fn apply_writer_key_annotations_in_transaction(
@@ -203,12 +199,14 @@ pub(crate) async fn persist_binary_blob_writes(
     let resolved = resolve_binary_blob_writes_in_transaction(transaction, writes)
         .await?
         .into_iter()
-        .map(|write| crate::binary_cas::support::ResolvedBinaryBlobWrite {
-            file_id: write.file_id,
-            version_id: write.version_id,
-            untracked: write.untracked,
-            data: write.data,
-        })
+        .map(
+            |write| crate::binary_cas::support::ResolvedBinaryBlobWrite {
+                file_id: write.file_id,
+                version_id: write.version_id,
+                untracked: write.untracked,
+                data: write.data,
+            },
+        )
         .collect::<Vec<_>>();
     crate::binary_cas::support::persist_resolved_binary_blob_writes_in_transaction(
         transaction,
@@ -220,10 +218,8 @@ pub(crate) async fn persist_binary_blob_writes(
 pub(crate) async fn garbage_collect_unreachable_binary_cas(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
-    crate::binary_cas::support::garbage_collect_unreachable_binary_cas_in_transaction(
-        transaction,
-    )
-    .await
+    crate::binary_cas::support::garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+        .await
 }
 
 pub(crate) async fn persist_runtime_sequence(

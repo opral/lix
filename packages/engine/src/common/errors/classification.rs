@@ -1,8 +1,8 @@
+use crate::common::errors;
 use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
 use crate::contracts::surface::SurfaceRegistry;
 use crate::schema::{builtin_public_surface_columns, builtin_public_surface_names};
 use crate::LixBackend;
-use crate::common::errors;
 use crate::LixError;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use std::ops::ControlFlow;

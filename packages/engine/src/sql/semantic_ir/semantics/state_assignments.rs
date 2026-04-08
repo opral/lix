@@ -1,5 +1,5 @@
-use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::common::identity::{derive_entity_id_from_json_paths, EntityIdDerivationError};
+use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::schema::annotations::defaults::apply_schema_defaults_with_shared_runtime;
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateAssignments, MutationPayload, PlannedStateRow,

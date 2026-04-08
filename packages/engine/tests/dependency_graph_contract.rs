@@ -1247,7 +1247,11 @@ fn analyzer_resolves_explicit_super_dependencies_to_the_top_level_scope() {
         "runtime".to_string(),
     ];
     assert_eq!(
-        resolve_explicit_dependency(&["super".to_string(), "super".to_string()], "buffered", &deeper_module_path),
+        resolve_explicit_dependency(
+            &["super".to_string(), "super".to_string()],
+            "buffered",
+            &deeper_module_path
+        ),
         Some("execution".to_string()),
     );
 }
@@ -1708,10 +1712,10 @@ fn phase_g_session_mod_defers_version_convenience_to_request_collaborators() {
 
 #[test]
 fn phase_g_sql_uses_neutral_dialect_seam_instead_of_backend_owner() {
-    let dialect_source = read_engine_source("sql/common/dialect.rs");
+    let dialect_source = read_engine_source("common/dialect.rs");
     assert!(
         dialect_source.contains("pub enum SqlDialect"),
-        "sql_dialect.rs should own the neutral SqlDialect foundation type"
+        "common/dialect.rs should own the neutral SqlDialect foundation type"
     );
 
     for relative in [
@@ -1984,8 +1988,9 @@ fn phase_b_canonical_read_exports_commit_addressed_apis_only() {
 
 #[test]
 fn phase_b_checkpoint_history_rebuild_uses_explicit_head_inputs() {
-    let history_source =
-        strip_test_code(&read_engine_source("canonical/checkpoint_labels/history.rs"));
+    let history_source = strip_test_code(&read_engine_source(
+        "canonical/checkpoint_labels/history.rs",
+    ));
     assert!(
         history_source.contains("struct CheckpointVersionHeadFact"),
         "canonical/checkpoint_labels/history.rs should define explicit checkpoint rebuild inputs"
@@ -2018,7 +2023,11 @@ fn phase_b_contracts_stay_free_of_projection_registry_coupling() {
         let source = strip_test_code(
             &fs::read_to_string(&absolute_path).expect("contracts source should be readable"),
         );
-        for forbidden in ["use crate::projections", "crate::projections::", "ProjectionRegistry"] {
+        for forbidden in [
+            "use crate::projections",
+            "crate::projections::",
+            "ProjectionRegistry",
+        ] {
             assert!(
                 !source.contains(forbidden),
                 "{relative_path} should stay free of projection-registry coupling via `{forbidden}`"

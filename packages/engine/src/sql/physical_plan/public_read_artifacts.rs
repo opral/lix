@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::SurfaceFamily;
-use crate::sql::backend::PushdownDecision;
+use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;

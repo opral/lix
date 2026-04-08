@@ -1,9 +1,9 @@
-use crate::contracts::change::TrackedDomainChangeView;
 use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
     CommitPreconditions, DomainChangeBatch, ExpectedHead, IdempotencyKey, PublicDomainChange,
     SemanticEffect,
 };
+use crate::contracts::change::TrackedDomainChangeView;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,

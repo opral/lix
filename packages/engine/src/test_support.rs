@@ -6,13 +6,13 @@ use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::contracts::traits::PendingView;
+use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::projections::ProjectionRegistry;
 use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
+use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::logical_plan::public_ir::{PlannedWrite, ResolvedWritePlan};
-use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
-use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::{
     boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,

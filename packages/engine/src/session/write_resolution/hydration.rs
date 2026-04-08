@@ -1,7 +1,9 @@
-use crate::contracts::traits::PendingStateOverlay;
-use crate::session::write_resolution::prepared_artifacts::{ExactEffectiveStateRow, ExactEffectiveStateRowRequest};
-use crate::version_state::{load_committed_version_ref_with_backend, GLOBAL_VERSION_ID};
 use super::effective_state::resolve_exact_effective_state_row_with_pending_overlay;
+use crate::contracts::traits::PendingStateOverlay;
+use crate::session::write_resolution::prepared_artifacts::{
+    ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
+};
+use crate::version_state::{load_committed_version_ref_with_backend, GLOBAL_VERSION_ID};
 use crate::{LixBackend, LixError};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -66,7 +68,7 @@ impl<'a> PublicWriteHydrator<'a> {
                 self.backend,
                 version_id,
             )
-                .await?
+            .await?
         else {
             return Ok(None);
         };

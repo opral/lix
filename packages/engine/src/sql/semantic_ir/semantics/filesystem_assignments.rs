@@ -1,4 +1,6 @@
-use crate::common::paths::filesystem::{normalize_path_segment, NormalizedDirectoryPath, ParsedFilePath};
+use crate::common::paths::filesystem::{
+    normalize_path_segment, NormalizedDirectoryPath, ParsedFilePath,
+};
 use crate::Value;
 use std::collections::BTreeMap;
 

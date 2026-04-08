@@ -1,10 +1,11 @@
+use std::collections::BTreeMap;
+
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::SqlPreparationMetadataReader;
 use crate::schema::builtin::builtin_schema_definition;
 use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 use serde_json::{json, Value as JsonValue};
-use std::collections::BTreeMap;
 
 const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";

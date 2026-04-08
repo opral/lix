@@ -248,8 +248,8 @@ mod tests {
 
     use super::{execute_read_time_projection_read, execute_read_time_projection_rows};
     use crate::contracts::artifacts::{
-        PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
-        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
+        PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
+        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
     };
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
@@ -258,13 +258,13 @@ mod tests {
         init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionBindings,
         CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
     use crate::version_state::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_snapshot_content,
     };
-    use crate::version_state::inventory::build_admin_version_source_sql_with_current_heads;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
     #[derive(Debug, Clone)]
@@ -432,13 +432,10 @@ mod tests {
             },
         };
 
-        let actual = execute_read_time_projection_read(
-            &backend,
-            &BuiltinReadExecutionBindings,
-            &artifact,
-        )
-        .await
-        .expect("read-time projection query should execute");
+        let actual =
+            execute_read_time_projection_read(&backend, &BuiltinReadExecutionBindings, &artifact)
+                .await
+                .expect("read-time projection query should execute");
         let expected = current_admin_sql_query_result(
             &backend,
             &current_heads,
@@ -495,13 +492,10 @@ mod tests {
             },
         };
 
-        let actual = execute_read_time_projection_read(
-            &backend,
-            &BuiltinReadExecutionBindings,
-            &artifact,
-        )
-        .await
-        .expect("read-time projection count query should execute");
+        let actual =
+            execute_read_time_projection_read(&backend, &BuiltinReadExecutionBindings, &artifact)
+                .await
+                .expect("read-time projection count query should execute");
         let expected = current_admin_sql_query_result(
             &backend,
             &current_heads,

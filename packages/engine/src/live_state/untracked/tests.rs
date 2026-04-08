@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
+use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
 use crate::live_state::projection::local_version_head_write_row;
@@ -11,7 +12,6 @@ use crate::live_state::untracked::{
 };
 use crate::schema::builtin::storage::builtin_schema_storage_metadata;
 use crate::schema::builtin::types::LixActiveVersion;
-use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };

@@ -4,6 +4,7 @@ pub(crate) mod prepared_artifacts;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
+use crate::execution::write::filesystem::query::FilesystemQueryError;
 use crate::session::write_resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
     OverlayLane, PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
@@ -17,7 +18,6 @@ use crate::version_state::{
     version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
     version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
-use crate::execution::write::filesystem::query::FilesystemQueryError;
 use crate::{LixBackend, Value};
 use async_trait::async_trait;
 use std::collections::{BTreeMap, BTreeSet};

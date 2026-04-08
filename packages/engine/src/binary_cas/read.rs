@@ -10,10 +10,7 @@ use crate::{LixBackend, LixError, Value};
 
 #[async_trait(?Send)]
 impl BlobDataReader for dyn LixBackend + '_ {
-    async fn load_blob_data_by_hash(
-        &self,
-        blob_hash: &str,
-    ) -> Result<Option<Vec<u8>>, LixError> {
+    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
         load_binary_blob_data_by_hash(self, blob_hash).await
     }
 }

@@ -132,9 +132,9 @@ simulation_test!(
         assert!(error.description.contains(
             "Direct writes against internal storage relations can lead to data corruption."
         ));
-        assert!(error.description.contains(
-            "not as a public reserved SQL namespace"
-        ));
+        assert!(error
+            .description
+            .contains("not as a public reserved SQL namespace"));
     }
 );
 

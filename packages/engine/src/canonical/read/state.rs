@@ -352,11 +352,11 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::version_ops::committed_state::load_exact_committed_state_row_at_version_head;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::session::version_ops::committed_state::load_exact_committed_state_row_at_version_head;
     use crate::version_state::load_local_version_head_commit_id_with_executor;
     use std::collections::BTreeMap;
 

@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
 use crate::backend::TransactionBackendAdapter;
+use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
 use crate::contracts::artifacts::{
     PreparedBatch, PreparedExplainMode, PreparedInsertOnConflictAction,
     PreparedInternalWriteArtifact, PreparedPublicSurfaceRegistryEffect,
@@ -26,16 +27,23 @@ use crate::contracts::functions::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
 use crate::contracts::surface::SurfaceRegistry;
-use crate::projections::ProjectionRegistry;
 use crate::contracts::traits::{
     CompiledSchemaCache, LiveReadShapeContract, LiveStateQueryBackend, PendingView,
     SqlPreparationMetadataReader,
 };
-use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
+use crate::execution::write::{
+    PendingTransactionView, PreparedWriteExecutionStep, PreparedWriteRuntimeState,
+};
+use crate::projections::ProjectionRegistry;
+use crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::session::execution_context::ExecutionContext;
-use crate::session::SessionWriteSelectorResolver;
 use crate::session::collaborators::WriteExecutionCollaborators;
+use crate::session::execution_context::ExecutionContext;
+use crate::session::write_resolution::resolve_write_plan_with_functions;
+use crate::session::write_validation::{
+    validate_batch_local_write, validate_inserts, validate_update_inputs,
+};
+use crate::session::SessionWriteSelectorResolver;
 use crate::sql::binder::bind_sql;
 use crate::sql::explain::{
     build_public_write_explain_artifacts, prepare_analyzed_explain_template,
@@ -51,14 +59,6 @@ use crate::sql::prepare::{
 };
 use crate::sql::semantic_ir::semantics::domain_changes::{
     build_domain_change_batch, derive_commit_preconditions,
-};
-use crate::execution::write::{
-    PendingTransactionView, PreparedWriteExecutionStep, PreparedWriteRuntimeState,
-};
-use crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
-use crate::session::write_resolution::resolve_write_plan_with_functions;
-use crate::session::write_validation::{
-    validate_batch_local_write, validate_inserts, validate_update_inputs,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 

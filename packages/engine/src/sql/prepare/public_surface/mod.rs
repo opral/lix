@@ -1,10 +1,15 @@
 //! Compiler-owned preparation of public surface artifacts.
 
-use crate::contracts::change::TrackedDomainChangeView;
+pub(crate) mod routing;
+
+use crate::common::errors::{
+    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
+};
 use crate::contracts::artifacts::{
     CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
     SessionStateDelta, StateCommitStreamOperation,
 };
+use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::state_commit_stream::{
     state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamRuntimeMetadata,
@@ -14,14 +19,11 @@ use crate::contracts::surface::{
 };
 #[cfg(test)]
 use crate::contracts::traits::SqlPreparationMetadataReader;
-use crate::common::errors::{
-    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
-};
-use crate::schema::relation_policy::{classify_relation_name, RelationPolicy};
 use crate::schema::builtin::builtin_schema_definition;
+use crate::schema::relation_policy::{classify_relation_name, RelationPolicy};
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
-use crate::sql::backend::PushdownDecision;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
+use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::explain::{
     build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts,
     ExplainRequest, ExplainStage, ExplainStageTiming, ExplainTimingCollector,
@@ -1698,11 +1700,11 @@ mod tests {
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
     use crate::contracts::surface::SurfaceReadFreshness;
-    use crate::live_state::{self, mark_mode_with_backend};
     use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
+    use crate::live_state::{self, mark_mode_with_backend};
     use crate::schema::builtin::types::LixCommit;
     use crate::sql::prepare::prepare_public_read_artifact;
-    use crate::sql::routing::delay_broad_routing_for_test;
+    use crate::sql::prepare::public_surface::routing::delay_broad_routing_for_test;
     use crate::sql::{
         binder::{
             bind_public_read_statement, delay_broad_binding_for_test, forbid_broad_binding_for_test,

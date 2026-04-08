@@ -55,8 +55,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             crate::version_state::GLOBAL_VERSION_ID,
         )
         .await?;
-        self.seed_local_version_head(crate::version_state::GLOBAL_VERSION_ID, &bootstrap_commit_id)
-            .await?;
+        self.seed_local_version_head(
+            crate::version_state::GLOBAL_VERSION_ID,
+            &bootstrap_commit_id,
+        )
+        .await?;
         self.seed_local_version_head(&main_version_id, &bootstrap_commit_id)
             .await?;
 
@@ -174,8 +177,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             metadata: None,
             writer_key: None,
             snapshot_content: Some(crate::version_state::version_ref_snapshot_content(
-                version_id,
-                commit_id,
+                version_id, commit_id,
             )),
             created_at: Some(timestamp.clone()),
             updated_at: timestamp,

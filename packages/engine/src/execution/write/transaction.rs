@@ -11,7 +11,6 @@ use crate::common::paths::filesystem::NormalizedDirectoryPath;
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
-pub(crate) use crate::backend::program::WriteProgram;
 #[allow(unused_imports)]
 pub use super::contracts::{
     CommitOutcome, TransactionCommitOutcome, TransactionDelta, TransactionJournal,
@@ -20,6 +19,7 @@ pub use super::contracts::{
 pub use super::execution::WriteTransaction;
 #[allow(unused_imports)]
 pub use super::read_context::ReadContext;
+pub(crate) use crate::backend::program::WriteProgram;
 
 pub(crate) async fn lookup_directory_id_by_path_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
@@ -121,5 +121,3 @@ pub(crate) async fn normalize_sql_error_with_transaction_and_relation_names(
     let backend = TransactionExecutionBackend::new(transaction);
     normalize_sql_error_with_backend_and_relation_names(&backend, error, relation_names).await
 }
-
-

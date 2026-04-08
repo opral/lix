@@ -3,10 +3,10 @@ use crate::execution::write::WriteExecutionBindings;
 use crate::{LixBackendTransaction, LixError};
 
 use super::internal_apply::run_internal_write_txn_with_transaction;
-use crate::execution::write::buffered::{PlannedWriteDelta, PlannedWriteUnit};
 use super::runtime::{empty_public_write_execution_outcome, SqlExecutionOutcome};
 use super::tracked_apply::run_public_tracked_append_txn_with_transaction;
 use super::untracked_apply::run_public_untracked_write_txn_with_transaction;
+use crate::execution::write::buffered::{PlannedWriteDelta, PlannedWriteUnit};
 
 pub(crate) async fn execute_planned_write_delta(
     bindings: &dyn WriteExecutionBindings,

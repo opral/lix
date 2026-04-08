@@ -2,11 +2,11 @@ use crate::canonical::read::{
     build_state_history_source_sql, CanonicalHistoryContentMode, CanonicalHistoryRootFacts,
     CanonicalHistoryRootSelection, CanonicalRootCommit,
 };
+use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
     StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
-use crate::common::text::escape_sql_string;
 use crate::version_state::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,

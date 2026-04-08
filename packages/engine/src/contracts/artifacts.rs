@@ -4,13 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
+use crate::common::error::LixError;
+use crate::common::types::Value;
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
 };
-use crate::contracts::ReplayCursor;
-use crate::common::error::LixError;
 use crate::contracts::transaction_mode::TransactionMode;
-use crate::common::types::Value;
+use crate::contracts::ReplayCursor;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {
@@ -2239,13 +2239,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        FileHistoryRequest, PreparedBatch, PreparedDirectPublicRead,
-        PreparedExplainMode, PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
+        FileHistoryRequest, PreparedBatch, PreparedDirectPublicRead, PreparedExplainMode,
+        PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
         PreparedPublicReadArtifact, PreparedPublicReadContract,
         PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
-        PreparedReadStep, PreparedStatement, ReadDiagnosticCatalogSnapshot,
-        ReadDiagnosticContext, ReadTimeProjectionRead, ReadTimeProjectionReadQuery,
-        ReadTimeProjectionSurface, ResultContract,
+        PreparedReadStep, PreparedStatement, ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext,
+        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
+        ResultContract,
     };
     use crate::contracts::surface::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
     use crate::Value;

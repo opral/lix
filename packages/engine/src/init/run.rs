@@ -13,10 +13,10 @@ use crate::live_state::{
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
 use crate::session::observe;
-use crate::session::workspace;
 use crate::session::version_ops;
-use crate::version_state;
 use crate::session::version_ops::commit;
+use crate::session::workspace;
+use crate::version_state;
 use crate::{LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;
@@ -61,7 +61,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
                 .map_err(|error| init_step_error("observe::init", error))?;
             version_state::checkpoints::cache::init(&backend)
                 .await
-                .map_err(|error| init_step_error("version_state::checkpoints::cache::init", error))?;
+                .map_err(|error| {
+                    init_step_error("version_state::checkpoints::cache::init", error)
+                })?;
             version_ops::init(&backend)
                 .await
                 .map_err(|error| init_step_error("session::version_ops::init", error))?;
@@ -97,17 +99,26 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
                 &mut backend,
             )
             .await
-            .map_err(|error| init_step_error("session::version_ops::load_checkpoint_version_heads_with_executor", error))?
+            .map_err(|error| {
+                init_step_error(
+                    "session::version_ops::load_checkpoint_version_heads_with_executor",
+                    error,
+                )
+            })?
             .into_iter()
-            .map(|head| crate::canonical::checkpoint_labels::CheckpointVersionHeadFact {
-                version_id: head.version_id,
-                head_commit_id: head.head_commit_id,
-            })
+            .map(
+                |head| crate::canonical::checkpoint_labels::CheckpointVersionHeadFact {
+                    version_id: head.version_id,
+                    head_commit_id: head.head_commit_id,
+                },
+            )
             .collect::<Vec<_>>()
         };
         canonical::checkpoint_labels::seed_bootstrap(&mut init, &checkpoint_version_heads)
             .await
-            .map_err(|error| init_step_error("canonical::checkpoint_labels::seed_bootstrap", error))?;
+            .map_err(|error| {
+                init_step_error("canonical::checkpoint_labels::seed_bootstrap", error)
+            })?;
         init.seed_boot_config_key_values(&default_active_version_id)
             .await
             .map_err(|error| init_step_error("InitExecutor::seed_boot_config_key_values", error))?;
@@ -172,7 +183,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
 pub(crate) async fn init_if_needed(engine: &Engine) -> Result<bool, LixError> {
     match init(engine).await {
         Ok(()) => Ok(true),
-        Err(error) if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() => {
+        Err(error)
+            if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() =>
+        {
             engine.wait_for_concurrent_init_ready().await?;
             engine.refresh_public_surface_registry().await?;
             Ok(false)

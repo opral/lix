@@ -6,12 +6,12 @@
 use crate::contracts::artifacts::PreparedStatement;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::ast::lowering::lower_statement;
-use crate::sql::internal::inline_functions::inline_lix_functions_with_provider;
-use crate::sql::internal::param_context::normalize_statement_placeholders_in_batch;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::contracts::planned_statement::{
     MutationRow, PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
+use crate::sql::semantic_ir::inline_functions::inline_lix_functions_with_provider;
+use crate::sql::semantic_ir::param_context::normalize_statement_placeholders_in_batch;
 use crate::{LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;

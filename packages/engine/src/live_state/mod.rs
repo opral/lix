@@ -51,7 +51,8 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
-pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
+pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str =
+    "lix_internal_registered_schema_bootstrap";
 pub(crate) const FILE_DATA_CACHE_TABLE: &str = "lix_internal_file_data_cache";
 pub(crate) const FILE_PATH_CACHE_TABLE: &str = "lix_internal_file_path_cache";
 pub(crate) const FILE_LIXCOL_CACHE_TABLE: &str = "lix_internal_file_lixcol_cache";
@@ -63,6 +64,7 @@ pub(crate) use crate::contracts::artifacts::{
     TrackedTombstoneLookupRequest,
 };
 pub use crate::contracts::artifacts::{LiveStateMode, SchemaRegistration};
+use crate::contracts::ReplayCursor;
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 pub use effective::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
@@ -81,7 +83,6 @@ pub use materialize::{
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
-use crate::contracts::ReplayCursor;
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
 pub use tracked::{

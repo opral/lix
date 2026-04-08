@@ -1,16 +1,13 @@
+use crate::common::errors::sql_unknown_column_error;
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
-use crate::common::errors::sql_unknown_column_error;
 use crate::filesystem_projection_sql::{
     build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
-use crate::public_surface_source_sql::{
-    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
-};
-use crate::sql::backend::{PushdownDecision, PushdownSupport, RejectedPredicate};
+use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
     CanonicalStateScan, CanonicalWorkingChangesScan, FilesystemKind, ReadPlan,
@@ -24,6 +21,9 @@ use crate::sql::physical_plan::plan::{
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_has_live_payload_collisions, entity_surface_payload_alias,
     entity_surface_uses_payload_alias, escape_sql_string, render_identifier,
+};
+use crate::sql::physical_plan::source_sql::{
+    build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::version_state::inventory::{
@@ -1433,7 +1433,7 @@ mod tests {
         BroadSqlFunctionArgExpr, BroadSqlFunctionArguments, BroadSqlProvenance,
     };
     use crate::sql::physical_plan::plan::LoweredReadStatementShape;
-    use crate::sql::routing::{
+    use crate::sql::prepare::public_surface::routing::{
         forbid_broad_routing_for_test, route_broad_public_read_statement_with_known_live_layouts,
     };
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;

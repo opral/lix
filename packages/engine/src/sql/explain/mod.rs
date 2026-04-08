@@ -16,8 +16,8 @@ use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
     SurfaceVariant,
 };
-use crate::sql::backend::{PushdownDecision, PushdownSupport};
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
+use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
     DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
@@ -64,7 +64,7 @@ use crate::sql::prepare::contracts::effects::PlanEffects;
 use crate::sql::prepare::contracts::planned_statement::{
     MutationOperation, MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use crate::sql::routing::RoutingPassTrace;
+use crate::sql::prepare::public_surface::routing::RoutingPassTrace;
 use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, StateSourceAuthority,

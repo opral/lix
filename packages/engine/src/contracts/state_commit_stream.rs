@@ -1,8 +1,8 @@
-use crate::contracts::change::TrackedDomainChangeView;
 use crate::contracts::artifacts::{
     MutationOperation, MutationRow, PlannedStateRow, StateCommitStreamChange,
     StateCommitStreamOperation,
 };
+use crate::contracts::change::TrackedDomainChangeView;
 use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
