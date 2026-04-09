@@ -174,6 +174,71 @@ simulation_test!(
 );
 
 simulation_test!(
+    lix_working_changes_and_checkpoint_do_not_require_commit_family_live_mirrors,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine_deterministic()
+            .await
+            .expect("boot_simulated_engine_deterministic should succeed");
+        engine.initialize().await.expect("init should succeed");
+        rotate_working_commit(&engine).await;
+        let key = unique_key("wc-view-no-live-mirrors-checkpoint");
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ($1, 'v1')",
+                &[Value::Text(key.clone())],
+            )
+            .await
+            .expect("insert should succeed");
+
+        for table in [
+            "lix_internal_live_v1_lix_commit",
+            "lix_internal_live_v1_lix_change_set_element",
+            "lix_internal_live_v1_lix_commit_edge",
+        ] {
+            engine
+                .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("dropping '{table}' should succeed: {}", error.description)
+                });
+        }
+
+        let before_checkpoint = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_working_changes \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND file_id = 'lix' \
+                   AND entity_id = $1",
+                &[Value::Text(key.clone())],
+            )
+            .await
+            .expect("working changes query should succeed without commit-family live mirrors");
+        assert_eq!(as_i64(&before_checkpoint.statements[0].rows[0][0]), 1);
+
+        engine
+            .create_checkpoint()
+            .await
+            .expect("checkpoint should succeed without commit-family live mirrors");
+
+        let after_checkpoint = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_working_changes \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND file_id = 'lix' \
+                   AND entity_id = $1",
+                &[Value::Text(key)],
+            )
+            .await
+            .expect("post-checkpoint working changes query should succeed without commit-family live mirrors");
+        assert_eq!(as_i64(&after_checkpoint.statements[0].rows[0][0]), 0);
+    }
+);
+
+simulation_test!(
     lix_working_changes_update_reports_modified_rows_against_commit_baseline,
     |sim| async move {
         let engine = sim

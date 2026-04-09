@@ -68,8 +68,8 @@ pub(crate) fn build_ensure_runtime_sequence_row_sql(
 
     format!(
         "INSERT INTO {table_name} \
-         (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, writer_key, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
-         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
+         (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
+         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
          ON CONFLICT (entity_id, file_id, version_id, untracked) DO NOTHING",
         table_name = tracked_relation_name(key_value_schema_key()),
         key_column = key_column,

@@ -66,16 +66,11 @@ async fn apply_materialized_row_in_transaction(
         .as_deref()
         .map(crate::live_state::constraints::sql_literal_text)
         .unwrap_or_else(|| "NULL".to_string());
-    let writer_key_sql = row
-        .writer_key
-        .as_deref()
-        .map(crate::live_state::constraints::sql_literal_text)
-        .unwrap_or_else(|| "NULL".to_string());
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, writer_key, is_tombstone, created_at, updated_at{normalized_columns}\
+         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, created_at, updated_at{normalized_columns}\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {writer_key}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
+         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
          ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
          schema_key = excluded.schema_key, \
          schema_version = excluded.schema_version, \
@@ -83,7 +78,6 @@ async fn apply_materialized_row_in_transaction(
          plugin_key = excluded.plugin_key, \
          change_id = excluded.change_id, \
          metadata = excluded.metadata, \
-         writer_key = excluded.writer_key, \
          is_tombstone = excluded.is_tombstone, \
          created_at = excluded.created_at, \
          updated_at = excluded.updated_at{normalized_updates}",
@@ -97,7 +91,6 @@ async fn apply_materialized_row_in_transaction(
         plugin_key = crate::live_state::constraints::escape_sql_string(&row.plugin_key),
         change_id = crate::live_state::constraints::escape_sql_string(&row.change_id),
         metadata = metadata_sql,
-        writer_key = writer_key_sql,
         is_tombstone = if is_tombstone { "1" } else { "0" },
         created_at = crate::live_state::constraints::escape_sql_string(created_at),
         updated_at = crate::live_state::constraints::escape_sql_string(&row.updated_at),

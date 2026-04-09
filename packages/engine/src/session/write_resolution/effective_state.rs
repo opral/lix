@@ -218,6 +218,13 @@ async fn exact_effective_state_row_from_pending(
         Value::Text(row.plugin_key.clone()),
     );
     values.insert(
+        "snapshot_content".to_string(),
+        row.snapshot_content
+            .clone()
+            .map(Value::Text)
+            .unwrap_or(Value::Null),
+    );
+    values.insert(
         "metadata".to_string(),
         row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
     );
@@ -300,6 +307,13 @@ async fn exact_effective_state_row_from_live_row(
     values.insert(
         "plugin_key".to_string(),
         Value::Text(row.plugin_key.clone()),
+    );
+    values.insert(
+        "snapshot_content".to_string(),
+        row.snapshot_content
+            .clone()
+            .map(Value::Text)
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "metadata".to_string(),

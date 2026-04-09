@@ -103,7 +103,7 @@ async fn scan_rows_with_limit_and_order(
     let selected_columns = selected_columns(&access, &request.required_columns, "untracked")?;
     let projection = selected_projection_sql(&selected_columns);
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
-        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, created_at, updated_at",
+        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, created_at, updated_at",
         schema_key: &request.schema_key,
         version_id: &request.version_id,
         projection: &projection,
@@ -139,13 +139,12 @@ pub(crate) fn decode_untracked_row(
     let global = required_bool_cell(row, 5, schema_key, "global", "untracked")?;
     let plugin_key = required_text_cell(row, 6, schema_key, "plugin_key", "untracked")?;
     let metadata = row.get(7).and_then(text_from_value);
-    let writer_key = row.get(8).and_then(text_from_value);
-    let created_at = required_text_cell(row, 9, schema_key, "created_at", "untracked")?;
-    let updated_at = required_text_cell(row, 10, schema_key, "updated_at", "untracked")?;
+    let created_at = required_text_cell(row, 8, schema_key, "created_at", "untracked")?;
+    let updated_at = required_text_cell(row, 9, schema_key, "updated_at", "untracked")?;
 
     let mut values = std::collections::BTreeMap::new();
     for (offset, column) in selected_columns.iter().enumerate() {
-        let raw_value = row.get(11 + offset).ok_or_else(|| {
+        let raw_value = row.get(10 + offset).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 &format!(
@@ -167,7 +166,7 @@ pub(crate) fn decode_untracked_row(
         global,
         plugin_key,
         metadata,
-        writer_key,
+        writer_key: None,
         created_at,
         updated_at,
         values,

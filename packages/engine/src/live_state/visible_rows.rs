@@ -166,17 +166,21 @@ async fn scan_live_rows_with_executor_ref(
                 .await
                 .map(|rows| rows.into_iter().map(LiveReadRow::from).collect())
         }
-        LiveStorageLane::Untracked => scan_untracked_rows_with_executor(
-            executor,
-            &UntrackedScanRequest {
-                schema_key: schema_key.to_string(),
-                version_id: version_id.to_string(),
-                constraints: constraints.to_vec(),
-                required_columns: required_columns.to_vec(),
-            },
-        )
-        .await
-        .map(|rows| rows.into_iter().map(LiveReadRow::from).collect()),
+        LiveStorageLane::Untracked => {
+            let rows = scan_untracked_rows_with_executor(
+                executor,
+                &UntrackedScanRequest {
+                    schema_key: schema_key.to_string(),
+                    version_id: version_id.to_string(),
+                    constraints: constraints.to_vec(),
+                    required_columns: required_columns.to_vec(),
+                },
+            )
+            .await?;
+            overlay_writer_key_annotations_on_untracked_rows_with_executor(executor, rows)
+                .await
+                .map(|rows| rows.into_iter().map(LiveReadRow::from).collect())
+        }
     }
 }
 
@@ -197,6 +201,30 @@ async fn overlay_writer_key_annotations_on_tracked_rows_with_executor(
     for row in &mut rows {
         row.writer_key = annotations
             .get(&RowIdentity::from_tracked_row(row))
+            .cloned()
+            .unwrap_or(None);
+    }
+
+    Ok(rows)
+}
+
+async fn overlay_writer_key_annotations_on_untracked_rows_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    mut rows: Vec<UntrackedRow>,
+) -> Result<Vec<UntrackedRow>, LixError> {
+    if rows.is_empty() {
+        return Ok(rows);
+    }
+
+    let row_identities = rows
+        .iter()
+        .map(RowIdentity::from_untracked_row)
+        .collect::<BTreeSet<_>>();
+    let annotations = load_writer_key_annotations_with_executor(executor, &row_identities).await?;
+
+    for row in &mut rows {
+        row.writer_key = annotations
+            .get(&RowIdentity::from_untracked_row(row))
             .cloned()
             .unwrap_or(None);
     }

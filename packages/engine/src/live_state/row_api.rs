@@ -24,7 +24,7 @@ use super::untracked::{
 use super::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use super::{
     load_exact_tracked_row_with_backend, load_exact_tracked_tombstone_with_executor,
-    scan_tracked_rows_with_backend, scan_tracked_tombstones_with_executor,
+    scan_tracked_rows_with_backend, scan_tracked_tombstones_with_executor, RowIdentity,
 };
 use crate::schema::{schema_key_from_definition, SchemaKey};
 use crate::version_state::{load_local_version_head_commit_id_with_executor, GLOBAL_VERSION_ID};
@@ -157,18 +157,24 @@ pub async fn write_live_rows(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[LiveRow],
 ) -> Result<(), LixError> {
-    let tracked_live_rows = rows
-        .iter()
-        .filter(|row| !row.untracked)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !tracked_live_rows.is_empty() {
+    if !rows.is_empty() {
+        let annotations = rows
+            .iter()
+            .map(|row| {
+                (
+                    RowIdentity {
+                        schema_key: row.schema_key.clone(),
+                        version_id: row.version_id.clone(),
+                        entity_id: row.entity_id.clone(),
+                        file_id: row.file_id.clone(),
+                    },
+                    row.writer_key.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut executor = &mut *transaction;
-        super::writer_key::apply_writer_keys_for_tracked_live_rows_with_executor(
-            &mut executor,
-            &tracked_live_rows,
-        )
-        .await?;
+        super::writer_key::apply_writer_key_annotations_with_executor(&mut executor, &annotations)
+            .await?;
     }
 
     let (tracked, untracked) = partition_live_rows_for_write(rows)?;
@@ -234,6 +240,7 @@ async fn scan_tracked_rows(
         rows.extend(tombstones.into_iter().map(tracked_tombstone_to_row));
     }
 
+    overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
     rows.sort_by(row_sort_key);
     Ok(rows)
 }
@@ -277,7 +284,11 @@ async fn load_exact_tracked_row(
     )
     .await?
     {
-        let row = tracked_row_to_row(row, &contract)?;
+        let mut rows = vec![tracked_row_to_row(row, &contract)?];
+        overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
+        let row = rows
+            .pop()
+            .expect("tracked exact read overlay should preserve single row");
         return Ok(exact_live_row_matches_query(&row, request).then_some(row));
     }
 
@@ -296,9 +307,16 @@ async fn load_exact_tracked_row(
         },
     )
     .await?;
-    Ok(tombstone
-        .map(tracked_tombstone_to_row)
-        .filter(|row| exact_live_row_matches_query(row, request)))
+    if let Some(tombstone) = tombstone {
+        let mut rows = vec![tracked_tombstone_to_row(tombstone)];
+        overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
+        let row = rows
+            .pop()
+            .expect("tracked tombstone overlay should preserve single row");
+        return Ok(exact_live_row_matches_query(&row, request).then_some(row));
+    }
+
+    Ok(None)
 }
 
 async fn load_exact_untracked_row(
@@ -666,7 +684,47 @@ async fn scan_lane_rows(
         row
     }));
 
+    overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
     Ok(rows)
+}
+
+async fn overlay_writer_key_annotations_on_tracked_live_rows(
+    backend: &dyn LixBackend,
+    rows: &mut [LiveRow],
+) -> Result<(), LixError> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let row_identities = rows
+        .iter()
+        .map(|row| RowIdentity {
+            schema_key: row.schema_key.clone(),
+            version_id: row.version_id.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        })
+        .collect::<BTreeSet<_>>();
+
+    if row_identities.is_empty() {
+        return Ok(());
+    }
+
+    let annotations =
+        super::writer_key::load_writer_key_annotations(backend, &row_identities).await?;
+    for row in rows.iter_mut() {
+        row.writer_key = annotations
+            .get(&RowIdentity {
+                schema_key: row.schema_key.clone(),
+                version_id: row.version_id.clone(),
+                entity_id: row.entity_id.clone(),
+                file_id: row.file_id.clone(),
+            })
+            .cloned()
+            .unwrap_or(None);
+    }
+
+    Ok(())
 }
 
 fn tracked_row_to_row(

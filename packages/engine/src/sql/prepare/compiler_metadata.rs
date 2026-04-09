@@ -1,6 +1,7 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::common::naming::tracked_relation_name;
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingSemanticStorage, PendingView, SqlPreparationMetadataReader};
 use crate::schema::{
@@ -11,7 +12,6 @@ use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
 
-const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
 const LIX_STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 #[derive(Debug, Clone, Default)]
@@ -101,19 +101,20 @@ async fn load_latest_schema_entry_for_preparation(
     reader: &mut dyn SqlPreparationMetadataReader,
     schema_key: &str,
 ) -> Result<Option<(SchemaKey, JsonValue)>, LixError> {
+    let registered_schema_table = tracked_relation_name("lix_registered_schema");
     let prefix = format!("{schema_key}~");
     let prefix_escaped = escape_sql_string(&prefix);
     let prefix_len = prefix.len();
     let sql = format!(
-        "SELECT schema_version, snapshot_content \
+        "SELECT schema_version, value_json \
          FROM {table} \
          WHERE substr(entity_id, 1, {prefix_len}) = '{prefix_escaped}' \
            AND version_id = '{global_version}' \
            AND is_tombstone = 0 \
-           AND snapshot_content IS NOT NULL \
+           AND value_json IS NOT NULL \
          ORDER BY CAST(schema_version AS INTEGER) DESC \
          LIMIT 1",
-        table = REGISTERED_SCHEMA_TABLE,
+        table = registered_schema_table,
         prefix_len = prefix_len,
         prefix_escaped = prefix_escaped,
         global_version = GLOBAL_VERSION,
@@ -124,27 +125,29 @@ async fn load_latest_schema_entry_for_preparation(
     };
 
     let schema_version = required_text_cell(row, 0, "schema_version")?;
-    let snapshot_content = required_text_cell(row, 1, "snapshot_content")?;
+    let value_json = required_text_cell(row, 1, "value_json")?;
     Ok(Some((
         SchemaKey::new(schema_key.to_string(), schema_version),
-        schema_from_registered_snapshot_content(&snapshot_content)?,
+        schema_from_registered_value_json(&value_json)?,
     )))
 }
 
-fn schema_from_registered_snapshot_content(raw: &str) -> Result<JsonValue, LixError> {
+fn schema_from_registered_value_json(raw: &str) -> Result<JsonValue, LixError> {
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("registered schema snapshot_content invalid JSON: {error}"),
+            format!("registered schema value_json invalid JSON: {error}"),
         )
     })?;
 
-    parsed.get("value").cloned().ok_or_else(|| {
-        LixError::new(
+    if parsed.is_object() {
+        Ok(parsed)
+    } else {
+        Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "registered schema snapshot_content missing value",
-        )
-    })
+            "registered schema value_json must decode to an object",
+        ))
+    }
 }
 
 fn collect_pending_latest_schema_entries(

@@ -388,7 +388,7 @@ simulation_test!(
         let raw_after = engine
             .execute(
                 &format!(
-                    "SELECT writer_key, change_id \
+                    "SELECT change_id \
                      FROM lix_internal_live_v1_materialization_test_schema \
                      WHERE schema_key = 'materialization_test_schema' \
                        AND entity_id = 'entity-writer' \
@@ -402,8 +402,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(raw_after.statements[0].rows.len(), 1);
-        assert_eq!(raw_after.statements[0].rows[0][0], Value::Null);
-        match &raw_after.statements[0].rows[0][1] {
+        match &raw_after.statements[0].rows[0][0] {
             Value::Text(change_id) => assert!(!change_id.is_empty()),
             other => panic!("expected text change_id after rebuild, got {other:?}"),
         }
@@ -489,10 +488,31 @@ simulation_test!(
             .await
             .unwrap();
 
-        let raw_before = engine
+        let overlay_before = engine
             .execute(
                 &format!(
                     "SELECT writer_key \
+                     FROM lix_internal_writer_key \
+                     WHERE version_id = '{}' \
+                       AND schema_key = 'materialization_test_schema' \
+                       AND entity_id = 'entity-writer-missing' \
+                       AND file_id = 'file-1'",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(overlay_before.statements[0].rows.len(), 1);
+        assert_eq!(
+            overlay_before.statements[0].rows[0][0],
+            Value::Text("editor:seed".to_string())
+        );
+
+        let raw_before = engine
+            .execute(
+                &format!(
+                    "SELECT change_id \
                      FROM lix_internal_live_v1_materialization_test_schema \
                      WHERE schema_key = 'materialization_test_schema' \
                        AND entity_id = 'entity-writer-missing' \
@@ -506,10 +526,10 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(raw_before.statements[0].rows.len(), 1);
-        assert_eq!(
-            raw_before.statements[0].rows[0][0],
-            Value::Text("editor:seed".to_string())
-        );
+        match &raw_before.statements[0].rows[0][0] {
+            Value::Text(change_id) => assert!(!change_id.is_empty()),
+            other => panic!("expected text change_id before rebuild, got {other:?}"),
+        }
 
         engine
             .execute(
@@ -559,7 +579,7 @@ simulation_test!(
         let raw_after = engine
             .execute(
                 &format!(
-                    "SELECT writer_key, change_id \
+                    "SELECT change_id \
                      FROM lix_internal_live_v1_materialization_test_schema \
                      WHERE schema_key = 'materialization_test_schema' \
                        AND entity_id = 'entity-writer-missing' \
@@ -573,8 +593,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(raw_after.statements[0].rows.len(), 1);
-        assert_eq!(raw_after.statements[0].rows[0][0], Value::Null);
-        match &raw_after.statements[0].rows[0][1] {
+        match &raw_after.statements[0].rows[0][0] {
             Value::Text(change_id) => assert!(!change_id.is_empty()),
             other => panic!("expected text change_id after rebuild, got {other:?}"),
         }

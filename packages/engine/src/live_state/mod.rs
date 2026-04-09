@@ -98,6 +98,7 @@ pub(crate) use untracked::{ExactUntrackedRowRequest, UntrackedRow};
 pub(crate) use visible_rows::{
     scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
 };
+pub(crate) use writer_key::WRITER_KEY_TABLE;
 
 pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str =
     "lix_internal_registered_schema_bootstrap";

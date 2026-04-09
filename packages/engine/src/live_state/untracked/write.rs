@@ -50,23 +50,17 @@ async fn apply_upsert_in_transaction(
         .as_deref()
         .map(crate::live_state::constraints::sql_literal_text)
         .unwrap_or_else(|| "NULL".to_string());
-    let writer_key_sql = row
-        .writer_key
-        .as_deref()
-        .map(crate::live_state::constraints::sql_literal_text)
-        .unwrap_or_else(|| "NULL".to_string());
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, writer_key, untracked, created_at, updated_at{normalized_columns}\
+         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, untracked, created_at, updated_at{normalized_columns}\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {metadata}, {writer_key}, true, '{created_at}', '{updated_at}'{normalized_values}\
+         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {metadata}, true, '{created_at}', '{updated_at}'{normalized_values}\
          ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
          schema_key = excluded.schema_key, \
          schema_version = excluded.schema_version, \
          global = excluded.global, \
          plugin_key = excluded.plugin_key, \
          metadata = excluded.metadata, \
-         writer_key = excluded.writer_key, \
          updated_at = excluded.updated_at{normalized_updates}",
         table = quoted_live_table_name(&row.schema_key),
         entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
@@ -77,7 +71,6 @@ async fn apply_upsert_in_transaction(
         global = if row.global { "true" } else { "false" },
         plugin_key = crate::live_state::constraints::escape_sql_string(&row.plugin_key),
         metadata = metadata_sql,
-        writer_key = writer_key_sql,
         created_at = crate::live_state::constraints::escape_sql_string(created_at),
         updated_at = crate::live_state::constraints::escape_sql_string(&row.updated_at),
         normalized_columns = normalized_columns,

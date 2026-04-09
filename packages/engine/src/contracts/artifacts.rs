@@ -1320,11 +1320,19 @@ impl SchemaRegistrationSet {
     pub(crate) fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
         let registration = registration.into();
         self.inner
-            .insert(registration.schema_key().to_string(), registration);
+            .entry(registration.schema_key().to_string())
+            .and_modify(|existing| {
+                if !existing.has_request_local_layout() && registration.has_request_local_layout() {
+                    *existing = registration.clone();
+                }
+            })
+            .or_insert(registration);
     }
 
     pub(crate) fn extend(&mut self, other: SchemaRegistrationSet) {
-        self.inner.extend(other.inner);
+        for registration in other.inner.into_values() {
+            self.insert(registration);
+        }
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -1392,6 +1400,10 @@ impl SchemaRegistration {
 
     pub(crate) fn registered_snapshot(&self) -> Option<&JsonValue> {
         self.registered_snapshot.as_ref()
+    }
+
+    fn has_request_local_layout(&self) -> bool {
+        self.schema_definition_override().is_some() || self.registered_snapshot().is_some()
     }
 
     pub(crate) fn schema_definition_override(&self) -> Option<&JsonValue> {
