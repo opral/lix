@@ -13,14 +13,9 @@ pub(crate) mod hydration;
 pub(crate) mod replay;
 pub(crate) mod status;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
-use crate::contracts::artifacts::{CanonicalCommitReceipt, UpdatedVersionRef};
-use crate::contracts::traits::UntrackedWriteParticipant;
-use crate::live_state::shared::identity::RowIdentity;
-use crate::live_state::untracked::{
-    UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
-};
+use crate::contracts::artifacts::CanonicalCommitReceipt;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
@@ -158,74 +153,11 @@ pub(crate) async fn apply_canonical_receipt_in_transaction(
     .await
 }
 
-pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    receipt: &CanonicalCommitReceipt,
-    tracked_writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
-) -> Result<(), LixError> {
-    apply_local_version_head_rows_in_transaction(transaction, &receipt.updated_version_refs)
-        .await?;
-
-    if receipt.affected_versions.is_empty() {
-        return Ok(());
-    }
-
-    if crate::live_state::require_ready_in_transaction(transaction)
-        .await
-        .is_err()
-    {
-        replay::mark_live_state_projection_needs_rebuild_at_replay_cursor_in_transaction(
-            transaction,
-            &receipt.replay_cursor,
-        )
-        .await?;
-        return Ok(());
-    }
-
-    let rebuild_request = LiveStateRebuildRequest {
-        scope: LiveStateRebuildScope::Versions(receipt.affected_versions.iter().cloned().collect()),
-        debug: LiveStateRebuildDebugMode::Off,
-        debug_row_limit: 0,
-    };
-    if let Err(_projection_error) =
-        crate::live_state::rebuild_scope_with_writer_key_hints_in_transaction(
-            transaction,
-            &rebuild_request,
-            tracked_writer_key_hints,
-        )
-        .await
-    {
-        replay::mark_live_state_projection_needs_rebuild_at_replay_cursor_in_transaction(
-            transaction,
-            &receipt.replay_cursor,
-        )
-        .await?;
-    } else {
-        replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction(transaction)
-            .await?;
-    }
-
-    Ok(())
-}
-
-async fn apply_local_version_head_rows_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    version_ref_updates: &[UpdatedVersionRef],
-) -> Result<(), LixError> {
-    if version_ref_updates.is_empty() {
-        return Ok(());
-    }
-    let batch: UntrackedWriteBatch = version_ref_updates
-        .iter()
-        .map(local_version_head_write_row_from_update)
-        .collect();
-    transaction.apply_untracked_write_batch(&batch).await
-}
-
 pub(crate) async fn mark_live_state_projection_ready_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<ReplayCursor, LixError> {
-    crate::live_state::finalize_commit_in_transaction(transaction).await
+    crate::live_state::mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction)
+        .await
 }
 
 pub(crate) async fn mark_live_state_projection_ready_with_backend(
@@ -427,46 +359,12 @@ async fn apply_live_state_replay_scope_to_cursor(
     transaction.commit().await
 }
 
-/// Replica-local version-head row used to resolve committed heads on this
-/// engine instance.
-pub(crate) fn local_version_head_write_row(
-    version_id: &str,
-    commit_id: &str,
-    timestamp: &str,
-) -> UntrackedWriteRow {
-    UntrackedWriteRow {
-        entity_id: version_id.to_string(),
-        schema_key: version_ref_schema_key(),
-        schema_version: version_ref_schema_version(),
-        file_id: version_ref_file_id(),
-        version_id: version_ref_storage_version_id(),
-        global: true,
-        plugin_key: version_ref_plugin_key(),
-        metadata: None,
-        writer_key: None,
-        snapshot_content: Some(version_ref_snapshot_content(version_id, commit_id)),
-        created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: UntrackedWriteOperation::Upsert,
-    }
-}
-
-fn local_version_head_write_row_from_update(update: &UpdatedVersionRef) -> UntrackedWriteRow {
-    local_version_head_write_row(
-        update.version_id.as_str(),
-        &update.commit_id,
-        &update.created_at,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_canonical_receipt_in_transaction,
-        apply_commit_projections_best_effort_in_transaction,
-        catch_up_live_state_to_current_frontier, projection_status, replay, status,
-        version_ref_schema_key, CanonicalCommitReceipt, DerivedProjectionId,
-        ProjectionCatchUpOutcome, ProjectionReplayMode, UpdatedVersionRef,
+        apply_canonical_receipt_in_transaction, catch_up_live_state_to_current_frontier,
+        projection_status, replay, status, CanonicalCommitReceipt, DerivedProjectionId,
+        ProjectionCatchUpOutcome, ProjectionReplayMode,
     };
     use crate::live_state::LiveStateMode;
     use crate::test_support::{
@@ -474,9 +372,9 @@ mod tests {
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
+    use crate::CreateVersionOptions;
     use crate::ReplayCursor;
-    use crate::{CommittedVersionFrontier, LixBackend, LixError, TransactionMode};
-    use crate::{CreateVersionOptions, VersionId};
+    use crate::{CommittedVersionFrontier, LixBackend, TransactionMode};
     use std::collections::BTreeMap;
 
     async fn init_projection_backend() -> TestSqliteBackend {
@@ -605,49 +503,6 @@ mod tests {
                 && sql.contains("'change-2'")
                 && sql.contains("commit-2")
         }));
-        transaction
-            .rollback()
-            .await
-            .expect("transaction rollback should succeed");
-    }
-
-    #[tokio::test]
-    async fn local_version_head_writes_are_required_for_projection_application() {
-        let backend = init_projection_backend().await;
-        let version_ref_table =
-            crate::live_state::schema_access::tracked_relation_name(&version_ref_schema_key());
-        backend.block_writes_to(
-            &version_ref_table,
-            LixError::new("LIX_ERROR_UNKNOWN", "local version-head write failed"),
-        );
-        backend.clear_query_log();
-        let mut transaction = backend
-            .begin_transaction(TransactionMode::Write)
-            .await
-            .expect("transaction should begin");
-        let receipt = CanonicalCommitReceipt {
-            commit_id: "commit-2".to_string(),
-            replay_cursor: ReplayCursor::new("change-2", "2026-03-15T01:02:03Z"),
-            updated_version_refs: vec![UpdatedVersionRef {
-                version_id: VersionId::new("main").expect("valid version id"),
-                commit_id: "commit-2".to_string(),
-                created_at: "2026-03-15T01:02:03Z".to_string(),
-            }],
-            affected_versions: Vec::new(),
-        };
-
-        apply_commit_projections_best_effort_in_transaction(
-            transaction.as_mut(),
-            &receipt,
-            &BTreeMap::new(),
-        )
-        .await
-        .expect_err("local version-head writes should block projection application");
-
-        assert!(backend
-            .executed_sql()
-            .iter()
-            .any(|sql| sql.contains(&version_ref_table)));
         transaction
             .rollback()
             .await

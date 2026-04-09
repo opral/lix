@@ -1252,20 +1252,6 @@ pub enum LiveStateMode {
     Rebuilding,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiveQueryOverlayLane {
-    LocalUntracked,
-    LocalTracked,
-    GlobalUntracked,
-    GlobalTracked,
-}
-
-impl LiveQueryOverlayLane {
-    pub(crate) fn is_global(self) -> bool {
-        matches!(self, Self::GlobalTracked | Self::GlobalUntracked)
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveStateProjectionStatus {
     pub(crate) mode: LiveStateMode,
@@ -1314,46 +1300,6 @@ pub(crate) struct LiveSnapshotRow {
     pub(crate) metadata: Option<String>,
     pub(crate) source_change_id: Option<String>,
     pub(crate) snapshot: JsonValue,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ExactUntrackedLookupRequest {
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) entity_id: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) schema_version: Option<String>,
-    pub(crate) writer_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct TrackedTombstoneLookupRequest {
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) entity_id: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) schema_version: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LiveQueryEffectiveRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: Option<String>,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) source_version_id: String,
-    pub(crate) global: bool,
-    pub(crate) untracked: bool,
-    pub(crate) plugin_key: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) writer_key: Option<String>,
-    pub(crate) created_at: Option<String>,
-    pub(crate) updated_at: Option<String>,
-    pub(crate) source_change_id: Option<String>,
-    pub(crate) values: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1786,6 +1732,7 @@ pub(crate) fn exact_row_constraints(request: &ExactRowRequest) -> Vec<ScanConstr
     constraints
 }
 
+#[cfg(test)]
 pub(crate) fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstraint> {
     let mut constraints = vec![ScanConstraint {
         field: ScanField::EntityId,
@@ -1966,8 +1913,6 @@ pub struct TrackedWriteRow {
     pub operation: TrackedWriteOperation,
 }
 
-pub type TrackedWriteBatch = Vec<TrackedWriteRow>;
-
 /// Decoded untracked/helper live row.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UntrackedRow {
@@ -2017,8 +1962,6 @@ pub struct UntrackedWriteRow {
     pub updated_at: String,
     pub operation: UntrackedWriteOperation,
 }
-
-pub type UntrackedWriteBatch = Vec<UntrackedWriteRow>;
 
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,

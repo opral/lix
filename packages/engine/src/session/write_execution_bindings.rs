@@ -156,7 +156,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.execution_mode() {
         crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
-            crate::live_state::execute_prepared_public_read_in_transaction(
+            crate::session::pending_reads::execute_prepared_public_read_with_pending_view_in_transaction(
                 transaction,
                 pending_view,
                 public_read,
@@ -228,15 +228,6 @@ pub(crate) async fn execute_public_tracked_append(
         .is_some_and(|batch| batch.changes.is_empty())
         && !unit.has_compiler_only_filesystem_changes()
     {
-        if !unit.writer_key_annotations.is_empty() {
-            let mut executor = &mut *transaction;
-            crate::live_state::writer_key::apply_writer_key_annotations_with_executor(
-                &mut executor,
-                &unit.writer_key_annotations,
-            )
-            .await?;
-        }
-
         return Ok(TrackedCommitExecutionOutcome::default());
     }
 
@@ -300,15 +291,6 @@ pub(crate) async fn execute_public_tracked_append(
 
     if let Some(applied_output) = append_outcome.applied_output.as_ref() {
         mirror_public_registered_schema_bootstrap_rows(transaction, applied_output).await?;
-    }
-
-    if !unit.writer_key_annotations.is_empty() {
-        let mut executor = &mut *transaction;
-        crate::live_state::writer_key::apply_writer_key_annotations_with_executor(
-            &mut executor,
-            &unit.writer_key_annotations,
-        )
-        .await?;
     }
 
     let applied_changes = public_changes_from_staged(&append_outcome.applied_changes);

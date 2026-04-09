@@ -63,6 +63,20 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
     head_commit_id: &str,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<ExactCommittedStateRow>, LixError> {
+    let change =
+        load_exact_committed_change_from_commit_with_executor(executor, head_commit_id, request)
+            .await?;
+    change
+        .map(|change| exact_committed_state_row_from_change(change, &request.version_id))
+        .transpose()
+        .map(|row| row.flatten())
+}
+
+pub(crate) async fn load_exact_committed_change_from_commit_with_executor(
+    executor: &mut dyn CommitQueryExecutor,
+    head_commit_id: &str,
+    request: &ExactCommittedStateRowRequest,
+) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
     let lineage = load_reachable_commit_lineage(executor, head_commit_id).await?;
     let reachable_depths = compute_min_commit_depths(head_commit_id, &lineage);
     let mut ordered_commits = reachable_depths.into_iter().collect::<Vec<_>>();
@@ -100,7 +114,7 @@ pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
             if !canonical_change_matches_request(&change, request) {
                 continue;
             }
-            return exact_committed_state_row_from_change(change, &request.version_id);
+            return Ok(Some(change));
         }
     }
 
@@ -352,7 +366,7 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::version_ops::committed_state::load_exact_committed_state_row_at_version_head;
+    use crate::session::version_ops::committed_state::load_exact_committed_state_row_at_version_head_with_executor;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
@@ -366,6 +380,14 @@ mod tests {
             .await
             .expect("test backend init should succeed");
         backend
+    }
+
+    async fn load_exact_committed_state_row_at_version_head(
+        backend: &TestSqliteBackend,
+        request: &ExactCommittedStateRowRequest,
+    ) -> Result<Option<ExactCommittedStateRow>, LixError> {
+        let mut executor = backend;
+        load_exact_committed_state_row_at_version_head_with_executor(&mut executor, request).await
     }
 
     async fn seed_committed_history_fixture(

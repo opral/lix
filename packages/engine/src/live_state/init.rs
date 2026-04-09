@@ -5,6 +5,14 @@ use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_
 use crate::{LixBackend, LixError};
 
 const LIVE_STATE_INIT_STATEMENTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS lix_internal_writer_key (\
+     version_id TEXT NOT NULL,\
+     schema_key TEXT NOT NULL,\
+     entity_id TEXT NOT NULL,\
+     file_id TEXT NOT NULL,\
+     writer_key TEXT NOT NULL,\
+     PRIMARY KEY (version_id, schema_key, entity_id, file_id)\
+     )",
     "CREATE TABLE IF NOT EXISTS lix_internal_registered_schema_bootstrap (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\

@@ -2,12 +2,12 @@ use std::time::Duration;
 
 use sqlparser::ast::Statement;
 
+use crate::backend::TransactionBackendAdapter;
 use crate::contracts::artifacts::{
     PendingPublicCommitSession, PreparedPublicWriteExecutionPartition, PreparedWriteStep,
     SessionStateDelta,
 };
 use crate::contracts::traits::PendingView;
-use crate::execution::read::bootstrap_public_surface_registry_in_transaction;
 use crate::execution::write::buffered_write_transaction::{
     BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
 };
@@ -360,14 +360,18 @@ async fn apply_prepared_write_context_invalidation(
     let registry = match invalidation {
         PreparedWriteContextInvalidation::None => return Ok(None),
         PreparedWriteContextInvalidation::RegenerateFromPendingView => {
-            bootstrap_public_surface_registry_in_transaction(
-                transaction,
+            crate::session::pending_reads::build_surface_registry(
+                &TransactionBackendAdapter::new(transaction),
                 pending_transaction_view.map(|view| view as &dyn PendingView),
             )
             .await?
         }
         PreparedWriteContextInvalidation::RegenerateFromCommittedState => {
-            bootstrap_public_surface_registry_in_transaction(transaction, None).await?
+            crate::session::pending_reads::build_surface_registry(
+                &TransactionBackendAdapter::new(transaction),
+                None,
+            )
+            .await?
         }
     };
     context.install_public_surface_registry(registry);

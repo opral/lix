@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
+use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
-use crate::live_state;
 use crate::version_state::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_ref_file_id, version_ref_plugin_key,
@@ -148,7 +148,7 @@ pub(crate) fn build_local_version_ref_heads_source_sql() -> String {
            AND is_tombstone = 0 \
            AND commit_id IS NOT NULL \
            AND commit_id <> ''",
-        table = live_state::tracked_relation_name(version_ref_schema_key()),
+        table = tracked_relation_name(version_ref_schema_key()),
         ref_schema_key = escape_sql_string(version_ref_schema_key()),
         ref_schema_version = escape_sql_string(version_ref_schema_version()),
         ref_file_id = escape_sql_string(version_ref_file_id()),

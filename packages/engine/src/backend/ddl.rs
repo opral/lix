@@ -35,36 +35,6 @@ pub(crate) async fn add_column_if_missing(
     Ok(())
 }
 
-pub(crate) async fn table_exists(backend: &dyn LixBackend, table: &str) -> Result<bool, LixError> {
-    let exists = match backend.dialect() {
-        SqlDialect::Sqlite => {
-            backend
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE type = 'table' \
-                       AND name = $1 \
-                     LIMIT 1",
-                    &[Value::Text(table.to_string())],
-                )
-                .await?
-        }
-        SqlDialect::Postgres => {
-            backend
-                .execute(
-                    "SELECT 1 \
-                     FROM information_schema.tables \
-                     WHERE table_schema = current_schema() \
-                       AND table_name = $1 \
-                     LIMIT 1",
-                    &[Value::Text(table.to_string())],
-                )
-                .await?
-        }
-    };
-    Ok(!exists.rows.is_empty())
-}
-
 async fn column_exists(
     backend: &dyn LixBackend,
     table: &str,

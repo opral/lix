@@ -4042,31 +4042,50 @@ mod tests {
             .await?;
         for (index, descriptor) in descriptors.iter().enumerate() {
             let timestamp = format!("2026-04-02T00:00:0{}Z", index);
-            live_state::upsert_bootstrap_tracked_row_in_transaction(
+            live_state::write_live_rows(
                 transaction.as_mut(),
-                descriptor.id,
-                version_descriptor_schema_key(),
-                version_descriptor_schema_version(),
-                version_descriptor_file_id(),
-                GLOBAL_VERSION_ID,
-                version_descriptor_plugin_key(),
-                &format!("change-public-{}", descriptor.id),
-                &public_version_descriptor_snapshot_json(descriptor),
-                &timestamp,
+                &[live_state::LiveRow {
+                    entity_id: descriptor.id.to_string(),
+                    file_id: version_descriptor_file_id().to_string(),
+                    schema_key: version_descriptor_schema_key().to_string(),
+                    schema_version: version_descriptor_schema_version().to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    plugin_key: version_descriptor_plugin_key().to_string(),
+                    metadata: None,
+                    change_id: Some(format!("change-public-{}", descriptor.id)),
+                    writer_key: None,
+                    global: true,
+                    untracked: false,
+                    created_at: Some(timestamp.clone()),
+                    updated_at: Some(timestamp.clone()),
+                    snapshot_content: Some(public_version_descriptor_snapshot_json(descriptor)),
+                }],
             )
             .await?;
 
             if let Some(commit_id) = descriptor.current_commit_id {
-                live_state::upsert_bootstrap_untracked_row_in_transaction(
+                let ref_timestamp = format!("2026-04-02T00:01:0{}Z", index);
+                live_state::write_live_rows(
                     transaction.as_mut(),
-                    descriptor.id,
-                    version_ref_schema_key(),
-                    version_ref_schema_version(),
-                    version_ref_file_id(),
-                    GLOBAL_VERSION_ID,
-                    version_ref_plugin_key(),
-                    &version_ref_snapshot_content(descriptor.id, commit_id),
-                    &format!("2026-04-02T00:01:0{}Z", index),
+                    &[live_state::LiveRow {
+                        entity_id: descriptor.id.to_string(),
+                        file_id: version_ref_file_id().to_string(),
+                        schema_key: version_ref_schema_key().to_string(),
+                        schema_version: version_ref_schema_version().to_string(),
+                        version_id: GLOBAL_VERSION_ID.to_string(),
+                        plugin_key: version_ref_plugin_key().to_string(),
+                        metadata: None,
+                        change_id: None,
+                        writer_key: None,
+                        global: true,
+                        untracked: true,
+                        created_at: Some(ref_timestamp.clone()),
+                        updated_at: Some(ref_timestamp),
+                        snapshot_content: Some(version_ref_snapshot_content(
+                            descriptor.id,
+                            commit_id,
+                        )),
+                    }],
                 )
                 .await?;
             }

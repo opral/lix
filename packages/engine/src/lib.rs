@@ -61,7 +61,6 @@ pub use contracts::ReplayCursor;
 pub use engine::{boot, BootArgs};
 pub use engine::{BootKeyValue, Engine};
 pub use live_state::{
-    apply_live_state_rebuild_plan, live_state_rebuild_plan, rebuild_live_state,
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,

@@ -1,9 +1,12 @@
 //! Compiler-owned public surface source SQL builders.
 
+use crate::common::naming::tracked_relation_name;
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
-use crate::live_state;
-use crate::live_state::writer_key::WRITER_KEY_TABLE;
+use crate::live_state::{
+    normalized_projection_sql_for_schema, payload_column_name_for_schema,
+    snapshot_select_expr_for_schema,
+};
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_payload_alias, entity_surface_uses_payload_alias, escape_sql_string,
     expr_contains_string_literal, json_array_text_join_sql, quote_ident, render_identifier,
@@ -44,8 +47,8 @@ pub(crate) fn build_effective_public_read_source_sql(
 
     let (target_version_predicates, source_predicates) =
         split_effective_state_pushdown_predicates(pushdown_predicates);
-    let commit_table = live_state::tracked_relation_name("lix_commit");
-    let cse_table = live_state::tracked_relation_name("lix_change_set_element");
+    let commit_table = tracked_relation_name("lix_commit");
+    let cse_table = tracked_relation_name("lix_change_set_element");
     let commit_change_set_id_column =
         quote_ident(&builtin_payload_column_name("lix_commit", "change_set_id"));
     let cse_change_set_id_column = quote_ident(&builtin_payload_column_name(
@@ -134,7 +137,7 @@ pub(crate) fn build_working_changes_public_read_source_sql(
     dialect: SqlDialect,
     active_version_id: &str,
 ) -> String {
-    let version_ref_table = live_state::tracked_relation_name("lix_version_ref");
+    let version_ref_table = tracked_relation_name("lix_version_ref");
     let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
         version_ref_schema_key(),
         "commit_id",
@@ -525,7 +528,7 @@ fn explicit_target_versions_cte_sql(
     schema_keys: &[String],
     target_version_predicates: &[Expr],
 ) -> String {
-    let version_descriptor_table = live_state::tracked_relation_name("lix_version_descriptor");
+    let version_descriptor_table = tracked_relation_name("lix_version_descriptor");
     let version_descriptor_hidden_column = quote_ident(&builtin_payload_column_name(
         version_descriptor_schema_key(),
         "hidden",
@@ -553,7 +556,7 @@ fn explicit_target_versions_cte_sql(
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}' \
                    AND untracked = false",
-                table_name = quote_ident(&live_state::tracked_relation_name(schema_key)),
+                table_name = quote_ident(&tracked_relation_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         })
@@ -563,7 +566,7 @@ fn explicit_target_versions_cte_sql(
                  FROM {table_name} \
                  WHERE version_id <> '{global_version}' \
                    AND untracked = true",
-                table_name = quote_ident(&live_state::tracked_relation_name(schema_key)),
+                table_name = quote_ident(&tracked_relation_name(schema_key)),
                 global_version = escape_sql_string(GLOBAL_VERSION_ID),
             )
         }))
@@ -621,10 +624,9 @@ fn effective_state_schema_winner_rows_sql(
     schema_keys
         .iter()
         .map(|schema_key| {
-            let table_name = quote_ident(&live_state::tracked_relation_name(schema_key));
-            let untracked_table = quote_ident(&live_state::tracked_relation_name(schema_key));
-            let writer_key_table = quote_ident(WRITER_KEY_TABLE);
-            let tracked_full_projection = live_state::normalized_projection_sql_for_schema(
+            let table_name = quote_ident(&tracked_relation_name(schema_key));
+            let untracked_table = quote_ident(&tracked_relation_name(schema_key));
+            let tracked_full_projection = normalized_projection_sql_for_schema(
                 schema_key,
                 known_live_layouts.get(schema_key),
                 Some("t"),
@@ -635,7 +637,7 @@ fn effective_state_schema_winner_rows_sql(
                     error.description
                 )
             });
-            let untracked_full_projection = live_state::normalized_projection_sql_for_schema(
+            let untracked_full_projection = normalized_projection_sql_for_schema(
                 schema_key,
                 known_live_layouts.get(schema_key),
                 Some("u"),
@@ -657,7 +659,7 @@ fn effective_state_schema_winner_rows_sql(
             let final_snapshot_projection = if include_snapshot_content {
                 format!(
                     "{} AS snapshot_content, ",
-                    live_state::snapshot_select_expr_for_schema(
+                    snapshot_select_expr_for_schema(
                         schema_key,
                         known_live_layouts.get(schema_key),
                         dialect,
@@ -715,7 +717,7 @@ fn effective_state_schema_winner_rows_sql(
                        t.change_id AS effective_change_id, \
                        cc.commit_id AS effective_commit_id, \
                        false AS effective_untracked, \
-                       wk.writer_key AS effective_writer_key, \
+                       t.writer_key AS effective_writer_key, \
                        t.metadata AS effective_metadata, \
                        t.is_tombstone AS is_tombstone{tracked_full_projection}, \
                        2 AS precedence \
@@ -724,11 +726,6 @@ fn effective_state_schema_winner_rows_sql(
                        ON tv.version_id = t.version_id \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
-                     LEFT JOIN {writer_key_table} wk \
-                       ON wk.version_id = t.version_id \
-                      AND wk.schema_key = t.schema_key \
-                      AND wk.entity_id = t.entity_id \
-                      AND wk.file_id = t.file_id \
                      WHERE t.untracked = false{tracked_predicates} \
                      UNION ALL \
                      SELECT \
@@ -744,7 +741,7 @@ fn effective_state_schema_winner_rows_sql(
                        t.change_id AS effective_change_id, \
                        cc.commit_id AS effective_commit_id, \
                        false AS effective_untracked, \
-                       gwk.writer_key AS effective_writer_key, \
+                       t.writer_key AS effective_writer_key, \
                        t.metadata AS effective_metadata, \
                        t.is_tombstone AS is_tombstone{tracked_full_projection}, \
                        4 AS precedence \
@@ -754,11 +751,6 @@ fn effective_state_schema_winner_rows_sql(
                       AND t.version_id = '{global_version}' \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
-                     LEFT JOIN {writer_key_table} gwk \
-                       ON gwk.version_id = t.version_id \
-                      AND gwk.schema_key = t.schema_key \
-                      AND gwk.entity_id = t.entity_id \
-                      AND gwk.file_id = t.file_id \
                      WHERE t.version_id = '{global_version}' \
                        AND t.untracked = false{tracked_predicates} \
                      UNION ALL \
@@ -820,7 +812,6 @@ fn effective_state_schema_winner_rows_sql(
                 untracked_predicates = untracked_predicates,
                 table_name = table_name,
                 untracked_table = untracked_table,
-                writer_key_table = writer_key_table,
             )
         })
         .collect::<Vec<_>>()
@@ -828,14 +819,12 @@ fn effective_state_schema_winner_rows_sql(
 }
 
 fn builtin_payload_column_name(schema_key: &str, property_name: &str) -> String {
-    live_state::payload_column_name_for_schema(schema_key, None, property_name).unwrap_or_else(
-        |error| {
-            panic!(
-                "builtin live schema '{schema_key}' must include '{property_name}': {}",
-                error.description
-            )
-        },
-    )
+    payload_column_name_for_schema(schema_key, None, property_name).unwrap_or_else(|error| {
+        panic!(
+            "builtin live schema '{schema_key}' must include '{property_name}': {}",
+            error.description
+        )
+    })
 }
 
 fn effective_state_payload_columns(
@@ -937,7 +926,7 @@ fn render_live_payload_column_expr(
     public_column: &str,
 ) -> String {
     let Ok(column_name) =
-        live_state::payload_column_name_for_schema(schema_key, schema_definition, public_column)
+        payload_column_name_for_schema(schema_key, schema_definition, public_column)
     else {
         return "NULL".to_string();
     };

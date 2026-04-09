@@ -16,7 +16,10 @@ use super::pending::{
     build_pending_public_commit_session, create_commit_error_to_lix_error,
     merge_public_change_batch_into_pending_commit, pending_session_matches_create_commit,
 };
-use super::types::StagedChange;
+use super::types::{
+    tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
+    StagedChange,
+};
 use super::CanonicalCommitReceipt;
 
 pub(crate) struct BufferedTrackedAppendArgs {
@@ -54,8 +57,8 @@ async fn append_tracked_unchecked(
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
     // This helper intentionally composes multiple owners atomically:
-    // canonical commit facts, replica-local version-head state, live-state
-    // writer-key metadata, and derived live-state projections. The owners
+    // canonical commit facts, replica-local version-head state, and
+    // derived live-state rows. The owners
     // remain distinct even though the write unit commits them together.
     let execution_writer_key = args.writer_key.clone();
     let result = create_commit(transaction, args, functions, invariant_checker)
@@ -63,13 +66,19 @@ async fn append_tracked_unchecked(
         .map_err(create_commit_error_to_lix_error)?;
 
     if let Some(receipt) = result.receipt.as_ref() {
-        crate::live_state::apply_tracked_commit_effects_in_transaction(
-            transaction,
-            receipt,
+        let tracked_live_rows = tracked_live_rows_from_staged_changes(
             &result.applied_changes,
             execution_writer_key.as_deref(),
-        )
-        .await?;
+        )?;
+        let untracked_live_rows =
+            untracked_live_rows_from_updated_version_refs(&receipt.updated_version_refs);
+
+        let mut live_rows = tracked_live_rows;
+        live_rows.extend(untracked_live_rows);
+        if !live_rows.is_empty() {
+            crate::live_state::write_live_rows(transaction, &live_rows).await?;
+        }
+        crate::live_state::finalize_live_state_after_commit_write(transaction).await?;
     }
 
     Ok(result)
@@ -220,7 +229,9 @@ mod tests {
                         ),
                         Value::Null,
                         Value::Null,
-                        Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                        Value::Text(
+                            crate::live_state::testing::LIVE_STATE_SCHEMA_EPOCH.to_string(),
+                        ),
                     ]],
                     columns: vec![
                         "mode".to_string(),

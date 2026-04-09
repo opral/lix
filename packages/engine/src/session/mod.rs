@@ -9,6 +9,7 @@ pub(crate) mod checkpoint_ops;
 pub(crate) mod collaborators;
 pub(crate) mod execution_context;
 pub(crate) mod observe;
+pub(crate) mod pending_reads;
 pub(crate) mod plugin;
 pub(crate) mod read_execution_bindings;
 pub(crate) mod read_preparation;

@@ -3,6 +3,7 @@ use crate::engine::Engine;
 use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+    write_live_rows, LiveRow,
 };
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
@@ -421,19 +422,23 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<(), LixError> {
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
-        crate::live_state::upsert_bootstrap_tracked_row_in_transaction(
-            self.backend_transaction_mut()?,
-            entity_id,
-            schema_key,
-            schema_version,
-            file_id,
-            version_id,
-            plugin_key,
-            &change_id,
-            snapshot_content,
-            &timestamp,
-        )
-        .await?;
+        let row = LiveRow {
+            entity_id: entity_id.to_string(),
+            file_id: file_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: schema_version.to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: plugin_key.to_string(),
+            metadata: None,
+            change_id: Some(change_id.clone()),
+            writer_key: None,
+            global: version_id == GLOBAL_VERSION_ID,
+            untracked: false,
+            created_at: Some(timestamp.clone()),
+            updated_at: Some(timestamp.clone()),
+            snapshot_content: Some(snapshot_content.to_string()),
+        };
+        write_live_rows(self.backend_transaction_mut()?, &[row]).await?;
 
         self.insert_change_row_for_snapshot(
             entity_id,
@@ -465,18 +470,23 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         snapshot_content: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.generate_runtime_timestamp().await?;
-        crate::live_state::upsert_bootstrap_untracked_row_in_transaction(
-            self.backend_transaction_mut()?,
-            entity_id,
-            schema_key,
-            schema_version,
-            file_id,
-            version_id,
-            plugin_key,
-            snapshot_content,
-            &timestamp,
-        )
-        .await?;
+        let row = LiveRow {
+            entity_id: entity_id.to_string(),
+            file_id: file_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: schema_version.to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: plugin_key.to_string(),
+            metadata: None,
+            change_id: None,
+            writer_key: None,
+            global: version_id == GLOBAL_VERSION_ID,
+            untracked: true,
+            created_at: Some(timestamp.clone()),
+            updated_at: Some(timestamp),
+            snapshot_content: Some(snapshot_content.to_string()),
+        };
+        write_live_rows(self.backend_transaction_mut()?, &[row]).await?;
         Ok(())
     }
 

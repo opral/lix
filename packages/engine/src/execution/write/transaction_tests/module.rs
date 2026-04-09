@@ -7,7 +7,7 @@ use crate::live_state::tracked::{
 };
 use crate::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
-    UntrackedWriteRow,
+    UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::{
@@ -244,7 +244,7 @@ fn local_version_head_untracked_write_row(
         )),
         created_at: Some(timestamp.to_string()),
         updated_at: timestamp.to_string(),
-        operation: crate::live_state::UntrackedWriteOperation::Upsert,
+        operation: UntrackedWriteOperation::Upsert,
     }
 }
 

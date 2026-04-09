@@ -7,8 +7,8 @@ use crate::live_state;
 use crate::live_state::{
     load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
     mark_live_state_projection_ready_with_backend, mark_mode_with_backend,
-    try_claim_bootstrap_with_backend, LiveStateMode, LiveStateRebuildDebugMode,
-    LiveStateRebuildRequest, LiveStateRebuildScope,
+    rebuild_scope_in_transaction, try_claim_bootstrap_with_backend, LiveStateMode,
+    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::runtime::TransactionBackendAdapter;
 use crate::schema;
@@ -135,7 +135,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
                 .await
                 .map_err(|error| init_step_error("mark_live_state_rebuilding", error))?;
         }
-        live_state::rebuild_scope_in_transaction(
+        rebuild_scope_in_transaction(
             transaction.as_mut(),
             &LiveStateRebuildRequest {
                 scope: LiveStateRebuildScope::Full,

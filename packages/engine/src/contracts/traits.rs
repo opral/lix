@@ -14,10 +14,8 @@ use crate::contracts::artifacts::{
     TrackedTombstoneMarker, UntrackedRow,
 };
 use crate::contracts::artifacts::{
-    ExactUntrackedLookupRequest, LiveFilter, LiveQueryEffectiveRow, LiveQueryOverlayLane,
-    LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, OptionalTextPatch, SchemaKey,
-    SchemaRegistration, StateHistoryRequest, StateHistoryRow, TrackedTombstoneLookupRequest,
-    TrackedWriteRow, UntrackedWriteRow,
+    LiveFilter, LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, OptionalTextPatch,
+    SchemaKey, SchemaRegistration, StateHistoryRequest, StateHistoryRow,
 };
 use crate::contracts::plugin::InstalledPlugin;
 
@@ -280,14 +278,6 @@ pub(crate) trait TrackedTombstoneView {
     ) -> Result<Vec<TrackedTombstoneMarker>, LixError>;
 }
 
-#[async_trait(?Send)]
-pub(crate) trait TrackedWriteParticipant {
-    async fn apply_tracked_write_batch(
-        &mut self,
-        batch: &[TrackedWriteRow],
-    ) -> Result<(), LixError>;
-}
-
 #[cfg(test)]
 #[async_trait(?Send)]
 pub(crate) trait UntrackedReadView {
@@ -298,14 +288,6 @@ pub(crate) trait UntrackedReadView {
 
     #[cfg(test)]
     async fn scan_rows(&self, request: &ScanRequest) -> Result<Vec<UntrackedRow>, LixError>;
-}
-
-#[async_trait(?Send)]
-pub(crate) trait UntrackedWriteParticipant {
-    async fn apply_untracked_write_batch(
-        &mut self,
-        batch: &[UntrackedWriteRow],
-    ) -> Result<(), LixError>;
 }
 
 #[cfg(test)]
@@ -390,18 +372,6 @@ pub(crate) trait LiveStateQueryBackend {
         schema_key: &str,
         snapshot_content: Option<&str>,
     ) -> Result<BTreeMap<String, Value>, LixError>;
-
-    async fn load_exact_untracked_effective_row(
-        &self,
-        request: &ExactUntrackedLookupRequest,
-        requested_version_id: &str,
-        overlay_lane: LiveQueryOverlayLane,
-    ) -> Result<Option<LiveQueryEffectiveRow>, LixError>;
-
-    async fn tracked_tombstone_shadows_exact_row(
-        &self,
-        request: &TrackedTombstoneLookupRequest,
-    ) -> Result<bool, LixError>;
 
     async fn load_live_state_projection_status(
         &self,

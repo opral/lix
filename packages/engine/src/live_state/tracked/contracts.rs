@@ -1,18 +1,20 @@
+#[cfg(test)]
 use async_trait::async_trait;
 
+#[cfg(test)]
+pub use crate::contracts::artifacts::BatchRowRequest as BatchTrackedRowRequest;
 pub use crate::contracts::artifacts::{
-    BatchRowRequest as BatchTrackedRowRequest, ExactRowRequest as ExactTrackedRowRequest,
-    ScanRequest as TrackedScanRequest, TrackedRow, TrackedTombstoneMarker, TrackedWriteBatch,
-    TrackedWriteOperation, TrackedWriteRow,
+    ExactRowRequest as ExactTrackedRowRequest, ScanRequest as TrackedScanRequest, TrackedRow,
+    TrackedTombstoneMarker, TrackedWriteOperation, TrackedWriteRow,
 };
 #[cfg(test)]
 pub(crate) use crate::contracts::traits::TrackedReadView;
 #[cfg(test)]
 pub(crate) use crate::contracts::traits::TrackedTombstoneView;
-pub(crate) use crate::contracts::traits::TrackedWriteParticipant;
 #[cfg(test)]
 use crate::LixBackend;
-use crate::{LixBackendTransaction, LixError};
+#[cfg(test)]
+use crate::LixError;
 
 #[cfg(test)]
 #[async_trait(?Send)]
@@ -47,28 +49,5 @@ where
     ) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
         let mut executor = self;
         super::read::scan_tombstones_with_executor(&mut executor, request).await
-    }
-}
-
-#[async_trait(?Send)]
-impl<T> TrackedWriteParticipant for T
-where
-    T: LixBackendTransaction,
-{
-    async fn apply_tracked_write_batch(
-        &mut self,
-        batch: &[TrackedWriteRow],
-    ) -> Result<(), LixError> {
-        super::write::apply_write_batch_in_transaction(self, batch).await
-    }
-}
-
-#[async_trait(?Send)]
-impl TrackedWriteParticipant for dyn LixBackendTransaction + '_ {
-    async fn apply_tracked_write_batch(
-        &mut self,
-        batch: &[TrackedWriteRow],
-    ) -> Result<(), LixError> {
-        super::write::apply_write_batch_in_transaction(self, batch).await
     }
 }

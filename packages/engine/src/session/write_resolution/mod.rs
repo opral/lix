@@ -117,12 +117,6 @@ impl ResolvedWritePartitionBuilder {
                 return true;
             };
             let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
-            if unchanged && authoritative.writer_key != row.writer_key {
-                if let Some(identity) = planned_state_row_workspace_identity(row) {
-                    self.writer_key_updates
-                        .insert(identity, row.writer_key.clone());
-                }
-            }
             if unchanged && row.schema_key == "lix_binary_blob_ref" && row.version_id.is_some() {
                 dropped_blob_rows.insert((
                     row.entity_id.clone(),
@@ -695,19 +689,8 @@ fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow
         && left.schema_key == right.schema_key
         && left.version_id == right.version_id
         && left.tombstone == right.tombstone
+        && left.writer_key == right.writer_key
         && left.values == right.values
-}
-
-fn planned_state_row_workspace_identity(row: &PlannedStateRow) -> Option<PlannedRowIdentity> {
-    Some(PlannedRowIdentity {
-        schema_key: row.schema_key.clone(),
-        version_id: row.version_id.clone()?,
-        entity_id: row.entity_id.clone(),
-        file_id: row.values.get("file_id").and_then(|value| match value {
-            Value::Text(value) => Some(value.clone()),
-            _ => None,
-        })?,
-    })
 }
 
 fn execution_mode_for_overlay_lane(overlay_lane: OverlayLane) -> WriteMode {
@@ -1142,5 +1125,50 @@ fn write_resolve_backend_error(error: crate::LixError) -> WriteResolveError {
 fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteResolveError {
     WriteResolveError {
         message: error.message,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ResolvedWritePartitionBuilder;
+    use crate::contracts::artifacts::PlannedStateRow;
+    use crate::Value;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn writer_key_change_is_not_normalized_into_a_noop() {
+        let mut builder = ResolvedWritePartitionBuilder {
+            authoritative_pre_state_rows: vec![planned_state_row(Some("writer-a"))],
+            intended_post_state: vec![planned_state_row(Some("writer-b"))],
+            ..ResolvedWritePartitionBuilder::default()
+        };
+
+        builder.normalize_semantic_noops();
+
+        assert_eq!(builder.intended_post_state.len(), 1);
+        assert!(builder.writer_key_updates.is_empty());
+    }
+
+    fn planned_state_row(writer_key: Option<&str>) -> PlannedStateRow {
+        let mut values = BTreeMap::new();
+        values.insert("file_id".to_string(), Value::Text("file-1".to_string()));
+        values.insert(
+            "plugin_key".to_string(),
+            Value::Text("plugin-a".to_string()),
+        );
+        values.insert("schema_version".to_string(), Value::Text("1".to_string()));
+        values.insert(
+            "snapshot_content".to_string(),
+            Value::Text("{\"value\":\"same\"}".to_string()),
+        );
+
+        PlannedStateRow {
+            entity_id: "entity-1".to_string(),
+            schema_key: "lix_key_value".to_string(),
+            version_id: Some("version-a".to_string()),
+            values,
+            writer_key: writer_key.map(str::to_string),
+            tombstone: false,
+        }
     }
 }

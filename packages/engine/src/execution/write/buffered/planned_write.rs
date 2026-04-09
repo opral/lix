@@ -2,11 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::artifacts::{
     coalesce_live_table_requirements, ChangeBatch, ExpectedHead, MutationRow, OptionalTextPatch,
-    PlanEffects, PlannedRowIdentity, PlannedStateRow, PreparedInternalWriteArtifact,
-    PreparedPublicWriteArtifact, PreparedPublicWriteExecutionArtifact,
-    PreparedPublicWriteExecutionPartition, PreparedTrackedWriteExecution,
-    PreparedUntrackedWriteExecution, PreparedWriteStep, ResultContract, RowIdentity,
-    SchemaRegistration, SchemaRegistrationSet, WriteMode,
+    PlanEffects, PlannedStateRow, PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
+    PreparedPublicWriteExecutionArtifact, PreparedPublicWriteExecutionPartition,
+    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteStep,
+    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
 use crate::execution::write::filesystem::runtime::{
@@ -28,7 +27,6 @@ pub(crate) struct TrackedTxnUnit {
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) runtime_state: PreparedWriteRuntimeState,
     pub(crate) writer_key: Option<String>,
-    pub(crate) writer_key_annotations: BTreeMap<RowIdentity, Option<String>>,
 }
 
 impl TrackedTxnUnit {
@@ -63,7 +61,6 @@ fn build_tracked_txn_unit(
         filesystem_state: filesystem_state.clone(),
         runtime_state: runtime_state.clone(),
         writer_key: public_write.contract.writer_key.clone(),
-        writer_key_annotations: writer_key_annotations_from_public_write(public_write),
     }
 }
 
@@ -486,26 +483,6 @@ pub(crate) fn build_planned_write_delta(
         .transpose()
 }
 
-fn writer_key_annotations_from_public_write(
-    public_write: &PreparedPublicWriteArtifact,
-) -> BTreeMap<RowIdentity, Option<String>> {
-    let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
-        return BTreeMap::new();
-    };
-
-    resolved
-        .partitions
-        .iter()
-        .flat_map(|partition| partition.writer_key_updates.iter())
-        .map(|(identity, annotation)| {
-            (
-                runtime_row_identity_from_planned(identity),
-                annotation.clone(),
-            )
-        })
-        .collect()
-}
-
 fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> SchemaRegistrationSet {
     let mut registrations = SchemaRegistrationSet::default();
     for unit in &plan.units {
@@ -609,9 +586,6 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                         }
                     }
                 }
-                overlay
-                    .annotations
-                    .extend(tracked.writer_key_annotations.clone());
             }
             PlannedWriteUnit::PublicUntracked(untracked) => {
                 for row in &untracked.execution.intended_post_state {
@@ -1097,15 +1071,6 @@ fn tracked_plan_entity_targets_disjoint(left: &TrackedTxnUnit, right: &TrackedTx
     let left_targets = tracked_plan_entity_targets(left);
     let right_targets = tracked_plan_entity_targets(right);
     left_targets.is_disjoint(&right_targets)
-}
-
-fn runtime_row_identity_from_planned(identity: &PlannedRowIdentity) -> RowIdentity {
-    RowIdentity {
-        schema_key: identity.schema_key.clone(),
-        version_id: identity.version_id.clone(),
-        entity_id: identity.entity_id.clone(),
-        file_id: identity.file_id.clone(),
-    }
 }
 
 fn merge_plan_effects(current: &mut PlanEffects, next: &PlanEffects) {

@@ -5,7 +5,7 @@ use crate::canonical::read::{
     ExactCommittedStateRow, ExactCommittedStateRowRequest,
 };
 use crate::version_state::load_local_version_head_commit_id_with_executor;
-use crate::{LixBackend, LixError, VersionId};
+use crate::{LixError, VersionId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VersionSnapshot {
@@ -55,14 +55,6 @@ pub(crate) async fn load_version_info_for_versions(
     }
 
     Ok(versions)
-}
-
-pub(crate) async fn load_exact_committed_state_row_at_version_head(
-    backend: &dyn LixBackend,
-    request: &ExactCommittedStateRowRequest,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let mut executor = backend;
-    load_exact_committed_state_row_at_version_head_with_executor(&mut executor, request).await
 }
 
 pub(crate) async fn load_exact_committed_state_row_at_version_head_with_executor(

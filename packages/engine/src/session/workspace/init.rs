@@ -1,5 +1,4 @@
 use crate::backend::ddl::execute_ddl_batch;
-use crate::live_state::writer_key::ensure_writer_key_table_ready;
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
@@ -11,6 +10,5 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
         super::WORKSPACE_METADATA_TABLE
     )];
     let statement_refs = statements.iter().map(String::as_str).collect::<Vec<_>>();
-    execute_ddl_batch(backend, "workspace", &statement_refs).await?;
-    ensure_writer_key_table_ready(backend).await
+    execute_ddl_batch(backend, "workspace", &statement_refs).await
 }

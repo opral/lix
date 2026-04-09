@@ -4,6 +4,7 @@ use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, Val
 
 use crate::contracts::artifacts::{PendingViewFilter, ScanConstraint, ScanField, ScanOperator};
 use crate::contracts::traits::{LiveStateQueryBackend, PendingSemanticStorage, PendingView};
+use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, RowReadMode};
 use crate::sql::logical_plan::public_ir::{CanonicalStateRowKey, PlannedWrite, ScopeProof};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::{LixBackend, LixError, Value};
@@ -187,37 +188,34 @@ async fn scan_selector_lane(
     constraints: &[ScanConstraint],
 ) -> Result<BTreeMap<SelectorRowIdentity, LaneSelectorResult>, LixError> {
     let storage_version_id = selector_storage_version_id(requested_version_id, lane);
-    let request = crate::contracts::artifacts::ScanRequest {
+    let request = LiveRowQuery {
         schema_key: schema_key.to_string(),
         version_id: storage_version_id.clone(),
+        mode: if lane.is_untracked() {
+            RowReadMode::Untracked
+        } else {
+            RowReadMode::Tracked
+        },
         constraints: constraints.to_vec(),
-        required_columns: Vec::new(),
+        include_tombstones: !lane.is_untracked(),
     };
     let mut lane_rows = BTreeMap::<SelectorRowIdentity, LaneSelectorResult>::new();
 
-    if lane.is_untracked() {
-        for row in crate::live_state::scan_untracked_rows_with_backend(backend, &request).await? {
-            let row = candidate_row_from_untracked(row, requested_version_id, lane, None, None);
-            lane_rows.insert(row.identity(), LaneSelectorResult::Visible(row));
-        }
-    } else {
-        for row in crate::live_state::scan_tracked_rows_with_backend(backend, &request).await? {
-            let row = candidate_row_from_tracked(row, requested_version_id, lane, None, None);
-            lane_rows.insert(row.identity(), LaneSelectorResult::Visible(row));
-        }
-        let mut executor = backend;
-        for tombstone in
-            crate::live_state::scan_tracked_tombstones_with_executor(&mut executor, &request)
-                .await?
-        {
+    for row in scan_live_rows(backend, &request).await? {
+        if !lane.is_untracked() && row.snapshot_content.is_none() {
             lane_rows.insert(
                 SelectorRowIdentity {
-                    entity_id: tombstone.entity_id,
-                    file_id: tombstone.file_id,
+                    entity_id: row.entity_id,
+                    file_id: row.file_id,
                 },
                 LaneSelectorResult::Tombstone,
             );
+            continue;
         }
+
+        let row = candidate_row_from_live_row(backend, row, requested_version_id, lane, None, None)
+            .await?;
+        lane_rows.insert(row.identity(), LaneSelectorResult::Visible(row));
     }
 
     let Some(pending_view) = pending_view else {
@@ -293,50 +291,49 @@ async fn scan_selector_lane(
     Ok(lane_rows)
 }
 
-fn candidate_row_from_tracked(
-    row: crate::contracts::artifacts::TrackedRow,
+async fn candidate_row_from_live_row(
+    backend: &dyn LixBackend,
+    row: LiveRow,
     requested_version_id: &str,
     lane: SelectorOverlayLane,
     snapshot_content: Option<String>,
     writer_key_override: Option<String>,
-) -> SelectorCandidateRow {
-    SelectorCandidateRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        schema_version: row.schema_version,
-        file_id: row.file_id,
-        version_id: selector_projected_version_id(requested_version_id, lane, &row.version_id),
-        global: lane.is_global() || row.global,
-        untracked: false,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        writer_key: writer_key_override.or(row.writer_key),
-        snapshot_content,
-        values: row.values,
-    }
-}
+) -> Result<SelectorCandidateRow, LixError> {
+    let LiveRow {
+        entity_id,
+        file_id,
+        schema_key,
+        schema_version,
+        version_id,
+        plugin_key,
+        metadata,
+        writer_key,
+        global,
+        snapshot_content: row_snapshot_content,
+        ..
+    } = row;
+    let snapshot_content = snapshot_content.or(row_snapshot_content);
+    let values = LiveStateQueryBackend::normalize_live_snapshot_values(
+        backend,
+        &schema_key,
+        snapshot_content.as_deref(),
+    )
+    .await?;
 
-fn candidate_row_from_untracked(
-    row: crate::contracts::artifacts::UntrackedRow,
-    requested_version_id: &str,
-    lane: SelectorOverlayLane,
-    snapshot_content: Option<String>,
-    writer_key_override: Option<String>,
-) -> SelectorCandidateRow {
-    SelectorCandidateRow {
-        entity_id: row.entity_id,
-        schema_key: row.schema_key,
-        schema_version: row.schema_version,
-        file_id: row.file_id,
-        version_id: selector_projected_version_id(requested_version_id, lane, &row.version_id),
-        global: lane.is_global() || row.global,
-        untracked: true,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        writer_key: writer_key_override.or(row.writer_key),
+    Ok(SelectorCandidateRow {
+        entity_id,
+        schema_key,
+        schema_version,
+        file_id,
+        version_id: selector_projected_version_id(requested_version_id, lane, &version_id),
+        global: lane.is_global() || global,
+        untracked: lane.is_untracked(),
+        plugin_key,
+        metadata,
+        writer_key: writer_key_override.or(writer_key),
         snapshot_content,
-        values: row.values,
-    }
+        values,
+    })
 }
 
 fn selector_scan_constraints(planned_write: &PlannedWrite) -> Vec<ScanConstraint> {

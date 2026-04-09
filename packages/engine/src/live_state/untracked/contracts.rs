@@ -1,16 +1,18 @@
+#[cfg(test)]
 use async_trait::async_trait;
 
+#[cfg(test)]
+pub use crate::contracts::artifacts::BatchRowRequest as BatchUntrackedRowRequest;
 pub use crate::contracts::artifacts::{
-    BatchRowRequest as BatchUntrackedRowRequest, ExactRowRequest as ExactUntrackedRowRequest,
-    ScanRequest as UntrackedScanRequest, UntrackedRow, UntrackedWriteBatch,
+    ExactRowRequest as ExactUntrackedRowRequest, ScanRequest as UntrackedScanRequest, UntrackedRow,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
 #[cfg(test)]
 pub(crate) use crate::contracts::traits::UntrackedReadView;
-pub(crate) use crate::contracts::traits::UntrackedWriteParticipant;
 #[cfg(test)]
 use crate::LixBackend;
-use crate::{LixBackendTransaction, LixError};
+#[cfg(test)]
+use crate::LixError;
 
 #[cfg(test)]
 #[async_trait(?Send)]
@@ -33,28 +35,5 @@ where
     ) -> Result<Vec<UntrackedRow>, LixError> {
         let mut executor = self;
         super::read::scan_rows_with_executor(&mut executor, request).await
-    }
-}
-
-#[async_trait(?Send)]
-impl<T> UntrackedWriteParticipant for T
-where
-    T: LixBackendTransaction,
-{
-    async fn apply_untracked_write_batch(
-        &mut self,
-        batch: &[UntrackedWriteRow],
-    ) -> Result<(), LixError> {
-        super::write::apply_write_batch_in_transaction(self, batch).await
-    }
-}
-
-#[async_trait(?Send)]
-impl UntrackedWriteParticipant for dyn LixBackendTransaction + '_ {
-    async fn apply_untracked_write_batch(
-        &mut self,
-        batch: &[UntrackedWriteRow],
-    ) -> Result<(), LixError> {
-        super::write::apply_write_batch_in_transaction(self, batch).await
     }
 }
