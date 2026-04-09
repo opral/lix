@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::binary_cas;
 use crate::canonical;
 use crate::engine::Engine;
+use crate::init::{init_builtin_schema_storage, seed_builtin_registered_schemas};
 use crate::live_state;
 use crate::live_state::{
     load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
@@ -11,7 +12,6 @@ use crate::live_state::{
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::runtime::TransactionBackendAdapter;
-use crate::schema;
 use crate::session::observe;
 use crate::session::version_ops;
 use crate::session::version_ops::commit;
@@ -44,9 +44,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             live_state::init(&backend)
                 .await
                 .map_err(|error| init_step_error("live_state::init", error))?;
-            schema::init(&backend)
+            init_builtin_schema_storage(&backend)
                 .await
-                .map_err(|error| init_step_error("schema::init", error))?;
+                .map_err(|error| init_step_error("init::init_builtin_schema_storage", error))?;
             canonical::init(&backend)
                 .await
                 .map_err(|error| init_step_error("canonical::init", error))?;
@@ -81,9 +81,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
 
         let mut init = InitExecutor::new(engine, transaction.as_mut())
             .map_err(|error| init_step_error("init_executor", error))?;
-        schema::seed_bootstrap(&mut init)
+        seed_builtin_registered_schemas(&mut init)
             .await
-            .map_err(|error| init_step_error("schema::seed_bootstrap", error))?;
+            .map_err(|error| init_step_error("init::seed_builtin_registered_schemas", error))?;
         let default_active_version_id = version_ops::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("session::version_ops::seed_bootstrap", error))?;

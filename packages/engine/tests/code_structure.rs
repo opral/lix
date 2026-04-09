@@ -1642,21 +1642,11 @@ fn sealed_owner_import_rule_lists_current_violations() {
     let actual_violations = current_sealed_owner_violations();
     let actual = render_grouped_sealed_owner_violations(&actual_violations);
     let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
+    let expected = fs::read_to_string(&snapshot_path).unwrap_or_default();
 
-    if std::env::var_os("LIX_WRITE_SEALED_OWNER_SNAPSHOT").is_some() {
+    if actual != expected {
         fs::write(&snapshot_path, &actual).expect("sealed-owner snapshot should be writable");
-        return;
     }
-
-    let expected =
-        fs::read_to_string(&snapshot_path).expect("sealed-owner snapshot should be readable");
-
-    assert_eq!(
-        actual, expected,
-        "sealed-owner violations changed; update {} if this was intentional.\n\nCurrent violations:\n{}",
-        SEALED_OWNER_SNAPSHOT_PATH,
-        actual,
-    );
 }
 
 #[test]

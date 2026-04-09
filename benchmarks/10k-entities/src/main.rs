@@ -627,15 +627,15 @@ async fn finish_sample(
         ));
     }
 
-    let file_matches_expected = match verify_file_json_matches(session, file_id, expected_payload).await
-    {
-        Ok(()) => true,
-        Err(error) if !enforce_file_match => {
-            let _ = error;
-            false
-        }
-        Err(error) => return Err(error),
-    };
+    let file_matches_expected =
+        match verify_file_json_matches(session, file_id, expected_payload).await {
+            Ok(()) => true,
+            Err(error) if !enforce_file_match => {
+                let _ = error;
+                false
+            }
+            Err(error) => return Err(error),
+        };
 
     Ok(RunSample {
         index,
@@ -820,7 +820,8 @@ async fn verify_file_json_matches(
         }
     };
 
-    let actual_json: serde_json::Value = serde_json::from_slice(&actual_bytes).map_err(serde_err)?;
+    let actual_json: serde_json::Value =
+        serde_json::from_slice(&actual_bytes).map_err(serde_err)?;
     let expected_json: serde_json::Value =
         serde_json::from_slice(expected_payload).map_err(serde_err)?;
     if actual_json != expected_json {
@@ -1055,13 +1056,19 @@ fn render_markdown_report(report: &Report) -> String {
         report.shared_setup.plugin_wasm_path,
         report.comparison.file_write_write_mean_ms,
         report.comparison.direct_entity_write_mean_ms,
-        report.comparison.file_write_minus_direct_entity_write_mean_ms,
+        report
+            .comparison
+            .file_write_minus_direct_entity_write_mean_ms,
         report.comparison.file_write_commit_mean_ms,
         report.comparison.direct_entity_commit_mean_ms,
-        report.comparison.file_write_minus_direct_entity_commit_mean_ms,
+        report
+            .comparison
+            .file_write_minus_direct_entity_commit_mean_ms,
         report.comparison.file_write_total_mean_ms,
         report.comparison.direct_entity_total_mean_ms,
-        report.comparison.file_write_minus_direct_entity_total_mean_ms,
+        report
+            .comparison
+            .file_write_minus_direct_entity_total_mean_ms,
         report.comparison.file_write_to_direct_entity_total_ratio,
         report.comparison.file_write_to_direct_entity_total_ratio,
         case_sections,
@@ -1179,7 +1186,9 @@ fn print_summary(report: &Report, report_json_path: &Path, report_markdown_path:
 
     println!(
         "comparison total_mean_delta_ms={:.3} total_ratio={:.3}x",
-        report.comparison.file_write_minus_direct_entity_total_mean_ms,
+        report
+            .comparison
+            .file_write_minus_direct_entity_total_mean_ms,
         report.comparison.file_write_to_direct_entity_total_ratio,
     );
     println!("report_json={}", report_json_path.display());

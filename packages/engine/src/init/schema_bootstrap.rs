@@ -2,28 +2,30 @@ use crate::common::errors;
 use crate::engine::builtin_schema_entity_id;
 use crate::init::InitExecutor;
 use crate::live_state::register_schema;
+use crate::schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::Value;
 use crate::{LixBackend, LixError};
 
-pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    for schema_key in super::builtin::builtin_schema_keys() {
+pub(crate) async fn init_builtin_schema_storage(backend: &dyn LixBackend) -> Result<(), LixError> {
+    for schema_key in builtin_schema_keys() {
         register_schema(backend, *schema_key).await?;
     }
     Ok(())
 }
 
-pub(crate) async fn seed_bootstrap(executor: &mut InitExecutor<'_, '_>) -> Result<(), LixError> {
-    executor.seed_builtin_schemas().await
+pub(crate) async fn seed_builtin_registered_schemas(
+    executor: &mut InitExecutor<'_, '_>,
+) -> Result<(), LixError> {
+    executor.seed_builtin_registered_schemas().await
 }
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
-    pub(crate) async fn seed_builtin_schemas(&mut self) -> Result<(), LixError> {
-        for schema_key in super::builtin::builtin_schema_keys() {
-            let schema =
-                super::builtin::builtin_schema_definition(schema_key).ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!("builtin schema '{schema_key}' is not available"),
-                })?;
+    pub(crate) async fn seed_builtin_registered_schemas(&mut self) -> Result<(), LixError> {
+        for schema_key in builtin_schema_keys() {
+            let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("builtin schema '{schema_key}' is not available"),
+            })?;
             let entity_id = builtin_schema_entity_id(schema)?;
 
             let existing = self
