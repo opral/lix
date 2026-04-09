@@ -294,7 +294,7 @@ pub(crate) async fn resolve_write_plan_for_test(
 
 pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(), LixError> {
     crate::live_state::init(backend).await?;
-    crate::schema::init(backend).await?;
+    crate::init::init_builtin_schema_storage(backend).await?;
     crate::canonical::init(backend).await?;
     crate::session::version_ops::commit::init(backend).await?;
     crate::session::version_ops::init(backend).await?;
