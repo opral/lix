@@ -9,7 +9,7 @@ use crate::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
     UntrackedWriteRow,
 };
-use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
+use crate::schema::WORKSPACE_WRITER_KEY_TABLE;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };

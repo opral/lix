@@ -2,10 +2,10 @@ use super::*;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::traits::{PendingSemanticStorage, PendingView};
 use crate::live_state::{decode_registered_schema_row, scan_rows, RowQuery, RowReadMode};
-use crate::schema::annotations::defaults::apply_schema_defaults_with_shared_runtime;
-use crate::schema::annotations::overrides::collect_state_column_overrides_with_shared_runtime;
-use crate::schema::builtin_schema_definition;
-use crate::schema::{schema_from_registered_snapshot, SchemaKey};
+use crate::schema::{
+    apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
+    collect_state_column_overrides_with_shared_runtime, schema_from_registered_snapshot, SchemaKey,
+};
 use crate::session::write_resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
 use crate::session::write_resolution::prepared_artifacts::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,

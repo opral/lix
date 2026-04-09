@@ -12,7 +12,7 @@ use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
-use crate::schema::annotations::writer_key::WorkspaceWriterKeyReadView;
+use crate::schema::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
 use async_trait::async_trait;
 

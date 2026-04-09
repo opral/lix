@@ -2,7 +2,7 @@ use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::live_state;
-use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
+use crate::schema::WORKSPACE_WRITER_KEY_TABLE;
 use crate::version_state::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 

@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::version_state::GLOBAL_VERSION_ID;
 
 #[allow(dead_code)]

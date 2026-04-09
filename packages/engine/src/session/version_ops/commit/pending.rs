@@ -151,9 +151,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     timestamp: &str,
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let tracked_writer_key_annotations =
-        crate::schema::annotations::writer_key::tracked_writer_key_annotations_from_changes(
-            changes, writer_key,
-        );
+        crate::schema::tracked_writer_key_annotations_from_changes(changes, writer_key);
     let domain_changes = changes
         .iter()
         .map(|change| {
@@ -411,7 +409,7 @@ async fn execute_generated_commit_result(
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     let mut executor = &mut *transaction;
-    crate::schema::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
+    crate::schema::apply_workspace_writer_key_annotations_with_executor(
         &mut executor,
         tracked_writer_key_annotations,
     )

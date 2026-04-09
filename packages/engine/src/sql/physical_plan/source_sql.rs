@@ -3,7 +3,7 @@
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
 use crate::live_state;
-use crate::schema::annotations::writer_key::WORKSPACE_WRITER_KEY_TABLE;
+use crate::schema::WORKSPACE_WRITER_KEY_TABLE;
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_payload_alias, entity_surface_uses_payload_alias, escape_sql_string,
     expr_contains_string_literal, json_array_text_join_sql, quote_ident, render_identifier,
