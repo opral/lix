@@ -351,6 +351,7 @@ impl<'a> TransactionReadModel<'a> {
             ) else {
                 continue;
             };
+            row.writer_key = writer_key.clone();
             row.normalized_values.insert(
                 "writer_key".to_string(),
                 writer_key.clone().map(Value::Text).unwrap_or(Value::Null),
@@ -420,6 +421,7 @@ struct OverlayVisibleLiveRow {
     untracked: bool,
     plugin_key: String,
     metadata: Option<String>,
+    writer_key: Option<String>,
     change_id: Option<String>,
     snapshot_content: Option<String>,
     is_tombstone: bool,
@@ -546,6 +548,7 @@ fn visible_live_row_from_raw(
         untracked,
         plugin_key: row.plugin_key().to_string(),
         metadata: row.metadata().map(ToOwned::to_owned),
+        writer_key: row.writer_key().map(ToOwned::to_owned),
         change_id: row.change_id().map(ToOwned::to_owned),
         normalized_values: row.values().clone(),
         snapshot_content: Some(snapshot_content),
@@ -567,6 +570,7 @@ fn visible_live_row_from_pending(
         untracked: matches!(pending.storage, PendingSemanticStorage::Untracked),
         plugin_key: pending.plugin_key.clone(),
         metadata: pending.metadata.clone(),
+        writer_key: None,
         change_id: None,
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
@@ -602,6 +606,7 @@ fn visible_live_row_from_pending_filesystem_state(
         untracked: pending.untracked,
         plugin_key: "lix".to_string(),
         metadata: descriptor.metadata.clone(),
+        writer_key: None,
         change_id: None,
         snapshot_content: Some(snapshot_content.clone()),
         is_tombstone: false,
@@ -662,6 +667,12 @@ fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
         "metadata" | "lixcol_metadata" => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }
+        "writer_key" | "lixcol_writer_key" => Some(
+            row.writer_key
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+        ),
         "change_id" | "lixcol_change_id" => Some(
             row.change_id
                 .clone()

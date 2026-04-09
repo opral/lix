@@ -609,7 +609,6 @@ struct SharedDeterministicRun {
     case_id: String,
     call_index: Mutex<usize>,
     state: Arc<SharedDeterministicCase>,
-    is_baseline: bool,
 }
 
 struct SharedDeterministicCase {
@@ -618,12 +617,13 @@ struct SharedDeterministicCase {
 }
 
 struct SharedDeterministicCaseState {
+    preferred_baseline_backend: String,
     baseline_backend: Option<String>,
     baseline_finished: bool,
     baseline_failed: bool,
     baseline_call_count: Option<usize>,
     expected_values: Vec<Box<dyn Any + Send + Sync>>,
-    role_by_backend: HashMap<String, bool>,
+    created_at: Instant,
 }
 
 struct SharedDeterministicRunGuard {
@@ -631,6 +631,25 @@ struct SharedDeterministicRunGuard {
 }
 
 impl SharedDeterministicRun {
+    fn is_current_baseline(&self, state: &SharedDeterministicCaseState) -> bool {
+        state.baseline_backend.as_deref() == Some(self.backend_name.as_str())
+    }
+
+    fn maybe_claim_fallback_baseline(&self, state: &mut SharedDeterministicCaseState) -> bool {
+        const SQLITE_BASELINE_GRACE: Duration = Duration::from_secs(1);
+
+        if state.baseline_backend.is_some() {
+            return self.is_current_baseline(state);
+        }
+
+        if state.created_at.elapsed() < SQLITE_BASELINE_GRACE {
+            return false;
+        }
+
+        state.baseline_backend = Some(self.backend_name.clone());
+        true
+    }
+
     fn next_index(&self) -> usize {
         let mut idx = self
             .call_index
@@ -653,24 +672,26 @@ impl SharedDeterministicRun {
         T: PartialEq + std::fmt::Debug + Clone + Send + Sync + 'static,
     {
         let idx = self.next_index();
-        if self.is_baseline {
-            let mut state = self
-                .state
-                .state
-                .lock()
-                .expect("shared deterministic mutex poisoned");
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .expect("shared deterministic mutex poisoned");
+
+        if self.is_current_baseline(&state) || self.maybe_claim_fallback_baseline(&mut state) {
             state.expected_values.push(Box::new(actual));
             self.state.condvar.notify_all();
             return;
         }
 
         let deadline = Instant::now() + Duration::from_secs(120);
-        let mut state = self
-            .state
-            .state
-            .lock()
-            .expect("shared deterministic mutex poisoned");
         loop {
+            if self.is_current_baseline(&state) || self.maybe_claim_fallback_baseline(&mut state) {
+                state.expected_values.push(Box::new(actual));
+                self.state.condvar.notify_all();
+                return;
+            }
+
             if idx < state.expected_values.len() {
                 break;
             }
@@ -727,12 +748,13 @@ impl SharedDeterministicRun {
     }
 
     fn finish(&self, success: bool) -> Result<(), String> {
-        if self.is_baseline {
-            let mut state = self
-                .state
-                .state
-                .lock()
-                .expect("shared deterministic mutex poisoned");
+        let mut state = self
+            .state
+            .state
+            .lock()
+            .expect("shared deterministic mutex poisoned");
+
+        if self.is_current_baseline(&state) || self.maybe_claim_fallback_baseline(&mut state) {
             state.baseline_finished = true;
             state.baseline_failed = !success;
             state.baseline_call_count = Some(self.call_count());
@@ -745,12 +767,14 @@ impl SharedDeterministicRun {
         }
 
         let deadline = Instant::now() + Duration::from_secs(120);
-        let mut state = self
-            .state
-            .state
-            .lock()
-            .expect("shared deterministic mutex poisoned");
         while !state.baseline_finished {
+            if self.is_current_baseline(&state) || self.maybe_claim_fallback_baseline(&mut state) {
+                state.baseline_finished = true;
+                state.baseline_failed = false;
+                state.baseline_call_count = Some(self.call_count());
+                self.state.condvar.notify_all();
+                return Ok(());
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Err(format!(
@@ -803,6 +827,7 @@ impl Drop for SharedDeterministicRunGuard {
 
 impl SharedExpectDeterministic {
     fn new(case_id: &str, backend_name: &str) -> (Self, SharedDeterministicRunGuard) {
+        const PREFERRED_BASELINE_BACKEND: &str = "sqlite";
         static REGISTRY: OnceLock<Mutex<HashMap<String, Arc<SharedDeterministicCase>>>> =
             OnceLock::new();
         let registry = REGISTRY.get_or_init(|| Mutex::new(HashMap::new()));
@@ -815,12 +840,13 @@ impl SharedExpectDeterministic {
                 .or_insert_with(|| {
                     Arc::new(SharedDeterministicCase {
                         state: Mutex::new(SharedDeterministicCaseState {
+                            preferred_baseline_backend: PREFERRED_BASELINE_BACKEND.to_string(),
                             baseline_backend: None,
                             baseline_finished: false,
                             baseline_failed: false,
                             baseline_call_count: None,
                             expected_values: Vec::new(),
-                            role_by_backend: HashMap::new(),
+                            created_at: Instant::now(),
                         }),
                         condvar: Condvar::new(),
                     })
@@ -828,34 +854,27 @@ impl SharedExpectDeterministic {
                 .clone()
         };
 
-        let is_baseline = {
+        {
             let mut state = case
                 .state
                 .lock()
                 .expect("shared deterministic mutex poisoned");
-            if let Some(existing) = state.role_by_backend.get(backend_name) {
-                *existing
-            } else {
-                let is_baseline = match state.baseline_backend.as_deref() {
-                    Some(baseline) => baseline == backend_name,
-                    None => {
-                        state.baseline_backend = Some(backend_name.to_string());
-                        true
-                    }
-                };
-                state
-                    .role_by_backend
-                    .insert(backend_name.to_string(), is_baseline);
-                is_baseline
+            if state.preferred_baseline_backend != PREFERRED_BASELINE_BACKEND {
+                panic!(
+                    "shared deterministic case `{case_id}` registered with conflicting preferred baselines: `{}` vs `{PREFERRED_BASELINE_BACKEND}`",
+                    state.preferred_baseline_backend
+                );
             }
-        };
+            if backend_name == PREFERRED_BASELINE_BACKEND && state.baseline_backend.is_none() {
+                state.baseline_backend = Some(backend_name.to_string());
+            }
+        }
 
         let run = Arc::new(SharedDeterministicRun {
             backend_name: backend_name.to_string(),
             case_id: case_id.to_string(),
             call_index: Mutex::new(0),
             state: case,
-            is_baseline,
         });
         let guard = SharedDeterministicRunGuard { run: run.clone() };
         (Self { run }, guard)
@@ -970,7 +989,11 @@ where
     }
 }
 
-pub async fn run_single_simulation_test<F, Fut>(simulation_name: &str, case_id: &str, test_fn: F)
+pub async fn run_single_simulation_test<F, Fut>(
+    simulation_name: &str,
+    case_id: &str,
+    test_fn: F,
+)
 where
     F: Fn(SimulationArgs) -> Fut,
     Fut: Future<Output = ()>,
@@ -992,6 +1015,7 @@ where
 pub fn default_simulations() -> Vec<Simulation> {
     default_simulations_impl()
 }
+
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementKind {
@@ -1025,6 +1049,62 @@ fn classify_with_statement(sql: &str) -> StatementKind {
         StatementKind::Write
     } else {
         StatementKind::Read
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shared_deterministic_prefers_sqlite_when_it_participates() {
+        let case_id = "simulation_test::prefers_sqlite_when_present";
+
+        let (postgres_expect, _postgres_guard) = SharedExpectDeterministic::new(case_id, "postgres");
+        let state = postgres_expect
+            .run
+            .state
+            .state
+            .lock()
+            .expect("shared deterministic mutex poisoned");
+        assert_eq!(state.baseline_backend, None);
+        drop(state);
+
+        let (sqlite_expect, _sqlite_guard) = SharedExpectDeterministic::new(case_id, "sqlite");
+        let state = sqlite_expect
+            .run
+            .state
+            .state
+            .lock()
+            .expect("shared deterministic mutex poisoned");
+        assert_eq!(state.baseline_backend.as_deref(), Some("sqlite"));
+    }
+
+    #[test]
+    fn shared_deterministic_falls_back_when_sqlite_never_starts() {
+        let case_id = "simulation_test::falls_back_without_sqlite";
+        let (postgres_expect, _postgres_guard) = SharedExpectDeterministic::new(case_id, "postgres");
+
+        {
+            let mut state = postgres_expect
+                .run
+                .state
+                .state
+                .lock()
+                .expect("shared deterministic mutex poisoned");
+            state.created_at = Instant::now() - Duration::from_secs(2);
+        }
+
+        postgres_expect.assert_deterministic(42usize);
+
+        let state = postgres_expect
+            .run
+            .state
+            .state
+            .lock()
+            .expect("shared deterministic mutex poisoned");
+        assert_eq!(state.baseline_backend.as_deref(), Some("postgres"));
+        assert_eq!(state.expected_values.len(), 1);
     }
 }
 

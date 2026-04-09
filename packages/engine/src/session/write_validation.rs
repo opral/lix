@@ -34,8 +34,9 @@ use crate::live_state::{
     LiveRowQuery, LiveRowSemantics, RowReadMode,
 };
 use crate::schema::{
-    builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
-    schema_key_from_definition, validate_lix_schema_definition, SchemaKey,
+    builtin_schema_definition, builtin_schema_keys, lix_state_surface_schema_definition,
+    schema_from_registered_snapshot, schema_key_from_definition, validate_lix_schema_definition,
+    SchemaKey,
 };
 use crate::{LixBackend, LixError, Value};
 
@@ -2066,12 +2067,7 @@ fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
         return None;
     }
 
-    Some(serde_json::json!({
-        "type": "object",
-        "x-lix-key": "lix_state",
-        "x-lix-version": "1",
-        "properties": {},
-    }))
+    Some(lix_state_surface_schema_definition().clone())
 }
 
 fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String, LixError> {
