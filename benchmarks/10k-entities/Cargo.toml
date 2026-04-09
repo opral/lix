@@ -1,0 +1,17 @@
+[package]
+name = "ten_k_entities_benchmark"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-trait = "0.1"
+clap = { version = "4.5.31", features = ["derive"] }
+lix_engine = { path = "../../packages/engine" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8.6", default-features = false, features = ["sqlite", "runtime-tokio-rustls"] }
+tokio = { version = "1", features = ["sync"] }
+wasmtime = { version = "30", features = ["component-model"] }
+wasmtime-wasi = "30"
+zip = { version = "2", default-features = false, features = ["deflate"] }
