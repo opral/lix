@@ -433,7 +433,7 @@ pub(crate) async fn seed_live_state_status_row(
                 applied_frontier
                     .map(|value| Value::Text(value.to_json_string()))
                     .unwrap_or(Value::Null),
-                Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
+                Value::Text(crate::live_state::testing::LIVE_STATE_SCHEMA_EPOCH.to_string()),
                 Value::Text(updated_at.to_string()),
             ],
         )

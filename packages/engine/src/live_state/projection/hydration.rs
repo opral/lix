@@ -1,9 +1,11 @@
 use crate::live_state::shared::version_heads::load_current_committed_version_frontier_with_backend;
-use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-use crate::live_state::{
-    scan_tracked_rows_with_backend, scan_untracked_rows_with_backend, TrackedScanRequest,
-    UntrackedScanRequest,
+use crate::live_state::tracked::{
+    scan_rows_with_backend as scan_tracked_rows_with_backend, TrackedScanRequest,
 };
+use crate::live_state::untracked::{
+    scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
+};
+use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::projections::{
     ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
     ProjectionInputVersionScope, ProjectionStorageKind, ProjectionTrait,
@@ -121,7 +123,7 @@ mod tests {
     use super::hydrate_projection_input_with_backend;
     use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
     use crate::live_state;
-    use crate::live_state::builtin_schema_storage_metadata;
+    use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
     use crate::projections::{
         DerivedRow, ProjectionInput, ProjectionInputSpec, ProjectionSurfaceSpec, ProjectionTrait,
     };
@@ -279,6 +281,63 @@ mod tests {
         .to_string()
     }
 
+    fn bootstrap_tracked_live_row(
+        entity_id: &str,
+        schema_key: &str,
+        schema_version: &str,
+        file_id: &str,
+        version_id: &str,
+        plugin_key: &str,
+        change_id: &str,
+        snapshot_content: &str,
+        timestamp: &str,
+    ) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            file_id: file_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: schema_version.to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: plugin_key.to_string(),
+            metadata: None,
+            change_id: Some(change_id.to_string()),
+            writer_key: None,
+            global: version_id == crate::version_state::GLOBAL_VERSION_ID,
+            untracked: false,
+            created_at: Some(timestamp.to_string()),
+            updated_at: Some(timestamp.to_string()),
+            snapshot_content: Some(snapshot_content.to_string()),
+        }
+    }
+
+    fn bootstrap_untracked_live_row(
+        entity_id: &str,
+        schema_key: &str,
+        schema_version: &str,
+        file_id: &str,
+        version_id: &str,
+        plugin_key: &str,
+        snapshot_content: &str,
+        timestamp: &str,
+    ) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            file_id: file_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: schema_version.to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: plugin_key.to_string(),
+            metadata: None,
+            change_id: None,
+            writer_key: None,
+            global: version_id == crate::version_state::GLOBAL_VERSION_ID,
+            untracked: true,
+            created_at: Some(timestamp.to_string()),
+            updated_at: Some(timestamp.to_string()),
+            snapshot_content: Some(snapshot_content.to_string()),
+        }
+    }
+
     #[tokio::test]
     async fn hydrates_bootstrap_lix_version_projection_input_from_engine_owned_state() {
         let backend = TestSqliteBackend::new();
@@ -295,65 +354,76 @@ mod tests {
             .begin_transaction(TransactionMode::Write)
             .await
             .expect("write transaction should begin");
-        live_state::upsert_bootstrap_tracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_descriptor_schema_key(),
-            &version_descriptor_schema_version(),
-            &version_descriptor_file_id(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_descriptor_plugin_key(),
-            "change-global",
-            &version_descriptor_snapshot_content(
+            &[bootstrap_tracked_live_row(
                 crate::version_state::GLOBAL_VERSION_ID,
+                &version_descriptor_schema_key(),
+                &version_descriptor_schema_version(),
+                &version_descriptor_file_id(),
                 crate::version_state::GLOBAL_VERSION_ID,
-                true,
-            ),
-            "2026-04-01T00:00:00Z",
+                &version_descriptor_plugin_key(),
+                "change-global",
+                &version_descriptor_snapshot_content(
+                    crate::version_state::GLOBAL_VERSION_ID,
+                    crate::version_state::GLOBAL_VERSION_ID,
+                    true,
+                ),
+                "2026-04-01T00:00:00Z",
+            )],
         )
         .await
         .expect("global descriptor should seed");
-        live_state::upsert_bootstrap_tracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            "version-main",
-            &version_descriptor_schema_key(),
-            &version_descriptor_schema_version(),
-            &version_descriptor_file_id(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_descriptor_plugin_key(),
-            "change-main",
-            &version_descriptor_snapshot_content(
+            &[bootstrap_tracked_live_row(
                 "version-main",
-                crate::version_state::DEFAULT_ACTIVE_VERSION_NAME,
-                false,
-            ),
-            "2026-04-01T00:00:01Z",
+                &version_descriptor_schema_key(),
+                &version_descriptor_schema_version(),
+                &version_descriptor_file_id(),
+                crate::version_state::GLOBAL_VERSION_ID,
+                &version_descriptor_plugin_key(),
+                "change-main",
+                &version_descriptor_snapshot_content(
+                    "version-main",
+                    crate::version_state::DEFAULT_ACTIVE_VERSION_NAME,
+                    false,
+                ),
+                "2026-04-01T00:00:01Z",
+            )],
         )
         .await
         .expect("main descriptor should seed");
-        live_state::upsert_bootstrap_untracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_ref_schema_key(),
-            &version_ref_schema_version(),
-            &version_ref_file_id(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_ref_plugin_key(),
-            &version_ref_snapshot_content(crate::version_state::GLOBAL_VERSION_ID, "commit-global"),
-            "2026-04-01T00:00:02Z",
+            &[bootstrap_untracked_live_row(
+                crate::version_state::GLOBAL_VERSION_ID,
+                &version_ref_schema_key(),
+                &version_ref_schema_version(),
+                &version_ref_file_id(),
+                crate::version_state::GLOBAL_VERSION_ID,
+                &version_ref_plugin_key(),
+                &version_ref_snapshot_content(
+                    crate::version_state::GLOBAL_VERSION_ID,
+                    "commit-global",
+                ),
+                "2026-04-01T00:00:02Z",
+            )],
         )
         .await
         .expect("global ref should seed");
-        live_state::upsert_bootstrap_untracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            "version-main",
-            &version_ref_schema_key(),
-            &version_ref_schema_version(),
-            &version_ref_file_id(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_ref_plugin_key(),
-            &version_ref_snapshot_content("version-main", "commit-main"),
-            "2026-04-01T00:00:03Z",
+            &[bootstrap_untracked_live_row(
+                "version-main",
+                &version_ref_schema_key(),
+                &version_ref_schema_version(),
+                &version_ref_file_id(),
+                crate::version_state::GLOBAL_VERSION_ID,
+                &version_ref_plugin_key(),
+                &version_ref_snapshot_content("version-main", "commit-main"),
+                "2026-04-01T00:00:03Z",
+            )],
         )
         .await
         .expect("main ref should seed");
@@ -440,57 +510,68 @@ mod tests {
             .begin_transaction(TransactionMode::Write)
             .await
             .expect("write transaction should begin");
-        live_state::upsert_bootstrap_untracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            "version-main",
-            &version_ref_schema_key(),
-            &version_ref_schema_version(),
-            &version_ref_file_id(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_ref_plugin_key(),
-            &version_ref_snapshot_content("version-main", "commit-main"),
-            "2026-04-02T00:00:00Z",
+            &[bootstrap_untracked_live_row(
+                "version-main",
+                &version_ref_schema_key(),
+                &version_ref_schema_version(),
+                &version_ref_file_id(),
+                crate::version_state::GLOBAL_VERSION_ID,
+                &version_ref_plugin_key(),
+                &version_ref_snapshot_content("version-main", "commit-main"),
+                "2026-04-02T00:00:00Z",
+            )],
         )
         .await
         .expect("main ref should seed");
-        live_state::upsert_bootstrap_untracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            "version-dev",
-            &version_ref_schema_key(),
-            &version_ref_schema_version(),
-            &version_ref_file_id(),
-            crate::version_state::GLOBAL_VERSION_ID,
-            &version_ref_plugin_key(),
-            &version_ref_snapshot_content("version-dev", "commit-dev"),
-            "2026-04-02T00:00:01Z",
+            &[bootstrap_untracked_live_row(
+                "version-dev",
+                &version_ref_schema_key(),
+                &version_ref_schema_version(),
+                &version_ref_file_id(),
+                crate::version_state::GLOBAL_VERSION_ID,
+                &version_ref_plugin_key(),
+                &version_ref_snapshot_content("version-dev", "commit-dev"),
+                "2026-04-02T00:00:01Z",
+            )],
         )
         .await
         .expect("dev ref should seed");
-        live_state::upsert_bootstrap_tracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            "theme",
-            &key_value_schema_key(),
-            &key_value_schema_version(),
-            &key_value_file_id(),
-            "version-main",
-            &key_value_plugin_key(),
-            "change-main",
-            &key_value_snapshot_content("theme", serde_json::Value::String("dark".to_string())),
-            "2026-04-02T00:00:02Z",
+            &[bootstrap_tracked_live_row(
+                "theme",
+                &key_value_schema_key(),
+                &key_value_schema_version(),
+                &key_value_file_id(),
+                "version-main",
+                &key_value_plugin_key(),
+                "change-main",
+                &key_value_snapshot_content("theme", serde_json::Value::String("dark".to_string())),
+                "2026-04-02T00:00:02Z",
+            )],
         )
         .await
         .expect("main key value row should seed");
-        live_state::upsert_bootstrap_tracked_row_in_transaction(
+        live_state::write_live_rows(
             transaction.as_mut(),
-            "theme",
-            &key_value_schema_key(),
-            &key_value_schema_version(),
-            &key_value_file_id(),
-            "version-dev",
-            &key_value_plugin_key(),
-            "change-dev",
-            &key_value_snapshot_content("theme", serde_json::Value::String("light".to_string())),
-            "2026-04-02T00:00:03Z",
+            &[bootstrap_tracked_live_row(
+                "theme",
+                &key_value_schema_key(),
+                &key_value_schema_version(),
+                &key_value_file_id(),
+                "version-dev",
+                &key_value_plugin_key(),
+                "change-dev",
+                &key_value_snapshot_content(
+                    "theme",
+                    serde_json::Value::String("light".to_string()),
+                ),
+                "2026-04-02T00:00:03Z",
+            )],
         )
         .await
         .expect("dev key value row should seed");

@@ -198,18 +198,7 @@ pub(crate) async fn require_ready_in_transaction(
     }
 }
 
-pub async fn finalize_commit(backend: &dyn LixBackend) -> Result<ReplayCursor, LixError> {
-    let cursor = load_latest_replay_cursor(backend).await?.ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "live_state::finalize_commit expected a replay cursor",
-        )
-    })?;
-    mark_live_state_ready_with_backend(backend, &cursor).await?;
-    Ok(cursor)
-}
-
-pub(crate) async fn finalize_commit_in_transaction(
+pub(crate) async fn mark_live_state_ready_at_latest_replay_cursor_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<ReplayCursor, LixError> {
     let cursor = load_latest_replay_cursor_in_transaction(transaction)
@@ -217,7 +206,7 @@ pub(crate) async fn finalize_commit_in_transaction(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "live_state::finalize_commit expected a replay cursor",
+                "live_state::mark_live_state_ready_at_latest_replay_cursor expected a replay cursor",
             )
         })?;
     let frontier = load_current_committed_frontier_in_transaction(transaction).await?;

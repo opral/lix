@@ -1,15 +1,18 @@
 use crate::backend::QueryExecutor;
 use crate::common::errors::classification::is_missing_relation_error;
-use crate::contracts::artifacts::{batch_row_constraints, exact_row_constraints};
+#[cfg(test)]
+use crate::contracts::artifacts::batch_row_constraints;
+use crate::contracts::artifacts::exact_row_constraints;
 use crate::live_state::storage::{
     build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
     required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
 };
 use crate::{LixBackend, LixError, Value};
 
+#[cfg(test)]
+use super::contracts::BatchTrackedRowRequest;
 use super::contracts::{
-    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedRow, TrackedScanRequest,
-    TrackedTombstoneMarker,
+    ExactTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 
 pub async fn load_exact_row_with_backend(
@@ -20,6 +23,7 @@ pub async fn load_exact_row_with_backend(
     load_exact_row_with_executor(&mut executor, request).await
 }
 
+#[cfg(test)]
 pub async fn load_exact_rows_with_backend(
     backend: &dyn LixBackend,
     request: &BatchTrackedRowRequest,
@@ -94,6 +98,7 @@ pub(crate) async fn load_exact_tombstone_with_executor(
     Ok(rows.into_iter().next())
 }
 
+#[cfg(test)]
 pub(crate) async fn load_exact_rows_with_executor(
     executor: &mut dyn QueryExecutor,
     request: &BatchTrackedRowRequest,

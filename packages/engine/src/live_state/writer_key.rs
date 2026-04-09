@@ -14,24 +14,15 @@ use std::collections::{BTreeMap, BTreeSet};
 #[cfg(test)]
 use async_trait::async_trait;
 
-use crate::backend::ddl::table_exists;
 use crate::backend::QueryExecutor;
 use crate::contracts::artifacts::RowIdentity;
 use crate::contracts::change::TrackedChangeView;
 #[cfg(test)]
 pub(crate) use crate::contracts::traits::WriterKeyReadView;
+use crate::live_state::LiveRow;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WRITER_KEY_TABLE: &str = "lix_internal_writer_key";
-const LEGACY_WRITER_KEY_TABLE: &str = "lix_internal_workspace_writer_key";
-const CREATE_WRITER_KEY_TABLE_SQL: &str = "CREATE TABLE IF NOT EXISTS lix_internal_writer_key (\
-     version_id TEXT NOT NULL, \
-     schema_key TEXT NOT NULL, \
-     entity_id TEXT NOT NULL, \
-     file_id TEXT NOT NULL, \
-     writer_key TEXT NOT NULL, \
-     PRIMARY KEY (version_id, schema_key, entity_id, file_id)\
-     )";
 
 #[cfg(test)]
 #[async_trait(?Send)]
@@ -52,27 +43,6 @@ where
     ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
         load_writer_key_annotations(self, row_identities).await
     }
-}
-
-pub(crate) async fn ensure_writer_key_table_ready(
-    backend: &dyn LixBackend,
-) -> Result<(), LixError> {
-    if table_exists(backend, WRITER_KEY_TABLE).await? {
-        return Ok(());
-    }
-
-    if table_exists(backend, LEGACY_WRITER_KEY_TABLE).await? {
-        backend
-            .execute(
-                &format!("ALTER TABLE {LEGACY_WRITER_KEY_TABLE} RENAME TO {WRITER_KEY_TABLE}"),
-                &[],
-            )
-            .await?;
-        return Ok(());
-    }
-
-    backend.execute(CREATE_WRITER_KEY_TABLE_SQL, &[]).await?;
-    Ok(())
 }
 
 pub(crate) fn tracked_writer_key_annotations_from_changes<Change: TrackedChangeView>(
@@ -290,6 +260,46 @@ pub(crate) async fn apply_writer_key_annotations_with_executor(
             }
             None => {
                 clear_writer_key_annotation_with_executor(executor, row_identity).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn apply_writer_keys_for_tracked_live_rows_with_executor(
+    executor: &mut dyn QueryExecutor,
+    tracked_rows: &[LiveRow],
+) -> Result<(), LixError> {
+    for row in tracked_rows {
+        if row.untracked {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "tracked writer-key apply expected tracked live rows, got untracked row '{}:{}'",
+                    row.schema_key, row.entity_id
+                ),
+            ));
+        }
+
+        let row_identity = RowIdentity {
+            version_id: row.version_id.clone(),
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+        };
+
+        match row
+            .writer_key
+            .as_deref()
+            .filter(|writer_key| !writer_key.is_empty())
+        {
+            Some(writer_key) => {
+                persist_writer_key_annotation_with_executor(executor, &row_identity, writer_key)
+                    .await?;
+            }
+            None => {
+                clear_writer_key_annotation_with_executor(executor, &row_identity).await?;
             }
         }
     }

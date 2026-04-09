@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use crate::backend::TransactionBackendAdapter;
 use crate::contracts::artifacts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery,
     PendingViewReadStorage, PreparedPublicReadArtifact, PublicReadExecutionMode,
@@ -8,12 +9,13 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
-use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadContract};
+use crate::live_state::{
+    compile_live_read_contract_from_registered_snapshots, read_contract_from_definition,
+    scan_visible_live_rows, LiveReadContract, LiveReadRow, LiveStorageLane, ScanConstraint,
+    ScanField, ScanOperator,
+};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
-
-use super::{scan_visible_live_rows, LiveReadRow, LiveStorageLane};
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -251,8 +253,8 @@ impl<'a> TransactionReadModel<'a> {
     }
 
     async fn load_live_row_access(&self, schema_key: &str) -> Result<LiveReadContract, LixError> {
-        if let Some(layout) = super::storage::builtin_live_table_layout(schema_key)? {
-            return Ok(live_read_contract_from_layout(layout));
+        if let Ok(contract) = read_contract_from_definition(schema_key, None) {
+            return Ok(contract);
         }
 
         let rows = self
@@ -261,8 +263,7 @@ impl<'a> TransactionReadModel<'a> {
             .into_values()
             .map(|snapshot_content| vec![Value::Text(snapshot_content)])
             .collect::<Vec<_>>();
-        let layout = super::storage::compile_registered_live_layout(schema_key, rows)?;
-        Ok(live_read_contract_from_layout(layout))
+        compile_live_read_contract_from_registered_snapshots(schema_key, rows)
     }
 
     fn apply_filesystem_overlay_to_rows(
@@ -358,7 +359,7 @@ impl<'a> TransactionReadModel<'a> {
     }
 }
 
-pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_view(
+pub(crate) async fn build_surface_registry(
     base: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
@@ -367,25 +368,25 @@ pub(crate) async fn bootstrap_public_surface_registry_with_pending_transaction_v
         .await
 }
 
-pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view(
+pub(crate) async fn execute_prepared_public_read_with_pending_view(
     base: &dyn LixBackend,
-    pending_transaction_view: Option<&dyn PendingView>,
+    pending_view: Option<&dyn PendingView>,
     public_read: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
-    TransactionReadModel::new(base, pending_transaction_view)
+    TransactionReadModel::new(base, pending_view)
         .execute_prepared_public_read(public_read)
         .await
 }
 
-pub(crate) async fn execute_prepared_public_read_with_pending_transaction_view_in_transaction(
+pub(crate) async fn execute_prepared_public_read_with_pending_view_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    pending_transaction_view: Option<&dyn PendingView>,
+    pending_view: Option<&dyn PendingView>,
     public_read: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.execution_mode() {
         PublicReadExecutionMode::PendingView => {
-            let backend = crate::backend::TransactionBackendAdapter::new(transaction);
-            TransactionReadModel::new(&backend, pending_transaction_view)
+            let backend = TransactionBackendAdapter::new(transaction);
+            TransactionReadModel::new(&backend, pending_view)
                 .execute_prepared_public_read(public_read)
                 .await
         }

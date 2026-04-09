@@ -121,7 +121,6 @@ pub(crate) fn builtin_internal_exact_relation_names() -> &'static [&'static str]
         crate::canonical::TIMELINE_STATUS_TABLE,
         crate::session::version_ops::undo_redo::UNDO_REDO_OPERATION_TABLE,
         crate::session::workspace::WORKSPACE_METADATA_TABLE,
-        crate::live_state::writer_key::WRITER_KEY_TABLE,
     ]
 }
 
@@ -154,10 +153,10 @@ fn classify_registry_surface_name(
 }
 
 fn is_internal_storage_relation_name(normalized_relation_name: &str) -> bool {
-    builtin_internal_exact_relation_names()
-        .iter()
-        .any(|name| *name == normalized_relation_name)
-        || crate::live_state::is_internal_relation_name(normalized_relation_name)
+    normalized_relation_name.starts_with("lix_internal_")
+        || builtin_internal_exact_relation_names()
+            .iter()
+            .any(|name| *name == normalized_relation_name)
 }
 
 fn normalize_relation_name(relation_name: &str) -> String {
@@ -175,10 +174,10 @@ fn object_name_to_relation_name(name: &ObjectName) -> Option<String> {
 mod tests {
     use std::collections::BTreeMap;
 
+    use crate::common::naming::tracked_relation_name;
     use crate::contracts::surface::{
         entity_surface_descriptors, CatalogSource, DynamicEntitySurfaceSpec, SurfaceRegistry,
     };
-    use crate::live_state::tracked_relation_name;
 
     use super::{
         builtin_internal_exact_relation_names, builtin_internal_relation_families,
@@ -200,7 +199,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_live_storage_family_through_live_state_owner() {
+    fn classifies_live_storage_family_through_internal_relation_prefix() {
         assert_eq!(
             classify_builtin_relation_name(&tracked_relation_name("lix_key_value")),
             RelationPolicy::InternalStorage

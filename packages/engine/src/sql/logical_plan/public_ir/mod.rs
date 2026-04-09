@@ -787,24 +787,6 @@ impl CanonicalStateRowKey {
             && self.untracked.is_some()
             && (!expose_version_id || self.version_id.is_some())
     }
-
-    pub(crate) fn committed_exact_filters(&self) -> BTreeMap<String, Value> {
-        let mut filters = BTreeMap::new();
-        filters.insert("entity_id".to_string(), Value::Text(self.entity_id.clone()));
-        if let Some(file_id) = self.file_id.as_ref() {
-            filters.insert("file_id".to_string(), Value::Text(file_id.clone()));
-        }
-        if let Some(plugin_key) = self.plugin_key.as_ref() {
-            filters.insert("plugin_key".to_string(), Value::Text(plugin_key.clone()));
-        }
-        if let Some(schema_version) = self.schema_version.as_ref() {
-            filters.insert(
-                "schema_version".to_string(),
-                Value::Text(schema_version.clone()),
-            );
-        }
-        filters
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

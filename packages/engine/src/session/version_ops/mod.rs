@@ -12,7 +12,6 @@ pub(crate) mod undo_redo;
 
 pub(crate) use bootstrap::{init, seed_bootstrap};
 pub(crate) use committed_state::{
-    load_exact_committed_state_row_at_version_head,
     load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
 };
 pub(crate) use committed_state::{VersionInfo, VersionSnapshot};

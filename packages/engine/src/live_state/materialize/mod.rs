@@ -1,9 +1,7 @@
 //! Rebuildable materialization of query-serving live-state rows.
 //!
 //! `materialize` projects canonical committed meaning into derived live-state
-//! rows for query serving. Workspace annotation data such as `writer_key` may
-//! be supplied as optional overlay hints for current read surfaces, but it is
-//! not required for semantic replay correctness.
+//! rows for query serving.
 //!
 //! Losing or rebuilding this state may affect performance or readiness, but it
 //! must not change committed semantics.
@@ -14,8 +12,6 @@ mod loader;
 mod plan;
 mod types;
 
-use std::collections::BTreeMap;
-
 pub use types::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
@@ -25,7 +21,6 @@ pub use types::{
 };
 
 use crate::backend::TransactionBackendAdapter;
-use crate::live_state::shared::identity::RowIdentity;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub async fn rebuild_plan(
@@ -50,17 +45,11 @@ pub async fn apply_rebuild_plan(
     apply::apply_live_state_rebuild_plan_internal(backend, plan).await
 }
 
-pub(crate) async fn apply_rebuild_scope_with_writer_key_hints_in_transaction(
+pub(crate) async fn apply_rebuild_scope_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     plan: &LiveStateRebuildPlan,
-    writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(usize, std::collections::BTreeSet<String>), LixError> {
-    apply::apply_live_state_scope_with_writer_key_hints_in_transaction(
-        transaction,
-        plan,
-        writer_key_hints,
-    )
-    .await
+    apply::apply_live_state_scope_in_transaction(transaction, plan).await
 }
 
 pub async fn rebuild(

@@ -53,7 +53,7 @@ impl LiveReadContract {
         schema_key: &str,
         values: &std::collections::BTreeMap<String, Value>,
     ) -> Result<JsonValue, LixError> {
-        super::snapshot_json_from_values(&self.access, schema_key, values)
+        super::raw::snapshot_json_from_values(&self.access, schema_key, values)
     }
 
     pub(crate) fn snapshot_text_from_values(
@@ -61,7 +61,17 @@ impl LiveReadContract {
         schema_key: &str,
         values: &std::collections::BTreeMap<String, Value>,
     ) -> Result<String, LixError> {
-        super::snapshot_text_from_values(&self.access, schema_key, values)
+        serde_json::to_string(&self.snapshot_json_from_values(schema_key, values)?).map_err(
+            |error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    &format!(
+                        "failed to serialize live snapshot for schema '{}': {error}",
+                        schema_key
+                    ),
+                )
+            },
+        )
     }
 }
 
@@ -91,7 +101,7 @@ pub(crate) fn read_contract_from_definition(
         .map(|layout| read_contract_from_storage(super::storage::LiveRowAccess::new(layout)))
 }
 
-pub(super) fn live_read_contract_from_layout(
+pub(crate) fn live_read_contract_from_layout(
     layout: super::storage::LiveTableLayout,
 ) -> LiveReadContract {
     read_contract_from_storage(super::storage::LiveRowAccess::new(layout))

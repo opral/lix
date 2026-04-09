@@ -4,12 +4,17 @@ mod contracts;
 mod read;
 mod write;
 
-pub use contracts::{
-    BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
-    UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
+#[cfg(test)]
+pub(crate) use contracts::BatchUntrackedRowRequest;
+pub(crate) use contracts::{
+    ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
+    UntrackedWriteRow,
 };
-pub use read::{load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend};
+#[cfg(test)]
+pub(crate) use read::load_exact_rows_with_backend;
+pub(crate) use read::{load_exact_row_with_backend, scan_rows_with_backend};
 pub(crate) use read::{load_exact_row_with_executor, scan_rows_with_executor};
+pub(crate) use write::apply_write_batch_in_transaction;
 
 #[cfg(test)]
 mod tests;

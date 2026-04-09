@@ -1,16 +1,14 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::live_state::builtin_schema_storage_metadata;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
-use crate::live_state::projection::local_version_head_write_row;
+use crate::live_state::testing::local_version_head_live_row;
 use crate::live_state::untracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchUntrackedRowRequest, ExactUntrackedRowRequest, UntrackedScanRequest,
-    UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::live_state::LiveRow;
 use crate::schema::LixActiveVersion;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
@@ -174,34 +172,18 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
 
 async fn commit_untracked_rows(
     backend: &SqliteBackend,
-    rows: Vec<UntrackedWriteRow>,
+    rows: Vec<LiveRow>,
 ) -> Result<(), LixError> {
-    let read_context = ReadContext::new(backend, backend, backend);
-    let backend_txn = backend.begin_transaction(TransactionMode::Write).await?;
-    let mut write_tx = WriteTransaction::new(backend_txn, read_context);
-    let schema_keys = rows
-        .iter()
-        .map(|row| row.schema_key.clone())
-        .collect::<BTreeSet<_>>();
-    for schema_key in schema_keys {
-        write_tx.register_schema(schema_key)?;
-    }
-    write_tx.stage(TransactionDelta {
-        tracked_writes: Vec::new(),
-        untracked_writes: rows,
-    })?;
-    write_tx.commit().await?;
+    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    crate::live_state::write_live_rows(transaction.as_mut(), &rows).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
-fn active_version_helper_write_row(
-    entity_id: &str,
-    version_id: &str,
-    timestamp: &str,
-) -> UntrackedWriteRow {
+fn active_version_helper_live_row(entity_id: &str, version_id: &str, timestamp: &str) -> LiveRow {
     let metadata = builtin_schema_storage_metadata("lix_active_version")
         .expect("lix_active_version metadata should exist");
-    UntrackedWriteRow {
+    LiveRow {
         entity_id: entity_id.to_string(),
         schema_key: metadata.schema_key,
         schema_version: metadata.schema_version,
@@ -219,8 +201,9 @@ fn active_version_helper_write_row(
             .expect("lix_active_version snapshot serialization must succeed"),
         ),
         created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: UntrackedWriteOperation::Upsert,
+        updated_at: Some(timestamp.to_string()),
+        change_id: None,
+        untracked: true,
     }
 }
 
@@ -250,9 +233,9 @@ async fn live_untracked_state_roundtrips_helper_rows() {
     commit_untracked_rows(
         &backend,
         vec![
-            active_version_helper_write_row("active-row", "main", timestamp),
-            local_version_head_write_row("main", "commit-1", timestamp),
-            local_version_head_write_row("other", "commit-2", timestamp),
+            active_version_helper_live_row("active-row", "main", timestamp),
+            local_version_head_live_row("main", "commit-1", timestamp),
+            local_version_head_live_row("other", "commit-2", timestamp),
         ],
     )
     .await
@@ -361,14 +344,14 @@ async fn live_untracked_state_delete_removes_rows() {
         .expect("live_state init should succeed");
     commit_untracked_rows(
         &backend,
-        vec![local_version_head_write_row("main", "commit-1", timestamp)],
+        vec![local_version_head_live_row("main", "commit-1", timestamp)],
     )
     .await
     .expect("initial version ref transaction should succeed");
 
     commit_untracked_rows(
         &backend,
-        vec![UntrackedWriteRow {
+        vec![LiveRow {
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
@@ -377,11 +360,12 @@ async fn live_untracked_state_delete_removes_rows() {
             global: true,
             plugin_key: "lix".to_string(),
             metadata: None,
+            change_id: None,
             writer_key: None,
+            untracked: true,
             snapshot_content: None,
             created_at: None,
-            updated_at: timestamp.to_string(),
-            operation: UntrackedWriteOperation::Delete,
+            updated_at: Some(timestamp.to_string()),
         }],
     )
     .await

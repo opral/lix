@@ -26,7 +26,10 @@ use super::create::{
 };
 use super::generate::generate_commit;
 use super::receipt::latest_replay_cursor_from_change_rows;
-use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
+use super::types::{
+    tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
+    GenerateCommitArgs, GenerateCommitResult, StagedChange,
+};
 use super::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 struct TransactionCommitExecutor<'a> {
@@ -268,13 +271,13 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
         staged_changes.len(),
         timestamp,
     )?;
+    let tracked_live_rows = tracked_live_rows_from_staged_changes(&staged_changes, writer_key)?;
     execute_generated_commit_result(
         transaction,
         rewritten,
         binary_blob_writes,
         functions,
-        changes,
-        writer_key,
+        &tracked_live_rows,
     )
     .await
 }
@@ -376,8 +379,7 @@ async fn execute_generated_commit_result(
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
-    changes: &[StagedChange],
-    writer_key: Option<&str>,
+    tracked_live_rows: &[crate::live_state::LiveRow],
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let mut executor = &mut *transaction;
     let commit_graph_rows =
@@ -411,13 +413,15 @@ async fn execute_generated_commit_result(
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
-    crate::live_state::apply_tracked_commit_effects_in_transaction(
-        transaction,
-        &receipt,
-        changes,
-        writer_key,
-    )
-    .await?;
+    let untracked_live_rows =
+        untracked_live_rows_from_updated_version_refs(&receipt.updated_version_refs);
+
+    let mut live_rows = tracked_live_rows.to_vec();
+    live_rows.extend(untracked_live_rows);
+    if !live_rows.is_empty() {
+        crate::live_state::write_live_rows(transaction, &live_rows).await?;
+    }
+    crate::live_state::finalize_live_state_after_commit_write(transaction).await?;
     Ok(receipt)
 }
 

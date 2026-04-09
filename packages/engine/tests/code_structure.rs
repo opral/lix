@@ -1585,6 +1585,27 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
     violations.into_iter().collect()
 }
 
+fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
+    ["live_state"].into_iter().collect()
+}
+
+fn violations_for_sealed_owners(
+    violations: &[SealedOwnerViolation],
+    sealed_owners: &BTreeSet<&'static str>,
+) -> Vec<SealedOwnerViolation> {
+    violations
+        .iter()
+        .filter(|violation| {
+            violation
+                .imported_path
+                .split("::")
+                .next()
+                .is_some_and(|owner| sealed_owners.contains(owner))
+        })
+        .cloned()
+        .collect()
+}
+
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {
     let mut grouped: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
 
@@ -1635,6 +1656,20 @@ fn sealed_owner_import_rule_lists_current_violations() {
         "sealed-owner violations changed; update {} if this was intentional.\n\nCurrent violations:\n{}",
         SEALED_OWNER_SNAPSHOT_PATH,
         actual,
+    );
+}
+
+#[test]
+fn sealed_owner_whitelist_has_no_current_violations() {
+    let all_violations = current_sealed_owner_violations();
+    let sealed_owners = sealed_owner_whitelist();
+    let violations = violations_for_sealed_owners(&all_violations, &sealed_owners);
+
+    assert!(
+        violations.is_empty(),
+        "owners marked sealed still have child-module import leaks.\n\nSealed owners: {}\n\nCurrent violations:\n{}",
+        sealed_owners.iter().copied().collect::<Vec<_>>().join(", "),
+        render_grouped_sealed_owner_violations(&violations),
     );
 }
 

@@ -84,7 +84,7 @@ fn version_ref_row_from_local(row: LocalVersionRefRow) -> VersionRefRow {
 mod tests {
     use super::*;
     use crate::live_state::constraints::{quote_ident, sql_literal};
-    use crate::live_state::{
+    use crate::live_state::testing::{
         live_relation_name, live_schema_column_names, normalized_values_for_schema,
     };
     use crate::test_support::{init_test_backend_core, seed_local_version_head, TestSqliteBackend};

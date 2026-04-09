@@ -1,17 +1,18 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
 use crate::live_state::lifecycle::build_set_live_state_mode_sql;
-use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::storage::{
     load_live_table_layout_in_transaction, normalized_insert_columns_sql,
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
     quoted_live_table_name,
 };
 use crate::live_state::LiveStateMode;
-use crate::live_state::{finalize_commit_in_transaction, register_schema_in_transaction};
+use crate::live_state::{
+    mark_live_state_ready_at_latest_replay_cursor_in_transaction, register_schema_in_transaction,
+};
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
@@ -29,7 +30,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
         apply_live_state_scope_in_transaction(transaction.as_mut(), plan).await?;
 
     if matches!(plan.scope, LiveStateRebuildScope::Full) {
-        finalize_commit_in_transaction(transaction.as_mut()).await?;
+        mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction.as_mut()).await?;
     } else {
         transaction
             .execute(
@@ -52,15 +53,6 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
 pub(crate) async fn apply_live_state_scope_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     plan: &LiveStateRebuildPlan,
-) -> Result<(usize, BTreeSet<String>), LixError> {
-    apply_live_state_scope_with_writer_key_hints_in_transaction(transaction, plan, &BTreeMap::new())
-        .await
-}
-
-pub(crate) async fn apply_live_state_scope_with_writer_key_hints_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    plan: &LiveStateRebuildPlan,
-    writer_key_hints: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<(usize, BTreeSet<String>), LixError> {
     let mut tables_touched = BTreeSet::new();
 
@@ -91,17 +83,7 @@ pub(crate) async fn apply_live_state_scope_with_writer_key_hints_in_transaction(
                 )
             })
             .unwrap_or_else(|| "NULL".to_string());
-        // Semantic rebuild does not preserve writer annotations from prior live
-        // rows. Only explicit workspace annotation hints are overlaid here.
-        let writer_key_sql = match writer_key_hints.get(&RowIdentity {
-            schema_key: write.schema_key.to_string(),
-            version_id: write.version_id.to_string(),
-            entity_id: write.entity_id.to_string(),
-            file_id: write.file_id.to_string(),
-        }) {
-            Some(Some(writer_key)) => crate::live_state::constraints::sql_literal_text(writer_key),
-            _ => "NULL".to_string(),
-        };
+        let writer_key_sql = "NULL".to_string();
         let layout = load_live_table_layout_in_transaction(transaction, &write.schema_key).await?;
         let normalized_values =
             normalized_live_column_values(&layout, write.snapshot_content.as_deref())?

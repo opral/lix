@@ -132,17 +132,24 @@ async fn ensure_checkpoint_label_on_commit(
     let snapshot_content = checkpoint_commit_label_snapshot(commit_id);
     let change_id = generate_runtime_uuid(tx).await?;
     let timestamp = generate_runtime_timestamp(tx).await?;
-    crate::live_state::upsert_bootstrap_tracked_row_in_transaction(
+    crate::live_state::write_live_rows(
         tx.backend_transaction_mut()?,
-        &state_entity_id,
-        CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
-        "1",
-        "lix",
-        GLOBAL_VERSION_ID,
-        "lix",
-        &change_id,
-        &snapshot_content,
-        &timestamp,
+        &[crate::live_state::LiveRow {
+            entity_id: state_entity_id.clone(),
+            file_id: "lix".to_string(),
+            schema_key: CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string(),
+            schema_version: "1".to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            plugin_key: "lix".to_string(),
+            metadata: None,
+            change_id: Some(change_id.clone()),
+            writer_key: None,
+            global: true,
+            untracked: false,
+            created_at: Some(timestamp.clone()),
+            updated_at: Some(timestamp.clone()),
+            snapshot_content: Some(snapshot_content.clone()),
+        }],
     )
     .await?;
     insert_canonical_checkpoint_label_change(
