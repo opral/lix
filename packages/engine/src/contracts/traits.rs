@@ -62,7 +62,7 @@ pub(crate) struct PendingFilesystemFileView {
 
 #[cfg(test)]
 #[async_trait(?Send)]
-pub(crate) trait WorkspaceWriterKeyReadView {
+pub(crate) trait WriterKeyReadView {
     #[allow(dead_code)]
     async fn load_annotation(&self, row_identity: &RowIdentity)
         -> Result<Option<String>, LixError>;
@@ -94,7 +94,7 @@ pub(crate) trait PendingView {
 
     fn visible_files(&self) -> Vec<PendingFilesystemFileView>;
 
-    fn workspace_writer_key_annotation_for_state_row(
+    fn writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
         schema_key: &str,
@@ -145,7 +145,7 @@ pub(crate) trait PendingStateOverlay {
         schema_key: &str,
     ) -> Vec<PendingSemanticRow>;
 
-    fn workspace_writer_key_annotation_for_state_row(
+    fn writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
         schema_key: &str,
@@ -178,14 +178,14 @@ where
         PendingView::visible_semantic_rows(self, storage, schema_key)
     }
 
-    fn workspace_writer_key_annotation_for_state_row(
+    fn writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        PendingView::workspace_writer_key_annotation_for_state_row(
+        PendingView::writer_key_annotation_for_state_row(
             self, version_id, schema_key, entity_id, file_id,
         )
     }
@@ -204,14 +204,14 @@ impl PendingStateOverlay for dyn PendingView + '_ {
         PendingView::visible_semantic_rows(self, storage, schema_key)
     }
 
-    fn workspace_writer_key_annotation_for_state_row(
+    fn writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        PendingView::workspace_writer_key_annotation_for_state_row(
+        PendingView::writer_key_annotation_for_state_row(
             self, version_id, schema_key, entity_id, file_id,
         )
     }
@@ -230,14 +230,14 @@ impl PendingStateOverlay for PendingStateOverlayRef<'_> {
         PendingView::visible_semantic_rows(self.view, storage, schema_key)
     }
 
-    fn workspace_writer_key_annotation_for_state_row(
+    fn writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        PendingView::workspace_writer_key_annotation_for_state_row(
+        PendingView::writer_key_annotation_for_state_row(
             self.view, version_id, schema_key, entity_id, file_id,
         )
     }
@@ -313,7 +313,7 @@ pub(crate) struct LiveReadContext<'a> {
     pub(crate) tracked: &'a dyn TrackedReadView,
     pub(crate) untracked: &'a dyn UntrackedReadView,
     pub(crate) tracked_tombstones: Option<&'a dyn TrackedTombstoneView>,
-    pub(crate) workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
+    pub(crate) writer_keys: &'a dyn WriterKeyReadView,
 }
 
 #[cfg(test)]
@@ -321,13 +321,13 @@ impl<'a> LiveReadContext<'a> {
     pub(crate) fn new(
         tracked: &'a dyn TrackedReadView,
         untracked: &'a dyn UntrackedReadView,
-        workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
+        writer_keys: &'a dyn WriterKeyReadView,
     ) -> Self {
         Self {
             tracked,
             untracked,
             tracked_tombstones: None,
-            workspace_writer_keys,
+            writer_keys,
         }
     }
 

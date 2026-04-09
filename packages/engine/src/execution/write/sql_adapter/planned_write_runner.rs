@@ -34,15 +34,6 @@ pub(crate) async fn execute_planned_write_delta(
             PlannedWriteUnit::Internal(internal) => {
                 run_internal_write_txn_with_transaction(bindings, transaction, internal).await?
             }
-            PlannedWriteUnit::WorkspaceWriterKey(workspace_writer_key) => {
-                bindings
-                    .apply_writer_key_annotations_in_transaction(
-                        transaction,
-                        &workspace_writer_key.annotations,
-                    )
-                    .await?;
-                None
-            }
         };
 
         if let Some(outcome) = outcome {

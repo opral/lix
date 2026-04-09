@@ -2,7 +2,7 @@ use crate::contracts::artifacts::{
     MutationOperation, MutationRow, PlannedStateRow, StateCommitStreamChange,
     StateCommitStreamOperation,
 };
-use crate::contracts::change::TrackedDomainChangeView;
+use crate::contracts::change::TrackedChangeView;
 use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
@@ -72,7 +72,7 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
         .collect()
 }
 
-pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDomainChangeView>(
+pub(crate) fn state_commit_stream_changes_from_changes<Change: TrackedChangeView>(
     changes: &[Change],
     operation: StateCommitStreamOperation,
     runtime_metadata: StateCommitStreamRuntimeMetadata,
@@ -84,14 +84,14 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
     let mut resolved = Vec::with_capacity(changes.len());
     for change in changes {
         let snapshot_content = match change.snapshot_content() {
-            Some(snapshot_content) => Some(
-                serde_json::from_str(snapshot_content).map_err(|error| LixError {
+            Some(snapshot_content) => Some(serde_json::from_str(snapshot_content).map_err(
+                |error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!(
-                        "domain change state commit stream expected JSON snapshot_content text: {error}"
+                        "change state commit stream expected JSON snapshot_content text: {error}"
                     ),
-                })?,
-            ),
+                },
+            )?),
             None => None,
         };
         resolved.push(StateCommitStreamChange {
@@ -102,15 +102,14 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
                 .schema_version()
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "domain change state commit stream requires schema_version"
-                        .to_string(),
+                    description: "change state commit stream requires schema_version".to_string(),
                 })?
                 .to_string(),
             file_id: change
                 .file_id()
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "domain change state commit stream requires file_id".to_string(),
+                    description: "change state commit stream requires file_id".to_string(),
                 })?
                 .to_string(),
             version_id: change.version_id().to_string(),
@@ -118,8 +117,7 @@ pub(crate) fn state_commit_stream_changes_from_domain_changes<Change: TrackedDom
                 .plugin_key()
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "domain change state commit stream requires plugin_key"
-                        .to_string(),
+                    description: "change state commit stream requires plugin_key".to_string(),
                 })?
                 .to_string(),
             snapshot_content,
@@ -239,19 +237,19 @@ fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOpe
 #[cfg(test)]
 mod tests {
     use super::{
-        state_commit_stream_changes_from_domain_changes,
-        state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
-        StateCommitStreamRuntimeMetadata,
+        state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
+        StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
     use crate::contracts::artifacts::PlannedStateRow;
-    use crate::session::version_ops::commit::ProposedDomainChange;
+    use crate::session::version_ops::commit::StagedChange;
     use crate::Value;
     use std::collections::BTreeMap;
 
     #[test]
-    fn domain_changes_map_to_update_changes() {
-        let changes = state_commit_stream_changes_from_domain_changes(
-            &[ProposedDomainChange {
+    fn changes_map_to_update_changes() {
+        let changes = state_commit_stream_changes_from_changes(
+            &[StagedChange {
+                id: None,
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
@@ -261,11 +259,12 @@ mod tests {
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
                 writer_key: Some("writer-a".to_string()),
+                created_at: None,
             }],
             StateCommitStreamOperation::Update,
             StateCommitStreamRuntimeMetadata::default(),
         )
-        .expect("domain changes should map");
+        .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].operation, StateCommitStreamOperation::Update);
@@ -276,8 +275,9 @@ mod tests {
 
     #[test]
     fn state_commit_stream_uses_runtime_writer_metadata_when_change_omits_it() {
-        let changes = state_commit_stream_changes_from_domain_changes(
-            &[ProposedDomainChange {
+        let changes = state_commit_stream_changes_from_changes(
+            &[StagedChange {
+                id: None,
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
@@ -287,11 +287,12 @@ mod tests {
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
                 writer_key: None,
+                created_at: None,
             }],
             StateCommitStreamOperation::Update,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
         )
-        .expect("domain changes should map");
+        .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].writer_key.as_deref(), Some("writer-runtime"));
@@ -299,8 +300,9 @@ mod tests {
 
     #[test]
     fn state_commit_stream_prefers_change_writer_key_over_runtime_metadata() {
-        let changes = state_commit_stream_changes_from_domain_changes(
-            &[ProposedDomainChange {
+        let changes = state_commit_stream_changes_from_changes(
+            &[StagedChange {
+                id: None,
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
@@ -310,11 +312,12 @@ mod tests {
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
                 writer_key: Some("writer-change".to_string()),
+                created_at: None,
             }],
             StateCommitStreamOperation::Update,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
         )
-        .expect("domain changes should map");
+        .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].writer_key.as_deref(), Some("writer-change"));

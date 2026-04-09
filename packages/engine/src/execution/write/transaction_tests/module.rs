@@ -9,12 +9,14 @@ use crate::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
     UntrackedWriteRow,
 };
-use crate::schema::WORKSPACE_WRITER_KEY_TABLE;
+use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
+
+const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Clone)]
 struct SqliteBackend {
@@ -189,7 +191,7 @@ async fn init_workspace(backend: &dyn LixBackend) -> Result<(), LixError> {
              writer_key TEXT NOT NULL, \
              PRIMARY KEY (version_id, schema_key, entity_id, file_id)\
              )",
-            WORKSPACE_WRITER_KEY_TABLE
+            WRITER_KEY_TABLE
         ),
     ];
     let statement_refs = statements.iter().map(String::as_str).collect::<Vec<_>>();
@@ -222,6 +224,30 @@ fn tracked_row(
     }
 }
 
+fn local_version_head_untracked_write_row(
+    version_id: &str,
+    commit_id: &str,
+    timestamp: &str,
+) -> UntrackedWriteRow {
+    UntrackedWriteRow {
+        entity_id: version_id.to_string(),
+        schema_key: "lix_version_ref".to_string(),
+        schema_version: "1".to_string(),
+        file_id: "lix".to_string(),
+        version_id: GLOBAL_VERSION_ID.to_string(),
+        global: true,
+        plugin_key: "lix".to_string(),
+        metadata: None,
+        writer_key: None,
+        snapshot_content: Some(format!(
+            "{{\"id\":\"{version_id}\",\"commit_id\":\"{commit_id}\"}}"
+        )),
+        created_at: Some(timestamp.to_string()),
+        updated_at: timestamp.to_string(),
+        operation: crate::live_state::UntrackedWriteOperation::Upsert,
+    }
+}
+
 #[tokio::test]
 async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     let backend = SqliteBackend::new();
@@ -245,7 +271,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![crate::live_state::testing::local_version_head_write_row(
+            untracked_writes: vec![local_version_head_untracked_write_row(
                 "main", "commit-1", timestamp,
             )],
         })
@@ -354,7 +380,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     write_tx
         .stage(TransactionDelta {
             tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![crate::live_state::testing::local_version_head_write_row(
+            untracked_writes: vec![local_version_head_untracked_write_row(
                 "main", "commit-1", timestamp,
             )],
         })

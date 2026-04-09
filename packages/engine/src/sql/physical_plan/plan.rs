@@ -1,5 +1,5 @@
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::contracts::artifacts::{CommitPreconditions, DomainChangeBatch, ReadTimeProjectionRead};
+use crate::contracts::artifacts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionRead};
 use crate::contracts::surface::SurfaceBinding;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
@@ -330,7 +330,7 @@ pub(crate) enum PublicWriteExecutionPartition {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) change_batch: Option<ChangeBatch>,
     pub(crate) create_preconditions: CommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
 }

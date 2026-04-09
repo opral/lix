@@ -2,7 +2,7 @@ use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::live_state;
-use crate::schema::WORKSPACE_WRITER_KEY_TABLE;
+use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::version_state::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 
@@ -523,7 +523,7 @@ fn effective_state_candidates_sql(
 ) -> String {
     let table_name = quote_ident(&live_state::tracked_relation_name(schema_key));
     let untracked_table = quote_ident(&live_state::tracked_relation_name(schema_key));
-    let workspace_writer_key_table = quote_ident(WORKSPACE_WRITER_KEY_TABLE);
+    let writer_key_table = quote_ident(WRITER_KEY_TABLE);
     let tracked_payload_projection = payload_columns
         .iter()
         .map(|(alias, tracked_expr, _)| format!("{tracked_expr} AS {alias}"))
@@ -557,7 +557,7 @@ fn effective_state_candidates_sql(
            ON tv.version_id = t.version_id \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
-         LEFT JOIN {workspace_writer_key_table} wk \
+         LEFT JOIN {writer_key_table} wk \
            ON wk.version_id = t.version_id \
           AND wk.schema_key = t.schema_key \
           AND wk.entity_id = t.entity_id \
@@ -587,7 +587,7 @@ fn effective_state_candidates_sql(
           AND t.version_id = '{global_version}' \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
-         LEFT JOIN {workspace_writer_key_table} gwk \
+         LEFT JOIN {writer_key_table} gwk \
            ON gwk.version_id = t.version_id \
           AND gwk.schema_key = t.schema_key \
           AND gwk.entity_id = t.entity_id \
@@ -645,7 +645,7 @@ fn effective_state_candidates_sql(
         tracked_payload_projection = tracked_payload_projection,
         untracked_payload_projection = untracked_payload_projection,
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
-        workspace_writer_key_table = workspace_writer_key_table,
+        writer_key_table = writer_key_table,
     )
 }
 

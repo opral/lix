@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::canonical::read::CommitQueryExecutor;
-use crate::schema::load_workspace_writer_key_annotations_with_executor;
+use crate::live_state::writer_key::load_writer_key_annotations_with_executor;
 use crate::{LixBackend, LixError, Value};
 
 use super::constraints::ScanConstraint;
@@ -158,7 +158,7 @@ async fn scan_live_rows_with_executor_ref(
                 },
             )
             .await?;
-            overlay_workspace_writer_key_annotations_on_tracked_rows_with_executor(executor, rows)
+            overlay_writer_key_annotations_on_tracked_rows_with_executor(executor, rows)
                 .await
                 .map(|rows| rows.into_iter().map(LiveReadRow::from).collect())
         }
@@ -176,7 +176,7 @@ async fn scan_live_rows_with_executor_ref(
     }
 }
 
-async fn overlay_workspace_writer_key_annotations_on_tracked_rows_with_executor(
+async fn overlay_writer_key_annotations_on_tracked_rows_with_executor(
     executor: &mut dyn CommitQueryExecutor,
     mut rows: Vec<TrackedRow>,
 ) -> Result<Vec<TrackedRow>, LixError> {
@@ -188,8 +188,7 @@ async fn overlay_workspace_writer_key_annotations_on_tracked_rows_with_executor(
         .iter()
         .map(RowIdentity::from_tracked_row)
         .collect::<BTreeSet<_>>();
-    let annotations =
-        load_workspace_writer_key_annotations_with_executor(executor, &row_identities).await?;
+    let annotations = load_writer_key_annotations_with_executor(executor, &row_identities).await?;
 
     for row in &mut rows {
         row.writer_key = annotations

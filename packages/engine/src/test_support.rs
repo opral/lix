@@ -1,4 +1,3 @@
-use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,7 +5,7 @@ use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::contracts::traits::PendingView;
-use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
+use crate::live_state::{write_live_rows, LiveRow};
 use crate::projections::ProjectionRegistry;
 use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
@@ -312,23 +311,11 @@ pub(crate) async fn init_test_backend_with_binary_cas(
 
 pub(crate) async fn commit_untracked_rows(
     backend: &TestSqliteBackend,
-    rows: Vec<crate::live_state::untracked::UntrackedWriteRow>,
+    rows: Vec<LiveRow>,
 ) -> Result<(), LixError> {
-    let read_context = ReadContext::new(backend, backend, backend);
-    let backend_txn = backend.begin_transaction(TransactionMode::Write).await?;
-    let mut write_tx = WriteTransaction::new(backend_txn, read_context);
-    let schema_keys = rows
-        .iter()
-        .map(|row| row.schema_key.clone())
-        .collect::<BTreeSet<_>>();
-    for schema_key in schema_keys {
-        write_tx.register_schema(schema_key)?;
-    }
-    write_tx.stage(TransactionDelta {
-        tracked_writes: Vec::new(),
-        untracked_writes: rows,
-    })?;
-    write_tx.commit().await?;
+    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    write_live_rows(transaction.as_mut(), &rows).await?;
+    transaction.commit().await?;
     Ok(())
 }
 
@@ -340,7 +327,7 @@ pub(crate) async fn seed_local_version_head(
 ) -> Result<(), LixError> {
     commit_untracked_rows(
         backend,
-        vec![crate::live_state::testing::local_version_head_write_row(
+        vec![crate::live_state::testing::local_version_head_live_row(
             version_id, commit_id, timestamp,
         )],
     )

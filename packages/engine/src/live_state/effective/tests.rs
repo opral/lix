@@ -1,5 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::contracts::traits::WriterKeyReadView;
 use crate::contracts::traits::{
     LiveReadContext as ReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
 };
@@ -12,7 +13,6 @@ use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
-use crate::schema::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
 use async_trait::async_trait;
 
@@ -34,7 +34,7 @@ struct MockTrackedTombstones {
 }
 
 #[derive(Default)]
-struct MockWorkspaceWriterKeys {
+struct MockWriterKeys {
     annotations: BTreeMap<RowIdentity, Option<String>>,
 }
 
@@ -121,7 +121,7 @@ impl TrackedTombstoneView for MockTrackedTombstones {
 }
 
 #[async_trait(?Send)]
-impl WorkspaceWriterKeyReadView for MockWorkspaceWriterKeys {
+impl WriterKeyReadView for MockWriterKeys {
     async fn load_annotation(
         &self,
         row_identity: &RowIdentity,
@@ -208,8 +208,8 @@ fn tombstone(entity_id: &str, version_id: &str, global: bool) -> TrackedTombston
     }
 }
 
-fn workspace_writer_keys(rows: &[TrackedRow]) -> MockWorkspaceWriterKeys {
-    MockWorkspaceWriterKeys {
+fn writer_keys(rows: &[TrackedRow]) -> MockWriterKeys {
+    MockWriterKeys {
         annotations: rows
             .iter()
             .map(|row| (RowIdentity::from_tracked_row(row), row.writer_key.clone()))
@@ -231,7 +231,7 @@ async fn effective_state_exact_prefers_local_untracked_first() {
             untracked_row("edge-1", "global", true, "untracked-global"),
         ],
     };
-    let writer_keys = workspace_writer_keys(&tracked.rows);
+    let writer_keys = writer_keys(&tracked.rows);
 
     let resolved = resolve_effective_row(
         &EffectiveRowRequest {
@@ -266,7 +266,7 @@ async fn effective_state_exact_tombstone_hides_global_fallback() {
     let tombstones = MockTrackedTombstones {
         rows: vec![tombstone("edge-1", "main", false)],
     };
-    let writer_keys = workspace_writer_keys(&tracked.rows);
+    let writer_keys = writer_keys(&tracked.rows);
 
     let resolved = resolve_effective_row(
         &EffectiveRowRequest {
@@ -299,7 +299,7 @@ async fn effective_state_scan_merges_lanes_and_projects_global_versions() {
             untracked_row("edge-c", "global", true, "untracked-global"),
         ],
     };
-    let writer_keys = workspace_writer_keys(&tracked.rows);
+    let writer_keys = writer_keys(&tracked.rows);
 
     let resolved = resolve_effective_rows(
         &EffectiveRowsRequest {
@@ -351,7 +351,7 @@ async fn effective_state_scan_can_return_tombstones_when_requested() {
     let tombstones = MockTrackedTombstones {
         rows: vec![tombstone("edge-a", "main", false)],
     };
-    let writer_keys = workspace_writer_keys(&tracked.rows);
+    let writer_keys = writer_keys(&tracked.rows);
 
     let resolved = resolve_effective_rows(
         &EffectiveRowsRequest {
@@ -385,12 +385,12 @@ fn effective_state_global_version_skips_duplicate_global_lanes() {
 }
 
 #[tokio::test]
-async fn effective_state_exact_overlays_workspace_writer_key_annotation() {
+async fn effective_state_exact_overlays_writer_key_annotation() {
     let mut row = tracked_row("edge-1", "main", false, "tracked-local");
     row.writer_key = Some("raw-stale".to_string());
     let tracked = MockTrackedView { rows: vec![row] };
     let untracked = MockUntrackedView::default();
-    let writer_keys = MockWorkspaceWriterKeys {
+    let writer_keys = MockWriterKeys {
         annotations: BTreeMap::from([(
             RowIdentity::from_tracked_row(&tracked.rows[0]),
             Some("writer-overlay".to_string()),

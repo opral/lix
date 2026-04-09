@@ -894,7 +894,7 @@ pub(crate) struct PreparedResolvedWritePartition {
     pub(crate) execution_mode: WriteMode,
     pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
-    pub(crate) workspace_writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
+    pub(crate) writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     pub(crate) filesystem_state: PlannedFilesystemState,
 }
 
@@ -943,7 +943,7 @@ pub(crate) struct PreparedPublicWriteContract {
 #[allow(dead_code)]
 pub(crate) struct PreparedTrackedWriteExecution {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) domain_change_batch: Option<DomainChangeBatch>,
+    pub(crate) change_batch: Option<ChangeBatch>,
     pub(crate) create_preconditions: CommitPreconditions,
     pub(crate) semantic_effects: PlanEffects,
 }
@@ -1537,7 +1537,7 @@ pub(crate) struct PlannedStatementSet {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FilesystemPayloadDomainChange {
+pub(crate) struct FilesystemPayloadChange {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
@@ -1675,7 +1675,7 @@ pub struct PlannedRowIdentity {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PublicDomainChange {
+pub struct PublicChange {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: Option<String>,
@@ -1694,8 +1694,8 @@ pub struct SemanticEffect {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DomainChangeBatch {
-    pub changes: Vec<PublicDomainChange>,
+pub struct ChangeBatch {
+    pub changes: Vec<PublicChange>,
     pub write_lane: WriteLane,
     pub writer_key: Option<String>,
     pub semantic_effects: Vec<SemanticEffect>,

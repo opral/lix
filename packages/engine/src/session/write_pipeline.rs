@@ -57,8 +57,8 @@ use crate::sql::prepare::{
     BoundStatementTemplateInstance, CompiledExecution, PreparationPolicy, SqlCompilerMetadata,
     UpdateValidationPlan,
 };
-use crate::sql::semantic_ir::semantics::domain_changes::{
-    build_domain_change_batch, derive_commit_preconditions,
+use crate::sql::semantic_ir::semantics::changes::{
+    build_change_batches, derive_commit_preconditions,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
@@ -845,7 +845,7 @@ fn prepared_public_write_execution_partition_from_sql(
         crate::sql::physical_plan::PublicWriteExecutionPartition::Tracked(tracked) => {
             PreparedPublicWriteExecutionPartition::Tracked(PreparedTrackedWriteExecution {
                 schema_live_table_requirements: tracked.schema_live_table_requirements.clone(),
-                domain_change_batch: tracked.domain_change_batch.clone(),
+                change_batch: tracked.change_batch.clone(),
                 create_preconditions: tracked.create_preconditions.clone(),
                 semantic_effects: tracked.semantic_effects.clone(),
             })
@@ -872,7 +872,7 @@ fn prepared_resolved_write_plan_from_sql(
                 execution_mode: partition.execution_mode,
                 authoritative_pre_state_rows: partition.authoritative_pre_state_rows.clone(),
                 intended_post_state: partition.intended_post_state.clone(),
-                workspace_writer_key_updates: partition.workspace_writer_key_updates.clone(),
+                writer_key_updates: partition.writer_key_updates.clone(),
                 filesystem_state: partition.filesystem_state.clone(),
             })
             .collect(),
@@ -952,11 +952,10 @@ where
 
     public_write.planned_write.resolved_write_plan = Some(resolved_write_plan);
 
-    let domain_change_batches =
-        build_domain_change_batch(&public_write.planned_write).map_err(|error| {
-            public_write_preparation_error(&public_write.canonicalized, &error.message)
-                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
-        })?;
+    let change_batches = build_change_batches(&public_write.planned_write).map_err(|error| {
+        public_write_preparation_error(&public_write.canonicalized, &error.message)
+            .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", &error.message))
+    })?;
     let commit_preconditions =
         derive_commit_preconditions(&public_write.planned_write).map_err(|error| {
             public_write_preparation_error(&public_write.canonicalized, &error.message)
@@ -966,7 +965,7 @@ where
 
     let mut execution = build_public_write_execution(
         &public_write.planned_write,
-        &domain_change_batches,
+        &change_batches,
         &commit_preconditions,
     )?
     .ok_or_else(|| {
@@ -997,14 +996,14 @@ where
         physical_started.elapsed(),
     ));
 
-    public_write.domain_change_batches = domain_change_batches.clone();
+    public_write.change_batches = change_batches.clone();
     public_write.execution = execution.clone();
     public_write.explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
         request: public_write.explain_plan.request.clone(),
         semantics: public_write.explain_plan.semantics.clone(),
         planned_write: public_write.planned_write.clone(),
         execution,
-        domain_change_batches,
+        change_batches,
         invariant_trace: Some(build_public_write_invariant_trace(
             &public_write.planned_write,
         )),

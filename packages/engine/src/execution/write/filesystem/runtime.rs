@@ -1,6 +1,6 @@
 use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
-    FilesystemPayloadDomainChange, FilesystemProjectionScope, MutationRow, OptionalTextPatch,
+    FilesystemPayloadChange, FilesystemProjectionScope, MutationRow, OptionalTextPatch,
 };
 use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::execution::write::filesystem::query::{
@@ -142,12 +142,12 @@ pub(crate) struct CompiledFilesystemFinalization {
 }
 
 impl CompiledFilesystemFinalization {
-    pub(crate) fn payload_domain_changes(&self) -> Vec<FilesystemPayloadDomainChange> {
-        dedupe_filesystem_payload_domain_changes(
+    pub(crate) fn payload_changes(&self) -> Vec<FilesystemPayloadChange> {
+        dedupe_filesystem_payload_changes(
             &self
                 .semantic_changes
                 .iter()
-                .map(FilesystemSemanticChange::to_payload_domain_change)
+                .map(FilesystemSemanticChange::to_payload_change)
                 .collect::<Vec<_>>(),
         )
     }
@@ -158,16 +158,16 @@ pub(crate) fn compile_filesystem_finalization(
     binary_blob_writes: Vec<BinaryBlobWrite>,
     mutations: &[MutationRow],
 ) -> CompiledFilesystemFinalization {
-    let payload_domain_changes = dedupe_filesystem_payload_domain_changes(
+    let payload_changes = dedupe_filesystem_payload_changes(
         &semantic_changes
             .iter()
-            .map(FilesystemSemanticChange::to_payload_domain_change)
+            .map(FilesystemSemanticChange::to_payload_change)
             .collect::<Vec<_>>(),
     );
     CompiledFilesystemFinalization {
         binary_blob_writes,
         semantic_changes,
-        should_run_gc: should_run_binary_cas_gc(mutations, &payload_domain_changes),
+        should_run_gc: should_run_binary_cas_gc(mutations, &payload_changes),
     }
 }
 
@@ -294,8 +294,8 @@ pub(crate) struct FilesystemSemanticChange {
 }
 
 impl FilesystemSemanticChange {
-    pub(crate) fn to_payload_domain_change(&self) -> FilesystemPayloadDomainChange {
-        FilesystemPayloadDomainChange {
+    pub(crate) fn to_payload_change(&self) -> FilesystemPayloadChange {
+        FilesystemPayloadChange {
             entity_id: self.entity_id.clone(),
             schema_key: self.schema_key.clone(),
             schema_version: self.schema_version.clone(),
@@ -486,9 +486,9 @@ fn binary_blob_ref_tombstone_change_for_target(
     }
 }
 
-pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
+pub(crate) async fn persist_filesystem_payload_changes_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    changes: &[FilesystemPayloadDomainChange],
+    changes: &[FilesystemPayloadChange],
 ) -> Result<(), LixError> {
     let tracked = changes
         .iter()
@@ -496,7 +496,7 @@ pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
         .cloned()
         .collect::<Vec<_>>();
     if !tracked.is_empty() {
-        persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+        persist_filesystem_payload_changes_with_untracked_in_transaction(
             transaction,
             &tracked,
             false,
@@ -510,7 +510,7 @@ pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
         .cloned()
         .collect::<Vec<_>>();
     if !untracked.is_empty() {
-        persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+        persist_filesystem_payload_changes_with_untracked_in_transaction(
             transaction,
             &untracked,
             true,
@@ -521,17 +521,17 @@ pub(crate) async fn persist_filesystem_payload_domain_changes_in_transaction(
     Ok(())
 }
 
-pub(crate) async fn persist_filesystem_payload_domain_changes_with_untracked_in_transaction(
+pub(crate) async fn persist_filesystem_payload_changes_with_untracked_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    changes: &[FilesystemPayloadDomainChange],
+    changes: &[FilesystemPayloadChange],
     untracked: bool,
 ) -> Result<(), LixError> {
-    let deduped_changes = dedupe_filesystem_payload_domain_changes(changes);
+    let deduped_changes = dedupe_filesystem_payload_changes(changes);
     if deduped_changes.is_empty() {
         return Ok(());
     }
 
-    let (sql, params) = build_filesystem_payload_domain_changes_insert(&deduped_changes, untracked);
+    let (sql, params) = build_filesystem_payload_changes_insert(&deduped_changes, untracked);
     transaction.execute(&sql, &params).await?;
 
     Ok(())
@@ -623,7 +623,7 @@ trait DedupableFilesystemPayloadChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str, bool);
 }
 
-impl DedupableFilesystemPayloadChange for FilesystemPayloadDomainChange {
+impl DedupableFilesystemPayloadChange for FilesystemPayloadChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str, bool) {
         (
             &self.file_id,
@@ -652,26 +652,26 @@ where
         .collect()
 }
 
-fn dedupe_filesystem_payload_domain_changes(
-    changes: &[FilesystemPayloadDomainChange],
-) -> Vec<FilesystemPayloadDomainChange> {
+fn dedupe_filesystem_payload_changes(
+    changes: &[FilesystemPayloadChange],
+) -> Vec<FilesystemPayloadChange> {
     dedupe_detected_changes(changes)
 }
 
 fn should_run_binary_cas_gc(
     mutations: &[MutationRow],
-    filesystem_payload_domain_changes: &[FilesystemPayloadDomainChange],
+    filesystem_payload_changes: &[FilesystemPayloadChange],
 ) -> bool {
     mutations
         .iter()
         .any(|mutation| !mutation.untracked && mutation.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
-        || filesystem_payload_domain_changes
+        || filesystem_payload_changes
             .iter()
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
 }
 
-pub(crate) fn build_filesystem_payload_domain_changes_insert(
-    changes: &[FilesystemPayloadDomainChange],
+pub(crate) fn build_filesystem_payload_changes_insert(
+    changes: &[FilesystemPayloadChange],
     untracked: bool,
 ) -> (String, Vec<Value>) {
     let values_per_row = if untracked { 10 } else { 9 };
@@ -703,7 +703,7 @@ pub(crate) fn build_filesystem_payload_domain_changes_insert(
         }
     }
 
-    let sql = insert_filesystem_payload_domain_changes_sql(&rows.join(", "), untracked);
+    let sql = insert_filesystem_payload_changes_sql(&rows.join(", "), untracked);
     (sql, params)
 }
 
@@ -716,7 +716,7 @@ fn values_row_placeholders_sql(row_index: usize, values_per_row: usize) -> Strin
     format!("({placeholders})")
 }
 
-fn insert_filesystem_payload_domain_changes_sql(row_values: &str, untracked: bool) -> String {
+fn insert_filesystem_payload_changes_sql(row_values: &str, untracked: bool) -> String {
     if untracked {
         return format!(
             "INSERT INTO {} (\

@@ -4,13 +4,12 @@
 //! and compiler-owned explain payload/template generation.
 
 use crate::contracts::artifacts::{
-    CommitPreconditions, DirectoryHistoryRequest, DomainChangeBatch, EffectiveStateRequest,
+    ChangeBatch, CommitPreconditions, DirectoryHistoryRequest, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PreparedExplainTemplate,
-    PreparedStatement, PublicDomainChange, ReadTimeProjectionRead, SemanticEffect,
-    SessionDependency, SessionStateDelta, StateCommitStreamChange, StateHistoryContentMode,
-    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
+    PreparedStatement, PublicChange, ReadTimeProjectionRead, SemanticEffect, SessionDependency,
+    SessionStateDelta, StateCommitStreamChange, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
 };
 use crate::contracts::surface::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
@@ -774,7 +773,7 @@ pub(crate) struct CommitPreconditionsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct PublicDomainChangeSnapshot {
+pub(crate) struct PublicChangeSnapshot {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: Option<String>,
@@ -793,8 +792,8 @@ pub(crate) struct SemanticEffectSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct DomainChangeBatchSnapshot {
-    pub(crate) changes: Vec<PublicDomainChangeSnapshot>,
+pub(crate) struct ChangeBatchSnapshot {
+    pub(crate) changes: Vec<PublicChangeSnapshot>,
     pub(crate) write_lane: ExplainWriteLaneKind,
     pub(crate) writer_key: Option<String>,
     pub(crate) semantic_effects: Vec<SemanticEffectSnapshot>,
@@ -828,7 +827,7 @@ pub(crate) enum PublicWriteExecutionPartitionSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct TrackedWriteExecutionSnapshot {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirementSnapshot>,
-    pub(crate) domain_change_batch: Option<DomainChangeBatchSnapshot>,
+    pub(crate) change_batch: Option<ChangeBatchSnapshot>,
     pub(crate) create_preconditions: CommitPreconditionsSnapshot,
     pub(crate) semantic_effects: PlanEffectsSnapshot,
 }
@@ -1788,7 +1787,7 @@ pub(crate) struct CompiledExplainArtifacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resolved_write_plan: Option<Box<ResolvedWritePlanSnapshot>>,
     #[serde(default)]
-    pub(crate) domain_change_batches: Vec<DomainChangeBatchSnapshot>,
+    pub(crate) change_batches: Vec<ChangeBatchSnapshot>,
     #[serde(default)]
     pub(crate) commit_preconditions: Vec<CommitPreconditionsSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2090,10 +2089,7 @@ fn render_compiled_artifacts_text(artifacts: &CompiledExplainArtifacts) -> Strin
             "commit_preconditions: {}",
             artifacts.commit_preconditions.len()
         ),
-        format!(
-            "domain_change_batches: {}",
-            artifacts.domain_change_batches.len()
-        ),
+        format!("change_batches: {}", artifacts.change_batches.len()),
         format!(
             "internal_live_table_requirements: {}",
             artifacts.internal_live_table_requirements.len()
@@ -2347,7 +2343,7 @@ pub(crate) struct PublicWriteExplainBuildInput {
     pub(crate) semantics: PublicWriteSemantics,
     pub(crate) planned_write: PlannedWrite,
     pub(crate) execution: PreparedPublicWriteExecution,
-    pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
+    pub(crate) change_batches: Vec<ChangeBatch>,
     pub(crate) invariant_trace: Option<PublicWriteInvariantTrace>,
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
 }
@@ -2493,7 +2489,7 @@ pub(crate) fn build_public_write_explain_artifacts(
 ) -> ExplainArtifacts {
     let compiled_artifacts = compiled_artifacts_for_public_write(
         &input.planned_write,
-        &input.domain_change_batches,
+        &input.change_batches,
         input.invariant_trace.as_ref(),
     );
 
@@ -2633,7 +2629,7 @@ fn compiled_artifacts_for_public_read(
         schema_proof: None,
         target_set_proof: None,
         resolved_write_plan: None,
-        domain_change_batches: Vec::new(),
+        change_batches: Vec::new(),
         commit_preconditions: Vec::new(),
         invariant_trace: None,
         internal_live_table_requirements: Vec::new(),
@@ -2644,7 +2640,7 @@ fn compiled_artifacts_for_public_read(
 
 fn compiled_artifacts_for_public_write(
     planned_write: &PlannedWrite,
-    domain_change_batches: &[DomainChangeBatch],
+    change_batches: &[ChangeBatch],
     invariant_trace: Option<&PublicWriteInvariantTrace>,
 ) -> CompiledExplainArtifacts {
     let target = &planned_write.command.target;
@@ -2678,10 +2674,7 @@ fn compiled_artifacts_for_public_write(
             .as_ref()
             .map(resolved_write_plan_snapshot)
             .map(Box::new),
-        domain_change_batches: domain_change_batches
-            .iter()
-            .map(domain_change_batch_snapshot)
-            .collect(),
+        change_batches: change_batches.iter().map(change_batch_snapshot).collect(),
         commit_preconditions: planned_write
             .commit_preconditions
             .iter()
@@ -2713,7 +2706,7 @@ fn compiled_artifacts_for_internal(logical_plan: &InternalLogicalPlan) -> Compil
         schema_proof: None,
         target_set_proof: None,
         resolved_write_plan: None,
-        domain_change_batches: Vec::new(),
+        change_batches: Vec::new(),
         commit_preconditions: Vec::new(),
         invariant_trace: None,
         internal_live_table_requirements: statements
@@ -4757,10 +4750,7 @@ fn tracked_write_execution_snapshot(
             .iter()
             .map(schema_live_table_requirement_snapshot)
             .collect(),
-        domain_change_batch: execution
-            .domain_change_batch
-            .as_ref()
-            .map(domain_change_batch_snapshot),
+        change_batch: execution.change_batch.as_ref().map(change_batch_snapshot),
         create_preconditions: commit_preconditions_snapshot(&execution.create_preconditions),
         semantic_effects: plan_effects_snapshot(&execution.semantic_effects),
     }
@@ -5181,13 +5171,9 @@ fn commit_preconditions_snapshot(
     }
 }
 
-fn domain_change_batch_snapshot(batch: &DomainChangeBatch) -> DomainChangeBatchSnapshot {
-    DomainChangeBatchSnapshot {
-        changes: batch
-            .changes
-            .iter()
-            .map(public_domain_change_snapshot)
-            .collect(),
+fn change_batch_snapshot(batch: &ChangeBatch) -> ChangeBatchSnapshot {
+    ChangeBatchSnapshot {
+        changes: batch.changes.iter().map(public_change_snapshot).collect(),
         write_lane: write_lane_kind_snapshot(&batch.write_lane),
         writer_key: batch.writer_key.clone(),
         semantic_effects: batch
@@ -5198,8 +5184,8 @@ fn domain_change_batch_snapshot(batch: &DomainChangeBatch) -> DomainChangeBatchS
     }
 }
 
-fn public_domain_change_snapshot(change: &PublicDomainChange) -> PublicDomainChangeSnapshot {
-    PublicDomainChangeSnapshot {
+fn public_change_snapshot(change: &PublicChange) -> PublicChangeSnapshot {
+    PublicChangeSnapshot {
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         schema_version: change.schema_version.clone(),

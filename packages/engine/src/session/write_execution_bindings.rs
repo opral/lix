@@ -6,11 +6,10 @@ use jsonschema::JSONSchema;
 
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::{
-    CommitPreconditions, DomainChangeBatch, ExpectedHead, PendingPublicCommitSession,
-    PreparedPublicReadArtifact, PreparedPublicWriteArtifact, PublicDomainChange, SchemaKey,
-    WriteLane,
+    ChangeBatch, CommitPreconditions, ExpectedHead, PendingPublicCommitSession,
+    PreparedPublicReadArtifact, PreparedPublicWriteArtifact, PublicChange, SchemaKey, WriteLane,
 };
-use crate::contracts::change::TrackedDomainChangeView;
+use crate::contracts::change::TrackedChangeView;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::traits::{CompiledSchemaCache, PendingView};
 use crate::execution::write::buffered::TrackedTxnUnit;
@@ -26,7 +25,7 @@ use crate::session::version_ops::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
     CreateCommitAppliedOutput, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
-    CreateCommitPreconditions, CreateCommitWriteLane, ProposedDomainChange,
+    CreateCommitPreconditions, CreateCommitWriteLane, StagedChange,
 };
 use crate::session::write_validation::validate_commit_time_write;
 use crate::version_state::parse_active_version_snapshot;
@@ -147,22 +146,6 @@ impl WriteExecutionBindings for SessionCollaborators {
         execute_public_tracked_append(transaction, unit, pending_commit_session.as_deref_mut())
             .await
     }
-
-    async fn apply_writer_key_annotations_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        annotations: &std::collections::BTreeMap<
-            crate::contracts::artifacts::RowIdentity,
-            Option<String>,
-        >,
-    ) -> Result<(), LixError> {
-        let mut executor = &mut *transaction;
-        crate::schema::apply_workspace_writer_key_annotations_with_executor(
-            &mut executor,
-            annotations,
-        )
-        .await
-    }
 }
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
@@ -238,6 +221,25 @@ pub(crate) async fn execute_public_tracked_append(
     unit: &TrackedTxnUnit,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<TrackedCommitExecutionOutcome, LixError> {
+    if unit
+        .execution
+        .change_batch
+        .as_ref()
+        .is_some_and(|batch| batch.changes.is_empty())
+        && !unit.has_compiler_only_filesystem_changes()
+    {
+        if !unit.writer_key_annotations.is_empty() {
+            let mut executor = &mut *transaction;
+            crate::live_state::writer_key::apply_writer_key_annotations_with_executor(
+                &mut executor,
+                &unit.writer_key_annotations,
+            )
+            .await?;
+        }
+
+        return Ok(TrackedCommitExecutionOutcome::default());
+    }
+
     let mut create_commit_functions = unit.runtime_state.functions().clone();
     let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
 
@@ -266,9 +268,9 @@ pub(crate) async fn execute_public_tracked_append(
             timestamp: None,
             changes: unit
                 .execution
-                .domain_change_batch
+                .change_batch
                 .as_ref()
-                .map(|batch| public_domain_changes_to_proposed(&batch.changes))
+                .map(|batch| public_changes_to_staged(&batch.changes))
                 .transpose()?
                 .unwrap_or_default(),
             filesystem_state: unit.filesystem_state.clone(),
@@ -300,8 +302,16 @@ pub(crate) async fn execute_public_tracked_append(
         mirror_public_registered_schema_bootstrap_rows(transaction, applied_output).await?;
     }
 
-    let applied_domain_changes =
-        public_domain_changes_from_proposed(&append_outcome.applied_domain_changes);
+    if !unit.writer_key_annotations.is_empty() {
+        let mut executor = &mut *transaction;
+        crate::live_state::writer_key::apply_writer_key_annotations_with_executor(
+            &mut executor,
+            &unit.writer_key_annotations,
+        )
+        .await?;
+    }
+
+    let applied_changes = public_changes_from_staged(&append_outcome.applied_changes);
     let plugin_changes_committed =
         matches!(append_outcome.disposition, CreateCommitDisposition::Applied);
 
@@ -309,11 +319,11 @@ pub(crate) async fn execute_public_tracked_append(
         crate::version_state::checkpoints::cache::apply_public_version_last_checkpoint_side_effects(
             transaction,
             &unit.public_write,
-            &DomainChangeBatch {
-                changes: applied_domain_changes.clone(),
+            &ChangeBatch {
+                changes: applied_changes.clone(),
                 write_lane: unit
                     .execution
-                    .domain_change_batch
+                    .change_batch
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
                     .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
@@ -325,7 +335,7 @@ pub(crate) async fn execute_public_tracked_append(
                     }),
                 writer_key: unit
                     .execution
-                    .domain_change_batch
+                    .change_batch
                     .as_ref()
                     .and_then(|batch| batch.writer_key.clone())
                     .or_else(|| unit.public_write.contract.writer_key.clone()),
@@ -344,10 +354,8 @@ pub(crate) async fn execute_public_tracked_append(
 
     Ok(TrackedCommitExecutionOutcome {
         receipt: append_outcome.receipt,
-        next_active_version_id: next_active_version_id_from_domain_changes(
-            &applied_domain_changes,
-        )?,
-        applied_domain_changes,
+        next_active_version_id: next_active_version_id_from_changes(&applied_changes)?,
+        applied_changes,
         plugin_changes_committed,
     })
 }
@@ -414,14 +422,14 @@ fn canonical_create_commit_preconditions_for_tracked_unit(
 ) -> Result<CreateCommitPreconditions, LixError> {
     canonical_create_commit_preconditions_from_public_write(
         &unit.execution.create_preconditions,
-        unit.execution.domain_change_batch.as_ref(),
+        unit.execution.change_batch.as_ref(),
         &unit.public_write,
     )
 }
 
 fn canonical_create_commit_preconditions_from_public_write(
     commit_preconditions: &CommitPreconditions,
-    batch: Option<&DomainChangeBatch>,
+    batch: Option<&ChangeBatch>,
     public_write: &PreparedPublicWriteArtifact,
 ) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
@@ -458,19 +466,13 @@ fn canonical_create_commit_preconditions_from_public_write(
     })
 }
 
-fn public_domain_changes_to_proposed(
-    changes: &[PublicDomainChange],
-) -> Result<Vec<ProposedDomainChange>, LixError> {
-    changes
-        .iter()
-        .map(public_domain_change_to_proposed)
-        .collect()
+fn public_changes_to_staged(changes: &[PublicChange]) -> Result<Vec<StagedChange>, LixError> {
+    changes.iter().map(public_change_to_staged).collect()
 }
 
-fn public_domain_change_to_proposed(
-    change: &PublicDomainChange,
-) -> Result<ProposedDomainChange, LixError> {
-    Ok(ProposedDomainChange {
+fn public_change_to_staged(change: &PublicChange) -> Result<StagedChange, LixError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: EntityId::new(change.entity_id.clone())?,
         schema_key: CanonicalSchemaKey::new(change.schema_key.clone())?,
         schema_version: change
@@ -488,15 +490,14 @@ fn public_domain_change_to_proposed(
         metadata: change.metadata.clone(),
         version_id: VersionId::new(change.version_id.clone())?,
         writer_key: change.writer_key.clone(),
+        created_at: None,
     })
 }
 
-fn public_domain_changes_from_proposed(
-    changes: &[ProposedDomainChange],
-) -> Vec<PublicDomainChange> {
+fn public_changes_from_staged(changes: &[StagedChange]) -> Vec<PublicChange> {
     changes
         .iter()
-        .map(|change| PublicDomainChange {
+        .map(|change| PublicChange {
             entity_id: change.entity_id.to_string(),
             schema_key: change.schema_key.to_string(),
             schema_version: change.schema_version.as_ref().map(ToString::to_string),
@@ -510,7 +511,7 @@ fn public_domain_changes_from_proposed(
         .collect()
 }
 
-fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
+fn next_active_version_id_from_changes<Change: TrackedChangeView>(
     changes: &[Change],
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {

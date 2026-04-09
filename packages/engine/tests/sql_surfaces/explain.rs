@@ -1972,18 +1972,16 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
         "idempotency_key.fingerprint should be a string"
     );
 
-    let domain_change_batches = json_array(
+    let change_batches = json_array(
         compiled_artifacts
-            .get("domain_change_batches")
-            .expect("compiled_artifacts should include domain_change_batches"),
-        "domain_change_batches",
+            .get("change_batches")
+            .expect("compiled_artifacts should include change_batches"),
+        "change_batches",
     );
-    assert_eq!(domain_change_batches.len(), 1);
-    let domain_change_batch = json_object(&domain_change_batches[0], "domain_change_batch");
+    assert_eq!(change_batches.len(), 1);
+    let change_batch = json_object(&change_batches[0], "change_batch");
     assert_eq!(
-        domain_change_batch
-            .get("write_lane")
-            .and_then(JsonValue::as_str),
+        change_batch.get("write_lane").and_then(JsonValue::as_str),
         Some("active_version")
     );
 

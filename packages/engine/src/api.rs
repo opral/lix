@@ -17,6 +17,8 @@ impl Engine {
         if !self.is_initialized().await? {
             return Err(errors::not_initialized_error());
         }
+        crate::live_state::writer_key::ensure_writer_key_table_ready(self.backend().as_ref())
+            .await?;
         self.refresh_public_surface_registry().await?;
         Ok(())
     }

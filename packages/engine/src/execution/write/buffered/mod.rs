@@ -21,7 +21,7 @@ pub(crate) use live_state_write_state::prepare_materialization_plan;
 pub(crate) use live_state_write_state::LiveStateWriteState;
 pub(crate) use planned_write::{
     build_planned_write_delta, BufferedWriteJournal, PendingFilesystemOverlay,
-    PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PendingWorkspaceWriterKeyOverlay,
+    PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PendingWriterKeyOverlay,
     PlannedInternalWriteUnit, PlannedPublicUntrackedWriteUnit, PlannedWriteDelta, PlannedWriteUnit,
     TrackedTxnUnit,
 };

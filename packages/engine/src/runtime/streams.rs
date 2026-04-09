@@ -2,7 +2,7 @@ pub use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStream
 pub use crate::contracts::state_commit_stream::StateCommitStreamFilter;
 #[cfg(test)]
 pub(crate) use crate::contracts::state_commit_stream::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamRuntimeMetadata,
 };
 use futures_util::future::poll_fn;
@@ -413,19 +413,19 @@ fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitStreamBatch) {
 #[cfg(test)]
 mod tests {
     use super::{
-        state_commit_stream_changes_from_domain_changes,
-        state_commit_stream_changes_from_planned_rows, StateCommitStreamOperation,
-        StateCommitStreamRuntimeMetadata,
+        state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
+        StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
     use crate::contracts::artifacts::PlannedStateRow;
-    use crate::session::version_ops::commit::ProposedDomainChange;
+    use crate::session::version_ops::commit::StagedChange;
     use crate::Value;
     use std::collections::BTreeMap;
 
     #[test]
-    fn domain_changes_map_to_update_changes() {
-        let changes = state_commit_stream_changes_from_domain_changes(
-            &[ProposedDomainChange {
+    fn changes_map_to_update_changes() {
+        let changes = state_commit_stream_changes_from_changes(
+            &[StagedChange {
+                id: None,
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
@@ -435,11 +435,12 @@ mod tests {
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
                 writer_key: Some("writer-a".to_string()),
+                created_at: None,
             }],
             StateCommitStreamOperation::Update,
             StateCommitStreamRuntimeMetadata::default(),
         )
-        .expect("domain changes should map");
+        .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].operation, StateCommitStreamOperation::Update);
@@ -450,8 +451,9 @@ mod tests {
 
     #[test]
     fn state_commit_stream_uses_runtime_writer_metadata_when_change_omits_it() {
-        let changes = state_commit_stream_changes_from_domain_changes(
-            &[ProposedDomainChange {
+        let changes = state_commit_stream_changes_from_changes(
+            &[StagedChange {
+                id: None,
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
@@ -461,11 +463,12 @@ mod tests {
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
                 writer_key: None,
+                created_at: None,
             }],
             StateCommitStreamOperation::Update,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
         )
-        .expect("domain changes should map");
+        .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].writer_key.as_deref(), Some("writer-runtime"));
@@ -473,8 +476,9 @@ mod tests {
 
     #[test]
     fn state_commit_stream_prefers_change_writer_key_over_runtime_metadata() {
-        let changes = state_commit_stream_changes_from_domain_changes(
-            &[ProposedDomainChange {
+        let changes = state_commit_stream_changes_from_changes(
+            &[StagedChange {
+                id: None,
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
@@ -484,11 +488,12 @@ mod tests {
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
                 writer_key: Some("writer-change".to_string()),
+                created_at: None,
             }],
             StateCommitStreamOperation::Update,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
         )
-        .expect("domain changes should map");
+        .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].writer_key.as_deref(), Some("writer-change"));

@@ -12,12 +12,12 @@ use crate::contracts::artifacts::{
 };
 use crate::contracts::traits::EffectiveRowsResolver;
 use crate::contracts::traits::LiveReadContext as ReadContext;
+use crate::contracts::traits::WriterKeyReadView;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
-use crate::schema::WorkspaceWriterKeyReadView;
 use crate::{LixError, Value};
 
 pub fn overlay_lanes(include_global: bool, include_untracked: bool) -> Vec<OverlayLane> {
@@ -74,9 +74,7 @@ pub(crate) async fn resolve_effective_row(
                     .into_iter()
                     .next()
                 {
-                    let writer_key =
-                        tracked_row_workspace_writer_key(context.workspace_writer_keys, &row)
-                            .await?;
+                    let writer_key = tracked_row_writer_key(context.writer_keys, &row).await?;
                     return Ok(Some(effective_row_from_tracked(
                         row,
                         &request.version_id,
@@ -220,7 +218,7 @@ async fn scan_tracked_lane(
         })
         .await?;
 
-    let rows = tracked_rows_with_workspace_writer_keys(context.workspace_writer_keys, rows).await?;
+    let rows = tracked_rows_with_writer_keys(context.writer_keys, rows).await?;
 
     for row in rows {
         let writer_key = row.writer_key.clone();
@@ -429,8 +427,7 @@ async fn load_effective_rows_exact_batch(
                     file_id: None,
                 })
                 .await?;
-            let rows = tracked_rows_with_workspace_writer_keys(context.workspace_writer_keys, rows)
-                .await?;
+            let rows = tracked_rows_with_writer_keys(context.writer_keys, rows).await?;
             Ok(rows
                 .into_iter()
                 .map(|row| {
@@ -466,17 +463,17 @@ async fn load_effective_rows_exact_batch(
 fn _preserve_value_type(_value: &Value) {}
 
 #[cfg(test)]
-async fn tracked_row_workspace_writer_key(
-    workspace_writer_keys: &dyn WorkspaceWriterKeyReadView,
+async fn tracked_row_writer_key(
+    writer_keys: &dyn WriterKeyReadView,
     row: &TrackedRow,
 ) -> Result<Option<String>, LixError> {
-    workspace_writer_keys
+    writer_keys
         .load_annotation(&RowIdentity::from_tracked_row(row))
         .await
 }
 
-async fn tracked_rows_with_workspace_writer_keys(
-    workspace_writer_keys: &dyn WorkspaceWriterKeyReadView,
+async fn tracked_rows_with_writer_keys(
+    writer_keys: &dyn WriterKeyReadView,
     mut rows: Vec<TrackedRow>,
 ) -> Result<Vec<TrackedRow>, LixError> {
     if rows.is_empty() {
@@ -487,9 +484,7 @@ async fn tracked_rows_with_workspace_writer_keys(
         .iter()
         .map(RowIdentity::from_tracked_row)
         .collect::<BTreeSet<_>>();
-    let annotations = workspace_writer_keys
-        .load_annotations(&row_identities)
-        .await?;
+    let annotations = writer_keys.load_annotations(&row_identities).await?;
 
     for row in &mut rows {
         row.writer_key = annotations

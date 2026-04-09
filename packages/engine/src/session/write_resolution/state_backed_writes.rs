@@ -1,7 +1,7 @@
 use super::*;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::traits::{PendingSemanticStorage, PendingView};
-use crate::live_state::{decode_registered_schema_row, scan_rows, RowQuery, RowReadMode};
+use crate::live_state::{decode_registered_schema_row, scan_live_rows, LiveRowQuery, RowReadMode};
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
     collect_state_column_overrides_with_shared_runtime, schema_from_registered_snapshot, SchemaKey,
@@ -33,9 +33,9 @@ async fn load_latest_registered_schema(
 ) -> Result<Option<JsonValue>, crate::LixError> {
     let mut latest = None::<(SchemaKey, JsonValue)>;
 
-    let rows = scan_rows(
+    let rows = scan_live_rows(
         backend,
-        &RowQuery {
+        &LiveRowQuery {
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
             mode: RowReadMode::Tracked,

@@ -68,7 +68,7 @@ struct ResolvedWritePartitionBuilder {
     authoritative_pre_state: Vec<ResolvedRowRef>,
     authoritative_pre_state_rows: Vec<PlannedStateRow>,
     intended_post_state: Vec<PlannedStateRow>,
-    workspace_writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
+    writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
     filesystem_state: PlannedFilesystemState,
@@ -78,7 +78,7 @@ impl ResolvedWritePartitionBuilder {
     fn is_empty(&self) -> bool {
         self.authoritative_pre_state.is_empty()
             && self.intended_post_state.is_empty()
-            && self.workspace_writer_key_updates.is_empty()
+            && self.writer_key_updates.is_empty()
             && self.tombstones.is_empty()
             && self.lineage.is_empty()
     }
@@ -90,7 +90,7 @@ impl ResolvedWritePartitionBuilder {
             authoritative_pre_state: self.authoritative_pre_state,
             authoritative_pre_state_rows: self.authoritative_pre_state_rows,
             intended_post_state: self.intended_post_state,
-            workspace_writer_key_updates: self.workspace_writer_key_updates,
+            writer_key_updates: self.writer_key_updates,
             tombstones: self.tombstones,
             lineage: self.lineage,
             target_write_lane: None,
@@ -119,7 +119,7 @@ impl ResolvedWritePartitionBuilder {
             let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
             if unchanged && authoritative.writer_key != row.writer_key {
                 if let Some(identity) = planned_state_row_workspace_identity(row) {
-                    self.workspace_writer_key_updates
+                    self.writer_key_updates
                         .insert(identity, row.writer_key.clone());
                 }
             }
@@ -671,7 +671,7 @@ fn single_partition_write_plan(
         authoritative_pre_state,
         authoritative_pre_state_rows,
         intended_post_state,
-        workspace_writer_key_updates: BTreeMap::new(),
+        writer_key_updates: BTreeMap::new(),
         tombstones,
         lineage,
         filesystem_state: Default::default(),
@@ -1011,7 +1011,7 @@ fn finalize_resolved_write_plan(
     resolved.partitions.retain(|partition| {
         !partition.intended_post_state.is_empty()
             || !partition.filesystem_state.files.is_empty()
-            || !partition.workspace_writer_key_updates.is_empty()
+            || !partition.writer_key_updates.is_empty()
     });
     for partition in &mut resolved.partitions {
         if partition.execution_mode == WriteMode::Untracked {

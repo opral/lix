@@ -135,7 +135,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_workspace_writer_key \
+                     FROM lix_internal_writer_key \
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-tracked' \
@@ -249,7 +249,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_workspace_writer_key \
+                     FROM lix_internal_writer_key \
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'lix_file_descriptor' \
                        AND entity_id = 'wk-file-1' \
@@ -331,11 +331,11 @@ simulation_test!(
 );
 
 #[test]
-fn workspace_writer_key_annotation_persists_across_engine_reopen_sqlite() {
+fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
     let path = temp_sqlite_path("persist-reopen");
     let path_for_thread = path.clone();
     let thread = std::thread::Builder::new()
-        .name("workspace_writer_key_annotation_persists_across_engine_reopen_sqlite".to_string())
+        .name("writer_key_annotation_persists_across_engine_reopen_sqlite".to_string())
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -393,7 +393,7 @@ fn workspace_writer_key_annotation_persists_across_engine_reopen_sqlite() {
                     .execute(
                         &format!(
                             "SELECT writer_key \
-                             FROM lix_internal_workspace_writer_key \
+                             FROM lix_internal_writer_key \
                              WHERE version_id = '{version_id}' \
                                AND schema_key = 'lix_file_descriptor' \
                                AND entity_id = 'wk-reopen' \
@@ -563,7 +563,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_workspace_writer_key \
+                     FROM lix_internal_writer_key \
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'lix_file_descriptor' \
                        AND entity_id = 'wk-clear-update' \
@@ -673,7 +673,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_workspace_writer_key \
+                     FROM lix_internal_writer_key \
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'lix_file_descriptor' \
                        AND entity_id = 'wk-rolled-back' \

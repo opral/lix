@@ -26,9 +26,7 @@ use super::create::{
 };
 use super::generate::generate_commit;
 use super::receipt::latest_replay_cursor_from_change_rows;
-use super::types::{
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
-};
+use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
 use super::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 struct TransactionCommitExecutor<'a> {
@@ -140,26 +138,24 @@ fn pending_public_commit_lane_from_write_lane(
     }
 }
 
-pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
+pub(crate) async fn merge_public_change_batch_into_pending_commit(
     transaction: &mut dyn LixBackendTransaction,
     session: &mut PendingPublicCommitSession,
-    changes: &[ProposedDomainChange],
+    changes: &[StagedChange],
     binary_blob_writes: &[BinaryBlobWrite],
     active_account_ids: &[String],
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
 ) -> Result<CanonicalCommitReceipt, LixError> {
-    let tracked_writer_key_annotations =
-        crate::schema::tracked_writer_key_annotations_from_changes(changes, writer_key);
-    let domain_changes = changes
+    let staged_changes = changes
         .iter()
         .map(|change| {
-            Ok::<DomainChangeInput, LixError>(DomainChangeInput {
-                id: functions.uuid_v7(),
+            Ok::<StagedChange, LixError>(StagedChange {
+                id: Some(functions.uuid_v7()),
                 entity_id: EntityId::new(change.entity_id.to_string())?,
                 schema_key: CanonicalSchemaKey::new(change.schema_key.to_string())?,
-                schema_version: CanonicalSchemaVersion::new(
+                schema_version: Some(CanonicalSchemaVersion::new(
                     change
                         .schema_version
                         .as_ref()
@@ -173,8 +169,8 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                                 ),
                             )
                         })?,
-                )?,
-                file_id: FileId::new(
+                )?),
+                file_id: Some(FileId::new(
                     change
                         .file_id
                         .as_ref()
@@ -188,8 +184,8 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                                 ),
                             )
                         })?,
-                )?,
-                plugin_key: CanonicalPluginKey::new(
+                )?),
+                plugin_key: Some(CanonicalPluginKey::new(
                     change
                         .plugin_key
                         .as_ref()
@@ -203,33 +199,35 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
                                 ),
                             )
                         })?,
-                )?,
+                )?),
                 snapshot_content: canonicalize_optional_json_text(
                     change.snapshot_content.as_deref(),
                     "snapshot_content",
                     change.schema_key.as_str(),
                     change.entity_id.as_str(),
-                )?,
+                )?
+                .map(|value| value.as_str().to_string()),
                 metadata: canonicalize_optional_json_text(
                     change.metadata.as_deref(),
                     "metadata",
                     change.schema_key.as_str(),
                     change.entity_id.as_str(),
-                )?,
-                created_at: timestamp.to_string(),
+                )?
+                .map(|value| value.as_str().to_string()),
                 version_id: VersionId::new(change.version_id.to_string())?,
                 writer_key: change.writer_key.clone(),
+                created_at: Some(timestamp.to_string()),
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     let active_accounts = active_account_ids.to_vec();
-    let versions = load_version_info_for_domain_changes(transaction, &domain_changes).await?;
+    let versions = load_version_info_for_staged_changes(transaction, &staged_changes).await?;
     let generated = generate_commit(
         GenerateCommitArgs {
             timestamp: timestamp.to_string(),
             active_accounts: active_accounts.clone(),
-            changes: domain_changes.clone(),
+            changes: staged_changes.clone(),
             versions,
             force_commit_versions: BTreeSet::new(),
         },
@@ -239,7 +237,12 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     extend_json_array_strings(
         &mut session.commit_snapshot,
         "change_ids",
-        domain_changes.iter().map(|change| change.id.clone()),
+        staged_changes.iter().map(|change| {
+            change
+                .id
+                .clone()
+                .expect("pending merge staged changes must have ids")
+        }),
     );
     extend_json_array_strings(
         &mut session.commit_snapshot,
@@ -262,7 +265,7 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
     let rewritten = rewrite_generated_commit_result_for_pending_session(
         session,
         generated,
-        domain_changes.len(),
+        staged_changes.len(),
         timestamp,
     )?;
     execute_generated_commit_result(
@@ -270,7 +273,8 @@ pub(crate) async fn merge_public_domain_change_batch_into_pending_commit(
         rewritten,
         binary_blob_writes,
         functions,
-        &tracked_writer_key_annotations,
+        changes,
+        writer_key,
     )
     .await
 }
@@ -295,11 +299,11 @@ fn canonicalize_optional_json_text(
         })
 }
 
-async fn load_version_info_for_domain_changes(
+async fn load_version_info_for_staged_changes(
     transaction: &mut dyn LixBackendTransaction,
-    domain_changes: &[DomainChangeInput],
+    staged_changes: &[StagedChange],
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
-    let affected_versions = domain_changes
+    let affected_versions = staged_changes
         .iter()
         .map(|change| change.version_id.to_string())
         .collect::<BTreeSet<_>>();
@@ -310,7 +314,7 @@ async fn load_version_info_for_domain_changes(
 fn rewrite_generated_commit_result_for_pending_session(
     session: &PendingPublicCommitSession,
     generated: GenerateCommitResult,
-    domain_change_count: usize,
+    change_count: usize,
     timestamp: &str,
 ) -> Result<GenerateCommitResult, LixError> {
     let updated_version_refs = generated
@@ -329,7 +333,7 @@ fn rewrite_generated_commit_result_for_pending_session(
                 .canonical_output
                 .changes
                 .into_iter()
-                .take(domain_change_count)
+                .take(change_count)
                 .collect(),
         },
         updated_version_refs,
@@ -372,10 +376,8 @@ async fn execute_generated_commit_result(
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
-    tracked_writer_key_annotations: &std::collections::BTreeMap<
-        crate::live_state::RowIdentity,
-        Option<String>,
-    >,
+    changes: &[StagedChange],
+    writer_key: Option<&str>,
 ) -> Result<CanonicalCommitReceipt, LixError> {
     let mut executor = &mut *transaction;
     let commit_graph_rows =
@@ -408,17 +410,12 @@ async fn execute_generated_commit_result(
     }
     program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
-    let mut executor = &mut *transaction;
-    crate::schema::apply_workspace_writer_key_annotations_with_executor(
-        &mut executor,
-        tracked_writer_key_annotations,
-    )
-    .await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
-    crate::live_state::apply_commit_projections_best_effort_in_transaction(
+    crate::live_state::apply_tracked_commit_effects_in_transaction(
         transaction,
         &receipt,
-        tracked_writer_key_annotations,
+        changes,
+        writer_key,
     )
     .await?;
     Ok(receipt)

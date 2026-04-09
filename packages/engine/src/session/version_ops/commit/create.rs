@@ -39,9 +39,7 @@ use super::preflight::{
     load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
 };
 use super::receipt::latest_replay_cursor_from_change_rows;
-use super::types::{
-    DomainChangeInput, GenerateCommitArgs, GenerateCommitResult, ProposedDomainChange,
-};
+use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
 use super::{CanonicalCommitReceipt, UpdatedVersionRef, COMMIT_IDEMPOTENCY_TABLE};
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
@@ -79,7 +77,7 @@ pub(crate) struct CreateCommitPreconditions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateCommitArgs {
     pub(crate) timestamp: Option<String>,
-    pub(crate) changes: Vec<ProposedDomainChange>,
+    pub(crate) changes: Vec<StagedChange>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
     pub(crate) active_account_ids: Vec<String>,
@@ -102,7 +100,7 @@ pub(crate) struct CreateCommitResult {
     pub(crate) committed_head: String,
     pub(crate) receipt: Option<CanonicalCommitReceipt>,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
-    pub(crate) applied_domain_changes: Vec<ProposedDomainChange>,
+    pub(crate) applied_changes: Vec<StagedChange>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,7 +143,7 @@ pub(crate) struct PendingPublicCommitSeed {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CreateCommitErrorKind {
     EmptyBatch,
-    MissingDomainField,
+    MissingChangeField,
     MissingWriteLane,
     TipDrift,
     Internal,
@@ -225,7 +223,7 @@ pub(crate) async fn create_commit(
                     committed_head: current.to_string(),
                     receipt: None,
                     applied_output: None,
-                    applied_domain_changes: Vec::new(),
+                    applied_changes: Vec::new(),
                 });
             }
             return Err(CreateCommitError {
@@ -254,7 +252,7 @@ pub(crate) async fn create_commit(
                     committed_head: current.to_string(),
                     receipt: None,
                     applied_output: None,
-                    applied_domain_changes: Vec::new(),
+                    applied_changes: Vec::new(),
                 });
             }
             return Err(CreateCommitError {
@@ -276,7 +274,7 @@ pub(crate) async fn create_commit(
             committed_head: commit_id,
             receipt: None,
             applied_output: None,
-            applied_domain_changes: Vec::new(),
+            applied_changes: Vec::new(),
         });
     }
 
@@ -284,23 +282,23 @@ pub(crate) async fn create_commit(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let (applied_domain_changes, mut compiled_filesystem_state) =
-        resolve_proposed_domain_changes(&args.changes, &preflight, &args.filesystem_state)?;
-    let applied_domain_changes = {
+    let (applied_changes, mut compiled_filesystem_state) =
+        resolve_staged_changes(&args.changes, &preflight, &args.filesystem_state)?;
+    let applied_changes = {
         let mut executor = TransactionCommitExecutor { transaction };
-        normalize_proposed_domain_changes(&mut executor, &applied_domain_changes).await?
+        normalize_staged_changes(&mut executor, &applied_changes).await?
     };
-    // Binary CAS writes are only meaningful when a surviving semantic change still
-    // points at them. If normalization removed every referencing domain change,
+    // Binary CAS writes are only meaningful when a surviving staged change still
+    // points at them. If normalization removed every referencing staged change,
     // drop the unreachable payload writes before deciding whether this is a noop.
-    let applied_change_identities = applied_domain_changes
+    let applied_change_identities = applied_changes
         .iter()
-        .map(proposed_domain_change_identity)
+        .map(staged_change_identity)
         .collect::<BTreeSet<_>>();
     compiled_filesystem_state
         .binary_blob_writes
         .retain(|write| binary_blob_write_still_needed(write, &applied_change_identities));
-    if applied_domain_changes.is_empty()
+    if applied_changes.is_empty()
         && compiled_filesystem_state.binary_blob_writes.is_empty()
         && !args.allow_empty_commit
     {
@@ -309,12 +307,11 @@ pub(crate) async fn create_commit(
             committed_head: current_head.unwrap_or_default(),
             receipt: None,
             applied_output: None,
-            applied_domain_changes: Vec::new(),
+            applied_changes: Vec::new(),
         });
     }
-    let domain_changes =
-        materialize_domain_changes(&timestamp, &applied_domain_changes, functions)?;
-    let affected_versions = domain_changes
+    let staged_changes = materialize_staged_changes(&timestamp, &applied_changes, functions)?;
+    let affected_versions = staged_changes
         .iter()
         .map(|change| change.version_id.to_string())
         .collect::<BTreeSet<_>>();
@@ -364,7 +361,7 @@ pub(crate) async fn create_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
             active_accounts: preflight.active_accounts,
-            changes: domain_changes,
+            changes: staged_changes,
             versions,
             force_commit_versions: if args.allow_empty_commit {
                 lane_version_id
@@ -469,7 +466,7 @@ pub(crate) async fn create_commit(
         committed_head,
         receipt: Some(receipt),
         applied_output: Some(applied_output),
-        applied_domain_changes,
+        applied_changes,
     })
 }
 
@@ -566,11 +563,11 @@ fn concrete_lane(
     }
 }
 
-fn resolve_proposed_domain_changes(
-    changes: &[ProposedDomainChange],
+fn resolve_staged_changes(
+    changes: &[StagedChange],
     preflight: &CreateCommitPreflightState,
     filesystem_state: &FilesystemTransactionState,
-) -> Result<(Vec<ProposedDomainChange>, CompiledTrackedFilesystemState), CreateCommitError> {
+) -> Result<(Vec<StagedChange>, CompiledTrackedFilesystemState), CreateCommitError> {
     let hydrated = with_exact_filesystem_descriptors(filesystem_state, &preflight.file_descriptors);
     let compiled_filesystem =
         compile_filesystem_transaction_state_from_state(&hydrated, None, &[] as &[MutationRow])
@@ -580,15 +577,15 @@ fn resolve_proposed_domain_changes(
     let mut index_by_identity = resolved
         .iter()
         .enumerate()
-        .map(|(index, change)| (proposed_domain_change_identity(change), index))
+        .map(|(index, change)| (staged_change_identity(change), index))
         .collect::<BTreeMap<_, _>>();
     for compiled_change in compiled_filesystem
         .semantic_changes
         .iter()
-        .map(proposed_domain_change_from_filesystem_semantic_change)
+        .map(staged_change_from_filesystem_semantic_change)
     {
         let compiled_change = compiled_change?;
-        let identity = proposed_domain_change_identity(&compiled_change);
+        let identity = staged_change_identity(&compiled_change);
         if let Some(index) = index_by_identity.get(&identity).copied() {
             let mut merged = compiled_change;
             if merged.writer_key.is_none() {
@@ -608,13 +605,13 @@ fn resolve_proposed_domain_changes(
     ))
 }
 
-async fn normalize_proposed_domain_changes(
+async fn normalize_staged_changes(
     executor: &mut dyn CommitQueryExecutor,
-    changes: &[ProposedDomainChange],
-) -> Result<Vec<ProposedDomainChange>, CreateCommitError> {
+    changes: &[StagedChange],
+) -> Result<Vec<StagedChange>, CreateCommitError> {
     let mut normalized = Vec::with_capacity(changes.len());
     for change in changes {
-        if proposed_domain_change_is_noop(executor, change).await? {
+        if staged_change_is_noop(executor, change).await? {
             continue;
         }
         normalized.push(change.clone());
@@ -622,9 +619,9 @@ async fn normalize_proposed_domain_changes(
     Ok(normalized)
 }
 
-async fn proposed_domain_change_is_noop(
+async fn staged_change_is_noop(
     executor: &mut dyn CommitQueryExecutor,
-    change: &ProposedDomainChange,
+    change: &StagedChange,
 ) -> Result<bool, CreateCommitError> {
     let Some(file_id) = change.file_id.clone() else {
         return Ok(false);
@@ -721,10 +718,11 @@ struct CompiledTrackedFilesystemState {
     binary_blob_writes: Vec<BinaryBlobWrite>,
 }
 
-fn proposed_domain_change_from_filesystem_semantic_change(
+fn staged_change_from_filesystem_semantic_change(
     change: &FilesystemSemanticChange,
-) -> Result<ProposedDomainChange, CreateCommitError> {
-    Ok(ProposedDomainChange {
+) -> Result<StagedChange, CreateCommitError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: try_identity(
             change.entity_id.clone(),
             "filesystem semantic change entity_id",
@@ -752,11 +750,12 @@ fn proposed_domain_change_from_filesystem_semantic_change(
             "filesystem semantic change version_id",
         )?,
         writer_key: change.writer_key.clone(),
+        created_at: None,
     })
 }
 
-fn proposed_domain_change_identity(
-    change: &ProposedDomainChange,
+fn staged_change_identity(
+    change: &StagedChange,
 ) -> (String, String, String, String, String, Option<String>) {
     (
         change.entity_id.to_string(),
@@ -793,46 +792,48 @@ fn binary_blob_write_still_needed(
     ))
 }
 
-fn materialize_domain_changes(
+fn materialize_staged_changes(
     timestamp: &str,
-    changes: &[ProposedDomainChange],
+    changes: &[StagedChange],
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<DomainChangeInput>, CreateCommitError> {
+) -> Result<Vec<StagedChange>, CreateCommitError> {
     changes
         .iter()
         .map(|change| {
-            Ok(DomainChangeInput {
-                id: functions.uuid_v7(),
+            Ok(StagedChange {
+                id: Some(functions.uuid_v7()),
                 entity_id: change.entity_id.clone(),
                 schema_key: change.schema_key.clone(),
-                schema_version: require_change_field(
+                schema_version: Some(require_change_field(
                     change.schema_version.clone(),
                     &change.schema_key,
                     "schema_version",
-                )?,
-                file_id: require_change_field(
+                )?),
+                file_id: Some(require_change_field(
                     change.file_id.clone(),
                     &change.schema_key,
                     "file_id",
-                )?,
+                )?),
                 version_id: change.version_id.clone(),
-                plugin_key: require_change_field(
+                plugin_key: Some(require_change_field(
                     change.plugin_key.clone(),
                     &change.schema_key,
                     "plugin_key",
-                )?,
+                )?),
                 snapshot_content: canonicalize_change_payload(
                     change.snapshot_content.as_deref(),
                     &change.schema_key,
                     "snapshot_content",
-                )?,
+                )?
+                .map(|value| value.as_str().to_string()),
                 metadata: canonicalize_change_payload(
                     change.metadata.as_deref(),
                     &change.schema_key,
                     "metadata",
-                )?,
-                created_at: timestamp.to_string(),
+                )?
+                .map(|value| value.as_str().to_string()),
                 writer_key: change.writer_key.clone(),
+                created_at: Some(timestamp.to_string()),
             })
         })
         .collect()
@@ -861,7 +862,7 @@ fn require_change_field<T>(
     field_name: &str,
 ) -> Result<T, CreateCommitError> {
     value.ok_or_else(|| CreateCommitError {
-        kind: CreateCommitErrorKind::MissingDomainField,
+        kind: CreateCommitErrorKind::MissingChangeField,
         message: format!(
             "create commit batch requires '{field_name}' for schema '{}'",
             schema_key
@@ -1119,7 +1120,7 @@ async fn load_tracked_file_descriptor(
 }
 
 fn validate_change_versions(
-    changes: &[ProposedDomainChange],
+    changes: &[StagedChange],
     filesystem_state: &FilesystemTransactionState,
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<(), CreateCommitError> {
@@ -1149,7 +1150,7 @@ fn validate_change_versions(
 }
 
 fn validate_change_versions_without_lazy(
-    changes: &[ProposedDomainChange],
+    changes: &[StagedChange],
     concrete_lane: &ConcreteWriteLane,
 ) -> Result<(), CreateCommitError> {
     let version_ids = changes
@@ -1432,7 +1433,7 @@ mod tests {
 
     fn create_commit_args(
         preconditions: CreateCommitPreconditions,
-        changes: Vec<crate::session::version_ops::commit::ProposedDomainChange>,
+        changes: Vec<crate::session::version_ops::commit::StagedChange>,
         filesystem_state: FilesystemTransactionState,
     ) -> CreateCommitArgs {
         CreateCommitArgs {
@@ -1479,8 +1480,9 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::session::version_ops::commit::ProposedDomainChange {
-        crate::session::version_ops::commit::ProposedDomainChange {
+    fn sample_change() -> crate::session::version_ops::commit::StagedChange {
+        crate::session::version_ops::commit::StagedChange {
+            id: None,
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -1490,11 +1492,13 @@ mod tests {
             metadata: None,
             version_id: "version-a".try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
+            created_at: None,
         }
     }
 
-    fn sample_global_change() -> crate::session::version_ops::commit::ProposedDomainChange {
-        crate::session::version_ops::commit::ProposedDomainChange {
+    fn sample_global_change() -> crate::session::version_ops::commit::StagedChange {
+        crate::session::version_ops::commit::StagedChange {
+            id: None,
             entity_id: "version-a".try_into().unwrap(),
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -1518,6 +1522,7 @@ mod tests {
             metadata: None,
             version_id: GLOBAL_VERSION_ID.try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
+            created_at: None,
         }
     }
 

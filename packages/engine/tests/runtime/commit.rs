@@ -81,7 +81,7 @@ async fn read_version_ref_commit_id(engine: &SimulationEngine, version_id: &str)
 
 async fn matching_commit_change_set_ids(
     engine: &SimulationEngine,
-    domain_change_ids: &BTreeSet<String>,
+    change_ids: &BTreeSet<String>,
 ) -> Vec<String> {
     let commit_snapshot_ids = engine
         .execute(
@@ -110,14 +110,16 @@ async fn matching_commit_change_set_ids(
             continue;
         }
         let commit_json = parse_json(&snapshot.statements[0].rows[0][0]);
-        let Some(change_ids) = commit_json.get("change_ids").and_then(|v| v.as_array()) else {
+        let Some(commit_snapshot_change_ids) =
+            commit_json.get("change_ids").and_then(|v| v.as_array())
+        else {
             continue;
         };
-        let commit_change_ids = change_ids
+        let commit_change_ids = commit_snapshot_change_ids
             .iter()
             .filter_map(|value| value.as_str().map(ToString::to_string))
             .collect::<BTreeSet<_>>();
-        if domain_change_ids.is_subset(&commit_change_ids) {
+        if change_ids.is_subset(&commit_change_ids) {
             let change_set_id = commit_json
                 .get("change_set_id")
                 .and_then(|v| v.as_str())
@@ -196,7 +198,7 @@ simulation_test!(
         let new_commit_id = read_version_ref_commit_id(&engine, "global").await;
         assert_ne!(new_commit_id, previous_commit_id);
 
-        let domain_change = engine
+        let change = engine
             .execute(
                 "SELECT id, snapshot_id \
                  FROM lix_internal_change \
@@ -207,9 +209,9 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_change.statements[0].rows.len(), 1);
+        assert_eq!(change.statements[0].rows.len(), 1);
 
-        let snapshot_id = as_text(&domain_change.statements[0].rows[0][1]);
+        let snapshot_id = as_text(&change.statements[0].rows[0][1]);
         let snapshot = engine
             .execute(
                 &format!(
@@ -387,7 +389,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let domain_changes = engine
+        let changes = engine
             .execute(
                 "SELECT id \
                  FROM lix_internal_change \
@@ -397,24 +399,23 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.statements[0].rows.len(), 2);
-        let domain_change_ids: BTreeSet<String> = domain_changes.statements[0]
+        assert_eq!(changes.statements[0].rows.len(), 2);
+        let change_ids: BTreeSet<String> = changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))
             .collect();
 
-        let matching_change_set_ids =
-            matching_commit_change_set_ids(&engine, &domain_change_ids).await;
+        let matching_change_set_ids = matching_commit_change_set_ids(&engine, &change_ids).await;
         assert_eq!(matching_change_set_ids.len(), 1);
         let change_set_id = &matching_change_set_ids[0];
 
         let cse_change_ids =
             change_set_element_change_ids_for_change_set(&engine, change_set_id).await;
         assert!(
-            domain_change_ids.is_subset(&cse_change_ids),
-            "expected domain change ids {:?} to be subset of change_set {:?}",
-            domain_change_ids,
+            change_ids.is_subset(&cse_change_ids),
+            "expected change ids {:?} to be subset of change_set {:?}",
+            change_ids,
             cse_change_ids
         );
     }
@@ -449,7 +450,7 @@ simulation_test!(
             .await
             .unwrap();
 
-        let domain_changes = engine
+        let changes = engine
             .execute(
                 "SELECT id \
                  FROM lix_internal_change \
@@ -459,24 +460,23 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.statements[0].rows.len(), 2);
-        let domain_change_ids: BTreeSet<String> = domain_changes.statements[0]
+        assert_eq!(changes.statements[0].rows.len(), 2);
+        let change_ids: BTreeSet<String> = changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))
             .collect();
 
-        let matching_change_set_ids =
-            matching_commit_change_set_ids(&engine, &domain_change_ids).await;
+        let matching_change_set_ids = matching_commit_change_set_ids(&engine, &change_ids).await;
         assert_eq!(matching_change_set_ids.len(), 1);
         let change_set_id = &matching_change_set_ids[0];
 
         let cse_change_ids =
             change_set_element_change_ids_for_change_set(&engine, change_set_id).await;
         assert!(
-            domain_change_ids.is_subset(&cse_change_ids),
-            "expected domain change ids {:?} to be subset of change_set {:?}",
-            domain_change_ids,
+            change_ids.is_subset(&cse_change_ids),
+            "expected change ids {:?} to be subset of change_set {:?}",
+            change_ids,
             cse_change_ids
         );
     }
@@ -552,7 +552,7 @@ simulation_test!(
         let after_commit_count = as_i64(&after_commit_count.statements[0].rows[0][0]);
         assert_eq!(after_commit_count, before_commit_count + 1);
 
-        let domain_changes = engine
+        let changes = engine
             .execute(
                 "SELECT id \
                  FROM lix_internal_change \
@@ -562,15 +562,14 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.statements[0].rows.len(), 2);
-        let domain_change_ids = domain_changes.statements[0]
+        assert_eq!(changes.statements[0].rows.len(), 2);
+        let change_ids = changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))
             .collect::<BTreeSet<_>>();
 
-        let matching_change_set_ids =
-            matching_commit_change_set_ids(&engine, &domain_change_ids).await;
+        let matching_change_set_ids = matching_commit_change_set_ids(&engine, &change_ids).await;
         assert_eq!(matching_change_set_ids.len(), 1);
     }
 );
@@ -653,7 +652,7 @@ simulation_test!(
         let after_commit_count = as_i64(&after_commit_count.statements[0].rows[0][0]);
         assert_eq!(after_commit_count, before_commit_count + 1);
 
-        let domain_changes = engine
+        let changes = engine
             .execute(
                 "SELECT id \
                  FROM lix_internal_change \
@@ -663,15 +662,14 @@ simulation_test!(
             )
             .await
             .unwrap();
-        assert_eq!(domain_changes.statements[0].rows.len(), 2);
-        let domain_change_ids = domain_changes.statements[0]
+        assert_eq!(changes.statements[0].rows.len(), 2);
+        let change_ids = changes.statements[0]
             .rows
             .iter()
             .map(|row| as_text(&row[0]))
             .collect::<BTreeSet<_>>();
 
-        let matching_change_set_ids =
-            matching_commit_change_set_ids(&engine, &domain_change_ids).await;
+        let matching_change_set_ids = matching_commit_change_set_ids(&engine, &change_ids).await;
         assert_eq!(matching_change_set_ids.len(), 1);
     }
 );

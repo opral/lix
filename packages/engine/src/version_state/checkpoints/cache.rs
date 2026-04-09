@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::backend::ddl::execute_ddl_batch;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::{
-    DomainChangeBatch, PreparedPublicWriteArtifact, PreparedWriteOperationKind,
+    ChangeBatch, PreparedPublicWriteArtifact, PreparedWriteOperationKind,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
@@ -25,7 +25,7 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
 pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
     transaction: &mut dyn LixBackendTransaction,
     public_write: &PreparedPublicWriteArtifact,
-    batch: &DomainChangeBatch,
+    batch: &ChangeBatch,
 ) -> Result<(), LixError> {
     if public_write.contract.target.descriptor.public_name != "lix_version" {
         return Ok(());
@@ -70,7 +70,7 @@ pub(crate) async fn upsert_last_checkpoint_for_version_in_transaction(
 
 fn version_checkpoint_rows_from_resolved_write(
     public_write: &PreparedPublicWriteArtifact,
-    batch: &DomainChangeBatch,
+    batch: &ChangeBatch,
 ) -> Vec<(String, String)> {
     if let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() {
         let rows = resolved
@@ -126,7 +126,7 @@ fn version_checkpoint_rows_from_resolved_write(
 
 fn version_ids_from_resolved_write(
     public_write: &PreparedPublicWriteArtifact,
-    batch: &DomainChangeBatch,
+    batch: &ChangeBatch,
 ) -> Vec<String> {
     if let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() {
         let version_ids = resolved

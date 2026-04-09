@@ -459,7 +459,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    full_rebuild_keeps_semantic_state_when_workspace_writer_key_annotation_is_missing,
+    full_rebuild_keeps_semantic_state_when_writer_key_annotation_is_missing,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -514,7 +514,7 @@ simulation_test!(
         engine
             .execute(
                 &format!(
-                    "DELETE FROM lix_internal_workspace_writer_key \
+                    "DELETE FROM lix_internal_writer_key \
                      WHERE version_id = '{}' \
                        AND schema_key = 'materialization_test_schema' \
                        AND entity_id = 'entity-writer-missing' \
