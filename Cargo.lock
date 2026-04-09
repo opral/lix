@@ -3821,6 +3821,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ten_k_entities_benchmark"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "clap",
+ "lix_engine",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "wasmtime",
+ "wasmtime-wasi",
+ "zip",
+]
+
+[[package]]
 name = "termcolor"
 version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
