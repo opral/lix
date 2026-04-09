@@ -117,6 +117,15 @@ impl ResolvedWritePartitionBuilder {
                 return true;
             };
             let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
+            if unchanged {
+                if authoritative.writer_key != row.writer_key {
+                    let Some(row_identity) = planned_row_identity_from_state_row(row) else {
+                        return true;
+                    };
+                    self.writer_key_updates
+                        .insert(row_identity, row.writer_key.clone());
+                }
+            }
             if unchanged && row.schema_key == "lix_binary_blob_ref" && row.version_id.is_some() {
                 dropped_blob_rows.insert((
                     row.entity_id.clone(),
@@ -684,12 +693,23 @@ fn planned_state_row_identity(row: &PlannedStateRow) -> (String, String, Option<
     )
 }
 
+fn planned_row_identity_from_state_row(row: &PlannedStateRow) -> Option<PlannedRowIdentity> {
+    Some(PlannedRowIdentity {
+        schema_key: row.schema_key.clone(),
+        version_id: row.version_id.clone()?,
+        entity_id: row.entity_id.clone(),
+        file_id: row.values.get("file_id").and_then(|value| match value {
+            Value::Text(value) => Some(value.clone()),
+            _ => None,
+        })?,
+    })
+}
+
 fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow) -> bool {
     left.entity_id == right.entity_id
         && left.schema_key == right.schema_key
         && left.version_id == right.version_id
         && left.tombstone == right.tombstone
-        && left.writer_key == right.writer_key
         && left.values == right.values
 }
 
@@ -1136,7 +1156,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn writer_key_change_is_not_normalized_into_a_noop() {
+    fn writer_key_change_is_normalized_into_overlay_update() {
         let mut builder = ResolvedWritePartitionBuilder {
             authoritative_pre_state_rows: vec![planned_state_row(Some("writer-a"))],
             intended_post_state: vec![planned_state_row(Some("writer-b"))],
@@ -1145,8 +1165,18 @@ mod tests {
 
         builder.normalize_semantic_noops();
 
-        assert_eq!(builder.intended_post_state.len(), 1);
-        assert!(builder.writer_key_updates.is_empty());
+        assert!(builder.intended_post_state.is_empty());
+        assert_eq!(builder.writer_key_updates.len(), 1);
+        assert_eq!(
+            builder
+                .writer_key_updates
+                .values()
+                .next()
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("writer-b")
+        );
     }
 
     fn planned_state_row(writer_key: Option<&str>) -> PlannedStateRow {

@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
+use crate::backend::TransactionBackendAdapter;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PendingPublicCommitSession,
@@ -18,6 +19,7 @@ use crate::execution::write::filesystem::runtime::{
 };
 use crate::execution::write::transaction::TransactionExecutionBackend;
 use crate::execution::write::{TrackedCommitExecutionOutcome, WriteExecutionBindings};
+use crate::live_state::RowIdentity;
 use crate::projections::ProjectionRegistry;
 use crate::session::collaborators::SessionCollaborators;
 use crate::session::read_execution_bindings::ProjectionRegistryReadExecutionBindings;
@@ -221,13 +223,27 @@ pub(crate) async fn execute_public_tracked_append(
     unit: &TrackedTxnUnit,
     mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
 ) -> Result<TrackedCommitExecutionOutcome, LixError> {
+    let writer_key_updates = tracked_writer_key_updates_for_unit(unit);
     if unit
         .execution
         .change_batch
         .as_ref()
         .is_some_and(|batch| batch.changes.is_empty())
         && !unit.has_compiler_only_filesystem_changes()
+        && writer_key_updates.is_empty()
     {
+        return Ok(TrackedCommitExecutionOutcome::default());
+    }
+
+    if unit.execution.change_batch.is_none()
+        && !unit.has_compiler_only_filesystem_changes()
+        && !writer_key_updates.is_empty()
+    {
+        let live_rows =
+            tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
+        if !live_rows.is_empty() {
+            crate::live_state::write_live_rows(transaction, &live_rows).await?;
+        }
         return Ok(TrackedCommitExecutionOutcome::default());
     }
 
@@ -276,6 +292,14 @@ pub(crate) async fn execute_public_tracked_append(
         !unit.has_compiler_only_filesystem_changes(),
     )
     .await?;
+
+    if !writer_key_updates.is_empty() {
+        let live_rows =
+            tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
+        if !live_rows.is_empty() {
+            crate::live_state::write_live_rows(transaction, &live_rows).await?;
+        }
+    }
 
     if append_outcome.merged_into_pending_session
         && create_commit_functions
@@ -450,6 +474,79 @@ fn canonical_create_commit_preconditions_from_public_write(
 
 fn public_changes_to_staged(changes: &[PublicChange]) -> Result<Vec<StagedChange>, LixError> {
     changes.iter().map(public_change_to_staged).collect()
+}
+
+fn tracked_writer_key_updates_for_unit(
+    unit: &TrackedTxnUnit,
+) -> BTreeMap<RowIdentity, Option<String>> {
+    let mut updates = BTreeMap::new();
+    for public_write in &unit.public_writes {
+        let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
+            continue;
+        };
+        for partition in &resolved.partitions {
+            if partition.execution_mode != crate::contracts::artifacts::WriteMode::Tracked {
+                continue;
+            }
+            updates.extend(partition.writer_key_updates.iter().map(
+                |(row_identity, writer_key)| {
+                    (
+                        RowIdentity {
+                            schema_key: row_identity.schema_key.clone(),
+                            version_id: row_identity.version_id.clone(),
+                            entity_id: row_identity.entity_id.clone(),
+                            file_id: row_identity.file_id.clone(),
+                        },
+                        writer_key.clone(),
+                    )
+                },
+            ));
+        }
+    }
+    updates
+}
+
+async fn tracked_live_rows_for_writer_key_updates(
+    transaction: &mut dyn LixBackendTransaction,
+    updates: &BTreeMap<RowIdentity, Option<String>>,
+) -> Result<Vec<crate::live_state::LiveRow>, LixError> {
+    let backend = TransactionBackendAdapter::new(transaction);
+    let mut rows = Vec::with_capacity(updates.len());
+    for (row_identity, writer_key) in updates {
+        let row = crate::live_state::load_exact_live_row(
+            &backend,
+            &crate::live_state::ExactLiveRowQuery {
+                semantics: crate::live_state::LiveRowSemantics::Tracked,
+                schema_key: row_identity.schema_key.clone(),
+                version_id: row_identity.version_id.clone(),
+                entity_id: row_identity.entity_id.clone(),
+                file_id: Some(row_identity.file_id.clone()),
+                schema_version: None,
+                plugin_key: None,
+                writer_key: None,
+                global: None,
+                untracked: Some(false),
+                include_tombstones: true,
+                include_global_overlay: true,
+                include_untracked_overlay: true,
+            },
+        )
+        .await?
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "writer_key-only live-state update requires tracked row '{}:{}'",
+                    row_identity.schema_key, row_identity.entity_id
+                ),
+            )
+        })?;
+        rows.push(crate::live_state::LiveRow {
+            writer_key: writer_key.clone(),
+            ..row
+        });
+    }
+    Ok(rows)
 }
 
 fn public_change_to_staged(change: &PublicChange) -> Result<StagedChange, LixError> {

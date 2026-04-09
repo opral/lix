@@ -13,7 +13,8 @@ pub(crate) use annotations::overrides::{
 };
 pub(crate) use builtin::{
     builtin_schema_definition, builtin_schema_json, builtin_schema_keys, decode_lixcol_literal,
-    LixActiveVersion, LixCommit, LixVersionDescriptor, LixVersionRef,
+    lix_state_surface_schema_definition, LixActiveVersion, LixCommit, LixVersionDescriptor,
+    LixVersionRef,
 };
 pub use definition::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,

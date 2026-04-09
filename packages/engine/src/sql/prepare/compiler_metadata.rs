@@ -3,15 +3,17 @@ use std::collections::BTreeMap;
 
 use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingSemanticStorage, PendingView, SqlPreparationMetadataReader};
-use crate::schema::builtin_schema_definition;
-use crate::schema::{schema_from_registered_snapshot, SchemaKey};
+use crate::schema::{
+    builtin_schema_definition, lix_state_surface_schema_definition,
+    schema_from_registered_snapshot, SchemaKey,
+};
 use crate::sql::common::text::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
-use serde_json::{json, Value as JsonValue};
+use serde_json::Value as JsonValue;
 
 const REGISTERED_SCHEMA_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const GLOBAL_VERSION: &str = "global";
-const LIVE_STATE_INTERNAL_SCHEMA_KEY: &str = "lix_state";
+const LIX_STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SqlCompilerMetadata {
     pub(crate) known_live_schema_definitions: BTreeMap<String, JsonValue>,
@@ -69,8 +71,8 @@ async fn load_latest_schema_for_preparation_with_pending(
     schema_key: &str,
     pending_entry: Option<&PendingLatestSchemaEntry>,
 ) -> Result<JsonValue, LixError> {
-    if schema_key == LIVE_STATE_INTERNAL_SCHEMA_KEY {
-        return Ok(lix_state_internal_schema());
+    if schema_key == LIX_STATE_SURFACE_SCHEMA_KEY {
+        return Ok(lix_state_surface_schema_definition().clone());
     }
 
     if let Some(schema) = builtin_schema_definition(schema_key) {
@@ -218,28 +220,4 @@ fn required_text_cell(row: &[Value], index: usize, name: &str) -> Result<String,
             format!("missing value for {name}"),
         )),
     }
-}
-
-fn lix_state_internal_schema() -> JsonValue {
-    json!({
-        "x-lix-key": "lix_state",
-        "x-lix-version": "1",
-        "x-lix-primary-key": [
-            "/entity_id",
-            "/schema_key",
-            "/file_id"
-        ],
-        "type": "object",
-        "properties": {
-            "entity_id": { "type": "string" },
-            "schema_key": { "type": "string" },
-            "file_id": { "type": "string" }
-        },
-        "required": [
-            "entity_id",
-            "schema_key",
-            "file_id"
-        ],
-        "additionalProperties": true
-    })
 }

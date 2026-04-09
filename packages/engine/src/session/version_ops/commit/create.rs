@@ -361,7 +361,7 @@ pub(crate) async fn create_commit(
         GenerateCommitArgs {
             timestamp: timestamp.clone(),
             active_accounts: preflight.active_accounts,
-            changes: staged_changes,
+            changes: staged_changes.clone(),
             versions,
             force_commit_versions: if args.allow_empty_commit {
                 lane_version_id
@@ -466,7 +466,7 @@ pub(crate) async fn create_commit(
         committed_head,
         receipt: Some(receipt),
         applied_output: Some(applied_output),
-        applied_changes,
+        applied_changes: staged_changes,
     })
 }
 

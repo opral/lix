@@ -1,11 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::artifacts::{
-    coalesce_live_table_requirements, ChangeBatch, ExpectedHead, MutationRow, OptionalTextPatch,
-    PlanEffects, PlannedStateRow, PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
+    coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
+    IdempotencyKey, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
+    PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
     PreparedPublicWriteExecutionArtifact, PreparedPublicWriteExecutionPartition,
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteStep,
-    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
+    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
 };
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
 use crate::execution::write::filesystem::runtime::{
@@ -454,6 +455,27 @@ pub(crate) fn build_planned_write_plan(
                 }
             }
         }
+        if let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() {
+            for partition in &resolved.partitions {
+                if partition.execution_mode != WriteMode::Tracked
+                    || !partition.intended_post_state.is_empty()
+                    || partition.writer_key_updates.is_empty()
+                {
+                    continue;
+                }
+                units.push(PlannedWriteUnit::PublicTracked(build_tracked_txn_unit(
+                    public_write,
+                    &PreparedTrackedWriteExecution {
+                        schema_live_table_requirements: Vec::new(),
+                        change_batch: None,
+                        create_preconditions: writer_key_only_commit_preconditions(public_write),
+                        semantic_effects: PlanEffects::default(),
+                    },
+                    &filesystem_state,
+                    runtime_state,
+                )));
+            }
+        }
     } else if let Some(internal_execution) = prepared.internal_write() {
         if internal_execution.read_only_query {
             return None;
@@ -481,6 +503,22 @@ pub(crate) fn build_planned_write_delta(
     build_planned_write_plan(prepared, runtime_state)
         .map(PlannedWriteDelta::from_materialization_plan)
         .transpose()
+}
+
+fn writer_key_only_commit_preconditions(
+    public_write: &PreparedPublicWriteArtifact,
+) -> CommitPreconditions {
+    let write_lane = public_write
+        .contract
+        .requested_version_id
+        .as_ref()
+        .map(|version_id| WriteLane::SingleVersion(version_id.clone()))
+        .unwrap_or(WriteLane::ActiveVersion);
+    CommitPreconditions {
+        write_lane,
+        expected_head: ExpectedHead::CurrentHead,
+        idempotency_key: IdempotencyKey("writer-key-only-live-state-update".to_string()),
+    }
 }
 
 fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> SchemaRegistrationSet {
@@ -561,6 +599,17 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                     for partition in &resolved.partitions {
                         if partition.execution_mode != WriteMode::Tracked {
                             continue;
+                        }
+                        for (row_identity, writer_key) in &partition.writer_key_updates {
+                            overlay.annotations.insert(
+                                RowIdentity {
+                                    schema_key: row_identity.schema_key.clone(),
+                                    version_id: row_identity.version_id.clone(),
+                                    entity_id: row_identity.entity_id.clone(),
+                                    file_id: row_identity.file_id.clone(),
+                                },
+                                writer_key.clone(),
+                            );
                         }
                         for row in &partition.intended_post_state {
                             let Some(version_id) = row.version_id.as_ref() else {

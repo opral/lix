@@ -64,6 +64,10 @@ impl LiveReadRow {
         self.metadata.as_deref()
     }
 
+    pub(crate) fn writer_key(&self) -> Option<&str> {
+        self.writer_key.as_deref()
+    }
+
     pub(crate) fn change_id(&self) -> Option<&str> {
         self.change_id.as_deref()
     }
