@@ -230,6 +230,12 @@ async fn live_untracked_state_roundtrips_helper_rows() {
     init_live_state(&backend)
         .await
         .expect("live_state init should succeed");
+    crate::live_state::register_schema(&backend, "lix_active_version")
+        .await
+        .expect("lix_active_version schema registration should succeed");
+    crate::live_state::register_schema(&backend, "lix_version_ref")
+        .await
+        .expect("lix_version_ref schema registration should succeed");
     commit_untracked_rows(
         &backend,
         vec![
@@ -342,6 +348,9 @@ async fn live_untracked_state_delete_removes_rows() {
     init_live_state(&backend)
         .await
         .expect("live_state init should succeed");
+    crate::live_state::register_schema(&backend, "lix_version_ref")
+        .await
+        .expect("lix_version_ref schema registration should succeed");
     commit_untracked_rows(
         &backend,
         vec![local_version_head_live_row("main", "commit-1", timestamp)],

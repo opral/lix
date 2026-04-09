@@ -85,7 +85,7 @@ async fn register_writer_key_test_schema(engine: &support::simulation_test::Simu
 }
 
 simulation_test!(
-    tracked_reads_overlay_writer_key_while_untracked_rows_store_it,
+    tracked_and_untracked_reads_overlay_writer_key_annotations,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -152,22 +152,26 @@ simulation_test!(
             "editor:both",
         );
 
-        let untracked = engine
+        let untracked_annotation = engine
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_live_v1_wk_writer_key_schema \
+                     FROM lix_internal_writer_key \
                      WHERE entity_id = 'wk-untracked' \
+                       AND schema_key = 'wk_writer_key_schema' \
+                       AND file_id = 'file-1' \
                        AND version_id = '{version_id}' \
-                       AND untracked = true \
                      LIMIT 1"
                 ),
                 &[],
             )
             .await
             .unwrap();
-        assert_eq!(untracked.statements[0].rows.len(), 1);
-        assert_text(&untracked.statements[0].rows[0][0], "editor:both");
+        assert_eq!(untracked_annotation.statements[0].rows.len(), 1);
+        assert_text(
+            &untracked_annotation.statements[0].rows[0][0],
+            "editor:both",
+        );
 
         let view_rows = engine
             .execute(
@@ -201,7 +205,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
         engine
             .execute(
-                "SELECT writer_key FROM lix_internal_live_v1_lix_file_descriptor LIMIT 0",
+                "SELECT entity_id FROM lix_internal_live_v1_lix_file_descriptor LIMIT 0",
                 &[],
             )
             .await
@@ -278,7 +282,7 @@ simulation_test!(
         let raw_tracked = engine
             .execute(
                 &format!(
-                    "SELECT writer_key \
+                    "SELECT change_id \
                      FROM lix_internal_live_v1_lix_file_descriptor \
                      WHERE entity_id = 'wk-file-1' \
                        AND version_id = '{version_id}' \
@@ -290,7 +294,10 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(raw_tracked.statements[0].rows.len(), 1);
-        assert_null(&raw_tracked.statements[0].rows[0][0]);
+        match &raw_tracked.statements[0].rows[0][0] {
+            Value::Text(change_id) => assert!(!change_id.is_empty()),
+            other => panic!("expected text change_id after rebuild, got {other:?}"),
+        }
 
         let rebuilt_file_row = engine
             .execute(
@@ -412,7 +419,7 @@ fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
                 let raw_tracked = session_b
                     .execute(
                         &format!(
-                            "SELECT writer_key \
+                            "SELECT change_id \
                              FROM lix_internal_live_v1_lix_file_descriptor \
                              WHERE entity_id = 'wk-reopen' \
                                AND version_id = '{version_id}' \
@@ -424,7 +431,10 @@ fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
                     .await
                     .expect("raw tracked query should succeed");
                 assert_eq!(raw_tracked.statements[0].rows.len(), 1);
-                assert_null(&raw_tracked.statements[0].rows[0][0]);
+                match &raw_tracked.statements[0].rows[0][0] {
+                    Value::Text(change_id) => assert!(!change_id.is_empty()),
+                    other => panic!("expected text change_id after reopen, got {other:?}"),
+                }
 
                 let state_row = session_b
                     .execute(
@@ -610,7 +620,7 @@ simulation_test!(
         let tombstone = engine
             .execute(
                 &format!(
-                    "SELECT writer_key, is_tombstone \
+                    "SELECT is_tombstone \
                      FROM lix_internal_live_v1_lix_file_descriptor \
                      WHERE entity_id = 'wk-clear-delete' \
                        AND version_id = '{version_id}' \
@@ -621,8 +631,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(tombstone.statements[0].rows.len(), 1);
-        assert_null(&tombstone.statements[0].rows[0][0]);
-        assert_eq!(tombstone.statements[0].rows[0][1], Value::Integer(1));
+        assert_eq!(tombstone.statements[0].rows[0][0], Value::Integer(1));
     }
 );
 

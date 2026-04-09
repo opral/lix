@@ -146,7 +146,7 @@ async fn scan_rows_with_limit_and_order(
     let selected_columns = selected_columns(&access, &request.required_columns, "tracked")?;
     let projection = selected_projection_sql(&selected_columns);
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
-        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, writer_key, created_at, updated_at",
+        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, created_at, updated_at",
         schema_key: &request.schema_key,
         version_id: &request.version_id,
         projection: &projection,
@@ -176,7 +176,7 @@ async fn scan_tombstones_with_limit_and_order(
     order_by: &[&str],
 ) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
-        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, writer_key, created_at, updated_at",
+        select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, created_at, updated_at",
         schema_key: &request.schema_key,
         version_id: &request.version_id,
         projection: "",
@@ -213,13 +213,12 @@ fn decode_tracked_row(
     let plugin_key = required_text_cell(row, 6, schema_key, "plugin_key", "tracked")?;
     let metadata = row.get(7).and_then(text_from_value);
     let change_id = row.get(8).and_then(text_from_value);
-    let writer_key = row.get(9).and_then(text_from_value);
-    let created_at = required_text_cell(row, 10, schema_key, "created_at", "tracked")?;
-    let updated_at = required_text_cell(row, 11, schema_key, "updated_at", "tracked")?;
+    let created_at = required_text_cell(row, 9, schema_key, "created_at", "tracked")?;
+    let updated_at = required_text_cell(row, 10, schema_key, "updated_at", "tracked")?;
 
     let mut values = std::collections::BTreeMap::new();
     for (offset, column) in selected_columns.iter().enumerate() {
-        let raw_value = row.get(12 + offset).ok_or_else(|| {
+        let raw_value = row.get(11 + offset).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 &format!(
@@ -242,7 +241,7 @@ fn decode_tracked_row(
         plugin_key,
         metadata,
         change_id,
-        writer_key,
+        writer_key: None,
         created_at,
         updated_at,
         values,
@@ -298,8 +297,8 @@ fn decode_tracked_tombstone(
         )?),
         metadata: row.get(7).and_then(text_from_value),
         change_id: row.get(8).and_then(text_from_value),
-        writer_key: row.get(9).and_then(text_from_value),
-        created_at: row.get(10).and_then(text_from_value),
-        updated_at: row.get(11).and_then(text_from_value),
+        writer_key: None,
+        created_at: row.get(9).and_then(text_from_value),
+        updated_at: row.get(10).and_then(text_from_value),
     })
 }

@@ -27,7 +27,6 @@ pub(crate) fn ensure_schema_live_table_sql_statements(
          plugin_key TEXT NOT NULL,\
          change_id TEXT,\
          metadata TEXT,\
-         writer_key TEXT,\
          is_tombstone INTEGER NOT NULL DEFAULT 0,\
          untracked BOOLEAN NOT NULL DEFAULT false,\
          created_at TEXT NOT NULL,\

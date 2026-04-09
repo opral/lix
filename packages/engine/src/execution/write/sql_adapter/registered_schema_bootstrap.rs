@@ -37,7 +37,6 @@ pub(super) async fn mirror_registered_schema_planned_rows_in_transaction(
                 plugin_key: plugin_key.as_str(),
                 snapshot_content: snapshot_content.as_deref(),
                 metadata,
-                writer_key: row.writer_key.as_deref(),
                 untracked,
             },
         )
@@ -78,7 +77,6 @@ pub(super) async fn mirror_registered_schema_mutations_in_transaction(
                 plugin_key: row.plugin_key.as_str(),
                 snapshot_content: snapshot_content.as_deref(),
                 metadata: None,
-                writer_key: None,
                 untracked: row.untracked,
             },
         )
@@ -96,7 +94,6 @@ struct RegisteredSchemaBootstrapRow<'a> {
     plugin_key: &'a str,
     snapshot_content: Option<&'a str>,
     metadata: Option<&'a str>,
-    writer_key: Option<&'a str>,
     untracked: bool,
 }
 
@@ -112,16 +109,12 @@ async fn upsert_registered_schema_bootstrap_row_in_transaction(
         .metadata
         .map(|value| format!("'{}'", escape_sql_string(value)))
         .unwrap_or_else(|| "NULL".to_string());
-    let writer_key_sql = row
-        .writer_key
-        .map(|value| format!("'{}'", escape_sql_string(value)))
-        .unwrap_or_else(|| "NULL".to_string());
     let synthetic_change_id = format!("bootstrap~{}", row.entity_id);
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, untracked, created_at, updated_at\
+         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, untracked, created_at, updated_at\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {writer_key}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'\
+         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'\
          ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
          schema_key = excluded.schema_key, \
          schema_version = excluded.schema_version, \
@@ -130,7 +123,6 @@ async fn upsert_registered_schema_bootstrap_row_in_transaction(
          snapshot_content = excluded.snapshot_content, \
          change_id = excluded.change_id, \
          metadata = excluded.metadata, \
-         writer_key = excluded.writer_key, \
          is_tombstone = excluded.is_tombstone, \
          updated_at = excluded.updated_at",
         table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
@@ -148,7 +140,6 @@ async fn upsert_registered_schema_bootstrap_row_in_transaction(
         snapshot_content = snapshot_sql,
         change_id = escape_sql_string(&synthetic_change_id),
         metadata = metadata_sql,
-        writer_key = writer_key_sql,
         is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 },
         untracked = if row.untracked { "true" } else { "false" },
         created_at = PENDING_BOOTSTRAP_TIMESTAMP,

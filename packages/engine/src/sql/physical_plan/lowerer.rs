@@ -1033,7 +1033,6 @@ fn build_entity_source_sql(
     } else {
         projection.join(", ")
     };
-
     let state_source_sql = match surface_binding.descriptor.surface_variant {
         SurfaceVariant::Default | SurfaceVariant::ByVersion => {
             Some(build_effective_public_read_source_sql(
@@ -2049,8 +2048,15 @@ mod tests {
             .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
+        assert!(lowered_sql.contains("FROM lix_internal_change commit_change"));
+        assert!(lowered_sql
+            .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"));
         assert!(!lowered_sql.contains("FROM lix_state"));
         assert!(!lowered_sql.contains(") WHERE schema_key = 'lix_key_value'"));
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_change_set_element"),
+            "effective-state lowering should not depend on live change-set element mirrors: {lowered_sql}"
+        );
         assert_eq!(
             lowered.pushdown_decision.accepted_predicate_sql(),
             vec!["schema_key = 'lix_key_value'".to_string()]
@@ -2102,6 +2108,118 @@ mod tests {
         assert!(
             !lowered_sql.contains("json_extract(\"ranked\".\"entity_id\""),
             "string payload predicates should not rely on sqlite JSON extraction: {lowered_sql}"
+        );
+        assert!(
+            lowered_sql.contains("FROM lix_internal_change commit_change"),
+            "change-set element lowering should derive from canonical commit facts: {lowered_sql}"
+        );
+        assert!(
+            lowered_sql
+                .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"),
+            "change-set element lowering should expand commit membership lazily: {lowered_sql}"
+        );
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_change_set_element"),
+            "change-set element lowering should not use live change-set element mirrors: {lowered_sql}"
+        );
+    }
+
+    #[test]
+    fn lowers_change_set_element_by_version_reads_through_version_heads() {
+        let registry = crate::surfaces::build_builtin_surface_registry();
+        let lowered = lowered_program(
+            &registry,
+            "SELECT change_id, version_id FROM lix_change_set_element_by_version \
+             WHERE version_id = 'main' AND schema_key = 'lix_file_descriptor'",
+        )
+        .expect("change-set element by-version read should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(
+            lowered_sql.contains("current_refs AS"),
+            "by-version lowering should resolve current version heads: {lowered_sql}"
+        );
+        assert!(
+            lowered_sql.contains("current_refs JOIN lix_internal_change commit_change ON commit_change.entity_id = current_refs.head_commit_id"),
+            "by-version lowering should expand only the current head commit per version: {lowered_sql}"
+        );
+        assert!(
+            lowered_sql.contains("commit_rows.target_version_id AS version_id"),
+            "by-version lowering should preserve the target version id through lazy membership expansion: {lowered_sql}"
+        );
+        assert!(
+            lowered_sql
+                .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"),
+            "by-version lowering should expand commit membership lazily: {lowered_sql}"
+        );
+        assert!(
+            lowered_sql.contains("lix_internal_live_v1_lix_version_ref"),
+            "by-version lowering should resolve heads through version refs: {lowered_sql}"
+        );
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_change_set_element"),
+            "by-version lowering should not use live change-set element mirrors: {lowered_sql}"
+        );
+    }
+
+    #[test]
+    fn commit_family_entity_views_lower_as_state_projections() {
+        let registry = crate::surfaces::build_builtin_surface_registry();
+
+        let commit = lowered_program(
+            &registry,
+            "SELECT change_set_id FROM lix_commit WHERE id = 'commit-1'",
+        )
+        .expect("commit entity view should lower");
+        let commit_sql = commit.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(
+            commit_sql.contains("target_versions AS"),
+            "commit entity view should route through state target-version resolution: {commit_sql}"
+        );
+        assert!(
+            commit_sql.contains("WHERE ch.schema_key = 'lix_commit'"),
+            "commit entity view should project over lazy commit state rows: {commit_sql}"
+        );
+        assert!(
+            !commit_sql.contains("FROM lix_commit"),
+            "commit entity view should not recurse through the public commit relation: {commit_sql}"
+        );
+        assert!(
+            !commit_sql.contains("lix_internal_live_v1_lix_commit"),
+            "commit entity view should not depend on live commit mirrors: {commit_sql}"
+        );
+
+        let author = lowered_program(
+            &registry,
+            "SELECT account_id FROM lix_change_author_by_version WHERE version_id = 'version-a'",
+        )
+        .expect("change-author by-version view should lower");
+        let author_sql = author.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(
+            author_sql.contains("current_refs AS"),
+            "change-author by-version view should route through state version-head scoping: {author_sql}"
+        );
+        assert!(
+            author_sql.contains(
+                "JOIN json_each(commit_rows.commit_snapshot_content, '$.author_account_ids')"
+            ),
+            "change-author by-version view should project over lazy author state rows: {author_sql}"
+        );
+        assert!(
+            !author_sql.contains("FROM lix_change_author_by_version"),
+            "change-author by-version view should not recurse through the public relation: {author_sql}"
+        );
+        assert!(
+            !author_sql.contains("lix_internal_live_v1_lix_change_author"),
+            "change-author by-version view should not depend on live author mirrors: {author_sql}"
         );
     }
 
@@ -2413,6 +2531,11 @@ mod tests {
         assert!(current_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
         assert!(current_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(current_sql.contains("lix_internal_binary_blob_store"));
+        assert!(current_sql.contains("FROM lix_internal_change commit_change"));
+        assert!(current_sql
+            .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"));
+        assert!(!current_sql.contains("lix_internal_live_v1_lix_commit"));
+        assert!(!current_sql.contains("lix_internal_live_v1_lix_change_set_element"));
         assert!(!current_sql.contains("FROM lix_file_by_version"));
         assert_eq!(
             current.pushdown_decision.residual_predicate_sql(),
@@ -2431,6 +2554,11 @@ mod tests {
 
         assert!(by_version_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
         assert!(by_version_sql.contains("all_target_versions AS"));
+        assert!(by_version_sql.contains("FROM lix_internal_change commit_change"));
+        assert!(by_version_sql
+            .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"));
+        assert!(!by_version_sql.contains("lix_internal_live_v1_lix_commit"));
+        assert!(!by_version_sql.contains("lix_internal_live_v1_lix_change_set_element"));
         assert!(!by_version_sql.contains("FROM lix_directory_by_version"));
         assert_eq!(
             by_version.pushdown_decision.residual_predicate_sql(),
@@ -2439,6 +2567,146 @@ mod tests {
                 "lixcol_version_id = 'version-a'".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn lowers_commit_family_state_reads_through_lazy_state_derivation() {
+        let registry = crate::surfaces::build_builtin_surface_registry();
+
+        let current = lowered_program(
+            &registry,
+            "SELECT entity_id, schema_key, snapshot_content \
+             FROM lix_state \
+             WHERE schema_key = 'lix_commit_edge' \
+               AND entity_id = 'parent~child'",
+        )
+        .expect("commit-family state read should lower");
+        let current_sql = current.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(current_sql.contains("FROM lix_internal_change commit_change"));
+        assert!(current_sql.contains(
+            "JOIN json_each(commit_rows.commit_snapshot_content, '$.parent_commit_ids')"
+        ));
+        assert!(
+            !current_sql.contains("lix_internal_live_v1_lix_commit_edge"),
+            "state lowering should not depend on live commit-edge mirrors: {current_sql}"
+        );
+        assert!(
+            !current_sql.contains("FROM lix_commit_edge"),
+            "state lowering should not recurse through public commit-edge surfaces: {current_sql}"
+        );
+
+        let by_version = lowered_program(
+            &registry,
+            "SELECT entity_id, schema_key, snapshot_content, version_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_change_author' \
+               AND version_id = 'version-a'",
+        )
+        .expect("commit-family by-version state read should lower");
+        let by_version_sql = by_version.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(by_version_sql.contains("current_refs AS"));
+        assert!(by_version_sql.contains("lix_internal_live_v1_lix_version_ref"));
+        assert!(by_version_sql.contains(
+            "JOIN json_each(commit_rows.commit_snapshot_content, '$.author_account_ids')"
+        ));
+        assert!(by_version_sql
+            .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"));
+        assert!(
+            !by_version_sql.contains("lix_internal_live_v1_lix_change_author"),
+            "by-version state lowering should not depend on live change-author mirrors: {by_version_sql}"
+        );
+        assert!(
+            !by_version_sql.contains("FROM lix_change_author_by_version"),
+            "by-version state lowering should not recurse through public change-author surfaces: {by_version_sql}"
+        );
+    }
+
+    #[test]
+    fn commit_family_reads_do_not_depend_on_eager_live_mirrors() {
+        let registry = crate::surfaces::build_builtin_surface_registry();
+        let cases = [
+            (
+                "state-commit",
+                "SELECT entity_id, schema_key, snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_commit' \
+                   AND entity_id = 'commit-1'",
+            ),
+            (
+                "state-change-set-element-by-version",
+                "SELECT entity_id, schema_key, snapshot_content, version_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_change_set_element' \
+                   AND version_id = 'version-a'",
+            ),
+            (
+                "state-commit-edge",
+                "SELECT entity_id, schema_key, snapshot_content \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_commit_edge' \
+                   AND entity_id = 'parent~child'",
+            ),
+            (
+                "state-change-author-by-version",
+                "SELECT entity_id, schema_key, snapshot_content, version_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_change_author' \
+                   AND version_id = 'version-a'",
+            ),
+            (
+                "entity-commit",
+                "SELECT id, change_set_id FROM lix_commit WHERE id = 'commit-1'",
+            ),
+            (
+                "entity-change-set-element-by-version",
+                "SELECT change_id \
+                 FROM lix_change_set_element_by_version \
+                 WHERE version_id = 'version-a'",
+            ),
+            (
+                "entity-commit-edge",
+                "SELECT parent_id, child_id \
+                 FROM lix_commit_edge \
+                 WHERE id = 'parent~child'",
+            ),
+            (
+                "entity-change-author-by-version",
+                "SELECT account_id \
+                 FROM lix_change_author_by_version \
+                 WHERE version_id = 'version-a'",
+            ),
+        ];
+
+        for (label, sql) in cases {
+            let lowered =
+                lowered_program(&registry, sql).unwrap_or_else(|| panic!("{label} should lower"));
+            let lowered_sql = lowered.statements[0]
+                .render_sql(SqlDialect::Sqlite)
+                .unwrap_or_else(|_| panic!("{label} should render"));
+
+            assert!(
+                !lowered_sql.contains("lix_internal_live_v1_lix_commit"),
+                "{label} should not depend on live commit mirrors: {lowered_sql}"
+            );
+            assert!(
+                !lowered_sql.contains("lix_internal_live_v1_lix_change_set_element"),
+                "{label} should not depend on live change-set element mirrors: {lowered_sql}"
+            );
+            assert!(
+                !lowered_sql.contains("lix_internal_live_v1_lix_commit_edge"),
+                "{label} should not depend on live commit-edge mirrors: {lowered_sql}"
+            );
+            assert!(
+                !lowered_sql.contains("lix_internal_live_v1_lix_change_author"),
+                "{label} should not depend on live change-author mirrors: {lowered_sql}"
+            );
+        }
     }
 
     #[test]
@@ -2519,6 +2787,11 @@ mod tests {
         );
         assert!(lowered_sql.contains("lix_version_descriptor"));
         assert!(lowered_sql.contains("lix_internal_change"));
+        assert!(
+            !lowered_sql.contains("lix_internal_live_v1_lix_commit"),
+            "lowered sql still depends on live lix_commit rows: {lowered_sql}"
+        );
+        assert!(lowered_sql.contains("WHERE ch.schema_key = 'lix_commit'"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_version_ref"));
     }
 

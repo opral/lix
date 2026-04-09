@@ -754,6 +754,14 @@ impl SharedDeterministicRun {
             .lock()
             .expect("shared deterministic mutex poisoned");
 
+        if state.baseline_backend.is_none() && state.expected_values.is_empty() {
+            state.baseline_finished = true;
+            state.baseline_failed = !success;
+            state.baseline_call_count = Some(0);
+            self.state.condvar.notify_all();
+            return Ok(());
+        }
+
         if self.is_current_baseline(&state) || self.maybe_claim_fallback_baseline(&mut state) {
             state.baseline_finished = true;
             state.baseline_failed = !success;
@@ -989,11 +997,7 @@ where
     }
 }
 
-pub async fn run_single_simulation_test<F, Fut>(
-    simulation_name: &str,
-    case_id: &str,
-    test_fn: F,
-)
+pub async fn run_single_simulation_test<F, Fut>(simulation_name: &str, case_id: &str, test_fn: F)
 where
     F: Fn(SimulationArgs) -> Fut,
     Fut: Future<Output = ()>,
@@ -1015,7 +1019,6 @@ where
 pub fn default_simulations() -> Vec<Simulation> {
     default_simulations_impl()
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum StatementKind {
@@ -1060,7 +1063,8 @@ mod tests {
     fn shared_deterministic_prefers_sqlite_when_it_participates() {
         let case_id = "simulation_test::prefers_sqlite_when_present";
 
-        let (postgres_expect, _postgres_guard) = SharedExpectDeterministic::new(case_id, "postgres");
+        let (postgres_expect, _postgres_guard) =
+            SharedExpectDeterministic::new(case_id, "postgres");
         let state = postgres_expect
             .run
             .state
@@ -1083,7 +1087,8 @@ mod tests {
     #[test]
     fn shared_deterministic_falls_back_when_sqlite_never_starts() {
         let case_id = "simulation_test::falls_back_without_sqlite";
-        let (postgres_expect, _postgres_guard) = SharedExpectDeterministic::new(case_id, "postgres");
+        let (postgres_expect, _postgres_guard) =
+            SharedExpectDeterministic::new(case_id, "postgres");
 
         {
             let mut state = postgres_expect

@@ -161,6 +161,20 @@ async fn change_set_element_change_ids_for_change_set(
     change_ids
 }
 
+async fn drop_commit_family_live_mirrors(engine: &SimulationEngine) {
+    for table in [
+        "lix_internal_live_v1_lix_commit",
+        "lix_internal_live_v1_lix_change_set_element",
+        "lix_internal_live_v1_lix_commit_edge",
+        "lix_internal_live_v1_lix_change_author",
+    ] {
+        engine
+            .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
+            .await
+            .unwrap();
+    }
+}
+
 simulation_test!(
     commit_writes_business_rows_to_change_and_snapshot_tables,
     |sim| async move {
@@ -300,6 +314,138 @@ simulation_test!(
                 .unwrap();
             assert_eq!(exists.statements[0].rows[0][0], Value::Integer(1));
         }
+    }
+);
+
+simulation_test!(
+    commit_family_rows_remain_visible_through_state_without_live_mirrors,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_engine(None)
+            .await
+            .expect("boot_simulated_engine should succeed");
+
+        engine.initialize().await.unwrap();
+        register_test_schema(&engine).await;
+        engine
+            .set_active_account_ids(vec!["acct-runtime".to_string()])
+            .await
+            .expect("set_active_account_ids should succeed");
+        engine.create_named_version("version-main").await.unwrap();
+
+        let previous_commit_id = read_version_ref_commit_id(&engine, "version-main").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'mirrorless-entity', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"value\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let new_commit_id = read_version_ref_commit_id(&engine, "version-main").await;
+        assert_ne!(new_commit_id, previous_commit_id);
+
+        let changes = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_internal_change \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'mirrorless-entity'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(changes.statements[0].rows.len(), 1);
+        let change_id = as_text(&changes.statements[0].rows[0][0]);
+
+        drop_commit_family_live_mirrors(&engine).await;
+
+        let commit_row = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_commit' \
+                   AND entity_id = $1 \
+                   AND version_id = 'version-main' \
+                 LIMIT 1",
+                &[Value::Text(new_commit_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit_row.statements[0].rows.len(), 1);
+        let commit_snapshot = parse_json(&commit_row.statements[0].rows[0][0]);
+        let change_set_id = commit_snapshot["change_set_id"]
+            .as_str()
+            .expect("commit state snapshot should include change_set_id")
+            .to_string();
+
+        let cse_rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_change_set_element' \
+                   AND version_id = 'version-main'",
+                &[],
+            )
+            .await
+            .unwrap();
+        let mut cse_contains_change = false;
+        for row in &cse_rows.statements[0].rows {
+            let parsed = parse_json(&row[0]);
+            if parsed["change_set_id"] == change_set_id && parsed["change_id"] == change_id {
+                cse_contains_change = true;
+                break;
+            }
+        }
+        assert!(cse_contains_change);
+
+        let edge_row = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_commit_edge' \
+                   AND entity_id = $1 \
+                   AND version_id = 'version-main' \
+                 LIMIT 1",
+                &[Value::Text(format!("{previous_commit_id}~{new_commit_id}"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(edge_row.statements[0].rows.len(), 1);
+        let edge_snapshot = parse_json(&edge_row.statements[0].rows[0][0]);
+        assert_eq!(
+            edge_snapshot["parent_id"].as_str(),
+            Some(previous_commit_id.as_str())
+        );
+        assert_eq!(
+            edge_snapshot["child_id"].as_str(),
+            Some(new_commit_id.as_str())
+        );
+
+        let author_row = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_change_author' \
+                   AND entity_id = $1 \
+                   AND version_id = 'version-main' \
+                 LIMIT 1",
+                &[Value::Text(format!("{change_id}~acct-runtime"))],
+            )
+            .await
+            .unwrap();
+        assert_eq!(author_row.statements[0].rows.len(), 1);
+        let author_snapshot = parse_json(&author_row.statements[0].rows[0][0]);
+        assert_eq!(
+            author_snapshot["change_id"].as_str(),
+            Some(change_id.as_str())
+        );
+        assert_eq!(author_snapshot["account_id"].as_str(), Some("acct-runtime"));
     }
 );
 
@@ -494,7 +640,7 @@ simulation_test!(
 
         let before_commit_count = engine
             .execute(
-                "SELECT COUNT(*) \
+                "SELECT COUNT(DISTINCT entity_id) \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
@@ -542,7 +688,7 @@ simulation_test!(
 
         let after_commit_count = engine
             .execute(
-                "SELECT COUNT(*) \
+                "SELECT COUNT(DISTINCT entity_id) \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
@@ -586,7 +732,7 @@ simulation_test!(
 
         let before_commit_count = engine
             .execute(
-                "SELECT COUNT(*) \
+                "SELECT COUNT(DISTINCT entity_id) \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],
@@ -642,7 +788,7 @@ simulation_test!(
 
         let after_commit_count = engine
             .execute(
-                "SELECT COUNT(*) \
+                "SELECT COUNT(DISTINCT entity_id) \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_commit'",
                 &[],

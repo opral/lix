@@ -388,9 +388,9 @@ async fn mirror_public_registered_schema_bootstrap_rows(
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, writer_key, is_tombstone, created_at, updated_at\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, created_at, updated_at\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, NULL, {is_tombstone}, '{created_at}', '{updated_at}'\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'\
              ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
@@ -399,7 +399,6 @@ async fn mirror_public_registered_schema_bootstrap_rows(
              snapshot_content = excluded.snapshot_content, \
              change_id = excluded.change_id, \
              metadata = excluded.metadata, \
-             writer_key = excluded.writer_key, \
              is_tombstone = excluded.is_tombstone, \
              updated_at = excluded.updated_at",
             table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,

@@ -345,7 +345,6 @@ fn live_envelope_column_names() -> BTreeSet<&'static str> {
         "snapshot_content",
         "change_id",
         "metadata",
-        "writer_key",
         "is_tombstone",
         "created_at",
         "updated_at",

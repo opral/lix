@@ -2,7 +2,8 @@ use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::FilesystemProjectionScope;
-use crate::live_state::payload_column_name_for_schema;
+use crate::live_state::{payload_column_name_for_schema, WRITER_KEY_TABLE};
+use crate::sql::physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::version_state::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 
@@ -11,22 +12,25 @@ const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 
+fn tracked_writer_key_join_sql(row_alias: &str, writer_alias: &str) -> String {
+    format!(
+        "LEFT JOIN {writer_key_table} {writer_alias} \
+           ON {writer_alias}.version_id = {row_alias}.version_id \
+          AND {writer_alias}.schema_key = {row_alias}.schema_key \
+          AND {writer_alias}.entity_id = {row_alias}.entity_id \
+          AND {writer_alias}.file_id = {row_alias}.file_id",
+        writer_key_table = WRITER_KEY_TABLE,
+        row_alias = quote_ident(row_alias),
+        writer_alias = quote_ident(writer_alias),
+    )
+}
+
 pub(crate) fn build_filesystem_file_projection_sql(
     scope: FilesystemProjectionScope,
     active_version_id: Option<&str>,
     include_blob_hash: bool,
     dialect: SqlDialect,
 ) -> Result<String, LixError> {
-    let commit_change_set_id_column =
-        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
-    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
-        "lix_change_set_element",
-        "change_set_id",
-    ));
-    let cse_change_id_column = quote_ident(&live_payload_column_name(
-        "lix_change_set_element",
-        "change_id",
-    ));
     let commit_id_projection = match scope {
         FilesystemProjectionScope::ActiveVersion => {
             active_version_commit_id_sql(required_active_version_id(scope, active_version_id)?)?
@@ -38,40 +42,11 @@ pub(crate) fn build_filesystem_file_projection_sql(
     } else {
         String::new()
     };
-    let live_commit_table = tracked_relation_name("lix_commit");
-    let live_cse_table = tracked_relation_name("lix_change_set_element");
 
     Ok(format!(
         "WITH RECURSIVE \
            {target_versions_cte}, \
-           commit_by_version AS ( \
-             SELECT \
-               entity_id AS commit_id, \
-               {commit_change_set_id_column} AS change_set_id \
-             FROM {live_commit_table} \
-             WHERE schema_key = 'lix_commit' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-           ), \
-           change_set_element_by_version AS ( \
-             SELECT \
-               {cse_change_set_id_column} AS change_set_id, \
-               {cse_change_id_column} AS change_id \
-             FROM {live_cse_table} \
-             WHERE schema_key = 'lix_change_set_element' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-           ), \
-           change_commit_by_change_id AS ( \
-             SELECT \
-               cse.change_id AS change_id, \
-               MAX(cbv.commit_id) AS commit_id \
-             FROM change_set_element_by_version cse \
-             JOIN commit_by_version cbv \
-               ON cbv.change_set_id = cse.change_set_id \
-             WHERE cse.change_id IS NOT NULL \
-             GROUP BY cse.change_id \
-           ), \
+           {lazy_change_commit_ctes}, \
            directory_descriptor_candidates AS ( \
              {directory_candidates_sql} \
            ), \
@@ -278,73 +253,31 @@ pub(crate) fn build_filesystem_file_projection_sql(
                 BINARY_BLOB_REF_SCHEMA_KEY
             ]
         )?,
+        lazy_change_commit_ctes = build_lazy_change_commit_by_change_id_ctes_sql(dialect),
         directory_candidates_sql = effective_directory_descriptor_candidates_sql(),
         file_candidates_sql = effective_file_descriptor_candidates_sql(dialect),
         blob_candidates_sql = effective_binary_blob_ref_candidates_sql(),
-        global_version = escape_sql_string(GLOBAL_VERSION_ID),
         blob_hash_projection = blob_hash_projection,
         binary_blob_store = INTERNAL_BINARY_BLOB_STORE,
         commit_id_projection = commit_id_projection,
-        commit_change_set_id_column = commit_change_set_id_column,
-        cse_change_set_id_column = cse_change_set_id_column,
-        cse_change_id_column = cse_change_id_column,
     ))
 }
 
 pub(crate) fn build_filesystem_directory_projection_sql(
     scope: FilesystemProjectionScope,
     active_version_id: Option<&str>,
-    _dialect: SqlDialect,
+    dialect: SqlDialect,
 ) -> Result<String, LixError> {
-    let commit_change_set_id_column =
-        quote_ident(&live_payload_column_name("lix_commit", "change_set_id"));
-    let cse_change_set_id_column = quote_ident(&live_payload_column_name(
-        "lix_change_set_element",
-        "change_set_id",
-    ));
-    let cse_change_id_column = quote_ident(&live_payload_column_name(
-        "lix_change_set_element",
-        "change_id",
-    ));
     let commit_id_projection = match scope {
         FilesystemProjectionScope::ActiveVersion => {
             active_version_commit_id_sql(required_active_version_id(scope, active_version_id)?)?
         }
         FilesystemProjectionScope::ExplicitVersion => "d.lixcol_commit_id".to_string(),
     };
-    let live_commit_table = tracked_relation_name("lix_commit");
-    let live_cse_table = tracked_relation_name("lix_change_set_element");
     Ok(format!(
         "WITH RECURSIVE \
            {target_versions_cte}, \
-           commit_by_version AS ( \
-             SELECT \
-               entity_id AS commit_id, \
-               {commit_change_set_id_column} AS change_set_id \
-             FROM {live_commit_table} \
-             WHERE schema_key = 'lix_commit' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-           ), \
-           change_set_element_by_version AS ( \
-             SELECT \
-               {cse_change_set_id_column} AS change_set_id, \
-               {cse_change_id_column} AS change_id \
-             FROM {live_cse_table} \
-             WHERE schema_key = 'lix_change_set_element' \
-               AND version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-           ), \
-           change_commit_by_change_id AS ( \
-             SELECT \
-               cse.change_id AS change_id, \
-               MAX(cbv.commit_id) AS commit_id \
-             FROM change_set_element_by_version cse \
-             JOIN commit_by_version cbv \
-               ON cbv.change_set_id = cse.change_set_id \
-             WHERE cse.change_id IS NOT NULL \
-             GROUP BY cse.change_id \
-           ), \
+           {lazy_change_commit_ctes}, \
            directory_descriptor_candidates AS ( \
              {directory_candidates_sql} \
            ), \
@@ -439,12 +372,9 @@ pub(crate) fn build_filesystem_directory_projection_sql(
           AND dp.lixcol_version_id = d.lixcol_version_id",
         target_versions_cte =
             target_versions_cte_sql(scope, active_version_id, &[DIRECTORY_DESCRIPTOR_SCHEMA_KEY])?,
+        lazy_change_commit_ctes = build_lazy_change_commit_by_change_id_ctes_sql(dialect),
         directory_candidates_sql = effective_directory_descriptor_candidates_sql(),
-        global_version = escape_sql_string(GLOBAL_VERSION_ID),
         commit_id_projection = commit_id_projection,
-        commit_change_set_id_column = commit_change_set_id_column,
-        cse_change_set_id_column = cse_change_set_id_column,
-        cse_change_id_column = cse_change_id_column,
     ))
 }
 
@@ -546,12 +476,13 @@ fn effective_state_candidates_sql(
            t.change_id AS change_id, \
            cc.commit_id AS commit_id, \
            false AS untracked, \
-           t.writer_key AS writer_key, \
+           wk.writer_key AS writer_key, \
            t.metadata AS metadata, \
            2 AS precedence \
          FROM {table_name} t \
          JOIN target_versions tv \
            ON tv.version_id = t.version_id \
+         {tracked_writer_key_join_sql} \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
          WHERE t.untracked = false \
@@ -570,13 +501,14 @@ fn effective_state_candidates_sql(
            t.change_id AS change_id, \
            cc.commit_id AS commit_id, \
            false AS untracked, \
-           t.writer_key AS writer_key, \
+           wk_global.writer_key AS writer_key, \
            t.metadata AS metadata, \
            4 AS precedence \
          FROM {table_name} t \
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND t.version_id = '{global_version}' \
+         {tracked_global_writer_key_join_sql} \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
          WHERE t.version_id = '{global_version}' \
@@ -596,12 +528,13 @@ fn effective_state_candidates_sql(
            NULL AS change_id, \
            'untracked' AS commit_id, \
            true AS untracked, \
-           u.writer_key AS writer_key, \
+           uwk.writer_key AS writer_key, \
            u.metadata AS metadata, \
            1 AS precedence \
          FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id = u.version_id \
+         {untracked_writer_key_join_sql} \
          WHERE u.untracked = true \
          UNION ALL \
          SELECT \
@@ -618,19 +551,24 @@ fn effective_state_candidates_sql(
            NULL AS change_id, \
            'untracked' AS commit_id, \
            true AS untracked, \
-           u.writer_key AS writer_key, \
+           uwk_global.writer_key AS writer_key, \
            u.metadata AS metadata, \
            3 AS precedence \
          FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND u.version_id = '{global_version}' \
+         {untracked_global_writer_key_join_sql} \
          WHERE u.version_id = '{global_version}' \
            AND u.untracked = true",
         table_name = table_name,
         untracked_table = untracked_table,
         tracked_payload_projection = tracked_payload_projection,
         untracked_payload_projection = untracked_payload_projection,
+        tracked_writer_key_join_sql = tracked_writer_key_join_sql("t", "wk"),
+        tracked_global_writer_key_join_sql = tracked_writer_key_join_sql("t", "wk_global"),
+        untracked_writer_key_join_sql = tracked_writer_key_join_sql("u", "uwk"),
+        untracked_global_writer_key_join_sql = tracked_writer_key_join_sql("u", "uwk_global"),
         global_version = escape_sql_string(GLOBAL_VERSION_ID),
     )
 }

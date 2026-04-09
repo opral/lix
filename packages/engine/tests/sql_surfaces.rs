@@ -4,6 +4,8 @@ mod support;
 
 #[path = "sql_surfaces/change.rs"]
 mod change;
+#[path = "sql_surfaces/change_set_element.rs"]
+mod change_set_element;
 #[path = "sql_surfaces/entity.rs"]
 mod entity;
 #[path = "sql_surfaces/entity_by_version.rs"]

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
+use crate::live_state::row_api::{load_exact_live_row, ExactLiveRowQuery, LiveRowSemantics};
 use crate::live_state::tracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest, TrackedWriteOperation,
@@ -238,13 +239,22 @@ async fn live_tracked_state_roundtrips_rows() {
     .await
     .expect("tracked transaction should succeed");
 
-    let exact = load_exact_row_with_backend(
+    let exact = load_exact_live_row(
         &backend,
-        &ExactTrackedRowRequest {
+        &ExactLiveRowQuery {
+            semantics: LiveRowSemantics::Tracked,
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
             file_id: Some("lix".to_string()),
+            schema_version: None,
+            plugin_key: None,
+            writer_key: None,
+            global: None,
+            untracked: None,
+            include_tombstones: false,
+            include_global_overlay: true,
+            include_untracked_overlay: true,
         },
     )
     .await
@@ -252,7 +262,14 @@ async fn live_tracked_state_roundtrips_rows() {
     .expect("tracked row should exist");
     assert_eq!(exact.change_id.as_deref(), Some("change-1"));
     assert_eq!(exact.writer_key.as_deref(), Some("writer-a"));
-    assert_eq!(exact.property_text("child_id").as_deref(), Some("child-1"));
+    let snapshot: serde_json::Value = serde_json::from_str(
+        exact
+            .snapshot_content
+            .as_deref()
+            .expect("tracked live row should include snapshot_content"),
+    )
+    .expect("tracked live row snapshot_content should be valid JSON");
+    assert_eq!(snapshot["child_id"].as_str(), Some("child-1"));
 
     let batch = load_exact_rows_with_backend(
         &backend,

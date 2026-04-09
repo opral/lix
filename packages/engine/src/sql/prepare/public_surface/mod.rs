@@ -1805,6 +1805,78 @@ mod tests {
         }
     }
 
+    fn is_registered_schema_live_scan(sql: &str) -> bool {
+        sql.contains("lix_internal_live_v1_lix_registered_schema")
+    }
+
+    fn registered_schema_live_scan_rows(schema_rows: &HashMap<String, String>) -> Vec<Vec<Value>> {
+        schema_rows
+            .iter()
+            .map(|(schema_key, snapshot)| {
+                let value_json = serde_json::from_str::<serde_json::Value>(snapshot)
+                    .ok()
+                    .and_then(|value| value.get("value").cloned())
+                    .unwrap_or(serde_json::Value::Null)
+                    .to_string();
+                vec![
+                    Value::Text(format!("{schema_key}~1")),
+                    Value::Text("lix_registered_schema".to_string()),
+                    Value::Text("1".to_string()),
+                    Value::Text("lix".to_string()),
+                    Value::Text("global".to_string()),
+                    Value::Boolean(true),
+                    Value::Text("lix".to_string()),
+                    Value::Null,
+                    Value::Text(format!("change-{schema_key}")),
+                    Value::Text("1970-01-01T00:00:00Z".to_string()),
+                    Value::Text("1970-01-01T00:00:00Z".to_string()),
+                    Value::Text(value_json),
+                ]
+            })
+            .collect()
+    }
+
+    fn registered_schema_live_rows_for_projection(
+        sql: &str,
+        schema_rows: &HashMap<String, String>,
+    ) -> (Vec<Vec<Value>>, Vec<String>) {
+        if sql.contains("SELECT schema_version, value_json") {
+            let rows = schema_rows
+                .iter()
+                .map(|(_schema_key, snapshot)| {
+                    let value_json = serde_json::from_str::<serde_json::Value>(snapshot)
+                        .ok()
+                        .and_then(|value| value.get("value").cloned())
+                        .unwrap_or(serde_json::Value::Null)
+                        .to_string();
+                    vec![Value::Text("1".to_string()), Value::Text(value_json)]
+                })
+                .collect::<Vec<_>>();
+            return (
+                rows,
+                vec!["schema_version".to_string(), "value_json".to_string()],
+            );
+        }
+
+        (
+            registered_schema_live_scan_rows(schema_rows),
+            vec![
+                "entity_id".to_string(),
+                "schema_key".to_string(),
+                "schema_version".to_string(),
+                "file_id".to_string(),
+                "version_id".to_string(),
+                "global".to_string(),
+                "plugin_key".to_string(),
+                "metadata".to_string(),
+                "change_id".to_string(),
+                "created_at".to_string(),
+                "updated_at".to_string(),
+                "value_json".to_string(),
+            ],
+        )
+    }
+
     #[async_trait(?Send)]
     impl LixBackend for FakeBackend {
         fn dialect(&self) -> SqlDialect {
@@ -1816,6 +1888,16 @@ mod tests {
             sql: &str,
             _params: &[Value],
         ) -> Result<crate::QueryResult, LixError> {
+            if is_registered_schema_live_scan(sql) {
+                self.registered_schema_query_count
+                    .fetch_add(1, Ordering::SeqCst);
+                if let Some(delay) = self.registered_schema_delay {
+                    sleep(delay).await;
+                }
+                let (rows, columns) =
+                    registered_schema_live_rows_for_projection(sql, &self.registered_schema_rows);
+                return Ok(crate::QueryResult { rows, columns });
+            }
             if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
                 self.registered_schema_query_count
                     .fetch_add(1, Ordering::SeqCst);

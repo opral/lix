@@ -3,6 +3,7 @@ use super::layout::{
     LiveTableLayout,
 };
 use super::sql::ensure_schema_live_table_sql_statements;
+use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};
 use crate::live_state::SchemaRegistration;
 use crate::schema::schema_from_registered_snapshot;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
@@ -76,7 +77,15 @@ pub(crate) async fn load_live_table_layout_with_backend(
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     let mut provider = BackendSchemaLayoutProvider { backend };
-    load_live_table_layout_with_provider(&mut provider, schema_key).await
+    match load_live_table_layout_with_provider(&mut provider, schema_key).await {
+        Ok(layout) => Ok(layout),
+        Err(error) if error.description == format!("schema '{}' is not stored", schema_key) => {
+            load_live_table_layout_from_registered_schema_live_table(backend, schema_key)
+                .await
+                .or(Err(error))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) async fn load_live_table_layout_in_transaction(
@@ -138,6 +147,30 @@ async fn load_live_table_layout_with_provider(
     }
 
     compile_registered_live_layout(schema_key, provider.load_registered_schema_rows().await?)
+}
+
+async fn load_live_table_layout_from_registered_schema_live_table(
+    backend: &dyn LixBackend,
+    schema_key: &str,
+) -> Result<LiveTableLayout, LixError> {
+    let registered_schema_table = tracked_relation_name("lix_registered_schema");
+    let snapshot_expr = snapshot_select_expr_for_schema(
+        "lix_registered_schema",
+        None,
+        backend.dialect(),
+        Some("m"),
+    )?;
+    let sql = format!(
+        "SELECT {snapshot_expr} AS snapshot_content \
+         FROM {registered_schema_table} m \
+         WHERE m.schema_key = 'lix_registered_schema' \
+           AND m.version_id = 'global' \
+           AND m.is_tombstone = 0",
+        snapshot_expr = snapshot_expr,
+        registered_schema_table = registered_schema_table,
+    );
+    let result = backend.execute(&sql, &[]).await?;
+    compile_registered_live_layout(schema_key, result.rows)
 }
 
 fn requirement_from_registration(
