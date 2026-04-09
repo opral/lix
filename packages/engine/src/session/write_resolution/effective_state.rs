@@ -6,7 +6,7 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{
     LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingStateOverlay,
 };
-use crate::schema::annotations::writer_key::load_workspace_writer_key_annotation_for_state_row;
+use crate::schema::load_workspace_writer_key_annotation_for_state_row;
 use crate::session::version_ops::load_exact_committed_state_row_at_version_head as load_exact_committed_state_row;
 use crate::session::write_resolution::prepared_artifacts::{
     overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,

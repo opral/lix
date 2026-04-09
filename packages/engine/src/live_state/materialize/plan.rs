@@ -14,7 +14,7 @@ use crate::canonical::graph::{
     build_version_commit_depth_map, build_version_head_map, collect_commit_edges,
     min_depth_by_commit, VersionCommitDepthMap, VersionHeadMap,
 };
-use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixBackend, LixError, ReplayCursor};
 
 #[derive(Debug, Clone)]

@@ -10,9 +10,10 @@ use crate::contracts::surface::{
 };
 use crate::live_state::{decode_registered_schema_row, scan_rows, RowQuery, RowReadMode};
 use crate::runtime::cel::shared_runtime;
-use crate::schema::annotations::overrides::{collect_lixcol_overrides, LixcolOverrideValue};
-use crate::schema::builtin::{builtin_schema_definition, builtin_schema_keys};
-use crate::schema::{schema_from_registered_snapshot, SchemaKey};
+use crate::schema::{
+    builtin_schema_definition, builtin_schema_keys, collect_lixcol_overrides,
+    schema_from_registered_snapshot, LixcolOverrideValue, SchemaKey,
+};
 use crate::{LixBackend, LixError};
 
 mod relation_policy;

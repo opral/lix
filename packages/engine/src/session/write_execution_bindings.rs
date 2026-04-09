@@ -157,7 +157,7 @@ impl WriteExecutionBindings for SessionCollaborators {
         >,
     ) -> Result<(), LixError> {
         let mut executor = &mut *transaction;
-        crate::schema::annotations::writer_key::apply_workspace_writer_key_annotations_with_executor(
+        crate::schema::apply_workspace_writer_key_annotations_with_executor(
             &mut executor,
             annotations,
         )

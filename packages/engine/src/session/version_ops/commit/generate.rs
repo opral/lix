@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
-use crate::schema::builtin::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
 

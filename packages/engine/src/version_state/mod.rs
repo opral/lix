@@ -1,10 +1,10 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::builtin::{
-    builtin_schema_definition, builtin_schema_json, decode_lixcol_literal,
+use crate::schema::{
+    builtin_schema_definition, builtin_schema_json, decode_lixcol_literal, LixActiveVersion,
+    LixVersionDescriptor, LixVersionRef,
 };
-use crate::schema::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::LixError;
 
 pub(crate) mod checkpoints;
