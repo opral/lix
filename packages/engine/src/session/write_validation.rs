@@ -30,7 +30,8 @@ use crate::contracts::artifacts::{
 use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend, PendingView};
 use crate::live_state::{
-    decode_registered_schema_row, load_exact_row, scan_rows, ExactRowQuery, RowQuery, RowReadMode,
+    decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,
+    LiveRowQuery, RowReadMode,
 };
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
@@ -196,9 +197,9 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             return Ok(schema);
         }
 
-        let row = load_exact_row(
+        let row = load_exact_live_row(
             self.backend,
-            &ExactRowQuery {
+            &ExactLiveRowQuery {
                 schema_key: REGISTERED_SCHEMA_KEY.to_string(),
                 version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
                 entity_id: key.entity_id(),
@@ -287,9 +288,9 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             entries_by_key.insert(key, schema.clone());
         }
 
-        let rows = scan_rows(
+        let rows = scan_live_rows(
             self.backend,
-            &RowQuery {
+            &LiveRowQuery {
                 schema_key: REGISTERED_SCHEMA_KEY.to_string(),
                 version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
                 mode: RowReadMode::Tracked,

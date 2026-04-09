@@ -13,7 +13,7 @@ use crate::live_state::schema_access::{live_read_contract_from_layout, LiveReadC
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
-use super::{scan_live_rows, LiveReadRow, LiveStorageLane};
+use super::{scan_visible_live_rows, LiveReadRow, LiveStorageLane};
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -151,7 +151,7 @@ impl<'a> TransactionReadModel<'a> {
             .collect::<Vec<_>>();
         let storage = pending_semantic_storage(query.storage);
         let mut rows = match query.storage {
-            PendingViewReadStorage::Tracked => scan_live_rows(
+            PendingViewReadStorage::Tracked => scan_visible_live_rows(
                 self.base,
                 LiveStorageLane::Tracked,
                 &query.schema_key,
@@ -163,7 +163,7 @@ impl<'a> TransactionReadModel<'a> {
             .into_iter()
             .map(|row| visible_live_row_from_raw(&access, row, false))
             .collect::<Result<Vec<_>, _>>()?,
-            PendingViewReadStorage::Untracked => scan_live_rows(
+            PendingViewReadStorage::Untracked => scan_visible_live_rows(
                 self.base,
                 LiveStorageLane::Untracked,
                 &query.schema_key,
@@ -193,7 +193,7 @@ impl<'a> TransactionReadModel<'a> {
             }
         }
         self.apply_filesystem_overlay_to_rows(query, &access, &mut by_identity);
-        self.apply_workspace_writer_key_overlay_to_rows(query, &mut by_identity);
+        self.apply_writer_key_overlay_to_rows(query, &mut by_identity);
         let mut rows = by_identity
             .into_values()
             .filter(|row| {
@@ -329,7 +329,7 @@ impl<'a> TransactionReadModel<'a> {
         }
     }
 
-    fn apply_workspace_writer_key_overlay_to_rows(
+    fn apply_writer_key_overlay_to_rows(
         &self,
         query: &LiveTableOverlayQuery,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
@@ -342,7 +342,7 @@ impl<'a> TransactionReadModel<'a> {
         };
 
         for row in rows.values_mut() {
-            let Some(writer_key) = pending_view.workspace_writer_key_annotation_for_state_row(
+            let Some(writer_key) = pending_view.writer_key_annotation_for_state_row(
                 &row.version_id,
                 &row.schema_key,
                 &row.entity_id,

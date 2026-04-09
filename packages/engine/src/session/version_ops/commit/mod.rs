@@ -23,4 +23,4 @@ pub(crate) use append::{
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
 pub(crate) use init::init;
-pub(crate) use types::ProposedDomainChange;
+pub(crate) use types::StagedChange;

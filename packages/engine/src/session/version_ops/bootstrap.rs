@@ -1,7 +1,5 @@
 use crate::init::InitExecutor;
-use crate::live_state::{
-    apply_untracked_write_batch_in_transaction, UntrackedWriteOperation, UntrackedWriteRow,
-};
+use crate::live_state::{write_live_rows, LiveRow};
 use crate::schema::LixCommit;
 use crate::{LixBackend, LixError, Value};
 
@@ -166,23 +164,24 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         commit_id: &str,
     ) -> Result<(), LixError> {
         let timestamp = self.generate_runtime_timestamp().await?;
-        let row = UntrackedWriteRow {
+        let row = LiveRow {
             entity_id: version_id.to_string(),
             schema_key: crate::version_state::version_ref_schema_key().to_string(),
             schema_version: crate::version_state::version_ref_schema_version().to_string(),
             file_id: crate::version_state::version_ref_file_id().to_string(),
             version_id: crate::version_state::version_ref_storage_version_id().to_string(),
-            global: true,
             plugin_key: crate::version_state::version_ref_plugin_key().to_string(),
             metadata: None,
+            change_id: None,
             writer_key: None,
+            global: true,
+            untracked: true,
+            created_at: Some(timestamp.clone()),
+            updated_at: Some(timestamp),
             snapshot_content: Some(crate::version_state::version_ref_snapshot_content(
                 version_id, commit_id,
             )),
-            created_at: Some(timestamp.clone()),
-            updated_at: timestamp,
-            operation: UntrackedWriteOperation::Upsert,
         };
-        apply_untracked_write_batch_in_transaction(self.backend_transaction_mut()?, &[row]).await
+        write_live_rows(self.backend_transaction_mut()?, &[row]).await
     }
 }

@@ -13,7 +13,7 @@ use crate::{LixBackend, LixError, Value};
 use super::schema_access::LiveReadContract;
 use super::tracked::{ExactTrackedRowRequest, TrackedScanRequest, TrackedTombstoneMarker};
 use super::untracked::{ExactUntrackedRowRequest, UntrackedRow};
-use super::visible_rows::{scan_live_rows, LiveReadRow, LiveStorageLane};
+use super::visible_rows::{scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane};
 use super::{
     live_storage_relation_exists_with_backend, load_exact_tracked_tombstone_with_executor,
     load_exact_untracked_row_with_executor, scan_tracked_tombstones_with_executor, ScanConstraint,
@@ -129,7 +129,7 @@ pub(crate) async fn load_live_snapshot_rows_with_backend(
         .iter()
         .map(scan_constraint_from_filter)
         .collect::<Vec<_>>();
-    let rows = scan_live_rows(
+    let rows = scan_visible_live_rows(
         backend,
         storage_lane(storage),
         schema_key,

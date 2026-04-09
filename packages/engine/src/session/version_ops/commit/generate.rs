@@ -5,7 +5,7 @@ use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
 
-use super::types::{DomainChangeInput, GenerateCommitArgs, GenerateCommitResult};
+use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
 use super::UpdatedVersionRef;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -51,36 +51,37 @@ where
         }
     }
 
-    // Validate duplicate domain change ids.
+    // Validate duplicate staged change ids.
     let mut seen_ids = BTreeSet::new();
     for change in &args.changes {
-        if !seen_ids.insert(change.id.clone()) {
+        let change_id = require_staged_change_id(change)?;
+        if !seen_ids.insert(change_id.to_string()) {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("generate_commit: duplicate change id '{}'", change.id),
+                description: format!("generate_commit: duplicate change id '{}'", change_id),
             });
         }
-        validate_domain_change_identity(change)?;
+        validate_staged_change(change)?;
     }
 
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
     let change_set_schema = builtin_schema_meta(CHANGE_SET_SCHEMA_KEY)?;
-    let effective_domain_changes = collapse_domain_changes_last_wins(&args.changes);
-    let mut output_changes: Vec<ChangeRow> = effective_domain_changes
+    let effective_changes = collapse_staged_changes_last_wins(&args.changes);
+    let mut output_changes: Vec<ChangeRow> = effective_changes
         .iter()
-        .map(|change| sanitize_domain_change(change))
+        .map(|change| sanitize_staged_change(change))
         .collect();
     let mut updated_version_refs: Vec<UpdatedVersionRef> = Vec::new();
 
-    let mut domain_by_version: BTreeMap<String, Vec<&DomainChangeInput>> = BTreeMap::new();
-    for change in &effective_domain_changes {
-        domain_by_version
+    let mut changes_by_version: BTreeMap<String, Vec<&StagedChange>> = BTreeMap::new();
+    for change in &effective_changes {
+        changes_by_version
             .entry(change.version_id.to_string())
             .or_default()
             .push(*change);
     }
 
-    let versions_to_commit: BTreeSet<String> = domain_by_version
+    let versions_to_commit: BTreeSet<String> = changes_by_version
         .keys()
         .cloned()
         .chain(args.force_commit_versions.iter().cloned())
@@ -193,12 +194,15 @@ where
                 ),
             })?;
 
-        let member_change_ids: Vec<String> = domain_by_version
+        let member_change_ids: Vec<String> = changes_by_version
             .get(version_id)
             .into_iter()
-            .flat_map(|changes| changes.iter().map(|change| change.id.clone()))
-            .collect();
-
+            .flat_map(|changes| {
+                changes
+                    .iter()
+                    .map(|change| require_staged_change_id(change).map(ToString::to_string))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         snapshot["change_ids"] = serde_json::Value::Array(
             member_change_ids
                 .iter()
@@ -234,7 +238,7 @@ where
 
     output_changes.extend(meta_changes);
 
-    let affected_versions = effective_domain_changes
+    let affected_versions = effective_changes
         .iter()
         .map(|change| change.version_id.to_string())
         .chain(
@@ -255,35 +259,54 @@ where
     })
 }
 
-fn sanitize_domain_change(change: &DomainChangeInput) -> ChangeRow {
+fn sanitize_staged_change(change: &StagedChange) -> ChangeRow {
     ChangeRow {
-        id: change.id.clone(),
+        id: require_staged_change_id(change).unwrap().to_string(),
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
-        schema_version: change.schema_version.clone(),
-        file_id: change.file_id.clone(),
-        plugin_key: change.plugin_key.clone(),
-        snapshot_content: change.snapshot_content.clone(),
-        metadata: change.metadata.clone(),
-        created_at: change.created_at.clone(),
+        schema_version: change.schema_version.clone().unwrap(),
+        file_id: change.file_id.clone().unwrap(),
+        plugin_key: change.plugin_key.clone().unwrap(),
+        snapshot_content: change
+            .snapshot_content
+            .as_deref()
+            .map(CanonicalJson::from_text)
+            .transpose()
+            .unwrap(),
+        metadata: change
+            .metadata
+            .as_deref()
+            .map(CanonicalJson::from_text)
+            .transpose()
+            .unwrap(),
+        created_at: require_staged_change_created_at(change)
+            .unwrap()
+            .to_string(),
     }
 }
 
-fn validate_domain_change_identity(change: &DomainChangeInput) -> Result<(), LixError> {
-    let change_label = if change.id.is_empty() {
+fn validate_staged_change(change: &StagedChange) -> Result<(), LixError> {
+    let change_id = require_staged_change_id(change)?;
+    let created_at = require_staged_change_created_at(change)?;
+    let schema_version = require_staged_change_schema_version(change)?;
+    let file_id = require_staged_change_file_id(change)?;
+    let plugin_key = require_staged_change_plugin_key(change)?;
+
+    let change_label = if change_id.is_empty() {
         "<empty change id>"
     } else {
-        change.id.as_str()
+        change_id
     };
 
     for (field, value) in [
-        ("id", change.id.as_str()),
+        ("id", change_id),
         ("entity_id", change.entity_id.as_str()),
         ("schema_key", change.schema_key.as_str()),
-        ("schema_version", change.schema_version.as_str()),
-        ("file_id", change.file_id.as_str()),
-        ("plugin_key", change.plugin_key.as_str()),
+        ("schema_version", schema_version),
+        ("file_id", file_id),
+        ("plugin_key", plugin_key),
         ("version_id", change.version_id.as_str()),
+        ("created_at", created_at),
     ] {
         if value.is_empty() {
             return Err(LixError {
@@ -296,6 +319,68 @@ fn validate_domain_change_identity(change: &DomainChangeInput) -> Result<(), Lix
     }
 
     Ok(())
+}
+
+fn require_staged_change_id(change: &StagedChange) -> Result<&str, LixError> {
+    change.id.as_deref().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "generate_commit: staged change '{}:{}' requires id",
+            change.schema_key, change.entity_id
+        ),
+    })
+}
+
+fn require_staged_change_created_at(change: &StagedChange) -> Result<&str, LixError> {
+    change.created_at.as_deref().ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "generate_commit: staged change '{}:{}' requires created_at",
+            change.schema_key, change.entity_id
+        ),
+    })
+}
+
+fn require_staged_change_schema_version(change: &StagedChange) -> Result<&str, LixError> {
+    change
+        .schema_version
+        .as_ref()
+        .map(|value| value.as_str())
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "generate_commit: staged change '{}:{}' requires schema_version",
+                change.schema_key, change.entity_id
+            ),
+        })
+}
+
+fn require_staged_change_file_id(change: &StagedChange) -> Result<&str, LixError> {
+    change
+        .file_id
+        .as_ref()
+        .map(|value| value.as_str())
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "generate_commit: staged change '{}:{}' requires file_id",
+                change.schema_key, change.entity_id
+            ),
+        })
+}
+
+fn require_staged_change_plugin_key(change: &StagedChange) -> Result<&str, LixError> {
+    change
+        .plugin_key
+        .as_ref()
+        .map(|value| value.as_str())
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "generate_commit: staged change '{}:{}' requires plugin_key",
+                change.schema_key, change.entity_id
+            ),
+        })
 }
 
 fn expect_identity<T>(value: impl Into<String>, context: &str) -> T
@@ -382,7 +467,7 @@ fn dedupe_ordered(values: &[String]) -> Vec<String> {
     deduped
 }
 
-fn collapse_domain_changes_last_wins(changes: &[DomainChangeInput]) -> Vec<&DomainChangeInput> {
+fn collapse_staged_changes_last_wins(changes: &[StagedChange]) -> Vec<&StagedChange> {
     let mut latest_index_by_key: BTreeMap<(String, String, String, String), usize> =
         BTreeMap::new();
     for (index, change) in changes.iter().enumerate() {
@@ -391,7 +476,9 @@ fn collapse_domain_changes_last_wins(changes: &[DomainChangeInput]) -> Vec<&Doma
                 change.version_id.to_string(),
                 change.entity_id.to_string(),
                 change.schema_key.to_string(),
-                change.file_id.to_string(),
+                require_staged_change_file_id(change)
+                    .expect("validated staged changes require file_id")
+                    .to_string(),
             ),
             index,
         );
@@ -410,26 +497,28 @@ mod tests {
     use super::*;
     use crate::session::version_ops::{VersionInfo, VersionSnapshot};
 
-    fn domain_change(
+    fn staged_change(
         id: &str,
         entity_id: &str,
         schema_key: &str,
         version_id: &str,
         writer_key: Option<&str>,
-    ) -> DomainChangeInput {
-        DomainChangeInput {
-            id: id.to_string(),
+    ) -> StagedChange {
+        StagedChange {
+            id: Some(id.to_string()),
             entity_id: entity_id.try_into().unwrap(),
             schema_key: schema_key.try_into().unwrap(),
-            schema_version: "1".try_into().unwrap(),
-            file_id: "lix".try_into().unwrap(),
-            plugin_key: "lix".try_into().unwrap(),
+            schema_version: Some("1".try_into().unwrap()),
+            file_id: Some("lix".try_into().unwrap()),
+            plugin_key: Some("lix".try_into().unwrap()),
             snapshot_content: Some(
                 CanonicalJson::from_text(format!(r#"{{"id":"{id}"}}"#))
-                    .expect("test snapshot should be valid canonical json"),
+                    .expect("test snapshot should be valid canonical json")
+                    .as_str()
+                    .to_string(),
             ),
             metadata: None,
-            created_at: "2025-01-01T00:00:00.000Z".to_string(),
+            created_at: Some("2025-01-01T00:00:00.000Z".to_string()),
             version_id: version_id.try_into().unwrap(),
             writer_key: writer_key.map(ToString::to_string),
         }
@@ -464,7 +553,7 @@ mod tests {
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec!["acct-1".to_string()],
-            changes: vec![domain_change(
+            changes: vec![staged_change(
                 "chg_active",
                 "kv_active",
                 "lix_key_value",
@@ -524,7 +613,7 @@ mod tests {
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec!["acct-1".to_string()],
-            changes: vec![domain_change(
+            changes: vec![staged_change(
                 "chg_global",
                 "kv_global",
                 "lix_key_value",
@@ -586,8 +675,8 @@ mod tests {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec!["acct-1".to_string(), "acct-2".to_string()],
             changes: vec![
-                domain_change("chg_global", "kv_global", "lix_key_value", "global", None),
-                domain_change("chg_main", "kv_main", "lix_key_value", "version-main", None),
+                staged_change("chg_global", "kv_global", "lix_key_value", "global", None),
+                staged_change("chg_main", "kv_main", "lix_key_value", "version-main", None),
             ],
             versions,
             force_commit_versions: BTreeSet::new(),
@@ -639,7 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn collapses_domain_changes_per_entity_schema_file_with_last_wins() {
+    fn collapses_staged_changes_per_entity_schema_file_with_last_wins() {
         let mut versions = BTreeMap::new();
         versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
@@ -647,9 +736,9 @@ mod tests {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec!["acct-1".to_string()],
             changes: vec![
-                domain_change("chg_a1", "entity-a", "lix_key_value", "global", None),
-                domain_change("chg_b1", "entity-b", "lix_key_value", "global", None),
-                domain_change("chg_a2", "entity-a", "lix_key_value", "global", None),
+                staged_change("chg_a1", "entity-a", "lix_key_value", "global", None),
+                staged_change("chg_b1", "entity-b", "lix_key_value", "global", None),
+                staged_change("chg_a2", "entity-a", "lix_key_value", "global", None),
             ],
             versions,
             force_commit_versions: BTreeSet::new(),
@@ -663,14 +752,14 @@ mod tests {
         })
         .expect("generate_commit should succeed");
 
-        let domain_change_ids = result
+        let change_ids = result
             .canonical_output
             .changes
             .iter()
             .filter(|row| row.schema_key == "lix_key_value")
             .map(|row| row.id.clone())
             .collect::<Vec<_>>();
-        assert_eq!(domain_change_ids, vec!["chg_b1", "chg_a2"]);
+        assert_eq!(change_ids, vec!["chg_b1", "chg_a2"]);
         let commit_row = result
             .canonical_output
             .changes
@@ -686,7 +775,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_duplicate_domain_change_ids() {
+    fn rejects_duplicate_change_ids() {
         let mut versions = BTreeMap::new();
         versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
@@ -694,8 +783,8 @@ mod tests {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec![],
             changes: vec![
-                domain_change("dup", "entity-a", "lix_key_value", "global", None),
-                domain_change("dup", "entity-b", "lix_key_value", "global", None),
+                staged_change("dup", "entity-a", "lix_key_value", "global", None),
+                staged_change("dup", "entity-b", "lix_key_value", "global", None),
             ],
             versions,
             force_commit_versions: BTreeSet::new(),
@@ -711,7 +800,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_domain_change_entity_id() {
+    fn rejects_empty_change_entity_id() {
         let error = crate::EntityId::try_from("")
             .expect_err("expected empty entity_id to be rejected before commit generation");
         assert!(
@@ -722,14 +811,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_version_context_for_domain_change() {
+    fn rejects_missing_version_context_for_change() {
         let mut versions = BTreeMap::new();
         versions.insert("global".to_string(), version_info("global", &["P_global"]));
 
         let args = GenerateCommitArgs {
             timestamp: "2025-01-01T00:00:00.000Z".to_string(),
             active_accounts: vec![],
-            changes: vec![domain_change(
+            changes: vec![staged_change(
                 "chg-missing",
                 "entity-a",
                 "lix_key_value",

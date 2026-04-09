@@ -9,14 +9,14 @@ use zip::read::ZipArchive;
 use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::common::paths::filesystem::{NormalizedDirectoryPath, ParsedFilePath};
 use crate::contracts::artifacts::{
-    CommitPreconditions, DomainChangeBatch, IdempotencyKey, OptionalTextPatch, PlanEffects,
+    ChangeBatch, CommitPreconditions, IdempotencyKey, OptionalTextPatch, PlanEffects,
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
     PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
     PreparedPublicWriteArtifact, PreparedPublicWriteContract, PreparedPublicWriteExecutionArtifact,
     PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
     PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
     PreparedWriteArtifact, PreparedWriteDiagnosticContext, PreparedWriteOperationKind,
-    PreparedWriteStatementKind, PreparedWriteStep, PublicDomainChange, ResultContract,
+    PreparedWriteStatementKind, PreparedWriteStep, PublicChange, ResultContract,
     SchemaLiveTableRequirement, SemanticEffect, StateCommitStreamOperation, WriteLane, WriteMode,
 };
 use crate::contracts::plugin::{
@@ -24,7 +24,7 @@ use crate::contracts::plugin::{
     PluginManifest, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
 };
 use crate::contracts::state_commit_stream::{
-    state_commit_stream_changes_from_domain_changes, StateCommitStreamRuntimeMetadata,
+    state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
 };
 use crate::contracts::surface::{SurfaceBinding, SurfaceRegistry};
 use crate::contracts::{schema_key_from_definition, validate_lix_schema_definition};
@@ -194,9 +194,9 @@ fn prepare_registered_schema_write_step_from_schemas(
         .iter()
         .map(registered_schema_planned_row)
         .collect::<Vec<_>>();
-    let domain_changes = schema_rows
+    let changes = schema_rows
         .iter()
-        .map(|row| PublicDomainChange {
+        .map(|row| PublicChange {
             entity_id: row.entity_id.clone(),
             schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
             schema_version: Some(REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION.to_string()),
@@ -222,7 +222,7 @@ fn prepare_registered_schema_write_step_from_schemas(
         "lix_registered_schema_by_version",
         intended_post_state,
         PlannedFilesystemState::default(),
-        domain_changes,
+        changes,
         schema_live_table_requirements,
         PreparedPublicSurfaceRegistryEffect::ApplyMutations(
             schema_rows
@@ -275,9 +275,9 @@ fn prepare_plugin_archive_write_step(
         plugin_archive_file_descriptor_row(&archive_id, &descriptor),
         plugin_archive_binary_blob_ref_row(&archive_id, archive_bytes)?,
     ];
-    let domain_changes = intended_post_state
+    let changes = intended_post_state
         .iter()
-        .map(planned_row_to_public_domain_change)
+        .map(planned_row_to_public_change)
         .collect::<Result<Vec<_>, _>>()?;
 
     prepare_public_tracked_write_step(
@@ -286,7 +286,7 @@ fn prepare_plugin_archive_write_step(
         "lix_file_by_version",
         intended_post_state,
         filesystem_state,
-        domain_changes,
+        changes,
         Vec::new(),
         PreparedPublicSurfaceRegistryEffect::None,
         "semantic.install_plugin_archive",
@@ -456,16 +456,16 @@ fn prepare_public_tracked_write_step(
     relation_name: &str,
     intended_post_state: Vec<PlannedStateRow>,
     filesystem_state: PlannedFilesystemState,
-    domain_changes: Vec<PublicDomainChange>,
+    changes: Vec<PublicChange>,
     schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     public_surface_registry_effect: PreparedPublicSurfaceRegistryEffect,
     idempotency_purpose: &str,
 ) -> Result<PreparedWriteExecutionStep, LixError> {
     let semantic_effects =
-        semantic_plan_effects_from_domain_changes(&domain_changes, context.writer_key.as_deref())?;
+        semantic_plan_effects_from_changes(&changes, context.writer_key.as_deref())?;
     let write_payload = json!({
         "rows": intended_post_state.iter().map(summarize_planned_row).collect::<Vec<_>>(),
-        "domain_changes": domain_changes.iter().map(summarize_domain_change).collect::<Vec<_>>(),
+        "changes": changes.iter().map(summarize_change).collect::<Vec<_>>(),
         "filesystem_files": filesystem_state.files.keys().cloned().collect::<Vec<_>>(),
     });
     PreparedWriteExecutionStep::build(
@@ -485,7 +485,7 @@ fn prepare_public_tracked_write_step(
                             execution_mode: WriteMode::Tracked,
                             authoritative_pre_state_rows: Vec::new(),
                             intended_post_state,
-                            workspace_writer_key_updates: BTreeMap::new(),
+                            writer_key_updates: BTreeMap::new(),
                             filesystem_state,
                         }],
                     }),
@@ -495,12 +495,12 @@ fn prepare_public_tracked_write_step(
                         partitions: vec![PreparedPublicWriteExecutionPartition::Tracked(
                             PreparedTrackedWriteExecution {
                                 schema_live_table_requirements,
-                                domain_change_batch: Some(DomainChangeBatch {
-                                    changes: domain_changes.clone(),
+                                change_batch: Some(ChangeBatch {
+                                    changes: changes.clone(),
                                     write_lane: WriteLane::GlobalAdmin,
                                     writer_key: context.writer_key.clone(),
-                                    semantic_effects: semantic_effect_markers_from_domain_changes(
-                                        &domain_changes,
+                                    semantic_effects: semantic_effect_markers_from_changes(
+                                        &changes,
                                     ),
                                 }),
                                 create_preconditions: CommitPreconditions {
@@ -527,12 +527,12 @@ fn prepare_public_tracked_write_step(
     )
 }
 
-fn semantic_plan_effects_from_domain_changes(
-    changes: &[PublicDomainChange],
+fn semantic_plan_effects_from_changes(
+    changes: &[PublicChange],
     writer_key: Option<&str>,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
-        state_commit_stream_changes: state_commit_stream_changes_from_domain_changes(
+        state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             StateCommitStreamOperation::Insert,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
@@ -541,9 +541,7 @@ fn semantic_plan_effects_from_domain_changes(
     })
 }
 
-fn semantic_effect_markers_from_domain_changes(
-    changes: &[PublicDomainChange],
-) -> Vec<SemanticEffect> {
+fn semantic_effect_markers_from_changes(changes: &[PublicChange]) -> Vec<SemanticEffect> {
     changes
         .iter()
         .map(|change| SemanticEffect {
@@ -556,10 +554,8 @@ fn semantic_effect_markers_from_domain_changes(
         .collect()
 }
 
-fn planned_row_to_public_domain_change(
-    row: &PlannedStateRow,
-) -> Result<PublicDomainChange, LixError> {
-    Ok(PublicDomainChange {
+fn planned_row_to_public_change(row: &PlannedStateRow) -> Result<PublicChange, LixError> {
+    Ok(PublicChange {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         schema_version: planned_row_text_value(row, "schema_version"),
@@ -621,7 +617,7 @@ fn semantic_idempotency_key(
     ))
 }
 
-fn summarize_domain_change(change: &PublicDomainChange) -> JsonValue {
+fn summarize_change(change: &PublicChange) -> JsonValue {
     json!({
         "entity_id": change.entity_id,
         "schema_key": change.schema_key,

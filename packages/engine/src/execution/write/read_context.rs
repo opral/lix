@@ -7,8 +7,7 @@ use crate::contracts::artifacts::{
     TrackedTombstoneMarker, UntrackedRow,
 };
 use crate::contracts::traits::{
-    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
-    WorkspaceWriterKeyReadView,
+    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
 };
 use crate::LixError;
 
@@ -28,10 +27,10 @@ impl<'a> ReadContext<'a> {
     pub(crate) fn new(
         tracked: &'a dyn TrackedReadView,
         untracked: &'a dyn UntrackedReadView,
-        workspace_writer_keys: &'a dyn WorkspaceWriterKeyReadView,
+        writer_keys: &'a dyn WriterKeyReadView,
     ) -> Self {
         Self {
-            base: LiveReadContext::new(tracked, untracked, workspace_writer_keys),
+            base: LiveReadContext::new(tracked, untracked, writer_keys),
         }
     }
 
@@ -61,8 +60,8 @@ impl<'a> ReadContext<'a> {
                 base: self.base.tracked_tombstones,
                 pending,
             },
-            workspace_writer_keys: PendingWorkspaceWriterKeyReadView {
-                base: self.base.workspace_writer_keys,
+            writer_keys: PendingWriterKeyReadView {
+                base: self.base.writer_keys,
                 pending,
             },
         }
@@ -73,13 +72,12 @@ pub(crate) struct PendingReadContext<'a> {
     tracked: PendingTrackedReadView<'a>,
     untracked: PendingUntrackedReadView<'a>,
     tracked_tombstones: PendingTrackedTombstoneView<'a>,
-    workspace_writer_keys: PendingWorkspaceWriterKeyReadView<'a>,
+    writer_keys: PendingWriterKeyReadView<'a>,
 }
 
 impl<'a> PendingReadContext<'a> {
     pub(crate) fn effective_state_context(&'a self) -> LiveReadContext<'a> {
-        let context =
-            LiveReadContext::new(&self.tracked, &self.untracked, &self.workspace_writer_keys);
+        let context = LiveReadContext::new(&self.tracked, &self.untracked, &self.writer_keys);
         if self.tracked_tombstones.has_source() {
             context.with_tracked_tombstones(&self.tracked_tombstones)
         } else {
@@ -103,8 +101,8 @@ struct PendingTrackedTombstoneView<'a> {
     pending: &'a PendingWriteOverlay,
 }
 
-struct PendingWorkspaceWriterKeyReadView<'a> {
-    base: &'a dyn WorkspaceWriterKeyReadView,
+struct PendingWriterKeyReadView<'a> {
+    base: &'a dyn WriterKeyReadView,
     pending: &'a PendingWriteOverlay,
 }
 
@@ -115,14 +113,12 @@ impl PendingTrackedTombstoneView<'_> {
 }
 
 #[async_trait(?Send)]
-impl WorkspaceWriterKeyReadView for PendingWorkspaceWriterKeyReadView<'_> {
+impl WriterKeyReadView for PendingWriterKeyReadView<'_> {
     async fn load_annotation(
         &self,
         row_identity: &RowIdentity,
     ) -> Result<Option<String>, LixError> {
-        if let Some(annotation) =
-            pending_workspace_writer_key_annotation(self.pending, row_identity)
-        {
+        if let Some(annotation) = pending_writer_key_annotation(self.pending, row_identity) {
             return Ok(annotation);
         }
         self.base.load_annotation(row_identity).await
@@ -134,9 +130,7 @@ impl WorkspaceWriterKeyReadView for PendingWorkspaceWriterKeyReadView<'_> {
     ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
         let mut annotations = self.base.load_annotations(row_identities).await?;
         for row_identity in row_identities {
-            if let Some(annotation) =
-                pending_workspace_writer_key_annotation(self.pending, row_identity)
-            {
+            if let Some(annotation) = pending_writer_key_annotation(self.pending, row_identity) {
                 annotations.insert(row_identity.clone(), annotation);
             }
         }
@@ -366,7 +360,7 @@ fn sort_untracked_rows(rows: &mut [UntrackedRow]) {
     rows.sort_by_key(RowIdentity::from_untracked_row);
 }
 
-fn pending_workspace_writer_key_annotation(
+fn pending_writer_key_annotation(
     pending: &PendingWriteOverlay,
     row_identity: &RowIdentity,
 ) -> Option<Option<String>> {

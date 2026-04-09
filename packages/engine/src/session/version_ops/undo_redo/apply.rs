@@ -11,7 +11,7 @@ use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::TransactionBackendAdapter;
 use crate::session::version_ops::commit::{
-    append_tracked, CanonicalCommitReceipt, CreateCommitArgs, ProposedDomainChange,
+    append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };
 use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
 
@@ -327,7 +327,7 @@ async fn append_undo_redo_commit_in_transaction(
     tx: &mut SessionTransaction<'_>,
     version_id: &str,
     target_commit_id: &str,
-    changes: Vec<ProposedDomainChange>,
+    changes: Vec<StagedChange>,
     active_account_ids: Vec<String>,
     operation_kind: UndoRedoOperationKind,
 ) -> Result<AppliedUndoRedoCommit, LixError> {
@@ -696,8 +696,9 @@ async fn load_target_commit_change_effects(
 fn build_forward_proposed_change(
     version_id: &str,
     change: &CommittedCanonicalChangeRow,
-) -> Result<ProposedDomainChange, LixError> {
-    Ok(ProposedDomainChange {
+) -> Result<StagedChange, LixError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: require_identity(change.entity_id.clone(), "undo forward entity_id")?,
         schema_key: require_identity(change.schema_key.clone(), "undo forward schema_key")?,
         schema_version: Some(require_identity(
@@ -716,14 +717,16 @@ fn build_forward_proposed_change(
         metadata: change.metadata.clone(),
         version_id: require_identity(version_id.to_string(), "undo forward version_id")?,
         writer_key: None,
+        created_at: None,
     })
 }
 
 fn build_restore_proposed_change(
     version_id: &str,
     row: &ExactCommittedStateRow,
-) -> Result<ProposedDomainChange, LixError> {
-    Ok(ProposedDomainChange {
+) -> Result<StagedChange, LixError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: require_identity(row.entity_id.clone(), "undo restore entity_id")?,
         schema_key: require_identity(row.schema_key.clone(), "undo restore schema_key")?,
         schema_version: Some(require_identity(
@@ -748,14 +751,16 @@ fn build_restore_proposed_change(
             .and_then(|value| value_as_text(Some(value))),
         version_id: require_identity(version_id.to_string(), "undo restore version_id")?,
         writer_key: None,
+        created_at: None,
     })
 }
 
 fn build_tombstone_proposed_change(
     version_id: &str,
     change: &CommittedCanonicalChangeRow,
-) -> Result<ProposedDomainChange, LixError> {
-    Ok(ProposedDomainChange {
+) -> Result<StagedChange, LixError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: require_identity(change.entity_id.clone(), "undo tombstone entity_id")?,
         schema_key: require_identity(change.schema_key.clone(), "undo tombstone schema_key")?,
         schema_version: Some(require_identity(
@@ -774,6 +779,7 @@ fn build_tombstone_proposed_change(
         metadata: None,
         version_id: require_identity(version_id.to_string(), "undo tombstone version_id")?,
         writer_key: None,
+        created_at: None,
     })
 }
 

@@ -13,7 +13,7 @@ use crate::live_state::{
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::TransactionBackendAdapter;
-use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, ProposedDomainChange};
+use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
 use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
@@ -538,8 +538,9 @@ fn classify_merge_decision(
 fn proposed_change_from_exact_row(
     version_id: &str,
     row: &ExactCommittedStateRow,
-) -> Result<ProposedDomainChange, LixError> {
-    Ok(ProposedDomainChange {
+) -> Result<StagedChange, LixError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: parse_identity(row.entity_id.clone(), "merge entity_id")?,
         schema_key: parse_identity(row.schema_key.clone(), "merge schema_key")?,
         schema_version: Some(parse_identity(
@@ -558,6 +559,7 @@ fn proposed_change_from_exact_row(
         metadata: row.values.get("metadata").and_then(value_ref_as_text),
         version_id: parse_identity(version_id.to_string(), "merge version_id")?,
         writer_key: None,
+        created_at: None,
     })
 }
 
@@ -565,8 +567,9 @@ fn tombstone_change_from_state(
     version_id: &str,
     entity: &EntityKey,
     previous: &VisibleEntityState,
-) -> Result<ProposedDomainChange, LixError> {
-    Ok(ProposedDomainChange {
+) -> Result<StagedChange, LixError> {
+    Ok(StagedChange {
+        id: None,
         entity_id: parse_identity(entity.entity_id.clone(), "merge tombstone entity_id")?,
         schema_key: parse_identity(entity.schema_key.clone(), "merge tombstone schema_key")?,
         schema_version: Some(parse_identity(
@@ -585,6 +588,7 @@ fn tombstone_change_from_state(
         metadata: None,
         version_id: parse_identity(version_id.to_string(), "merge tombstone version_id")?,
         writer_key: None,
+        created_at: None,
     })
 }
 

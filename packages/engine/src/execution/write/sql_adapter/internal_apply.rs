@@ -1,6 +1,6 @@
-use crate::contracts::artifacts::FilesystemPayloadDomainChange;
+use crate::contracts::artifacts::FilesystemPayloadChange;
 use crate::execution::write::filesystem::runtime::{
-    build_filesystem_payload_domain_changes_insert,
+    build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,
 };
 use crate::execution::write::filesystem::state::filesystem_transaction_state_from_planned;
@@ -42,9 +42,9 @@ pub(super) async fn run_internal_write_txn_with_transaction(
             )
             .await?;
     }
-    persist_filesystem_payload_domain_changes_direct(
+    persist_filesystem_payload_changes_direct(
         transaction,
-        &filesystem_finalization.payload_domain_changes(),
+        &filesystem_finalization.payload_changes(),
     )
     .await?;
     if filesystem_finalization.should_run_gc {
@@ -71,9 +71,9 @@ pub(super) async fn run_internal_write_txn_with_transaction(
     Ok(Some(execution))
 }
 
-async fn persist_filesystem_payload_domain_changes_direct(
+async fn persist_filesystem_payload_changes_direct(
     transaction: &mut dyn LixBackendTransaction,
-    changes: &[FilesystemPayloadDomainChange],
+    changes: &[FilesystemPayloadChange],
 ) -> Result<(), LixError> {
     let tracked = changes
         .iter()
@@ -81,7 +81,7 @@ async fn persist_filesystem_payload_domain_changes_direct(
         .cloned()
         .collect::<Vec<_>>();
     if !tracked.is_empty() {
-        let (sql, params) = build_filesystem_payload_domain_changes_insert(&tracked, false);
+        let (sql, params) = build_filesystem_payload_changes_insert(&tracked, false);
         transaction.execute(&sql, &params).await?;
     }
 
@@ -91,7 +91,7 @@ async fn persist_filesystem_payload_domain_changes_direct(
         .cloned()
         .collect::<Vec<_>>();
     if !untracked.is_empty() {
-        let (sql, params) = build_filesystem_payload_domain_changes_insert(&untracked, true);
+        let (sql, params) = build_filesystem_payload_changes_insert(&untracked, true);
         transaction.execute(&sql, &params).await?;
     }
 

@@ -14,14 +14,14 @@ pub(crate) use super::create::{
 };
 use super::pending::{
     build_pending_public_commit_session, create_commit_error_to_lix_error,
-    merge_public_domain_change_batch_into_pending_commit, pending_session_matches_create_commit,
+    merge_public_change_batch_into_pending_commit, pending_session_matches_create_commit,
 };
-use super::types::ProposedDomainChange;
+use super::types::StagedChange;
 use super::CanonicalCommitReceipt;
 
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,
-    pub(crate) changes: Vec<ProposedDomainChange>,
+    pub(crate) changes: Vec<StagedChange>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
     pub(crate) active_account_ids: Vec<String>,
@@ -34,7 +34,7 @@ pub(crate) struct BufferedTrackedAppendOutcome {
     pub(crate) disposition: CreateCommitDisposition,
     pub(crate) receipt: Option<CanonicalCommitReceipt>,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
-    pub(crate) applied_domain_changes: Vec<ProposedDomainChange>,
+    pub(crate) applied_changes: Vec<StagedChange>,
     pub(crate) merged_into_pending_session: bool,
 }
 
@@ -54,8 +54,8 @@ async fn append_tracked_unchecked(
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
 ) -> Result<CreateCommitResult, LixError> {
     // This helper intentionally composes multiple owners atomically:
-    // canonical commit facts, replica-local version-head state, workspace
-    // writer-key annotations, and derived live-state projections. The owners
+    // canonical commit facts, replica-local version-head state, live-state
+    // writer-key metadata, and derived live-state projections. The owners
     // remain distinct even though the write unit commits them together.
     let execution_writer_key = args.writer_key.clone();
     let result = create_commit(transaction, args, functions, invariant_checker)
@@ -63,21 +63,11 @@ async fn append_tracked_unchecked(
         .map_err(create_commit_error_to_lix_error)?;
 
     if let Some(receipt) = result.receipt.as_ref() {
-        let tracked_writer_key_annotations =
-            crate::schema::tracked_writer_key_annotations_from_changes(
-                &result.applied_domain_changes,
-                execution_writer_key.as_deref(),
-            );
-        let mut executor = &mut *transaction;
-        crate::schema::apply_workspace_writer_key_annotations_with_executor(
-            &mut executor,
-            &tracked_writer_key_annotations,
-        )
-        .await?;
-        crate::live_state::apply_commit_projections_best_effort_in_transaction(
+        crate::live_state::apply_tracked_commit_effects_in_transaction(
             transaction,
             receipt,
-            &tracked_writer_key_annotations,
+            &result.applied_changes,
+            execution_writer_key.as_deref(),
         )
         .await?;
     }
@@ -114,7 +104,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             let session = session_slot.as_mut().expect(
                 "pending public commit session should exist when merge preconditions match",
             );
-            let receipt = merge_public_domain_change_batch_into_pending_commit(
+            let receipt = merge_public_change_batch_into_pending_commit(
                 transaction,
                 session,
                 &args.changes,
@@ -129,7 +119,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
                 disposition: CreateCommitDisposition::Applied,
                 receipt: Some(receipt),
                 applied_output: None,
-                applied_domain_changes: args.changes,
+                applied_changes: args.changes,
                 merged_into_pending_session: true,
             });
         }
@@ -174,7 +164,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
         disposition: create_result.disposition,
         receipt: create_result.receipt,
         applied_output: create_result.applied_output,
-        applied_domain_changes: create_result.applied_domain_changes,
+        applied_changes: create_result.applied_changes,
         merged_into_pending_session: false,
     })
 }
@@ -266,8 +256,9 @@ mod tests {
         }
     }
 
-    fn sample_change() -> crate::session::version_ops::commit::ProposedDomainChange {
-        crate::session::version_ops::commit::ProposedDomainChange {
+    fn sample_change() -> crate::session::version_ops::commit::StagedChange {
+        crate::session::version_ops::commit::StagedChange {
+            id: None,
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
@@ -277,6 +268,7 @@ mod tests {
             metadata: None,
             version_id: "version-a".try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
+            created_at: None,
         }
     }
 

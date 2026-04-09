@@ -47,7 +47,9 @@ pub(crate) mod testing;
 pub mod tracked;
 pub mod untracked;
 mod visible_rows;
+pub(crate) mod writer_key;
 use crate::contracts::traits::{TrackedWriteParticipant, UntrackedWriteParticipant};
+use crate::contracts::change::TrackedChangeView;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -87,8 +89,8 @@ pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
 pub use row_api::{
-    decode_registered_schema_row, load_exact_row, scan_rows, ExactRowQuery, Row, RowQuery,
-    RowReadMode,
+    decode_registered_schema_row, load_exact_live_row, scan_live_rows, write_live_rows,
+    ExactLiveRowQuery, LiveRow, LiveRowQuery, RowReadMode,
 };
 pub(crate) use schema_access::LiveReadContract;
 pub use shared::identity::RowIdentity;
@@ -115,7 +117,9 @@ pub use untracked::{
     ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteBatch,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
-pub(crate) use visible_rows::{scan_live_rows, LiveReadRow, LiveStorageLane};
+pub(crate) use visible_rows::{
+    scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
+};
 
 pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
     lifecycle::require_ready(backend).await
@@ -265,6 +269,28 @@ pub(crate) async fn apply_commit_projections_best_effort_in_transaction(
         transaction,
         receipt,
         tracked_writer_key_hints,
+    )
+    .await
+}
+
+pub(crate) async fn apply_tracked_commit_effects_in_transaction<Change: TrackedChangeView>(
+    transaction: &mut dyn LixBackendTransaction,
+    receipt: &crate::contracts::artifacts::CanonicalCommitReceipt,
+    changes: &[Change],
+    execution_writer_key: Option<&str>,
+) -> Result<(), LixError> {
+    let tracked_writer_key_hints =
+        writer_key::tracked_writer_key_annotations_from_changes(changes, execution_writer_key);
+    let mut executor = &mut *transaction;
+    writer_key::apply_writer_key_annotations_with_executor(
+        &mut executor,
+        &tracked_writer_key_hints,
+    )
+    .await?;
+    apply_commit_projections_best_effort_in_transaction(
+        transaction,
+        receipt,
+        &tracked_writer_key_hints,
     )
     .await
 }
@@ -459,23 +485,23 @@ pub(crate) async fn upsert_bootstrap_tracked_row_in_transaction(
     snapshot_content: &str,
     timestamp: &str,
 ) -> Result<(), LixError> {
-    let batch = [tracked::TrackedWriteRow {
+    let rows = [LiveRow {
         entity_id: entity_id.to_string(),
         schema_key: schema_key.to_string(),
         schema_version: schema_version.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
-        global: version_id == crate::version_state::GLOBAL_VERSION_ID,
         plugin_key: plugin_key.to_string(),
         metadata: None,
-        change_id: change_id.to_string(),
+        change_id: Some(change_id.to_string()),
         writer_key: None,
-        snapshot_content: Some(snapshot_content.to_string()),
+        global: version_id == crate::version_state::GLOBAL_VERSION_ID,
+        untracked: false,
         created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: tracked::TrackedWriteOperation::Upsert,
+        updated_at: Some(timestamp.to_string()),
+        snapshot_content: Some(snapshot_content.to_string()),
     }];
-    apply_tracked_write_batch_in_transaction(transaction, &batch).await
+    write_live_rows(transaction, &rows).await
 }
 
 pub(crate) async fn upsert_bootstrap_untracked_row_in_transaction(
@@ -489,22 +515,23 @@ pub(crate) async fn upsert_bootstrap_untracked_row_in_transaction(
     snapshot_content: &str,
     timestamp: &str,
 ) -> Result<(), LixError> {
-    let batch = [untracked::UntrackedWriteRow {
+    let rows = [LiveRow {
         entity_id: entity_id.to_string(),
         schema_key: schema_key.to_string(),
         schema_version: schema_version.to_string(),
         file_id: file_id.to_string(),
         version_id: version_id.to_string(),
-        global: version_id == crate::version_state::GLOBAL_VERSION_ID,
         plugin_key: plugin_key.to_string(),
         metadata: None,
+        change_id: None,
         writer_key: None,
-        snapshot_content: Some(snapshot_content.to_string()),
+        global: version_id == crate::version_state::GLOBAL_VERSION_ID,
+        untracked: true,
         created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: untracked::UntrackedWriteOperation::Upsert,
+        updated_at: Some(timestamp.to_string()),
+        snapshot_content: Some(snapshot_content.to_string()),
     }];
-    apply_untracked_write_batch_in_transaction(transaction, &batch).await
+    write_live_rows(transaction, &rows).await
 }
 
 #[cfg(test)]

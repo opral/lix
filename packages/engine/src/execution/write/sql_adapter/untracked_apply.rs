@@ -1,11 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::artifacts::{
-    PlannedStateRow, UntrackedWriteBatch, UntrackedWriteOperation, UntrackedWriteRow,
-};
+use crate::contracts::artifacts::PlannedStateRow;
 use crate::contracts::functions::LixFunctionProvider;
-use crate::contracts::traits::UntrackedWriteParticipant;
 use crate::execution::write::filesystem::runtime::compile_filesystem_finalization_from_state_in_transaction;
+use crate::live_state::{write_live_rows, LiveRow};
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::registered_schema_bootstrap::mirror_registered_schema_planned_rows_in_transaction;
@@ -25,15 +23,15 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
 
     if plan.execution.persist_filesystem_payloads_before_write {
         // Untracked filesystem writes materialize blob payloads eagerly, but keep
-        // descriptor-domain visibility in the untracked live tables owned here.
+        // descriptor visibility in the untracked live tables owned here.
     }
 
-    let batch = untracked_write_batch_from_planned_rows(
+    let rows = live_rows_from_planned_rows(
         &plan.execution.intended_post_state,
         &timestamp,
         plan.writer_key.as_deref(),
     )?;
-    transaction.apply_untracked_write_batch(&batch).await?;
+    write_live_rows(transaction, &rows).await?;
     mirror_registered_schema_planned_rows_in_transaction(
         transaction,
         &plan.execution.intended_post_state,
@@ -96,21 +94,21 @@ pub(super) async fn run_public_untracked_write_txn_with_transaction(
     }))
 }
 
-fn untracked_write_batch_from_planned_rows(
+fn live_rows_from_planned_rows(
     rows: &[PlannedStateRow],
     timestamp: &str,
     execution_writer_key: Option<&str>,
-) -> Result<UntrackedWriteBatch, LixError> {
+) -> Result<Vec<LiveRow>, LixError> {
     rows.iter()
-        .map(|row| untracked_write_row_from_planned_row(row, timestamp, execution_writer_key))
+        .map(|row| live_row_from_planned_row(row, timestamp, execution_writer_key))
         .collect()
 }
 
-fn untracked_write_row_from_planned_row(
+fn live_row_from_planned_row(
     row: &PlannedStateRow,
     timestamp: &str,
     execution_writer_key: Option<&str>,
-) -> Result<UntrackedWriteRow, LixError> {
+) -> Result<LiveRow, LixError> {
     let file_id = planned_row_text_value(row, "file_id")?;
     let plugin_key = planned_row_text_value(row, "plugin_key")?;
     let schema_version = planned_row_text_value(row, "schema_version")?;
@@ -120,7 +118,7 @@ fn untracked_write_row_from_planned_row(
         .and_then(value_as_bool)
         .unwrap_or_else(|| row.version_id.as_deref() == Some(GLOBAL_VERSION_ID));
 
-    Ok(UntrackedWriteRow {
+    Ok(LiveRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         schema_version: schema_version.to_string(),
@@ -132,21 +130,18 @@ fn untracked_write_row_from_planned_row(
         global,
         plugin_key: plugin_key.to_string(),
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
+        change_id: None,
         writer_key: row
             .writer_key
             .as_deref()
             .or(execution_writer_key)
             .map(ToString::to_string),
+        untracked: true,
+        created_at: Some(timestamp.to_string()),
+        updated_at: Some(timestamp.to_string()),
         snapshot_content: (!row.tombstone)
             .then(|| planned_row_json_text_value(row, "snapshot_content"))
             .transpose()?,
-        created_at: Some(timestamp.to_string()),
-        updated_at: timestamp.to_string(),
-        operation: if row.tombstone {
-            UntrackedWriteOperation::Delete
-        } else {
-            UntrackedWriteOperation::Upsert
-        },
     })
 }
 

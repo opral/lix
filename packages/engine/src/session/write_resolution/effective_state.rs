@@ -6,7 +6,7 @@ use crate::contracts::artifacts::{
 use crate::contracts::traits::{
     LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingStateOverlay,
 };
-use crate::schema::load_workspace_writer_key_annotation_for_state_row;
+use crate::live_state::writer_key::load_writer_key_annotation_for_state_row;
 use crate::session::version_ops::load_exact_committed_state_row_at_version_head as load_exact_committed_state_row;
 use crate::session::write_resolution::prepared_artifacts::{
     overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,
@@ -123,12 +123,8 @@ async fn load_exact_tracked_effective_row(
     .await?;
 
     if let Some(row) = row {
-        let row = annotate_tracked_exact_row_with_workspace_writer_key(
-            backend,
-            pending_state_overlay,
-            row,
-        )
-        .await?;
+        let row =
+            annotate_tracked_exact_row_with_writer_key(backend, pending_state_overlay, row).await?;
         if tracked_exact_row_matches_row_key(&row, &request.row_key) {
             return Ok(TrackedExactEffectiveRowLookup::Matched(
                 exact_effective_state_row_from_tracked(row, &request.version_id, overlay_lane),
@@ -273,12 +269,12 @@ fn live_state_overlay_lane(lane: OverlayLane) -> LiveQueryOverlayLane {
     }
 }
 
-async fn annotate_tracked_exact_row_with_workspace_writer_key(
+async fn annotate_tracked_exact_row_with_writer_key(
     backend: &dyn LixBackend,
     pending_state_overlay: Option<&dyn PendingStateOverlay>,
     row: ExactCommittedStateRow,
 ) -> Result<WorkspaceAnnotatedTrackedExactRow, LixError> {
-    let writer_key = if let Some(writer_key) = pending_workspace_writer_key_annotation(
+    let writer_key = if let Some(writer_key) = pending_writer_key_annotation(
         pending_state_overlay,
         &row.version_id,
         &row.schema_key,
@@ -287,7 +283,7 @@ async fn annotate_tracked_exact_row_with_workspace_writer_key(
     ) {
         writer_key
     } else {
-        load_workspace_writer_key_annotation_for_state_row(
+        load_writer_key_annotation_for_state_row(
             backend,
             &row.version_id,
             &row.schema_key,
@@ -302,7 +298,7 @@ async fn annotate_tracked_exact_row_with_workspace_writer_key(
     })
 }
 
-fn pending_workspace_writer_key_annotation(
+fn pending_writer_key_annotation(
     pending_state_overlay: Option<&dyn PendingStateOverlay>,
     version_id: &str,
     schema_key: &str,
@@ -310,9 +306,7 @@ fn pending_workspace_writer_key_annotation(
     file_id: &str,
 ) -> Option<Option<String>> {
     pending_state_overlay.and_then(|view| {
-        view.workspace_writer_key_annotation_for_state_row(
-            version_id, schema_key, entity_id, file_id,
-        )
+        view.writer_key_annotation_for_state_row(version_id, schema_key, entity_id, file_id)
     })
 }
 
@@ -457,7 +451,7 @@ async fn exact_effective_state_row_from_pending(
         "metadata".to_string(),
         row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
     );
-    let writer_key = pending_workspace_writer_key_annotation(
+    let writer_key = pending_writer_key_annotation(
         pending_state_overlay,
         &row.version_id,
         &row.schema_key,

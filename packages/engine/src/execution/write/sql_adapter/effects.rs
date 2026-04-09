@@ -9,7 +9,7 @@ use crate::execution::write::buffered::{
 };
 use crate::execution::write::filesystem::runtime::{
     compile_filesystem_finalization_from_state_in_transaction, merge_filesystem_transaction_state,
-    persist_filesystem_payload_domain_changes_in_transaction,
+    persist_filesystem_payload_changes_in_transaction,
 };
 use crate::execution::write::filesystem::state::filesystem_transaction_state_from_planned;
 use crate::execution::write::{
@@ -153,9 +153,9 @@ pub(crate) async fn complete_sql_command_execution(
             )
         };
         if let Some(filesystem_finalization) = filesystem_finalization.as_ref() {
-            persist_filesystem_payload_domain_changes_in_transaction(
+            persist_filesystem_payload_changes_in_transaction(
                 transaction,
-                &filesystem_finalization.payload_domain_changes(),
+                &filesystem_finalization.payload_changes(),
             )
             .await
             .map_err(|error| LixError {

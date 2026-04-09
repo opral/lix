@@ -1,9 +1,8 @@
 use crate::common::fingerprint::stable_content_fingerprint_hex;
 use crate::contracts::artifacts::{
-    CommitPreconditions, DomainChangeBatch, ExpectedHead, IdempotencyKey, PublicDomainChange,
-    SemanticEffect,
+    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,
 };
-use crate::contracts::change::TrackedDomainChangeView;
+use crate::contracts::change::TrackedChangeView;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,
@@ -11,7 +10,7 @@ use crate::sql::logical_plan::public_ir::{
 use crate::LixError;
 use serde_json::{json, Map, Value as JsonValue};
 
-impl TrackedDomainChangeView for PublicDomainChange {
+impl TrackedChangeView for PublicChange {
     fn entity_id(&self) -> &str {
         &self.entity_id
     }
@@ -46,18 +45,18 @@ impl TrackedDomainChangeView for PublicDomainChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DomainChangeError {
+pub(crate) struct ChangeError {
     pub(crate) message: String,
 }
 
-pub(crate) fn build_domain_change_batch(
+pub(crate) fn build_change_batches(
     planned_write: &PlannedWrite,
-) -> Result<Vec<DomainChangeBatch>, DomainChangeError> {
+) -> Result<Vec<ChangeBatch>, ChangeError> {
     let resolved = planned_write
         .resolved_write_plan
         .as_ref()
-        .ok_or_else(|| DomainChangeError {
-            message: "public domain-change derivation requires a resolved write plan".to_string(),
+        .ok_or_else(|| ChangeError {
+            message: "public change derivation requires a resolved write plan".to_string(),
         })?;
     resolved
         .partitions
@@ -66,17 +65,17 @@ pub(crate) fn build_domain_change_batch(
             partition.execution_mode == WriteMode::Tracked
                 && !partition.intended_post_state.is_empty()
         })
-        .map(|partition| build_domain_change_batch_for_partition(planned_write, partition))
+        .map(|partition| build_change_batch_for_partition(planned_write, partition))
         .collect()
 }
 
 pub(crate) fn derive_commit_preconditions(
     planned_write: &PlannedWrite,
-) -> Result<Vec<CommitPreconditions>, DomainChangeError> {
+) -> Result<Vec<CommitPreconditions>, ChangeError> {
     let resolved = planned_write
         .resolved_write_plan
         .as_ref()
-        .ok_or_else(|| DomainChangeError {
+        .ok_or_else(|| ChangeError {
             message: "public commit precondition derivation requires a resolved write plan"
                 .to_string(),
         })?;
@@ -94,7 +93,7 @@ pub(crate) fn derive_commit_preconditions(
         let write_lane = partition
             .target_write_lane
             .clone()
-            .ok_or_else(|| DomainChangeError {
+            .ok_or_else(|| ChangeError {
                 message:
                     "public commit precondition derivation requires exactly one tracked write lane"
                         .to_string(),
@@ -110,21 +109,20 @@ pub(crate) fn derive_commit_preconditions(
     Ok(preconditions)
 }
 
-fn build_domain_change_batch_for_partition(
+fn build_change_batch_for_partition(
     planned_write: &PlannedWrite,
     partition: &ResolvedWritePartition,
-) -> Result<DomainChangeBatch, DomainChangeError> {
+) -> Result<ChangeBatch, ChangeError> {
     if partition.intended_post_state.is_empty() {
-        return Err(DomainChangeError {
-            message: "public domain-change derivation requires tracked rows".to_string(),
+        return Err(ChangeError {
+            message: "public change derivation requires tracked rows".to_string(),
         });
     }
     let write_lane = partition
         .target_write_lane
         .clone()
-        .ok_or_else(|| DomainChangeError {
-            message: "public domain-change derivation requires exactly one tracked write lane"
-                .to_string(),
+        .ok_or_else(|| ChangeError {
+            message: "public change derivation requires exactly one tracked write lane".to_string(),
         })?;
 
     let mut changes = Vec::new();
@@ -140,38 +138,33 @@ fn build_domain_change_batch_for_partition(
         } else {
             "state.upsert"
         };
-        changes.push(PublicDomainChange {
+        changes.push(PublicChange {
             entity_id: require_identity::<crate::EntityId>(
                 row.entity_id.clone(),
-                "public domain-change entity_id",
+                "public change entity_id",
             )?
             .into_inner(),
             schema_key: require_identity::<crate::CanonicalSchemaKey>(
                 row.schema_key.clone(),
-                "public domain-change schema_key",
+                "public change schema_key",
             )?
             .into_inner(),
             schema_version: text_value(&row.values, "schema_version")
                 .map(|value| {
                     require_identity::<crate::CanonicalSchemaVersion>(
                         value,
-                        "public domain-change schema_version",
+                        "public change schema_version",
                     )
                 })
                 .transpose()?
                 .map(|value| value.into_inner()),
             file_id: text_value(&row.values, "file_id")
-                .map(|value| {
-                    require_identity::<crate::FileId>(value, "public domain-change file_id")
-                })
+                .map(|value| require_identity::<crate::FileId>(value, "public change file_id"))
                 .transpose()?
                 .map(|value| value.into_inner()),
             plugin_key: text_value(&row.values, "plugin_key")
                 .map(|value| {
-                    require_identity::<crate::CanonicalPluginKey>(
-                        value,
-                        "public domain-change plugin_key",
-                    )
+                    require_identity::<crate::CanonicalPluginKey>(value, "public change plugin_key")
                 })
                 .transpose()?
                 .map(|value| value.into_inner()),
@@ -182,11 +175,10 @@ fn build_domain_change_batch_for_partition(
             },
             metadata: serialized_value(&row.values, "metadata"),
             version_id: require_identity::<crate::VersionId>(
-                row.version_id.clone().ok_or_else(|| DomainChangeError {
-                    message: "public domain-change derivation requires a concrete version_id"
-                        .to_string(),
+                row.version_id.clone().ok_or_else(|| ChangeError {
+                    message: "public change derivation requires a concrete version_id".to_string(),
                 })?,
-                "public domain-change version_id",
+                "public change version_id",
             )?
             .into_inner(),
             writer_key,
@@ -200,7 +192,7 @@ fn build_domain_change_batch_for_partition(
         });
     }
 
-    Ok(DomainChangeBatch {
+    Ok(ChangeBatch {
         changes,
         write_lane,
         writer_key: planned_write.command.execution_context.writer_key.clone(),
@@ -213,7 +205,7 @@ fn build_idempotency_key(
     partition: &ResolvedWritePartition,
     partition_index: usize,
     write_lane: &WriteLane,
-) -> Result<IdempotencyKey, DomainChangeError> {
+) -> Result<IdempotencyKey, ChangeError> {
     let summarized = json!({
         "surface": planned_write.command.target.descriptor.public_name,
         "operation": write_operation_kind_name(planned_write.command.operation_kind),
@@ -223,7 +215,7 @@ fn build_idempotency_key(
         "payload": summarize_mutation_payload(&planned_write.command.payload),
         "resolved_rows": summarize_partition_rows(partition),
     });
-    let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| DomainChangeError {
+    let summarized_bytes = serde_json::to_vec(&summarized).map_err(|error| ChangeError {
         message: format!("public idempotency-key serialization failed: {error}"),
     })?;
     let fingerprint = stable_content_fingerprint_hex(&summarized_bytes);
@@ -361,12 +353,12 @@ fn serialized_value(
     }
 }
 
-fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, DomainChangeError>
+fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, ChangeError>
 where
     T: TryFrom<String, Error = LixError>,
 {
     let value = value.into();
-    T::try_from(value.clone()).map_err(|_| DomainChangeError {
+    T::try_from(value.clone()).map_err(|_| ChangeError {
         message: format!(
             "{context} must be a non-empty canonical identity, got '{}'",
             value
@@ -380,7 +372,7 @@ fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_domain_change_batch, derive_commit_preconditions};
+    use super::{build_change_batches, derive_commit_preconditions};
     use crate::contracts::artifacts::ExpectedHead;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::WriteLane;
@@ -457,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn builds_tracked_domain_change_batch_for_state_insert() {
+    fn builds_tracked_change_batch_for_state_insert() {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -470,8 +462,8 @@ mod tests {
                     )
                     .await;
 
-                    let batches = build_domain_change_batch(&planned_write)
-                        .expect("domain changes should derive")
+                    let batches = build_change_batches(&planned_write)
+                        .expect("changes should derive")
                         .into_iter()
                         .next()
                         .expect("tracked writes should produce a batch");

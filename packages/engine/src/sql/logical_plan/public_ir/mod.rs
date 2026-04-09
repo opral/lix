@@ -874,7 +874,7 @@ pub(crate) struct ResolvedWritePartition {
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
     pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
-    pub(crate) workspace_writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
+    pub(crate) writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,

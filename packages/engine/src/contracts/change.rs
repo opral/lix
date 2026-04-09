@@ -1,4 +1,4 @@
-pub(crate) trait TrackedDomainChangeView {
+pub(crate) trait TrackedChangeView {
     fn entity_id(&self) -> &str;
     fn schema_key(&self) -> &str;
     fn schema_version(&self) -> Option<&str>;

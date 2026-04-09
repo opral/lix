@@ -3,7 +3,7 @@ use crate::contracts::traits::{
 };
 use crate::execution::write::buffered::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
-    PendingWorkspaceWriterKeyOverlay,
+    PendingWriterKeyOverlay,
 };
 
 #[derive(Clone, Default)]
@@ -11,7 +11,7 @@ pub(crate) struct PendingTransactionView {
     registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
     semantic_overlay: Option<PendingSemanticOverlay>,
     filesystem_overlay: Option<PendingFilesystemOverlay>,
-    workspace_writer_key_overlay: Option<PendingWorkspaceWriterKeyOverlay>,
+    writer_key_overlay: Option<PendingWriterKeyOverlay>,
 }
 
 impl PendingTransactionView {
@@ -19,13 +19,13 @@ impl PendingTransactionView {
         registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
         semantic_overlay: Option<PendingSemanticOverlay>,
         filesystem_overlay: Option<PendingFilesystemOverlay>,
-        workspace_writer_key_overlay: Option<PendingWorkspaceWriterKeyOverlay>,
+        writer_key_overlay: Option<PendingWriterKeyOverlay>,
     ) -> Option<Self> {
         let view = Self {
             registered_schema_overlay,
             semantic_overlay,
             filesystem_overlay,
-            workspace_writer_key_overlay,
+            writer_key_overlay,
         };
         view.has_overlays().then_some(view)
     }
@@ -34,7 +34,7 @@ impl PendingTransactionView {
         self.registered_schema_overlay.is_some()
             || self.semantic_overlay.is_some()
             || self.filesystem_overlay.is_some()
-            || self.workspace_writer_key_overlay.is_some()
+            || self.writer_key_overlay.is_some()
     }
 
     pub(crate) fn registered_schema_overlay(&self) -> Option<&PendingRegisteredSchemaOverlay> {
@@ -49,8 +49,8 @@ impl PendingTransactionView {
         self.semantic_overlay.as_ref()
     }
 
-    pub(crate) fn workspace_writer_key_overlay(&self) -> Option<&PendingWorkspaceWriterKeyOverlay> {
-        self.workspace_writer_key_overlay.as_ref()
+    pub(crate) fn writer_key_overlay(&self) -> Option<&PendingWriterKeyOverlay> {
+        self.writer_key_overlay.as_ref()
     }
 }
 
@@ -113,14 +113,14 @@ impl PendingView for PendingTransactionView {
             .unwrap_or_default()
     }
 
-    fn workspace_writer_key_annotation_for_state_row(
+    fn writer_key_annotation_for_state_row(
         &self,
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        self.workspace_writer_key_overlay()
+        self.writer_key_overlay()
             .and_then(|overlay| {
                 overlay.annotation_for_state_row(version_id, schema_key, entity_id, file_id)
             })

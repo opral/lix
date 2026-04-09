@@ -1,9 +1,8 @@
 use async_trait::async_trait;
-use std::collections::BTreeMap;
 
 use crate::contracts::artifacts::{
-    CanonicalCommitReceipt, PendingPublicCommitSession, PreparedPublicReadArtifact,
-    PublicDomainChange, RowIdentity, SessionStateDelta, StateCommitStreamChange,
+    CanonicalCommitReceipt, PendingPublicCommitSession, PreparedPublicReadArtifact, PublicChange,
+    SessionStateDelta, StateCommitStreamChange,
 };
 #[cfg(test)]
 use crate::contracts::artifacts::{
@@ -143,7 +142,7 @@ impl TransactionCommitOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct TrackedCommitExecutionOutcome {
     pub(crate) receipt: Option<CanonicalCommitReceipt>,
-    pub(crate) applied_domain_changes: Vec<PublicDomainChange>,
+    pub(crate) applied_changes: Vec<PublicChange>,
     pub(crate) plugin_changes_committed: bool,
     pub(crate) next_active_version_id: Option<String>,
 }
@@ -180,12 +179,6 @@ pub(crate) trait WriteExecutionBindings {
         unit: &TrackedTxnUnit,
         pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
     ) -> Result<TrackedCommitExecutionOutcome, LixError>;
-
-    async fn apply_writer_key_annotations_in_transaction(
-        &self,
-        transaction: &mut dyn LixBackendTransaction,
-        annotations: &BTreeMap<RowIdentity, Option<String>>,
-    ) -> Result<(), LixError>;
 }
 
 #[derive(Default)]

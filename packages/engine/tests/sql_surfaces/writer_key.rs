@@ -83,7 +83,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT writer_key \
-                     FROM lix_internal_workspace_writer_key \
+                     FROM lix_internal_writer_key \
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-explicit-insert' \

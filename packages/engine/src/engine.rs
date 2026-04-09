@@ -226,22 +226,6 @@ impl crate::execution::write::WriteExecutionBindings for Engine {
         )
         .await
     }
-
-    async fn apply_writer_key_annotations_in_transaction(
-        &self,
-        transaction: &mut dyn crate::LixBackendTransaction,
-        annotations: &std::collections::BTreeMap<
-            crate::contracts::artifacts::RowIdentity,
-            Option<String>,
-        >,
-    ) -> Result<(), LixError> {
-        let mut executor = &mut *transaction;
-        crate::schema::apply_workspace_writer_key_annotations_with_executor(
-            &mut executor,
-            annotations,
-        )
-        .await
-    }
 }
 
 impl Engine {

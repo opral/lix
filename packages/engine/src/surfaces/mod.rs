@@ -8,7 +8,7 @@ use crate::contracts::surface::{
     DynamicEntitySurfaceSpec, SurfaceColumnType, SurfaceOverridePredicate, SurfaceOverrideValue,
     SurfaceRegistry,
 };
-use crate::live_state::{decode_registered_schema_row, scan_rows, RowQuery, RowReadMode};
+use crate::live_state::{decode_registered_schema_row, scan_live_rows, LiveRowQuery, RowReadMode};
 use crate::runtime::cel::shared_runtime;
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, collect_lixcol_overrides,
@@ -82,9 +82,9 @@ pub(crate) async fn load_public_surface_registry_with_backend(
 async fn load_latest_registered_schemas(
     backend: &dyn LixBackend,
 ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
-    let rows = scan_rows(
+    let rows = scan_live_rows(
         backend,
-        &RowQuery {
+        &LiveRowQuery {
             schema_key: "lix_registered_schema".to_string(),
             version_id: "global".to_string(),
             mode: RowReadMode::Tracked,

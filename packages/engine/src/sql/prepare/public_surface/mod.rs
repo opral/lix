@@ -7,12 +7,12 @@ use crate::common::errors::{
     sql_unknown_table_error,
 };
 use crate::contracts::artifacts::{
-    CommitPreconditions, CommittedReadMode, DomainChangeBatch, EffectiveStateRequest,
-    SessionStateDelta, StateCommitStreamOperation,
+    ChangeBatch, CommitPreconditions, CommittedReadMode, EffectiveStateRequest, SessionStateDelta,
+    StateCommitStreamOperation,
 };
-use crate::contracts::change::TrackedDomainChangeView;
+use crate::contracts::change::TrackedChangeView;
 use crate::contracts::state_commit_stream::{
-    state_commit_stream_changes_from_domain_changes, state_commit_stream_changes_from_planned_rows,
+    state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamRuntimeMetadata,
 };
 use crate::contracts::surface::{
@@ -131,7 +131,7 @@ pub(crate) struct PreparedPublicWrite {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
     pub(crate) explain_plan: PreparedPublicWriteExplainPlan,
-    pub(crate) domain_change_batches: Vec<DomainChangeBatch>,
+    pub(crate) change_batches: Vec<ChangeBatch>,
     pub(crate) surface_bindings: Vec<String>,
     pub(crate) execution: PreparedPublicWriteExecution,
     pub(crate) explain: ExplainArtifacts,
@@ -1200,7 +1200,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         semantics: write_analysis.semantics.clone(),
         planned_write: planned_write.clone(),
         execution: execution.clone(),
-        domain_change_batches: Vec::new(),
+        change_batches: Vec::new(),
         invariant_trace: Some(build_public_write_invariant_trace(&planned_write)),
         stage_timings: explain_plan.stage_timings.clone(),
     });
@@ -1209,7 +1209,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         explain,
         planned_write,
         explain_plan,
-        domain_change_batches: Vec::new(),
+        change_batches: Vec::new(),
         surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
         execution,
         canonicalized: canonicalized.clone(),
@@ -1218,13 +1218,13 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
 
 pub(crate) fn build_public_write_execution(
     planned_write: &PlannedWrite,
-    domain_change_batches: &[DomainChangeBatch],
+    change_batches: &[ChangeBatch],
     commit_preconditions: &[CommitPreconditions],
 ) -> Result<Option<PreparedPublicWriteExecution>, LixError> {
     let Some(resolved) = planned_write.resolved_write_plan.as_ref() else {
         return Ok(None);
     };
-    let mut tracked_batches = domain_change_batches.iter();
+    let mut tracked_batches = change_batches.iter();
     let mut tracked_preconditions = commit_preconditions.iter();
     let mut partitions = Vec::new();
     let mut filesystem_payloads_persisted = false;
@@ -1246,7 +1246,7 @@ pub(crate) fn build_public_write_execution(
                     return Ok(None);
                 }
 
-                let Some(domain_change_batch) = tracked_batches.next().cloned() else {
+                let Some(change_batch) = tracked_batches.next().cloned() else {
                     return Ok(None);
                 };
 
@@ -1255,12 +1255,12 @@ pub(crate) fn build_public_write_execution(
                         schema_live_table_requirements:
                             schema_live_table_requirements_from_partition(partition),
                         create_preconditions: commit_preconditions.clone(),
-                        semantic_effects: semantic_plan_effects_from_domain_changes(
-                            &domain_change_batch.changes,
+                        semantic_effects: semantic_plan_effects_from_changes(
+                            &change_batch.changes,
                             state_commit_stream_operation(planned_write.command.operation_kind),
-                            domain_change_batch.writer_key.as_deref(),
+                            change_batch.writer_key.as_deref(),
                         )?,
-                        domain_change_batch: Some(domain_change_batch),
+                        change_batch: Some(change_batch),
                     },
                 ));
             }
@@ -1433,27 +1433,27 @@ fn semantic_plan_effects_from_untracked_public_write(
     Ok(effects)
 }
 
-pub(crate) fn semantic_plan_effects_from_domain_changes<Change: TrackedDomainChangeView>(
+pub(crate) fn semantic_plan_effects_from_changes<Change: TrackedChangeView>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
     writer_key: Option<&str>,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
-        state_commit_stream_changes: state_commit_stream_changes_from_domain_changes(
+        state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             stream_operation,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
         )?,
         session_delta: SessionStateDelta {
-            next_active_version_id: next_active_version_id_from_domain_changes(changes)?,
+            next_active_version_id: next_active_version_id_from_changes(changes)?,
             next_active_account_ids: None,
             persist_workspace: false,
         },
-        file_cache_refresh_targets: file_cache_refresh_targets_from_domain_changes(changes),
+        file_cache_refresh_targets: file_cache_refresh_targets_from_changes(changes),
     })
 }
 
-fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
+fn next_active_version_id_from_changes<Change: TrackedChangeView>(
     changes: &[Change],
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {
@@ -1473,7 +1473,7 @@ fn next_active_version_id_from_domain_changes<Change: TrackedDomainChangeView>(
     Ok(None)
 }
 
-fn file_cache_refresh_targets_from_domain_changes<Change: TrackedDomainChangeView>(
+fn file_cache_refresh_targets_from_changes<Change: TrackedChangeView>(
     changes: &[Change],
 ) -> BTreeSet<(String, String)> {
     changes

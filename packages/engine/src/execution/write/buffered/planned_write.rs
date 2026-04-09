@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::artifacts::{
-    coalesce_live_table_requirements, DomainChangeBatch, ExpectedHead, MutationRow,
-    OptionalTextPatch, PlanEffects, PlannedRowIdentity, PlannedStateRow,
-    PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
-    PreparedPublicWriteExecutionArtifact, PreparedPublicWriteExecutionPartition,
-    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteStep,
-    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteMode,
+    coalesce_live_table_requirements, ChangeBatch, ExpectedHead, MutationRow, OptionalTextPatch,
+    PlanEffects, PlannedRowIdentity, PlannedStateRow, PreparedInternalWriteArtifact,
+    PreparedPublicWriteArtifact, PreparedPublicWriteExecutionArtifact,
+    PreparedPublicWriteExecutionPartition, PreparedTrackedWriteExecution,
+    PreparedUntrackedWriteExecution, PreparedWriteStep, ResultContract, RowIdentity,
+    SchemaRegistration, SchemaRegistrationSet, WriteMode,
 };
 use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
 use crate::execution::write::filesystem::runtime::{
@@ -28,6 +28,7 @@ pub(crate) struct TrackedTxnUnit {
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) runtime_state: PreparedWriteRuntimeState,
     pub(crate) writer_key: Option<String>,
+    pub(crate) writer_key_annotations: BTreeMap<RowIdentity, Option<String>>,
 }
 
 impl TrackedTxnUnit {
@@ -41,7 +42,7 @@ impl TrackedTxnUnit {
     }
 
     pub(crate) fn has_compiler_only_filesystem_changes(&self) -> bool {
-        self.execution.domain_change_batch.is_none() && !self.filesystem_state.files.is_empty()
+        self.execution.change_batch.is_none() && !self.filesystem_state.files.is_empty()
     }
 
     pub(crate) fn is_merged_transaction_plan(&self) -> bool {
@@ -62,6 +63,7 @@ fn build_tracked_txn_unit(
         filesystem_state: filesystem_state.clone(),
         runtime_state: runtime_state.clone(),
         writer_key: public_write.contract.writer_key.clone(),
+        writer_key_annotations: writer_key_annotations_from_public_write(public_write),
     }
 }
 
@@ -80,17 +82,11 @@ pub(crate) struct PlannedInternalWriteUnit {
     pub(crate) runtime_state: PreparedWriteRuntimeState,
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct PlannedWorkspaceWriterKeyUnit {
-    pub(crate) annotations: BTreeMap<RowIdentity, Option<String>>,
-}
-
 #[derive(Clone)]
 pub(crate) enum PlannedWriteUnit {
     PublicTracked(TrackedTxnUnit),
     PublicUntracked(PlannedPublicUntrackedWriteUnit),
     Internal(PlannedInternalWriteUnit),
-    WorkspaceWriterKey(PlannedWorkspaceWriterKeyUnit),
 }
 
 #[derive(Clone, Default)]
@@ -132,7 +128,7 @@ pub(crate) struct PlannedWriteDelta {
     registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
     semantic_overlay: Option<PendingSemanticOverlay>,
     filesystem_overlay: Option<PendingFilesystemOverlay>,
-    workspace_writer_key_overlay: Option<PendingWorkspaceWriterKeyOverlay>,
+    writer_key_overlay: Option<PendingWriterKeyOverlay>,
 }
 
 impl PlannedWriteDelta {
@@ -145,8 +141,8 @@ impl PlannedWriteDelta {
             pending_semantic_overlay_for_planned_write_plan(&materialization_plan)?;
         let filesystem_overlay =
             pending_filesystem_overlay_for_planned_write_plan(&materialization_plan);
-        let workspace_writer_key_overlay =
-            pending_workspace_writer_key_overlay_for_planned_write_plan(&materialization_plan);
+        let writer_key_overlay =
+            pending_writer_key_overlay_for_planned_write_plan(&materialization_plan);
         let registered_schema_overlay = semantic_overlay
             .as_ref()
             .and_then(PendingSemanticOverlay::registered_schema_overlay);
@@ -156,7 +152,7 @@ impl PlannedWriteDelta {
             registered_schema_overlay,
             semantic_overlay,
             filesystem_overlay,
-            workspace_writer_key_overlay,
+            writer_key_overlay,
         })
     }
 
@@ -180,8 +176,8 @@ impl PlannedWriteDelta {
         self.filesystem_overlay.clone()
     }
 
-    pub(crate) fn workspace_writer_key_overlay(&self) -> Option<PendingWorkspaceWriterKeyOverlay> {
-        self.workspace_writer_key_overlay.clone()
+    pub(crate) fn writer_key_overlay(&self) -> Option<PendingWriterKeyOverlay> {
+        self.writer_key_overlay.clone()
     }
 
     pub(crate) fn pending_transaction_view(&self) -> Option<PendingTransactionView> {
@@ -189,7 +185,7 @@ impl PlannedWriteDelta {
             self.registered_schema_overlay(),
             self.semantic_overlay(),
             self.filesystem_overlay(),
-            self.workspace_writer_key_overlay(),
+            self.writer_key_overlay(),
         )
     }
 
@@ -221,18 +217,16 @@ impl PlannedWriteDelta {
                 (None, Some(incoming)) => Some(incoming),
                 (None, None) => None,
             };
-        self.workspace_writer_key_overlay = match (
-            self.workspace_writer_key_overlay.take(),
-            incoming.workspace_writer_key_overlay,
-        ) {
-            (Some(mut current), Some(incoming)) => {
-                merge_pending_workspace_writer_key_overlay(&mut current, incoming);
-                Some(current)
-            }
-            (Some(current), None) => Some(current),
-            (None, Some(incoming)) => Some(incoming),
-            (None, None) => None,
-        };
+        self.writer_key_overlay =
+            match (self.writer_key_overlay.take(), incoming.writer_key_overlay) {
+                (Some(mut current), Some(incoming)) => {
+                    merge_pending_writer_key_overlay(&mut current, incoming);
+                    Some(current)
+                }
+                (Some(current), None) => Some(current),
+                (None, Some(incoming)) => Some(incoming),
+                (None, None) => None,
+            };
         self.registered_schema_overlay = self
             .semantic_overlay
             .as_ref()
@@ -354,7 +348,7 @@ pub(crate) struct PendingFilesystemOverlay {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct PendingWorkspaceWriterKeyOverlay {
+pub(crate) struct PendingWriterKeyOverlay {
     annotations: BTreeMap<RowIdentity, Option<String>>,
 }
 
@@ -374,7 +368,7 @@ impl PendingFilesystemOverlay {
     }
 }
 
-impl PendingWorkspaceWriterKeyOverlay {
+impl PendingWriterKeyOverlay {
     pub(crate) fn annotation_for_state_row(
         &self,
         version_id: &str,
@@ -463,13 +457,6 @@ pub(crate) fn build_planned_write_plan(
                 }
             }
         }
-        if let Some(workspace_writer_key_unit) =
-            planned_workspace_writer_key_unit_from_public_write(public_write)
-        {
-            units.push(PlannedWriteUnit::WorkspaceWriterKey(
-                workspace_writer_key_unit,
-            ));
-        }
     } else if let Some(internal_execution) = prepared.internal_write() {
         if internal_execution.read_only_query {
             return None;
@@ -499,22 +486,24 @@ pub(crate) fn build_planned_write_delta(
         .transpose()
 }
 
-fn planned_workspace_writer_key_unit_from_public_write(
+fn writer_key_annotations_from_public_write(
     public_write: &PreparedPublicWriteArtifact,
-) -> Option<PlannedWorkspaceWriterKeyUnit> {
-    let resolved = public_write.contract.resolved_write_plan.as_ref()?;
-    let mut annotations = BTreeMap::new();
-    for partition in &resolved.partitions {
-        annotations.extend(partition.workspace_writer_key_updates.iter().map(
-            |(identity, annotation)| {
-                (
-                    runtime_row_identity_from_planned(identity),
-                    annotation.clone(),
-                )
-            },
-        ));
-    }
-    (!annotations.is_empty()).then_some(PlannedWorkspaceWriterKeyUnit { annotations })
+) -> BTreeMap<RowIdentity, Option<String>> {
+    let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
+        return BTreeMap::new();
+    };
+
+    resolved
+        .partitions
+        .iter()
+        .flat_map(|partition| partition.writer_key_updates.iter())
+        .map(|(identity, annotation)| {
+            (
+                runtime_row_identity_from_planned(identity),
+                annotation.clone(),
+            )
+        })
+        .collect()
 }
 
 fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> SchemaRegistrationSet {
@@ -556,7 +545,6 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                     }
                 }
             }
-            PlannedWriteUnit::WorkspaceWriterKey(_) => {}
         }
     }
     registrations
@@ -582,10 +570,10 @@ pub(crate) fn pending_filesystem_overlay_for_planned_write_plan(
     (!overlay.directory_rows.is_empty() || !overlay.files.is_empty()).then_some(overlay)
 }
 
-pub(crate) fn pending_workspace_writer_key_overlay_for_planned_write_plan(
+pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
     plan: &PlannedWritePlan,
-) -> Option<PendingWorkspaceWriterKeyOverlay> {
-    let mut overlay = PendingWorkspaceWriterKeyOverlay::default();
+) -> Option<PendingWriterKeyOverlay> {
+    let mut overlay = PendingWriterKeyOverlay::default();
     for unit in &plan.units {
         match unit {
             PlannedWriteUnit::PublicTracked(tracked) => {
@@ -621,11 +609,35 @@ pub(crate) fn pending_workspace_writer_key_overlay_for_planned_write_plan(
                         }
                     }
                 }
+                overlay
+                    .annotations
+                    .extend(tracked.writer_key_annotations.clone());
             }
-            PlannedWriteUnit::WorkspaceWriterKey(unit) => {
-                overlay.annotations.extend(unit.annotations.clone());
+            PlannedWriteUnit::PublicUntracked(untracked) => {
+                for row in &untracked.execution.intended_post_state {
+                    let Some(version_id) = row.version_id.as_ref() else {
+                        continue;
+                    };
+                    let Some(file_id) = row.values.get("file_id").and_then(|value| match value {
+                        crate::Value::Text(value) => Some(value.clone()),
+                        _ => None,
+                    }) else {
+                        continue;
+                    };
+                    overlay.annotations.insert(
+                        RowIdentity {
+                            schema_key: row.schema_key.clone(),
+                            version_id: version_id.clone(),
+                            entity_id: row.entity_id.clone(),
+                            file_id,
+                        },
+                        row.writer_key
+                            .clone()
+                            .or_else(|| untracked.writer_key.clone()),
+                    );
+                }
             }
-            PlannedWriteUnit::PublicUntracked(_) | PlannedWriteUnit::Internal(_) => {}
+            PlannedWriteUnit::Internal(_) => {}
         }
     }
     (!overlay.annotations.is_empty()).then_some(overlay)
@@ -637,9 +649,7 @@ pub(crate) fn planned_write_plan_is_independent_filesystem(plan: &PlannedWritePl
             PlannedWriteUnit::PublicTracked(tracked) => {
                 tracked_plan_is_coalescible_filesystem(tracked)
             }
-            PlannedWriteUnit::PublicUntracked(_)
-            | PlannedWriteUnit::Internal(_)
-            | PlannedWriteUnit::WorkspaceWriterKey(_) => false,
+            PlannedWriteUnit::PublicUntracked(_) | PlannedWriteUnit::Internal(_) => false,
         })
 }
 
@@ -681,9 +691,9 @@ fn merge_pending_filesystem_overlay(
     current.files.extend(incoming.files);
 }
 
-fn merge_pending_workspace_writer_key_overlay(
-    current: &mut PendingWorkspaceWriterKeyOverlay,
-    incoming: PendingWorkspaceWriterKeyOverlay,
+fn merge_pending_writer_key_overlay(
+    current: &mut PendingWriterKeyOverlay,
+    incoming: PendingWriterKeyOverlay,
 ) {
     current.annotations.extend(incoming.annotations);
 }
@@ -726,7 +736,6 @@ fn collect_semantic_overlay_from_planned_write_plan(
                     )?
                     && !internal.execution.has_update_validations
             }
-            PlannedWriteUnit::WorkspaceWriterKey(_) => true,
         };
 
         if !unit_supported {
@@ -751,9 +760,7 @@ fn collect_filesystem_overlay_from_planned_write_plan(
             PlannedWriteUnit::PublicTracked(tracked) => {
                 collect_filesystem_overlay_from_tracked_plan(tracked, overlay, &mut saw_entry)
             }
-            PlannedWriteUnit::PublicUntracked(_)
-            | PlannedWriteUnit::Internal(_)
-            | PlannedWriteUnit::WorkspaceWriterKey(_) => false,
+            PlannedWriteUnit::PublicUntracked(_) | PlannedWriteUnit::Internal(_) => false,
         };
         if !unit_supported {
             return false;
@@ -1033,9 +1040,9 @@ fn try_merge_filesystem_tracked_plans(current: &mut TrackedTxnUnit, next: &Track
                 .push(requirement.clone());
         }
     }
-    current.execution.domain_change_batch = merge_optional_domain_change_batches(
-        current.execution.domain_change_batch.as_ref(),
-        next.execution.domain_change_batch.as_ref(),
+    current.execution.change_batch = merge_optional_change_batches(
+        current.execution.change_batch.as_ref(),
+        next.execution.change_batch.as_ref(),
     );
     merge_plan_effects(
         &mut current.execution.semantic_effects,
@@ -1113,7 +1120,7 @@ fn merge_plan_effects(current: &mut PlanEffects, next: &PlanEffects) {
 
 fn tracked_plan_entity_targets(plan: &TrackedTxnUnit) -> BTreeSet<(String, String, String)> {
     let mut targets = BTreeSet::new();
-    if let Some(batch) = plan.execution.domain_change_batch.as_ref() {
+    if let Some(batch) = plan.execution.change_batch.as_ref() {
         for change in &batch.changes {
             if change.schema_key == "lix_directory_descriptor" {
                 continue;
@@ -1147,10 +1154,10 @@ fn tracked_plan_entity_targets(plan: &TrackedTxnUnit) -> BTreeSet<(String, Strin
     targets
 }
 
-fn merge_optional_domain_change_batches(
-    left: Option<&DomainChangeBatch>,
-    right: Option<&DomainChangeBatch>,
-) -> Option<DomainChangeBatch> {
+fn merge_optional_change_batches(
+    left: Option<&ChangeBatch>,
+    right: Option<&ChangeBatch>,
+) -> Option<ChangeBatch> {
     match (left, right) {
         (None, None) => None,
         (Some(batch), None) | (None, Some(batch)) => Some(batch.clone()),
@@ -1168,7 +1175,7 @@ fn merge_optional_domain_change_batches(
             }
             let mut semantic_effects = left.semantic_effects.clone();
             semantic_effects.extend(right.semantic_effects.clone());
-            Some(DomainChangeBatch {
+            Some(ChangeBatch {
                 changes: merged.into_values().collect(),
                 write_lane: left.write_lane.clone(),
                 writer_key: left.writer_key.clone().or_else(|| right.writer_key.clone()),

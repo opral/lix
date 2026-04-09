@@ -3,7 +3,7 @@
 use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
 use crate::live_state;
-use crate::schema::WORKSPACE_WRITER_KEY_TABLE;
+use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_payload_alias, entity_surface_uses_payload_alias, escape_sql_string,
     expr_contains_string_literal, json_array_text_join_sql, quote_ident, render_identifier,
@@ -623,7 +623,7 @@ fn effective_state_schema_winner_rows_sql(
         .map(|schema_key| {
             let table_name = quote_ident(&live_state::tracked_relation_name(schema_key));
             let untracked_table = quote_ident(&live_state::tracked_relation_name(schema_key));
-            let workspace_writer_key_table = quote_ident(WORKSPACE_WRITER_KEY_TABLE);
+            let writer_key_table = quote_ident(WRITER_KEY_TABLE);
             let tracked_full_projection = live_state::normalized_projection_sql_for_schema(
                 schema_key,
                 known_live_layouts.get(schema_key),
@@ -724,7 +724,7 @@ fn effective_state_schema_winner_rows_sql(
                        ON tv.version_id = t.version_id \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
-                     LEFT JOIN {workspace_writer_key_table} wk \
+                     LEFT JOIN {writer_key_table} wk \
                        ON wk.version_id = t.version_id \
                       AND wk.schema_key = t.schema_key \
                       AND wk.entity_id = t.entity_id \
@@ -754,7 +754,7 @@ fn effective_state_schema_winner_rows_sql(
                       AND t.version_id = '{global_version}' \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
-                     LEFT JOIN {workspace_writer_key_table} gwk \
+                     LEFT JOIN {writer_key_table} gwk \
                        ON gwk.version_id = t.version_id \
                       AND gwk.schema_key = t.schema_key \
                       AND gwk.entity_id = t.entity_id \
@@ -820,7 +820,7 @@ fn effective_state_schema_winner_rows_sql(
                 untracked_predicates = untracked_predicates,
                 table_name = table_name,
                 untracked_table = untracked_table,
-                workspace_writer_key_table = workspace_writer_key_table,
+                writer_key_table = writer_key_table,
             )
         })
         .collect::<Vec<_>>()

@@ -1,17 +1,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::journal::CanonicalCommitOutput;
-use crate::contracts::change::TrackedDomainChangeView;
+use crate::contracts::change::TrackedChangeView;
 use crate::session::version_ops::VersionInfo;
 use crate::{
-    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
-    FileId, VersionId,
+    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
 
 use super::UpdatedVersionRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProposedDomainChange {
+pub(crate) struct StagedChange {
+    pub(crate) id: Option<String>,
     pub(crate) entity_id: EntityId,
     pub(crate) schema_key: CanonicalSchemaKey,
     pub(crate) schema_version: Option<CanonicalSchemaVersion>,
@@ -21,9 +21,10 @@ pub(crate) struct ProposedDomainChange {
     pub(crate) metadata: Option<String>,
     pub(crate) version_id: VersionId,
     pub(crate) writer_key: Option<String>,
+    pub(crate) created_at: Option<String>,
 }
 
-impl TrackedDomainChangeView for ProposedDomainChange {
+impl TrackedChangeView for StagedChange {
     fn entity_id(&self) -> &str {
         self.entity_id.as_str()
     }
@@ -58,25 +59,10 @@ impl TrackedDomainChangeView for ProposedDomainChange {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DomainChangeInput {
-    pub id: String,
-    pub entity_id: EntityId,
-    pub schema_key: CanonicalSchemaKey,
-    pub schema_version: CanonicalSchemaVersion,
-    pub file_id: FileId,
-    pub plugin_key: CanonicalPluginKey,
-    pub snapshot_content: Option<CanonicalJson>,
-    pub metadata: Option<CanonicalJson>,
-    pub created_at: String,
-    pub version_id: VersionId,
-    pub writer_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCommitArgs {
     pub timestamp: String,
     pub active_accounts: Vec<String>,
-    pub changes: Vec<DomainChangeInput>,
+    pub changes: Vec<StagedChange>,
     pub versions: BTreeMap<String, VersionInfo>,
     pub force_commit_versions: BTreeSet<String>,
 }

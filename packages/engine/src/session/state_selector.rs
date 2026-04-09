@@ -257,7 +257,7 @@ async fn scan_selector_lane(
             continue;
         }
 
-        let writer_key = pending_view.workspace_writer_key_annotation_for_state_row(
+        let writer_key = pending_view.writer_key_annotation_for_state_row(
             &pending.version_id,
             &pending.schema_key,
             &pending.entity_id,

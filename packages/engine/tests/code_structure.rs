@@ -2316,7 +2316,7 @@ fn planned_write_runner_and_filesystem_resolution_stay_split_by_owner() {
         "append_tracked_with_pending_public_session(",
         "execute_internal_execution_with_transaction(",
         "validate_commit_time_write(",
-        "persist_filesystem_payload_domain_changes_direct(",
+        "persist_filesystem_payload_changes_direct(",
     ] {
         assert!(
             !runner_source.contains(forbidden),

@@ -92,7 +92,7 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::contracts::traits::WorkspaceWriterKeyReadView;
+    use crate::contracts::traits::WriterKeyReadView;
     use crate::contracts::traits::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
     use crate::execution::write::buffered::prepare_materialization_plan;
     use crate::live_state::shared::identity::RowIdentity;
@@ -118,7 +118,7 @@ mod tests {
     }
 
     struct EmptyTombstones;
-    struct EmptyWorkspaceWriterKeys;
+    struct EmptyWriterKeys;
 
     #[async_trait(?Send)]
     impl TrackedReadView for CountingTrackedView {
@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl WorkspaceWriterKeyReadView for EmptyWorkspaceWriterKeys {
+    impl WriterKeyReadView for EmptyWriterKeys {
         async fn load_annotation(
             &self,
             _row_identity: &RowIdentity,
@@ -192,7 +192,7 @@ mod tests {
         let tracked = CountingTrackedView::default();
         let untracked = CountingUntrackedView::default();
         let tombstones = EmptyTombstones;
-        let writer_keys = EmptyWorkspaceWriterKeys;
+        let writer_keys = EmptyWriterKeys;
         let read_context = ReadContext::new(&tracked, &untracked, &writer_keys)
             .with_tracked_tombstones(&tombstones);
         let mut journal = TransactionJournal::default();
