@@ -14,7 +14,9 @@ pub(crate) async fn execute_read_time_projection_read(
     bindings: &dyn ReadExecutionBindings,
     artifact: &ReadTimeProjectionRead,
 ) -> Result<QueryResult, LixError> {
-    let rows = bindings.derive_read_time_projection_rows(backend).await?;
+    let rows = bindings
+        .derive_read_time_projection_rows(backend, artifact)
+        .await?;
     execute_read_time_projection_rows(rows, artifact)
 }
 
@@ -280,6 +282,7 @@ mod tests {
     fn executes_projection_filter_order_and_limit_over_supplied_rows() {
         let artifact = ReadTimeProjectionRead {
             surface: ReadTimeProjectionSurface::LixVersion,
+            requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![
                     PendingViewProjection::Column {
@@ -344,6 +347,7 @@ mod tests {
     fn counts_rows_after_filters_in_bounded_rowset_runtime() {
         let artifact = ReadTimeProjectionRead {
             surface: ReadTimeProjectionSurface::LixVersion,
+            requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![PendingViewProjection::CountAll {
                     output_column: "count".into(),
@@ -401,6 +405,7 @@ mod tests {
 
         let artifact = ReadTimeProjectionRead {
             surface: ReadTimeProjectionSurface::LixVersion,
+            requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![
                     PendingViewProjection::Column {
@@ -483,6 +488,7 @@ mod tests {
 
         let artifact = ReadTimeProjectionRead {
             surface: ReadTimeProjectionSurface::LixVersion,
+            requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![PendingViewProjection::CountAll {
                     output_column: "count".into(),

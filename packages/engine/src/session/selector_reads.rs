@@ -82,10 +82,12 @@ impl ReadExecutionBindings for SessionWriteSelectorResolver<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
+        artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
         crate::session::read_execution_bindings::derive_read_time_projection_rows_with_registry(
             self.projection_registry,
             backend,
+            artifact,
         )
         .await
     }

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::artifacts::PreparedPublicReadArtifact;
+use crate::contracts::artifacts::{PreparedPublicReadArtifact, ReadTimeProjectionRead};
 use crate::contracts::traits::PendingView;
 use crate::execution::read::{
     execute_prepared_public_read_artifact_with_backend, PendingPublicReadExecutionBackend,
@@ -25,9 +25,10 @@ impl<'a> CatalogProjectionRegistryReadExecutionBindings<'a> {
 pub(crate) async fn derive_read_time_projection_rows_with_registry(
     projection_registry: &CatalogProjectionRegistry,
     backend: &dyn LixBackend,
+    artifact: &ReadTimeProjectionRead,
 ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
     Ok(
-        crate::live_state::derive_read_time_surface_rows(backend, projection_registry)
+        crate::live_state::derive_read_time_surface_rows(backend, projection_registry, artifact)
             .await?
             .into_iter()
             .map(|row| ReadTimeProjectionRow {
@@ -44,8 +45,10 @@ impl ReadExecutionBindings for CatalogProjectionRegistryReadExecutionBindings<'_
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
+        artifact: &ReadTimeProjectionRead,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        derive_read_time_projection_rows_with_registry(self.projection_registry, backend).await
+        derive_read_time_projection_rows_with_registry(self.projection_registry, backend, artifact)
+            .await
     }
 }
 
@@ -54,9 +57,14 @@ impl ReadExecutionBindings for SessionCollaborators {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
+        artifact: &ReadTimeProjectionRead,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        derive_read_time_projection_rows_with_registry(self.catalog_projection_registry(), backend)
-            .await
+        derive_read_time_projection_rows_with_registry(
+            self.catalog_projection_registry(),
+            backend,
+            artifact,
+        )
+        .await
     }
 }
 

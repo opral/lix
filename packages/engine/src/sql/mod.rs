@@ -35,6 +35,7 @@ mod relation_policy;
 pub(crate) mod semantic_ir;
 pub(crate) mod support;
 
+pub(crate) use physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 pub(crate) use physical_plan::source_sql::lower_catalog_relation_binding_to_source_sql;
 pub(crate) use relation_policy::{
     builtin_relation_inventory, classify_builtin_relation_name, classify_relation_name,

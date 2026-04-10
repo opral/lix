@@ -252,11 +252,13 @@ impl crate::execution::read::ReadExecutionBindings for BuiltinReadExecutionBindi
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
+        artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
     ) -> Result<Vec<crate::execution::read::ReadTimeProjectionRow>, LixError> {
         Ok(
             crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend(
                 backend,
                 crate::catalog::builtin_catalog_projection_registry(),
+                artifact,
             )
             .await?
             .into_iter()

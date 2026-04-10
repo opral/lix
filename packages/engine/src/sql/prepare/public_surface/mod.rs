@@ -3102,16 +3102,18 @@ mod tests {
                 .clone(),
             vec!["id = 'file-1'".to_string()]
         );
-        let lowered_sql = prepared
-            .explain
-            .compiled_artifacts
-            .lowered_sql
-            .first()
-            .expect("filesystem read should lower");
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_file_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
-        assert!(lowered_sql.contains("lix_internal_binary_blob_store"));
-        assert!(!lowered_sql.contains("FROM lix_file_by_version"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+                assert_eq!(artifact.surface.public_name(), "lix_file");
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("filesystem read should use read-time projection execution")
+            }
+            PreparedPublicReadExecution::Direct(_) => {
+                panic!("filesystem read should not use direct execution")
+            }
+        }
     }
 
     #[tokio::test]
@@ -3150,15 +3152,18 @@ mod tests {
                 "lixcol_version_id = 'version-a'".to_string()
             ]
         );
-        let lowered_sql = prepared
-            .explain
-            .compiled_artifacts
-            .lowered_sql
-            .first()
-            .expect("filesystem by-version read should lower");
-        assert!(lowered_sql.contains("all_target_versions AS"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_lix_directory_descriptor"));
-        assert!(!lowered_sql.contains("FROM lix_directory_by_version"));
+        match &prepared.execution {
+            PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+                assert_eq!(artifact.surface.public_name(), "lix_directory_by_version");
+                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
+            }
+            PreparedPublicReadExecution::LoweredSql(_) => {
+                panic!("filesystem by-version read should use read-time projection execution")
+            }
+            PreparedPublicReadExecution::Direct(_) => {
+                panic!("filesystem by-version read should not use direct execution")
+            }
+        }
     }
 
     #[tokio::test]
