@@ -16,9 +16,7 @@ fn as_i64(value: &Value) -> i64 {
     }
 }
 
-async fn active_version_ref(
-    engine: &support::simulation_test::SimulationEngine,
-) -> (String, String) {
+async fn active_version_ref(engine: &support::simulation_test::SimulatedLix) -> (String, String) {
     let version_id = engine
         .active_version_id()
         .await
@@ -44,12 +42,12 @@ simulation_test!(
     checkpoint_create_succeeds_without_internal_access,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 access_to_internal: false,
                 ..Default::default()
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.expect("init should succeed");
         engine
@@ -73,9 +71,9 @@ simulation_test!(
     checkpoint_noop_returns_tip_and_updates_last_checkpoint,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let (version_id, before_commit_id) = active_version_ref(&engine).await;
@@ -107,9 +105,9 @@ simulation_test!(
 
 simulation_test!(checkpoint_labels_current_commit, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -147,9 +145,9 @@ simulation_test!(
     checkpoint_updates_last_checkpoint_after_tracked_write,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -182,9 +180,9 @@ simulation_test!(
 
 simulation_test!(checkpoint_clears_working_changes, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -218,9 +216,9 @@ simulation_test!(
     checkpoint_does_not_create_commits_or_edges_on_noop,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let commits_before = engine

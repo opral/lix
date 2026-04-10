@@ -1,6 +1,5 @@
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::engine::Engine;
 use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
@@ -12,28 +11,28 @@ use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntim
 use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parser::parse_sql;
-use crate::{LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) const LIX_ID_KEY: &str = "lix_id";
 
 pub(crate) struct InitExecutor<'engine, 'tx> {
-    engine: &'engine Engine,
+    lix: &'engine Lix,
     write_transaction: BorrowedBufferedWriteTransaction<'tx>,
     context: ExecutionContext,
 }
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) fn new(
-        engine: &'engine Engine,
+        lix: &'engine Lix,
         transaction: &'tx mut dyn LixBackendTransaction,
     ) -> Result<Self, LixError> {
         Ok(Self {
-            engine,
+            lix,
             write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
             context: ExecutionContext::new(
                 ExecuteOptions::default(),
-                engine.public_surface_registry(),
+                lix.public_surface_registry(),
                 SessionExecutionRuntime::new(),
                 GLOBAL_VERSION_ID.to_string(),
                 Vec::new(),
@@ -42,7 +41,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) fn boot_key_values(&self) -> &[crate::BootKeyValue] {
-        self.engine.boot_key_values()
+        self.lix.boot_key_values()
     }
 
     pub(crate) async fn execute_internal(
@@ -52,7 +51,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let result = execute_parsed_statements_in_borrowed_write_transaction(
-            self.engine,
+            self.lix,
             &mut self.write_transaction,
             parsed_statements,
             params,
@@ -63,7 +62,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         let mut execution_input = self.context.buffered_write_execution_input();
         self.write_transaction
-            .flush_buffered_write_journal(self.engine, &mut execution_input)
+            .flush_buffered_write_journal(self.lix, &mut execution_input)
             .await?;
         self.context
             .apply_buffered_write_execution_input(&execution_input);
@@ -131,7 +130,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let backend =
             TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
         let (settings, functions) = self
-            .engine
+            .lix
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
         let runtime_state = ExecutionRuntimeState::from_prepared_parts(settings, functions);

@@ -1,15 +1,15 @@
 use crate::support;
 
 use lix_engine::{ExecuteOptions, Value};
-use support::simulation_test::SimulationBootArgs;
+use support::simulation_test::SimulatedLixBootArgs;
 
 simulation_test!(
     execute_before_init_returns_not_initialized,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         let err = engine
             .execute("SELECT 1 + 1", &[])
@@ -21,9 +21,9 @@ simulation_test!(
 
 simulation_test!(select_works_after_init, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     let result = engine.execute("SELECT 1 + 1", &[]).await.unwrap();
@@ -36,9 +36,9 @@ simulation_test!(
     dml_without_returning_returns_empty_public_rowset,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -71,9 +71,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let result = engine
@@ -92,12 +92,12 @@ simulation_test!(
 );
 
 simulation_test!(internal_table_read_is_allowed, |sim| async move {
-    let mut boot_args = SimulationBootArgs::default();
+    let mut boot_args = SimulatedLixBootArgs::default();
     boot_args.access_to_internal = false;
     let engine = sim
-        .boot_simulated_engine(Some(boot_args))
+        .boot_simulated_lix(Some(boot_args))
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -112,12 +112,12 @@ simulation_test!(internal_table_read_is_allowed, |sim| async move {
 simulation_test!(
     internal_table_write_returns_access_denied,
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
@@ -141,12 +141,12 @@ simulation_test!(
 simulation_test!(
     internal_table_write_in_transaction_returns_access_denied,
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let mut tx = engine
@@ -169,12 +169,12 @@ simulation_test!(
     internal_table_drop_table_returns_access_denied,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
@@ -190,12 +190,12 @@ simulation_test!(
     internal_table_alter_table_returns_access_denied,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
@@ -214,12 +214,12 @@ simulation_test!(
     internal_table_create_trigger_returns_access_denied,
     simulations = [sqlite],
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
@@ -238,12 +238,12 @@ simulation_test!(
     public_create_table_is_denied,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
@@ -262,12 +262,12 @@ simulation_test!(
     public_create_table_in_transaction_is_denied,
     simulations = [sqlite, postgres],
     |sim| async move {
-        let mut boot_args = SimulationBootArgs::default();
+        let mut boot_args = SimulatedLixBootArgs::default();
         boot_args.access_to_internal = false;
         let engine = sim
-            .boot_simulated_engine(Some(boot_args))
+            .boot_simulated_lix(Some(boot_args))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let mut tx = engine

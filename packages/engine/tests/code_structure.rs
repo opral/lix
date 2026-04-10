@@ -19,7 +19,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &[
             "backend",
             "canonical",
-            "engine",
+            "api",
             "execution",
             "init",
             "live_state",
@@ -41,7 +41,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "backend",
             "canonical",
             "execution",
-            "engine",
+            "api",
             "live_state",
             "projections",
             "runtime",
@@ -51,8 +51,8 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "runtime",
-        reason: "runtime is a sidecar and must not reacquire execution, engine-shell, workflow, or compiler owners; sealed live_state root APIs are allowed",
-        forbidden_scopes: &["execution", "engine", "session", "sql"],
+        reason: "runtime is a sidecar and must not reacquire execution, root-shell, workflow, or compiler owners; sealed live_state root APIs are allowed",
+        forbidden_scopes: &["execution", "api", "session", "sql"],
     },
     ForbiddenDependencyRule {
         from_scope: "live_state",
@@ -80,7 +80,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         reason: "execution should consume contracts, live_state, and backend; compiler access must come through prepared artifacts rather than direct owner imports",
         forbidden_scopes: &[
             "canonical",
-            "engine",
+            "api",
             "init",
             "runtime",
             "session",
@@ -89,8 +89,8 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "session",
-        reason: "session owns orchestration and workflow code, but should not couple itself to the root engine shell",
-        forbidden_scopes: &["engine"],
+        reason: "session owns orchestration and workflow code, but should not couple itself to the root API shell",
+        forbidden_scopes: &["api"],
     },
 ];
 
@@ -1771,7 +1771,7 @@ fn builtin_projection_registry_is_only_used_at_registry_owners() {
         })
         .collect();
 
-    let expected_paths: BTreeSet<String> = ["engine.rs", "projections/mod.rs"]
+    let expected_paths: BTreeSet<String> = ["api/lix.rs", "projections/mod.rs"]
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -1857,7 +1857,7 @@ fn execution_forbidden_rule_covers_closed_handoff_edges() {
         .expect("execution should have an explicit forbidden dependency rule");
     let forbidden_scopes: BTreeSet<&str> = rule.forbidden_scopes.iter().copied().collect();
 
-    for forbidden_scope in ["session", "sql", "runtime", "engine"] {
+    for forbidden_scope in ["session", "sql", "runtime", "api"] {
         assert!(
             forbidden_scopes.contains(forbidden_scope),
             "execution forbidden dependency rule should explicitly forbid `{forbidden_scope}`",
@@ -2537,8 +2537,8 @@ fn prepared_write_execution_seam_stays_closed_over_runtime_inputs() {
             "crate::sql::prepare::",
             "crate::session::",
             "ExecutionContext",
-            "crate::engine::Engine",
-            "&Engine",
+            "use crate::Lix;",
+            "&Lix",
             "sqlparser::ast",
             "load_sql_compiler_metadata(",
             "compile_execution_from_template_instance_with_context(",

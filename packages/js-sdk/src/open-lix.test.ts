@@ -147,12 +147,12 @@ test("createVersion + switchVersion use the JS API surface", async () => {
 	await lix.close();
 });
 
-test("openChildSession snapshots the caller active version and isolates later switches", async () => {
+test("openAdditionalSession snapshots the caller active version and isolates later switches", async () => {
 	const lix = await createInitializedLix();
 	const version = await lix.createVersion({ name: "session-branch" });
 	await lix.switchVersion(version.id);
 
-	const worker = await lix.openChildSession();
+	const worker = await lix.openAdditionalSession();
 	await worker.switchVersion("global");
 
 	expect(await lix.activeVersionId()).toBe(version.id);
@@ -162,11 +162,11 @@ test("openChildSession snapshots the caller active version and isolates later sw
 	await lix.close();
 });
 
-test("openChildSession accepts an explicit activeVersionId override", async () => {
+test("openAdditionalSession accepts an explicit activeVersionId override", async () => {
 	const lix = await createInitializedLix();
 	const version = await lix.createVersion({ name: "override-branch" });
 
-	const worker = await lix.openChildSession({
+	const worker = await lix.openAdditionalSession({
 		activeVersionId: version.id,
 	});
 	expect(await worker.activeVersionId()).toBe(version.id);
@@ -175,13 +175,13 @@ test("openChildSession accepts an explicit activeVersionId override", async () =
 	await lix.close();
 });
 
-test("openChildSession snapshots active accounts and allows explicit overrides", async () => {
+test("openAdditionalSession snapshots active accounts and allows explicit overrides", async () => {
 	const lix = await createInitializedLix();
-	const seeded = await lix.openChildSession({
+	const seeded = await lix.openAdditionalSession({
 		activeAccountIds: ["acct-parent"],
 	});
-	const worker = await seeded.openChildSession();
-	const overrideWorker = await seeded.openChildSession({
+	const worker = await seeded.openAdditionalSession();
+	const overrideWorker = await seeded.openAdditionalSession({
 		activeAccountIds: ["acct-override"],
 	});
 

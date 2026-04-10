@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use lix_engine::wasm::NoopWasmRuntime;
-use lix_engine::{boot, BootArgs, BootKeyValue, Value};
+use lix_engine::{BootKeyValue, Lix, LixConfig, Value};
 use serde_json::json;
 
 const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
@@ -40,7 +40,7 @@ fn assert_uuid_v7_like(value: &str, field: &str) {
     );
 }
 
-async fn global_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn global_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let result = engine
         .execute(
             "SELECT commit_id \
@@ -58,7 +58,7 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulationE
     )
 }
 
-fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Engine> {
+fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Lix> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
@@ -68,12 +68,12 @@ fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Engine> {
         .create(true)
         .open(path)
         .expect("sqlite test file should be creatable");
-    let mut args = BootArgs::new(
+    let config = LixConfig::new(
         support::simulations::sqlite_backend_with_filename(format!("sqlite://{}", path.display())),
         Arc::new(NoopWasmRuntime),
-    );
-    args.access_to_internal = true;
-    Arc::new(boot(args))
+    )
+    .with_access_to_internal(true);
+    Arc::new(Lix::boot(config))
 }
 
 fn temp_sqlite_init_path(label: &str) -> PathBuf {
@@ -199,10 +199,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                     let engine_a = boot_sqlite_engine_at_path(&path_for_thread);
                     engine_a.initialize().await.expect("first init should succeed");
 
-                    let session_a = engine_a
-                        .open_session()
-                        .await
-                        .expect("workspace session should open after init");
+                    let session_a = Arc::clone(&engine_a);
 
                     session_a
                         .execute(
@@ -261,10 +258,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                         .open_existing()
                         .await
                         .expect("reopen open should load active version state");
-                    let session_b = engine_b
-                        .open_session()
-                        .await
-                        .expect("workspace session should open after reopen");
+                    let session_b = Arc::clone(&engine_b);
 
                     let after = session_b
                         .execute(
@@ -381,10 +375,7 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                     // Two INSERT statements separated by ; WITHOUT BEGIN/COMMIT.
                     // This is exactly what the CLI does when a user runs:
                     //   lix sql execute "INSERT ...; INSERT ...;"
-                    let session_a = engine_a
-                        .open_session()
-                        .await
-                        .expect("workspace session should open after init");
+                    let session_a = Arc::clone(&engine_a);
 
                     session_a
                         .execute(
@@ -403,10 +394,7 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
                         "reopen after bare multi-statement write must not fail \
                              with LIX_ERROR_LIVE_STATE_NOT_READY",
                     );
-                    let session_b = engine_b
-                        .open_session()
-                        .await
-                        .expect("workspace session should open after reopen");
+                    let session_b = Arc::clone(&engine_b);
 
                     // Verify both rows are actually readable.
                     let result = session_b
@@ -454,9 +442,9 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
 
 simulation_test!(init_creates_active_version_live_table, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -475,9 +463,9 @@ simulation_test!(
     init_does_not_seed_runtime_active_version_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -500,9 +488,9 @@ simulation_test!(
     init_does_not_seed_runtime_active_account_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -523,9 +511,9 @@ simulation_test!(
 
 simulation_test!(init_does_not_seed_lix_account_rows, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -549,9 +537,9 @@ simulation_test!(init_does_not_seed_lix_account_rows, |sim| async move {
 
 simulation_test!(init_creates_snapshot_table, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -565,9 +553,9 @@ simulation_test!(init_creates_snapshot_table, |sim| async move {
 
 simulation_test!(init_creates_change_table, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -581,9 +569,9 @@ simulation_test!(init_creates_change_table, |sim| async move {
 
 simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -604,9 +592,9 @@ simulation_test!(
     init_creates_key_value_materialized_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -626,9 +614,9 @@ simulation_test!(
 
 simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -664,9 +652,9 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
 
 simulation_test!(init_seeds_lix_id_key_value, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -701,9 +689,9 @@ simulation_test!(init_seeds_lix_id_key_value, |sim| async move {
 
 simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -789,9 +777,9 @@ simulation_test!(
     init_seeds_bootstrap_change_set_for_hidden_global_version_commit,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -833,9 +821,9 @@ simulation_test!(
     init_seeds_bootstrap_commit_and_change_set_with_uuid_ids,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -873,9 +861,9 @@ simulation_test!(
     init_seeds_main_version_and_global_checkpoint_pointers,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -973,9 +961,9 @@ simulation_test!(
     init_second_call_returns_already_initialized,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -990,9 +978,9 @@ simulation_test!(
     init_seeds_checkpoint_label_in_global_lane,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -1077,9 +1065,9 @@ simulation_test!(
 
 simulation_test!(init_seeds_global_system_directories, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -1156,9 +1144,9 @@ simulation_test!(
     init_seeds_global_system_directories_with_uuid_ids,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -1199,9 +1187,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let commit_graph_count = scalar_count(
@@ -1268,17 +1256,17 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: vec![BootKeyValue {
                     key: "plan3_boot_key".to_string(),
                     value: json!("seeded"),
                     lixcol_global: Some(true),
                     lixcol_untracked: Some(false),
                 }],
-                ..support::simulation_test::SimulationBootArgs::default()
+                ..support::simulation_test::SimulatedLixBootArgs::default()
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         let initialized = engine
             .initialize_if_needed()
@@ -1320,17 +1308,17 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: vec![BootKeyValue {
                     key: "lix_id".to_string(),
                     value: json!("caller-provided"),
                     lixcol_global: Some(true),
                     lixcol_untracked: Some(false),
                 }],
-                ..support::simulation_test::SimulationBootArgs::default()
+                ..support::simulation_test::SimulatedLixBootArgs::default()
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         let err = engine
             .initialize()

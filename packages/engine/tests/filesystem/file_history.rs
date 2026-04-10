@@ -168,7 +168,7 @@ fn value_as_i64(value: &Value) -> i64 {
     }
 }
 
-async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_plugin_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -180,7 +180,7 @@ async fn register_plugin_schema(engine: &support::simulation_test::SimulationEng
         .expect("register plugin schema should succeed");
 }
 
-async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let rows = engine
         .execute(
             "SELECT commit_id \
@@ -200,20 +200,20 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
 
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> support::simulation_test::SimulationEngine {
+) -> support::simulation_test::SimulatedLix {
     let runtime = Arc::new(
         wasmtime_runtime::TestWasmtimeRuntime::new()
             .expect("test wasmtime runtime should initialize"),
     ) as Arc<dyn WasmRuntime>;
 
     let engine = sim
-        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+        .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine
         .initialize()
         .await
@@ -1308,9 +1308,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await

@@ -1,10 +1,10 @@
 use crate::common::errors;
-use crate::engine::builtin_schema_entity_id;
 use crate::init::InitExecutor;
 use crate::live_state::register_schema;
 use crate::schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::Value;
 use crate::{LixBackend, LixError};
+use serde_json::Value as JsonValue;
 
 pub(crate) async fn init_builtin_schema_storage(backend: &dyn LixBackend) -> Result<(), LixError> {
     for schema_key in builtin_schema_keys() {
@@ -68,4 +68,23 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
         Ok(())
     }
+}
+
+fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
+    let schema_key = schema
+        .get("x-lix-key")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "builtin schema must define string x-lix-key".to_string(),
+        })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "builtin schema must define string x-lix-version".to_string(),
+        })?;
+
+    Ok(format!("{schema_key}~{schema_version}"))
 }

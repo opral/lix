@@ -11,9 +11,9 @@ simulation_test!(
     lix_change_set_element_by_version_scopes_to_version_heads,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -113,9 +113,9 @@ simulation_test!(
     lix_change_set_element_checkpoint_reads_do_not_require_commit_family_live_mirrors,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         engine

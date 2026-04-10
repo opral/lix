@@ -19,9 +19,9 @@ simulation_test!(
     key_value_crud_is_handled_through_state_surface,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -110,7 +110,7 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: vec![BootKeyValue {
                     key: "boot-default-active".to_string(),
                     value: json!("active-value"),
@@ -120,7 +120,7 @@ simulation_test!(
                 ..Default::default()
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -149,7 +149,7 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: vec![BootKeyValue {
                     key: "boot-global".to_string(),
                     value: json!("global-value"),
@@ -159,7 +159,7 @@ simulation_test!(
                 ..Default::default()
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -186,9 +186,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -228,9 +228,9 @@ simulation_test!(
 
 simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -311,9 +311,9 @@ simulation_test!(
     key_value_distinguishes_string_and_number_literals,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -362,9 +362,9 @@ simulation_test!(
     key_value_lix_json_extract_supports_array_index_segments,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -397,9 +397,9 @@ simulation_test!(
     key_value_lix_json_extract_supports_numeric_object_key_segments,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -434,9 +434,9 @@ simulation_test!(
     key_value_lix_json_extract_supports_empty_object_key_segments,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -471,9 +471,9 @@ simulation_test!(
     key_value_lix_json_extract_returns_json_boolean_lexemes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -507,9 +507,9 @@ simulation_test!(
     key_value_lix_json_normalizes_literal_scalars,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
