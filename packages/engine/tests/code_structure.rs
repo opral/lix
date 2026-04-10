@@ -15,15 +15,13 @@ struct ForbiddenDependencyRule {
 const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     ForbiddenDependencyRule {
         from_scope: "catalog",
-        reason: "catalog is the semantic owner for public named relations and must not depend on lowering, orchestration, or runtime owners",
+        reason: "catalog is the semantic owner for public named relations and must not depend on lowering, orchestration, or sidecar owners",
         forbidden_scopes: &[
             "backend",
             "canonical",
             "engine",
             "execution",
             "init",
-            "live_state",
-            "projections",
             "runtime",
             "session",
             "sql",
@@ -43,7 +41,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "execution",
             "engine",
             "live_state",
-            "projections",
             "runtime",
             "session",
             "sql",
@@ -60,20 +57,9 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &["execution", "runtime"],
     },
     ForbiddenDependencyRule {
-        from_scope: "projections",
-        reason: "projection definitions must stay declarative and must not reach storage or projection-engine owners directly",
-        forbidden_scopes: &["backend", "canonical", "live_state"],
-    },
-    ForbiddenDependencyRule {
         from_scope: "sql",
         reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or session/runtime owners directly; sealed owner-root query-contract APIs plus acyclic internal-relation inventory roots are allowed",
-        forbidden_scopes: &[
-            "backend",
-            "execution",
-            "projections",
-            "runtime",
-            "session",
-        ],
+        forbidden_scopes: &["backend", "execution", "runtime", "session"],
     },
     ForbiddenDependencyRule {
         from_scope: "execution",
@@ -100,7 +86,6 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "contracts",
     "execution",
     "live_state",
-    "projections",
     "runtime",
     "session",
     "sql",
@@ -1723,35 +1708,35 @@ fn analyzer_resolves_explicit_super_dependencies_to_the_top_level_scope() {
     );
 }
 
-// Why this exists: new projections should extend the `projections/*` owner
-// boundary. If a production `ProjectionTrait` impl appears elsewhere, we have
-// pushed projection definition work back into execution or orchestration code.
+// Why this exists: derived-surface declarations are now catalog-owned. If a
+// production declaration impl appears elsewhere, we have pushed semantic
+// ownership back into execution or orchestration code.
 #[test]
-fn projection_trait_impls_are_owned_by_projections() {
+fn catalog_projection_definition_impls_are_owned_by_catalog() {
     let impl_paths: Vec<String> = production_source_files()
         .into_iter()
         .filter_map(|(relative_path, source)| {
             let sanitized = mask_rust_source(&source);
             sanitized
-                .contains("impl ProjectionTrait for")
+                .contains("impl CatalogProjectionDefinition for")
                 .then_some(relative_path)
         })
         .collect();
 
     assert!(
         !impl_paths.is_empty(),
-        "expected at least one production `impl ProjectionTrait for ...` under src/",
+        "expected at least one production `impl CatalogProjectionDefinition for ...` under src/",
     );
 
     let violations: Vec<String> = impl_paths
         .iter()
-        .filter(|path| !path.starts_with("projections/"))
+        .filter(|path| !path.starts_with("catalog/"))
         .cloned()
         .collect();
 
     assert!(
         violations.is_empty(),
-        "production `ProjectionTrait` impls must live under `src/projections/*`; found stray impls in:\n{}",
+        "production `CatalogProjectionDefinition` impls must live under `src/catalog/*`; found stray impls in:\n{}",
         violations.join("\n"),
     );
 }
@@ -1760,25 +1745,25 @@ fn projection_trait_impls_are_owned_by_projections() {
 // the registry owner and consumed from startup-owned state. Ad hoc lookups in
 // execution paths would silently reintroduce the fallback we just removed.
 #[test]
-fn builtin_projection_registry_is_only_used_at_registry_owners() {
+fn builtin_catalog_projection_registry_is_only_used_at_registry_owners() {
     let usage_paths: BTreeSet<String> = production_source_files()
         .into_iter()
         .filter_map(|(relative_path, source)| {
             let sanitized = mask_rust_source(&source);
             sanitized
-                .contains("builtin_projection_registry(")
+                .contains("builtin_catalog_projection_registry(")
                 .then_some(relative_path)
         })
         .collect();
 
-    let expected_paths: BTreeSet<String> = ["engine.rs", "projections/mod.rs"]
+    let expected_paths: BTreeSet<String> = ["catalog/declaration.rs", "engine.rs"]
         .into_iter()
         .map(str::to_string)
         .collect();
 
     assert_eq!(
         usage_paths, expected_paths,
-        "production `builtin_projection_registry()` usage must stay in the registry owner plus startup owner",
+        "production `builtin_catalog_projection_registry()` usage must stay in the registry owner plus startup/bootstrap seams",
     );
 }
 
@@ -2095,9 +2080,9 @@ fn plan82_registry_loading_moves_to_runtime_and_session_owners() {
 }
 
 #[test]
-fn plan82_catalog_schema_to_spec_helper_stays_free_of_runtime_storage_and_sql_owners() {
+fn plan82_catalog_schema_to_spec_helper_stays_free_of_runtime_sidecars_and_sql_owners() {
     let graph = analyze_engine_dependency_graph();
-    for forbidden in ["runtime", "live_state", "session", "sql"] {
+    for forbidden in ["runtime", "session", "sql"] {
         if let Some(edge) = graph
             .edges
             .iter()
@@ -2123,8 +2108,6 @@ fn plan82_catalog_schema_to_spec_helper_stays_free_of_runtime_storage_and_sql_ow
         "crate::runtime::",
         "use crate::runtime",
         "shared_runtime(",
-        "crate::live_state::",
-        "use crate::live_state",
         "crate::session::",
         "use crate::session",
         "crate::sql::",
@@ -2132,7 +2115,7 @@ fn plan82_catalog_schema_to_spec_helper_stays_free_of_runtime_storage_and_sql_ow
     ] {
         assert!(
             !sanitized.contains(forbidden),
-            "Plan 82 regression: catalog/mod.rs should stay free of runtime/live_state/session/sql ownership imports, but found `{forbidden}`"
+            "Plan 82 regression: catalog/mod.rs should stay free of runtime sidecar/session/sql ownership imports, but found `{forbidden}`"
         );
     }
 }
@@ -2574,6 +2557,25 @@ fn prepared_write_execution_seam_stays_closed_over_runtime_inputs() {
             "execution/write/buffered/planned_write.rs should plan from prepared artifact `{required}`"
         );
     }
+}
+
+#[test]
+fn phase_d_contracts_artifacts_stays_the_only_generic_artifact_bucket() {
+    let artifact_paths: BTreeSet<String> = production_source_files()
+        .into_iter()
+        .map(|(relative_path, _)| relative_path)
+        .filter(|relative_path| relative_path.ends_with("/artifacts.rs"))
+        .collect();
+
+    let expected_paths: BTreeSet<String> = ["contracts/artifacts.rs"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+
+    assert_eq!(
+        artifact_paths, expected_paths,
+        "Phase D regression: owner-local artifact families should use role-based file names; only contracts/artifacts.rs should remain generic",
+    );
 }
 
 #[test]

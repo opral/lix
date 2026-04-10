@@ -1,7 +1,6 @@
 mod boot;
 
-use crate::catalog::SurfaceRegistry;
-use crate::projections::ProjectionRegistry;
+use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::functions::SharedFunctionProvider;
@@ -79,8 +78,8 @@ impl crate::session::collaborators::SessionServices for EngineSessionServices {
         self.engine.backend().export_image(writer).await
     }
 
-    fn projection_registry(&self) -> &ProjectionRegistry {
-        self.engine.projection_registry().as_ref()
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        self.engine.catalog_projection_registry().as_ref()
     }
 
     fn compiled_schema_cache(&self) -> &dyn crate::contracts::traits::CompiledSchemaCache {
@@ -131,8 +130,8 @@ impl crate::session::collaborators::SessionServices for EngineSessionServices {
 
 #[async_trait(?Send)]
 impl crate::session::collaborators::WriteExecutionCollaborators for Engine {
-    fn projection_registry(&self) -> &ProjectionRegistry {
-        self.projection_registry().as_ref()
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        self.catalog_projection_registry().as_ref()
     }
 
     fn compiled_schema_cache(&self) -> &dyn crate::contracts::traits::CompiledSchemaCache {
@@ -173,7 +172,7 @@ impl crate::execution::write::WriteExecutionBindings for Engine {
         public_read: &crate::contracts::artifacts::PreparedPublicReadArtifact,
     ) -> Result<crate::QueryResult, LixError> {
         crate::session::write_execution_bindings::execute_prepared_public_read_with_registry(
-            self.projection_registry().as_ref(),
+            self.catalog_projection_registry().as_ref(),
             transaction,
             pending_view,
             public_read,
@@ -292,8 +291,8 @@ impl Engine {
         Ok(registry)
     }
 
-    pub(crate) fn projection_registry(&self) -> &Arc<ProjectionRegistry> {
-        self.runtime.projection_registry()
+    pub(crate) fn catalog_projection_registry(&self) -> &Arc<CatalogProjectionRegistry> {
+        self.runtime.catalog_projection_registry()
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
@@ -346,8 +345,8 @@ impl Engine {
         args: BootArgs,
         boot_deterministic_settings: Option<DeterministicSettings>,
     ) -> Self {
-        let projection_registry =
-            Arc::new(crate::projections::builtin_projection_registry().clone());
+        let catalog_projection_registry =
+            Arc::new(crate::catalog::builtin_catalog_projection_registry().clone());
         Self {
             runtime: Arc::new(Runtime::new(
                 args.backend,
@@ -355,7 +354,7 @@ impl Engine {
                 args.access_to_internal,
                 boot_deterministic_settings,
                 crate::catalog::build_builtin_surface_registry(),
-                projection_registry,
+                catalog_projection_registry,
             )),
             boot_key_values: args.key_values,
         }

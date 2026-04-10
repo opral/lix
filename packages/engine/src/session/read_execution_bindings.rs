@@ -1,21 +1,21 @@
 use async_trait::async_trait;
 
+use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::artifacts::PreparedPublicReadArtifact;
 use crate::contracts::traits::PendingView;
 use crate::execution::read::{
     execute_prepared_public_read_artifact_with_backend, PendingPublicReadExecutionBackend,
     ReadExecutionBindings, ReadTimeProjectionRow,
 };
-use crate::projections::ProjectionRegistry;
 use crate::session::collaborators::SessionCollaborators;
 use crate::{LixBackend, LixError, QueryResult};
 
-pub(crate) struct ProjectionRegistryReadExecutionBindings<'a> {
-    projection_registry: &'a ProjectionRegistry,
+pub(crate) struct CatalogProjectionRegistryReadExecutionBindings<'a> {
+    projection_registry: &'a CatalogProjectionRegistry,
 }
 
-impl<'a> ProjectionRegistryReadExecutionBindings<'a> {
-    pub(crate) fn new(projection_registry: &'a ProjectionRegistry) -> Self {
+impl<'a> CatalogProjectionRegistryReadExecutionBindings<'a> {
+    pub(crate) fn new(projection_registry: &'a CatalogProjectionRegistry) -> Self {
         Self {
             projection_registry,
         }
@@ -23,7 +23,7 @@ impl<'a> ProjectionRegistryReadExecutionBindings<'a> {
 }
 
 pub(crate) async fn derive_read_time_projection_rows_with_registry(
-    projection_registry: &ProjectionRegistry,
+    projection_registry: &CatalogProjectionRegistry,
     backend: &dyn LixBackend,
 ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
     Ok(
@@ -40,7 +40,7 @@ pub(crate) async fn derive_read_time_projection_rows_with_registry(
 }
 
 #[async_trait(?Send)]
-impl ReadExecutionBindings for ProjectionRegistryReadExecutionBindings<'_> {
+impl ReadExecutionBindings for CatalogProjectionRegistryReadExecutionBindings<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
@@ -55,7 +55,8 @@ impl ReadExecutionBindings for SessionCollaborators {
         &self,
         backend: &dyn LixBackend,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        derive_read_time_projection_rows_with_registry(self.projection_registry(), backend).await
+        derive_read_time_projection_rows_with_registry(self.catalog_projection_registry(), backend)
+            .await
     }
 }
 

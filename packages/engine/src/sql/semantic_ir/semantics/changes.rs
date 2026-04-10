@@ -417,7 +417,7 @@ mod tests {
             analyze_write(&canonicalized).expect("write analysis should succeed");
         let resolved_write_plan = crate::test_support::resolve_write_plan_for_test(
             &backend,
-            crate::projections::builtin_projection_registry(),
+            crate::catalog::builtin_catalog_projection_registry(),
             &planned_write,
             None,
         )

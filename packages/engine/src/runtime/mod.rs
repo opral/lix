@@ -13,10 +13,9 @@ pub mod streams;
 pub mod wasm;
 
 use crate::backend::QueryExecutor;
-use crate::catalog::SurfaceRegistry;
+use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::plugin::InstalledPlugin;
 use crate::contracts::traits::{CompiledSchemaCache, FilesystemPluginMaterializer};
-use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::DeterministicSettings;
 use crate::runtime::plugin::runtime::CachedPluginComponent;
 use crate::runtime::streams::{
@@ -49,7 +48,7 @@ pub(crate) struct Runtime {
     in_init_transaction: AtomicBool,
     savepoint_counter: AtomicU64,
     public_surface_registry: RwLock<SurfaceRegistry>,
-    projection_registry: Arc<ProjectionRegistry>,
+    catalog_projection_registry: Arc<CatalogProjectionRegistry>,
     access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, CachedPluginComponent>>,
@@ -63,7 +62,7 @@ impl Runtime {
         access_to_internal: bool,
         boot_deterministic_settings: Option<DeterministicSettings>,
         public_surface_registry: SurfaceRegistry,
-        projection_registry: Arc<ProjectionRegistry>,
+        catalog_projection_registry: Arc<CatalogProjectionRegistry>,
     ) -> Self {
         let deterministic_boot_pending = boot_deterministic_settings.is_some();
         Self {
@@ -77,7 +76,7 @@ impl Runtime {
             in_init_transaction: AtomicBool::new(false),
             savepoint_counter: AtomicU64::new(0),
             public_surface_registry: RwLock::new(public_surface_registry),
-            projection_registry,
+            catalog_projection_registry,
             access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
@@ -112,8 +111,8 @@ impl Runtime {
             .clone()
     }
 
-    pub(crate) fn projection_registry(&self) -> &Arc<ProjectionRegistry> {
-        &self.projection_registry
+    pub(crate) fn catalog_projection_registry(&self) -> &Arc<CatalogProjectionRegistry> {
+        &self.catalog_projection_registry
     }
 
     pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {

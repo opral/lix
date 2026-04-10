@@ -1,3 +1,8 @@
+use crate::catalog::{
+    CatalogProjectionDefinition, CatalogProjectionInput, CatalogProjectionInputRows,
+    CatalogProjectionInputSpec, CatalogProjectionInputVersionScope, CatalogProjectionSourceRow,
+    CatalogProjectionStorageKind,
+};
 use crate::live_state::tracked::{
     scan_rows_with_backend as scan_tracked_rows_with_backend, TrackedScanRequest,
 };
@@ -5,10 +10,6 @@ use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-use crate::projections::{
-    ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
-    ProjectionInputVersionScope, ProjectionStorageKind, ProjectionTrait,
-};
 use crate::session::version_ops::load_current_committed_version_frontier_with_backend;
 use crate::{LixBackend, LixError};
 
@@ -19,8 +20,8 @@ use crate::{LixBackend, LixError};
 /// or current committed local-version rows.
 pub(crate) async fn hydrate_projection_input_with_backend(
     backend: &dyn LixBackend,
-    projection: &dyn ProjectionTrait,
-) -> Result<ProjectionInput, LixError> {
+    projection: &dyn CatalogProjectionDefinition,
+) -> Result<CatalogProjectionInput, LixError> {
     let context = ProjectionHydrationContext::for_read_time_with_backend(backend).await?;
     hydrate_projection_input_with_context_with_backend(backend, &context, projection).await
 }
@@ -28,13 +29,13 @@ pub(crate) async fn hydrate_projection_input_with_backend(
 async fn hydrate_projection_input_with_context_with_backend(
     backend: &dyn LixBackend,
     context: &ProjectionHydrationContext,
-    projection: &dyn ProjectionTrait,
-) -> Result<ProjectionInput, LixError> {
+    projection: &dyn CatalogProjectionDefinition,
+) -> Result<CatalogProjectionInput, LixError> {
     let mut inputs = Vec::new();
     for spec in projection.inputs() {
         inputs.push(hydrate_input_rows_with_backend(backend, context, spec).await?);
     }
-    Ok(ProjectionInput::new(inputs))
+    Ok(CatalogProjectionInput::new(inputs))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,15 +51,15 @@ impl ProjectionHydrationContext {
         })
     }
 
-    fn version_ids_for_spec(&self, spec: &ProjectionInputSpec) -> Vec<String> {
+    fn version_ids_for_spec(&self, spec: &CatalogProjectionInputSpec) -> Vec<String> {
         match spec.version_scope {
-            ProjectionInputVersionScope::Global => {
+            CatalogProjectionInputVersionScope::Global => {
                 vec![crate::contracts::GLOBAL_VERSION_ID.to_string()]
             }
-            ProjectionInputVersionScope::CurrentCommittedFrontier => {
+            CatalogProjectionInputVersionScope::CurrentCommittedFrontier => {
                 self.current_committed_version_ids.clone()
             }
-            ProjectionInputVersionScope::SchemaDefault => {
+            CatalogProjectionInputVersionScope::SchemaDefault => {
                 schema_default_version_ids(spec, &self.current_committed_version_ids)
             }
         }
@@ -68,12 +69,12 @@ impl ProjectionHydrationContext {
 async fn hydrate_input_rows_with_backend(
     backend: &dyn LixBackend,
     context: &ProjectionHydrationContext,
-    spec: ProjectionInputSpec,
-) -> Result<ProjectionInputRows, LixError> {
+    spec: CatalogProjectionInputSpec,
+) -> Result<CatalogProjectionInputRows, LixError> {
     let mut rows = Vec::new();
     for version_id in context.version_ids_for_spec(&spec) {
         match spec.storage {
-            ProjectionStorageKind::Tracked => rows.extend(
+            CatalogProjectionStorageKind::Tracked => rows.extend(
                 scan_tracked_rows_with_backend(
                     backend,
                     &TrackedScanRequest {
@@ -85,9 +86,17 @@ async fn hydrate_input_rows_with_backend(
                 )
                 .await?
                 .into_iter()
-                .map(ProjectionHydratedRow::Tracked),
+                .map(|row| {
+                    CatalogProjectionSourceRow::new(
+                        CatalogProjectionStorageKind::Tracked,
+                        crate::contracts::artifacts::RowIdentity::from_tracked_row(&row),
+                        row.schema_key.clone(),
+                        row.version_id.clone(),
+                        row.values,
+                    )
+                }),
             ),
-            ProjectionStorageKind::Untracked => rows.extend(
+            CatalogProjectionStorageKind::Untracked => rows.extend(
                 scan_untracked_rows_with_backend(
                     backend,
                     &UntrackedScanRequest {
@@ -99,16 +108,24 @@ async fn hydrate_input_rows_with_backend(
                 )
                 .await?
                 .into_iter()
-                .map(ProjectionHydratedRow::Untracked),
+                .map(|row| {
+                    CatalogProjectionSourceRow::new(
+                        CatalogProjectionStorageKind::Untracked,
+                        crate::contracts::artifacts::RowIdentity::from_untracked_row(&row),
+                        row.schema_key.clone(),
+                        row.version_id.clone(),
+                        row.values,
+                    )
+                }),
             ),
         }
     }
 
-    Ok(ProjectionInputRows::new(spec, rows))
+    Ok(CatalogProjectionInputRows::new(spec, rows))
 }
 
 fn schema_default_version_ids(
-    spec: &ProjectionInputSpec,
+    spec: &CatalogProjectionInputSpec,
     current_committed_version_ids: &[String],
 ) -> Vec<String> {
     match builtin_schema_storage_metadata(&spec.schema_key).map(|metadata| metadata.storage_lane) {
@@ -121,12 +138,12 @@ fn schema_default_version_ids(
 #[cfg(test)]
 mod tests {
     use super::hydrate_projection_input_with_backend;
-    use crate::catalog::{SurfaceFamily, SurfaceVariant};
+    use crate::catalog::{
+        CatalogDerivedRow, CatalogProjectionDefinition, CatalogProjectionInput,
+        CatalogProjectionInputSpec, CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
+    };
     use crate::live_state;
     use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
-    use crate::projections::{
-        DerivedRow, ProjectionInput, ProjectionInputSpec, ProjectionSurfaceSpec, ProjectionTrait,
-    };
     use crate::schema::{LixVersionDescriptor, LixVersionRef};
     use crate::test_support::{init_test_backend_core, TestSqliteBackend};
     use crate::{LixBackend, TransactionMode};
@@ -137,49 +154,55 @@ mod tests {
     #[derive(Debug, Clone, Copy)]
     struct TestLocalKeyValueProjection;
 
-    impl ProjectionTrait for TestLixVersionProjection {
+    impl CatalogProjectionDefinition for TestLixVersionProjection {
         fn name(&self) -> &'static str {
             "lix_version"
         }
 
-        fn inputs(&self) -> Vec<ProjectionInputSpec> {
+        fn inputs(&self) -> Vec<CatalogProjectionInputSpec> {
             vec![
-                ProjectionInputSpec::tracked("lix_version_descriptor"),
-                ProjectionInputSpec::untracked("lix_version_ref"),
+                CatalogProjectionInputSpec::tracked("lix_version_descriptor"),
+                CatalogProjectionInputSpec::untracked("lix_version_ref"),
             ]
         }
 
-        fn surfaces(&self) -> Vec<ProjectionSurfaceSpec> {
-            vec![ProjectionSurfaceSpec::new(
+        fn surfaces(&self) -> Vec<CatalogProjectionSurfaceSpec> {
+            vec![CatalogProjectionSurfaceSpec::new(
                 "lix_version",
                 SurfaceFamily::Admin,
                 SurfaceVariant::Default,
             )]
         }
 
-        fn derive(&self, _input: &ProjectionInput) -> Result<Vec<DerivedRow>, crate::LixError> {
+        fn derive(
+            &self,
+            _input: &CatalogProjectionInput,
+        ) -> Result<Vec<CatalogDerivedRow>, crate::LixError> {
             Ok(Vec::new())
         }
     }
 
-    impl ProjectionTrait for TestLocalKeyValueProjection {
+    impl CatalogProjectionDefinition for TestLocalKeyValueProjection {
         fn name(&self) -> &'static str {
             "local_key_value_projection"
         }
 
-        fn inputs(&self) -> Vec<ProjectionInputSpec> {
-            vec![ProjectionInputSpec::tracked("lix_key_value")]
+        fn inputs(&self) -> Vec<CatalogProjectionInputSpec> {
+            vec![CatalogProjectionInputSpec::tracked("lix_key_value")]
         }
 
-        fn surfaces(&self) -> Vec<ProjectionSurfaceSpec> {
-            vec![ProjectionSurfaceSpec::new(
+        fn surfaces(&self) -> Vec<CatalogProjectionSurfaceSpec> {
+            vec![CatalogProjectionSurfaceSpec::new(
                 "local_key_value_projection",
                 SurfaceFamily::Admin,
                 SurfaceVariant::Default,
             )]
         }
 
-        fn derive(&self, _input: &ProjectionInput) -> Result<Vec<DerivedRow>, crate::LixError> {
+        fn derive(
+            &self,
+            _input: &CatalogProjectionInput,
+        ) -> Result<Vec<CatalogDerivedRow>, crate::LixError> {
             Ok(Vec::new())
         }
     }
@@ -435,10 +458,12 @@ mod tests {
             .expect("hydration should succeed");
 
         let descriptor_rows = input
-            .rows_for(&ProjectionInputSpec::tracked("lix_version_descriptor"))
+            .rows_for(&CatalogProjectionInputSpec::tracked(
+                "lix_version_descriptor",
+            ))
             .expect("tracked descriptor rows should be present");
         let version_ref_rows = input
-            .rows_for(&ProjectionInputSpec::untracked("lix_version_ref"))
+            .rows_for(&CatalogProjectionInputSpec::untracked("lix_version_ref"))
             .expect("untracked version ref rows should be present");
 
         assert!(
@@ -452,7 +477,7 @@ mod tests {
 
         let descriptor_ids = descriptor_rows
             .iter()
-            .map(|row| row.identity().entity_id)
+            .map(|row| row.identity().entity_id.clone())
             .collect::<Vec<_>>();
         assert!(
             descriptor_ids
@@ -468,7 +493,7 @@ mod tests {
                     crate::Value::Text(name)
                         if name == crate::contracts::DEFAULT_ACTIVE_VERSION_NAME =>
                     {
-                        Some(row.identity().entity_id)
+                        Some(row.identity().entity_id.clone())
                     }
                     _ => None,
                 })
@@ -477,7 +502,7 @@ mod tests {
 
         let ref_ids = version_ref_rows
             .iter()
-            .map(|row| row.identity().entity_id)
+            .map(|row| row.identity().entity_id.clone())
             .collect::<Vec<_>>();
         assert!(
             ref_ids
@@ -581,7 +606,7 @@ mod tests {
             .await
             .expect("hydration should succeed");
         let rows = input
-            .rows_for(&ProjectionInputSpec::tracked("lix_key_value"))
+            .rows_for(&CatalogProjectionInputSpec::tracked("lix_key_value"))
             .expect("tracked key value rows should be present");
 
         assert_eq!(
@@ -592,7 +617,7 @@ mod tests {
 
         let version_ids = rows
             .iter()
-            .map(|row| row.identity().version_id)
+            .map(|row| row.identity().version_id.clone())
             .collect::<Vec<_>>();
         assert!(
             version_ids

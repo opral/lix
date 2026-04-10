@@ -1,5 +1,10 @@
 mod binding;
+mod declaration;
+mod directory;
+mod file;
 mod registry;
+mod state;
+mod version;
 
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -23,6 +28,20 @@ pub(crate) use binding::{
     SchemaRelationBinding, StoredVersionHeadSourceBinding, VersionDescriptorSourceBinding,
     VersionHeadSourceBinding, VersionRelationBinding,
 };
+#[allow(unused_imports)]
+pub(crate) use declaration::{
+    builtin_catalog_projection_registry, CatalogDerivedRow, CatalogProjectionDefinition,
+    CatalogProjectionInput, CatalogProjectionInputRows, CatalogProjectionInputSpec,
+    CatalogProjectionInputVersionScope, CatalogProjectionLifecycle, CatalogProjectionRegistration,
+    CatalogProjectionRegistry, CatalogProjectionSourceRow, CatalogProjectionStorageKind,
+    CatalogProjectionSurfaceSpec, RegisteredCatalogProjection,
+};
+#[allow(unused_imports)]
+pub(crate) use directory::LixDirectoryProjection;
+#[allow(unused_imports)]
+pub(crate) use file::LixFileProjection;
+#[allow(unused_imports)]
+pub(crate) use version::{builtin_lix_version_catalog_registration, LixVersionProjection};
 
 pub(crate) fn build_builtin_surface_registry() -> SurfaceRegistry {
     let mut registry = SurfaceRegistry::new();

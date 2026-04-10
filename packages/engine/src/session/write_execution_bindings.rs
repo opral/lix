@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
 use crate::backend::TransactionBackendAdapter;
+use crate::catalog::CatalogProjectionRegistry;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PendingPublicCommitSession,
@@ -21,9 +22,8 @@ use crate::execution::write::filesystem::runtime::{
 use crate::execution::write::transaction::TransactionExecutionBackend;
 use crate::execution::write::{TrackedCommitExecutionOutcome, WriteExecutionBindings};
 use crate::live_state::RowIdentity;
-use crate::projections::ProjectionRegistry;
 use crate::session::collaborators::SessionCollaborators;
-use crate::session::read_execution_bindings::ProjectionRegistryReadExecutionBindings;
+use crate::session::read_execution_bindings::CatalogProjectionRegistryReadExecutionBindings;
 use crate::session::version_ops::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
     CreateCommitAppliedOutput, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
@@ -108,7 +108,7 @@ impl WriteExecutionBindings for SessionCollaborators {
         public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError> {
         execute_prepared_public_read_with_registry(
-            self.projection_registry(),
+            self.catalog_projection_registry(),
             transaction,
             pending_view,
             public_read,
@@ -151,7 +151,7 @@ impl WriteExecutionBindings for SessionCollaborators {
 }
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
-    projection_registry: &ProjectionRegistry,
+    projection_registry: &CatalogProjectionRegistry,
     transaction: &mut dyn LixBackendTransaction,
     pending_view: Option<&dyn PendingView>,
     public_read: &PreparedPublicReadArtifact,
@@ -166,7 +166,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
             .await
         }
         crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
-            let bindings = ProjectionRegistryReadExecutionBindings::new(projection_registry);
+            let bindings = CatalogProjectionRegistryReadExecutionBindings::new(projection_registry);
             crate::execution::read::execute_prepared_public_read_artifact_in_transaction(
                 transaction,
                 &bindings,
