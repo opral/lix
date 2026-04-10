@@ -1,8 +1,8 @@
 use crate::common::fingerprint::stable_content_fingerprint_hex;
-use crate::contracts::artifacts::{
+use crate::contracts::TrackedChangeView;
+use crate::contracts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,
 };
-use crate::contracts::change::TrackedChangeView;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,
@@ -373,7 +373,7 @@ fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{build_change_batches, derive_commit_preconditions};
-    use crate::contracts::artifacts::ExpectedHead;
+    use crate::contracts::ExpectedHead;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::WriteLane;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;

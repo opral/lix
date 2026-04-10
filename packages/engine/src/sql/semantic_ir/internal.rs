@@ -3,8 +3,8 @@
 //! This stage owns the front-end normalization output for internal SQL after
 //! parse/bind but before later planning and execution-specific wrapping.
 
-use crate::contracts::artifacts::PreparedStatement;
-use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::contracts::PreparedStatement;
+use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::ast::lowering::lower_statement;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::contracts::planned_statement::{

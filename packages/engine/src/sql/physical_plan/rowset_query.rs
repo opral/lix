@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{
+use crate::contracts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
     ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
 };

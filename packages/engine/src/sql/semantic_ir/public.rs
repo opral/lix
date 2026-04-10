@@ -6,8 +6,8 @@ use super::statement::BoundStatement;
 use crate::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
-use crate::common::errors::schema_not_registered_error;
-use crate::contracts::artifacts::EffectiveStateRequest;
+use crate::contracts::EffectiveStateRequest;
+use crate::diagnostics::schema_not_registered_error;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract,
     ReadPlan, StructuredPublicRead,

@@ -11,9 +11,9 @@ use crate::live_state::tracked::{
 use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
+use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::session::version_ops::load_current_committed_version_frontier_with_backend;
-use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::{LixBackend, LixError, Value};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
@@ -123,7 +123,7 @@ async fn hydrate_input_rows_with_backend(
                         .map(|row| {
                             CatalogProjectionSourceRow::new(
                                 CatalogProjectionStorageKind::Tracked,
-                                crate::contracts::artifacts::RowIdentity::from_tracked_row(&row),
+                                crate::contracts::RowIdentity::from_tracked_row(&row),
                                 row.schema_key.clone(),
                                 row.version_id.clone(),
                                 row.values,
@@ -148,7 +148,7 @@ async fn hydrate_input_rows_with_backend(
                         .map(|row| {
                             CatalogProjectionSourceRow::new(
                                 CatalogProjectionStorageKind::Tracked,
-                                crate::contracts::artifacts::RowIdentity {
+                                crate::contracts::RowIdentity {
                                     entity_id: row.entity_id.clone(),
                                     schema_key: row.schema_key.clone(),
                                     version_id: row.version_id.clone(),
@@ -187,7 +187,7 @@ async fn hydrate_input_rows_with_backend(
                 .map(|row| {
                     CatalogProjectionSourceRow::new(
                         CatalogProjectionStorageKind::Untracked,
-                        crate::contracts::artifacts::RowIdentity::from_untracked_row(&row),
+                        crate::contracts::RowIdentity::from_untracked_row(&row),
                         row.schema_key.clone(),
                         row.version_id.clone(),
                         row.values,
@@ -223,12 +223,7 @@ async fn overlay_writer_keys_on_source_rows_with_backend(
         .collect::<std::collections::BTreeSet<_>>();
     let annotations = load_writer_key_annotations(backend, &row_identities).await?;
     for row in rows {
-        row.set_writer_key(
-            annotations
-                .get(row.identity())
-                .cloned()
-                .flatten(),
-        );
+        row.set_writer_key(annotations.get(row.identity()).cloned().flatten());
     }
     Ok(())
 }

@@ -5,6 +5,7 @@ pub(crate) mod canonical;
 pub(crate) mod catalog;
 mod common;
 pub(crate) mod contracts;
+mod diagnostics;
 pub(crate) mod execution;
 mod init;
 pub mod live_state;

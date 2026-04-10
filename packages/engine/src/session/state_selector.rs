@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 
-use crate::contracts::artifacts::{PendingViewFilter, ScanConstraint, ScanField, ScanOperator};
-use crate::contracts::traits::{LiveStateQueryBackend, PendingSemanticStorage, PendingView};
+use crate::contracts::{LiveStateQueryBackend, PendingSemanticStorage, PendingView};
+use crate::contracts::{PendingViewFilter, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, RowReadMode};
 use crate::sql::logical_plan::public_ir::{CanonicalStateRowKey, PlannedWrite, ScopeProof};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
@@ -230,7 +230,7 @@ async fn scan_selector_lane(
 
     for pending in pending_view.visible_semantic_rows(pending_storage, schema_key) {
         if pending.version_id != storage_version_id
-            || !crate::contracts::artifacts::matches_constraints(
+            || !crate::contracts::matches_constraints(
                 &pending.entity_id,
                 &pending.file_id,
                 &pending.plugin_key,

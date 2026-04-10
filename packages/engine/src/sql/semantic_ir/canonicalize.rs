@@ -1382,7 +1382,7 @@ fn unknown_write_column_error(
 }
 
 fn filesystem_file_data_error(_error: CanonicalizeError) -> CanonicalizeError {
-    CanonicalizeError::unsupported(crate::common::errors::FILE_DATA_EXPECTS_BYTES_MESSAGE)
+    CanonicalizeError::unsupported(crate::diagnostics::FILE_DATA_EXPECTS_BYTES_MESSAGE)
 }
 
 pub(crate) fn evaluate_public_write_expr_to_value(

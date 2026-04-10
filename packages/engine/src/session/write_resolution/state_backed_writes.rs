@@ -1,6 +1,6 @@
 use super::*;
-use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::traits::{PendingSemanticStorage, PendingView};
+use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::contracts::{PendingSemanticStorage, PendingView};
 use crate::live_state::{decode_registered_schema_row, scan_live_rows, LiveRowQuery, RowReadMode};
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,

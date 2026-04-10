@@ -5,7 +5,7 @@ use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, CanonicalChange, CanonicalStateIdentity,
     CanonicalStateRow,
 };
-use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOperation};
+use crate::contracts::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::TransactionBackendAdapter;

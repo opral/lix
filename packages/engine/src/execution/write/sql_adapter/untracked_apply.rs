@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::artifacts::PlannedStateRow;
-use crate::contracts::functions::LixFunctionProvider;
+use crate::contracts::LixFunctionProvider;
+use crate::contracts::PlannedStateRow;
 use crate::execution::write::filesystem::runtime::compile_filesystem_finalization_from_state_in_transaction;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};

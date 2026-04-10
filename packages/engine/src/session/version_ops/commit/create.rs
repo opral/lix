@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::backend::QueryExecutor;
 use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::{append_changes, CanonicalChangeWrite, CanonicalStateIdentity};
-use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
-use crate::contracts::functions::LixFunctionProvider;
-use crate::contracts::version_artifacts::version_ref_snapshot_content;
+use crate::contracts::version_ref_snapshot_content;
+use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{MutationRow, OptionalTextPatch};
 use crate::execution::write::filesystem::runtime::{
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
@@ -1292,8 +1292,8 @@ mod tests {
         CreateCommitWriteLane,
     };
     use crate::canonical::CanonicalChangeWrite;
-    use crate::contracts::artifacts::OptionalTextPatch;
-    use crate::contracts::functions::LixFunctionProvider;
+    use crate::contracts::LixFunctionProvider;
+    use crate::contracts::OptionalTextPatch;
     use crate::contracts::GLOBAL_VERSION_ID;
     use crate::execution::write::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState,
@@ -1450,24 +1450,22 @@ mod tests {
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
             file_id: Some(
-                crate::contracts::version_artifacts::version_descriptor_file_id()
+                crate::contracts::version_descriptor_file_id()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
             plugin_key: Some(
-                crate::contracts::version_artifacts::version_descriptor_plugin_key()
+                crate::contracts::version_descriptor_plugin_key()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
-            snapshot_content: Some(
-                crate::contracts::version_artifacts::version_descriptor_snapshot_content(
-                    "version-a",
-                    "Version A",
-                    false,
-                ),
-            ),
+            snapshot_content: Some(crate::contracts::version_descriptor_snapshot_content(
+                "version-a",
+                "Version A",
+                false,
+            )),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
@@ -1755,10 +1753,7 @@ mod tests {
             .to_string(),
             "current_head_fingerprint",
             "fp-1",
-            &crate::contracts::version_artifacts::version_ref_snapshot_content(
-                "version-a",
-                "commit-456",
-            ),
+            &crate::contracts::version_ref_snapshot_content("version-a", "commit-456"),
             "commit-456",
         )
         .await;

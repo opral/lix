@@ -1603,7 +1603,9 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 }
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
-    ["canonical", "catalog", "live_state"].into_iter().collect()
+    ["canonical", "catalog", "contracts", "live_state"]
+        .into_iter()
+        .collect()
 }
 
 fn violations_for_sealed_owners(
@@ -2466,6 +2468,85 @@ fn phase_g_sql_uses_neutral_dialect_seam_instead_of_backend_owner() {
             source.contains("SqlDialect"),
             "{relative} should consume the neutral SqlDialect seam"
         );
+    }
+}
+
+#[test]
+fn phase_1_common_stays_a_small_foundation_bucket() {
+    let common_paths: BTreeSet<String> = production_source_files()
+        .into_iter()
+        .map(|(relative_path, _)| relative_path)
+        .filter(|relative_path| relative_path.starts_with("common/"))
+        .collect();
+
+    let expected_paths: BTreeSet<String> = [
+        "common/dialect.rs",
+        "common/error.rs",
+        "common/errors/mod.rs",
+        "common/fingerprint.rs",
+        "common/identity.rs",
+        "common/mod.rs",
+        "common/paths/filesystem.rs",
+        "common/paths/mod.rs",
+        "common/text.rs",
+        "common/types.rs",
+        "common/wire.rs",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect();
+
+    assert_eq!(
+        common_paths, expected_paths,
+        "Plan 93 Phase 1 regression: common/* should stay a small owner-agnostic foundation bucket; new shared seam files belong in contracts/* or a sealed owner root",
+    );
+}
+
+#[test]
+fn phase_1_common_stays_free_of_owner_and_contract_imports() {
+    for absolute_path in rust_files_for_top_level_module("common") {
+        let relative_path = absolute_path
+            .strip_prefix(src_root())
+            .expect("common file should live under src/")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source = strip_test_code(
+            &fs::read_to_string(&absolute_path).expect("common source should be readable"),
+        );
+
+        for forbidden in [
+            "use crate::api",
+            "crate::api::",
+            "use crate::backend",
+            "crate::backend::",
+            "use crate::binary_cas",
+            "crate::binary_cas::",
+            "use crate::canonical",
+            "crate::canonical::",
+            "use crate::catalog",
+            "crate::catalog::",
+            "use crate::contracts",
+            "crate::contracts::",
+            "use crate::execution",
+            "crate::execution::",
+            "use crate::init",
+            "crate::init::",
+            "use crate::live_state",
+            "crate::live_state::",
+            "use crate::runtime",
+            "crate::runtime::",
+            "use crate::schema",
+            "crate::schema::",
+            "use crate::session",
+            "crate::session::",
+            "use crate::sql",
+            "crate::sql::",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "Plan 93 Phase 1 regression: {relative_path} should stay owner-agnostic and free of seam-layer imports via `{forbidden}`",
+            );
+        }
     }
 }
 

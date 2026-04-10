@@ -45,7 +45,7 @@ pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError
 pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
     for statement in statements {
         if statement_mutates_protected_lix_relation(statement) {
-            return Err(crate::common::errors::internal_table_access_denied_error());
+            return Err(crate::diagnostics::internal_table_access_denied_error());
         }
     }
     Ok(())
@@ -59,7 +59,7 @@ pub(crate) fn reject_public_create_table(statements: &[Statement]) -> Result<(),
         .iter()
         .any(|statement| matches!(statement, Statement::CreateTable(_)))
     {
-        return Err(crate::common::errors::public_create_table_denied_error());
+        return Err(crate::diagnostics::public_create_table_denied_error());
     }
     Ok(())
 }

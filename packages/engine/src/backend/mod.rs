@@ -10,7 +10,7 @@ use async_trait::async_trait;
 
 use crate::backend::prepared::PreparedBatch;
 use crate::common::dialect::SqlDialect;
-pub use crate::contracts::transaction_mode::TransactionMode;
+pub use crate::contracts::TransactionMode;
 use crate::{LixError, QueryResult, Value};
 pub use image::{ImageChunkReader, ImageChunkWriter};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;

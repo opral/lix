@@ -5,13 +5,25 @@ pub(crate) mod execution_effects;
 pub(crate) mod explain_output;
 pub(crate) mod functions;
 pub(crate) mod plugin;
+pub(crate) mod read_execution;
 pub(crate) mod replay_cursor;
 pub(crate) mod state_commit_stream;
 pub(crate) mod traits;
 pub(crate) mod transaction_mode;
 pub(crate) mod version_artifacts;
+pub(crate) mod write_execution;
 
-pub(crate) use constants::{DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID};
+pub use artifacts::*;
+pub use change::*;
+pub use constants::{DEFAULT_ACTIVE_VERSION_NAME, GLOBAL_VERSION_ID};
+pub use execution_effects::*;
+pub use explain_output::*;
+pub use functions::*;
+pub use plugin::*;
+pub use read_execution::*;
 pub use replay_cursor::ReplayCursor;
-
-pub(crate) use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
+pub use state_commit_stream::*;
+pub use traits::*;
+pub use transaction_mode::*;
+pub use version_artifacts::*;
+pub use write_execution::*;

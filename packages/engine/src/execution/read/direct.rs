@@ -1,4 +1,5 @@
-use crate::contracts::artifacts::{
+use crate::contracts::CommittedStateHistoryReader;
+use crate::contracts::{
     DirectoryHistoryRow, FileHistoryRow, PreparedDirectDirectoryHistoryField,
     PreparedDirectEntityHistoryField, PreparedDirectFileHistoryField, PreparedDirectPublicRead,
     PreparedDirectStateHistoryField, PreparedDirectoryHistoryAggregate,
@@ -11,7 +12,6 @@ use crate::contracts::artifacts::{
     PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
     PreparedStateHistorySortValue, StateHistoryRow,
 };
-use crate::contracts::traits::CommittedStateHistoryReader;
 use crate::execution::read::filesystem::history::{
     load_directory_history_rows, load_file_history_rows,
 };

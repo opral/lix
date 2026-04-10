@@ -5,7 +5,7 @@ use crate::binary_cas::schema::{
 };
 use async_trait::async_trait;
 
-use crate::contracts::traits::BlobDataReader;
+use crate::contracts::BlobDataReader;
 use crate::{LixBackend, LixError, Value};
 
 #[async_trait(?Send)]

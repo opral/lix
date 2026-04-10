@@ -1,4 +1,4 @@
-use crate::contracts::traits::{
+use crate::contracts::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
 use crate::execution::write::buffered::{

@@ -163,13 +163,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = LiveRow {
             entity_id: version_id.to_string(),
-            schema_key: crate::contracts::version_artifacts::version_ref_schema_key().to_string(),
-            schema_version: crate::contracts::version_artifacts::version_ref_schema_version()
-                .to_string(),
-            file_id: crate::contracts::version_artifacts::version_ref_file_id().to_string(),
-            version_id: crate::contracts::version_artifacts::version_ref_storage_version_id()
-                .to_string(),
-            plugin_key: crate::contracts::version_artifacts::version_ref_plugin_key().to_string(),
+            schema_key: crate::contracts::version_ref_schema_key().to_string(),
+            schema_version: crate::contracts::version_ref_schema_version().to_string(),
+            file_id: crate::contracts::version_ref_file_id().to_string(),
+            version_id: crate::contracts::version_ref_storage_version_id().to_string(),
+            plugin_key: crate::contracts::version_ref_plugin_key().to_string(),
             metadata: None,
             change_id: None,
             writer_key: None,
@@ -177,11 +175,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             untracked: true,
             created_at: Some(timestamp.clone()),
             updated_at: Some(timestamp),
-            snapshot_content: Some(
-                crate::contracts::version_artifacts::version_ref_snapshot_content(
-                    version_id, commit_id,
-                ),
-            ),
+            snapshot_content: Some(crate::contracts::version_ref_snapshot_content(
+                version_id, commit_id,
+            )),
         };
         write_live_rows(self.backend_transaction_mut()?, &[row]).await
     }

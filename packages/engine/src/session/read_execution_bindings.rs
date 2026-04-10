@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::artifacts::{PreparedPublicReadArtifact, ReadTimeProjectionRead};
-use crate::contracts::traits::PendingView;
-use crate::execution::read::{
-    execute_prepared_public_read_artifact_with_backend, PendingPublicReadExecutionBackend,
-    ReadExecutionBindings, ReadTimeProjectionRow,
+use crate::contracts::PendingView;
+use crate::contracts::{
+    PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
 };
+use crate::contracts::{PreparedPublicReadArtifact, ReadTimeProjectionRead};
+use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
 use crate::session::collaborators::SessionCollaborators;
 use crate::{LixBackend, LixError, QueryResult};
 
@@ -77,7 +77,7 @@ impl PendingPublicReadExecutionBackend for dyn LixBackend + '_ {
         public_read: &PreparedPublicReadArtifact,
     ) -> Result<QueryResult, LixError> {
         match public_read.contract.execution_mode() {
-            crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
+            crate::contracts::PublicReadExecutionMode::PendingView => {
                 crate::session::pending_reads::execute_prepared_public_read_with_pending_view(
                     self,
                     pending_view,
@@ -85,7 +85,7 @@ impl PendingPublicReadExecutionBackend for dyn LixBackend + '_ {
                 )
                 .await
             }
-            crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
+            crate::contracts::PublicReadExecutionMode::Committed(_) => {
                 execute_prepared_public_read_artifact_with_backend(self, bindings, public_read)
                     .await
             }

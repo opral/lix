@@ -1,4 +1,4 @@
-pub(crate) use crate::contracts::artifacts::{
+pub(crate) use crate::contracts::{
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
     PlannedStateRow, WriteLane, WriteMode,
 };

@@ -1,7 +1,7 @@
-use crate::contracts::artifacts::{
+use crate::contracts::should_invalidate_deterministic_settings_cache;
+use crate::contracts::{
     CanonicalCommitReceipt, PendingPublicCommitSession, StateCommitStreamChange,
 };
-use crate::contracts::state_commit_stream::should_invalidate_deterministic_settings_cache;
 use crate::execution::write::buffered::{
     apply_schema_registrations_in_transaction, BufferedWriteState, PlannedWriteDelta,
     TransactionCoordinator,

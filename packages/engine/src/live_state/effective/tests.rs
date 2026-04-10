@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::contracts::traits::WriterKeyReadView;
-use crate::contracts::traits::{
+use crate::contracts::WriterKeyReadView;
+use crate::contracts::{
     LiveReadContext as ReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
 };
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};

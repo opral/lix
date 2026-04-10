@@ -1,16 +1,14 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use crate::contracts::artifacts::{
+use crate::contracts::PendingView;
+use crate::contracts::{
     coalesce_live_table_requirements, CanonicalCommitReceipt, PendingPublicCommitSession,
     PlanEffects, PreparedBatch, PreparedInternalWriteArtifact, PreparedPublicReadArtifact,
     PreparedWriteDiagnosticContext, PreparedWriteStatementKind, PreparedWriteStep, ResultContract,
     SchemaRegistration, SchemaRegistrationSet, StateCommitStreamChange,
 };
-use crate::contracts::explain_output::{
-    render_analyzed_explain_result, render_plain_explain_result,
-};
-use crate::contracts::traits::PendingView;
+use crate::contracts::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::execution::write::buffered::apply_schema_registrations_in_transaction;
 use crate::execution::write::transaction::normalize_sql_error_with_transaction_and_relation_names;
 use crate::execution::write::{
@@ -272,7 +270,7 @@ pub(crate) async fn execute_internal_execution_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     internal: &PreparedInternalWriteArtifact,
     result_contract: ResultContract,
-    functions: &dyn crate::contracts::functions::LixFunctionProvider,
+    functions: &dyn crate::contracts::LixFunctionProvider,
     writer_key: Option<&str>,
 ) -> Result<SqlExecutionOutcome, LixError> {
     let _ = (functions, writer_key, internal.should_refresh_file_cache);

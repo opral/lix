@@ -2,8 +2,8 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::catalog::SurfaceRegistry;
-use crate::common::naming::tracked_relation_name;
-use crate::contracts::traits::{PendingSemanticStorage, PendingView, SqlPreparationMetadataReader};
+use crate::contracts::{PendingSemanticStorage, PendingView, SqlPreparationMetadataReader};
+use crate::live_state::tracked_relation_name;
 use crate::schema::{
     builtin_schema_definition, lix_state_surface_schema_definition,
     schema_from_registered_snapshot, SchemaKey,

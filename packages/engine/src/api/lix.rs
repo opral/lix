@@ -9,7 +9,7 @@ use serde_json::Value as JsonValue;
 
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::traits::CompiledSchemaCache;
+use crate::contracts::CompiledSchemaCache;
 use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
@@ -547,7 +547,7 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
         self.catalog_projection_registry().as_ref()
     }
 
-    fn compiled_schema_cache(&self) -> &dyn crate::contracts::traits::CompiledSchemaCache {
+    fn compiled_schema_cache(&self) -> &dyn crate::contracts::CompiledSchemaCache {
         self.runtime().schema_cache()
     }
 
@@ -558,7 +558,7 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
     ) -> crate::sql::prepare::SqlPreparationSeed<'a> {
         crate::sql::prepare::SqlPreparationSeed {
             dialect: self.backend().dialect(),
-            functions: crate::contracts::functions::clone_boxed_function_provider(functions),
+            functions: crate::contracts::clone_boxed_function_provider(functions),
             surface_registry,
         }
     }
@@ -581,8 +581,8 @@ impl crate::execution::write::WriteExecutionBindings for Lix {
     async fn execute_prepared_public_read_with_pending_view(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        pending_view: Option<&dyn crate::contracts::traits::PendingView>,
-        public_read: &crate::contracts::artifacts::PreparedPublicReadArtifact,
+        pending_view: Option<&dyn crate::contracts::PendingView>,
+        public_read: &crate::contracts::PreparedPublicReadArtifact,
     ) -> Result<crate::QueryResult, LixError> {
         crate::session::write_execution_bindings::execute_prepared_public_read_with_registry(
             self.catalog_projection_registry().as_ref(),
@@ -615,9 +615,7 @@ impl crate::execution::write::WriteExecutionBindings for Lix {
     async fn persist_runtime_sequence_in_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        functions: &SharedFunctionProvider<
-            Box<dyn crate::contracts::functions::LixFunctionProvider + Send>,
-        >,
+        functions: &SharedFunctionProvider<Box<dyn crate::contracts::LixFunctionProvider + Send>>,
     ) -> Result<(), LixError> {
         crate::session::write_execution_bindings::persist_runtime_sequence(transaction, functions)
             .await
@@ -627,10 +625,8 @@ impl crate::execution::write::WriteExecutionBindings for Lix {
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
         unit: &crate::execution::write::buffered::TrackedTxnUnit,
-        pending_commit_session: Option<
-            &mut Option<crate::contracts::artifacts::PendingPublicCommitSession>,
-        >,
-    ) -> Result<crate::execution::write::TrackedCommitExecutionOutcome, LixError> {
+        pending_commit_session: Option<&mut Option<crate::contracts::PendingPublicCommitSession>>,
+    ) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
         crate::session::write_execution_bindings::execute_public_tracked_append(
             transaction,
             unit,

@@ -20,13 +20,13 @@ use crate::catalog::SurfaceFamily;
 use crate::common::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
-use crate::contracts::artifacts::{
+use crate::contracts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
     LiveSnapshotStorage, MutationOperation, MutationRow, PlannedStateRow,
     PreparedInsertOnConflictAction, PreparedPublicWriteArtifact, PreparedResolvedWritePlan,
     PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
 };
-use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend, PendingView};
+use crate::contracts::{CompiledSchemaCache, LiveStateQueryBackend, PendingView};
 use crate::live_state::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,
     LiveRowQuery, LiveRowSemantics, RowReadMode,
@@ -166,8 +166,8 @@ impl<'a> WriteValidationSchemaLookup<'a> {
         }
 
         for storage in [
-            crate::contracts::traits::PendingSemanticStorage::Tracked,
-            crate::contracts::traits::PendingSemanticStorage::Untracked,
+            crate::contracts::PendingSemanticStorage::Tracked,
+            crate::contracts::PendingSemanticStorage::Untracked,
         ] {
             for row in pending_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
                 let Some(snapshot_content) = row.snapshot_content else {

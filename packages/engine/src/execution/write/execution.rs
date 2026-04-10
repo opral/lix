@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::SchemaRegistration;
+use crate::contracts::SchemaRegistration;
 use crate::execution::write::buffered::{LiveStateWriteState, TransactionCoordinator};
 use crate::{LixBackendTransaction, LixError};
 
@@ -92,8 +92,8 @@ mod tests {
     use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
 
-    use crate::contracts::traits::WriterKeyReadView;
-    use crate::contracts::traits::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
+    use crate::contracts::WriterKeyReadView;
+    use crate::contracts::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
     use crate::execution::write::buffered::prepare_materialization_plan;
     use crate::live_state::shared::identity::RowIdentity;
     use crate::live_state::tracked::{

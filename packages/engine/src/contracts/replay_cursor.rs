@@ -18,7 +18,7 @@ impl ReplayCursor {
         }
     }
 
-    pub(crate) fn is_newer_than(&self, other: &Self) -> bool {
+    pub fn is_newer_than(&self, other: &Self) -> bool {
         self.cmp(other).is_gt()
     }
 }

@@ -35,36 +35,32 @@ pub(crate) async fn apply_write_plan(
 }
 
 #[allow(dead_code)]
-fn tracked_writes_summary(
-    writes: &[crate::contracts::artifacts::TrackedWriteRow],
-) -> (usize, usize) {
+fn tracked_writes_summary(writes: &[crate::contracts::TrackedWriteRow]) -> (usize, usize) {
     let mut upserts = 0;
     let mut tombstones = 0;
     for write in writes {
         match write.operation {
-            crate::contracts::artifacts::TrackedWriteOperation::Upsert => upserts += 1,
-            crate::contracts::artifacts::TrackedWriteOperation::Tombstone => tombstones += 1,
+            crate::contracts::TrackedWriteOperation::Upsert => upserts += 1,
+            crate::contracts::TrackedWriteOperation::Tombstone => tombstones += 1,
         }
     }
     (upserts, tombstones)
 }
 
 #[allow(dead_code)]
-fn untracked_writes_summary(
-    writes: &[crate::contracts::artifacts::UntrackedWriteRow],
-) -> (usize, usize) {
+fn untracked_writes_summary(writes: &[crate::contracts::UntrackedWriteRow]) -> (usize, usize) {
     let mut upserts = 0;
     let mut deletes = 0;
     for write in writes {
         match write.operation {
-            crate::contracts::artifacts::UntrackedWriteOperation::Upsert => upserts += 1,
-            crate::contracts::artifacts::UntrackedWriteOperation::Delete => deletes += 1,
+            crate::contracts::UntrackedWriteOperation::Upsert => upserts += 1,
+            crate::contracts::UntrackedWriteOperation::Delete => deletes += 1,
         }
     }
     (upserts, deletes)
 }
 
-fn live_row_from_tracked_write(write: &crate::contracts::artifacts::TrackedWriteRow) -> LiveRow {
+fn live_row_from_tracked_write(write: &crate::contracts::TrackedWriteRow) -> LiveRow {
     LiveRow {
         entity_id: write.entity_id.clone(),
         file_id: write.file_id.clone(),
@@ -83,9 +79,7 @@ fn live_row_from_tracked_write(write: &crate::contracts::artifacts::TrackedWrite
     }
 }
 
-fn live_row_from_untracked_write(
-    write: &crate::contracts::artifacts::UntrackedWriteRow,
-) -> LiveRow {
+fn live_row_from_untracked_write(write: &crate::contracts::UntrackedWriteRow) -> LiveRow {
     LiveRow {
         entity_id: write.entity_id.clone(),
         file_id: write.file_id.clone(),
