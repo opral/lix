@@ -13,7 +13,7 @@ use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteR
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::logical_plan::public_ir::{PlannedWrite, ResolvedWritePlan};
 use crate::{
-    boot, BootArgs, CommittedVersionFrontier, Engine, LixBackend, LixBackendTransaction, LixError,
+    CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
 };
 
@@ -231,16 +231,15 @@ impl LixBackendTransaction for TestSqliteTransaction {
     }
 }
 
-pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Engine>, Session), LixError>
-{
+pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Lix>, Session), LixError> {
     let backend = TestSqliteBackend::new();
-    let engine = Arc::new(boot(BootArgs::new(
+    let lix = Arc::new(Lix::boot(LixConfig::new(
         Box::new(backend.clone()),
         Arc::new(NoopWasmRuntime),
     )));
-    engine.initialize().await?;
-    let session = engine.open_session().await?;
-    Ok((backend, engine, session))
+    lix.initialize().await?;
+    let session = lix.open_workspace_session().await?;
+    Ok((backend, lix, session))
 }
 
 #[cfg(test)]

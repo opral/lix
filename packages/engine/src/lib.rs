@@ -5,7 +5,6 @@ pub(crate) mod canonical;
 pub(crate) mod catalog;
 mod common;
 pub(crate) mod contracts;
-mod engine;
 pub(crate) mod execution;
 mod init;
 pub mod live_state;
@@ -38,6 +37,7 @@ pub use schema::{
     validate_lix_schema_definition,
 };
 
+pub use api::BootKeyValue;
 pub use api::{InitResult, Lix, LixConfig};
 pub use backend::prepared::{PreparedBatch, PreparedStatement};
 pub use backend::LixBackend;
@@ -54,9 +54,6 @@ pub use contracts::artifacts::CommittedVersionFrontier;
 pub use contracts::artifacts::ExecuteOptions;
 pub use contracts::transaction_mode::TransactionMode;
 pub use contracts::ReplayCursor;
-#[doc(hidden)]
-pub use engine::{boot, BootArgs};
-pub use engine::{BootKeyValue, Engine};
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
@@ -70,7 +67,7 @@ pub use session::version_ops::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult, RedoOptions, RedoResult, UndoOptions, UndoResult,
 };
-pub use session::{OpenSessionOptions, Session, SessionTransaction};
+pub use session::{AdditionalSessionOptions, Session, SessionTransaction};
 #[doc(hidden)]
 pub use sql::binder::{delay_broad_binding_for_test, BroadBindingDelayForTestGuard};
 pub use sql::prepare::prepared_batch::collapse_prepared_batch_for_dialect;

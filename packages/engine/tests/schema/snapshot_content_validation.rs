@@ -2,9 +2,9 @@ use lix_engine::Value;
 
 simulation_test!(allows_valid_snapshot, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -44,9 +44,9 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
 
 simulation_test!(rejects_invalid_snapshot, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -79,9 +79,9 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
 
 simulation_test!(requires_registered_schema, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -104,9 +104,9 @@ simulation_test!(requires_registered_schema, |sim| async move {
 
 simulation_test!(rejects_invalid_update, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -146,9 +146,9 @@ simulation_test!(rejects_invalid_update, |sim| async move {
 
 simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -188,9 +188,9 @@ simulation_test!(rejects_update_on_immutable_schema, |sim| async move {
 
 simulation_test!(allows_delete_on_immutable_schema, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 

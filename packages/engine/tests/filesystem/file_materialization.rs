@@ -369,7 +369,7 @@ fn plugin_txt_noop_wasm_bytes() -> Vec<u8> {
 }
 
 #[cfg(any())]
-async fn register_plugin_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_plugin_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -381,7 +381,7 @@ async fn register_plugin_schema(engine: &support::simulation_test::SimulationEng
         .expect("register plugin schema should succeed");
 }
 
-async fn main_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn main_version_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let rows = engine
         .execute(
             "SELECT id FROM lix_version WHERE name = 'main' LIMIT 1",
@@ -396,7 +396,7 @@ async fn main_version_id(engine: &support::simulation_test::SimulationEngine) ->
     }
 }
 
-async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let rows = engine
         .execute(
             "SELECT commit_id \
@@ -417,20 +417,20 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
 #[cfg(any())]
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> support::simulation_test::SimulationEngine {
+) -> support::simulation_test::SimulatedLix {
     let runtime = Arc::new(
         wasmtime_runtime::TestWasmtimeRuntime::new()
             .expect("test wasmtime runtime should initialize"),
     ) as Arc<dyn WasmRuntime>;
 
     let engine = sim
-        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+        .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine
         .initialize()
         .await
@@ -450,17 +450,17 @@ async fn boot_engine_with_json_plugin(
 #[cfg(any())]
 async fn boot_engine_with_path_echo_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> support::simulation_test::SimulationEngine {
+) -> support::simulation_test::SimulatedLix {
     let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
 
     let engine = sim
-        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+        .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine
         .initialize()
         .await
@@ -480,17 +480,17 @@ async fn boot_engine_with_path_echo_plugin(
 #[cfg(any())]
 async fn boot_engine_with_before_aware_plugin(
     sim: &support::simulation_test::SimulationArgs,
-) -> support::simulation_test::SimulationEngine {
+) -> support::simulation_test::SimulatedLix {
     let runtime = Arc::new(BeforeAwareRuntime) as Arc<dyn WasmRuntime>;
 
     let engine = sim
-        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+        .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine
         .initialize()
         .await
@@ -509,7 +509,7 @@ async fn boot_engine_with_before_aware_plugin(
 
 #[cfg(any())]
 async fn detected_json_pointer_entities(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
     version_id: &str,
 ) -> Vec<String> {
@@ -540,7 +540,7 @@ async fn detected_json_pointer_entities(
 
 #[cfg(any())]
 async fn json_pointer_change_count(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
 ) -> i64 {
     let rows = engine
@@ -594,7 +594,7 @@ fn value_as_text(value: &Value) -> String {
 
 #[cfg(any())]
 async fn file_cache_row_count(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
     version_id: &str,
 ) -> i64 {
@@ -616,7 +616,7 @@ async fn file_cache_row_count(
 
 #[cfg(any())]
 async fn file_descriptor_tombstone_count(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
     version_id: &str,
 ) -> i64 {
@@ -640,7 +640,7 @@ async fn file_descriptor_tombstone_count(
 
 #[cfg(any())]
 async fn total_file_cache_row_count_for_prefix(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id_prefix: &str,
 ) -> i64 {
     let rows = engine
@@ -661,7 +661,7 @@ async fn total_file_cache_row_count_for_prefix(
 
 #[cfg(any())]
 async fn orphan_file_cache_row_count_for_prefix(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id_prefix: &str,
 ) -> i64 {
     let rows = engine
@@ -687,7 +687,7 @@ async fn orphan_file_cache_row_count_for_prefix(
 }
 
 async fn binary_blob_hash_for_file_version(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
     version_id: &str,
 ) -> Option<String> {
@@ -714,7 +714,7 @@ async fn binary_blob_hash_for_file_version(
 }
 
 async fn binary_chunk_hash_for_blob(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     blob_hash: &str,
 ) -> Option<String> {
     let rows = engine
@@ -738,7 +738,7 @@ async fn binary_chunk_hash_for_blob(
 }
 
 async fn binary_manifest_row_count_by_hash(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     blob_hash: &str,
 ) -> i64 {
     let rows = engine
@@ -757,7 +757,7 @@ async fn binary_manifest_row_count_by_hash(
     value_as_i64(&rows.statements[0].rows[0][0])
 }
 
-async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::SimulationEngine) -> i64 {
+async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::SimulatedLix) -> i64 {
     let rows = engine
         .execute(
             "SELECT COUNT(*) \
@@ -774,7 +774,7 @@ async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::Simula
 }
 
 async fn orphan_binary_manifest_chunk_row_count(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
 ) -> i64 {
     let rows = engine
         .execute(
@@ -792,7 +792,7 @@ async fn orphan_binary_manifest_chunk_row_count(
 }
 
 async fn binary_codec_counts_for_blob(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     blob_hash: &str,
 ) -> (i64, i64, i64) {
     let rows = engine
@@ -818,7 +818,7 @@ async fn binary_codec_counts_for_blob(
 }
 
 async fn binary_prefixed_chunk_payload_count_for_blob(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     blob_hash: &str,
 ) -> i64 {
     let sqlite_style_query = format!(
@@ -852,17 +852,17 @@ async fn binary_prefixed_chunk_payload_count_for_blob(
 #[cfg(any())]
 async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     sim: &support::simulation_test::SimulationArgs,
-) -> support::simulation_test::SimulationEngine {
+) -> support::simulation_test::SimulatedLix {
     let runtime = Arc::new(JsonWithTxtNoopRuntime::new()) as Arc<dyn WasmRuntime>;
 
     let engine = sim
-        .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+        .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
             access_to_internal: true,
         }))
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine
         .initialize()
         .await
@@ -884,9 +884,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -948,13 +948,13 @@ simulation_test!(
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -999,9 +999,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -1071,13 +1071,13 @@ simulation_test!(
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -1130,13 +1130,13 @@ simulation_test!(
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -1232,13 +1232,13 @@ mod legacy_plugin_and_cache_tests {
             ) as Arc<dyn WasmRuntime>;
 
             let engine = sim
-                .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                     key_values: Vec::new(),
                     wasm_runtime: runtime,
                     access_to_internal: true,
                 }))
                 .await
-                .expect("boot_simulated_engine should succeed");
+                .expect("boot_simulated_lix should succeed");
 
             engine
                 .initialize()
@@ -1341,13 +1341,13 @@ mod legacy_plugin_and_cache_tests {
             ) as Arc<dyn WasmRuntime>;
 
             let engine = sim
-                .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                     key_values: Vec::new(),
                     wasm_runtime: runtime,
                     access_to_internal: true,
                 }))
                 .await
-                .expect("boot_simulated_engine should succeed");
+                .expect("boot_simulated_lix should succeed");
             engine
                 .initialize()
                 .await
@@ -1439,13 +1439,13 @@ mod legacy_plugin_and_cache_tests {
             ) as Arc<dyn WasmRuntime>;
 
             let engine = sim
-                .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+                .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                     key_values: Vec::new(),
                     wasm_runtime: runtime,
                     access_to_internal: true,
                 }))
                 .await
-                .expect("boot_simulated_engine should succeed");
+                .expect("boot_simulated_lix should succeed");
             engine
                 .initialize()
                 .await
@@ -3428,13 +3428,13 @@ simulation_test!(
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -3505,13 +3505,13 @@ simulation_test!(
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -3577,13 +3577,13 @@ simulation_test!(
     |sim| async move {
         let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
         let engine = sim
-            .boot_simulated_engine(Some(support::simulation_test::SimulationBootArgs {
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
                 access_to_internal: true,
             }))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await

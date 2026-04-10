@@ -19,7 +19,7 @@ fn value_as_bool(value: &Value) -> bool {
     }
 }
 
-async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let active = engine
         .execute(
             "SELECT commit_id \
@@ -35,7 +35,7 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
 }
 
 async fn version_commit_id(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     version_id: &str,
 ) -> String {
     let result = engine
@@ -50,7 +50,7 @@ async fn version_commit_id(
 }
 
 async fn key_value_value(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     key: &str,
 ) -> Option<String> {
     let result = engine
@@ -68,7 +68,7 @@ async fn key_value_value(
 }
 
 async fn merge_commit_parent_ids(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     commit_id: &str,
 ) -> Vec<String> {
     let result = engine
@@ -87,9 +87,9 @@ async fn merge_commit_parent_ids(
 
 simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     let active_before = engine
@@ -159,9 +159,9 @@ simulation_test!(
     tracked_write_moves_active_commit_id_off_global,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let active_before = engine
@@ -213,9 +213,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -247,9 +247,9 @@ simulation_test!(
     create_version_with_options_and_switch_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let created = engine
@@ -296,9 +296,9 @@ simulation_test!(
 
 simulation_test!(switch_version_rejects_invalid_inputs, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.expect("init should succeed");
 
     let empty = engine
@@ -318,9 +318,9 @@ simulation_test!(
     create_version_can_target_explicit_source_without_switching_active,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
         let main_version_id = engine
             .execute("SELECT lix_active_version_id()", &[])
@@ -399,9 +399,9 @@ simulation_test!(
 
 simulation_test!(create_version_switch_then_checkpoint, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.expect("init should succeed");
 
     let created = engine
@@ -422,9 +422,9 @@ simulation_test!(create_version_switch_then_checkpoint, |sim| async move {
 
 simulation_test!(merge_version_fast_forwards_target, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -490,9 +490,9 @@ simulation_test!(
     merge_version_creates_merge_commit_for_diverged_versions,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -624,9 +624,9 @@ simulation_test!(
 
 simulation_test!(merge_version_rejects_entity_conflicts, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine

@@ -8,8 +8,8 @@ use async_trait::async_trait;
 use lix_engine::image::{ImageChunkReader, ImageChunkWriter};
 use lix_engine::wasm::{NoopWasmRuntime, WasmRuntime};
 use lix_engine::{
-    boot, collapse_prepared_batch_for_dialect, BootArgs, CreateVersionOptions, Engine, LixBackend,
-    LixBackendTransaction, LixError, PreparedBatch, QueryResult, Session, SqlDialect,
+    collapse_prepared_batch_for_dialect, CreateVersionOptions, Lix, LixBackend,
+    LixBackendTransaction, LixConfig, LixError, PreparedBatch, QueryResult, SqlDialect,
     TransactionMode, Value,
 };
 use rusqlite::{
@@ -17,7 +17,7 @@ use rusqlite::{
     params_from_iter, Connection, Row,
 };
 
-fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> Arc<Engine> {
+fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -> Arc<Lix> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
@@ -29,12 +29,12 @@ fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -
         .expect("sqlite test file should be creatable");
     let backend =
         TestImageSqliteBackend::from_path(path).expect("test sqlite backend should open path");
-    let mut args = BootArgs::new(
+    let config = LixConfig::new(
         Box::new(backend) as Box<dyn LixBackend + Send + Sync>,
         wasm_runtime,
-    );
-    args.access_to_internal = true;
-    Arc::new(boot(args))
+    )
+    .with_access_to_internal(true);
+    Arc::new(Lix::boot(config))
 }
 
 fn temp_sqlite_path(label: &str) -> PathBuf {
@@ -397,19 +397,6 @@ fn to_sql_value(value: Value) -> rusqlite::types::Value {
     }
 }
 
-#[derive(Default)]
-struct VecImageWriter {
-    bytes: Vec<u8>,
-}
-
-#[async_trait(?Send)]
-impl ImageChunkWriter for VecImageWriter {
-    async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
-        self.bytes.extend_from_slice(chunk);
-        Ok(())
-    }
-}
-
 struct OneShotImageReader {
     bytes: Option<Vec<u8>>,
 }
@@ -427,13 +414,11 @@ impl ImageChunkReader for OneShotImageReader {
     }
 }
 
-async fn export_image_bytes(engine: &Engine) -> Vec<u8> {
-    let mut writer = VecImageWriter::default();
+async fn export_image_bytes(engine: &Lix) -> Vec<u8> {
     engine
-        .export_image(&mut writer)
+        .export_image()
         .await
-        .expect("export_image should succeed");
-    writer.bytes
+        .expect("export_image should succeed")
 }
 
 fn text_value(value: &Value, field: &str) -> String {
@@ -443,7 +428,7 @@ fn text_value(value: &Value, field: &str) -> String {
     }
 }
 
-async fn key_value_version_id(session: &Session, key: &str) -> String {
+async fn key_value_version_id(session: &Lix, key: &str) -> String {
     let result = session
         .execute(
             "SELECT lixcol_version_id \
@@ -470,10 +455,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .initialize()
         .await
         .expect("source init should succeed");
-    let source_session = source_engine
-        .open_session()
-        .await
-        .expect("source workspace session should open");
+    let source_session = Arc::clone(&source_engine);
     let source_version = source_session
         .create_version(CreateVersionOptions {
             id: Some("after".to_string()),
@@ -495,10 +477,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .initialize()
         .await
         .expect("destination init should succeed");
-    let destination_session = destination_engine
-        .open_session()
-        .await
-        .expect("destination workspace session should open");
+    let destination_session = Arc::clone(&destination_engine);
     let destination_version = destination_session
         .create_version(CreateVersionOptions {
             id: Some("before".to_string()),
@@ -518,10 +497,7 @@ async fn run_restore_from_image_refreshes_active_version_cache_sqlite() {
         .restore_from_image(&mut reader)
         .await
         .expect("restore_from_image should succeed");
-    let restored_session = destination_engine
-        .open_session()
-        .await
-        .expect("workspace session should reopen after restore");
+    let restored_session = Arc::clone(&destination_engine);
 
     restored_session
         .execute(

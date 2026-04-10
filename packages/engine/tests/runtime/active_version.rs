@@ -11,7 +11,7 @@ fn first_text(result: &lix_engine::ExecuteResult) -> String {
 }
 
 async fn workspace_metadata_value(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     key: &str,
 ) -> Option<String> {
     let result = engine
@@ -38,7 +38,7 @@ fn first_text_value(value: &Value) -> String {
     }
 }
 
-async fn insert_version(engine: &support::simulation_test::SimulationEngine, version_id: &str) {
+async fn insert_version(engine: &support::simulation_test::SimulatedLix, version_id: &str) {
     engine
         .create_version(CreateVersionOptions {
             id: Some(version_id.to_string()),
@@ -52,9 +52,9 @@ async fn insert_version(engine: &support::simulation_test::SimulationEngine, ver
 
 async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs) {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
 
     engine.initialize().await.expect("init should succeed");
 
@@ -97,9 +97,9 @@ simulation_test!(
     switch_version_updates_runtime_function_and_workspace_metadata,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
         insert_version(&engine, "version-switch-target").await;
 
@@ -125,9 +125,9 @@ simulation_test!(
 
 simulation_test!(switch_version_rejects_missing_version, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.expect("init should succeed");
 
     let error = engine
@@ -141,9 +141,9 @@ simulation_test!(
     active_version_surface_is_not_publicly_queryable,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use lix_engine::wasm::NoopWasmRuntime;
-use lix_engine::{boot, BootArgs, ExecuteOptions, LixError, Value};
+use lix_engine::{ExecuteOptions, Lix, LixConfig, LixError, Value};
 use serde_json::json;
 
 fn assert_text(value: &Value, expected: &str) {
@@ -50,7 +50,7 @@ fn cleanup_sqlite_path(path: &Path) {
     let _ = std::fs::remove_file(journal);
 }
 
-fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Engine> {
+fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Lix> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
@@ -60,15 +60,15 @@ fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Engine> {
         .create(true)
         .open(path)
         .expect("sqlite test file should be creatable");
-    let mut args = BootArgs::new(
+    let config = LixConfig::new(
         support::simulations::sqlite_backend_with_filename(format!("sqlite://{}", path.display())),
         Arc::new(NoopWasmRuntime),
-    );
-    args.access_to_internal = true;
-    Arc::new(boot(args))
+    )
+    .with_access_to_internal(true);
+    Arc::new(Lix::boot(config))
 }
 
-async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(&json!({
             "x-lix-key": "wk_writer_key_schema",
@@ -89,9 +89,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         register_writer_key_test_schema(&engine).await;
 
@@ -199,9 +199,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         engine
             .execute(
@@ -353,10 +353,7 @@ fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
                 let engine_a = boot_sqlite_engine_at_path(&path_for_thread);
                 engine_a.initialize().await.expect("init should succeed");
 
-                let session_a = engine_a
-                    .open_session()
-                    .await
-                    .expect("workspace session should open");
+                let session_a = Arc::clone(&engine_a);
                 session_a
                     .execute_with_options(
                         "INSERT INTO lix_file (id, path, data) VALUES ('wk-reopen', '/wk-reopen.json', lix_text_encode('persist'))",
@@ -367,7 +364,10 @@ fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
                     )
                     .await
                     .expect("writer-key insert should succeed");
-                let version_id = session_a.active_version_id();
+                let version_id = session_a
+                    .active_version_id()
+                    .await
+                    .expect("active version should load");
 
                 drop(session_a);
                 drop(engine_a);
@@ -391,10 +391,7 @@ fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
                     .await
                     .expect("rebuild after reopen should succeed");
 
-                let session_b = engine_b
-                    .open_session()
-                    .await
-                    .expect("workspace session should reopen");
+                let session_b = Arc::clone(&engine_b);
 
                 let workspace_annotation = session_b
                     .execute(
@@ -466,9 +463,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -524,9 +521,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -595,9 +592,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -640,9 +637,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let error = engine
@@ -704,9 +701,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -752,9 +749,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -807,9 +804,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         register_writer_key_test_schema(&engine).await;
 

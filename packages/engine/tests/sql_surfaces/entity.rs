@@ -39,7 +39,7 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 }
 
 async fn seed_key_value_row(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     key: &str,
     value: &str,
     version_id: &str,
@@ -63,7 +63,7 @@ async fn seed_key_value_row(
 }
 
 async fn install_global_override_schema(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     schema_key: &str,
 ) {
     engine
@@ -89,16 +89,16 @@ async fn install_global_override_schema(
 }
 
 async fn install_global_override_schema_for_version_override_schema(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
 ) {
     install_global_override_schema(engine, "lix_version_override_schema").await;
 }
 
-async fn install_global_override_child_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn install_global_override_child_schema(engine: &support::simulation_test::SimulatedLix) {
     install_global_override_schema(engine, "lix_version_override_child_schema").await;
 }
 
-async fn install_select_override_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn install_select_override_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -110,7 +110,7 @@ async fn install_select_override_schema(engine: &support::simulation_test::Simul
         .unwrap();
 }
 
-async fn install_inherited_override_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn install_inherited_override_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -122,7 +122,7 @@ async fn install_inherited_override_schema(engine: &support::simulation_test::Si
         .unwrap();
 }
 
-async fn install_default_values_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn install_default_values_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -134,7 +134,7 @@ async fn install_default_values_schema(engine: &support::simulation_test::Simula
         .unwrap();
 }
 
-async fn install_delete_subquery_schemas(engine: &support::simulation_test::SimulationEngine) {
+async fn install_delete_subquery_schemas(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -174,9 +174,9 @@ simulation_test!(
     lix_entity_view_select_exposes_properties_and_lixcols,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let active_version = engine.active_version_id().await.unwrap();
@@ -204,9 +204,9 @@ simulation_test!(
     lix_entity_view_insert_update_delete_delegate_to_lix_state,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -260,9 +260,9 @@ simulation_test!(
     lix_entity_view_update_supports_non_identity_state_columns,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -316,9 +316,9 @@ simulation_test!(
     lix_entity_view_insert_on_conflict_do_update_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -356,9 +356,9 @@ simulation_test!(
     lix_entity_view_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -396,9 +396,9 @@ simulation_test!(
     lix_entity_view_insert_default_values_populates_schema_defaults,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_default_values_schema(&engine).await;
 
@@ -442,9 +442,9 @@ simulation_test!(
     lix_entity_view_delete_rewrites_property_subquery_predicates,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_delete_subquery_schemas(&engine).await;
 
@@ -498,9 +498,9 @@ simulation_test!(
     lix_entity_by_version_view_reads_visible_global_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine.create_named_version("version-child").await.unwrap();
@@ -531,9 +531,9 @@ simulation_test!(
     lix_entity_view_update_property_assignment_is_schema_validated,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -579,9 +579,9 @@ simulation_test!(
     lix_entity_view_base_insert_read_honors_lixcol_global_override,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_global_override_schema_for_version_override_schema(&engine).await;
 
@@ -642,9 +642,9 @@ simulation_test!(
     lix_entity_view_base_update_honors_lixcol_global_override,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_global_override_schema_for_version_override_schema(&engine).await;
 
@@ -708,9 +708,9 @@ simulation_test!(
     lix_entity_view_base_select_with_lixcol_global_override_reads_global_state,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_global_override_child_schema(&engine).await;
         engine
@@ -745,9 +745,9 @@ simulation_test!(
     lix_entity_view_select_pushes_down_literal_lixcol_overrides,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_select_override_schema(&engine).await;
 
@@ -845,9 +845,9 @@ simulation_test!(
     lix_entity_view_select_pushes_down_inherited_from_version_override,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         install_inherited_override_schema(&engine).await;
 
@@ -901,9 +901,9 @@ simulation_test!(
     lix_entity_view_insert_rejects_unknown_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -925,9 +925,9 @@ simulation_test!(
     lix_entity_view_update_rejects_unknown_assignment_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -963,9 +963,9 @@ simulation_test!(
     lix_entity_view_delete_rejects_unknown_where_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -986,9 +986,9 @@ simulation_test!(
     lix_entity_view_read_unknown_column_lists_builtin_entity_view_columns,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -1009,9 +1009,9 @@ simulation_test!(
     lix_entity_view_read_unknown_column_lists_custom_entity_view_columns,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -1038,9 +1038,9 @@ simulation_test!(
     write_routing_rejects_unsupported_non_lix_targets,
     |sim| async move {
         let insert_engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         insert_engine.initialize().await.unwrap();
 
         let insert_err = insert_engine
@@ -1059,9 +1059,9 @@ simulation_test!(
         );
 
         let update_engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         update_engine.initialize().await.unwrap();
 
         let update_err = update_engine
@@ -1080,9 +1080,9 @@ simulation_test!(
         );
 
         let delete_engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         delete_engine.initialize().await.unwrap();
 
         let delete_err = delete_engine

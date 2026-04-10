@@ -11,9 +11,9 @@ simulation_test!(
     lix_entity_by_version_insert_update_delete,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         let version_id = engine.active_version_id().await.unwrap();
         let version_id_sql = version_id.replace('\'', "''");
@@ -105,9 +105,9 @@ simulation_test!(
     lix_entity_by_version_insert_requires_version_id,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -134,9 +134,9 @@ simulation_test!(
     lix_entity_by_version_insert_on_conflict_do_update_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         let version_id = engine.active_version_id().await.unwrap();
 
@@ -194,9 +194,9 @@ simulation_test!(
     lix_entity_by_version_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         let version_id = engine.active_version_id().await.unwrap();
 

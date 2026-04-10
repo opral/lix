@@ -11,7 +11,8 @@ mod wasm {
         Lix as CoreLix, LixBackend, LixBackendTransaction, LixConfig, LixError,
         ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
         ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, RedoOptions,
-        RedoResult, SqlDialect, TransactionMode, UndoOptions, UndoResult, Value as EngineValue,
+        RedoResult, Session as CoreSession, SqlDialect, TransactionMode, UndoOptions, UndoResult,
+        Value as EngineValue,
         WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -141,7 +142,7 @@ export type ExecuteOptions = {
   writerKey?: string | null;
 };
 
-export type OpenSessionOptions = {
+export type AdditionalSessionOptions = {
   activeVersionId?: string;
   activeAccountIds?: string[];
 };
@@ -168,6 +169,11 @@ export type LixObserveEvents = {
     #[wasm_bindgen]
     pub struct Lix {
         lix: Arc<CoreLix>,
+    }
+
+    #[wasm_bindgen]
+    pub struct Session {
+        session: Arc<CoreSession>,
     }
 
     #[wasm_bindgen(js_name = ObserveEvents)]
@@ -262,16 +268,19 @@ export type LixObserveEvents = {
             self.lix.switch_version(version_id).await.map_err(js_error)
         }
 
-        #[wasm_bindgen(js_name = openChildSession)]
-        pub async fn open_child_session(&self, args: Option<JsValue>) -> Result<Lix, JsValue> {
-            let options = parse_open_child_session_options(args).map_err(js_error)?;
+        #[wasm_bindgen(js_name = openAdditionalSession)]
+        pub async fn open_additional_session(
+            &self,
+            args: Option<JsValue>,
+        ) -> Result<Session, JsValue> {
+            let options = parse_open_additional_session_options(args).map_err(js_error)?;
             let session = self
                 .lix
-                .open_child_session(options)
+                .open_additional_session(options)
                 .await
                 .map_err(js_error)?;
-            Ok(Lix {
-                lix: Arc::new(session),
+            Ok(Session {
+                session: Arc::new(session),
             })
         }
 
@@ -285,6 +294,116 @@ export type LixObserveEvents = {
         pub fn observe(&self, query: JsValue) -> Result<JsObserveEvents, JsValue> {
             let query = parse_observe_query(query).map_err(js_error)?;
             let events = self.lix.observe(query).map_err(js_error)?;
+            Ok(JsObserveEvents {
+                inner: std::sync::Mutex::new(Some(events)),
+                in_flight_next_abort: std::sync::Mutex::new(None),
+                closed: AtomicBool::new(false),
+            })
+        }
+    }
+
+    #[wasm_bindgen]
+    impl Session {
+        #[wasm_bindgen(js_name = execute)]
+        pub async fn execute(
+            &self,
+            sql: String,
+            params: JsValue,
+            options: Option<JsValue>,
+        ) -> Result<JsValue, JsValue> {
+            let params = Array::from(&params);
+            let mut values = Vec::new();
+            for value in params.iter() {
+                values.push(value_from_js(value).map_err(js_error)?);
+            }
+            let execute_options = parse_execute_options(options, "execute").map_err(js_error)?;
+            let result = self
+                .session
+                .execute_with_options(&sql, &values, execute_options)
+                .await
+                .map_err(js_error)?;
+            execute_result_to_js(result).map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = activeVersionId)]
+        pub async fn active_version_id(&self) -> Result<String, JsValue> {
+            Ok(self.session.active_version_id())
+        }
+
+        #[wasm_bindgen(js_name = activeAccountIds)]
+        pub async fn active_account_ids(&self) -> Result<JsValue, JsValue> {
+            let account_ids = self.session.active_account_ids();
+            let values = Array::new();
+            for account_id in account_ids {
+                values.push(&JsValue::from_str(&account_id));
+            }
+            Ok(values.into())
+        }
+
+        #[wasm_bindgen(js_name = createCheckpoint)]
+        pub async fn create_checkpoint(&self) -> Result<JsValue, JsValue> {
+            let result = self.session.create_checkpoint().await.map_err(js_error)?;
+            Ok(create_checkpoint_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = undo)]
+        pub async fn undo(&self, args: Option<JsValue>) -> Result<JsValue, JsValue> {
+            let options = parse_undo_options(args).map_err(js_error)?;
+            let result = self
+                .session
+                .undo_with_options(options)
+                .await
+                .map_err(js_error)?;
+            Ok(undo_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = redo)]
+        pub async fn redo(&self, args: Option<JsValue>) -> Result<JsValue, JsValue> {
+            let options = parse_redo_options(args).map_err(js_error)?;
+            let result = self
+                .session
+                .redo_with_options(options)
+                .await
+                .map_err(js_error)?;
+            Ok(redo_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = createVersion)]
+        pub async fn create_version(&self, args: JsValue) -> Result<JsValue, JsValue> {
+            let options = parse_create_version_options(args).map_err(js_error)?;
+            let result = self
+                .session
+                .create_version(options)
+                .await
+                .map_err(js_error)?;
+            Ok(create_version_result_to_js(result).into())
+        }
+
+        #[wasm_bindgen(js_name = switchVersion)]
+        pub async fn switch_version(&self, version_id: String) -> Result<(), JsValue> {
+            self.session.switch_version(version_id).await.map_err(js_error)
+        }
+
+        #[wasm_bindgen(js_name = openAdditionalSession)]
+        pub async fn open_additional_session(
+            &self,
+            args: Option<JsValue>,
+        ) -> Result<Session, JsValue> {
+            let options = parse_open_additional_session_options(args).map_err(js_error)?;
+            let session = self
+                .session
+                .open_additional_session(options)
+                .await
+                .map_err(js_error)?;
+            Ok(Session {
+                session: Arc::new(session),
+            })
+        }
+
+        #[wasm_bindgen(js_name = observe)]
+        pub fn observe(&self, query: JsValue) -> Result<JsObserveEvents, JsValue> {
+            let query = parse_observe_query(query).map_err(js_error)?;
+            let events = self.session.observe(query).map_err(js_error)?;
             Ok(JsObserveEvents {
                 inner: std::sync::Mutex::new(Some(events)),
                 in_flight_next_abort: std::sync::Mutex::new(None),
@@ -459,35 +578,35 @@ export type LixObserveEvents = {
         config
     }
 
-    fn parse_open_child_session_options(
+    fn parse_open_additional_session_options(
         input: Option<JsValue>,
-    ) -> Result<lix_engine::OpenSessionOptions, LixError> {
+    ) -> Result<lix_engine::AdditionalSessionOptions, LixError> {
         let Some(input) = input else {
-            return Ok(lix_engine::OpenSessionOptions::default());
+            return Ok(lix_engine::AdditionalSessionOptions::default());
         };
         if input.is_null() || input.is_undefined() {
-            return Ok(lix_engine::OpenSessionOptions::default());
+            return Ok(lix_engine::AdditionalSessionOptions::default());
         }
         let object = Object::from(input);
         let active_version_id = match Reflect::get(&object, &JsValue::from_str("activeVersionId"))
             .map_err(|_| {
             LixError::new(
                 "LIX_ERROR_JS_SDK",
-                "openChildSession activeVersionId lookup failed",
+                "openAdditionalSession activeVersionId lookup failed",
             )
         })? {
             value if value.is_null() || value.is_undefined() => None,
             _value => Some(read_required_string_property(
                 &object,
                 "activeVersionId",
-                "openChildSession options",
+                "openAdditionalSession options",
             )?),
         };
         let active_account_ids = match Reflect::get(&object, &JsValue::from_str("activeAccountIds"))
             .map_err(|_| {
                 LixError::new(
                     "LIX_ERROR_JS_SDK",
-                    "openChildSession activeAccountIds lookup failed",
+                    "openAdditionalSession activeAccountIds lookup failed",
                 )
             })? {
             value if value.is_null() || value.is_undefined() => None,
@@ -495,7 +614,7 @@ export type LixObserveEvents = {
                 if !Array::is_array(&value) {
                     return Err(LixError::new(
                         "LIX_ERROR_JS_SDK",
-                        "openChildSession activeAccountIds must be an array",
+                        "openAdditionalSession activeAccountIds must be an array",
                     ));
                 }
                 let values = Array::from(&value);
@@ -504,13 +623,13 @@ export type LixObserveEvents = {
                     let account_id = entry.as_string().ok_or_else(|| {
                         LixError::new(
                             "LIX_ERROR_JS_SDK",
-                            "openChildSession activeAccountIds entries must be strings",
+                            "openAdditionalSession activeAccountIds entries must be strings",
                         )
                     })?;
                     if account_id.is_empty() {
                         return Err(LixError::new(
                             "LIX_ERROR_JS_SDK",
-                            "openChildSession activeAccountIds entries must be non-empty strings",
+                            "openAdditionalSession activeAccountIds entries must be non-empty strings",
                         ));
                     }
                     parsed.push(account_id);
@@ -518,7 +637,7 @@ export type LixObserveEvents = {
                 Some(parsed)
             }
         };
-        Ok(lix_engine::OpenSessionOptions {
+        Ok(lix_engine::AdditionalSessionOptions {
             active_version_id,
             active_account_ids,
         })

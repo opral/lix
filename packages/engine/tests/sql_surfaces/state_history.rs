@@ -39,7 +39,7 @@ fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<S
         .collect()
 }
 
-async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -51,7 +51,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
         .unwrap();
 }
 
-async fn active_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let version_id = engine.active_version_id().await.unwrap();
     let result = engine
         .execute(
@@ -74,9 +74,9 @@ simulation_test!(
     lix_state_history_select_reads_depth_zero_for_active_commit,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -121,9 +121,9 @@ simulation_test!(
     lix_state_history_select_reads_multiple_depths,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -188,9 +188,9 @@ simulation_test!(
     lix_state_history_exposes_commit_created_at,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -247,9 +247,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -316,9 +316,9 @@ simulation_test!(
     lix_state_history_select_reads_specific_root_commit,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -402,9 +402,9 @@ simulation_test!(
     lix_state_history_rejects_insert_update_delete,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         let insert_err = engine
@@ -434,9 +434,9 @@ simulation_test!(
     lix_state_history_stays_sparse_when_only_other_entities_change,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -505,9 +505,9 @@ simulation_test!(
     lix_state_history_depth_zero_exists_only_for_entities_changed_at_root,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 
@@ -601,9 +601,9 @@ simulation_test!(
     lix_state_history_has_no_duplicate_depth_rows_per_entity_and_root_commit,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
 

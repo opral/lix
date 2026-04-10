@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use crate::binary_cas;
 use crate::canonical;
-use crate::engine::Engine;
 use crate::init::{init_builtin_schema_storage, seed_builtin_registered_schemas};
 use crate::live_state;
 use crate::live_state::{
@@ -17,20 +16,20 @@ use crate::session::observe;
 use crate::session::version_ops;
 use crate::session::version_ops::commit;
 use crate::session::workspace;
-use crate::{LixBackend, LixError, SqlDialect, TransactionMode};
+use crate::{Lix, LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;
 use super::InitExecutor;
 
-pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
-    engine.try_mark_init_in_progress()?;
+pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
+    lix.try_mark_init_in_progress()?;
 
-    if load_mode_with_backend(engine.backend().as_ref()).await? != LiveStateMode::Uninitialized {
-        engine.reset_init_state();
+    if load_mode_with_backend(lix.backend().as_ref()).await? != LiveStateMode::Uninitialized {
+        lix.reset_init_state();
         return Err(crate::common::errors::already_initialized_error());
     }
 
-    let mut transaction = engine
+    let mut transaction = lix
         .backend()
         .begin_transaction(TransactionMode::Write)
         .await?;
@@ -77,7 +76,7 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
         }
         claimed_bootstrap = true;
 
-        let mut init = InitExecutor::new(engine, transaction.as_mut())
+        let mut init = InitExecutor::new(lix, transaction.as_mut())
             .map_err(|error| init_step_error("init_executor", error))?;
         seed_builtin_registered_schemas(&mut init)
             .await
@@ -158,39 +157,41 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
 
     let result = match init_result {
         Ok(()) => Ok(()),
-        Err(error) => Err(engine.normalize_init_error(error).await),
+        Err(error) => Err(lix.normalize_init_error(error).await),
     };
 
     if result.is_ok() {
         transaction.commit().await?;
-        if engine.deterministic_boot_pending() {
-            engine.clear_deterministic_boot_pending();
+        if lix.deterministic_boot_pending() {
+            lix.clear_deterministic_boot_pending();
         }
-        engine.mark_init_completed();
-        engine.refresh_public_surface_registry().await?;
+        lix.mark_init_completed();
+        lix.refresh_public_surface_registry().await?;
+        let _ = lix.opened_workspace_session().await?;
     } else {
         let _ = transaction.rollback().await;
-        engine.reset_init_state();
+        lix.reset_init_state();
     }
 
     result
 }
 
-pub(crate) async fn init_if_needed(engine: &Engine) -> Result<bool, LixError> {
-    match init(engine).await {
+pub(crate) async fn init_if_needed(lix: &Lix) -> Result<bool, LixError> {
+    match init(lix).await {
         Ok(()) => Ok(true),
         Err(error)
             if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() =>
         {
-            engine.wait_for_concurrent_init_ready().await?;
-            engine.refresh_public_surface_registry().await?;
+            lix.wait_for_concurrent_init_ready().await?;
+            lix.refresh_public_surface_registry().await?;
+            let _ = lix.opened_workspace_session().await?;
             Ok(false)
         }
         Err(error) => Err(error),
     }
 }
 
-impl Engine {
+impl Lix {
     #[doc(hidden)]
     pub async fn initialize(&self) -> Result<(), LixError> {
         crate::init::init(self).await
