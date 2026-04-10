@@ -2,21 +2,22 @@ use crate::common::errors::classification::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::contracts::artifacts::{
-    PreparedBatch, PreparedDirectDirectoryHistoryField, PreparedDirectEntityHistoryField,
-    PreparedDirectFileHistoryField, PreparedDirectPublicRead, PreparedDirectStateHistoryField,
+    PreparedBatch, PreparedDerivedRowsetReadArtifact, PreparedDirectDirectoryHistoryField,
+    PreparedDirectEntityHistoryField, PreparedDirectFileHistoryField,
+    PreparedDirectHistoryReadArtifact, PreparedDirectPublicRead, PreparedDirectStateHistoryField,
     PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryDirectReadPlan,
     PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryProjection,
     PreparedDirectoryHistorySortKey, PreparedEntityHistoryDirectReadPlan,
     PreparedEntityHistoryPredicate, PreparedEntityHistoryProjection, PreparedEntityHistorySortKey,
     PreparedExplainMode, PreparedFileHistoryAggregate, PreparedFileHistoryDirectReadPlan,
     PreparedFileHistoryPredicate, PreparedFileHistoryProjection, PreparedFileHistorySortKey,
-    PreparedInternalReadArtifact, PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact,
-    PreparedReadArtifact, PreparedReadProgram, PreparedReadStep, PreparedStateHistoryAggregate,
-    PreparedStateHistoryAggregatePredicate, PreparedStateHistoryDirectReadPlan,
-    PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
-    PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
-    PreparedStateHistorySortValue, PreparedStatement, PublicReadResultColumn,
-    PublicReadResultColumns, ReadDiagnosticContext,
+    PreparedGeneralProgramReadArtifact, PreparedInternalReadArtifact, PreparedPublicReadArtifact,
+    PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
+    PreparedReadStep, PreparedStateHistoryAggregate, PreparedStateHistoryAggregatePredicate,
+    PreparedStateHistoryDirectReadPlan, PreparedStateHistoryPredicate,
+    PreparedStateHistoryProjection, PreparedStateHistoryProjectionValue,
+    PreparedStateHistorySortKey, PreparedStateHistorySortValue, PreparedStatement,
+    PublicReadResultColumn, PublicReadResultColumns, ReadDiagnosticContext,
 };
 use crate::contracts::traits::SqlPreparationMetadataReader;
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
@@ -270,18 +271,26 @@ pub(crate) fn prepare_public_read_artifact(
 
     let execution = match &public_read.execution {
         PreparedPublicReadExecution::ReadTimeProjection(read) => {
-            PreparedPublicReadExecutionArtifact::ReadTimeProjection(read.clone())
+            PreparedPublicReadExecutionArtifact::DerivedRowset(PreparedDerivedRowsetReadArtifact {
+                read: read.clone(),
+            })
         }
         PreparedPublicReadExecution::LoweredSql(lowered) => {
-            PreparedPublicReadExecutionArtifact::LoweredSql(prepared_batch_from_lowered_read(
-                dialect,
-                lowered,
-                &public_read.bound_parameters,
-                &public_read.runtime_bindings,
-            )?)
+            PreparedPublicReadExecutionArtifact::GeneralProgram(
+                PreparedGeneralProgramReadArtifact {
+                    prepared_batch: prepared_batch_from_lowered_read(
+                        dialect,
+                        lowered,
+                        &public_read.bound_parameters,
+                        &public_read.runtime_bindings,
+                    )?,
+                },
+            )
         }
         PreparedPublicReadExecution::Direct(plan) => {
-            PreparedPublicReadExecutionArtifact::Direct(prepared_direct_public_read(plan))
+            PreparedPublicReadExecutionArtifact::DirectHistory(PreparedDirectHistoryReadArtifact {
+                plan: prepared_direct_public_read(plan),
+            })
         }
     };
 

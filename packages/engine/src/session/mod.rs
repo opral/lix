@@ -63,14 +63,13 @@ use crate::session::write_preparation::{
     execute_parsed_statements_in_write_transaction,
 };
 #[cfg(test)]
-use crate::sql::parser::parse_sql;
-use crate::sql::parser::parse_sql_with_timing;
-use crate::sql::prepare::script::extract_explicit_transaction_script_from_statements;
-use crate::sql::prepare::{
+use crate::sql::parse_sql;
+use crate::sql::{
+    extract_explicit_transaction_script, parse_sql_with_timing,
     prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
-    CommittedReadProgramContext, ExecutionProgram,
+    reject_internal_table_writes, reject_public_create_table, CommittedReadProgramContext,
+    ExecutionProgram,
 };
-use crate::sql::support::{reject_internal_table_writes, reject_public_create_table};
 use crate::{ExecuteResult, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -436,8 +435,7 @@ impl Session {
             reject_internal_table_writes(&parsed_statements)?;
         }
         let explicit_transaction_script =
-            extract_explicit_transaction_script_from_statements(&parsed_statements, params)?
-                .is_some();
+            extract_explicit_transaction_script(&parsed_statements, params)?.is_some();
         if !allow_internal_sql
             && contains_transaction_control_statement(&parsed_statements)
             && !explicit_transaction_script

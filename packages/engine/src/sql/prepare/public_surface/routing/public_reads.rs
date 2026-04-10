@@ -1,4 +1,5 @@
 use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
+use crate::contracts::artifacts::ReadTimeProjectionRead;
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::logical_plan::public_ir::{
@@ -13,7 +14,9 @@ use crate::sql::logical_plan::public_ir::{
     BroadSqlFunctionArg, BroadSqlFunctionArgExpr, BroadSqlFunctionArgumentList,
     BroadSqlFunctionArguments,
 };
+use crate::sql::logical_plan::SurfaceReadPlan;
 use crate::sql::physical_plan::lowerer::broad_public_relation_supports_terminal_render;
+use crate::sql::physical_plan::try_compile_read_time_projection_read;
 use crate::sql::prepare::public_surface::routing::registry::{
     run_fallible_pass, run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome,
     RoutingPassRegistry, RoutingPassSettings, RoutingPassTrace,
@@ -83,9 +86,16 @@ fn apply_broad_routing_delay_for_test() {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PublicReadExecutionRouteDecision {
-    pub(crate) direct_execution: bool,
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum PublicReadExecutionStrategy {
+    DirectHistory,
+    DerivedRowset(ReadTimeProjectionRead),
+    GeneralProgram,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct PublicReadExecutionStrategySelection {
+    pub(crate) strategy: PublicReadExecutionStrategy,
     pub(crate) pass_traces: Vec<RoutingPassTrace>,
 }
 
@@ -120,17 +130,27 @@ pub(crate) fn public_read_routing_pass_registry() -> &'static RoutingPassRegistr
 }
 
 pub(crate) fn route_public_read_execution_strategy(
-    binding: &SurfaceBinding,
-) -> PublicReadExecutionRouteDecision {
-    route_public_read_execution_strategy_with_settings(binding, &RoutingPassSettings::default())
+    surface_read_plan: &SurfaceReadPlan,
+) -> PublicReadExecutionStrategySelection {
+    route_public_read_execution_strategy_with_settings(
+        surface_read_plan,
+        &RoutingPassSettings::default(),
+    )
 }
 
 fn route_public_read_execution_strategy_with_settings(
-    binding: &SurfaceBinding,
+    surface_read_plan: &SurfaceReadPlan,
     settings: &RoutingPassSettings,
-) -> PublicReadExecutionRouteDecision {
+) -> PublicReadExecutionStrategySelection {
     let metadata = public_read_routing_pass_registry().passes[0];
-    let direct_execution = is_direct_only_history_surface(binding);
+    let binding = &surface_read_plan.structured_read().surface_binding;
+    let strategy = if is_direct_only_history_surface(binding) {
+        PublicReadExecutionStrategy::DirectHistory
+    } else if let Some(rowset_read) = try_compile_read_time_projection_read(surface_read_plan) {
+        PublicReadExecutionStrategy::DerivedRowset(rowset_read)
+    } else {
+        PublicReadExecutionStrategy::GeneralProgram
+    };
     let trace = run_infallible_pass(metadata, settings, || {
         let mut diagnostics = vec![format!(
             "surface '{}' family={} variant={}",
@@ -138,18 +158,24 @@ fn route_public_read_execution_strategy_with_settings(
             surface_family_name(binding.descriptor.surface_family),
             surface_variant_name(binding.descriptor.surface_variant)
         )];
-        if direct_execution {
-            diagnostics.push("direct history execution strategy selected".to_string());
-        } else {
-            diagnostics.push("surface is not eligible for direct history execution".to_string());
-        }
+        diagnostics.push(match &strategy {
+            PublicReadExecutionStrategy::DirectHistory => {
+                "direct history execution strategy selected".to_string()
+            }
+            PublicReadExecutionStrategy::DerivedRowset(_) => {
+                "derived rowset execution strategy selected".to_string()
+            }
+            PublicReadExecutionStrategy::GeneralProgram => {
+                "general lowered program execution strategy selected".to_string()
+            }
+        });
         RoutingPassOutcome {
-            changed: direct_execution,
+            changed: !matches!(strategy, PublicReadExecutionStrategy::GeneralProgram),
             diagnostics,
         }
     });
-    PublicReadExecutionRouteDecision {
-        direct_execution,
+    PublicReadExecutionStrategySelection {
+        strategy,
         pass_traces: vec![trace],
     }
 }
@@ -2246,13 +2272,62 @@ fn is_direct_only_history_surface(binding: &SurfaceBinding) -> bool {
 mod tests {
     use super::{
         public_read_routing_pass_registry, route_broad_public_read_statement,
-        route_public_read_execution_strategy,
+        route_public_read_execution_strategy, PublicReadExecutionStrategy,
     };
     use crate::sql::logical_plan::public_ir::{
         BroadPublicReadProjectionItemKind, BroadPublicReadRelation, BroadPublicReadSetExpr,
         BroadPublicReadStatement, BroadPublicReadTableFactor, BroadSqlExprKind,
     };
+    use crate::sql::logical_plan::{
+        public_ir::{
+            CanonicalAdminScan, CanonicalFilesystemScan, CanonicalStateScan,
+            NormalizedPublicReadQuery, ReadCommand, ReadContract, ReadPlan, StructuredPublicRead,
+        },
+        SurfaceReadPlan,
+    };
     use crate::sql::parser::parse_sql_statements;
+    use sqlparser::ast::{Expr, GroupByExpr, Ident, SelectItem};
+
+    fn surface_read_plan_for(surface_name: &str, projection: Vec<SelectItem>) -> SurfaceReadPlan {
+        let binding = crate::catalog::build_builtin_surface_registry()
+            .bind_relation_name(surface_name)
+            .expect("builtin surface should bind");
+        let root = if let Some(scan) = CanonicalStateScan::from_surface_binding(binding.clone()) {
+            ReadPlan::scan(scan)
+        } else if let Some(scan) = CanonicalAdminScan::from_surface_binding(binding.clone()) {
+            ReadPlan::admin_scan(scan)
+        } else if let Some(scan) = CanonicalFilesystemScan::from_surface_binding(binding.clone()) {
+            ReadPlan::filesystem_scan(scan)
+        } else {
+            panic!("test helper only supports state/admin/filesystem surfaces");
+        };
+
+        SurfaceReadPlan {
+            read: StructuredPublicRead {
+                bound_parameters: Vec::new(),
+                requested_version_id: Some("main".to_string()),
+                surface_binding: binding,
+                read_command: ReadCommand {
+                    root,
+                    contract: ReadContract::CommittedAtStart,
+                    requested_commit_mapping: None,
+                },
+                query: NormalizedPublicReadQuery {
+                    source_alias: None,
+                    projection,
+                    selection: None,
+                    selection_predicates: Vec::new(),
+                    group_by: GroupByExpr::Expressions(vec![], vec![]),
+                    having: None,
+                    order_by: None,
+                    limit_clause: None,
+                },
+            },
+            dependency_spec: None,
+            effective_state_request: None,
+            effective_state_plan: None,
+        }
+    }
 
     #[test]
     fn registry_exposes_stable_pass_order() {
@@ -2393,17 +2468,77 @@ mod tests {
 
     #[test]
     fn direct_history_strategy_records_trace() {
-        let binding = crate::catalog::build_builtin_surface_registry()
-            .bind_relation_name("lix_state_history")
-            .expect("builtin history surface should bind");
-        let decision = route_public_read_execution_strategy(&binding);
+        let plan = surface_read_plan_for(
+            "lix_state_history",
+            vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+                "entity_id",
+            )))],
+        );
+        let decision = route_public_read_execution_strategy(&plan);
 
-        assert!(decision.direct_execution);
+        assert!(matches!(
+            decision.strategy,
+            PublicReadExecutionStrategy::DirectHistory
+        ));
         assert_eq!(decision.pass_traces.len(), 1);
         assert_eq!(
             decision.pass_traces[0].name,
             "public-read.route-execution-strategy"
         );
         assert!(decision.pass_traces[0].changed);
+    }
+
+    #[test]
+    fn derived_rowset_strategy_records_trace() {
+        let plan = surface_read_plan_for(
+            "lix_version",
+            vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("id")))],
+        );
+        let decision = route_public_read_execution_strategy(&plan);
+
+        assert!(matches!(
+            decision.strategy,
+            PublicReadExecutionStrategy::DerivedRowset(_)
+        ));
+        assert_eq!(
+            decision.pass_traces[0].name,
+            "public-read.route-execution-strategy"
+        );
+        assert!(decision.pass_traces[0].changed);
+    }
+
+    #[test]
+    fn general_program_strategy_records_trace() {
+        let plan = surface_read_plan_for(
+            "lix_version",
+            vec![SelectItem::Wildcard(Default::default())],
+        );
+        let decision = route_public_read_execution_strategy(&plan);
+
+        assert!(matches!(
+            decision.strategy,
+            PublicReadExecutionStrategy::GeneralProgram
+        ));
+        assert_eq!(
+            decision.pass_traces[0].name,
+            "public-read.route-execution-strategy"
+        );
+        assert!(!decision.pass_traces[0].changed);
+    }
+
+    #[test]
+    fn non_declared_surface_does_not_route_to_derived_rowset() {
+        let plan = surface_read_plan_for(
+            "lix_state",
+            vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
+                "entity_id",
+            )))],
+        );
+        let decision = route_public_read_execution_strategy(&plan);
+
+        assert!(matches!(
+            decision.strategy,
+            PublicReadExecutionStrategy::GeneralProgram
+        ));
     }
 }

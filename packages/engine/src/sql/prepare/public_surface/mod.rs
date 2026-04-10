@@ -69,15 +69,7 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublicReadOptimization {
-    pub(crate) structured_read: StructuredPublicRead,
-    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
-    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PreparedPublicRead {
-    pub(crate) optimization: Option<PublicReadOptimization>,
     pub(crate) freshness_contract: SurfaceReadFreshness,
     pub(crate) surface_bindings: Vec<String>,
     pub(crate) logical_plan: PublicReadLogicalPlan,
@@ -89,6 +81,7 @@ pub(crate) struct PreparedPublicRead {
 }
 
 impl PreparedPublicRead {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
         self.logical_plan.structured_read()
     }
@@ -2118,7 +2111,7 @@ mod tests {
         );
         match &admin_read.execution {
             PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface.public_name(), "lix_version");
+                assert_eq!(artifact.surface_name, "lix_version");
                 assert!(admin_read.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::LoweredSql(_) => {
@@ -2152,7 +2145,7 @@ mod tests {
 
                     match &prepared.execution {
                         PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
-                            assert_eq!(artifact.surface.public_name(), "lix_version");
+                            assert_eq!(artifact.surface_name, "lix_version");
                         }
                         PreparedPublicReadExecution::LoweredSql(_) => {
                             panic!("plain lix_version read should not lower canonical admin SQL")
@@ -3104,7 +3097,7 @@ mod tests {
         );
         match &prepared.execution {
             PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface.public_name(), "lix_file");
+                assert_eq!(artifact.surface_name, "lix_file");
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::LoweredSql(_) => {
@@ -3154,7 +3147,7 @@ mod tests {
         );
         match &prepared.execution {
             PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface.public_name(), "lix_directory_by_version");
+                assert_eq!(artifact.surface_name, "lix_directory_by_version");
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PreparedPublicReadExecution::LoweredSql(_) => {

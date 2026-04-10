@@ -95,7 +95,6 @@ mod tests {
     use crate::contracts::traits::WriterKeyReadView;
     use crate::contracts::traits::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
     use crate::execution::write::buffered::prepare_materialization_plan;
-    use crate::live_state::shared::identity::RowIdentity;
     use crate::live_state::tracked::{
         BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
         TrackedWriteOperation, TrackedWriteRow,
@@ -104,6 +103,7 @@ mod tests {
         BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
         UntrackedWriteRow,
     };
+    use crate::live_state::RowIdentity;
 
     use super::*;
 

@@ -39,16 +39,16 @@ pub(crate) fn verify_public_read_logical_plan(
     plan: &PublicReadLogicalPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     match plan {
-        PublicReadLogicalPlan::Structured { read, .. } => {
+        PublicReadLogicalPlan::Structured { plan } => {
+            let read = plan.structured_read();
             if read.surface_binding.descriptor.public_name.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "structured public read must target a named surface",
                 ));
             }
         }
-        PublicReadLogicalPlan::DirectHistory {
-            read, direct_plan, ..
-        } => {
+        PublicReadLogicalPlan::DirectHistory { plan, direct_plan } => {
+            let read = plan.structured_read();
             if read.surface_binding.descriptor.public_name.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "direct history read must target a named surface",

@@ -1,3 +1,4 @@
+mod api;
 mod binding;
 mod declaration;
 mod directory;
@@ -16,6 +17,9 @@ use crate::schema::{
     SchemaAnnotationEvaluator,
 };
 use crate::LixError;
+
+#[allow(unused_imports)]
+pub(crate) use api::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogCompilerFacade};
 
 #[allow(unused_imports)]
 pub(crate) use registry::*;

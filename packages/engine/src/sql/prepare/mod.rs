@@ -38,6 +38,6 @@ pub(crate) use public_surface::{
     build_public_write_execution, build_public_write_invariant_trace,
     finalize_public_write_execution, public_authoritative_write_error,
     public_write_preparation_error, statement_references_public_surface,
-    try_prepare_public_read_with_registry_and_internal_access, PreparedPublicRead,
-    PreparedPublicWrite,
+    try_prepare_public_read_with_registry_and_internal_access, PreparedPublicExecution,
+    PreparedPublicRead, PreparedPublicWrite,
 };

@@ -9,7 +9,7 @@ use sqlparser::ast::{
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::parser::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
 pub(crate) use crate::sql::support::{
-    bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params,
+    bind_sql_with_state, bind_sql_with_state_and_appended_params,
 };
 use crate::{LixError, SqlDialect, Value};
 

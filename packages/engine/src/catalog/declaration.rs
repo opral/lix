@@ -424,6 +424,19 @@ impl CatalogProjectionRegistry {
     pub(crate) fn registrations(&self) -> &[RegisteredCatalogProjection] {
         &self.registrations
     }
+
+    pub(crate) fn registration_for_surface(
+        &self,
+        public_name: &str,
+    ) -> Option<&RegisteredCatalogProjection> {
+        self.registrations.iter().find(|registration| {
+            registration
+                .projection()
+                .surfaces()
+                .iter()
+                .any(|surface| surface.public_name.eq_ignore_ascii_case(public_name))
+        })
+    }
 }
 
 static BUILTIN_CATALOG_PROJECTION_REGISTRY: OnceLock<CatalogProjectionRegistry> = OnceLock::new();
@@ -554,6 +567,15 @@ mod tests {
 
         assert_eq!(registry.registrations().len(), 1);
         assert_eq!(registry.registrations()[0].projection().name(), "demo");
+    }
+
+    #[test]
+    fn catalog_projection_registry_finds_registration_by_surface_name() {
+        let registration = builtin_catalog_projection_registry()
+            .registration_for_surface("LIX_VERSION")
+            .expect("builtin lix_version declaration should resolve");
+
+        assert_eq!(registration.projection().name(), "lix_version");
     }
 
     #[test]

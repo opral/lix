@@ -5,8 +5,9 @@ use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, Val
 use crate::contracts::artifacts::{PendingViewFilter, ScanConstraint, ScanField, ScanOperator};
 use crate::contracts::traits::{LiveStateQueryBackend, PendingSemanticStorage, PendingView};
 use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, RowReadMode};
-use crate::sql::logical_plan::public_ir::{CanonicalStateRowKey, PlannedWrite, ScopeProof};
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::{
+    resolve_placeholder_index, CanonicalStateRowKey, PlaceholderState, PlannedWrite, ScopeProof,
+};
 use crate::{LixBackend, LixError, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";

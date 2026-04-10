@@ -55,18 +55,18 @@ pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_chec
     artifact: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
     let result = match &artifact.execution {
-        PreparedPublicReadExecutionArtifact::ReadTimeProjection(read) => {
-            execute_read_time_projection_read(backend, bindings, read).await?
+        PreparedPublicReadExecutionArtifact::DerivedRowset(artifact) => {
+            execute_read_time_projection_read(backend, bindings, &artifact.read).await?
         }
-        PreparedPublicReadExecutionArtifact::LoweredSql(batch) => {
-            execute_prepared_batch_with_backend(backend, batch)
+        PreparedPublicReadExecutionArtifact::GeneralProgram(execution_artifact) => {
+            execute_prepared_batch_with_backend(backend, &execution_artifact.prepared_batch)
                 .await
                 .map_err(|error| {
                     translate_lowered_public_read_error(error, &artifact.surface_bindings)
                 })?
         }
-        PreparedPublicReadExecutionArtifact::Direct(plan) => {
-            execute_direct_public_read_with_backend(backend, plan).await?
+        PreparedPublicReadExecutionArtifact::DirectHistory(artifact) => {
+            execute_direct_public_read_with_backend(backend, &artifact.plan).await?
         }
     };
     Ok(finalize_prepared_public_read_result(result, artifact))

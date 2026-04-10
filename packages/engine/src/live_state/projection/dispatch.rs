@@ -20,7 +20,7 @@ pub(crate) async fn derive_read_time_projection_rows_with_backend(
             .projection()
             .surfaces()
             .iter()
-            .any(|surface| surface.public_name == artifact.surface.public_name())
+            .any(|surface| surface.public_name == artifact.surface_name)
         {
             continue;
         }
