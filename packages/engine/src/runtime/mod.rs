@@ -88,10 +88,6 @@ impl Runtime {
         &self.backend
     }
 
-    pub(crate) fn wasm_runtime(&self) -> Arc<dyn WasmRuntime> {
-        Arc::clone(&self.wasm_runtime)
-    }
-
     pub(crate) fn wasm_runtime_ref(&self) -> &dyn WasmRuntime {
         self.wasm_runtime.as_ref()
     }

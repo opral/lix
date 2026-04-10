@@ -55,7 +55,7 @@ fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<S
         .collect()
 }
 
-async fn active_version_commit_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let rows = engine
         .execute(
             "SELECT commit_id \
@@ -74,7 +74,7 @@ async fn active_version_commit_id(engine: &support::simulation_test::SimulationE
 }
 
 async fn binary_blob_hash_for_file_version(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
     version_id: &str,
 ) -> String {
@@ -105,9 +105,9 @@ simulation_test!(
     file_view_insert_reads_inserted_blob_data,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -137,9 +137,9 @@ simulation_test!(
     file_insert_autocreates_first_level_directory,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -174,9 +174,9 @@ simulation_test!(
     file_insert_autocreates_all_ancestor_directories,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -224,9 +224,9 @@ simulation_test!(
     file_view_update_data_updates_binary_blob_ref_without_touching_descriptor_state,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -288,9 +288,9 @@ simulation_test!(
     lix_file_update_data_with_qmark_params_persists_bytes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -337,9 +337,9 @@ simulation_test!(
     lix_file_read_before_update_then_read_returns_updated_bytes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -396,9 +396,9 @@ simulation_test!(
     lix_file_update_data_matched_row_is_not_silent_noop,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -454,9 +454,9 @@ simulation_test!(
     file_view_update_data_expression_fails_fast,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -481,9 +481,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -513,9 +513,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -553,9 +553,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -598,9 +598,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -656,9 +656,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -721,9 +721,9 @@ simulation_test!(
     directory_insert_by_path_autocreates_missing_ancestors,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -755,9 +755,9 @@ simulation_test!(
     directory_delete_cascades_nested_directories_and_files,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -820,9 +820,9 @@ simulation_test!(
     directory_delete_with_parameterized_path_cascades_descendants,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -886,9 +886,9 @@ simulation_test!(
     directory_view_crud_rewrites_to_descriptor,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -947,9 +947,9 @@ simulation_test!(
 
 simulation_test!(filesystem_file_view_rejects_id_updates, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -1001,9 +1001,9 @@ simulation_test!(
     filesystem_directory_view_rejects_id_updates,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -1057,9 +1057,9 @@ simulation_test!(
 
 simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     let file_history_err = engine
@@ -1134,9 +1134,9 @@ simulation_test!(filesystem_history_views_reject_writes, |sim| async move {
 
 simulation_test!(file_by_version_crud_is_version_scoped, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     let version_a = engine.active_version_id().await.unwrap();
@@ -1257,9 +1257,9 @@ simulation_test!(
     file_by_version_insert_records_append_idempotency,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -1303,9 +1303,9 @@ simulation_test!(
     file_by_version_update_records_append_idempotency,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -1367,9 +1367,9 @@ simulation_test!(
     file_by_version_delete_records_append_idempotency,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -1436,9 +1436,9 @@ simulation_test!(
     directory_by_version_delete_records_append_idempotency,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -1503,9 +1503,9 @@ simulation_test!(
 
 simulation_test!(file_by_version_requires_version_id, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
     let version_id = engine.active_version_id().await.unwrap();
 
@@ -1618,9 +1618,9 @@ simulation_test!(
     directory_by_version_crud_is_version_scoped,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_a = engine.active_version_id().await.unwrap();
@@ -1737,9 +1737,9 @@ simulation_test!(
 
 simulation_test!(directory_by_version_requires_version_id, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
     let version_id = engine.active_version_id().await.unwrap();
 
@@ -1855,9 +1855,9 @@ simulation_test!(
     file_update_data_plus_metadata_updates_descriptor,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -1920,9 +1920,9 @@ simulation_test!(
     file_insert_with_only_data_column_is_rejected,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -1940,9 +1940,9 @@ simulation_test!(
 
 simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     let err = engine
@@ -1955,9 +1955,9 @@ simulation_test!(file_insert_with_text_data_is_rejected, |sim| async move {
 
 simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -1979,9 +1979,9 @@ simulation_test!(file_insert_with_blob_hex_data_succeeds, |sim| async move {
 
 simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -2002,9 +2002,9 @@ simulation_test!(file_update_with_text_data_is_rejected, |sim| async move {
 
 simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -2034,9 +2034,9 @@ simulation_test!(file_update_with_blob_hex_data_succeeds, |sim| async move {
 
 simulation_test!(filesystem_views_generate_default_ids, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -2074,9 +2074,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2119,9 +2119,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2162,9 +2162,9 @@ simulation_test!(
     filesystem_file_auto_id_insert_persists_data,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2190,9 +2190,9 @@ simulation_test!(
     filesystem_hidden_defaults_and_explicit_true_writes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2268,9 +2268,9 @@ simulation_test!(
 
 simulation_test!(directory_duplicate_paths_are_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -2303,9 +2303,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2352,9 +2352,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2416,9 +2416,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2469,9 +2469,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2566,9 +2566,9 @@ simulation_test!(
     directory_duplicate_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let parent_version_id = engine.active_version_id().await.unwrap();
@@ -2611,9 +2611,9 @@ simulation_test!(
 
 simulation_test!(file_duplicate_paths_are_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -2645,9 +2645,9 @@ simulation_test!(
     file_duplicate_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let parent_version_id = engine.active_version_id().await.unwrap();
@@ -2692,9 +2692,9 @@ simulation_test!(
     file_reinsert_path_after_child_tombstone_of_global_file_succeeds,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let parent_version_id = engine.active_version_id().await.unwrap();
@@ -2781,9 +2781,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2820,9 +2820,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2844,9 +2844,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2895,9 +2895,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2944,9 +2944,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -2987,9 +2987,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3025,9 +3025,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -3052,9 +3052,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let err = engine
@@ -3075,9 +3075,9 @@ simulation_test!(
     file_path_update_to_global_path_is_rejected_in_child_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let parent_version_id = engine.active_version_id().await.unwrap();
@@ -3130,9 +3130,9 @@ simulation_test!(
     file_insert_nested_path_with_missing_parent_does_not_conflict_with_same_root_filename,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3167,9 +3167,9 @@ simulation_test!(
 
 simulation_test!(file_path_update_collision_is_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -3208,9 +3208,9 @@ simulation_test!(
     file_path_update_auto_creates_missing_parent_directories_in_same_commit,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3306,9 +3306,9 @@ simulation_test!(
     file_path_update_with_untracked_predicate_persists_missing_parent_directories,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -3380,9 +3380,9 @@ simulation_test!(
     untracked_file_write_roundtrip_persists_data,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3455,9 +3455,9 @@ simulation_test!(
     file_by_version_insert_with_untracked_persists_data,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -3496,9 +3496,9 @@ simulation_test!(
     untracked_directory_insert_autocreates_missing_parent_directories,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3534,9 +3534,9 @@ simulation_test!(
     directory_by_version_insert_with_untracked_is_visible,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_id = engine.active_version_id().await.unwrap();
@@ -3575,9 +3575,9 @@ simulation_test!(
     untracked_directory_delete_cascades_only_untracked_descendants,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3630,9 +3630,9 @@ simulation_test!(
     tracked_directory_delete_partitions_tracked_and_untracked_descendants,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3683,9 +3683,9 @@ simulation_test!(
     file_path_update_noop_does_not_create_parent_directories,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3710,9 +3710,9 @@ simulation_test!(
     file_path_update_ignores_materialized_row_when_tombstone_exists,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3770,9 +3770,9 @@ simulation_test!(
     file_view_exposes_active_version_commit_id,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -3807,9 +3807,9 @@ simulation_test!(
     filesystem_current_views_follow_active_version_switch,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let version_a = engine.active_version_id().await.unwrap();
@@ -3899,9 +3899,9 @@ simulation_test!(
 
 simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     let file_err = engine
@@ -3941,9 +3941,9 @@ simulation_test!(
     filesystem_views_expose_expected_lixcol_columns,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -4083,9 +4083,9 @@ simulation_test!(
     file_and_file_by_version_expose_change_id,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -4128,9 +4128,9 @@ simulation_test!(
 
 simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -4187,9 +4187,9 @@ simulation_test!(
     filesystem_history_views_project_commit_and_depth,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -4289,9 +4289,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -4363,9 +4363,9 @@ simulation_test!(
     non_prefixed_filesystem_views_are_not_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let file_err = engine

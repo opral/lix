@@ -27,7 +27,7 @@ fn scrub_timestamp_fields(value: &mut serde_json::Value) {
     }
 }
 
-async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -39,7 +39,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
         .unwrap();
 }
 
-async fn main_version_id(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn main_version_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let rows = engine
         .execute(
             "SELECT id FROM lix_version WHERE name = 'main' LIMIT 1",
@@ -59,9 +59,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization, timestamp_shuffle],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -137,9 +137,9 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization, timestamp_shuffle],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -225,9 +225,9 @@ simulation_test!(
     simulations = [sqlite, postgres, timestamp_shuffle],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -326,9 +326,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -462,9 +462,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;

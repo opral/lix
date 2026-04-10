@@ -10,14 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
+use lix_engine::streams::{StateCommitStream, StateCommitStreamFilter};
 use lix_engine::wasm::{NoopWasmRuntime, WasmRuntime};
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, CreateCheckpointResult, CreateVersionOptions,
-    CreateVersionResult, Engine, ExecuteOptions, ExecuteResult, LiveStateApplyReport,
-    LiveStateRebuildDebugMode, LiveStateRebuildPlan, LiveStateRebuildReport,
-    LiveStateRebuildRequest, LiveStateRebuildScope, LixBackend, LixError, MergeVersionOptions,
-    MergeVersionResult, ObserveEvents, ObserveQuery, RedoOptions, RedoResult, Session,
-    SessionTransaction, UndoOptions, UndoResult, Value,
+    BootKeyValue, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
+    ExecuteOptions, ExecuteResult, LiveStateApplyReport, LiveStateRebuildDebugMode,
+    LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest, LiveStateRebuildScope,
+    Lix, LixBackend, LixConfig, LixError, MergeVersionOptions, MergeVersionResult,
+    ObserveEventsOwned, ObserveQuery, RedoOptions, RedoResult, SessionTransaction, UndoOptions,
+    UndoResult, Value,
 };
 use serde_json::Value as JsonValue;
 use tokio::sync::Mutex as TokioMutex;
@@ -47,37 +48,34 @@ pub struct SimulationArgs {
     expect: ExpectDeterministic,
 }
 
-pub struct SimulationBootArgs {
+pub struct SimulatedLixBootArgs {
     pub key_values: Vec<BootKeyValue>,
     pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub access_to_internal: bool,
 }
 
-impl Default for SimulationBootArgs {
+impl Default for SimulatedLixBootArgs {
     fn default() -> Self {
-        default_simulation_boot_args()
+        default_simulated_lix_boot_args()
     }
 }
 
-pub struct SimulationEngine {
-    engine: Arc<Engine>,
-    session: OnceLock<Arc<Session>>,
+pub struct SimulatedLix {
+    lix: Arc<Lix>,
     behavior: SimulationBehavior,
     rematerialization_pending: AtomicBool,
     initialized: AtomicBool,
     rematerialization_lock: TokioMutex<()>,
 }
 
-impl SimulationEngine {
+impl SimulatedLix {
     #[allow(dead_code)]
     pub async fn init(&self) -> Result<(), LixError> {
         self.initialize().await
     }
 
     pub async fn initialize(&self) -> Result<(), LixError> {
-        self.engine.initialize().await?;
-        let session = Arc::new(self.engine.open_session().await?);
-        let _ = self.session.set(session);
+        self.lix.initialize().await?;
         self.initialized.store(true, Ordering::SeqCst);
         if self.behavior == SimulationBehavior::Rematerialization {
             // Re-materialize on first read after init, mirroring "cache cleared then repopulated"
@@ -93,11 +91,11 @@ impl SimulationEngine {
     }
 
     pub async fn active_version_id(&self) -> Result<String, LixError> {
-        Ok(self.opened_session().await?.active_version_id())
+        self.lix.active_version_id().await
     }
 
     pub async fn active_account_ids(&self) -> Result<Vec<String>, LixError> {
-        Ok(self.opened_session().await?.active_account_ids())
+        self.lix.active_account_ids().await
     }
 
     pub async fn execute_with_options(
@@ -106,39 +104,35 @@ impl SimulationEngine {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        let session = self.opened_session().await?;
         match classify_statement(sql) {
             StatementKind::Read => {
                 self.rematerialize_before_read_if_needed().await?;
-                session.execute_with_options(sql, params, options).await
+                self.lix.execute_with_options(sql, params, options).await
             }
             StatementKind::Write => {
-                let result = session.execute_with_options(sql, params, options).await;
+                let result = self.lix.execute_with_options(sql, params, options).await;
                 if self.behavior == SimulationBehavior::Rematerialization && result.is_ok() {
                     self.rematerialization_pending.store(true, Ordering::SeqCst);
                 }
                 result
             }
-            StatementKind::Other => session.execute_with_options(sql, params, options).await,
+            StatementKind::Other => self.lix.execute_with_options(sql, params, options).await,
         }
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.opened_session()
-            .await?
-            .install_plugin(archive_bytes)
-            .await
+        self.lix.install_plugin(archive_bytes).await
     }
 
     pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
-        self.opened_session().await?.register_schema(schema).await
+        self.lix.register_schema(schema).await
     }
 
     pub async fn create_version(
         &self,
         options: CreateVersionOptions,
     ) -> Result<CreateVersionResult, LixError> {
-        self.opened_session().await?.create_version(options).await
+        self.lix.create_version(options).await
     }
 
     pub async fn create_named_version(
@@ -168,66 +162,56 @@ impl SimulationEngine {
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
-        self.opened_session()
-            .await?
-            .switch_version(version_id)
-            .await
+        self.lix.switch_version(version_id).await
     }
 
     pub async fn set_active_account_ids(
         &self,
         active_account_ids: Vec<String>,
     ) -> Result<(), LixError> {
-        self.opened_session()
-            .await?
-            .set_active_account_ids(active_account_ids)
-            .await
+        self.lix.set_active_account_ids(active_account_ids).await
     }
 
     pub async fn merge_version(
         &self,
         options: MergeVersionOptions,
     ) -> Result<MergeVersionResult, LixError> {
-        self.opened_session().await?.merge_version(options).await
+        self.lix.merge_version(options).await
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
-        self.opened_session().await?.create_checkpoint().await
+        self.lix.create_checkpoint().await
     }
 
     pub async fn undo(&self) -> Result<UndoResult, LixError> {
-        self.opened_session().await?.undo().await
+        self.lix.undo().await
     }
 
     pub async fn undo_with_options(&self, options: UndoOptions) -> Result<UndoResult, LixError> {
-        self.opened_session()
-            .await?
-            .undo_with_options(options)
-            .await
+        self.lix.undo_with_options(options).await
     }
 
     pub async fn redo(&self) -> Result<RedoResult, LixError> {
-        self.opened_session().await?.redo().await
+        self.lix.redo().await
     }
 
     pub async fn redo_with_options(&self, options: RedoOptions) -> Result<RedoResult, LixError> {
-        self.opened_session()
-            .await?
-            .redo_with_options(options)
-            .await
+        self.lix.redo_with_options(options).await
     }
 
-    pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
-        self.session()?.observe(query)
+    pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEventsOwned, LixError> {
+        self.lix.observe(query)
+    }
+
+    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
+        self.lix.state_commit_stream(filter)
     }
 
     pub async fn begin_transaction_with_options(
         &self,
         options: ExecuteOptions,
     ) -> Result<SessionTransaction<'_>, LixError> {
-        self.session()?
-            .begin_transaction_with_options(options)
-            .await
+        self.lix.begin_transaction_with_options(options).await
     }
 
     pub async fn transaction<T, F>(&self, options: ExecuteOptions, f: F) -> Result<T, LixError>
@@ -236,28 +220,28 @@ impl SimulationEngine {
             &'tx mut SessionTransaction<'_>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
-        self.session()?.transaction(options, f).await
+        self.lix.transaction(options, f).await
     }
 
     pub async fn live_state_rebuild_plan(
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildPlan, LixError> {
-        self.engine.live_state_rebuild_plan(req).await
+        self.lix.live_state_rebuild_plan(req).await
     }
 
     pub async fn apply_live_state_rebuild_plan(
         &self,
         plan: &LiveStateRebuildPlan,
     ) -> Result<LiveStateApplyReport, LixError> {
-        self.engine.apply_live_state_rebuild_plan(plan).await
+        self.lix.apply_live_state_rebuild_plan(plan).await
     }
 
     pub async fn rebuild_live_state(
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildReport, LixError> {
-        self.engine.rebuild_live_state(req).await
+        self.lix.rebuild_live_state(req).await
     }
 
     async fn rematerialize_before_read_if_needed(&self) -> Result<(), LixError> {
@@ -275,7 +259,7 @@ impl SimulationEngine {
             return Ok(());
         }
 
-        self.engine
+        self.lix
             .rebuild_live_state(&LiveStateRebuildRequest {
                 scope: LiveStateRebuildScope::Full,
                 debug: LiveStateRebuildDebugMode::Off,
@@ -285,22 +269,6 @@ impl SimulationEngine {
         self.rematerialization_pending
             .store(false, Ordering::SeqCst);
         Ok(())
-    }
-
-    fn session(&self) -> Result<&Session, LixError> {
-        self.session
-            .get()
-            .map(Arc::as_ref)
-            .ok_or_else(|| LixError::unknown("simulation session is not initialized"))
-    }
-
-    async fn opened_session(&self) -> Result<Arc<Session>, LixError> {
-        if let Some(session) = self.session.get() {
-            return Ok(Arc::clone(session));
-        }
-        let session = Arc::new(self.engine.open_session().await?);
-        let _ = self.session.set(Arc::clone(&session));
-        Ok(self.session.get().map(Arc::clone).unwrap_or(session))
     }
 }
 
@@ -419,34 +387,31 @@ pub fn build_test_plugin_archive(
         })
 }
 
-impl Deref for SimulationEngine {
-    type Target = Engine;
+impl Deref for SimulatedLix {
+    type Target = Lix;
 
     fn deref(&self) -> &Self::Target {
-        self.engine.as_ref()
+        self.lix.as_ref()
     }
 }
 
 impl SimulationArgs {
-    pub async fn boot_simulated_engine(
+    pub async fn boot_simulated_lix(
         &self,
-        args: Option<SimulationBootArgs>,
-    ) -> Result<SimulationEngine, LixError> {
+        args: Option<SimulatedLixBootArgs>,
+    ) -> Result<SimulatedLix, LixError> {
         if let Some(setup) = &self.setup {
             setup().await?;
         }
-        let mut args = args.unwrap_or_else(default_simulation_boot_args);
+        let mut args = args.unwrap_or_else(default_simulated_lix_boot_args);
         if self.behavior == SimulationBehavior::TimestampShuffle {
             enable_timestamp_shuffle_mode(&mut args.key_values);
         }
-        Ok(SimulationEngine {
-            engine: Arc::new(boot(BootArgs {
-                backend: (self.backend_factory)(),
-                wasm_runtime: args.wasm_runtime,
-                key_values: args.key_values,
-                access_to_internal: args.access_to_internal,
-            })),
-            session: OnceLock::new(),
+        let mut config = LixConfig::new((self.backend_factory)(), args.wasm_runtime)
+            .with_access_to_internal(args.access_to_internal);
+        config.key_values = args.key_values;
+        Ok(SimulatedLix {
+            lix: Arc::new(Lix::boot(config)),
             behavior: self.behavior,
             rematerialization_pending: AtomicBool::new(false),
             initialized: AtomicBool::new(false),
@@ -454,8 +419,8 @@ impl SimulationArgs {
         })
     }
 
-    pub async fn boot_simulated_engine_deterministic(&self) -> Result<SimulationEngine, LixError> {
-        self.boot_simulated_engine(Some(SimulationBootArgs {
+    pub async fn boot_simulated_lix_deterministic(&self) -> Result<SimulatedLix, LixError> {
+        self.boot_simulated_lix(Some(SimulatedLixBootArgs {
             key_values: vec![BootKeyValue {
                 key: "lix_deterministic_mode".to_string(),
                 value: serde_json::json!({ "enabled": true }),
@@ -480,8 +445,8 @@ impl SimulationArgs {
     }
 }
 
-fn default_simulation_boot_args() -> SimulationBootArgs {
-    SimulationBootArgs {
+fn default_simulated_lix_boot_args() -> SimulatedLixBootArgs {
+    SimulatedLixBootArgs {
         key_values: Vec::new(),
         wasm_runtime: default_simulation_wasm_runtime(),
         access_to_internal: true,

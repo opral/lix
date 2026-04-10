@@ -953,7 +953,7 @@ mod tests {
     };
     use crate::runtime::wasm::NoopWasmRuntime;
     use crate::{
-        boot, BootArgs, ExecuteOptions, LixBackend, LixBackendTransaction, LixError, QueryResult,
+        ExecuteOptions, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
         Session, SqlDialect, Value,
     };
     use async_trait::async_trait;
@@ -1084,14 +1084,14 @@ mod tests {
     fn observe_dedups_initial_query_execution_across_identical_subscribers() {
         run_observe_test_with_large_stack(|| async move {
             let observe_query_hits = Arc::new(AtomicUsize::new(0));
-            let engine = Arc::new(boot(BootArgs::new(
+            let lix = Arc::new(Lix::boot(LixConfig::new(
                 Box::new(CountingObserveBackend {
                     observe_query_hits: Arc::clone(&observe_query_hits),
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1125,14 +1125,14 @@ mod tests {
     fn observe_late_subscriber_reuses_cached_initial_snapshot() {
         run_observe_test_with_large_stack(|| async move {
             let observe_query_hits = Arc::new(AtomicUsize::new(0));
-            let engine = Arc::new(boot(BootArgs::new(
+            let lix = Arc::new(Lix::boot(LixConfig::new(
                 Box::new(CountingObserveBackend {
                     observe_query_hits: Arc::clone(&observe_query_hits),
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1231,14 +1231,14 @@ mod tests {
     fn observe_does_not_reexecute_for_unrelated_session_dependency_changes() {
         run_observe_test_with_large_stack(|| async move {
             let observe_query_hits = Arc::new(AtomicUsize::new(0));
-            let engine = Arc::new(boot(BootArgs::new(
+            let lix = Arc::new(Lix::boot(LixConfig::new(
                 Box::new(CountingObserveBackend {
                     observe_query_hits: Arc::clone(&observe_query_hits),
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1278,14 +1278,14 @@ mod tests {
     fn observe_reexecutes_when_public_surface_registry_generation_changes() {
         run_observe_test_with_large_stack(|| async move {
             let observe_query_hits = Arc::new(AtomicUsize::new(0));
-            let engine = Arc::new(boot(BootArgs::new(
+            let lix = Arc::new(Lix::boot(LixConfig::new(
                 Box::new(CountingObserveBackend {
                     observe_query_hits: Arc::clone(&observe_query_hits),
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );

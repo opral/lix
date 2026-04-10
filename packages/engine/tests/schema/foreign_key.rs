@@ -2,10 +2,7 @@ use crate::support;
 
 use serde_json::json;
 
-async fn register_parent_schema(
-    engine: &support::simulation_test::SimulationEngine,
-    schema_key: &str,
-) {
+async fn register_parent_schema(engine: &support::simulation_test::SimulatedLix, schema_key: &str) {
     engine
         .register_schema(&json!({
             "x-lix-key": schema_key,
@@ -24,7 +21,7 @@ async fn register_parent_schema(
 }
 
 async fn register_child_schema(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     schema_key: &str,
     parent_schema_key: &str,
 ) {
@@ -56,7 +53,7 @@ async fn register_child_schema(
 }
 
 async fn register_state_ref_schema(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     schema_key: &str,
 ) {
     engine
@@ -96,9 +93,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_parent_schema(&engine, "fk_parent_same_version").await;
@@ -141,9 +138,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_parent_schema(&engine, "fk_parent_same_file").await;
@@ -185,9 +182,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_parent_schema(&engine, "fk_state_target_doc").await;
@@ -241,9 +238,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_parent_schema(&engine, "fk_parent_delete_restrict").await;

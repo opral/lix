@@ -8,9 +8,9 @@ simulation_test!(
     registered_schema_registers_materialized_table,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -70,9 +70,9 @@ simulation_test!(
     registered_schema_insert_accepts_parameterized_snapshot,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -112,9 +112,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -143,9 +143,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -199,9 +199,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -240,9 +240,9 @@ simulation_test!(
     registered_schema_public_surface_round_trips_inserted_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -293,9 +293,9 @@ simulation_test!(
     registered_schema_rejects_removed_lixcol_version_override,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -321,9 +321,9 @@ simulation_test!(
     registered_schema_requires_foreign_key_targets_are_unique_or_primary,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -363,9 +363,9 @@ simulation_test!(
     registered_schema_updates_validate_schema_definition,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 

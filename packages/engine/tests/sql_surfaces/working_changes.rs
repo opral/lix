@@ -47,7 +47,7 @@ fn unique_key(prefix: &str) -> String {
     format!("{prefix}-{n}")
 }
 
-async fn rotate_working_commit(engine: &support::simulation_test::SimulationEngine) {
+async fn rotate_working_commit(engine: &support::simulation_test::SimulatedLix) {
     engine
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('working-changes-view-seed', 'seed')",
@@ -61,7 +61,7 @@ async fn rotate_working_commit(engine: &support::simulation_test::SimulationEngi
         .expect("seed checkpoint should succeed");
 }
 
-async fn active_version_ref(engine: &support::simulation_test::SimulationEngine) -> String {
+async fn active_version_ref(engine: &support::simulation_test::SimulatedLix) -> String {
     let version_id = engine
         .active_version_id()
         .await
@@ -82,9 +82,9 @@ async fn active_version_ref(engine: &support::simulation_test::SimulationEngine)
 
 simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
     rotate_working_commit(&engine).await;
     let key = unique_key("wc-view-added");
@@ -123,9 +123,9 @@ simulation_test!(
     lix_working_changes_reads_committed_base_without_commit_family_live_mirrors,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         rotate_working_commit(&engine).await;
         let key = unique_key("wc-view-no-live-mirrors");
@@ -177,9 +177,9 @@ simulation_test!(
     lix_working_changes_and_checkpoint_do_not_require_commit_family_live_mirrors,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         rotate_working_commit(&engine).await;
         let key = unique_key("wc-view-no-live-mirrors-checkpoint");
@@ -242,9 +242,9 @@ simulation_test!(
     lix_working_changes_update_reports_modified_rows_against_commit_baseline,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-modified");
 
@@ -302,9 +302,9 @@ simulation_test!(
     lix_working_changes_reports_removed_rows_against_commit_baseline,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-removed");
 
@@ -351,9 +351,9 @@ simulation_test!(
     lix_working_changes_excludes_unchanged_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-unchanged");
 
@@ -391,9 +391,9 @@ simulation_test!(
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-collapse");
 
@@ -481,9 +481,9 @@ simulation_test!(
     checkpoint_moves_working_changes_into_checkpoint_change_set,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
         let key = unique_key("wc-view-checkpoint-move");
 
@@ -546,9 +546,9 @@ simulation_test!(
     lix_working_changes_includes_all_since_checkpoint_commits,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let key_a = unique_key("wc-view-since-cp-a");
@@ -606,9 +606,9 @@ simulation_test!(
     lix_working_changes_preserves_earlier_entity_when_later_commit_is_unrelated,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let target_key = unique_key("wc-view-target");
@@ -661,9 +661,9 @@ simulation_test!(
     lix_working_changes_isolation_across_versions_uses_per_version_baseline,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let main_key_a = unique_key("wc-view-main-a");
@@ -814,9 +814,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -888,9 +888,9 @@ simulation_test!(
     lix_working_changes_supports_nested_filesystem_subquery_filters,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let file_path = format!("/{}.txt", unique_key("wc-view-nested-subquery"));

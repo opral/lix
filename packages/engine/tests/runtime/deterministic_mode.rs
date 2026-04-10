@@ -27,7 +27,7 @@ fn deterministic_counter_from_uuid(value: &str) -> Option<i64> {
 }
 
 async fn read_highest_deterministic_canonical_counter(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
 ) -> i64 {
     let changes = engine
         .execute(
@@ -52,7 +52,7 @@ async fn read_highest_deterministic_canonical_counter(
         .expect("deterministic canonical write should produce deterministic counters")
 }
 
-async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(&json!({
             "x-lix-key": "test_schema",
@@ -74,7 +74,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
         .unwrap();
 }
 
-async fn register_defaults_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_defaults_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(&json!({
             "x-lix-key": "defaults_schema",
@@ -96,7 +96,7 @@ async fn register_defaults_schema(engine: &support::simulation_test::SimulationE
         .unwrap();
 }
 
-async fn read_sequence_value(engine: &support::simulation_test::SimulationEngine) -> i64 {
+async fn read_sequence_value(engine: &support::simulation_test::SimulatedLix) -> i64 {
     let sequence = engine
         .execute(
             "SELECT snapshot_content \
@@ -125,9 +125,9 @@ simulation_test!(
     deterministic_boot_key_values_apply_during_init,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         let mode_metadata = engine
@@ -185,9 +185,9 @@ simulation_test!(
     deterministic_functions_are_sequential_and_persisted,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -244,9 +244,9 @@ simulation_test!(
     deterministic_mode_applies_to_tracked_metadata,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -328,9 +328,9 @@ simulation_test!(
     deterministic_timestamp_can_be_disabled_independently,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -373,9 +373,9 @@ simulation_test!(
     deterministic_mode_applies_to_cel_defaults,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_defaults_schema(&engine).await;
@@ -430,9 +430,9 @@ simulation_test!(
     deterministic_uuid_stays_valid_after_u32_sequence_boundary,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -470,9 +470,9 @@ simulation_test!(
     simulations = [timestamp_shuffle],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let before = read_sequence_value(&engine).await;
