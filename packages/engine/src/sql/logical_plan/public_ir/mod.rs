@@ -919,7 +919,7 @@ mod tests {
 
     #[test]
     fn canonical_state_scan_tracks_explicit_version_visibility() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let scan = CanonicalStateScan::from_surface_binding(
             registry
                 .bind_relation_name("lix_state_by_version")
@@ -934,8 +934,8 @@ mod tests {
 
     #[test]
     fn entity_surface_canonicalizes_with_projection_spec() {
-        let mut registry = crate::surfaces::build_builtin_surface_registry();
-        crate::surfaces::register_dynamic_entity_surface_spec(
+        let mut registry = crate::catalog::build_builtin_surface_registry();
+        crate::catalog::register_dynamic_entity_surface_spec(
             &mut registry,
             DynamicEntitySurfaceSpec {
                 schema_key: "lix_key_value".to_string(),

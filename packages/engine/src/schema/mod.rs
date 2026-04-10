@@ -7,8 +7,8 @@ mod tests;
 
 pub(crate) use annotations::defaults::apply_schema_defaults_with_shared_runtime;
 pub(crate) use annotations::overrides::{
-    collect_lixcol_overrides, collect_state_column_overrides_with_shared_runtime,
-    LixcolOverrideValue,
+    collect_dynamic_entity_surface_overrides, collect_state_column_overrides_with_shared_runtime,
+    DynamicEntitySurfaceOverride, LixcolOverrideValue, SchemaAnnotationEvaluator,
 };
 pub(crate) use builtin::{
     builtin_schema_definition, builtin_schema_json, builtin_schema_keys, decode_lixcol_literal,

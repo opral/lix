@@ -1,4 +1,4 @@
-//! Centralized relation protection policy.
+//! Centralized relation protection policy for SQL-facing name classification.
 //!
 //! Policy choice:
 //! - Lix uses a semantic internal-object model.
@@ -9,9 +9,9 @@
 
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 
-use crate::catalog::{CatalogSource, SurfaceRegistry};
-
-use super::build_builtin_surface_registry;
+use crate::catalog::{
+    build_builtin_surface_registry, builtin_public_surface_names, CatalogSource, SurfaceRegistry,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelationPolicyModel {
@@ -99,29 +99,12 @@ pub(crate) fn relation_policy_choice_summary() -> &'static str {
     }
 }
 
-fn non_canonical_internal_exact_relation_names() -> &'static [&'static str] {
-    &[
-        crate::binary_cas::schema::INTERNAL_BINARY_BLOB_MANIFEST,
-        crate::binary_cas::schema::INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,
-        crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE,
-        crate::binary_cas::schema::INTERNAL_BINARY_CHUNK_STORE,
-        crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF,
-        crate::session::version_ops::commit::COMMIT_IDEMPOTENCY_TABLE,
-        crate::live_state::FILE_DATA_CACHE_TABLE,
-        crate::live_state::FILE_LIXCOL_CACHE_TABLE,
-        crate::live_state::FILE_PATH_CACHE_TABLE,
-        crate::version_state::checkpoints::cache::LAST_CHECKPOINT_TABLE,
-        crate::live_state::LIVE_STATE_STATUS_TABLE,
-        crate::session::observe::OBSERVE_TICK_TABLE,
-        crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-        crate::session::version_ops::undo_redo::UNDO_REDO_OPERATION_TABLE,
-        crate::session::workspace::WORKSPACE_METADATA_TABLE,
-    ]
-}
-
 pub(crate) fn builtin_internal_exact_relation_names() -> Vec<&'static str> {
-    let mut relations = crate::canonical::internal_exact_relation_names().to_vec();
-    relations.extend_from_slice(non_canonical_internal_exact_relation_names());
+    let mut relations = Vec::new();
+    relations.extend_from_slice(crate::canonical::internal_exact_relation_names());
+    relations.extend_from_slice(crate::live_state::internal_exact_relation_names());
+    relations.extend_from_slice(crate::binary_cas::internal_exact_relation_names());
+    relations.extend_from_slice(crate::version_state::internal_exact_relation_names());
     relations
 }
 
@@ -133,7 +116,7 @@ pub(crate) fn builtin_internal_relation_families() -> &'static [InternalRelation
 }
 
 pub(crate) fn protected_builtin_public_surface_names() -> Vec<String> {
-    builtin_surface_registry().public_surface_names()
+    builtin_public_surface_names()
 }
 
 fn builtin_surface_registry() -> &'static SurfaceRegistry {
@@ -154,7 +137,7 @@ fn classify_registry_surface_name(
 }
 
 fn is_internal_storage_relation_name(normalized_relation_name: &str) -> bool {
-    normalized_relation_name.starts_with("lix_internal_")
+    normalized_relation_name.starts_with(crate::common::naming::INTERNAL_RELATION_PREFIX)
         || builtin_internal_exact_relation_names()
             .iter()
             .any(|name| *name == normalized_relation_name)

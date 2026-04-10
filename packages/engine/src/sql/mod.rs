@@ -31,7 +31,13 @@ pub(crate) mod optimizer;
 pub(crate) mod parser;
 pub(crate) mod physical_plan;
 pub(crate) mod prepare;
+mod relation_policy;
 pub(crate) mod semantic_ir;
 pub(crate) mod support;
 
 pub(crate) use physical_plan::source_sql::lower_catalog_relation_binding_to_source_sql;
+pub(crate) use relation_policy::{
+    builtin_relation_inventory, classify_builtin_relation_name, classify_relation_name,
+    object_name_is_internal_storage_relation, object_name_is_protected_builtin_ddl_target,
+    protected_builtin_public_surface_names, relation_policy_choice_summary, RelationPolicy,
+};

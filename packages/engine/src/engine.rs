@@ -354,7 +354,7 @@ impl Engine {
                 args.wasm_runtime,
                 args.access_to_internal,
                 boot_deterministic_settings,
-                crate::surfaces::build_builtin_surface_registry(),
+                crate::catalog::build_builtin_surface_registry(),
                 projection_registry,
             )),
             boot_key_values: args.key_values,

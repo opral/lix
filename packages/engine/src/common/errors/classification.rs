@@ -1,7 +1,7 @@
 use crate::catalog::SurfaceRegistry;
+use crate::catalog::{builtin_public_surface_columns, builtin_public_surface_names};
 use crate::common::errors;
 use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
-use crate::surfaces::{builtin_public_surface_columns, builtin_public_surface_names};
 use crate::LixBackend;
 use crate::LixError;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
@@ -199,7 +199,7 @@ async fn resolve_available_columns(
         return Vec::new();
     };
 
-    let registry = match crate::surfaces::load_public_surface_registry_with_backend(backend).await {
+    let registry = match crate::runtime::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry,
         Err(_) => return Vec::new(),
     };
@@ -209,7 +209,7 @@ async fn resolve_available_columns(
 }
 
 async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
-    match crate::surfaces::load_public_surface_registry_with_backend(backend).await {
+    match crate::runtime::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry.public_surface_names(),
         Err(_) => builtin_public_surface_names(),
     }
@@ -220,7 +220,7 @@ async fn public_surfaces_in_relation_names_with_backend(
     relation_names: &[String],
     fallback_statements: Option<&[Statement]>,
 ) -> Vec<String> {
-    let registry = match crate::surfaces::load_public_surface_registry_with_backend(backend).await {
+    let registry = match crate::runtime::load_public_surface_registry_with_backend(backend).await {
         Ok(registry) => registry,
         Err(_) => {
             return fallback_statements

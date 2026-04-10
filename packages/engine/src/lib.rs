@@ -14,7 +14,6 @@ mod runtime;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
-pub(crate) mod surfaces;
 #[cfg(test)]
 mod test_support;
 pub(crate) mod version_state;
