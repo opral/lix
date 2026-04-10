@@ -1,17 +1,20 @@
 use crate::catalog::{
-    CatalogProjectionDefinition, CatalogProjectionInput, CatalogProjectionInputRows,
-    CatalogProjectionInputSpec, CatalogProjectionInputVersionScope, CatalogProjectionSourceRow,
-    CatalogProjectionStorageKind,
+    CatalogProjectionContext, CatalogProjectionDefinition, CatalogProjectionInput,
+    CatalogProjectionInputRows, CatalogProjectionInputSpec, CatalogProjectionInputVersionScope,
+    CatalogProjectionSourceRow, CatalogProjectionStorageKind,
 };
+use crate::common::text::escape_sql_string;
 use crate::live_state::tracked::{
-    scan_rows_with_backend as scan_tracked_rows_with_backend, TrackedScanRequest,
+    scan_rows_with_backend as scan_tracked_rows_with_backend,
+    scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,
 };
 use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::session::version_ops::load_current_committed_version_frontier_with_backend;
-use crate::{LixBackend, LixError};
+use crate::live_state::writer_key::load_writer_key_annotations;
+use crate::{LixBackend, LixError, Value};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
 ///
@@ -21,8 +24,11 @@ use crate::{LixBackend, LixError};
 pub(crate) async fn hydrate_projection_input_with_backend(
     backend: &dyn LixBackend,
     projection: &dyn CatalogProjectionDefinition,
+    requested_version_id: Option<&str>,
 ) -> Result<CatalogProjectionInput, LixError> {
-    let context = ProjectionHydrationContext::for_read_time_with_backend(backend).await?;
+    let context =
+        ProjectionHydrationContext::for_read_time_with_backend(backend, requested_version_id)
+            .await?;
     hydrate_projection_input_with_context_with_backend(backend, &context, projection).await
 }
 
@@ -35,33 +41,62 @@ async fn hydrate_projection_input_with_context_with_backend(
     for spec in projection.inputs() {
         inputs.push(hydrate_input_rows_with_backend(backend, context, spec).await?);
     }
-    Ok(CatalogProjectionInput::new(inputs))
+    let projection_context =
+        build_catalog_projection_context_with_backend(backend, context, &inputs).await?;
+    Ok(CatalogProjectionInput::with_context(
+        inputs,
+        projection_context,
+    ))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ProjectionHydrationContext {
+    requested_version_id: Option<String>,
     current_committed_version_ids: Vec<String>,
+    current_version_heads: std::collections::BTreeMap<String, String>,
 }
 
 impl ProjectionHydrationContext {
-    async fn for_read_time_with_backend(backend: &dyn LixBackend) -> Result<Self, LixError> {
+    async fn for_read_time_with_backend(
+        backend: &dyn LixBackend,
+        requested_version_id: Option<&str>,
+    ) -> Result<Self, LixError> {
         let frontier = load_current_committed_version_frontier_with_backend(backend).await?;
         Ok(Self {
+            requested_version_id: requested_version_id.map(str::to_string),
             current_committed_version_ids: frontier.version_heads.keys().cloned().collect(),
+            current_version_heads: frontier.version_heads,
         })
     }
 
-    fn version_ids_for_spec(&self, spec: &CatalogProjectionInputSpec) -> Vec<String> {
+    fn version_ids_for_spec(
+        &self,
+        spec: &CatalogProjectionInputSpec,
+    ) -> Result<Vec<String>, LixError> {
         match spec.version_scope {
             CatalogProjectionInputVersionScope::Global => {
-                vec![crate::contracts::GLOBAL_VERSION_ID.to_string()]
+                Ok(vec![crate::contracts::GLOBAL_VERSION_ID.to_string()])
             }
+            CatalogProjectionInputVersionScope::RequestedVersion => self
+                .requested_version_id
+                .clone()
+                .map(|value| vec![value])
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_INVALID_ARGUMENT",
+                        format!(
+                            "projection input '{}' requires requested version scope",
+                            spec.schema_key
+                        ),
+                    )
+                }),
             CatalogProjectionInputVersionScope::CurrentCommittedFrontier => {
-                self.current_committed_version_ids.clone()
+                Ok(self.current_committed_version_ids.clone())
             }
-            CatalogProjectionInputVersionScope::SchemaDefault => {
-                schema_default_version_ids(spec, &self.current_committed_version_ids)
-            }
+            CatalogProjectionInputVersionScope::SchemaDefault => Ok(schema_default_version_ids(
+                spec,
+                &self.current_committed_version_ids,
+            )),
         }
     }
 }
@@ -72,30 +107,71 @@ async fn hydrate_input_rows_with_backend(
     spec: CatalogProjectionInputSpec,
 ) -> Result<CatalogProjectionInputRows, LixError> {
     let mut rows = Vec::new();
-    for version_id in context.version_ids_for_spec(&spec) {
+    for version_id in context.version_ids_for_spec(&spec)? {
         match spec.storage {
-            CatalogProjectionStorageKind::Tracked => rows.extend(
-                scan_tracked_rows_with_backend(
-                    backend,
-                    &TrackedScanRequest {
-                        schema_key: spec.schema_key.clone(),
-                        version_id,
-                        constraints: Vec::new(),
-                        required_columns: Vec::new(),
-                    },
-                )
-                .await?
-                .into_iter()
-                .map(|row| {
-                    CatalogProjectionSourceRow::new(
-                        CatalogProjectionStorageKind::Tracked,
-                        crate::contracts::artifacts::RowIdentity::from_tracked_row(&row),
-                        row.schema_key.clone(),
-                        row.version_id.clone(),
-                        row.values,
-                    )
-                }),
-            ),
+            CatalogProjectionStorageKind::Tracked => {
+                let request = TrackedScanRequest {
+                    schema_key: spec.schema_key.clone(),
+                    version_id,
+                    constraints: Vec::new(),
+                    required_columns: Vec::new(),
+                };
+                rows.extend(
+                    scan_tracked_rows_with_backend(backend, &request)
+                        .await?
+                        .into_iter()
+                        .map(|row| {
+                            CatalogProjectionSourceRow::new(
+                                CatalogProjectionStorageKind::Tracked,
+                                crate::contracts::artifacts::RowIdentity::from_tracked_row(&row),
+                                row.schema_key.clone(),
+                                row.version_id.clone(),
+                                row.values,
+                            )
+                            .with_tombstone(false)
+                            .with_live_metadata(
+                                row.schema_version,
+                                row.plugin_key,
+                                row.metadata,
+                                row.change_id,
+                                row.writer_key,
+                                row.global,
+                                Some(row.created_at),
+                                Some(row.updated_at),
+                            )
+                        }),
+                );
+                rows.extend(
+                    scan_tracked_tombstones_with_backend(backend, &request)
+                        .await?
+                        .into_iter()
+                        .map(|row| {
+                            CatalogProjectionSourceRow::new(
+                                CatalogProjectionStorageKind::Tracked,
+                                crate::contracts::artifacts::RowIdentity {
+                                    entity_id: row.entity_id.clone(),
+                                    schema_key: row.schema_key.clone(),
+                                    version_id: row.version_id.clone(),
+                                    file_id: row.file_id.clone(),
+                                },
+                                row.schema_key.clone(),
+                                row.version_id.clone(),
+                                std::collections::BTreeMap::new(),
+                            )
+                            .with_tombstone(true)
+                            .with_live_metadata(
+                                row.schema_version.unwrap_or_default(),
+                                row.plugin_key.unwrap_or_default(),
+                                row.metadata,
+                                row.change_id,
+                                row.writer_key,
+                                row.global,
+                                row.created_at,
+                                row.updated_at,
+                            )
+                        }),
+                );
+            }
             CatalogProjectionStorageKind::Untracked => rows.extend(
                 scan_untracked_rows_with_backend(
                     backend,
@@ -116,12 +192,120 @@ async fn hydrate_input_rows_with_backend(
                         row.version_id.clone(),
                         row.values,
                     )
+                    .with_tombstone(false)
+                    .with_live_metadata(
+                        row.schema_version,
+                        row.plugin_key,
+                        row.metadata,
+                        None,
+                        row.writer_key,
+                        row.global,
+                        Some(row.created_at),
+                        Some(row.updated_at),
+                    )
                 }),
             ),
         }
     }
 
+    overlay_writer_keys_on_source_rows_with_backend(backend, &mut rows).await?;
+
     Ok(CatalogProjectionInputRows::new(spec, rows))
+}
+
+async fn overlay_writer_keys_on_source_rows_with_backend(
+    backend: &dyn LixBackend,
+    rows: &mut [CatalogProjectionSourceRow],
+) -> Result<(), LixError> {
+    let row_identities = rows
+        .iter()
+        .map(|row| row.identity().clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let annotations = load_writer_key_annotations(backend, &row_identities).await?;
+    for row in rows {
+        row.set_writer_key(
+            annotations
+                .get(row.identity())
+                .cloned()
+                .flatten(),
+        );
+    }
+    Ok(())
+}
+
+async fn build_catalog_projection_context_with_backend(
+    backend: &dyn LixBackend,
+    context: &ProjectionHydrationContext,
+    inputs: &[CatalogProjectionInputRows],
+) -> Result<CatalogProjectionContext, LixError> {
+    let change_ids = inputs
+        .iter()
+        .flat_map(|input| input.rows.iter())
+        .filter_map(|row| row.change_id().map(str::to_string))
+        .collect::<std::collections::BTreeSet<_>>();
+    let blob_hashes = inputs
+        .iter()
+        .flat_map(|input| input.rows.iter())
+        .filter_map(|row| row.property_text("blob_hash"))
+        .collect::<std::collections::BTreeSet<_>>();
+
+    Ok(CatalogProjectionContext {
+        requested_version_id: context.requested_version_id.clone(),
+        current_committed_version_ids: context.current_committed_version_ids.clone(),
+        current_version_heads: context.current_version_heads.clone(),
+        change_commit_ids: load_change_commit_ids_with_backend(backend, &change_ids).await?,
+        blob_data_by_hash: load_blob_data_by_hash_with_backend(backend, &blob_hashes).await?,
+    })
+}
+
+async fn load_change_commit_ids_with_backend(
+    backend: &dyn LixBackend,
+    change_ids: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, String>, LixError> {
+    if change_ids.is_empty() {
+        return Ok(std::collections::BTreeMap::new());
+    }
+
+    let in_list = change_ids
+        .iter()
+        .map(|change_id| format!("'{}'", escape_sql_string(change_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH {change_commit_cte} \
+         SELECT change_id, commit_id \
+         FROM change_commit_by_change_id \
+         WHERE change_id IN ({in_list})",
+        change_commit_cte =
+            crate::sql::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
+        in_list = in_list,
+    );
+    let result = backend.execute(&sql, &[]).await?;
+    let mut rows = std::collections::BTreeMap::new();
+    for row in result.rows {
+        let Some(Value::Text(change_id)) = row.first() else {
+            continue;
+        };
+        let Some(Value::Text(commit_id)) = row.get(1) else {
+            continue;
+        };
+        rows.insert(change_id.clone(), commit_id.clone());
+    }
+    Ok(rows)
+}
+
+async fn load_blob_data_by_hash_with_backend(
+    backend: &dyn LixBackend,
+    blob_hashes: &std::collections::BTreeSet<String>,
+) -> Result<std::collections::BTreeMap<String, Option<Vec<u8>>>, LixError> {
+    let mut rows = std::collections::BTreeMap::new();
+    for blob_hash in blob_hashes {
+        rows.insert(
+            blob_hash.clone(),
+            crate::binary_cas::read::load_binary_blob_data_by_hash(backend, blob_hash).await?,
+        );
+    }
+    Ok(rows)
 }
 
 fn schema_default_version_ids(
@@ -453,7 +637,7 @@ mod tests {
             .expect("seed transaction should commit");
         let projection = TestLixVersionProjection;
 
-        let input = hydrate_projection_input_with_backend(&backend, &projection)
+        let input = hydrate_projection_input_with_backend(&backend, &projection, None)
             .await
             .expect("hydration should succeed");
 
@@ -602,9 +786,10 @@ mod tests {
             .await
             .expect("seed transaction should commit");
 
-        let input = hydrate_projection_input_with_backend(&backend, &TestLocalKeyValueProjection)
-            .await
-            .expect("hydration should succeed");
+        let input =
+            hydrate_projection_input_with_backend(&backend, &TestLocalKeyValueProjection, None)
+                .await
+                .expect("hydration should succeed");
         let rows = input
             .rows_for(&CatalogProjectionInputSpec::tracked("lix_key_value"))
             .expect("tracked key value rows should be present");

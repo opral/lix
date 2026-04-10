@@ -30,16 +30,26 @@ pub(crate) use binding::{
 };
 #[allow(unused_imports)]
 pub(crate) use declaration::{
-    builtin_catalog_projection_registry, CatalogDerivedRow, CatalogProjectionDefinition,
-    CatalogProjectionInput, CatalogProjectionInputRows, CatalogProjectionInputSpec,
-    CatalogProjectionInputVersionScope, CatalogProjectionLifecycle, CatalogProjectionRegistration,
-    CatalogProjectionRegistry, CatalogProjectionSourceRow, CatalogProjectionStorageKind,
-    CatalogProjectionSurfaceSpec, RegisteredCatalogProjection,
+    builtin_catalog_projection_registry, CatalogDerivedRow, CatalogProjectionContext,
+    CatalogProjectionDefinition, CatalogProjectionInput, CatalogProjectionInputRows,
+    CatalogProjectionInputSpec, CatalogProjectionInputVersionScope, CatalogProjectionLifecycle,
+    CatalogProjectionRegistration, CatalogProjectionRegistry, CatalogProjectionSourceRow,
+    CatalogProjectionStorageKind, CatalogProjectionSurfaceSpec, RegisteredCatalogProjection,
 };
 #[allow(unused_imports)]
 pub(crate) use directory::LixDirectoryProjection;
 #[allow(unused_imports)]
+pub(crate) use directory::{
+    builtin_lix_directory_by_version_catalog_registration,
+    builtin_lix_directory_catalog_registration, LixDirectoryByVersionProjection,
+};
+#[allow(unused_imports)]
 pub(crate) use file::LixFileProjection;
+#[allow(unused_imports)]
+pub(crate) use file::{
+    builtin_lix_file_by_version_catalog_registration, builtin_lix_file_catalog_registration,
+    LixFileByVersionProjection,
+};
 #[allow(unused_imports)]
 pub(crate) use version::{builtin_lix_version_catalog_registration, LixVersionProjection};
 

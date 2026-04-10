@@ -91,6 +91,7 @@ pub(crate) fn try_compile_read_time_projection_read(
 
     Some(ReadTimeProjectionRead {
         surface,
+        requested_version_id: structured_read.requested_version_id.clone(),
         query: ReadTimeProjectionReadQuery {
             projections: query.projections,
             filters: query.filters,

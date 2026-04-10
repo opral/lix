@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use crate::catalog::SurfaceFamily;
 use crate::contracts::artifacts::EffectiveStateRequest;
-use crate::sql::common::pushdown::PushdownDecision;
+use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
@@ -72,7 +72,7 @@ pub(crate) fn select_specialized_public_read_artifact(
         return Ok(SpecializedPublicReadArtifactSelection::Prepared(
             CompilerOwnedPublicReadExecutionSelection {
                 execution: PreparedPublicReadExecution::ReadTimeProjection(artifact),
-                pushdown_decision: None,
+                pushdown_decision: Some(read_time_projection_pushdown_decision(structured_read)),
             },
         ));
     }
@@ -101,4 +101,38 @@ pub(crate) fn select_specialized_public_read_artifact(
             pushdown_decision,
         },
     ))
+}
+
+fn read_time_projection_pushdown_decision(structured_read: &StructuredPublicRead) -> PushdownDecision {
+    let residual_predicates = structured_read.query.selection_predicates.clone();
+    let reason = match structured_read.surface_binding.descriptor.surface_family {
+        SurfaceFamily::Filesystem => {
+            "read-time filesystem execution keeps predicates above the derived source"
+        }
+        SurfaceFamily::Admin => {
+            "read-time admin execution keeps predicates above the derived source"
+        }
+        SurfaceFamily::State => {
+            "read-time state execution keeps predicates above the derived source"
+        }
+        SurfaceFamily::Entity => {
+            "read-time entity execution keeps predicates above the derived source"
+        }
+        SurfaceFamily::Change => {
+            "read-time change execution keeps predicates above the derived source"
+        }
+    };
+
+    PushdownDecision {
+        accepted_predicates: Vec::new(),
+        rejected_predicates: residual_predicates
+            .iter()
+            .map(|predicate| RejectedPredicate {
+                predicate: predicate.clone(),
+                reason: reason.to_string(),
+                support: PushdownSupport::Unsupported,
+            })
+            .collect(),
+        residual_predicates,
+    }
 }

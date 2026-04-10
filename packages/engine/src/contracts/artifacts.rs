@@ -312,6 +312,10 @@ pub(crate) struct PendingViewOrderClause {
 #[allow(dead_code)]
 pub(crate) enum ReadTimeProjectionSurface {
     LixVersion,
+    LixFile,
+    LixFileByVersion,
+    LixDirectory,
+    LixDirectoryByVersion,
 }
 
 #[allow(dead_code)]
@@ -319,6 +323,10 @@ impl ReadTimeProjectionSurface {
     pub(crate) fn from_public_name(public_name: &str) -> Option<Self> {
         match public_name {
             "lix_version" => Some(Self::LixVersion),
+            "lix_file" => Some(Self::LixFile),
+            "lix_file_by_version" => Some(Self::LixFileByVersion),
+            "lix_directory" => Some(Self::LixDirectory),
+            "lix_directory_by_version" => Some(Self::LixDirectoryByVersion),
             _ => None,
         }
     }
@@ -326,18 +334,28 @@ impl ReadTimeProjectionSurface {
     pub(crate) fn public_name(self) -> &'static str {
         match self {
             Self::LixVersion => "lix_version",
+            Self::LixFile => "lix_file",
+            Self::LixFileByVersion => "lix_file_by_version",
+            Self::LixDirectory => "lix_directory",
+            Self::LixDirectoryByVersion => "lix_directory_by_version",
         }
     }
 
     pub(crate) fn surface_family(self) -> SurfaceFamily {
         match self {
             Self::LixVersion => SurfaceFamily::Admin,
+            Self::LixFile
+            | Self::LixFileByVersion
+            | Self::LixDirectory
+            | Self::LixDirectoryByVersion => SurfaceFamily::Filesystem,
         }
     }
 
     pub(crate) fn surface_variant(self) -> SurfaceVariant {
         match self {
             Self::LixVersion => SurfaceVariant::Default,
+            Self::LixFile | Self::LixDirectory => SurfaceVariant::Default,
+            Self::LixFileByVersion | Self::LixDirectoryByVersion => SurfaceVariant::ByVersion,
         }
     }
 }
@@ -362,6 +380,7 @@ pub(crate) struct ReadTimeProjectionReadQuery {
 #[allow(dead_code)]
 pub(crate) struct ReadTimeProjectionRead {
     pub(crate) surface: ReadTimeProjectionSurface,
+    pub(crate) requested_version_id: Option<String>,
     pub(crate) query: ReadTimeProjectionReadQuery,
 }
 
@@ -2219,6 +2238,7 @@ mod tests {
     fn read_time_projection_read_keeps_query_shape_runtime_neutral() {
         let artifact = ReadTimeProjectionRead {
             surface: ReadTimeProjectionSurface::LixVersion,
+            requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![super::PendingViewProjection::Column {
                     source_column: "id".into(),
@@ -2257,6 +2277,7 @@ mod tests {
             execution: PreparedPublicReadExecutionArtifact::ReadTimeProjection(
                 ReadTimeProjectionRead {
                     surface: ReadTimeProjectionSurface::LixVersion,
+                    requested_version_id: None,
                     query: ReadTimeProjectionReadQuery {
                         projections: vec![super::PendingViewProjection::Column {
                             source_column: "id".into(),

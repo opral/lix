@@ -59,7 +59,10 @@ fn derive_lix_version_rows(
         ))
         .unwrap_or(&[])
         .iter()
-        .filter(|row| row.storage() == crate::catalog::CatalogProjectionStorageKind::Tracked)
+        .filter(|row| {
+            row.storage() == crate::catalog::CatalogProjectionStorageKind::Tracked
+                && !row.is_tombstone()
+        })
         .map(|descriptor| {
             let version_id = descriptor
                 .property_text("id")
@@ -95,7 +98,10 @@ fn version_ref_commit_ids(input: &CatalogProjectionInput) -> BTreeMap<String, St
         ))
         .unwrap_or(&[])
         .iter()
-        .filter(|row| row.storage() == crate::catalog::CatalogProjectionStorageKind::Untracked)
+        .filter(|row| {
+            row.storage() == crate::catalog::CatalogProjectionStorageKind::Untracked
+                && !row.is_tombstone()
+        })
         .map(version_ref_entry)
         .collect()
 }
@@ -189,6 +195,20 @@ mod tests {
             derived[0].values.get("hidden"),
             Some(&Value::Boolean(false))
         );
+    }
+
+    #[test]
+    fn tombstoned_descriptor_rows_do_not_derive_visible_versions() {
+        let projection = LixVersionProjection;
+        let input = CatalogProjectionInput::new(vec![CatalogProjectionInputRows::new(
+            CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
+            vec![sample_descriptor_row("main", "Main", false).with_tombstone(true)],
+        )]);
+
+        let derived = CatalogProjectionDefinition::derive(&projection, &input)
+            .expect("derive should succeed");
+
+        assert!(derived.is_empty());
     }
 
     #[test]

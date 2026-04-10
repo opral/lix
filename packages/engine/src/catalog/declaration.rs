@@ -55,6 +55,7 @@ pub(crate) enum CatalogProjectionStorageKind {
 pub(crate) enum CatalogProjectionInputVersionScope {
     SchemaDefault,
     Global,
+    RequestedVersion,
     CurrentCommittedFrontier,
 }
 
@@ -119,9 +120,18 @@ impl CatalogProjectionSurfaceSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CatalogProjectionSourceRow {
     pub(crate) storage: CatalogProjectionStorageKind,
+    pub(crate) tombstone: bool,
     pub(crate) identity: RowIdentity,
     pub(crate) schema_key: String,
     pub(crate) version_id: String,
+    pub(crate) schema_version: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) change_id: Option<String>,
+    pub(crate) writer_key: Option<String>,
+    pub(crate) global: Option<bool>,
+    pub(crate) created_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
     pub(crate) values: std::collections::BTreeMap<String, Value>,
 }
 
@@ -135,15 +145,59 @@ impl CatalogProjectionSourceRow {
     ) -> Self {
         Self {
             storage,
+            tombstone: false,
             identity,
             schema_key: schema_key.into(),
             version_id: version_id.into(),
+            schema_version: None,
+            plugin_key: None,
+            metadata: None,
+            change_id: None,
+            writer_key: None,
+            global: None,
+            created_at: None,
+            updated_at: None,
             values,
         }
     }
 
+    pub(crate) fn with_live_metadata(
+        mut self,
+        schema_version: impl Into<String>,
+        plugin_key: impl Into<String>,
+        metadata: Option<String>,
+        change_id: Option<String>,
+        writer_key: Option<String>,
+        global: bool,
+        created_at: Option<String>,
+        updated_at: Option<String>,
+    ) -> Self {
+        self.schema_version = Some(schema_version.into());
+        self.plugin_key = Some(plugin_key.into());
+        self.metadata = metadata;
+        self.change_id = change_id;
+        self.writer_key = writer_key;
+        self.global = Some(global);
+        self.created_at = created_at;
+        self.updated_at = updated_at;
+        self
+    }
+
+    pub(crate) fn with_tombstone(mut self, tombstone: bool) -> Self {
+        self.tombstone = tombstone;
+        self
+    }
+
+    pub(crate) fn set_writer_key(&mut self, writer_key: Option<String>) {
+        self.writer_key = writer_key;
+    }
+
     pub(crate) fn storage(&self) -> CatalogProjectionStorageKind {
         self.storage
+    }
+
+    pub(crate) fn is_tombstone(&self) -> bool {
+        self.tombstone
     }
 
     #[allow(dead_code)]
@@ -154,6 +208,42 @@ impl CatalogProjectionSourceRow {
     #[allow(dead_code)]
     pub(crate) fn values(&self) -> &std::collections::BTreeMap<String, Value> {
         &self.values
+    }
+
+    pub(crate) fn file_id(&self) -> &str {
+        self.identity.file_id.as_str()
+    }
+
+    pub(crate) fn schema_version(&self) -> Option<&str> {
+        self.schema_version.as_deref()
+    }
+
+    pub(crate) fn plugin_key(&self) -> Option<&str> {
+        self.plugin_key.as_deref()
+    }
+
+    pub(crate) fn metadata_text(&self) -> Option<&str> {
+        self.metadata.as_deref()
+    }
+
+    pub(crate) fn change_id(&self) -> Option<&str> {
+        self.change_id.as_deref()
+    }
+
+    pub(crate) fn writer_key(&self) -> Option<&str> {
+        self.writer_key.as_deref()
+    }
+
+    pub(crate) fn global(&self) -> Option<bool> {
+        self.global
+    }
+
+    pub(crate) fn created_at(&self) -> Option<&str> {
+        self.created_at.as_deref()
+    }
+
+    pub(crate) fn updated_at(&self) -> Option<&str> {
+        self.updated_at.as_deref()
     }
 
     pub(crate) fn entity_id(&self) -> &str {
@@ -186,13 +276,60 @@ impl CatalogProjectionInputRows {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
+pub(crate) struct CatalogProjectionContext {
+    pub(crate) requested_version_id: Option<String>,
+    pub(crate) current_committed_version_ids: Vec<String>,
+    pub(crate) current_version_heads: std::collections::BTreeMap<String, String>,
+    pub(crate) change_commit_ids: std::collections::BTreeMap<String, String>,
+    pub(crate) blob_data_by_hash: std::collections::BTreeMap<String, Option<Vec<u8>>>,
+}
+
+impl CatalogProjectionContext {
+    pub(crate) fn requested_version_id(&self) -> Option<&str> {
+        self.requested_version_id.as_deref()
+    }
+
+    pub(crate) fn current_committed_version_ids(&self) -> &[String] {
+        self.current_committed_version_ids.as_slice()
+    }
+
+    pub(crate) fn current_head_commit_id(&self, version_id: &str) -> Option<&str> {
+        self.current_version_heads
+            .get(version_id)
+            .map(String::as_str)
+    }
+
+    pub(crate) fn commit_id_for_change(&self, change_id: &str) -> Option<&str> {
+        self.change_commit_ids.get(change_id).map(String::as_str)
+    }
+
+    pub(crate) fn blob_data(&self, blob_hash: &str) -> Option<&[u8]> {
+        self.blob_data_by_hash
+            .get(blob_hash)
+            .and_then(|value| value.as_deref())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct CatalogProjectionInput {
     pub(crate) inputs: Vec<CatalogProjectionInputRows>,
+    pub(crate) context: CatalogProjectionContext,
 }
 
 impl CatalogProjectionInput {
+    #[allow(dead_code)]
     pub(crate) fn new(inputs: Vec<CatalogProjectionInputRows>) -> Self {
-        Self { inputs }
+        Self {
+            inputs,
+            context: CatalogProjectionContext::default(),
+        }
+    }
+
+    pub(crate) fn with_context(
+        inputs: Vec<CatalogProjectionInputRows>,
+        context: CatalogProjectionContext,
+    ) -> Self {
+        Self { inputs, context }
     }
 
     pub(crate) fn rows_for(
@@ -203,6 +340,10 @@ impl CatalogProjectionInput {
             .iter()
             .find(|input| &input.spec == spec)
             .map(|input| input.rows.as_slice())
+    }
+
+    pub(crate) fn context(&self) -> &CatalogProjectionContext {
+        &self.context
     }
 }
 
@@ -289,9 +430,23 @@ static BUILTIN_CATALOG_PROJECTION_REGISTRY: OnceLock<CatalogProjectionRegistry> 
 
 pub(crate) fn builtin_catalog_projection_registry() -> &'static CatalogProjectionRegistry {
     BUILTIN_CATALOG_PROJECTION_REGISTRY.get_or_init(|| {
-        CatalogProjectionRegistry::new(vec![RegisteredCatalogProjection::new(
-            crate::catalog::builtin_lix_version_catalog_registration(),
-        )])
+        CatalogProjectionRegistry::new(vec![
+            RegisteredCatalogProjection::new(
+                crate::catalog::builtin_lix_version_catalog_registration(),
+            ),
+            RegisteredCatalogProjection::new(
+                crate::catalog::builtin_lix_file_catalog_registration(),
+            ),
+            RegisteredCatalogProjection::new(
+                crate::catalog::builtin_lix_file_by_version_catalog_registration(),
+            ),
+            RegisteredCatalogProjection::new(
+                crate::catalog::builtin_lix_directory_catalog_registration(),
+            ),
+            RegisteredCatalogProjection::new(
+                crate::catalog::builtin_lix_directory_by_version_catalog_registration(),
+            ),
+        ])
     })
 }
 
@@ -365,15 +520,27 @@ mod tests {
     }
 
     #[test]
-    fn builtin_catalog_projection_registry_exposes_lix_version() {
+    fn builtin_catalog_projection_registry_exposes_builtin_surfaces() {
         let registrations = builtin_catalog_projection_registry().registrations();
 
-        assert_eq!(registrations.len(), 1);
-        assert_eq!(registrations[0].projection().name(), "lix_version");
+        let names = registrations
+            .iter()
+            .map(|registration| registration.projection().name())
+            .collect::<Vec<_>>();
+
         assert_eq!(
-            registrations[0].lifecycle(),
-            CatalogProjectionLifecycle::ReadTime
+            names,
+            vec![
+                "lix_version",
+                "lix_file",
+                "lix_file_by_version",
+                "lix_directory",
+                "lix_directory_by_version",
+            ]
         );
+        assert!(registrations
+            .iter()
+            .all(|registration| registration.lifecycle() == CatalogProjectionLifecycle::ReadTime));
     }
 
     #[test]

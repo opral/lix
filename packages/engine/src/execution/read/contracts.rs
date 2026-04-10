@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use crate::contracts::artifacts::RowIdentity;
+use crate::contracts::artifacts::{ReadTimeProjectionRead, RowIdentity};
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -17,5 +17,6 @@ pub(crate) trait ReadExecutionBindings {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
+        artifact: &ReadTimeProjectionRead,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError>;
 }

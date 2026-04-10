@@ -40,6 +40,14 @@ pub async fn scan_rows_with_backend(
     scan_rows_with_executor(&mut executor, request).await
 }
 
+pub async fn scan_tombstones_with_backend(
+    backend: &dyn LixBackend,
+    request: &TrackedScanRequest,
+) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
+    let mut executor = backend;
+    scan_tombstones_with_executor(&mut executor, request).await
+}
+
 pub(crate) async fn load_exact_row_with_executor(
     executor: &mut dyn QueryExecutor,
     request: &ExactTrackedRowRequest,

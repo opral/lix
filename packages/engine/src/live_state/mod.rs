@@ -128,8 +128,10 @@ pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionSta
 pub(crate) async fn derive_read_time_surface_rows(
     backend: &dyn LixBackend,
     registry: &crate::catalog::CatalogProjectionRegistry,
+    artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
 ) -> Result<Vec<crate::catalog::CatalogDerivedRow>, LixError> {
-    projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry).await
+    projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry, artifact)
+        .await
 }
 
 pub async fn register_schema(
