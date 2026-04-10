@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::json;
 
-use super::loader::{load_data_with_executor, ChangeRecord, LoadedData};
+use super::loader::{load_data_with_executor, LoadedData};
 use super::types::{
     LatestVisibleWinnerDebugRow, LiveStateRebuildDebugMode, LiveStateRebuildDebugTrace,
     LiveStateRebuildPlan, LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning,
@@ -10,12 +10,14 @@ use super::types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 use crate::backend::QueryExecutor;
-use crate::canonical::graph::{
-    build_version_commit_depth_map, build_version_head_map, collect_commit_edges,
-    min_depth_by_commit, VersionCommitDepthMap, VersionHeadMap,
+use crate::canonical::{
+    load_visible_state, CanonicalContentMode, CanonicalTombstoneMode, CanonicalVisibleStateFilter,
+    CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
 use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixBackend, LixError, ReplayCursor};
+
+type VersionHeadMap = BTreeMap<String, Vec<String>>;
 
 #[derive(Debug, Clone)]
 struct VisibleRow {
@@ -38,14 +40,6 @@ struct VisibleRow {
 struct FinalStateRow {
     version_id: String,
     source: VisibleRow,
-}
-
-#[derive(Debug, Clone)]
-struct VisibleCandidate {
-    source_version_id: String,
-    depth: usize,
-    commit_id: String,
-    change: ChangeRecord,
 }
 
 #[derive(Debug, Clone)]
@@ -78,33 +72,27 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
     let mut stats = Vec::new();
     let mut warnings = Vec::new();
 
-    let all_commit_edges = build_all_commit_edges(&data, &mut stats);
     let version_refs = load_version_heads_from_canonical(executor, &mut stats).await?;
-    let commit_graph = build_version_commit_depth_map(&version_refs, &all_commit_edges);
-    stats.push(StageStat {
-        stage: "commit_graph".to_string(),
-        input_rows: version_refs.values().map(|rows| rows.len()).sum::<usize>()
-            + all_commit_edges.len(),
-        output_rows: commit_graph.len(),
-    });
+    let target_versions = resolve_target_versions(req, &version_refs, &data);
+    let visible_state_rows =
+        load_canonical_visible_state(executor, &version_refs, &target_versions, &mut stats).await?;
 
     let latest_visible_state = build_latest_visible_state(
         &data,
-        &commit_graph,
+        &visible_state_rows,
         &version_refs,
         &mut warnings,
         &mut stats,
-    );
+    )?;
 
-    let target_versions = resolve_target_versions(req, &version_refs, &data, &latest_visible_state);
     let final_state = build_final_state(&latest_visible_state, &target_versions, &mut stats);
     let writes = build_writes(&final_state)?;
 
     let debug = build_debug_trace(
         req,
+        &data,
         &version_refs,
-        &commit_graph,
-        &all_commit_edges,
+        &visible_state_rows,
         &latest_visible_state,
         &final_state,
     )?;
@@ -132,127 +120,73 @@ fn resolved_scope(
     }
 }
 
-fn build_all_commit_edges(
-    data: &LoadedData,
-    stats: &mut Vec<StageStat>,
-) -> BTreeSet<(String, String)> {
-    let edges = collect_commit_edges(
-        data.commits.values().map(|commit| {
-            (
-                commit.entity_id.clone(),
-                commit.snapshot.parent_commit_ids.clone(),
-            )
-        }),
-        std::iter::empty(),
-    );
-
-    stats.push(StageStat {
-        stage: "all_commit_edges".to_string(),
-        input_rows: data.commits.len(),
-        output_rows: edges.len(),
-    });
-
-    edges
-}
-
 fn build_latest_visible_state(
     data: &LoadedData,
-    commit_graph: &VersionCommitDepthMap,
+    visible_state_rows: &[CanonicalVisibleStateRow],
     version_refs: &VersionHeadMap,
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
-) -> Vec<VisibleRow> {
-    let mut candidates: BTreeMap<(String, String, String, String), Vec<VisibleCandidate>> =
-        BTreeMap::new();
+) -> Result<Vec<VisibleRow>, LixError> {
+    let root_versions = root_versions_by_commit(version_refs);
+    let mut winners = Vec::new();
 
-    for ((version_id, commit_id), depth) in commit_graph {
-        let Some(commit) = data.commits.get(commit_id) else {
+    for row in visible_state_rows {
+        if row.schema_key == "lix_version_descriptor" || row.schema_key == "lix_version_ref" {
+            continue;
+        }
+        let Some(change) = data.changes.get(&row.source_change_id) else {
             warnings.push(LiveStateRebuildWarning {
-                code: "missing_commit_snapshot".to_string(),
+                code: "missing_change".to_string(),
                 message: format!(
-                    "commit_graph references commit '{}' for version '{}' but no lix_commit snapshot exists",
-                    commit_id, version_id
+                    "canonical visible state references missing change '{}'",
+                    row.source_change_id
                 ),
             });
             continue;
         };
+        let Some(version_ids) = root_versions.get(&row.root_commit_id) else {
+            warnings.push(LiveStateRebuildWarning {
+                code: "missing_root_version".to_string(),
+                message: format!(
+                    "canonical visible state root '{}' does not map to a live version head",
+                    row.root_commit_id
+                ),
+            });
+            continue;
+        };
+        let snapshot_content = row
+            .snapshot_content
+            .as_ref()
+            .map(|value| CanonicalJson::from_text(value.clone()))
+            .transpose()?;
+        let metadata = row
+            .metadata
+            .as_ref()
+            .map(|value| CanonicalJson::from_text(value.clone()))
+            .transpose()?;
 
-        for change_id in &commit.snapshot.change_ids {
-            let Some(change) = data.changes.get(change_id) else {
-                warnings.push(LiveStateRebuildWarning {
-                    code: "missing_change".to_string(),
-                    message: format!(
-                        "lix_commit '{}' references missing change '{}'",
-                        commit_id, change_id
-                    ),
-                });
-                continue;
-            };
-
-            if change.schema_key == "lix_version_descriptor"
-                || change.schema_key == "lix_version_ref"
-            {
-                continue;
-            }
-
-            let key = (
-                version_id.clone(),
-                change.entity_id.clone(),
-                change.schema_key.clone(),
-                change.file_id.clone(),
-            );
-            candidates.entry(key).or_default().push(VisibleCandidate {
-                source_version_id: version_id.clone(),
-                depth: *depth,
-                commit_id: commit.entity_id.clone(),
-                change: change.clone(),
+        for version_id in version_ids {
+            winners.push(VisibleRow {
+                version_id: version_id.clone(),
+                commit_id: row.source_commit_id.clone(),
+                replay_cursor: change.replay_cursor.clone(),
+                change_id: row.source_change_id.clone(),
+                entity_id: row.entity_id.clone(),
+                schema_key: row.schema_key.clone(),
+                schema_version: row.schema_version.clone(),
+                file_id: row.file_id.clone(),
+                plugin_key: row.plugin_key.clone(),
+                snapshot_content: snapshot_content.clone(),
+                metadata: metadata.clone(),
+                created_at: change.created_at.clone(),
+                updated_at: change.created_at.clone(),
             });
         }
     }
 
-    let mut winners = Vec::new();
-    for ((_version_id, _entity_id, _schema_key, _file_id), mut rows) in candidates {
-        rows.sort_by(|a, b| {
-            a.depth
-                .cmp(&b.depth)
-                .then_with(|| b.change.replay_cursor.cmp(&a.change.replay_cursor))
-        });
-
-        let Some(winner) = rows.first() else {
-            continue;
-        };
-
-        let mut created_candidates = rows.clone();
-        created_candidates.sort_by(|a, b| {
-            b.depth
-                .cmp(&a.depth)
-                .then_with(|| a.change.replay_cursor.cmp(&b.change.replay_cursor))
-        });
-        let created_at = created_candidates
-            .first()
-            .map(|row| row.change.created_at.clone())
-            .unwrap_or_else(|| winner.change.created_at.clone());
-
-        winners.push(VisibleRow {
-            version_id: winner.source_version_id.clone(),
-            commit_id: winner.commit_id.clone(),
-            replay_cursor: winner.change.replay_cursor.clone(),
-            change_id: winner.change.id.clone(),
-            entity_id: winner.change.entity_id.clone(),
-            schema_key: winner.change.schema_key.clone(),
-            schema_version: winner.change.schema_version.clone(),
-            file_id: winner.change.file_id.clone(),
-            plugin_key: winner.change.plugin_key.clone(),
-            snapshot_content: winner.change.snapshot_content.clone(),
-            metadata: winner.change.metadata.clone(),
-            created_at,
-            updated_at: winner.change.created_at.clone(),
-        });
-    }
-
     winners.extend(build_global_projection_rows(
         data,
-        commit_graph,
+        visible_state_rows,
         version_refs,
         warnings,
     ));
@@ -268,16 +202,16 @@ fn build_latest_visible_state(
 
     stats.push(StageStat {
         stage: "latest_visible_state".to_string(),
-        input_rows: commit_graph.len(),
+        input_rows: visible_state_rows.len(),
         output_rows: winners.len(),
     });
 
-    winners
+    Ok(winners)
 }
 
 fn build_global_projection_rows(
     data: &LoadedData,
-    commit_graph: &VersionCommitDepthMap,
+    visible_state_rows: &[CanonicalVisibleStateRow],
     version_refs: &VersionHeadMap,
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Vec<VisibleRow> {
@@ -287,7 +221,7 @@ fn build_global_projection_rows(
     let change_set_element_schema = builtin_projection_schema_meta("lix_change_set_element");
     let commit_edge_schema = builtin_projection_schema_meta("lix_commit_edge");
     let change_author_schema = builtin_projection_schema_meta("lix_change_author");
-    let commit_depths = min_depth_by_commit(commit_graph);
+    let commit_depths = min_depth_by_commit_rows(visible_state_rows);
 
     let mut candidates: BTreeMap<(String, String, String, String), Vec<ProjectionCandidate>> =
         BTreeMap::new();
@@ -366,13 +300,6 @@ fn build_global_projection_rows(
 
     for (commit_id, depth) in &commit_depths {
         let Some(commit) = data.commits.get(commit_id) else {
-            warnings.push(LiveStateRebuildWarning {
-                code: "missing_commit_snapshot".to_string(),
-                message: format!(
-                    "commit_graph references commit '{}' but no lix_commit snapshot exists",
-                    commit_id
-                ),
-            });
             continue;
         };
         let Some(commit_change) = data.changes.get(&commit.id) else {
@@ -586,7 +513,7 @@ async fn load_version_heads_from_canonical(
     let root_version_refs =
         crate::live_state::shared::version_heads::load_all_version_head_commit_ids(executor)
             .await?;
-    let heads = build_version_head_map(&root_version_refs);
+    let heads = build_version_head_map_local(&root_version_refs);
 
     stats.push(StageStat {
         stage: "version_ref_heads".to_string(),
@@ -595,6 +522,39 @@ async fn load_version_heads_from_canonical(
     });
 
     Ok(heads)
+}
+
+async fn load_canonical_visible_state(
+    executor: &mut dyn QueryExecutor,
+    version_refs: &VersionHeadMap,
+    target_versions: &BTreeSet<String>,
+    stats: &mut Vec<StageStat>,
+) -> Result<Vec<CanonicalVisibleStateRow>, LixError> {
+    let commit_ids = target_versions
+        .iter()
+        .filter_map(|version_id| version_refs.get(version_id))
+        .flat_map(|heads| heads.iter().cloned())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let rows = load_visible_state(
+        executor,
+        &CanonicalVisibleStateRequest {
+            commit_ids,
+            filter: CanonicalVisibleStateFilter::default(),
+            content_mode: CanonicalContentMode::IncludeSnapshotContent,
+            tombstones: CanonicalTombstoneMode::IncludeTombstones,
+        },
+    )
+    .await?;
+
+    stats.push(StageStat {
+        stage: "canonical_visible_state".to_string(),
+        input_rows: target_versions.len(),
+        output_rows: rows.len(),
+    });
+
+    Ok(rows)
 }
 
 fn resolve_projection_candidates(
@@ -685,7 +645,6 @@ fn resolve_target_versions(
     req: &LiveStateRebuildRequest,
     version_refs: &VersionHeadMap,
     data: &LoadedData,
-    latest_visible_state: &[VisibleRow],
 ) -> BTreeSet<String> {
     match &req.scope {
         LiveStateRebuildScope::Versions(versions) => {
@@ -700,9 +659,6 @@ fn resolve_target_versions(
             }
             for version_id in data.version_descriptors.keys() {
                 versions.insert(version_id.clone());
-            }
-            for row in latest_visible_state {
-                versions.insert(row.version_id.clone());
             }
             versions
         }
@@ -828,9 +784,9 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
 
 fn build_debug_trace(
     req: &LiveStateRebuildRequest,
+    data: &LoadedData,
     version_refs: &VersionHeadMap,
-    commit_graph: &VersionCommitDepthMap,
-    all_commit_edges: &BTreeSet<(String, String)>,
+    visible_state_rows: &[CanonicalVisibleStateRow],
     latest_visible_state: &[VisibleRow],
     final_state: &[FinalStateRow],
 ) -> Result<Option<LiveStateRebuildDebugTrace>, LixError> {
@@ -850,24 +806,62 @@ fn build_debug_trace(
         }
     }
 
+    let root_versions = root_versions_by_commit(version_refs);
+    let mut traversed_commit_set = BTreeSet::new();
     let mut traversed_commits = Vec::new();
-    for ((version_id, commit_id), depth) in commit_graph {
-        traversed_commits.push(TraversedCommitDebugRow {
-            version_id: require_identity(version_id.clone(), "debug traversed commit version_id")?,
-            commit_id: commit_id.clone(),
-            depth: *depth,
-        });
+    for row in visible_state_rows
+        .iter()
+        .filter(|row| row.schema_key == "lix_commit")
+    {
+        if let Some(version_ids) = root_versions.get(&row.root_commit_id) {
+            for version_id in version_ids {
+                if traversed_commit_set.insert((
+                    version_id.clone(),
+                    row.entity_id.clone(),
+                    row.depth,
+                )) {
+                    traversed_commits.push(TraversedCommitDebugRow {
+                        version_id: require_identity(
+                            version_id.clone(),
+                            "debug traversed commit version_id",
+                        )?,
+                        commit_id: row.entity_id.clone(),
+                        depth: row.depth,
+                    });
+                }
+            }
+        }
     }
 
+    let commit_depths = min_depth_by_commit_rows(visible_state_rows);
+    let mut traversed_edge_set = BTreeSet::new();
     let mut traversed_edges = Vec::new();
-    for (parent_id, child_id) in all_commit_edges {
-        for (version_id, tips) in version_refs {
-            if !tips.is_empty() {
-                traversed_edges.push(TraversedEdgeDebugRow {
-                    version_id: version_id.clone(),
-                    parent_id: parent_id.clone(),
-                    child_id: child_id.clone(),
-                });
+    for row in visible_state_rows
+        .iter()
+        .filter(|row| row.schema_key == "lix_commit")
+    {
+        let Some(version_ids) = root_versions.get(&row.root_commit_id) else {
+            continue;
+        };
+        let Some(commit) = data.commits.get(&row.entity_id) else {
+            continue;
+        };
+        for parent_id in &commit.snapshot.parent_commit_ids {
+            if !commit_depths.contains_key(parent_id) {
+                continue;
+            }
+            for version_id in version_ids {
+                if traversed_edge_set.insert((
+                    version_id.clone(),
+                    parent_id.clone(),
+                    row.entity_id.clone(),
+                )) {
+                    traversed_edges.push(TraversedEdgeDebugRow {
+                        version_id: version_id.clone(),
+                        parent_id: parent_id.clone(),
+                        child_id: row.entity_id.clone(),
+                    });
+                }
             }
         }
     }
@@ -932,6 +926,57 @@ fn build_debug_trace(
         latest_visible_winners,
         scope_winners,
     }))
+}
+
+fn build_version_head_map_local(root_version_refs: &[(String, String)]) -> VersionHeadMap {
+    let mut heads = BTreeMap::<String, Vec<String>>::new();
+    for (version_id, commit_id) in root_version_refs {
+        heads
+            .entry(version_id.clone())
+            .or_default()
+            .push(commit_id.clone());
+    }
+    for commit_ids in heads.values_mut() {
+        commit_ids.sort();
+        commit_ids.dedup();
+    }
+    heads
+}
+
+fn root_versions_by_commit(version_refs: &VersionHeadMap) -> BTreeMap<String, Vec<String>> {
+    let mut roots = BTreeMap::<String, Vec<String>>::new();
+    for (version_id, commit_ids) in version_refs {
+        for commit_id in commit_ids {
+            roots
+                .entry(commit_id.clone())
+                .or_default()
+                .push(version_id.clone());
+        }
+    }
+    for version_ids in roots.values_mut() {
+        version_ids.sort();
+        version_ids.dedup();
+    }
+    roots
+}
+
+fn min_depth_by_commit_rows(
+    visible_state_rows: &[CanonicalVisibleStateRow],
+) -> BTreeMap<String, usize> {
+    let mut depths = BTreeMap::new();
+    for row in visible_state_rows
+        .iter()
+        .filter(|row| row.schema_key == "lix_commit")
+    {
+        let commit_id = row.entity_id.clone();
+        match depths.get(&commit_id) {
+            Some(existing) if *existing <= row.depth => {}
+            _ => {
+                depths.insert(commit_id, row.depth);
+            }
+        }
+    }
+    depths
 }
 
 fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, LixError>

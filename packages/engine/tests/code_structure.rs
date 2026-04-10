@@ -1586,7 +1586,7 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 }
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
-    ["live_state"].into_iter().collect()
+    ["canonical", "live_state"].into_iter().collect()
 }
 
 fn violations_for_sealed_owners(

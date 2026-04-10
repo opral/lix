@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
-use crate::canonical::read::{
-    load_exact_committed_change_from_commit_with_executor, CommittedCanonicalChangeRow,
-    ExactCommittedStateRowRequest,
+use crate::canonical::{
+    load_change, load_visible_state, CanonicalContentMode, CanonicalTombstoneMode,
+    CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
+    CanonicalVisibleStateRow,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
@@ -503,78 +504,105 @@ async fn load_exact_tracked_row_from_canonical_for_lane(
         return Ok(EffectiveLaneOutcome::Missing);
     };
 
-    let canonical_request = ExactCommittedStateRowRequest {
-        entity_id: request.entity_id.clone(),
-        schema_key: request.schema_key.clone(),
-        version_id: storage_version_id.clone(),
-        exact_filters: exact_committed_state_filters(request),
-    };
-    let Some(change) = load_exact_committed_change_from_commit_with_executor(
+    let mut filter = CanonicalVisibleStateFilter::default();
+    filter.schema_keys.insert(request.schema_key.clone());
+    filter.entity_ids.insert(request.entity_id.clone());
+    if let Some(file_id) = request.file_id.as_ref() {
+        filter.file_ids.insert(file_id.clone());
+    }
+    if let Some(plugin_key) = request.plugin_key.as_ref() {
+        filter.plugin_keys.insert(plugin_key.clone());
+    }
+
+    let rows = load_visible_state(
         &mut executor,
-        &head_commit_id,
-        &canonical_request,
+        &CanonicalVisibleStateRequest {
+            commit_ids: vec![head_commit_id],
+            filter,
+            content_mode: CanonicalContentMode::IncludeSnapshotContent,
+            tombstones: if request.include_tombstones {
+                CanonicalTombstoneMode::IncludeTombstones
+            } else {
+                CanonicalTombstoneMode::ExcludeTombstones
+            },
+        },
     )
-    .await?
+    .await?;
+    let Some(row) = rows
+        .into_iter()
+        .find(|row| canonical_visible_state_row_matches_query(row, request))
     else {
         return Ok(EffectiveLaneOutcome::Missing);
     };
 
-    canonical_effective_lane_outcome_from_change(backend, storage_version_id, lane, change).await
+    canonical_effective_lane_outcome_from_visible_row(backend, storage_version_id, lane, row).await
 }
 
-fn exact_committed_state_filters(request: &ExactLiveRowQuery) -> BTreeMap<String, Value> {
-    let mut filters = BTreeMap::new();
-    if let Some(file_id) = request.file_id.as_ref() {
-        filters.insert("file_id".to_string(), Value::Text(file_id.clone()));
-    }
-    if let Some(plugin_key) = request.plugin_key.as_ref() {
-        filters.insert("plugin_key".to_string(), Value::Text(plugin_key.clone()));
-    }
-    if let Some(schema_version) = request.schema_version.as_ref() {
-        filters.insert(
-            "schema_version".to_string(),
-            Value::Text(schema_version.clone()),
-        );
-    }
-    filters
+fn canonical_visible_state_row_matches_query(
+    row: &CanonicalVisibleStateRow,
+    request: &ExactLiveRowQuery,
+) -> bool {
+    row.entity_id == request.entity_id
+        && row.schema_key == request.schema_key
+        && request
+            .file_id
+            .as_ref()
+            .is_none_or(|file_id| row.file_id == *file_id)
+        && request
+            .schema_version
+            .as_ref()
+            .is_none_or(|schema_version| row.schema_version == *schema_version)
+        && request
+            .plugin_key
+            .as_ref()
+            .is_none_or(|plugin_key| row.plugin_key == *plugin_key)
 }
 
-async fn canonical_effective_lane_outcome_from_change(
+async fn canonical_effective_lane_outcome_from_visible_row(
     backend: &dyn LixBackend,
     storage_version_id: String,
     lane: EffectiveLane,
-    change: CommittedCanonicalChangeRow,
+    row: CanonicalVisibleStateRow,
 ) -> Result<EffectiveLaneOutcome, LixError> {
+    let visibility = row.visibility;
+    let mut executor = backend;
+    let change = load_change(&mut executor, &row.source_change_id)
+        .await?
+        .ok_or_else(|| {
+            LixError::unknown(format!(
+                "canonical visible-state row references missing change '{}'",
+                row.source_change_id
+            ))
+        })?;
     let writer_key = super::writer_key::load_writer_key_annotation_for_state_row(
         backend,
         &storage_version_id,
-        &change.schema_key,
-        &change.entity_id,
-        &change.file_id,
+        &row.schema_key,
+        &row.entity_id,
+        &row.file_id,
     )
     .await?;
 
     let row = LiveRow {
-        entity_id: change.entity_id,
-        file_id: change.file_id,
-        schema_key: change.schema_key,
-        schema_version: change.schema_version,
+        entity_id: row.entity_id,
+        file_id: row.file_id,
+        schema_key: row.schema_key,
+        schema_version: row.schema_version,
         version_id: storage_version_id,
-        plugin_key: change.plugin_key,
-        metadata: change.metadata,
+        plugin_key: row.plugin_key,
+        metadata: row.metadata,
         change_id: Some(change.id),
         writer_key,
         global: lane.is_global(),
         untracked: false,
         created_at: Some(change.created_at.clone()),
         updated_at: Some(change.created_at),
-        snapshot_content: change.snapshot_content,
+        snapshot_content: row.snapshot_content,
     };
 
-    if row.snapshot_content.is_none() {
-        Ok(EffectiveLaneOutcome::Tombstone(row))
-    } else {
-        Ok(EffectiveLaneOutcome::Visible(row))
+    match visibility {
+        CanonicalVisibility::Visible => Ok(EffectiveLaneOutcome::Visible(row)),
+        CanonicalVisibility::Tombstone => Ok(EffectiveLaneOutcome::Tombstone(row)),
     }
 }
 
