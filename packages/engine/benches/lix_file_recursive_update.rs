@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    boot, BootArgs, BootKeyValue, LixBackend, LixBackendTransaction, LixError, QueryResult,
-    Session, SqlDialect, TransactionMode, Value,
+    BootKeyValue, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
+    SqlDialect, TransactionMode, Value,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -60,7 +60,7 @@ fn bench_lix_file_recursive_update(c: &mut Criterion) {
 }
 
 struct BenchFixture {
-    session: Session,
+    lix: Arc<Lix>,
     next_revision: usize,
     _tempdir: TempDir,
 }
@@ -123,7 +123,7 @@ impl BenchFixture {
     fn update_once(&mut self, runtime: &Runtime) {
         let payload = payload_for_revision(self.next_revision);
         runtime
-            .block_on(self.session.execute(
+            .block_on(self.lix.execute(
                 "UPDATE lix_file SET data = ? WHERE id = ?",
                 &[Value::Blob(payload), Value::Text(FILE_ID.to_string())],
             ))
@@ -152,24 +152,21 @@ fn build_fixture_with_trace(
         None => Box::new(backend),
     };
 
-    let mut boot_args = BootArgs::new(backend, Arc::new(NoopWasmRuntime));
-    boot_args.key_values.push(BootKeyValue {
+    let mut config = LixConfig::new(backend, Arc::new(NoopWasmRuntime));
+    config.key_values.push(BootKeyValue {
         key: "lix_deterministic_mode".to_string(),
         value: json!({ "enabled": true }),
         lixcol_global: Some(true),
         lixcol_untracked: None,
     });
 
-    let engine = Arc::new(boot(boot_args));
+    let lix = Arc::new(Lix::boot(config));
     runtime
-        .block_on(engine.initialize())
-        .expect("engine initialization should succeed");
-    let session = runtime
-        .block_on(engine.open_session())
-        .expect("workspace session should open");
+        .block_on(lix.initialize())
+        .expect("lix initialization should succeed");
 
     runtime
-        .block_on(session.execute(
+        .block_on(lix.execute(
             "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
             &[
                 Value::Text(FILE_ID.to_string()),
@@ -181,7 +178,7 @@ fn build_fixture_with_trace(
 
     for revision in 1..=history_depth {
         runtime
-            .block_on(session.execute(
+            .block_on(lix.execute(
                 "UPDATE lix_file SET data = ? WHERE id = ?",
                 &[
                     Value::Blob(payload_for_revision(revision)),
@@ -192,7 +189,7 @@ fn build_fixture_with_trace(
     }
 
     BenchFixture {
-        session,
+        lix,
         next_revision: history_depth + 1,
         _tempdir: tempdir,
     }

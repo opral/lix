@@ -623,7 +623,7 @@ impl SqlBufferedWriteScope<'_, '_> {
 mod tests {
     use super::*;
     use crate::runtime::wasm::NoopWasmRuntime;
-    use crate::{boot, BootArgs, Engine, ExecuteOptions, QueryResult, Session, SqlDialect};
+    use crate::{ExecuteOptions, Lix, LixConfig, QueryResult, Session, SqlDialect};
     use async_trait::async_trait;
     use std::sync::Arc;
 
@@ -692,16 +692,16 @@ mod tests {
         }
     }
 
-    fn test_engine() -> Arc<Engine> {
-        Arc::new(boot(BootArgs::new(
+    fn test_lix() -> Arc<Lix> {
+        Arc::new(Lix::boot(LixConfig::new(
             Box::new(NoopBackend),
             Arc::new(NoopWasmRuntime),
         )))
     }
 
-    fn test_session(engine: &Arc<Engine>) -> Session {
+    fn test_session(lix: &Arc<Lix>) -> Session {
         Session::new_for_test(
-            crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+            crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
             "version-test".to_string(),
             Vec::new(),
         )
@@ -709,8 +709,8 @@ mod tests {
 
     #[test]
     fn statement_template_cache_is_shared_across_repeated_calls_in_one_session() {
-        let engine = test_engine();
-        let session = test_session(&engine);
+        let lix = test_lix();
+        let session = test_session(&lix);
         let sql = "SELECT 1";
         let cache_key = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 0);
         let mut transaction = NoopTransaction;
@@ -743,9 +743,9 @@ mod tests {
 
     #[test]
     fn registry_generation_bumps_are_session_local_and_create_new_cache_namespaces() {
-        let engine = test_engine();
-        let session_a = test_session(&engine);
-        let session_b = test_session(&engine);
+        let lix = test_lix();
+        let session_a = test_session(&lix);
+        let session_b = test_session(&lix);
         let sql = "SELECT 1";
         let cache_key_v0 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 0);
         let cache_key_v1 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 1);

@@ -39,7 +39,7 @@ impl Runtime {
 mod tests {
     use super::*;
     use crate::runtime::wasm::NoopWasmRuntime;
-    use crate::{boot, BootArgs, QueryResult, SqlDialect, Value};
+    use crate::{Lix, LixConfig, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
@@ -91,10 +91,10 @@ mod tests {
         let backend = CountingBackend {
             execute_calls: Arc::clone(&execute_calls),
         };
-        let engine = boot(BootArgs::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
+        let lix = Lix::boot(LixConfig::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
-        let (settings, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend().as_ref())
+        let (settings, _) = lix
+            .prepare_runtime_functions_with_backend(lix.backend().as_ref())
             .await
             .expect("first runtime preparation should succeed");
         assert!(!settings.enabled);
@@ -104,8 +104,8 @@ mod tests {
             "first call should read deterministic settings from the backend"
         );
 
-        let (_settings, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend().as_ref())
+        let (_settings, _) = lix
+            .prepare_runtime_functions_with_backend(lix.backend().as_ref())
             .await
             .expect("second runtime preparation should succeed");
         assert_eq!(
@@ -114,10 +114,10 @@ mod tests {
             "disabled deterministic settings should be served from cache"
         );
 
-        engine.runtime().invalidate_deterministic_settings_cache();
+        lix.runtime().invalidate_deterministic_settings_cache();
 
-        let (_settings, _) = engine
-            .prepare_runtime_functions_with_backend(engine.backend().as_ref())
+        let (_settings, _) = lix
+            .prepare_runtime_functions_with_backend(lix.backend().as_ref())
             .await
             .expect("runtime preparation after invalidation should succeed");
         assert_eq!(

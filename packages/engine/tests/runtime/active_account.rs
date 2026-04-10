@@ -1,7 +1,7 @@
 use crate::support;
 
 use lix_engine::Value;
-use support::simulation_test::SimulationBootArgs;
+use support::simulation_test::SimulatedLixBootArgs;
 
 fn first_text(result: &lix_engine::ExecuteResult) -> String {
     match &result.statements[0].rows[0][0] {
@@ -16,7 +16,7 @@ fn first_string_vec(result: &lix_engine::ExecuteResult) -> Vec<String> {
 }
 
 async fn workspace_metadata_value(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     key: &str,
 ) -> Option<String> {
     let result = engine
@@ -44,9 +44,9 @@ simulation_test!(
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(SimulationBootArgs::default()))
+            .boot_simulated_lix(Some(SimulatedLixBootArgs::default()))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let result = engine
@@ -62,9 +62,9 @@ simulation_test!(
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -93,9 +93,9 @@ simulation_test!(
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(Some(SimulationBootArgs::default()))
+            .boot_simulated_lix(Some(SimulatedLixBootArgs::default()))
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -125,9 +125,9 @@ simulation_test!(
     simulations = [sqlite, materialization],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine

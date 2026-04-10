@@ -13,7 +13,7 @@ fn text_to_json(value: &Value) -> JsonValue {
     }
 }
 
-async fn enable_deterministic_mode(engine: &support::simulation_test::SimulationEngine) {
+async fn enable_deterministic_mode(engine: &support::simulation_test::SimulatedLix) {
     engine
         .execute(
             "INSERT INTO lix_state_by_version (\
@@ -27,9 +27,9 @@ async fn enable_deterministic_mode(engine: &support::simulation_test::Simulation
 
 simulation_test!(insert_applies_cel_default, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -67,9 +67,9 @@ simulation_test!(
     insert_applies_cel_default_with_parameterized_snapshot_content,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -113,9 +113,9 @@ simulation_test!(
 
 simulation_test!(insert_select_applies_cel_default, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -162,9 +162,9 @@ simulation_test!(insert_select_applies_cel_default, |sim| async move {
 
 simulation_test!(insert_uses_json_default_fallback, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -196,9 +196,9 @@ simulation_test!(insert_uses_json_default_fallback, |sim| async move {
 
 simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -233,9 +233,9 @@ simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
 
 simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -267,9 +267,9 @@ simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
 
 simulation_test!(update_does_not_backfill_defaults, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -308,9 +308,9 @@ simulation_test!(update_does_not_backfill_defaults, |sim| async move {
 
 async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
     enable_deterministic_mode(&engine).await;
@@ -354,9 +354,9 @@ simulation_test!(
 
 async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
     enable_deterministic_mode(&engine).await;
@@ -408,9 +408,9 @@ simulation_test!(
 
 simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
 
     engine.initialize().await.unwrap();
 
@@ -439,9 +439,9 @@ simulation_test!(
     entity_and_direct_state_insert_share_defaulting_outcome,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 

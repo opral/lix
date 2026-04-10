@@ -82,7 +82,7 @@ export type ExecuteOptions = {
 	writerKey?: string | null;
 };
 
-export type OpenSessionOptions = {
+export type AdditionalSessionOptions = {
 	activeVersionId?: string;
 	activeAccountIds?: string[];
 };
@@ -108,7 +108,8 @@ export type InitLixResult = {
 	initialized: boolean;
 };
 
-export type Lix = {
+/** Additional scoped working context opened from a `Lix` handle. */
+export type Session = {
 	execute(
 		sql: string,
 		params?: ReadonlyArray<LixRuntimeValue>,
@@ -122,7 +123,12 @@ export type Lix = {
 	undo(args?: UndoOptions): Promise<UndoResult>;
 	redo(args?: RedoOptions): Promise<RedoResult>;
 	switchVersion(versionId: string): Promise<void>;
-	openChildSession(options?: OpenSessionOptions): Promise<Lix>;
+	openAdditionalSession(options?: AdditionalSessionOptions): Promise<Session>;
+	close(): Promise<void>;
+};
+
+/** Repository handle and workspace session shell. */
+export type Lix = Session & {
 	installPlugin(
 		args: InstallPluginOptions | Uint8Array | ArrayBuffer,
 	): Promise<void>;
@@ -363,12 +369,14 @@ function createLixHandle(args: {
 		await runQueued(() => (wasmLix as any).switchVersion(versionId));
 	};
 
-	const openChildSession = async (
-		options: OpenSessionOptions = {},
-	): Promise<Lix> => {
-		ensureOpen("openChildSession");
-		if (typeof (wasmLix as any).openChildSession !== "function") {
-			throw new Error("openChildSession is not available in this wasm build");
+	const openAdditionalSession = async (
+		options: AdditionalSessionOptions = {},
+	): Promise<Session> => {
+		ensureOpen("openAdditionalSession");
+		if (typeof (wasmLix as any).openAdditionalSession !== "function") {
+			throw new Error(
+				"openAdditionalSession is not available in this wasm build",
+			);
 		}
 		if (
 			options.activeVersionId !== undefined &&
@@ -376,7 +384,7 @@ function createLixHandle(args: {
 				options.activeVersionId.length === 0)
 		) {
 			throw new Error(
-				"openChildSession requires activeVersionId to be a non-empty string",
+				"openAdditionalSession requires activeVersionId to be a non-empty string",
 			);
 		}
 		if (
@@ -388,17 +396,17 @@ function createLixHandle(args: {
 				))
 		) {
 			throw new Error(
-				"openChildSession requires activeAccountIds to be an array of non-empty strings",
+				"openAdditionalSession requires activeAccountIds to be an array of non-empty strings",
 			);
 		}
 		const sessionWasmLix = await runQueued(() =>
-			(wasmLix as any).openChildSession(options),
+			(wasmLix as any).openAdditionalSession(options),
 		);
 		return createLixHandle({
 			backend,
 			wasmLix: sessionWasmLix,
 			closeBackendOnClose: false,
-		});
+		}) as Session;
 	};
 
 	const installPlugin = async (
@@ -591,7 +599,7 @@ function createLixHandle(args: {
 		undo,
 		redo,
 		switchVersion,
-		openChildSession,
+		openAdditionalSession,
 		installPlugin,
 		export_image,
 		close,

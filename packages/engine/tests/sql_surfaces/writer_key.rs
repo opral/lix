@@ -17,7 +17,7 @@ fn assert_integer(value: &Value, expected: i64) {
     }
 }
 
-async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_writer_key_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(&json!({
             "x-lix-key": "wk_writer_key_schema",
@@ -38,9 +38,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         register_writer_key_test_schema(&engine).await;
 
@@ -107,9 +107,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         register_writer_key_test_schema(&engine).await;
 

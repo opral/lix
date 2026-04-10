@@ -90,9 +90,9 @@ simulation_test!(
     install_plugin_persists_manifest_and_wasm,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -142,9 +142,9 @@ simulation_test!(
 
 simulation_test!(install_plugin_rejects_missing_manifest, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine
         .initialize()
         .await
@@ -163,9 +163,9 @@ simulation_test!(
     install_plugin_rejects_missing_entry_file,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -195,9 +195,9 @@ simulation_test!(
     install_plugin_rejects_missing_schema_file,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -230,9 +230,9 @@ simulation_test!(
     install_plugin_rejects_invalid_schema_json,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -266,9 +266,9 @@ simulation_test!(
     install_plugin_rejects_duplicate_schema_key_and_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -302,9 +302,9 @@ simulation_test!(
     install_plugin_rejects_path_traversal_entries,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -339,9 +339,9 @@ simulation_test!(
     install_plugin_is_atomic_when_schema_insert_fails,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await
@@ -396,9 +396,9 @@ simulation_test!(
     install_plugin_upsert_replaces_existing_row_by_key,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine
             .initialize()
             .await

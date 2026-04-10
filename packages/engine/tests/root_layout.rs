@@ -16,12 +16,7 @@ fn root_rs_whitelist_matches_phase_a_layout_contract() {
 
     // Root now keeps only entrypoints and test helpers. Ownership cuts moved
     // the former filesystem/materialization shims under truthful module owners.
-    let allowed = BTreeSet::from([
-        "api.rs".to_string(),
-        "engine.rs".to_string(),
-        "lib.rs".to_string(),
-        "test_support.rs".to_string(),
-    ]);
+    let allowed = BTreeSet::from(["lib.rs".to_string(), "test_support.rs".to_string()]);
 
     let unexpected = actual.difference(&allowed).cloned().collect::<Vec<_>>();
     let missing = allowed.difference(&actual).cloned().collect::<Vec<_>>();

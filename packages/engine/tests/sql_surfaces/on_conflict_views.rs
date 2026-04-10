@@ -9,7 +9,7 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
-async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -25,9 +25,9 @@ simulation_test!(
     on_conflict_entity_view_do_update_is_applied,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -65,9 +65,9 @@ simulation_test!(
     on_conflict_entity_by_version_do_update_is_applied,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
         let version_id = engine.active_version_id().await.unwrap();
 
@@ -109,9 +109,9 @@ simulation_test!(
     on_conflict_state_view_do_update_is_applied,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -166,9 +166,9 @@ simulation_test!(
     on_conflict_state_by_version_do_update_is_applied,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -217,9 +217,9 @@ simulation_test!(
     on_conflict_registered_schema_by_version_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let schema_json = "{\"x-lix-key\":\"on_conflict_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}";

@@ -12,9 +12,7 @@ fn as_text(value: &Value) -> String {
     }
 }
 
-async fn active_version_ref(
-    engine: &support::simulation_test::SimulationEngine,
-) -> (String, String) {
+async fn active_version_ref(engine: &support::simulation_test::SimulatedLix) -> (String, String) {
     let version_id = engine
         .active_version_id()
         .await
@@ -37,7 +35,7 @@ async fn active_version_ref(
 }
 
 async fn key_value_value(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     key: &str,
 ) -> Option<String> {
     let result = engine
@@ -54,9 +52,7 @@ async fn key_value_value(
         .map(as_text)
 }
 
-async fn checkpoint_label_id(
-    engine: &support::simulation_test::SimulationEngine,
-) -> Option<String> {
+async fn checkpoint_label_id(engine: &support::simulation_test::SimulatedLix) -> Option<String> {
     let result = engine
         .execute(
             "SELECT id FROM lix_label WHERE id = $1 LIMIT 1",
@@ -71,9 +67,7 @@ async fn checkpoint_label_id(
         .map(as_text)
 }
 
-async fn plugins_directory_id(
-    engine: &support::simulation_test::SimulationEngine,
-) -> Option<String> {
+async fn plugins_directory_id(engine: &support::simulation_test::SimulatedLix) -> Option<String> {
     let result = engine
         .execute(
             "SELECT id FROM lix_directory WHERE path = '/.lix/plugins/' LIMIT 1",
@@ -89,7 +83,7 @@ async fn plugins_directory_id(
 }
 
 async fn directory_descriptor_exists(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     id: &str,
 ) -> Option<String> {
     let result = engine
@@ -107,7 +101,7 @@ async fn directory_descriptor_exists(
 }
 
 async fn file_bytes(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     file_id: &str,
 ) -> Option<Vec<u8>> {
     let result = engine
@@ -130,9 +124,9 @@ async fn file_bytes(
 
 simulation_test!(undo_redo_reverts_insert_and_replays_it, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     let (version_id, _baseline_commit_id) = active_version_ref(&engine).await;
@@ -171,9 +165,9 @@ simulation_test!(
     empty_key_insert_is_rejected_without_poisoning_undo_history,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let (version_id, _baseline_commit_id) = active_version_ref(&engine).await;
@@ -211,9 +205,9 @@ simulation_test!(
     undo_rejects_bootstrap_boundary_on_fresh_project,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let error = engine
@@ -233,9 +227,9 @@ simulation_test!(
     undo_redo_undo_cycle_creates_distinct_operation_commits,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -259,9 +253,9 @@ simulation_test!(
 
 simulation_test!(undo_stops_after_last_user_commit, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -287,9 +281,9 @@ simulation_test!(undo_stops_after_last_user_commit, |sim| async move {
 
 simulation_test!(checkpoint_label_delete_is_rejected, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     let original_id = checkpoint_label_id(&engine)
@@ -315,9 +309,9 @@ simulation_test!(
     undo_restores_deleted_bootstrap_plugins_directory,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let original_id = plugins_directory_id(&engine)
@@ -351,9 +345,9 @@ simulation_test!(
     undo_redo_reverts_updates_to_prior_snapshot,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -394,9 +388,9 @@ simulation_test!(
     undo_redo_reverts_deletes_to_restore_rows,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         engine
@@ -429,9 +423,9 @@ simulation_test!(
 
 simulation_test!(undo_redo_replays_file_inserts, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -459,9 +453,9 @@ simulation_test!(undo_redo_replays_file_inserts, |sim| async move {
 
 simulation_test!(undo_clears_redo_after_new_tracked_write, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine_deterministic should succeed");
+        .expect("boot_simulated_lix_deterministic should succeed");
     engine.initialize().await.expect("init should succeed");
 
     engine
@@ -513,9 +507,9 @@ simulation_test!(
     undo_with_options_targets_non_active_version_without_switching_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let (main_version_id, _main_commit_id) = active_version_ref(&engine).await;
@@ -571,9 +565,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {

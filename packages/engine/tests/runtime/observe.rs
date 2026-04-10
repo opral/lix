@@ -1,7 +1,7 @@
 use crate::support;
 
 use lix_engine::wasm::NoopWasmRuntime;
-use lix_engine::{boot, BootArgs, CreateVersionOptions, Engine, ExecuteOptions};
+use lix_engine::{CreateVersionOptions, ExecuteOptions, Lix, LixConfig};
 use lix_engine::{ObserveQuery, Value};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -37,9 +37,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let mut observed = engine
@@ -92,9 +92,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let mut observed_a = engine
@@ -149,9 +149,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let mut observed = engine
@@ -192,9 +192,9 @@ simulation_test!(
     simulations = [sqlite],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let key = "observe-recover-json";
@@ -269,9 +269,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let mut observed = engine
@@ -312,9 +312,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         engine
@@ -365,9 +365,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let mut observed = engine
@@ -417,9 +417,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let branch = engine
@@ -545,9 +545,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let branch = engine
@@ -612,9 +612,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let branch = engine
@@ -727,9 +727,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         let result = engine.observe(ObserveQuery::new(
@@ -769,14 +769,8 @@ fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -838,14 +832,8 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -918,14 +906,8 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -983,14 +965,8 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -1055,14 +1031,8 @@ fn observe_external_same_writer_key_is_suppressed() {
             .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
-        let session_a = engine_a
-            .open_session()
-            .await
-            .expect("session_a should open");
-        let session_b = engine_b
-            .open_session()
-            .await
-            .expect("session_b should open");
+        let session_a = Arc::clone(&engine_a);
+        let session_b = Arc::clone(&engine_b);
 
         let mut observed = session_a
             .observe(ObserveQuery::new(
@@ -1117,14 +1087,8 @@ fn observe_external_different_writer_key_emits() {
             .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
-        let session_a = engine_a
-            .open_session()
-            .await
-            .expect("session_a should open");
-        let session_b = engine_b
-            .open_session()
-            .await
-            .expect("session_b should open");
+        let session_a = Arc::clone(&engine_a);
+        let session_b = Arc::clone(&engine_b);
 
         let mut observed = session_a
             .observe(ObserveQuery::new(
@@ -1181,14 +1145,8 @@ fn observe_external_null_writer_key_emits() {
             .initialize_if_needed()
             .await
             .expect("engine_b init should succeed");
-        let session_a = engine_a
-            .open_session()
-            .await
-            .expect("session_a should open");
-        let session_b = engine_b
-            .open_session()
-            .await
-            .expect("session_b should open");
+        let session_a = Arc::clone(&engine_a);
+        let session_b = Arc::clone(&engine_b);
 
         let mut observed = session_a
             .observe(ObserveQuery::new(
@@ -1242,14 +1200,8 @@ fn observe_external_read_only_transaction_does_not_emit() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -1299,14 +1251,8 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -1379,14 +1325,8 @@ fn observe_external_unrelated_mutation_does_not_emit() {
                 .initialize_if_needed()
                 .await
                 .expect("engine_b init should succeed");
-            let session_a = engine_a
-                .open_session()
-                .await
-                .expect("session_a should open");
-            let session_b = engine_b
-                .open_session()
-                .await
-                .expect("session_b should open");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
             let mut observed = session_a
                 .observe(ObserveQuery::new(
@@ -1416,12 +1356,12 @@ fn observe_external_unrelated_mutation_does_not_emit() {
     );
 }
 
-fn boot_sqlite_engine_at_path(path: PathBuf) -> Arc<Engine> {
+fn boot_sqlite_engine_at_path(path: PathBuf) -> Arc<Lix> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
     }
     let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
-    Arc::new(boot(BootArgs::new(
+    Arc::new(Lix::boot(LixConfig::new(
         support::simulations::sqlite_backend_with_filename(format!(
             "sqlite://{}",
             path.to_string_lossy()
@@ -1430,8 +1370,8 @@ fn boot_sqlite_engine_at_path(path: PathBuf) -> Arc<Engine> {
     )))
 }
 
-fn boot_postgres_engine_at_url(connection_string: String) -> Arc<Engine> {
-    Arc::new(boot(BootArgs::new(
+fn boot_postgres_engine_at_url(connection_string: String) -> Arc<Lix> {
+    Arc::new(Lix::boot(LixConfig::new(
         support::simulations::postgres_backend_with_connection_string(connection_string),
         Arc::new(NoopWasmRuntime),
     )))

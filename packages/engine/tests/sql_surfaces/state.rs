@@ -19,7 +19,7 @@ fn assert_missing_version_id_error(error: &LixError, version_id: &str) {
     );
 }
 
-async fn register_test_schema(engine: &support::simulation_test::SimulationEngine) {
+async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
@@ -32,7 +32,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulationEngin
 }
 
 async fn insert_state_row(
-    engine: &support::simulation_test::SimulationEngine,
+    engine: &support::simulation_test::SimulatedLix,
     entity_id: &str,
     version_id: &str,
     snapshot_content: &str,
@@ -54,9 +54,9 @@ async fn insert_state_row(
 
 simulation_test!(lix_state_select_exposes_commit_id, |sim| async move {
     let engine = sim
-        .boot_simulated_engine_deterministic()
+        .boot_simulated_lix_deterministic()
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     register_test_schema(&engine).await;
@@ -99,9 +99,9 @@ simulation_test!(
     lix_state_select_scopes_to_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -138,9 +138,9 @@ simulation_test!(
     lix_state_select_switches_with_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -189,9 +189,9 @@ simulation_test!(
     lix_state_current_and_by_version_reads_survive_boundary_sealing,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine_deterministic should succeed");
+            .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -296,9 +296,9 @@ simulation_test!(
     lix_state_select_prioritizes_untracked_in_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -346,9 +346,9 @@ simulation_test!(
     lix_state_select_without_schema_key_filter,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -384,9 +384,9 @@ simulation_test!(
     lix_state_select_rejects_version_id_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -427,9 +427,9 @@ simulation_test!(
     lix_state_select_rejects_lixcol_version_id_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -470,9 +470,9 @@ simulation_test!(
     lix_state_select_rejects_version_id_from_wrapped_subquery,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -513,9 +513,9 @@ simulation_test!(
     lix_state_select_reflects_untracked_entity_after_vtable_update,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -569,9 +569,9 @@ simulation_test!(
     lix_state_insert_routes_to_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -654,9 +654,9 @@ simulation_test!(
     lix_state_insert_routes_to_active_version_with_placeholders,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -706,9 +706,9 @@ simulation_test!(
     lix_state_by_version_insert_rejects_missing_version_id,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -733,9 +733,9 @@ simulation_test!(
     lix_state_insert_on_conflict_do_update_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -806,9 +806,9 @@ simulation_test!(
     lix_state_insert_on_conflict_do_nothing_is_supported,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine_deterministic()
+            .boot_simulated_lix_deterministic()
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -862,9 +862,9 @@ simulation_test!(
     lix_state_insert_rejects_explicit_version_id_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -898,9 +898,9 @@ simulation_test!(
     lix_state_update_routes_to_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -966,9 +966,9 @@ simulation_test!(
     lix_state_by_version_update_rejects_missing_version_id,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -994,9 +994,9 @@ simulation_test!(
     lix_state_update_supports_placeholder_schema_key_predicate,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1054,9 +1054,9 @@ simulation_test!(
     lix_state_update_allows_untracked_with_untracked_predicate,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1108,9 +1108,9 @@ simulation_test!(
     lix_state_update_without_untracked_predicate_updates_effective_untracked_row,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1193,9 +1193,9 @@ simulation_test!(
     lix_state_update_partitions_tracked_and_untracked_targets,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1274,9 +1274,9 @@ simulation_test!(
     lix_state_update_rejects_explicit_version_id_assignment,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1318,9 +1318,9 @@ simulation_test!(
     lix_state_update_rejects_version_id_predicate,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1362,9 +1362,9 @@ simulation_test!(
     lix_state_update_rejects_unknown_assignment_column,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1406,9 +1406,9 @@ simulation_test!(
     lix_state_delete_routes_to_active_version,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1488,9 +1488,9 @@ simulation_test!(
     lix_state_delete_allows_untracked_with_untracked_predicate,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;
@@ -1558,9 +1558,9 @@ simulation_test!(
     lix_state_delete_rejects_version_id_predicate,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
         engine.initialize().await.unwrap();
 
         register_test_schema(&engine).await;

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput};
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    boot, BootArgs, LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult,
-    Session, SqlDialect, TransactionMode, Value,
+    Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, PreparedBatch, QueryResult,
+    SqlDialect, TransactionMode, Value,
 };
 use std::collections::BTreeMap;
 use std::fs;
@@ -64,7 +64,7 @@ fn bench_lix_file_insert_history(c: &mut Criterion) {
 }
 
 struct BenchFixture {
-    session: Session,
+    lix: Arc<Lix>,
     _tempdir: TempDir,
 }
 
@@ -136,7 +136,7 @@ impl BenchFixture {
             params.push(Value::Blob(insert_payload_for_row(index)));
         }
         runtime
-            .block_on(self.session.execute(
+            .block_on(self.lix.execute(
                 "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?), (?, ?, ?), (?, ?, ?)",
                 &params,
             ))
@@ -164,18 +164,18 @@ fn build_template_with_trace(
         None => Box::new(backend),
     };
 
-    let engine = Arc::new(boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime))));
+    let lix = Arc::new(Lix::boot(LixConfig::new(
+        backend,
+        Arc::new(NoopWasmRuntime),
+    )));
     runtime
-        .block_on(engine.initialize())
-        .expect("engine initialization should succeed");
-    let session = runtime
-        .block_on(engine.open_session())
-        .expect("workspace session should open");
+        .block_on(lix.initialize())
+        .expect("lix initialization should succeed");
 
     for revision in 0..history_depth {
         let bucket = revision % EXISTING_BUCKET_COUNT;
         runtime
-            .block_on(session.execute(
+            .block_on(lix.execute(
                 "INSERT INTO lix_file (id, path, data) VALUES (?, ?, ?)",
                 &[
                     Value::Text(format!("bench-existing-{revision:04}")),
@@ -215,16 +215,16 @@ fn build_fixture_from_template_with_trace(
         None => Box::new(backend),
     };
 
-    let engine = Arc::new(boot(BootArgs::new(backend, Arc::new(NoopWasmRuntime))));
+    let lix = Arc::new(Lix::boot(LixConfig::new(
+        backend,
+        Arc::new(NoopWasmRuntime),
+    )));
     runtime
-        .block_on(engine.open_existing())
+        .block_on(lix.open_existing())
         .expect("existing template db should open");
-    let session = runtime
-        .block_on(engine.open_session())
-        .expect("workspace session should open");
 
     BenchFixture {
-        session,
+        lix,
         _tempdir: tempdir,
     }
 }

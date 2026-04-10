@@ -9,9 +9,7 @@ fn assert_text(value: &Value) -> String {
     }
 }
 
-async fn tracked_commit_state(
-    engine: &support::simulation_test::SimulationEngine,
-) -> (i64, String) {
+async fn tracked_commit_state(engine: &support::simulation_test::SimulatedLix) -> (i64, String) {
     let commit_count = engine
         .execute("SELECT COUNT(*) FROM lix_commit", &[])
         .await
@@ -38,9 +36,9 @@ async fn tracked_commit_state(
 
 simulation_test!(same_value_state_update_is_noop, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine
@@ -67,9 +65,9 @@ simulation_test!(same_value_state_update_is_noop, |sim| async move {
 
 simulation_test!(same_bytes_exact_file_update_is_noop, |sim| async move {
     let engine = sim
-        .boot_simulated_engine(None)
+        .boot_simulated_lix(None)
         .await
-        .expect("boot_simulated_engine should succeed");
+        .expect("boot_simulated_lix should succeed");
     engine.initialize().await.unwrap();
 
     engine

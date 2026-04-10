@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 
 use lix_engine::{ExecuteOptions, Value};
 use serde_json::Value as JsonValue;
-use support::simulation_test::SimulationEngine;
+use support::simulation_test::SimulatedLix;
 
 // JS parity scope for this file:
 // - packages/sdk/src/state/vtable/commit.test.ts
@@ -25,7 +25,7 @@ use support::simulation_test::SimulationEngine;
 // - lineage/ancestry materialization assertions
 // - change_author end-to-end via active accounts
 
-async fn register_test_schema(engine: &SimulationEngine) {
+async fn register_test_schema(engine: &SimulatedLix) {
     engine
         .execute(
             "INSERT INTO lix_registered_schema (value) VALUES (\
@@ -56,7 +56,7 @@ fn as_i64(value: &Value) -> i64 {
     }
 }
 
-async fn read_version_ref_commit_id(engine: &SimulationEngine, version_id: &str) -> String {
+async fn read_version_ref_commit_id(engine: &SimulatedLix, version_id: &str) -> String {
     let result = engine
         .execute(
             &format!(
@@ -80,7 +80,7 @@ async fn read_version_ref_commit_id(engine: &SimulationEngine, version_id: &str)
 }
 
 async fn matching_commit_change_set_ids(
-    engine: &SimulationEngine,
+    engine: &SimulatedLix,
     change_ids: &BTreeSet<String>,
 ) -> Vec<String> {
     let commit_snapshot_ids = engine
@@ -133,7 +133,7 @@ async fn matching_commit_change_set_ids(
 }
 
 async fn change_set_element_change_ids_for_change_set(
-    engine: &SimulationEngine,
+    engine: &SimulatedLix,
     change_set_id: &str,
 ) -> BTreeSet<String> {
     let cse_rows = engine
@@ -161,7 +161,7 @@ async fn change_set_element_change_ids_for_change_set(
     change_ids
 }
 
-async fn drop_commit_family_live_mirrors(engine: &SimulationEngine) {
+async fn drop_commit_family_live_mirrors(engine: &SimulatedLix) {
     for table in [
         "lix_internal_live_v1_lix_commit",
         "lix_internal_live_v1_lix_change_set_element",
@@ -179,9 +179,9 @@ simulation_test!(
     commit_writes_business_rows_to_change_and_snapshot_tables,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
@@ -321,9 +321,9 @@ simulation_test!(
     commit_family_rows_remain_visible_through_state_without_live_mirrors,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
@@ -453,9 +453,9 @@ simulation_test!(
     commit_with_no_tracked_rows_does_not_create_change_set_artifacts,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
@@ -515,9 +515,9 @@ simulation_test!(
     groups_changes_of_single_statement_into_same_change_set,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
@@ -571,9 +571,9 @@ simulation_test!(
     groups_changes_across_multiple_statements_in_single_transaction,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
@@ -632,9 +632,9 @@ simulation_test!(
     explicit_begin_commit_with_multiple_key_value_inserts_creates_single_commit_with_both_changes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -724,9 +724,9 @@ simulation_test!(
     transaction_handle_multiple_key_value_inserts_create_single_commit_with_both_changes,
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 
@@ -825,9 +825,9 @@ simulation_test!(
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
-            .boot_simulated_engine(None)
+            .boot_simulated_lix(None)
             .await
-            .expect("boot_simulated_engine should succeed");
+            .expect("boot_simulated_lix should succeed");
 
         engine.initialize().await.unwrap();
 

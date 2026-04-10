@@ -2,8 +2,8 @@
 //!
 //! `Session` owns workspace-scoped selectors such as the active version and
 //! active accounts. Those selectors may be persisted for the workspace session
-//! or kept ephemeral for child sessions, but they are distinct from canonical
-//! version refs and committed graph state.
+//! or kept ephemeral for additional scoped sessions, but they are distinct
+//! from canonical version refs and committed graph state.
 
 pub(crate) mod checkpoint_ops;
 pub(crate) mod collaborators;
@@ -74,13 +74,14 @@ use crate::sql::support::{reject_internal_table_writes, reject_public_create_tab
 use crate::{ExecuteResult, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
-pub struct OpenSessionOptions {
-    /// Ephemeral workspace selector override for the child session.
+pub struct AdditionalSessionOptions {
+    /// Ephemeral workspace selector override for the additional scoped session.
     ///
     /// This does not mutate replica-local version heads or committed history.
     pub active_version_id: Option<String>,
     #[serde(default)]
-    /// Ephemeral workspace account-selector override for the child session.
+    /// Ephemeral workspace account-selector override for the additional scoped
+    /// session.
     pub active_account_ids: Option<Vec<String>>,
 }
 
@@ -90,6 +91,12 @@ enum Persistence {
     Ephemeral,
 }
 
+/// Additional scoped working context.
+///
+/// `Session` owns session-scoped selectors such as the active version and
+/// active accounts. The workspace session inside [`crate::Lix`] uses this same
+/// type internally, and additional sessions can be opened explicitly when a
+/// caller needs a different scoped view over the same repository.
 pub struct Session {
     collaborators: Arc<SessionCollaborators>,
     // Session-local runtime state. Workspace sessions persist these selectors
@@ -140,12 +147,15 @@ impl Session {
         })
     }
 
-    /// Opens an ephemeral child session with optional workspace-selector
+    /// Opens an additional scoped session with optional workspace-selector
     /// overrides.
     ///
     /// The returned session may read or write committed state, but these
     /// overrides only affect workspace selection for that session.
-    pub async fn open_child_session(&self, options: OpenSessionOptions) -> Result<Self, LixError> {
+    pub async fn open_additional_session(
+        &self,
+        options: AdditionalSessionOptions,
+    ) -> Result<Self, LixError> {
         let active_version_id = options
             .active_version_id
             .unwrap_or_else(|| self.active_version_id());
@@ -375,6 +385,24 @@ impl Session {
     pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
         let registry = self.collaborators.load_public_surface_registry().await?;
         self.install_public_surface_registry(registry);
+        Ok(())
+    }
+
+    pub(crate) async fn reload_workspace_state_from_backend(&self) -> Result<(), LixError> {
+        if !self.should_persist_workspace_selectors() {
+            return Ok(());
+        }
+
+        let active_version_id =
+            require_workspace_active_version_id(self.collaborators.backend().as_ref()).await?;
+        let active_account_ids =
+            load_workspace_active_account_ids(self.collaborators.backend().as_ref())
+                .await?
+                .unwrap_or_default();
+
+        self.replace_active_version_id(active_version_id);
+        self.replace_active_account_ids(active_account_ids);
+        self.refresh_public_surface_registry().await?;
         Ok(())
     }
 
@@ -1155,8 +1183,8 @@ mod tests {
         }
     }
 
-    fn test_engine(backend: RecordingBackend) -> Arc<crate::Engine> {
-        Arc::new(crate::boot(crate::BootArgs::new(
+    fn test_lix(backend: RecordingBackend) -> Arc<crate::Lix> {
+        Arc::new(crate::Lix::boot(crate::LixConfig::new(
             Box::new(backend),
             Arc::new(crate::runtime::wasm::NoopWasmRuntime),
         )))
@@ -1233,9 +1261,9 @@ mod tests {
     fn plain_reads_use_read_transaction_mode() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
+            let lix = test_lix(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1253,9 +1281,9 @@ mod tests {
     fn deterministic_reads_classify_as_committed_runtime_mutation() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
+            let lix = test_lix(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1285,9 +1313,9 @@ mod tests {
     fn explicit_transaction_scripts_use_write_transaction_mode() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
+            let lix = test_lix(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1301,14 +1329,11 @@ mod tests {
     fn history_public_reads_use_deferred_transaction_mode() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
-            engine
-                .initialize()
-                .await
-                .expect("engine init should succeed");
+            let lix = test_lix(backend.clone());
+            lix.initialize().await.expect("lix init should succeed");
             backend.clear_modes();
-            let session = engine
-                .open_session()
+            let session = lix
+                .open_workspace_session()
                 .await
                 .expect("workspace session should open");
 
@@ -1325,14 +1350,11 @@ mod tests {
     fn lowered_committed_public_reads_use_read_transaction_mode() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
-            engine
-                .initialize()
-                .await
-                .expect("engine init should succeed");
+            let lix = test_lix(backend.clone());
+            lix.initialize().await.expect("lix init should succeed");
             backend.clear_modes();
-            let session = engine
-                .open_session()
+            let session = lix
+                .open_workspace_session()
                 .await
                 .expect("workspace session should open");
 
@@ -1349,13 +1371,10 @@ mod tests {
     fn lowered_committed_only_public_reads_use_read_transaction_mode() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
-            engine
-                .initialize()
-                .await
-                .expect("engine init should succeed");
-            let session = engine
-                .open_session()
+            let lix = test_lix(backend.clone());
+            lix.initialize().await.expect("lix init should succeed");
+            let session = lix
+                .open_workspace_session()
                 .await
                 .expect("workspace session should open");
 
@@ -1383,9 +1402,9 @@ mod tests {
     fn parser_stage_internal_storage_guard_rejects_before_backend_execution() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
+            let lix = test_lix(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1414,9 +1433,9 @@ mod tests {
     fn parser_stage_public_create_table_guard_rejects_before_backend_execution() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
-            let engine = test_engine(backend.clone());
+            let lix = test_lix(backend.clone());
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(engine.session_services()),
+                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
                 "version-test".to_string(),
                 Vec::new(),
             );
