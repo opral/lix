@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
+use crate::canonical::CanonicalChangeWrite;
 use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
@@ -67,7 +67,7 @@ where
     let commit_schema = builtin_schema_meta(COMMIT_SCHEMA_KEY)?;
     let change_set_schema = builtin_schema_meta(CHANGE_SET_SCHEMA_KEY)?;
     let effective_changes = collapse_staged_changes_last_wins(&args.changes);
-    let mut output_changes: Vec<ChangeRow> = effective_changes
+    let mut output_changes: Vec<CanonicalChangeWrite> = effective_changes
         .iter()
         .map(|change| sanitize_staged_change(change))
         .collect();
@@ -106,12 +106,12 @@ where
     }
 
     let unique_active_accounts = dedupe_ordered(&args.active_accounts);
-    let mut meta_changes: Vec<ChangeRow> = Vec::new();
+    let mut meta_changes: Vec<CanonicalChangeWrite> = Vec::new();
     let mut commit_row_index_by_version: BTreeMap<String, usize> = BTreeMap::new();
 
     for (version_id, meta) in &meta_by_version {
         let change_set_change_id = generate_uuid();
-        meta_changes.push(ChangeRow {
+        meta_changes.push(CanonicalChangeWrite {
             id: change_set_change_id,
             entity_id: expect_identity(meta.change_set_id.clone(), "change_set entity_id"),
             schema_key: expect_identity(CHANGE_SET_SCHEMA_KEY.to_string(), "change_set schema_key"),
@@ -134,7 +134,7 @@ where
         let commit_change_id = generate_uuid();
         let commit_row_idx = meta_changes.len();
         commit_row_index_by_version.insert(version_id.clone(), commit_row_idx);
-        meta_changes.push(ChangeRow {
+        meta_changes.push(CanonicalChangeWrite {
             id: commit_change_id,
             entity_id: expect_identity(meta.commit_id.clone(), "commit entity_id"),
             schema_key: expect_identity(COMMIT_SCHEMA_KEY.to_string(), "commit schema_key"),
@@ -251,16 +251,14 @@ where
         .collect();
 
     Ok(GenerateCommitResult {
-        canonical_output: CanonicalCommitOutput {
-            changes: output_changes,
-        },
+        canonical_changes: output_changes,
         updated_version_refs,
         affected_versions,
     })
 }
 
-fn sanitize_staged_change(change: &StagedChange) -> ChangeRow {
-    ChangeRow {
+fn sanitize_staged_change(change: &StagedChange) -> CanonicalChangeWrite {
+    CanonicalChangeWrite {
         id: require_staged_change_id(change).unwrap().to_string(),
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
@@ -535,7 +533,7 @@ mod tests {
 
     fn counts_by_schema(result: &GenerateCommitResult) -> BTreeMap<String, usize> {
         let mut counts = BTreeMap::new();
-        for row in &result.canonical_output.changes {
+        for row in &result.canonical_changes {
             *counts.entry(row.schema_key.to_string()).or_insert(0) += 1;
         }
         counts
@@ -577,8 +575,7 @@ mod tests {
         assert_eq!(counts.get("lix_change_set"), Some(&1));
         assert_eq!(counts.get("lix_commit"), Some(&1));
         let commit_row = result
-            .canonical_output
-            .changes
+            .canonical_changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
             .expect("expected commit row");
@@ -641,8 +638,7 @@ mod tests {
         assert_eq!(result.affected_versions, vec!["global".to_string()]);
 
         let commit_row = result
-            .canonical_output
-            .changes
+            .canonical_changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
             .expect("expected commit row");
@@ -697,8 +693,7 @@ mod tests {
         assert_eq!(result.updated_version_refs.len(), 2);
 
         let commit_rows: Vec<_> = result
-            .canonical_output
-            .changes
+            .canonical_changes
             .iter()
             .filter(|row| row.schema_key == "lix_commit")
             .collect();
@@ -753,16 +748,14 @@ mod tests {
         .expect("generate_commit should succeed");
 
         let change_ids = result
-            .canonical_output
-            .changes
+            .canonical_changes
             .iter()
             .filter(|row| row.schema_key == "lix_key_value")
             .map(|row| row.id.clone())
             .collect::<Vec<_>>();
         assert_eq!(change_ids, vec!["chg_b1", "chg_a2"]);
         let commit_row = result
-            .canonical_output
-            .changes
+            .canonical_changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
             .expect("expected commit row");
@@ -867,8 +860,7 @@ mod tests {
         assert_eq!(counts.get("lix_commit"), Some(&1));
         assert_eq!(counts.get("lix_key_value"), None);
         let commit_row = result
-            .canonical_output
-            .changes
+            .canonical_changes
             .iter()
             .find(|row| row.schema_key == "lix_commit")
             .expect("expected commit row");

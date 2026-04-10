@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::journal::CanonicalCommitOutput;
+use crate::canonical::CanonicalChangeWrite;
 use crate::contracts::change::TrackedChangeView;
 use crate::live_state::LiveRow;
 use crate::session::version_ops::VersionInfo;
@@ -175,7 +175,7 @@ pub struct GenerateCommitArgs {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GenerateCommitResult {
-    pub canonical_output: CanonicalCommitOutput,
+    pub canonical_changes: Vec<CanonicalChangeWrite>,
     pub updated_version_refs: Vec<UpdatedVersionRef>,
     pub affected_versions: Vec<String>,
 }

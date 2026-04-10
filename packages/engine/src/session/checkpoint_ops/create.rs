@@ -1,9 +1,9 @@
 use crate::backend::TransactionBackendAdapter;
-use crate::canonical::checkpoint_labels::{
+use crate::canonical::load_commit as load_canonical_commit;
+use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
-use crate::canonical::read::load_commit_lineage_entry_by_id;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
@@ -95,8 +95,8 @@ async fn load_commit(
     tx: &mut SessionTransaction<'_>,
     commit_id: &str,
 ) -> Result<Option<CommitRow>, LixError> {
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
-    let Some(commit) = load_commit_lineage_entry_by_id(&mut executor, commit_id).await? else {
+    let mut executor = tx.backend_transaction_mut()?;
+    let Some(commit) = load_canonical_commit(&mut executor, commit_id).await? else {
         return Ok(None);
     };
     Ok(Some(CommitRow {

@@ -106,18 +106,16 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
                 )
             })?
             .into_iter()
-            .map(
-                |head| crate::canonical::checkpoint_labels::CheckpointVersionHeadFact {
-                    version_id: head.version_id,
-                    head_commit_id: head.head_commit_id,
-                },
-            )
+            .map(|head| crate::canonical::CheckpointVersionHeadFact {
+                version_id: head.version_id,
+                head_commit_id: head.head_commit_id,
+            })
             .collect::<Vec<_>>()
         };
-        canonical::checkpoint_labels::seed_bootstrap(&mut init, &checkpoint_version_heads)
+        canonical::seed_checkpoint_labels_bootstrap(&mut init, &checkpoint_version_heads)
             .await
             .map_err(|error| {
-                init_step_error("canonical::checkpoint_labels::seed_bootstrap", error)
+                init_step_error("canonical::seed_checkpoint_labels_bootstrap", error)
             })?;
         init.seed_boot_config_key_values(&default_active_version_id)
             .await

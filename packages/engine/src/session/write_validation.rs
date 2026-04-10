@@ -15,9 +15,7 @@ use std::sync::Arc;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
-use crate::canonical::checkpoint_labels::{
-    CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
-};
+use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
 use crate::common::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };

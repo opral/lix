@@ -1,17 +1,16 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::canonical::read::{
-    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
-};
+use crate::canonical::CanonicalStateIdentity;
 use crate::common::text::escape_sql_string;
+use crate::session::version_ops::load_exact_canonical_row_at_version_head_with_executor;
 use crate::surface_sql::version::build_admin_version_source_sql_with_current_heads;
 use crate::version_state::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
-    parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
+    parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_schema_key,
+    GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VersionDescriptorRow {
@@ -39,44 +38,22 @@ pub(crate) async fn load_version_descriptor_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionDescriptorRow>, LixError> {
-    let Some(global_head_commit_id) =
-        load_local_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
-    else {
-        return Ok(None);
-    };
-    let row = load_exact_committed_state_row_from_commit_with_executor(
+    let row = load_exact_canonical_row_at_version_head_with_executor(
         executor,
-        &global_head_commit_id,
-        &ExactCommittedStateRowRequest {
+        GLOBAL_VERSION_ID,
+        &CanonicalStateIdentity {
             entity_id: version_id.to_string(),
             schema_key: version_descriptor_schema_key().to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            exact_filters: BTreeMap::from([
-                (
-                    "file_id".to_string(),
-                    Value::Text(version_descriptor_file_id().to_string()),
-                ),
-                (
-                    "plugin_key".to_string(),
-                    Value::Text(version_descriptor_plugin_key().to_string()),
-                ),
-                (
-                    "schema_version".to_string(),
-                    Value::Text(version_descriptor_schema_version().to_string()),
-                ),
-            ]),
+            file_id: version_descriptor_file_id().to_string(),
         },
     )
     .await?;
     let Some(row) = row else {
         return Ok(None);
     };
-    let Some(Value::Text(snapshot_content)) = row.values.get("snapshot_content") else {
-        return Ok(None);
-    };
     Ok(Some(parse_descriptor_row(
-        snapshot_content,
-        row.source_change_id,
+        &row.snapshot_content,
+        Some(row.source_change_id),
     )?))
 }
 

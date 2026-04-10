@@ -1,22 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::backend::QueryExecutor;
 use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
-use crate::canonical::graph::{
-    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
-};
-use crate::canonical::journal::{
-    build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
-};
-use crate::canonical::json::CanonicalJson;
-use crate::canonical::read::CommitQueryExecutor;
+use crate::canonical::append_changes;
 use crate::contracts::artifacts::{PendingPublicCommitLane, PendingPublicCommitSession};
 use crate::contracts::functions::LixFunctionProvider;
 use crate::execution::write::filesystem::runtime::BinaryBlobWrite;
 use crate::execution::write::transaction::{execute_write_program_with_transaction, WriteProgram};
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
 use crate::{
-    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
-    LixBackendTransaction, LixError, QueryResult, Value, VersionId,
+    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
+    FileId, LixBackendTransaction, LixError, QueryResult, Value, VersionId,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -37,7 +31,7 @@ struct TransactionCommitExecutor<'a> {
 }
 
 #[async_trait::async_trait(?Send)]
-impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
+impl QueryExecutor for TransactionCommitExecutor<'_> {
     fn dialect(&self) -> crate::SqlDialect {
         self.transaction.dialect()
     }
@@ -331,14 +325,11 @@ fn rewrite_generated_commit_result_for_pending_session(
         .collect();
 
     Ok(GenerateCommitResult {
-        canonical_output: CanonicalCommitOutput {
-            changes: generated
-                .canonical_output
-                .changes
-                .into_iter()
-                .take(change_count)
-                .collect(),
-        },
+        canonical_changes: generated
+            .canonical_changes
+            .into_iter()
+            .take(change_count)
+            .collect(),
         updated_version_refs,
         affected_versions: generated.affected_versions,
     })
@@ -381,19 +372,7 @@ async fn execute_generated_commit_result(
     functions: &mut dyn LixFunctionProvider,
     tracked_live_rows: &[crate::live_state::LiveRow],
 ) -> Result<CanonicalCommitReceipt, LixError> {
-    let mut executor = &mut *transaction;
-    let commit_graph_rows =
-        resolve_commit_graph_node_write_rows_with_executor(&mut executor, &result.canonical_output)
-            .await?;
-    let mut prepared = build_prepared_batch_from_canonical_output(
-        &result.canonical_output,
-        functions,
-        transaction.dialect(),
-    )?;
-    prepared.extend(build_commit_graph_node_prepared_batch(
-        &commit_graph_rows,
-        transaction.dialect(),
-    )?);
+    append_changes(transaction, &result.canonical_changes, functions).await?;
     let mut program = WriteProgram::new();
     if !binary_blob_writes.is_empty() {
         let payloads = binary_blob_writes
@@ -410,7 +389,6 @@ async fn execute_generated_commit_result(
             &payloads,
         )?);
     }
-    program.push_batch(prepared);
     execute_write_program_with_transaction(transaction, program).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
     let untracked_live_rows =
@@ -428,7 +406,7 @@ async fn execute_generated_commit_result(
 fn canonical_commit_receipt_from_generated_result(
     result: &GenerateCommitResult,
 ) -> Result<CanonicalCommitReceipt, LixError> {
-    let replay_cursor = latest_replay_cursor_from_change_rows(&result.canonical_output.changes)
+    let replay_cursor = latest_replay_cursor_from_change_rows(&result.canonical_changes)
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",

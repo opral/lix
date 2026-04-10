@@ -370,7 +370,7 @@ async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixBackendTransaction,
     applied_output: &CreateCommitAppliedOutput,
 ) -> Result<(), LixError> {
-    for row in &applied_output.canonical_output.changes {
+    for row in &applied_output.canonical_changes {
         if row.schema_key != REGISTERED_SCHEMA_KEY {
             continue;
         }
