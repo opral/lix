@@ -1,13 +1,13 @@
 //! Compiler-owned public surface source SQL builders.
 
 use crate::catalog::{RelationBinding, SurfaceBinding, SurfaceVariant};
-use crate::common::naming::tracked_relation_name;
-use crate::contracts::artifacts::EffectiveStateRequest;
-use crate::contracts::version_artifacts::{
+use crate::contracts::EffectiveStateRequest;
+use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{
     version_descriptor_schema_key, version_ref_file_id, version_ref_plugin_key,
     version_ref_schema_key, version_ref_schema_version,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
+use crate::live_state::tracked_relation_name;
 use crate::live_state::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
     snapshot_select_expr_for_schema, WRITER_KEY_TABLE,

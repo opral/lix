@@ -5,12 +5,12 @@ use sqlparser::ast::{
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ExecutionRuntimeEffects {
-    pub(crate) requires_deterministic_sequence_persistence: bool,
+pub struct ExecutionRuntimeEffects {
+    pub requires_deterministic_sequence_persistence: bool,
 }
 
 impl ExecutionRuntimeEffects {
-    pub(crate) fn merge(self, other: Self) -> Self {
+    pub fn merge(self, other: Self) -> Self {
         Self {
             requires_deterministic_sequence_persistence: self
                 .requires_deterministic_sequence_persistence
@@ -19,9 +19,7 @@ impl ExecutionRuntimeEffects {
     }
 }
 
-pub(crate) fn derive_execution_runtime_effects(
-    statements: &[Statement],
-) -> ExecutionRuntimeEffects {
+pub fn derive_execution_runtime_effects(statements: &[Statement]) -> ExecutionRuntimeEffects {
     statements
         .iter()
         .fold(ExecutionRuntimeEffects::default(), |effects, statement| {

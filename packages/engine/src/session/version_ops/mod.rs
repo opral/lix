@@ -31,11 +31,11 @@ pub use merge::{ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, MergeVe
 pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
 
 #[async_trait(?Send)]
-impl crate::contracts::traits::CommittedStateHistoryReader for dyn crate::LixBackend + '_ {
+impl crate::contracts::CommittedStateHistoryReader for dyn crate::LixBackend + '_ {
     async fn load_committed_state_history_rows(
         &self,
-        request: &crate::contracts::artifacts::StateHistoryRequest,
-    ) -> Result<Vec<crate::contracts::artifacts::StateHistoryRow>, crate::LixError> {
+        request: &crate::contracts::StateHistoryRequest,
+    ) -> Result<Vec<crate::contracts::StateHistoryRow>, crate::LixError> {
         state_history::load_state_history_rows(self, request).await
     }
 }

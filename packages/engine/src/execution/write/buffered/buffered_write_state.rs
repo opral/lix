@@ -1,6 +1,6 @@
 use super::BufferedWriteJournal;
 use super::PlannedWriteDelta;
-use crate::contracts::artifacts::StateCommitStreamChange;
+use crate::contracts::StateCommitStreamChange;
 use crate::execution::write::overlay::PendingTransactionView;
 use crate::execution::write::TransactionCommitOutcome;
 use crate::LixError;

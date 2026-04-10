@@ -13,17 +13,17 @@ mod sql_adapter;
 pub(crate) mod transaction;
 #[cfg(test)]
 mod transaction_tests;
+pub use crate::contracts::TransactionCommitOutcome;
+pub(crate) use crate::contracts::{
+    BufferedWriteExecutionInput, PreparedWriteRuntimeState, TrackedCommitExecutionOutcome,
+};
 pub(crate) use buffered::PlannedWriteDelta;
 pub(crate) use buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionRoute, BufferedWriteSessionEffects,
 };
-pub use contracts::TransactionCommitOutcome;
-pub(crate) use contracts::{
-    BufferedWriteExecutionInput, DeferredTransactionSideEffects, PreparedWriteRuntimeState,
-    TrackedCommitExecutionOutcome, WriteExecutionBindings,
-};
 #[cfg(test)]
 pub use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
+pub(crate) use contracts::{DeferredTransactionSideEffects, WriteExecutionBindings};
 pub(crate) use observe_tick::append_observe_tick_in_transaction;
 pub(crate) use overlay::PendingTransactionView;
 pub(crate) use plugin_install::{

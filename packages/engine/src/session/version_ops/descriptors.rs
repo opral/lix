@@ -6,11 +6,11 @@ use crate::canonical::{
 };
 use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::common::text::escape_sql_string;
-use crate::contracts::version_artifacts::{
+use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::session::version_ops::{
     load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
 };

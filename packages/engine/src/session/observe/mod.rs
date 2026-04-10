@@ -1,6 +1,6 @@
 use crate::common::errors;
 use crate::common::wire::WireValue;
-use crate::contracts::artifacts::SessionDependency;
+use crate::contracts::SessionDependency;
 use crate::session::Session;
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::prepare::dependency_spec::{

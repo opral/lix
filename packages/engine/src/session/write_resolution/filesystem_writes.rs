@@ -10,7 +10,7 @@ use crate::common::paths::filesystem::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::contracts::traits::PendingView;
+use crate::contracts::PendingView;
 use crate::execution::write::filesystem::query::{
     ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
     load_directory_row_by_id_with_pending_transaction_view, load_directory_rows_under_path,
@@ -947,7 +947,7 @@ fn ensure_file_state_entry<'a>(
             version_id: version_id.to_string(),
             untracked,
             descriptor: None,
-            metadata_patch: crate::contracts::artifacts::OptionalTextPatch::Unchanged,
+            metadata_patch: crate::contracts::OptionalTextPatch::Unchanged,
             data: None,
             deleted: false,
         })
@@ -964,7 +964,7 @@ fn set_filesystem_descriptor_state(
     entry.untracked = untracked;
     entry.deleted = false;
     entry.descriptor = Some(descriptor);
-    entry.metadata_patch = crate::contracts::artifacts::OptionalTextPatch::Unchanged;
+    entry.metadata_patch = crate::contracts::OptionalTextPatch::Unchanged;
 }
 
 fn set_filesystem_data_state(
@@ -991,7 +991,7 @@ fn set_filesystem_deleted_state(
     entry.deleted = true;
     entry.descriptor = None;
     entry.data = None;
-    entry.metadata_patch = crate::contracts::artifacts::OptionalTextPatch::Unchanged;
+    entry.metadata_patch = crate::contracts::OptionalTextPatch::Unchanged;
 }
 
 async fn resolve_missing_directory_rows(

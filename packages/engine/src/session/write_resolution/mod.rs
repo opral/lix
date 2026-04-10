@@ -2,15 +2,15 @@ pub(crate) mod effective_state;
 pub(crate) mod prepared_artifacts;
 
 use crate::catalog::SurfaceFamily;
-use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
-use crate::contracts::version_artifacts::{
+use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
     version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
     version_ref_snapshot_content,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::contracts::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
 use crate::execution::write::filesystem::query::FilesystemQueryError;
 use crate::session::write_resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
@@ -150,7 +150,7 @@ impl ResolvedWritePartitionBuilder {
                     || file.data.is_some()
                     || !matches!(
                         file.metadata_patch,
-                        crate::contracts::artifacts::OptionalTextPatch::Unchanged
+                        crate::contracts::OptionalTextPatch::Unchanged
                     )
             });
         }
@@ -1150,7 +1150,7 @@ fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteR
 #[cfg(test)]
 mod tests {
     use super::ResolvedWritePartitionBuilder;
-    use crate::contracts::artifacts::PlannedStateRow;
+    use crate::contracts::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
 

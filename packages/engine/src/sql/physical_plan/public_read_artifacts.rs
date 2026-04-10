@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::catalog::SurfaceFamily;
-use crate::contracts::artifacts::EffectiveStateRequest;
+use crate::contracts::EffectiveStateRequest;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;
@@ -103,7 +103,9 @@ pub(crate) fn select_specialized_public_read_artifact(
     ))
 }
 
-fn read_time_projection_pushdown_decision(structured_read: &StructuredPublicRead) -> PushdownDecision {
+fn read_time_projection_pushdown_decision(
+    structured_read: &StructuredPublicRead,
+) -> PushdownDecision {
     let residual_predicates = structured_read.query.selection_predicates.clone();
     let reason = match structured_read.surface_binding.descriptor.surface_family {
         SurfaceFamily::Filesystem => {

@@ -3,10 +3,10 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::contracts::artifacts::{
+use crate::contracts::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
 };
-use crate::contracts::traits::{LiveReadShapeContract, LiveStateQueryBackend};
+use crate::contracts::{LiveReadShapeContract, LiveStateQueryBackend};
 use crate::{LixBackend, LixError, Value};
 
 use super::schema_access::LiveReadContract;
@@ -207,7 +207,7 @@ impl LiveStateQueryBackend for dyn LixBackend + '_ {
 
     async fn load_live_state_projection_status(
         &self,
-    ) -> Result<crate::contracts::artifacts::LiveStateProjectionStatus, LixError> {
+    ) -> Result<crate::contracts::LiveStateProjectionStatus, LixError> {
         super::projection::status::load_live_state_projection_status_with_backend(self).await
     }
 }

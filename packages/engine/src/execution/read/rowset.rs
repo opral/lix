@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{
+use crate::contracts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
@@ -250,15 +250,15 @@ mod tests {
 
     use super::{execute_read_time_projection_read, execute_read_time_projection_rows};
     use crate::catalog::{bind_named_relation, RelationBindContext};
-    use crate::contracts::artifacts::{
-        PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
-        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
-    };
-    use crate::contracts::version_artifacts::{
+    use crate::contracts::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_snapshot_content,
+    };
+    use crate::contracts::{
+        PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
+        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
     };
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;

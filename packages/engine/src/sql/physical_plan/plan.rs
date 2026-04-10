@@ -1,5 +1,5 @@
 use crate::catalog::SurfaceBinding;
-use crate::contracts::artifacts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionRead};
+use crate::contracts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionRead};
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};

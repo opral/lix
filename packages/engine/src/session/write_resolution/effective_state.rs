@@ -1,7 +1,7 @@
-use crate::contracts::traits::{
+use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{
     LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingStateOverlay,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRow, LiveRowSemantics};
 use crate::session::write_resolution::prepared_artifacts::{
     overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,

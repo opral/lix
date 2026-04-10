@@ -32,6 +32,7 @@ pub(crate) mod effective;
 mod init;
 pub(crate) mod lifecycle;
 pub(crate) mod materialize;
+pub(crate) mod naming;
 #[allow(dead_code)]
 pub(crate) mod projection;
 mod query_contracts;
@@ -53,11 +54,11 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 #[allow(unused_imports)]
-pub(crate) use crate::contracts::artifacts::{
+pub(crate) use crate::contracts::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
     LiveStateProjectionStatus, SchemaRegistrationSet,
 };
-pub use crate::contracts::artifacts::{LiveStateMode, SchemaRegistration};
+pub use crate::contracts::{LiveStateMode, SchemaRegistration};
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 pub use effective::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
@@ -101,6 +102,7 @@ pub(crate) use visible_rows::{
 pub(crate) use writer_key::WRITER_KEY_TABLE;
 
 pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;
+pub(crate) use naming::{tracked_relation_name, INTERNAL_RELATION_PREFIX};
 pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str =
     "lix_internal_registered_schema_bootstrap";
 pub(crate) const FILE_DATA_CACHE_TABLE: &str = "lix_internal_file_data_cache";
@@ -128,7 +130,7 @@ pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionSta
 pub(crate) async fn derive_read_time_surface_rows(
     backend: &dyn LixBackend,
     registry: &crate::catalog::CatalogProjectionRegistry,
-    artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
+    artifact: &crate::contracts::ReadTimeProjectionRead,
 ) -> Result<Vec<crate::catalog::CatalogDerivedRow>, LixError> {
     projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry, artifact)
         .await
@@ -336,10 +338,10 @@ pub(crate) async fn rebuild_scope_in_transaction(
 }
 
 #[async_trait(?Send)]
-impl crate::contracts::traits::LiveStateTransactionBridge for dyn LixBackendTransaction + '_ {
+impl crate::contracts::LiveStateTransactionBridge for dyn LixBackendTransaction + '_ {
     async fn register_live_state_schema(
         &mut self,
-        registration: &crate::contracts::artifacts::SchemaRegistration,
+        registration: &crate::contracts::SchemaRegistration,
     ) -> Result<(), LixError> {
         register_schema_in_transaction(self, registration.clone()).await
     }

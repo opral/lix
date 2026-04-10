@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{EffectiveStateRequest, EffectiveStateVersionScope};
+use crate::contracts::{EffectiveStateRequest, EffectiveStateVersionScope};
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };

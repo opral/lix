@@ -1,8 +1,8 @@
-use crate::contracts::artifacts::{
+use crate::contracts::TrackedChangeView;
+use crate::contracts::{
     MutationOperation, MutationRow, PlannedStateRow, StateCommitStreamChange,
     StateCommitStreamOperation,
 };
-use crate::contracts::change::TrackedChangeView;
 use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
@@ -35,19 +35,19 @@ impl Default for StateCommitStreamFilter {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct StateCommitStreamRuntimeMetadata {
-    pub(crate) writer_key: Option<String>,
+pub struct StateCommitStreamRuntimeMetadata {
+    pub writer_key: Option<String>,
 }
 
 impl StateCommitStreamRuntimeMetadata {
-    pub(crate) fn from_runtime_writer_key(writer_key: Option<&str>) -> Self {
+    pub fn from_runtime_writer_key(writer_key: Option<&str>) -> Self {
         Self {
             writer_key: writer_key.map(str::to_string),
         }
     }
 }
 
-pub(crate) fn state_commit_stream_changes_from_mutations(
+pub fn state_commit_stream_changes_from_mutations(
     mutations: &[MutationRow],
     runtime_metadata: StateCommitStreamRuntimeMetadata,
 ) -> Vec<StateCommitStreamChange> {
@@ -72,7 +72,7 @@ pub(crate) fn state_commit_stream_changes_from_mutations(
         .collect()
 }
 
-pub(crate) fn state_commit_stream_changes_from_changes<Change: TrackedChangeView>(
+pub fn state_commit_stream_changes_from_changes<Change: TrackedChangeView>(
     changes: &[Change],
     operation: StateCommitStreamOperation,
     runtime_metadata: StateCommitStreamRuntimeMetadata,
@@ -129,7 +129,7 @@ pub(crate) fn state_commit_stream_changes_from_changes<Change: TrackedChangeView
     Ok(resolved)
 }
 
-pub(crate) fn state_commit_stream_changes_from_planned_rows(
+pub fn state_commit_stream_changes_from_planned_rows(
     rows: &[PlannedStateRow],
     operation: StateCommitStreamOperation,
     untracked: bool,
@@ -169,7 +169,7 @@ pub(crate) fn state_commit_stream_changes_from_planned_rows(
     Ok(resolved)
 }
 
-pub(crate) fn should_invalidate_deterministic_settings_cache(
+pub fn should_invalidate_deterministic_settings_cache(
     mutations: &[MutationRow],
     state_commit_stream_changes: &[StateCommitStreamChange],
 ) -> bool {
@@ -240,7 +240,7 @@ mod tests {
         state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
         StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
-    use crate::contracts::artifacts::PlannedStateRow;
+    use crate::contracts::PlannedStateRow;
     use crate::session::version_ops::commit::StagedChange;
     use crate::Value;
     use std::collections::BTreeMap;

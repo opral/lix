@@ -5,8 +5,8 @@ use crate::catalog::{
     FilesystemProjectionScope, FilesystemRelationBinding, FilesystemRelationKind,
     StoredVersionHeadSourceBinding, VersionHeadSourceBinding, VersionRelationBinding,
 };
-use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
+use crate::live_state::tracked_relation_name;
 use crate::live_state::{payload_column_name_for_schema, WRITER_KEY_TABLE};
 use crate::sql::physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::{LixError, SqlDialect};

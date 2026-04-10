@@ -1,5 +1,5 @@
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::functions::DynFunctionProvider;
+use crate::contracts::DynFunctionProvider;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,

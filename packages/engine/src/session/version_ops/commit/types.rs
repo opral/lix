@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::CanonicalChangeWrite;
-use crate::contracts::change::TrackedChangeView;
+use crate::contracts::TrackedChangeView;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::LiveRow;
 use crate::session::version_ops::VersionInfo;
@@ -144,13 +144,11 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
         .iter()
         .map(|update| LiveRow {
             entity_id: update.version_id.to_string(),
-            file_id: crate::contracts::version_artifacts::version_ref_file_id().to_string(),
-            schema_key: crate::contracts::version_artifacts::version_ref_schema_key().to_string(),
-            schema_version: crate::contracts::version_artifacts::version_ref_schema_version()
-                .to_string(),
-            version_id: crate::contracts::version_artifacts::version_ref_storage_version_id()
-                .to_string(),
-            plugin_key: crate::contracts::version_artifacts::version_ref_plugin_key().to_string(),
+            file_id: crate::contracts::version_ref_file_id().to_string(),
+            schema_key: crate::contracts::version_ref_schema_key().to_string(),
+            schema_version: crate::contracts::version_ref_schema_version().to_string(),
+            version_id: crate::contracts::version_ref_storage_version_id().to_string(),
+            plugin_key: crate::contracts::version_ref_plugin_key().to_string(),
             metadata: None,
             change_id: None,
             writer_key: None,
@@ -158,12 +156,10 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
             untracked: true,
             created_at: Some(update.created_at.clone()),
             updated_at: Some(update.created_at.clone()),
-            snapshot_content: Some(
-                crate::contracts::version_artifacts::version_ref_snapshot_content(
-                    update.version_id.as_str(),
-                    &update.commit_id,
-                ),
-            ),
+            snapshot_content: Some(crate::contracts::version_ref_snapshot_content(
+                update.version_id.as_str(),
+                &update.commit_id,
+            )),
         })
         .collect()
 }

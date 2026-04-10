@@ -2,17 +2,15 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
+use crate::contracts::EffectiveRowsResolver;
+use crate::contracts::LiveReadContext as ReadContext;
+use crate::contracts::WriterKeyReadView;
 #[cfg(test)]
-use crate::contracts::artifacts::{
-    exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest,
-};
-use crate::contracts::artifacts::{
+use crate::contracts::{exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest};
+use crate::contracts::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowSet, EffectiveRowState, EffectiveRowsRequest,
     LaneResult, OverlayLane,
 };
-use crate::contracts::traits::EffectiveRowsResolver;
-use crate::contracts::traits::LiveReadContext as ReadContext;
-use crate::contracts::traits::WriterKeyReadView;
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
@@ -88,7 +86,7 @@ pub(crate) async fn resolve_effective_row(
                             schema_key: request.schema_key.clone(),
                             version_id: storage_version_id,
                             constraints: exact_row_constraints(
-                                &crate::contracts::artifacts::ExactRowRequest {
+                                &crate::contracts::ExactRowRequest {
                                     schema_key: request.schema_key.clone(),
                                     version_id: request.version_id.clone(),
                                     entity_id: request.entity_id.clone(),

@@ -1,6 +1,5 @@
-const TRACKED_LIVE_TABLE_PREFIX: &str = "lix_internal_live_v1_";
 pub(crate) const INTERNAL_RELATION_PREFIX: &str = "lix_internal_";
 
 pub(crate) fn tracked_relation_name(schema_key: &str) -> String {
-    format!("{TRACKED_LIVE_TABLE_PREFIX}{schema_key}")
+    format!("{}{schema_key}", super::TRACKED_RELATION_PREFIX)
 }

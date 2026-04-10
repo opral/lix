@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::FilesystemPayloadChange;
+use crate::contracts::FilesystemPayloadChange;
 use crate::execution::write::filesystem::runtime::{
     build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,

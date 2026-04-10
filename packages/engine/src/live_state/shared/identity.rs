@@ -1,1 +1,1 @@
-pub use crate::contracts::artifacts::RowIdentity;
+pub use crate::contracts::RowIdentity;

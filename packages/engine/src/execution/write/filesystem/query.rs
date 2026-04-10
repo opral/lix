@@ -1,12 +1,12 @@
 use crate::catalog::FilesystemProjectionScope;
-use crate::common::naming::tracked_relation_name;
 use crate::common::paths::filesystem::{
     compose_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::common::text::escape_sql_string;
-use crate::contracts::traits::{
+use crate::contracts::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
+use crate::live_state::tracked_relation_name;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;

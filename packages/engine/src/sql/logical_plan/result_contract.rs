@@ -1,1 +1,1 @@
-pub(crate) use crate::contracts::artifacts::{result_contract_for_statements, ResultContract};
+pub(crate) use crate::contracts::{result_contract_for_statements, ResultContract};

@@ -5,7 +5,7 @@
 //! systems can rebuild derived state from them later.
 
 use crate::backend::prepared::{PreparedBatch, PreparedStatement};
-use crate::contracts::functions::LixFunctionProvider;
+use crate::contracts::LixFunctionProvider;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, LixError, SqlDialect, Value,
