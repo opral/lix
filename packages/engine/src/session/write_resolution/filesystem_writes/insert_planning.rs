@@ -1,5 +1,5 @@
 use crate::catalog::FilesystemProjectionScope;
-use crate::common::paths::filesystem::{
+use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };

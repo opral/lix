@@ -5,8 +5,8 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
 use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
-use crate::common::error::LixError;
-use crate::common::types::Value;
+use crate::common::LixError;
+use crate::common::Value;
 use crate::contracts::ReplayCursor;
 use crate::contracts::TransactionMode;
 

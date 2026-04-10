@@ -17,9 +17,7 @@ use serde_json::Value as JsonValue;
 
 use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
 use crate::catalog::SurfaceFamily;
-use crate::common::identity::{
-    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
-};
+use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
 use crate::contracts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
     LiveSnapshotStorage, MutationOperation, MutationRow, PlannedStateRow,
@@ -1042,9 +1040,7 @@ fn collect_planned_binary_blob_hashes(
     let mut hashes = HashSet::new();
     for file in resolved.filesystem_state().files.values() {
         if let Some(data) = file.data.as_ref() {
-            hashes.insert(crate::common::fingerprint::stable_content_fingerprint_hex(
-                data,
-            ));
+            hashes.insert(crate::common::stable_content_fingerprint_hex(data));
         }
     }
     Ok(hashes)

@@ -6,8 +6,8 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::common::error::LixError;
-use crate::common::types::{QueryResult, Value};
+use crate::common::LixError;
+use crate::common::{QueryResult, Value};
 use crate::contracts::InstalledPlugin;
 #[cfg(test)]
 use crate::contracts::{

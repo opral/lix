@@ -1,5 +1,4 @@
-use crate::common::errors;
-use crate::common::wire::WireValue;
+use crate::common::{unexpected_statement_count_error, WireValue};
 use crate::contracts::SessionDependency;
 use crate::session::Session;
 use crate::sql::parser::parse_sql_statements;
@@ -640,7 +639,7 @@ fn extract_single_observe_query_result(
     result: crate::ExecuteResult,
 ) -> Result<QueryResult, LixError> {
     let [statement] = result.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
+        return Err(unexpected_statement_count_error(
             "observe query",
             1,
             result.statements.len(),

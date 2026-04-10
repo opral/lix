@@ -1,5 +1,5 @@
 use crate::catalog::FilesystemProjectionScope;
-use crate::common::fingerprint::stable_content_fingerprint_hex;
+use crate::common::stable_content_fingerprint_hex;
 use crate::contracts::{FilesystemPayloadChange, MutationRow, OptionalTextPatch};
 use crate::contracts::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::execution::write::filesystem::query::{

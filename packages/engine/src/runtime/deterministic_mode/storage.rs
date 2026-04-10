@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
 

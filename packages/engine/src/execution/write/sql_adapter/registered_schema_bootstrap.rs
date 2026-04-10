@@ -1,4 +1,4 @@
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::contracts::{MutationRow, PlannedStateRow};
 use crate::{LixBackendTransaction, LixError, Value};
 

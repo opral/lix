@@ -1,8 +1,6 @@
 use crate::catalog::FilesystemProjectionScope;
-use crate::common::paths::filesystem::{
-    compose_directory_path, NormalizedDirectoryPath, ParsedFilePath,
-};
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
+use crate::common::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::contracts::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };

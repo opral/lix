@@ -7,7 +7,7 @@ use async_trait::async_trait;
 
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
 use crate::catalog::FilesystemProjectionScope;
-use crate::common::paths::filesystem::NormalizedDirectoryPath;
+use crate::common::NormalizedDirectoryPath;
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
 

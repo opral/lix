@@ -6,7 +6,7 @@ use jsonschema::JSONSchema;
 
 use crate::backend::TransactionBackendAdapter;
 use crate::catalog::CatalogProjectionRegistry;
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::contracts::parse_active_version_snapshot;
 use crate::contracts::TrackedChangeView;
 use crate::contracts::{

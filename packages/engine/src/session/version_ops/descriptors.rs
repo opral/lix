@@ -5,7 +5,7 @@ use crate::canonical::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
 use crate::catalog::{bind_named_relation, RelationBindContext};
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,

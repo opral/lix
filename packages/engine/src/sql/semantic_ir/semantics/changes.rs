@@ -1,4 +1,4 @@
-use crate::common::fingerprint::stable_content_fingerprint_hex;
+use crate::common::stable_content_fingerprint_hex;
 use crate::contracts::TrackedChangeView;
 use crate::contracts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,

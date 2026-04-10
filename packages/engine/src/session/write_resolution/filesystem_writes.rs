@@ -6,7 +6,7 @@ use self::insert_planning::{
 };
 use super::*;
 use crate::catalog::{bind_named_relation, FilesystemProjectionScope, RelationBindContext};
-use crate::common::paths::filesystem::{
+use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
@@ -1995,7 +1995,7 @@ fn binary_blob_ref_row(
     })?;
     let snapshot_content = json!({
         "id": file_id,
-        "blob_hash": crate::common::fingerprint::stable_content_fingerprint_hex(data),
+        "blob_hash": crate::common::stable_content_fingerprint_hex(data),
         "size_bytes": size_bytes,
     })
     .to_string();
