@@ -1,24 +1,40 @@
+use std::collections::BTreeMap;
+
 use crate::backend::QueryExecutor;
 use crate::common::errors::classification::is_missing_relation_error;
+use crate::common::naming::tracked_relation_name;
 use crate::contracts::artifacts::CommittedVersionFrontier;
-use crate::live_state::schema_access::tracked_relation_name;
-use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
+use crate::contracts::version_artifacts::version_ref_storage_version_id;
+use crate::live_state::builtin_schema_storage_metadata;
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct VersionHeadRef {
-    pub(crate) version_id: String,
-    pub(crate) commit_id: String,
+struct VersionHeadRef {
+    version_id: String,
+    commit_id: String,
 }
 
-pub(crate) async fn load_all_version_head_commit_ids(
+pub(crate) async fn load_all_version_head_commit_ids_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<(String, String)>, LixError> {
     Ok(load_all_version_head_refs_with_executor(executor)
         .await?
+        .unwrap_or_default()
         .into_iter()
         .map(|row| (row.version_id, row.commit_id))
         .collect())
+}
+
+pub(crate) async fn load_version_head_commit_map_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<BTreeMap<String, String>>, LixError> {
+    Ok(load_all_version_head_refs_with_executor(executor)
+        .await?
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| (row.version_id, row.commit_id))
+                .collect()
+        }))
 }
 
 pub(crate) async fn load_current_committed_version_frontier_with_backend(
@@ -34,6 +50,7 @@ pub(crate) async fn load_current_committed_version_frontier_with_executor(
     Ok(CommittedVersionFrontier {
         version_heads: load_all_version_head_refs_with_executor(executor)
             .await?
+            .unwrap_or_default()
             .into_iter()
             .map(|row| (row.version_id, row.commit_id))
             .collect(),
@@ -42,7 +59,7 @@ pub(crate) async fn load_current_committed_version_frontier_with_executor(
 
 async fn load_all_version_head_refs_with_executor(
     executor: &mut dyn QueryExecutor,
-) -> Result<Vec<VersionHeadRef>, LixError> {
+) -> Result<Option<Vec<VersionHeadRef>>, LixError> {
     let metadata = version_ref_storage_metadata();
     let result = match executor
         .execute(
@@ -65,14 +82,14 @@ async fn load_all_version_head_refs_with_executor(
                 Value::Text(metadata.schema_key.clone()),
                 Value::Text(metadata.schema_version.clone()),
                 Value::Text(metadata.file_id.clone()),
-                Value::Text(version_ref_storage_version_id()),
+                Value::Text(version_ref_storage_version_id().to_string()),
                 Value::Text(metadata.plugin_key.clone()),
             ],
         )
         .await
     {
         Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(Vec::new()),
+        Err(error) if is_missing_relation_error(&error) => return Ok(None),
         Err(error) => return Err(error),
     };
 
@@ -93,21 +110,12 @@ async fn load_all_version_head_refs_with_executor(
         previous_version_id = Some(parsed.version_id.clone());
         rows.push(parsed);
     }
-    Ok(rows)
+    Ok(Some(rows))
 }
 
 fn version_ref_storage_metadata() -> crate::live_state::BuiltinSchemaStorageMetadata {
     builtin_schema_storage_metadata("lix_version_ref")
         .expect("lix_version_ref builtin storage metadata should exist")
-}
-
-fn version_ref_storage_version_id() -> String {
-    match version_ref_storage_metadata().storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::version_state::GLOBAL_VERSION_ID.to_string(),
-        BuiltinSchemaStorageLane::Local => {
-            panic!("lix_version_ref must use the global storage lane")
-        }
-    }
 }
 
 fn parse_version_head_ref_row(row: &[Value]) -> Result<VersionHeadRef, LixError> {

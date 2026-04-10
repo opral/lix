@@ -4,6 +4,7 @@ use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, resolve_merge_base, CanonicalStateIdentity,
     CanonicalStateRow,
 };
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
@@ -13,7 +14,6 @@ use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::TransactionBackendAdapter;
 use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::context::{

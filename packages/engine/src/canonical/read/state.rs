@@ -290,11 +290,11 @@ mod tests {
     use super::*;
     use crate::canonical::CanonicalStateIdentity;
     use crate::session::version_ops::committed_state::load_exact_canonical_row_at_version_head_with_executor;
+    use crate::session::version_ops::load_version_head_commit_id_with_executor;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::version_state::load_local_version_head_commit_id_with_executor;
     use std::collections::BTreeMap;
 
     async fn init_state_source_backend() -> TestSqliteBackend {
@@ -511,7 +511,7 @@ mod tests {
         backend.clear_query_log();
 
         let mut executor = &backend;
-        let commit_id = load_local_version_head_commit_id_with_executor(&mut executor, "v1")
+        let commit_id = load_version_head_commit_id_with_executor(&mut executor, "v1")
             .await
             .expect("canonical version head lookup should succeed");
 

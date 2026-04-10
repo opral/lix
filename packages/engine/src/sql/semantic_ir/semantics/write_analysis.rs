@@ -1,4 +1,5 @@
 use crate::catalog::SurfaceOverrideValue;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteModeRequest, WriteOperationKind,
@@ -11,7 +12,6 @@ use crate::sql::semantic_ir::semantics::filesystem_assignments::{
     parse_file_insert_assignments, parse_file_update_assignments, FilesystemWriteIntent,
 };
 use crate::sql::semantic_ir::semantics::surface_semantics::canonical_filter_column_name;
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::Value;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::BTreeSet;

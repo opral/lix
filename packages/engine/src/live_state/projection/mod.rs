@@ -47,7 +47,7 @@ fn version_ref_plugin_key() -> String {
 
 fn version_ref_storage_version_id() -> String {
     match version_ref_storage_metadata().storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::version_state::GLOBAL_VERSION_ID.to_string(),
+        BuiltinSchemaStorageLane::Global => crate::contracts::GLOBAL_VERSION_ID.to_string(),
         BuiltinSchemaStorageLane::Local => {
             panic!("lix_version_ref must use the global storage lane")
         }

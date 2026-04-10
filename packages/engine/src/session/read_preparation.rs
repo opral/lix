@@ -13,11 +13,11 @@ use crate::catalog::SurfaceRegistry;
 use crate::contracts::artifacts::PreparedPublicReadArtifact;
 use crate::contracts::traits::{PendingView, SqlPreparationMetadataReader};
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
+use crate::session::version_ops::load_version_head_commit_map_with_executor;
 use crate::sql::prepare::{
     load_sql_compiler_metadata, prepare_public_read_artifact,
     try_prepare_public_read_with_registry_and_internal_access, SqlCompilerMetadata,
 };
-use crate::version_state::load_local_version_ref_heads_map_with_executor;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 pub(crate) struct PreparedPublicReadCollaborators {
@@ -94,8 +94,8 @@ async fn prepare_required_active_public_read_artifact_with_reader(
 }
 
 // SqlPreparationMetadataReader blanket impls — session bridges backend to
-// version-state metadata so that sql/ and backend/ stay free of session/
-// and version_state/ imports.
+// session-owned preparation metadata so that sql/ and backend/ stay free of
+// session workflow internals.
 
 #[async_trait(?Send)]
 impl<T> SqlPreparationMetadataReader for &T
@@ -181,7 +181,7 @@ where
 async fn load_current_version_heads_for_preparation_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Option<BTreeMap<String, String>>, LixError> {
-    match load_local_version_ref_heads_map_with_executor(executor).await {
+    match load_version_head_commit_map_with_executor(executor).await {
         Ok(heads) => Ok(heads),
         Err(error)
             if error

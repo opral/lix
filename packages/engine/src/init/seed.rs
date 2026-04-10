@@ -1,4 +1,5 @@
 use crate::contracts::artifacts::ExecuteOptions;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::engine::Engine;
 use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::live_state::{
@@ -8,10 +9,9 @@ use crate::live_state::{
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::TransactionBackendAdapter;
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
+use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parser::parse_sql;
-use crate::version_state::load_committed_version_head_commit_id;
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
@@ -144,7 +144,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let mut backend =
             TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
         if let Some(commit_id) =
-            load_committed_version_head_commit_id(&mut backend, GLOBAL_VERSION_ID).await?
+            load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         {
             return Ok(Some(commit_id));
         }
@@ -179,7 +179,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn load_global_version_commit_id(&mut self) -> Result<String, LixError> {
         let mut backend = self.backend_adapter();
         let Some(commit_id) =
-            load_committed_version_head_commit_id(&mut backend, GLOBAL_VERSION_ID).await?
+            load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         else {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),

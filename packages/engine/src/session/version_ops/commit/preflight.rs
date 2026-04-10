@@ -1,5 +1,6 @@
 use crate::backend::QueryExecutor;
 use crate::canonical::CanonicalStateIdentity;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::execution::write::filesystem::runtime::{
     ExactFilesystemDescriptorState, FilesystemDescriptorState, FILESYSTEM_DESCRIPTOR_FILE_ID,
     FILESYSTEM_FILE_SCHEMA_KEY,
@@ -7,7 +8,6 @@ use crate::execution::write::filesystem::runtime::{
 use crate::live_state::key_value_schema_key;
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
 use crate::runtime::deterministic_mode::deterministic_sequence_key;
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
 use crate::session::version_ops::load_exact_canonical_row_at_version_head_with_executor;

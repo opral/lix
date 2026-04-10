@@ -104,7 +104,6 @@ pub(crate) fn builtin_internal_exact_relation_names() -> Vec<&'static str> {
     relations.extend_from_slice(crate::canonical::internal_exact_relation_names());
     relations.extend_from_slice(crate::live_state::internal_exact_relation_names());
     relations.extend_from_slice(crate::binary_cas::internal_exact_relation_names());
-    relations.extend_from_slice(crate::version_state::internal_exact_relation_names());
     relations
 }
 

@@ -40,7 +40,7 @@ pub fn overlay_lanes_for_version(
     include_untracked: bool,
 ) -> Vec<OverlayLane> {
     overlay_lanes(
-        include_global && version_id != crate::version_state::GLOBAL_VERSION_ID,
+        include_global && version_id != crate::contracts::GLOBAL_VERSION_ID,
         include_untracked,
     )
 }
@@ -386,7 +386,7 @@ fn tombstone_placeholder_row(
 
 fn storage_version_id(requested_version_id: &str, lane: OverlayLane) -> String {
     if lane.is_global() {
-        crate::version_state::GLOBAL_VERSION_ID.to_string()
+        crate::contracts::GLOBAL_VERSION_ID.to_string()
     } else {
         requested_version_id.to_string()
     }
@@ -397,7 +397,7 @@ fn projected_version_id(
     lane: OverlayLane,
     source_version_id: &str,
 ) -> String {
-    if lane.is_global() && source_version_id == crate::version_state::GLOBAL_VERSION_ID {
+    if lane.is_global() && source_version_id == crate::contracts::GLOBAL_VERSION_ID {
         requested_version_id.to_string()
     } else {
         source_version_id.to_string()
