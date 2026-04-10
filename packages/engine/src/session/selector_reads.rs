@@ -6,11 +6,11 @@ use sqlparser::ast::{
     ValueWithSpan,
 };
 
+use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::traits::PendingView;
 use crate::execution::read::{
     PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
 };
-use crate::projections::ProjectionRegistry;
 use crate::session::read_preparation::{
     bootstrap_prepared_public_read_collaborators,
     prepare_required_active_public_read_artifact_with_backend, PreparedPublicReadCollaborators,
@@ -27,7 +27,7 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct SessionWriteSelectorResolver<'a> {
     backend: &'a dyn LixBackend,
-    projection_registry: &'a ProjectionRegistry,
+    projection_registry: &'a CatalogProjectionRegistry,
     pending_view: Option<&'a dyn PendingView>,
     prepared_read_collaborators: PreparedPublicReadCollaborators,
 }
@@ -35,7 +35,7 @@ pub(crate) struct SessionWriteSelectorResolver<'a> {
 impl<'a> SessionWriteSelectorResolver<'a> {
     pub(crate) async fn new(
         backend: &'a dyn LixBackend,
-        projection_registry: &'a ProjectionRegistry,
+        projection_registry: &'a CatalogProjectionRegistry,
         pending_view: Option<&'a dyn PendingView>,
     ) -> Result<Self, LixError> {
         let prepared_read_collaborators =

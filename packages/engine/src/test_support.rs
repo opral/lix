@@ -4,9 +4,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
+use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::traits::PendingView;
 use crate::live_state::{write_live_rows, LiveRow};
-use crate::projections::ProjectionRegistry;
 use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
 use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteResolveError};
@@ -256,7 +256,7 @@ impl crate::execution::read::ReadExecutionBindings for BuiltinReadExecutionBindi
         Ok(
             crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend(
                 backend,
-                crate::projections::builtin_projection_registry(),
+                crate::catalog::builtin_catalog_projection_registry(),
             )
             .await?
             .into_iter()
@@ -272,7 +272,7 @@ impl crate::execution::read::ReadExecutionBindings for BuiltinReadExecutionBindi
 
 pub(crate) async fn resolve_write_plan_for_test(
     backend: &dyn LixBackend,
-    projection_registry: &ProjectionRegistry,
+    projection_registry: &CatalogProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_transaction_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {

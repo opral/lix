@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
 use crate::backend::TransactionBackendAdapter;
+use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
 use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
 use crate::contracts::artifacts::{
@@ -34,7 +35,6 @@ use crate::contracts::traits::{
 use crate::execution::write::{
     PendingTransactionView, PreparedWriteExecutionStep, PreparedWriteRuntimeState,
 };
-use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::session::collaborators::WriteExecutionCollaborators;
@@ -246,7 +246,7 @@ pub(crate) async fn prepare_buffered_write_execution_step(
     let relation_names = validated.relation_names().to_vec();
     let materialized = match materialize_validated_write_preparation(
         &backend,
-        collaborators.projection_registry(),
+        collaborators.catalog_projection_registry(),
         pending_transaction_view,
         validated,
     )
@@ -392,7 +392,7 @@ async fn validate_compiled_write_preparation(
 
 async fn materialize_validated_write_preparation(
     backend: &dyn crate::LixBackend,
-    projection_registry: &ProjectionRegistry,
+    projection_registry: &CatalogProjectionRegistry,
     pending_transaction_view: Option<&PendingTransactionView>,
     mut validated: ValidatedWritePreparation,
 ) -> Result<MaterializedWritePreparation, LixError> {
@@ -921,7 +921,7 @@ fn planned_row_optional_json_text_value<'a>(
 
 async fn materialize_prepared_public_write<P>(
     backend: &dyn crate::LixBackend,
-    projection_registry: &ProjectionRegistry,
+    projection_registry: &CatalogProjectionRegistry,
     pending_transaction_view: Option<&PendingTransactionView>,
     public_write: &crate::sql::prepare::PreparedPublicWrite,
     functions: SharedFunctionProvider<P>,

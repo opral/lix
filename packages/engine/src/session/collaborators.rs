@@ -2,11 +2,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::catalog::SurfaceRegistry;
+use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::functions::{clone_boxed_function_provider, SharedFunctionProvider};
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::image::ImageChunkWriter;
-use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::streams::{
@@ -38,7 +37,7 @@ pub(crate) trait SessionServices: Send + Sync {
 
     async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError>;
 
-    fn projection_registry(&self) -> &ProjectionRegistry;
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
 
@@ -66,7 +65,7 @@ pub(crate) trait SessionServices: Send + Sync {
 pub(crate) trait WriteExecutionCollaborators:
     crate::execution::write::WriteExecutionBindings
 {
-    fn projection_registry(&self) -> &ProjectionRegistry;
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
 
@@ -135,8 +134,8 @@ impl SessionCollaborators {
         self.services.export_image(writer).await
     }
 
-    pub(crate) fn projection_registry(&self) -> &ProjectionRegistry {
-        self.services.projection_registry()
+    pub(crate) fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        self.services.catalog_projection_registry()
     }
 
     pub(crate) fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
@@ -239,8 +238,8 @@ impl SessionCollaborators {
 
 #[async_trait(?Send)]
 impl WriteExecutionCollaborators for SessionCollaborators {
-    fn projection_registry(&self) -> &ProjectionRegistry {
-        SessionCollaborators::projection_registry(self)
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        SessionCollaborators::catalog_projection_registry(self)
     }
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {

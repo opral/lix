@@ -9,7 +9,6 @@ mod engine;
 pub(crate) mod execution;
 mod init;
 pub mod live_state;
-pub(crate) mod projections;
 mod runtime;
 mod schema;
 pub mod session;
