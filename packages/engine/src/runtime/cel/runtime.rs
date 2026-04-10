@@ -7,6 +7,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use crate::runtime::functions::{
     LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
 };
+use crate::schema::SchemaAnnotationEvaluator;
 use crate::LixError;
 
 use super::context::build_context_with_functions;
@@ -71,6 +72,16 @@ impl CelEvaluator {
             .insert(expression.to_string(), compiled.clone());
 
         Ok(compiled)
+    }
+}
+
+impl SchemaAnnotationEvaluator for CelEvaluator {
+    fn evaluate_schema_annotation_expression(
+        &self,
+        expression: &str,
+        variables: &JsonMap<String, JsonValue>,
+    ) -> Result<JsonValue, LixError> {
+        self.evaluate(expression, variables)
     }
 }
 

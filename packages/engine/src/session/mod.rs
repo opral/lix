@@ -11,6 +11,7 @@ pub(crate) mod execution_context;
 pub(crate) mod observe;
 pub(crate) mod pending_reads;
 pub(crate) mod plugin;
+mod public_surface_registry;
 pub(crate) mod read_execution_bindings;
 pub(crate) mod read_preparation;
 mod selector_reads;
@@ -48,6 +49,7 @@ use crate::session::collaborators::SessionCollaborators;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
+pub(crate) use crate::session::public_surface_registry::apply_registered_schema_snapshot_to_surface_registry;
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,

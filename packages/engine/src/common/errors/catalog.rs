@@ -1,4 +1,4 @@
-use crate::surfaces::{
+use crate::sql::{
     builtin_relation_inventory, protected_builtin_public_surface_names,
     relation_policy_choice_summary,
 };

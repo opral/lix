@@ -14,6 +14,7 @@ mod roots;
 
 pub(crate) const GLOBAL_VERSION_ID: &str = "global";
 pub(crate) const DEFAULT_ACTIVE_VERSION_NAME: &str = "main";
+pub(crate) const LAST_CHECKPOINT_TABLE: &str = "lix_internal_last_checkpoint";
 #[allow(unused_imports)]
 pub(crate) use heads::load_current_committed_version_frontier_with_backend;
 pub(crate) use heads::{
@@ -28,6 +29,10 @@ pub(crate) use roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
+
+pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
+    &[LAST_CHECKPOINT_TABLE]
+}
 
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();
 static VERSION_REF_SCHEMA_METADATA: OnceLock<SchemaMetadata> = OnceLock::new();

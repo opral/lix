@@ -13,7 +13,7 @@ use crate::sql::binder::bind_sql_with_state;
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::surfaces::{classify_builtin_relation_name, RelationPolicy};
+use crate::sql::{classify_builtin_relation_name, RelationPolicy};
 use crate::{LixError, SqlDialect, Value};
 
 pub(crate) fn derive_dependency_spec_from_statements(

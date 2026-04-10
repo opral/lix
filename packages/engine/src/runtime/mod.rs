@@ -8,6 +8,7 @@ pub(crate) mod deterministic_mode;
 pub(crate) mod execution_state;
 pub(crate) mod functions;
 pub(crate) mod plugin;
+mod public_surface_registry;
 pub mod streams;
 pub mod wasm;
 
@@ -28,6 +29,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
+
+pub(crate) use public_surface_registry::load_public_surface_registry_with_backend;
 
 const INIT_STATE_NOT_STARTED: u8 = 0;
 const INIT_STATE_IN_PROGRESS: u8 = 1;
@@ -128,7 +131,7 @@ impl Runtime {
     pub(crate) async fn load_public_surface_registry_from_backend(
         &self,
     ) -> Result<SurfaceRegistry, LixError> {
-        crate::surfaces::load_public_surface_registry_with_backend(self.backend().as_ref()).await
+        load_public_surface_registry_with_backend(self.backend().as_ref()).await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {

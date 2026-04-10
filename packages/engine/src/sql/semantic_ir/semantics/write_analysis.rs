@@ -648,7 +648,7 @@ mod tests {
         sql: &str,
         requested_version_id: &str,
     ) -> crate::sql::semantic_ir::canonicalize::CanonicalizedWrite {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
         let bound = bind_statement(

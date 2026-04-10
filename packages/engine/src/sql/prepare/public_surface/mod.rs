@@ -51,9 +51,7 @@ use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
     PublicWriteSemantics,
 };
-use crate::surfaces::{
-    classify_relation_name, protected_builtin_public_surface_names, RelationPolicy,
-};
+use crate::sql::{classify_relation_name, protected_builtin_public_surface_names, RelationPolicy};
 use crate::version_state::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,
@@ -294,7 +292,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
-    let registry = crate::surfaces::load_public_surface_registry_with_backend(backend)
+    let registry = crate::runtime::load_public_surface_registry_with_backend(backend)
         .await
         .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata =
@@ -3745,7 +3743,7 @@ mod tests {
         .into_iter()
         .next()
         .expect("statement should exist");
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let bound = bind_public_read_statement(
             statement,
             Vec::new(),

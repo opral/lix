@@ -27,7 +27,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "runtime",
             "session",
             "sql",
-            "surfaces",
         ],
     },
     ForbiddenDependencyRule {
@@ -68,11 +67,9 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "sql",
-        reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or history owners directly; sealed live_state root query-contract APIs are allowed",
+        reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or session/runtime owners directly; sealed owner-root query-contract APIs plus acyclic internal-relation inventory roots are allowed",
         forbidden_scopes: &[
             "backend",
-            "binary_cas",
-            "canonical",
             "execution",
             "projections",
             "runtime",
@@ -1248,6 +1245,27 @@ fn production_source_files() -> Vec<(String, String)> {
     files
 }
 
+fn source_and_test_rust_files() -> Vec<(String, String)> {
+    let mut files = production_source_files();
+    let mut test_files = Vec::new();
+    let tests_root = engine_root().join("tests");
+    walk_rust_files(&tests_root, &mut test_files);
+
+    for absolute_path in test_files {
+        let relative_path = absolute_path
+            .strip_prefix(engine_root())
+            .expect("test source file should be inside the engine root")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let source =
+            fs::read_to_string(&absolute_path).expect("test source file should be readable");
+        files.push((relative_path, source));
+    }
+
+    files.sort_by(|left, right| left.0.cmp(&right.0));
+    files
+}
+
 fn is_test_support_relative_path(relative_path: &str) -> bool {
     let parts: Vec<&str> = relative_path.split('/').collect();
     parts.iter().any(|part| {
@@ -1991,6 +2009,253 @@ fn plan81_catalog_relation_lowering_uses_root_owned_sql_api_outside_sql() {
         "Plan 81 regression: non-sql code should reach lowering through crate::sql::* root APIs, not sql child modules:\n{}",
         offenders.join("\n"),
     );
+}
+
+#[test]
+fn plan82_builtin_registry_access_moves_to_catalog_root_api() {
+    let offenders: Vec<String> = source_and_test_rust_files()
+        .into_iter()
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::surfaces::build_builtin_surface_registry")
+                || sanitized.contains("crate::surfaces::register_dynamic_entity_surface_spec")
+                || sanitized.contains("crate::surfaces::builtin_public_surface_names")
+                || sanitized.contains("crate::surfaces::builtin_public_surface_columns")
+                || sanitized.contains("use crate::surfaces::{builtin_public_surface_columns")
+                || sanitized.contains("use crate::surfaces::{builtin_public_surface_names"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 82 regression: builtin registry access should go through crate::catalog::* root APIs, not crate::surfaces::*:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan82_catalog_root_stays_the_only_public_entrypoint_outside_owner() {
+    let offenders: Vec<String> = source_and_test_rust_files()
+        .into_iter()
+        .filter(|(relative_path, _)| {
+            !relative_path.starts_with("src/catalog/")
+                && relative_path != "src/catalog.rs"
+                && relative_path != "src/lib.rs"
+        })
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::catalog::binding::")
+                || sanitized.contains("crate::catalog::registry::")
+                || sanitized.contains("use crate::catalog::binding")
+                || sanitized.contains("use crate::catalog::registry"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 82 regression: code outside catalog should depend on crate::catalog::* root APIs, not crate::catalog::child::*:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan82_registry_loading_moves_to_runtime_and_session_owners() {
+    let runtime_source = fs::read_to_string(src_root().join("runtime/mod.rs"))
+        .expect("runtime/mod.rs should be readable");
+    assert!(
+        runtime_source
+            .contains("load_public_surface_registry_with_backend(self.backend().as_ref())"),
+        "Plan 82 regression: runtime should load committed registries through the runtime root API"
+    );
+    assert!(
+        !runtime_source.contains("crate::surfaces::load_public_surface_registry_with_backend"),
+        "Plan 82 regression: runtime should not reach committed registry loading through surfaces"
+    );
+
+    let pending_reads_source = fs::read_to_string(src_root().join("session/pending_reads.rs"))
+        .expect("session/pending_reads.rs should be readable");
+    assert!(
+        pending_reads_source.contains("crate::runtime::load_public_surface_registry_with_backend(self.base)"),
+        "Plan 82 regression: session pending reads should use the runtime root API for committed registry loading"
+    );
+    assert!(
+        pending_reads_source.contains("crate::session::apply_registered_schema_snapshot_to_surface_registry("),
+        "Plan 82 regression: session pending reads should apply registered-schema overlays through the session root API"
+    );
+    assert!(
+        !pending_reads_source.contains("crate::surfaces::load_public_surface_registry_with_backend"),
+        "Plan 82 regression: session pending reads should not load committed registries through surfaces"
+    );
+    assert!(
+        !pending_reads_source
+            .contains("crate::surfaces::apply_registered_schema_snapshot_to_surface_registry"),
+        "Plan 82 regression: session pending reads should not apply overlays through surfaces"
+    );
+
+    assert!(
+        !src_root().join("surfaces/mod.rs").exists(),
+        "Plan 82 regression: surfaces/mod.rs should stay removed after registry loading moves to runtime and session owners"
+    );
+}
+
+#[test]
+fn plan82_catalog_schema_to_spec_helper_stays_free_of_runtime_storage_and_sql_owners() {
+    let graph = analyze_engine_dependency_graph();
+    for forbidden in ["runtime", "live_state", "session", "sql"] {
+        if let Some(edge) = graph
+            .edges
+            .iter()
+            .find(|edge| edge.from == "catalog" && edge.to == forbidden)
+        {
+            panic!(
+                "Plan 82 regression: catalog must not depend on {forbidden}; current edge flows via {:?}",
+                edge.via_files
+            );
+        }
+    }
+
+    let catalog_source = fs::read_to_string(src_root().join("catalog/mod.rs"))
+        .expect("catalog/mod.rs should be readable");
+    let sanitized = mask_rust_source(&catalog_source);
+
+    assert!(
+        sanitized.contains("dynamic_entity_surface_spec_from_schema("),
+        "Plan 82 regression: catalog should keep the schema-to-spec helper at the catalog root"
+    );
+
+    for forbidden in [
+        "crate::runtime::",
+        "use crate::runtime",
+        "shared_runtime(",
+        "crate::live_state::",
+        "use crate::live_state",
+        "crate::session::",
+        "use crate::session",
+        "crate::sql::",
+        "use crate::sql",
+    ] {
+        assert!(
+            !sanitized.contains(forbidden),
+            "Plan 82 regression: catalog/mod.rs should stay free of runtime/live_state/session/sql ownership imports, but found `{forbidden}`"
+        );
+    }
+}
+
+#[test]
+fn plan82_relation_policy_moves_to_sql_owner() {
+    assert!(
+        !src_root().join("surfaces/relation_policy.rs").exists(),
+        "Plan 82 regression: surfaces/relation_policy.rs should stay removed"
+    );
+    assert!(
+        !src_root().join("surfaces/mod.rs").exists(),
+        "Plan 82 regression: surfaces/mod.rs should stay removed"
+    );
+
+    let sql_source =
+        fs::read_to_string(src_root().join("sql/mod.rs")).expect("sql/mod.rs should be readable");
+    assert!(
+        sql_source.contains("mod relation_policy;"),
+        "Plan 82 regression: sql should own the relation_policy module"
+    );
+    assert!(
+        sql_source.contains("classify_relation_name")
+            && sql_source.contains("object_name_is_protected_builtin_ddl_target"),
+        "Plan 82 regression: sql root should re-export relation-policy APIs"
+    );
+
+    let offenders: Vec<String> = source_and_test_rust_files()
+        .into_iter()
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::surfaces::classify_builtin_relation_name")
+                || sanitized.contains("crate::surfaces::classify_relation_name")
+                || sanitized.contains("crate::surfaces::object_name_is_internal_storage_relation")
+                || sanitized
+                    .contains("crate::surfaces::object_name_is_protected_builtin_ddl_target")
+                || sanitized.contains("crate::surfaces::builtin_relation_inventory")
+                || sanitized.contains("crate::surfaces::protected_builtin_public_surface_names")
+                || sanitized.contains("crate::surfaces::relation_policy_choice_summary")
+                || sanitized.contains("use crate::surfaces::{classify_builtin_relation_name")
+                || sanitized.contains("use crate::surfaces::{classify_relation_name")
+                || sanitized.contains("use crate::surfaces::{builtin_relation_inventory")
+                || sanitized
+                    .contains("use crate::surfaces::{protected_builtin_public_surface_names"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 82 regression: relation-policy helpers should be consumed from crate::sql::*, not crate::surfaces::*:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan82_surfaces_root_stays_removed_from_production_code() {
+    let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
+    assert!(
+        !lib_source.contains("mod surfaces;"),
+        "Plan 82 regression: src/lib.rs should not reintroduce a surfaces root module"
+    );
+
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::surfaces::")
+                || sanitized.contains("use crate::surfaces")
+                || sanitized.contains("surfaces::"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 82 regression: production code should not import crate::surfaces::*:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan82_relation_policy_composes_internal_inventory_from_owner_roots() {
+    let sql_source = fs::read_to_string(src_root().join("sql/relation_policy.rs"))
+        .expect("sql/relation_policy.rs should be readable");
+    let sanitized = mask_rust_source(&sql_source);
+
+    for required in [
+        "crate::canonical::internal_exact_relation_names()",
+        "crate::live_state::internal_exact_relation_names()",
+        "crate::binary_cas::internal_exact_relation_names()",
+        "crate::version_state::internal_exact_relation_names()",
+    ] {
+        assert!(
+            sanitized.contains(required),
+            "Plan 82 regression: sql relation policy should compose internal-relation inventory through sealed owner roots, missing `{required}`"
+        );
+    }
+
+    for forbidden in [
+        "crate::common::naming::internal_exact_relation_names()",
+        "crate::canonical::graph::",
+        "crate::canonical::journal::",
+        "crate::live_state::lifecycle::",
+        "crate::live_state::storage::",
+        "crate::binary_cas::schema::",
+        "crate::session::internal_exact_relation_names()",
+        "crate::session::observe::",
+        "crate::session::workspace::",
+        "crate::session::version_ops::",
+        "crate::version_state::checkpoints::",
+    ] {
+        assert!(
+            !sanitized.contains(forbidden),
+            "Plan 82 regression: sql relation policy should stay on owner-root APIs, but found `{forbidden}`"
+        );
+    }
 }
 
 #[test]

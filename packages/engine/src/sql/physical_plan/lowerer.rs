@@ -1872,7 +1872,7 @@ mod tests {
 
     #[test]
     fn lowers_builtin_entity_reads_through_state_surfaces() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
@@ -1900,7 +1900,7 @@ mod tests {
 
     #[test]
     fn broad_physical_lowering_requires_routing_lowered_relations() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let broad_statement = bound_broad_statement(
             &registry,
             "SELECT s.schema_key, COUNT(*) \
@@ -1930,7 +1930,7 @@ mod tests {
     #[test]
     fn lowers_optimized_cte_and_joined_state_surfaces_to_internal_queries() {
         let lowered = lowered_broad_program(
-            &crate::surfaces::build_builtin_surface_registry(),
+            &crate::catalog::build_builtin_surface_registry(),
             "WITH keyed AS ( \
                SELECT entity_id, schema_key \
                FROM lix_state_by_version \
@@ -1959,7 +1959,7 @@ mod tests {
     #[test]
     fn cte_names_that_shadow_public_surfaces_do_not_lower_through_broad_physical_planning() {
         let lowered = lowered_broad_program(
-            &crate::surfaces::build_builtin_surface_registry(),
+            &crate::catalog::build_builtin_surface_registry(),
             "WITH lix_state AS (SELECT 'shadow' AS entity_id) \
              SELECT entity_id FROM lix_state",
         );
@@ -1972,8 +1972,8 @@ mod tests {
 
     #[test]
     fn lowers_dynamic_entity_reads_with_scalar_override_predicates() {
-        let mut registry = crate::surfaces::build_builtin_surface_registry();
-        crate::surfaces::register_dynamic_entity_surface_spec(
+        let mut registry = crate::catalog::build_builtin_surface_registry();
+        crate::catalog::register_dynamic_entity_surface_spec(
             &mut registry,
             crate::catalog::DynamicEntitySurfaceSpec {
                 schema_key: "message".to_string(),
@@ -2031,7 +2031,7 @@ mod tests {
 
     #[test]
     fn rejects_entity_wildcard_reads_for_live_lowering() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         assert_eq!(
             lowered_program(&registry, "SELECT * FROM lix_key_value"),
             None
@@ -2040,7 +2040,7 @@ mod tests {
 
     #[test]
     fn lowers_state_reads_through_explicit_source_boundary() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
@@ -2072,7 +2072,7 @@ mod tests {
 
     #[test]
     fn lowers_change_reads_through_internal_change_sources() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT id, schema_key, snapshot_content FROM lix_change WHERE entity_id = 'entity-1'",
@@ -2093,7 +2093,7 @@ mod tests {
 
     #[test]
     fn projects_entity_string_payloads_without_json_wrappers() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT change_id FROM lix_change_set_element \
@@ -2129,7 +2129,7 @@ mod tests {
 
     #[test]
     fn lowers_change_set_element_by_version_reads_through_version_heads() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT change_id, version_id FROM lix_change_set_element_by_version \
@@ -2169,7 +2169,7 @@ mod tests {
 
     #[test]
     fn commit_family_entity_views_lower_as_state_projections() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
 
         let commit = lowered_program(
             &registry,
@@ -2228,7 +2228,7 @@ mod tests {
 
     #[test]
     fn lowers_working_changes_reads_through_canonical_commit_sources() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT status, before_change_id, after_change_id \
@@ -2263,7 +2263,7 @@ mod tests {
 
     #[test]
     fn lowers_working_changes_reads_with_nested_filesystem_subqueries() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT COUNT(*) \
@@ -2285,7 +2285,7 @@ mod tests {
 
     #[test]
     fn lowers_broad_working_changes_reads_with_nested_filesystem_subqueries() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_broad_program(
             &registry,
             "SELECT COUNT(*) \
@@ -2309,7 +2309,7 @@ mod tests {
 
     #[test]
     fn lowers_broad_scalar_subqueries_without_top_level_surface_relations() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_broad_program(
             &registry,
             "SELECT \
@@ -2330,7 +2330,7 @@ mod tests {
 
     #[test]
     fn broad_physical_lowering_requires_routing_lowered_nested_relations() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let broad_statement = bound_broad_statement(
             &registry,
             "SELECT (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent')",
@@ -2379,7 +2379,7 @@ mod tests {
 
     #[test]
     fn broad_physical_lowering_does_not_call_back_into_binding_or_routing() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let broad_statement = bound_broad_statement(
             &registry,
             "SELECT \
@@ -2420,7 +2420,7 @@ mod tests {
 
     #[test]
     fn broad_physical_lowering_accepts_provenance_free_typed_ir() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let mut broad_statement = bound_broad_statement(
             &registry,
             "WITH keyed AS ( \
@@ -2469,7 +2469,7 @@ mod tests {
 
     #[test]
     fn broad_physical_lowering_emits_final_terminal_statement_artifacts() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_broad_program(
             &registry,
             "SELECT COUNT(*) \
@@ -2520,7 +2520,7 @@ mod tests {
 
     #[test]
     fn lowers_filesystem_current_and_versioned_reads_through_internal_sources() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
 
         let current = lowered_program(
             &registry,
@@ -2574,7 +2574,7 @@ mod tests {
 
     #[test]
     fn lowers_commit_family_state_reads_through_lazy_state_derivation() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
 
         let current = lowered_program(
             &registry,
@@ -2632,7 +2632,7 @@ mod tests {
 
     #[test]
     fn commit_family_reads_do_not_depend_on_eager_live_mirrors() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let cases = [
             (
                 "state-commit",
@@ -2714,19 +2714,19 @@ mod tests {
 
     #[test]
     fn rejects_removed_active_version_surface() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         assert!(registry.bind_relation_name("lix_active_version").is_none());
     }
 
     #[test]
     fn rejects_removed_active_account_surface() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         assert!(registry.bind_relation_name("lix_active_account").is_none());
     }
 
     #[test]
     fn lowers_version_reads_through_canonical_descriptor_and_pointer_sources() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT id, name, hidden, commit_id FROM lix_version WHERE name = 'main'",
@@ -2762,7 +2762,7 @@ mod tests {
 
     #[test]
     fn broad_lowering_keeps_version_commit_join_on_internal_sources() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_broad_program(
             &registry,
             "SELECT c.change_set_id \
@@ -2800,7 +2800,7 @@ mod tests {
 
     #[test]
     fn parameterized_version_reads_render_parseable_postgres_sql() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let mut statements = crate::sql::parser::parse_sql_script(
             "SELECT id, commit_id FROM lix_version WHERE id = $1 LIMIT 1",
         )
@@ -2848,7 +2848,7 @@ mod tests {
 
     #[test]
     fn lowers_registered_schema_reads_through_entity_surface() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_program(
             &registry,
             "SELECT value, lixcol_entity_id FROM lix_registered_schema WHERE lixcol_entity_id = 'x~1'",
@@ -2871,7 +2871,7 @@ mod tests {
 
     #[test]
     fn broad_lowering_preserves_select_distinct() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let lowered = lowered_broad_program(
             &registry,
             "SELECT DISTINCT schema_key \

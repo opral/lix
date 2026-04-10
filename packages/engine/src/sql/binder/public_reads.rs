@@ -12,7 +12,7 @@ use crate::sql::logical_plan::public_ir::{
     BroadSqlFunctionArgExpr, BroadSqlFunctionArgumentList, BroadSqlFunctionArguments,
     BroadSqlProvenance,
 };
-use crate::surfaces::{classify_relation_name, RelationPolicy};
+use crate::sql::{classify_relation_name, RelationPolicy};
 use crate::LixError;
 use sqlparser::ast::{
     Distinct, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr, JoinConstraint,
@@ -1277,7 +1277,7 @@ mod tests {
 
     #[test]
     fn broad_binding_rejects_unsupported_values_query_bodies_early() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let error =
             bind_broad_public_read_statement_with_registry(&parse_one("VALUES (1)"), &registry)
                 .expect_err("unsupported VALUES broad query bodies should fail during binding");
@@ -1290,7 +1290,7 @@ mod tests {
 
     #[test]
     fn broad_binding_rejects_table_query_bodies_without_terminal_relation_name() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let mut statement = parse_one("SELECT entity_id FROM lix_state");
         let Statement::Query(query) = &mut statement else {
             panic!("expected query statement");
@@ -1313,7 +1313,7 @@ mod tests {
 
     #[test]
     fn broad_binding_rejects_unsupported_table_factors_early() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let error = bind_broad_public_read_statement_with_registry(
             &parse_one("SELECT * FROM UNNEST(items) AS expanded"),
             &registry,
@@ -1328,7 +1328,7 @@ mod tests {
 
     #[test]
     fn broad_binding_rejects_table_factors_without_terminal_relation_name() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let mut statement = parse_one("SELECT entity_id FROM lix_state");
         let Statement::Query(query) = &mut statement else {
             panic!("expected query statement");
@@ -1352,7 +1352,7 @@ mod tests {
 
     #[test]
     fn binds_broad_public_read_queries_into_typed_ir_shapes() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let bound = bind_broad_public_read_statement_with_registry(
             &parse_one(
                 "WITH latest AS ( \
@@ -1460,7 +1460,7 @@ mod tests {
 
     #[test]
     fn binds_broad_public_read_select_distinct_into_typed_ir() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
+        let registry = crate::catalog::build_builtin_surface_registry();
         let bound = bind_broad_public_read_statement_with_registry(
             &parse_one(
                 "SELECT DISTINCT schema_key \

@@ -100,13 +100,22 @@ pub(crate) use visible_rows::{
 };
 pub(crate) use writer_key::WRITER_KEY_TABLE;
 
+pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;
 pub(crate) const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str =
     "lix_internal_registered_schema_bootstrap";
 pub(crate) const FILE_DATA_CACHE_TABLE: &str = "lix_internal_file_data_cache";
 pub(crate) const FILE_PATH_CACHE_TABLE: &str = "lix_internal_file_path_cache";
 pub(crate) const FILE_LIXCOL_CACHE_TABLE: &str = "lix_internal_file_lixcol_cache";
-pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;
-pub(crate) use lifecycle::LIVE_STATE_STATUS_TABLE;
+
+pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
+    &[
+        lifecycle::LIVE_STATE_STATUS_TABLE,
+        REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
+        FILE_DATA_CACHE_TABLE,
+        FILE_PATH_CACHE_TABLE,
+        FILE_LIXCOL_CACHE_TABLE,
+    ]
+}
 
 pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
     lifecycle::require_ready(backend).await

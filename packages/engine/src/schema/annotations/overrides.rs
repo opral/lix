@@ -2,9 +2,16 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::runtime::cel::CelEvaluator;
 use crate::LixError;
 use crate::Value;
+
+pub(crate) trait SchemaAnnotationEvaluator {
+    fn evaluate_schema_annotation_expression(
+        &self,
+        expression: &str,
+        variables: &JsonMap<String, JsonValue>,
+    ) -> Result<JsonValue, LixError>;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LixcolOverrideValue {
@@ -20,10 +27,16 @@ pub(crate) struct LixcolOverride {
     pub(crate) value: LixcolOverrideValue,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DynamicEntitySurfaceOverride {
+    pub(crate) column: String,
+    pub(crate) value: LixcolOverrideValue,
+}
+
 pub(crate) fn collect_lixcol_overrides(
     schema: &JsonValue,
     schema_key: &str,
-    evaluator: &CelEvaluator,
+    evaluator: &dyn SchemaAnnotationEvaluator,
 ) -> Result<Vec<LixcolOverride>, LixError> {
     reject_removed_lixcol_version_override(schema, schema_key)?;
 
@@ -53,7 +66,7 @@ pub(crate) fn collect_lixcol_overrides(
 pub(crate) fn collect_state_column_overrides(
     schema: &JsonValue,
     schema_key: &str,
-    evaluator: &CelEvaluator,
+    evaluator: &dyn SchemaAnnotationEvaluator,
 ) -> Result<BTreeMap<String, Value>, LixError> {
     let mut out = BTreeMap::new();
     for override_entry in collect_lixcol_overrides(schema, schema_key, evaluator)? {
@@ -66,6 +79,24 @@ pub(crate) fn collect_state_column_overrides(
         );
     }
     Ok(out)
+}
+
+pub(crate) fn collect_dynamic_entity_surface_overrides(
+    schema: &JsonValue,
+    schema_key: &str,
+    evaluator: &dyn SchemaAnnotationEvaluator,
+) -> Result<Vec<DynamicEntitySurfaceOverride>, LixError> {
+    let mut overrides = Vec::new();
+    for override_entry in collect_lixcol_overrides(schema, schema_key, evaluator)? {
+        let Some(column) = dynamic_entity_surface_column_name(&override_entry.key) else {
+            continue;
+        };
+        overrides.push(DynamicEntitySurfaceOverride {
+            column: column.to_string(),
+            value: override_entry.value,
+        });
+    }
+    Ok(overrides)
 }
 
 pub(crate) fn collect_state_column_overrides_with_shared_runtime(
@@ -104,7 +135,7 @@ fn evaluate_lixcol_override(
     schema: &JsonValue,
     schema_key: &str,
     key: &str,
-    evaluator: &CelEvaluator,
+    evaluator: &dyn SchemaAnnotationEvaluator,
 ) -> Result<Option<JsonValue>, LixError> {
     let Some(raw_expression) = raw_lixcol_override_expression(schema, key) else {
         return Ok(None);
@@ -114,7 +145,7 @@ fn evaluate_lixcol_override(
         return Ok(None);
     }
     evaluator
-        .evaluate(expression, &JsonMap::new())
+        .evaluate_schema_annotation_expression(expression, &JsonMap::new())
         .map(Some)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -129,7 +160,7 @@ fn extract_lixcol_scalar_override(
     schema: &JsonValue,
     schema_key: &str,
     key: &str,
-    evaluator: &CelEvaluator,
+    evaluator: &dyn SchemaAnnotationEvaluator,
 ) -> Result<Option<LixcolOverrideValue>, LixError> {
     let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
         return Ok(None);
@@ -164,6 +195,18 @@ fn entity_state_column_name(column: &str) -> Option<&'static str> {
     }
 }
 
+fn dynamic_entity_surface_column_name(column: &str) -> Option<&'static str> {
+    match column.to_ascii_lowercase().as_str() {
+        "lixcol_entity_id" => Some("entity_id"),
+        "lixcol_file_id" => Some("file_id"),
+        "lixcol_plugin_key" => Some("plugin_key"),
+        "lixcol_global" => Some("global"),
+        "lixcol_metadata" => Some("metadata"),
+        "lixcol_untracked" => Some("untracked"),
+        _ => None,
+    }
+}
+
 fn lixcol_override_to_engine_value(value: &LixcolOverrideValue) -> Value {
     match value {
         LixcolOverrideValue::Null => Value::Null,
@@ -174,5 +217,72 @@ fn lixcol_override_to_engine_value(value: &LixcolOverrideValue) -> Value {
             .or_else(|_| value.parse::<f64>().map(Value::Real))
             .unwrap_or_else(|_| Value::Text(value.clone())),
         LixcolOverrideValue::String(value) => Value::Text(value.clone()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collect_dynamic_entity_surface_overrides, DynamicEntitySurfaceOverride, LixcolOverrideValue,
+    };
+    use crate::runtime::cel::shared_runtime;
+    use serde_json::json;
+
+    #[test]
+    fn dynamic_entity_surface_overrides_map_lixcol_keys_to_surface_columns() {
+        let overrides = collect_dynamic_entity_surface_overrides(
+            &json!({
+                "x-lix-key": "message",
+                "x-lix-override-lixcols": {
+                    "lixcol_file_id": "\"lix\"",
+                    "lixcol_plugin_key": "\"plugin\"",
+                    "lixcol_global": "true",
+                    "lixcol_writer_key": "\"ignored\""
+                }
+            }),
+            "message",
+            shared_runtime(),
+        )
+        .expect("surface overrides should parse");
+
+        assert_eq!(
+            overrides,
+            vec![
+                DynamicEntitySurfaceOverride {
+                    column: "file_id".to_string(),
+                    value: LixcolOverrideValue::String("lix".to_string()),
+                },
+                DynamicEntitySurfaceOverride {
+                    column: "plugin_key".to_string(),
+                    value: LixcolOverrideValue::String("plugin".to_string()),
+                },
+                DynamicEntitySurfaceOverride {
+                    column: "global".to_string(),
+                    value: LixcolOverrideValue::Boolean(true),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn dynamic_entity_surface_overrides_reject_removed_version_override() {
+        let error = collect_dynamic_entity_surface_overrides(
+            &json!({
+                "x-lix-key": "message",
+                "x-lix-override-lixcols": {
+                    "lixcol_version_id": "\"global\""
+                }
+            }),
+            "message",
+            shared_runtime(),
+        )
+        .expect_err("removed version override should be rejected");
+
+        assert!(
+            error
+                .description
+                .contains("x-lix-override-lixcols.lixcol_version_id"),
+            "unexpected error: {error:?}"
+        );
     }
 }

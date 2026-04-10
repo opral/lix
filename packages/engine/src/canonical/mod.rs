@@ -44,23 +44,6 @@ mod journal;
 pub(crate) mod json;
 mod read;
 
-const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
-    "lix_internal_entity_state_timeline_breakpoint";
-const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
-const CHANGE_TABLE: &str = "lix_internal_change";
-const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
-const COMMIT_GRAPH_NODE_TABLE: &str = "lix_internal_commit_graph_node";
-
-pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
-    &[
-        CHANGE_TABLE,
-        COMMIT_GRAPH_NODE_TABLE,
-        ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,
-        SNAPSHOT_TABLE,
-        TIMELINE_STATUS_TABLE,
-    ]
-}
-
 #[allow(unused_imports)]
 pub(crate) use api::{
     append_changes, load_change, load_commit, load_exact_row_at_commit, load_history,
@@ -78,8 +61,22 @@ pub(crate) use checkpoint_labels::{
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY, CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME,
     CHECKPOINT_LABEL_SCHEMA_KEY,
 };
+pub(crate) use init::{init, seed_bootstrap};
 #[allow(unused_imports)]
 pub(crate) use read::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
-pub(crate) use init::{init, seed_bootstrap};
+
+pub(crate) const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
+    "lix_internal_entity_state_timeline_breakpoint";
+pub(crate) const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
+
+pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
+    &[
+        journal::write::CHANGE_TABLE,
+        graph::index::COMMIT_GRAPH_NODE_TABLE,
+        journal::write::SNAPSHOT_TABLE,
+        ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,
+        TIMELINE_STATUS_TABLE,
+    ]
+}

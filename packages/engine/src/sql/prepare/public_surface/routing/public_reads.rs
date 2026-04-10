@@ -2280,7 +2280,7 @@ mod tests {
             .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &crate::surfaces::build_builtin_surface_registry(),
+            &crate::catalog::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             Some("main"),
         )
@@ -2320,7 +2320,7 @@ mod tests {
             .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &crate::surfaces::build_builtin_surface_registry(),
+            &crate::catalog::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             None,
         )
@@ -2353,7 +2353,7 @@ mod tests {
         .expect("statement should exist");
         let optimized = route_broad_public_read_statement(
             &statement,
-            &crate::surfaces::build_builtin_surface_registry(),
+            &crate::catalog::build_builtin_surface_registry(),
             crate::SqlDialect::Sqlite,
             Some("main"),
         )
@@ -2393,7 +2393,7 @@ mod tests {
 
     #[test]
     fn direct_history_strategy_records_trace() {
-        let binding = crate::surfaces::build_builtin_surface_registry()
+        let binding = crate::catalog::build_builtin_surface_registry()
             .bind_relation_name("lix_state_history")
             .expect("builtin history surface should bind");
         let decision = route_public_read_execution_strategy(&binding);
