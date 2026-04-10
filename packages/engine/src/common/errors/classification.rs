@@ -1,6 +1,6 @@
+use crate::catalog::SurfaceRegistry;
 use crate::common::errors;
 use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
-use crate::contracts::surface::SurfaceRegistry;
 use crate::surfaces::{builtin_public_surface_columns, builtin_public_surface_names};
 use crate::LixBackend;
 use crate::LixError;
@@ -474,8 +474,8 @@ mod tests {
         normalize_sql_error_with_read_diagnostic_context,
         sanitize_lowered_public_sql_error_description,
     };
+    use crate::catalog::{builtin_surface_descriptors, SurfaceRegistry};
     use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
-    use crate::contracts::surface::{builtin_surface_descriptors, SurfaceRegistry};
     use crate::LixError;
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;

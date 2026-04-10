@@ -1,14 +1,11 @@
+use crate::catalog::FilesystemProjectionScope;
 use crate::common::naming::tracked_relation_name;
 use crate::common::paths::filesystem::{
     compose_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::common::text::escape_sql_string;
-use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
-};
-use crate::surface_sql::filesystem::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
 };
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
@@ -529,6 +526,7 @@ pub(crate) async fn lookup_directory_path_by_id_with_pending_transaction_view(
 
 pub(crate) async fn load_directory_rows_under_path(
     backend: &dyn LixBackend,
+    projection_sql: &str,
     version_id: &str,
     root_path: &str,
 ) -> Result<Vec<DirectoryFilesystemRow>, FilesystemQueryError> {
@@ -539,12 +537,7 @@ pub(crate) async fn load_directory_rows_under_path(
          WHERE lixcol_version_id = '{version_id}' \
            AND substr(path, 1, {prefix_length}) = '{root_path}' \
          ORDER BY path ASC, id ASC",
-        projection_sql = build_filesystem_directory_projection_sql(
-            FilesystemProjectionScope::ExplicitVersion,
-            None,
-            backend.dialect(),
-        )
-        .map_err(filesystem_query_backend_error)?,
+        projection_sql = projection_sql,
         version_id = escape_sql_string(version_id),
         prefix_length = prefix_length,
         root_path = escape_sql_string(root_path),
@@ -554,6 +547,7 @@ pub(crate) async fn load_directory_rows_under_path(
 
 pub(crate) async fn load_file_rows_under_path(
     backend: &dyn LixBackend,
+    projection_sql: &str,
     version_id: &str,
     root_path: &str,
 ) -> Result<Vec<FileFilesystemRow>, FilesystemQueryError> {
@@ -564,13 +558,7 @@ pub(crate) async fn load_file_rows_under_path(
          WHERE lixcol_version_id = '{version_id}' \
            AND substr(path, 1, {prefix_length}) = '{root_path}' \
          ORDER BY path ASC, id ASC",
-        projection_sql = build_filesystem_file_projection_sql(
-            FilesystemProjectionScope::ExplicitVersion,
-            None,
-            false,
-            backend.dialect(),
-        )
-        .map_err(filesystem_query_backend_error)?,
+        projection_sql = projection_sql,
         version_id = escape_sql_string(version_id),
         prefix_length = prefix_length,
         root_path = escape_sql_string(root_path),

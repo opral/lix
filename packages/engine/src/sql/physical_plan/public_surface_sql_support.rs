@@ -1,4 +1,4 @@
-use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::SqlDialect;
 use sqlparser::ast::{Expr, Ident, Value as SqlValue, Visit, Visitor};
 use std::ops::ControlFlow;

@@ -241,7 +241,7 @@ fn collect_columns_from_expr(expr: &Expr, required: &mut BTreeSet<String>) {
 #[cfg(test)]
 mod tests {
     use super::{build_effective_state, OverlayLane, StateSourceAuthority};
-    use crate::contracts::surface::SurfaceRegistry;
+    use crate::catalog::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;

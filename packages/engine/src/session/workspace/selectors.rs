@@ -1,4 +1,5 @@
-use crate::surface_sql::version::build_admin_version_source_sql;
+use crate::catalog::{bind_named_relation, RelationBindContext};
+use crate::sql::lower_catalog_relation_binding_to_source_sql;
 use crate::version_state::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::{LixBackend, LixError, Value};
 
@@ -112,7 +113,9 @@ async fn persist_workspace_metadata_value(
 async fn load_default_workspace_active_version_id(
     backend: &dyn LixBackend,
 ) -> Result<String, LixError> {
-    let source_sql = build_admin_version_source_sql(backend.dialect());
+    let binding = bind_named_relation("lix_version", RelationBindContext::default())?
+        .expect("lix_version must bind to a catalog relation");
+    let source_sql = lower_catalog_relation_binding_to_source_sql(backend.dialect(), &binding)?;
     let query_result = backend
         .execute(
             &format!(

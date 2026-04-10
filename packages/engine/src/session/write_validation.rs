@@ -18,6 +18,7 @@ use serde_json::Value as JsonValue;
 use crate::canonical::checkpoint_labels::{
     CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
 };
+use crate::catalog::SurfaceFamily;
 use crate::common::identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
@@ -27,7 +28,6 @@ use crate::contracts::artifacts::{
     PreparedInsertOnConflictAction, PreparedPublicWriteArtifact, PreparedResolvedWritePlan,
     PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
 };
-use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{CompiledSchemaCache, LiveStateQueryBackend, PendingView};
 use crate::live_state::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,

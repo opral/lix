@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
+use crate::catalog::FilesystemProjectionScope;
 use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
 use crate::common::paths::filesystem::NormalizedDirectoryPath;
-use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
 #[cfg(test)]

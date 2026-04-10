@@ -11,6 +11,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
 use crate::backend::TransactionBackendAdapter;
+use crate::catalog::SurfaceRegistry;
 use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
 use crate::contracts::artifacts::{
     PreparedBatch, PreparedExplainMode, PreparedInsertOnConflictAction,
@@ -26,7 +27,6 @@ use crate::contracts::artifacts::{
 use crate::contracts::functions::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
-use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{
     CompiledSchemaCache, LiveReadShapeContract, LiveStateQueryBackend, PendingView,
     SqlPreparationMetadataReader,

@@ -4,8 +4,9 @@ use crate::backend::QueryExecutor;
 use crate::canonical::read::{
     load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
+use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::common::text::escape_sql_string;
-use crate::surface_sql::version::build_admin_version_source_sql_with_current_heads;
+use crate::sql::lower_catalog_relation_binding_to_source_sql;
 use crate::version_state::{
     load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
@@ -192,15 +193,20 @@ async fn version_exists_in_descriptor_inventory_with_executor(
     version_id: &str,
 ) -> Result<bool, LixError> {
     let empty_heads = BTreeMap::new();
+    let binding = bind_named_relation(
+        "lix_version",
+        RelationBindContext {
+            active_version_id: None,
+            current_heads: Some(&empty_heads),
+        },
+    )?
+    .expect("lix_version must bind to a catalog relation");
     let sql = format!(
         "SELECT id \
          FROM ({source_sql}) version_inventory \
          WHERE id = '{version_id}' \
          LIMIT 1",
-        source_sql = build_admin_version_source_sql_with_current_heads(
-            executor.dialect(),
-            Some(&empty_heads),
-        ),
+        source_sql = lower_catalog_relation_binding_to_source_sql(executor.dialect(), &binding)?,
         version_id = escape_sql_string(version_id),
     );
     let result = executor.execute(&sql, &[]).await?;

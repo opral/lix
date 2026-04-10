@@ -1,4 +1,4 @@
-//! Shared public surface registry contracts.
+//! Catalog-owned public relation registry contracts.
 
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use std::collections::BTreeMap;
@@ -541,9 +541,9 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
         surface_variant: variant,
         read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
         read_semantics: SurfaceReadSemantics::CommittedGraph,
-        visible_columns: admin_columns(name),
+        visible_columns: version_columns(),
         hidden_columns: Vec::new(),
-        column_types: admin_column_types(name),
+        column_types: version_column_types(),
         capability,
         default_scope: DefaultScopeSemantics::GlobalAdmin,
         surface_traits: SurfaceTraits::default(),
@@ -560,121 +560,103 @@ fn admin_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescr
     }
 }
 
+pub(crate) fn dynamic_entity_surface_descriptor(
+    public_name: &str,
+    spec: &DynamicEntitySurfaceSpec,
+    variant: SurfaceVariant,
+    catalog_source: CatalogSource,
+) -> SurfaceDescriptor {
+    let (read_freshness, read_semantics, default_scope) = match variant {
+        SurfaceVariant::Default => (
+            SurfaceReadFreshness::RequiresFreshProjection,
+            SurfaceReadSemantics::WorkspaceEffective,
+            DefaultScopeSemantics::ActiveVersion,
+        ),
+        SurfaceVariant::ByVersion => (
+            SurfaceReadFreshness::RequiresFreshProjection,
+            SurfaceReadSemantics::WorkspaceEffective,
+            DefaultScopeSemantics::ExplicitVersion,
+        ),
+        SurfaceVariant::History => (
+            SurfaceReadFreshness::AllowsStaleProjection,
+            SurfaceReadSemantics::CanonicalHistory,
+            DefaultScopeSemantics::History,
+        ),
+        SurfaceVariant::WorkingChanges => (
+            SurfaceReadFreshness::AllowsStaleProjection,
+            SurfaceReadSemantics::WorkspaceChanges,
+            DefaultScopeSemantics::WorkingChanges,
+        ),
+    };
+    let capability = entity_surface_capability(&spec.schema_key, variant);
+
+    let visible_columns = entity_visible_columns(spec, variant);
+    let hidden_columns = entity_hidden_columns(variant);
+
+    SurfaceDescriptor {
+        public_name: public_name.to_string(),
+        surface_family: SurfaceFamily::Entity,
+        surface_variant: variant,
+        read_freshness,
+        read_semantics,
+        visible_columns,
+        hidden_columns,
+        column_types: entity_column_types(spec, variant),
+        capability,
+        default_scope,
+        surface_traits: SurfaceTraits {
+            state_backed: true,
+            schema_driven_projection: true,
+            exposes_version_column: matches!(
+                variant,
+                SurfaceVariant::ByVersion | SurfaceVariant::History
+            ),
+            exposes_history_columns: variant == SurfaceVariant::History,
+        },
+        resolution_capabilities: SurfaceResolutionCapabilities {
+            canonical_state_scan: true,
+            entity_projection: true,
+            semantic_write: capability == SurfaceCapability::ReadWrite,
+            ..SurfaceResolutionCapabilities::default()
+        },
+        implicit_overrides: SurfaceImplicitOverrides {
+            fixed_schema_key: Some(spec.schema_key.clone()),
+            expose_version_id: matches!(
+                variant,
+                SurfaceVariant::ByVersion | SurfaceVariant::History
+            ),
+            predicate_overrides: entity_override_predicates_for_variant(
+                &spec.predicate_overrides,
+                variant,
+            ),
+        },
+        catalog_source,
+    }
+}
+
 pub(crate) fn entity_surface_descriptors(
     spec: &DynamicEntitySurfaceSpec,
     catalog_source: CatalogSource,
 ) -> Vec<SurfaceDescriptor> {
-    let history_name = format!("{}_history", spec.schema_key);
-    let by_version_name = format!("{}_by_version", spec.schema_key);
-    let default_visible = entity_visible_columns(&spec.visible_columns, false, false);
-    let by_version_visible = entity_visible_columns(&spec.visible_columns, true, false);
-    let history_visible = entity_visible_columns(&spec.visible_columns, true, true);
-    let hidden_columns = entity_hidden_columns();
-    let column_types = entity_column_types(&spec.column_types);
-    let default_capability = entity_surface_capability(&spec.schema_key, SurfaceVariant::Default);
-    let by_version_capability =
-        entity_surface_capability(&spec.schema_key, SurfaceVariant::ByVersion);
-    let history_capability = entity_surface_capability(&spec.schema_key, SurfaceVariant::History);
-
     vec![
-        SurfaceDescriptor {
-            public_name: spec.schema_key.clone(),
-            surface_family: SurfaceFamily::Entity,
-            surface_variant: SurfaceVariant::Default,
-            read_freshness: SurfaceReadFreshness::RequiresFreshProjection,
-            read_semantics: SurfaceReadSemantics::WorkspaceEffective,
-            visible_columns: default_visible,
-            hidden_columns: hidden_columns.clone(),
-            column_types: column_types.clone(),
-            capability: default_capability,
-            default_scope: DefaultScopeSemantics::ActiveVersion,
-            surface_traits: SurfaceTraits {
-                state_backed: true,
-                schema_driven_projection: true,
-                ..SurfaceTraits::default()
-            },
-            resolution_capabilities: SurfaceResolutionCapabilities {
-                canonical_state_scan: true,
-                entity_projection: true,
-                semantic_write: default_capability == SurfaceCapability::ReadWrite,
-                ..SurfaceResolutionCapabilities::default()
-            },
-            implicit_overrides: SurfaceImplicitOverrides {
-                fixed_schema_key: Some(spec.schema_key.clone()),
-                expose_version_id: false,
-                predicate_overrides: entity_override_predicates_for_variant(
-                    &spec.predicate_overrides,
-                    SurfaceVariant::Default,
-                ),
-            },
+        dynamic_entity_surface_descriptor(
+            &spec.schema_key,
+            spec,
+            SurfaceVariant::Default,
             catalog_source,
-        },
-        SurfaceDescriptor {
-            public_name: by_version_name,
-            surface_family: SurfaceFamily::Entity,
-            surface_variant: SurfaceVariant::ByVersion,
-            read_freshness: SurfaceReadFreshness::RequiresFreshProjection,
-            read_semantics: SurfaceReadSemantics::WorkspaceEffective,
-            visible_columns: by_version_visible,
-            hidden_columns: hidden_columns.clone(),
-            column_types: column_types.clone(),
-            capability: by_version_capability,
-            default_scope: DefaultScopeSemantics::ExplicitVersion,
-            surface_traits: SurfaceTraits {
-                state_backed: true,
-                schema_driven_projection: true,
-                exposes_version_column: true,
-                ..SurfaceTraits::default()
-            },
-            resolution_capabilities: SurfaceResolutionCapabilities {
-                canonical_state_scan: true,
-                entity_projection: true,
-                semantic_write: by_version_capability == SurfaceCapability::ReadWrite,
-                ..SurfaceResolutionCapabilities::default()
-            },
-            implicit_overrides: SurfaceImplicitOverrides {
-                fixed_schema_key: Some(spec.schema_key.clone()),
-                expose_version_id: true,
-                predicate_overrides: entity_override_predicates_for_variant(
-                    &spec.predicate_overrides,
-                    SurfaceVariant::ByVersion,
-                ),
-            },
+        ),
+        dynamic_entity_surface_descriptor(
+            &format!("{}_by_version", spec.schema_key),
+            spec,
+            SurfaceVariant::ByVersion,
             catalog_source,
-        },
-        SurfaceDescriptor {
-            public_name: history_name,
-            surface_family: SurfaceFamily::Entity,
-            surface_variant: SurfaceVariant::History,
-            read_freshness: SurfaceReadFreshness::AllowsStaleProjection,
-            read_semantics: SurfaceReadSemantics::CanonicalHistory,
-            visible_columns: history_visible,
-            hidden_columns,
-            column_types,
-            capability: history_capability,
-            default_scope: DefaultScopeSemantics::History,
-            surface_traits: SurfaceTraits {
-                state_backed: true,
-                schema_driven_projection: true,
-                exposes_version_column: true,
-                exposes_history_columns: true,
-            },
-            resolution_capabilities: SurfaceResolutionCapabilities {
-                canonical_state_scan: true,
-                entity_projection: true,
-                semantic_write: history_capability == SurfaceCapability::ReadWrite,
-                ..SurfaceResolutionCapabilities::default()
-            },
-            implicit_overrides: SurfaceImplicitOverrides {
-                fixed_schema_key: Some(spec.schema_key.clone()),
-                expose_version_id: true,
-                predicate_overrides: entity_override_predicates_for_variant(
-                    &spec.predicate_overrides,
-                    SurfaceVariant::History,
-                ),
-            },
+        ),
+        dynamic_entity_surface_descriptor(
+            &format!("{}_history", spec.schema_key),
+            spec,
+            SurfaceVariant::History,
             catalog_source,
-        },
+        ),
     ]
 }
 
@@ -707,26 +689,120 @@ fn entity_override_predicates_for_variant(
         .collect()
 }
 
+fn entity_visible_columns(spec: &DynamicEntitySurfaceSpec, variant: SurfaceVariant) -> Vec<String> {
+    let mut columns = spec.visible_columns.clone();
+    match variant {
+        SurfaceVariant::Default => {}
+        SurfaceVariant::ByVersion => columns.push("lixcol_version_id".to_string()),
+        SurfaceVariant::History => columns.extend([
+            "lixcol_entity_id".to_string(),
+            "lixcol_schema_key".to_string(),
+            "lixcol_file_id".to_string(),
+            "lixcol_plugin_key".to_string(),
+            "lixcol_schema_version".to_string(),
+            "lixcol_version_id".to_string(),
+            "lixcol_change_id".to_string(),
+            "lixcol_commit_id".to_string(),
+            "lixcol_commit_created_at".to_string(),
+            "lixcol_root_commit_id".to_string(),
+            "lixcol_depth".to_string(),
+            "lixcol_metadata".to_string(),
+            "lixcol_global".to_string(),
+            "lixcol_untracked".to_string(),
+            "lixcol_writer_key".to_string(),
+        ]),
+        SurfaceVariant::WorkingChanges => {}
+    }
+    columns
+}
+
+fn entity_hidden_columns(variant: SurfaceVariant) -> Vec<String> {
+    match variant {
+        SurfaceVariant::Default => vec![
+            "lixcol_entity_id".to_string(),
+            "lixcol_schema_key".to_string(),
+            "lixcol_file_id".to_string(),
+            "lixcol_plugin_key".to_string(),
+            "lixcol_schema_version".to_string(),
+            "lixcol_version_id".to_string(),
+            "lixcol_metadata".to_string(),
+            "lixcol_global".to_string(),
+            "lixcol_untracked".to_string(),
+            "lixcol_writer_key".to_string(),
+        ],
+        SurfaceVariant::ByVersion => vec![
+            "lixcol_entity_id".to_string(),
+            "lixcol_schema_key".to_string(),
+            "lixcol_file_id".to_string(),
+            "lixcol_plugin_key".to_string(),
+            "lixcol_schema_version".to_string(),
+            "lixcol_metadata".to_string(),
+            "lixcol_global".to_string(),
+            "lixcol_untracked".to_string(),
+            "lixcol_writer_key".to_string(),
+        ],
+        SurfaceVariant::History => Vec::new(),
+        SurfaceVariant::WorkingChanges => Vec::new(),
+    }
+}
+
+fn entity_column_types(
+    spec: &DynamicEntitySurfaceSpec,
+    variant: SurfaceVariant,
+) -> BTreeMap<String, SurfaceColumnType> {
+    let mut column_types = spec.column_types.clone();
+    column_types.extend(BTreeMap::from([
+        ("lixcol_entity_id".to_string(), SurfaceColumnType::String),
+        ("lixcol_schema_key".to_string(), SurfaceColumnType::String),
+        ("lixcol_file_id".to_string(), SurfaceColumnType::String),
+        ("lixcol_plugin_key".to_string(), SurfaceColumnType::String),
+        (
+            "lixcol_schema_version".to_string(),
+            SurfaceColumnType::String,
+        ),
+        ("lixcol_version_id".to_string(), SurfaceColumnType::String),
+        ("lixcol_metadata".to_string(), SurfaceColumnType::Json),
+        ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
+        ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
+        ("lixcol_writer_key".to_string(), SurfaceColumnType::String),
+    ]));
+
+    if variant == SurfaceVariant::History {
+        column_types.extend(BTreeMap::from([
+            ("lixcol_change_id".to_string(), SurfaceColumnType::String),
+            ("lixcol_commit_id".to_string(), SurfaceColumnType::String),
+            (
+                "lixcol_commit_created_at".to_string(),
+                SurfaceColumnType::String,
+            ),
+            (
+                "lixcol_root_commit_id".to_string(),
+                SurfaceColumnType::String,
+            ),
+            ("lixcol_depth".to_string(), SurfaceColumnType::Integer),
+        ]));
+    }
+
+    column_types
+}
+
 fn state_columns() -> Vec<String> {
-    [
-        "entity_id",
-        "schema_key",
-        "file_id",
-        "plugin_key",
-        "snapshot_content",
-        "metadata",
-        "schema_version",
-        "created_at",
-        "updated_at",
-        "global",
-        "change_id",
-        "commit_id",
-        "untracked",
-        "writer_key",
+    vec![
+        "entity_id".to_string(),
+        "schema_key".to_string(),
+        "file_id".to_string(),
+        "plugin_key".to_string(),
+        "snapshot_content".to_string(),
+        "metadata".to_string(),
+        "schema_version".to_string(),
+        "created_at".to_string(),
+        "updated_at".to_string(),
+        "global".to_string(),
+        "change_id".to_string(),
+        "commit_id".to_string(),
+        "untracked".to_string(),
+        "writer_key".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn state_by_version_columns() -> Vec<String> {
@@ -735,49 +811,59 @@ fn state_by_version_columns() -> Vec<String> {
     columns
 }
 
+fn state_history_columns() -> Vec<String> {
+    vec![
+        "entity_id".to_string(),
+        "schema_key".to_string(),
+        "file_id".to_string(),
+        "plugin_key".to_string(),
+        "snapshot_content".to_string(),
+        "metadata".to_string(),
+        "schema_version".to_string(),
+        "change_id".to_string(),
+        "commit_id".to_string(),
+        "commit_created_at".to_string(),
+        "root_commit_id".to_string(),
+        "depth".to_string(),
+        "version_id".to_string(),
+    ]
+}
+
 fn state_column_types() -> BTreeMap<String, SurfaceColumnType> {
     BTreeMap::from([
+        ("entity_id".to_string(), SurfaceColumnType::String),
+        ("schema_key".to_string(), SurfaceColumnType::String),
+        ("file_id".to_string(), SurfaceColumnType::String),
+        ("plugin_key".to_string(), SurfaceColumnType::String),
+        ("snapshot_content".to_string(), SurfaceColumnType::Json),
+        ("metadata".to_string(), SurfaceColumnType::Json),
+        ("schema_version".to_string(), SurfaceColumnType::String),
+        ("created_at".to_string(), SurfaceColumnType::String),
+        ("updated_at".to_string(), SurfaceColumnType::String),
         ("global".to_string(), SurfaceColumnType::Boolean),
+        ("change_id".to_string(), SurfaceColumnType::String),
+        ("commit_id".to_string(), SurfaceColumnType::String),
         ("untracked".to_string(), SurfaceColumnType::Boolean),
+        ("writer_key".to_string(), SurfaceColumnType::String),
+        ("version_id".to_string(), SurfaceColumnType::String),
+        ("commit_created_at".to_string(), SurfaceColumnType::String),
+        ("root_commit_id".to_string(), SurfaceColumnType::String),
+        ("depth".to_string(), SurfaceColumnType::Integer),
     ])
 }
 
-fn state_history_columns() -> Vec<String> {
-    [
-        "entity_id",
-        "schema_key",
-        "file_id",
-        "plugin_key",
-        "snapshot_content",
-        "metadata",
-        "schema_version",
-        "change_id",
-        "commit_id",
-        "commit_created_at",
-        "root_commit_id",
-        "depth",
-        "version_id",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
-}
-
 fn change_columns() -> Vec<String> {
-    [
-        "id",
-        "entity_id",
-        "schema_key",
-        "schema_version",
-        "file_id",
-        "plugin_key",
-        "metadata",
-        "created_at",
-        "snapshot_content",
+    vec![
+        "id".to_string(),
+        "entity_id".to_string(),
+        "schema_key".to_string(),
+        "schema_version".to_string(),
+        "file_id".to_string(),
+        "plugin_key".to_string(),
+        "metadata".to_string(),
+        "created_at".to_string(),
+        "snapshot_content".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn change_column_types() -> BTreeMap<String, SurfaceColumnType> {
@@ -785,53 +871,55 @@ fn change_column_types() -> BTreeMap<String, SurfaceColumnType> {
 }
 
 fn working_changes_columns() -> Vec<String> {
-    [
-        "entity_id",
-        "schema_key",
-        "file_id",
-        "lixcol_global",
-        "before_change_id",
-        "after_change_id",
-        "before_commit_id",
-        "after_commit_id",
-        "status",
+    vec![
+        "entity_id".to_string(),
+        "schema_key".to_string(),
+        "schema_version".to_string(),
+        "file_id".to_string(),
+        "plugin_key".to_string(),
+        "snapshot_content".to_string(),
+        "change_id".to_string(),
+        "is_deleted".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn working_changes_column_types() -> BTreeMap<String, SurfaceColumnType> {
-    BTreeMap::from([("lixcol_global".to_string(), SurfaceColumnType::Boolean)])
+    BTreeMap::from([
+        ("entity_id".to_string(), SurfaceColumnType::String),
+        ("schema_key".to_string(), SurfaceColumnType::String),
+        ("schema_version".to_string(), SurfaceColumnType::String),
+        ("file_id".to_string(), SurfaceColumnType::String),
+        ("plugin_key".to_string(), SurfaceColumnType::String),
+        ("snapshot_content".to_string(), SurfaceColumnType::Json),
+        ("change_id".to_string(), SurfaceColumnType::String),
+        ("is_deleted".to_string(), SurfaceColumnType::Boolean),
+    ])
 }
 
 fn filesystem_file_columns() -> Vec<String> {
-    [
-        "id",
-        "directory_id",
-        "name",
-        "extension",
-        "path",
-        "data",
-        "metadata",
-        "hidden",
-        "lixcol_entity_id",
-        "lixcol_schema_key",
-        "lixcol_file_id",
-        "lixcol_plugin_key",
-        "lixcol_schema_version",
-        "lixcol_global",
-        "lixcol_change_id",
-        "lixcol_created_at",
-        "lixcol_updated_at",
-        "lixcol_commit_id",
-        "lixcol_writer_key",
-        "lixcol_untracked",
-        "lixcol_metadata",
+    vec![
+        "id".to_string(),
+        "directory_id".to_string(),
+        "name".to_string(),
+        "extension".to_string(),
+        "path".to_string(),
+        "data".to_string(),
+        "metadata".to_string(),
+        "hidden".to_string(),
+        "lixcol_entity_id".to_string(),
+        "lixcol_schema_key".to_string(),
+        "lixcol_file_id".to_string(),
+        "lixcol_plugin_key".to_string(),
+        "lixcol_schema_version".to_string(),
+        "lixcol_global".to_string(),
+        "lixcol_change_id".to_string(),
+        "lixcol_created_at".to_string(),
+        "lixcol_updated_at".to_string(),
+        "lixcol_commit_id".to_string(),
+        "lixcol_writer_key".to_string(),
+        "lixcol_untracked".to_string(),
+        "lixcol_metadata".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn filesystem_file_by_version_columns() -> Vec<String> {
@@ -841,51 +929,45 @@ fn filesystem_file_by_version_columns() -> Vec<String> {
 }
 
 fn filesystem_file_history_columns() -> Vec<String> {
-    [
-        "id",
-        "path",
-        "data",
-        "metadata",
-        "hidden",
-        "lixcol_entity_id",
-        "lixcol_schema_key",
-        "lixcol_file_id",
-        "lixcol_version_id",
-        "lixcol_plugin_key",
-        "lixcol_schema_version",
-        "lixcol_change_id",
-        "lixcol_metadata",
-        "lixcol_commit_id",
-        "lixcol_commit_created_at",
-        "lixcol_root_commit_id",
-        "lixcol_depth",
+    vec![
+        "id".to_string(),
+        "path".to_string(),
+        "data".to_string(),
+        "metadata".to_string(),
+        "hidden".to_string(),
+        "lixcol_entity_id".to_string(),
+        "lixcol_schema_key".to_string(),
+        "lixcol_file_id".to_string(),
+        "lixcol_version_id".to_string(),
+        "lixcol_plugin_key".to_string(),
+        "lixcol_schema_version".to_string(),
+        "lixcol_change_id".to_string(),
+        "lixcol_metadata".to_string(),
+        "lixcol_commit_id".to_string(),
+        "lixcol_commit_created_at".to_string(),
+        "lixcol_root_commit_id".to_string(),
+        "lixcol_depth".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn filesystem_directory_columns() -> Vec<String> {
-    [
-        "id",
-        "parent_id",
-        "name",
-        "path",
-        "hidden",
-        "lixcol_entity_id",
-        "lixcol_schema_key",
-        "lixcol_schema_version",
-        "lixcol_global",
-        "lixcol_change_id",
-        "lixcol_created_at",
-        "lixcol_updated_at",
-        "lixcol_commit_id",
-        "lixcol_untracked",
-        "lixcol_metadata",
+    vec![
+        "id".to_string(),
+        "parent_id".to_string(),
+        "name".to_string(),
+        "path".to_string(),
+        "hidden".to_string(),
+        "lixcol_entity_id".to_string(),
+        "lixcol_schema_key".to_string(),
+        "lixcol_schema_version".to_string(),
+        "lixcol_global".to_string(),
+        "lixcol_change_id".to_string(),
+        "lixcol_created_at".to_string(),
+        "lixcol_updated_at".to_string(),
+        "lixcol_commit_id".to_string(),
+        "lixcol_untracked".to_string(),
+        "lixcol_metadata".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn filesystem_directory_by_version_columns() -> Vec<String> {
@@ -895,28 +977,25 @@ fn filesystem_directory_by_version_columns() -> Vec<String> {
 }
 
 fn filesystem_directory_history_columns() -> Vec<String> {
-    [
-        "id",
-        "parent_id",
-        "name",
-        "path",
-        "hidden",
-        "lixcol_entity_id",
-        "lixcol_schema_key",
-        "lixcol_file_id",
-        "lixcol_version_id",
-        "lixcol_plugin_key",
-        "lixcol_schema_version",
-        "lixcol_change_id",
-        "lixcol_metadata",
-        "lixcol_commit_id",
-        "lixcol_commit_created_at",
-        "lixcol_root_commit_id",
-        "lixcol_depth",
+    vec![
+        "id".to_string(),
+        "parent_id".to_string(),
+        "name".to_string(),
+        "path".to_string(),
+        "hidden".to_string(),
+        "lixcol_entity_id".to_string(),
+        "lixcol_schema_key".to_string(),
+        "lixcol_file_id".to_string(),
+        "lixcol_version_id".to_string(),
+        "lixcol_plugin_key".to_string(),
+        "lixcol_schema_version".to_string(),
+        "lixcol_change_id".to_string(),
+        "lixcol_metadata".to_string(),
+        "lixcol_commit_id".to_string(),
+        "lixcol_commit_created_at".to_string(),
+        "lixcol_root_commit_id".to_string(),
+        "lixcol_depth".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
 fn filesystem_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
@@ -937,325 +1016,20 @@ fn filesystem_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
     }
 }
 
-fn admin_columns(name: &str) -> Vec<String> {
-    match name {
-        "lix_version" => vec![
-            "id".to_string(),
-            "name".to_string(),
-            "hidden".to_string(),
-            "commit_id".to_string(),
-        ],
-        _ => vec!["id".to_string()],
-    }
-}
-
-fn admin_column_types(name: &str) -> BTreeMap<String, SurfaceColumnType> {
-    match name {
-        "lix_version" => BTreeMap::from([("hidden".to_string(), SurfaceColumnType::Boolean)]),
-        _ => BTreeMap::new(),
-    }
-}
-
-fn entity_visible_columns(
-    visible_columns: &[String],
-    include_version_id: bool,
-    include_history_columns: bool,
-) -> Vec<String> {
-    let mut columns = visible_columns.to_vec();
-    if include_version_id {
-        columns.push("lixcol_version_id".to_string());
-    }
-    if include_history_columns {
-        columns.extend([
-            "lixcol_change_id".to_string(),
-            "lixcol_commit_id".to_string(),
-            "lixcol_root_commit_id".to_string(),
-            "lixcol_depth".to_string(),
-        ]);
-    }
-    columns
-}
-
-fn entity_hidden_columns() -> Vec<String> {
-    [
-        "lixcol_entity_id",
-        "lixcol_schema_key",
-        "lixcol_file_id",
-        "lixcol_plugin_key",
-        "lixcol_schema_version",
-        "lixcol_global",
-        "lixcol_writer_key",
-        "lixcol_untracked",
-        "lixcol_metadata",
+fn version_columns() -> Vec<String> {
+    vec![
+        "id".to_string(),
+        "name".to_string(),
+        "hidden".to_string(),
+        "commit_id".to_string(),
     ]
-    .into_iter()
-    .map(str::to_string)
-    .collect()
 }
 
-fn entity_column_types(
-    property_column_types: &BTreeMap<String, SurfaceColumnType>,
-) -> BTreeMap<String, SurfaceColumnType> {
-    let mut column_types = property_column_types.clone();
-    column_types.insert("lixcol_global".to_string(), SurfaceColumnType::Boolean);
-    column_types.insert("lixcol_untracked".to_string(), SurfaceColumnType::Boolean);
-    column_types
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        CatalogEpoch, DefaultScopeSemantics, DynamicEntitySurfaceSpec, SurfaceCapability,
-        SurfaceFamily, SurfaceReadSemantics, SurfaceVariant,
-    };
-    use crate::surfaces::{builtin_public_surface_columns, builtin_public_surface_names};
-    use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
-    use std::collections::{BTreeMap, HashSet};
-
-    #[test]
-    fn binds_builtin_state_surfaces() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-        let binding = registry
-            .bind_relation_name("lix_state_by_version")
-            .expect("builtin surface should bind");
-
-        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::State);
-        assert_eq!(
-            binding.descriptor.surface_variant,
-            SurfaceVariant::ByVersion
-        );
-        assert_eq!(
-            binding.default_scope,
-            DefaultScopeSemantics::ExplicitVersion
-        );
-        assert_eq!(
-            binding.read_semantics,
-            SurfaceReadSemantics::WorkspaceEffective
-        );
-        assert!(binding.implicit_overrides.expose_version_id);
-    }
-
-    #[test]
-    fn surfaces_declare_committed_vs_workspace_overlay_semantics() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-
-        assert_eq!(
-            registry
-                .bind_relation_name("lix_state")
-                .expect("lix_state should bind")
-                .read_semantics,
-            SurfaceReadSemantics::WorkspaceEffective
-        );
-        assert_eq!(
-            registry
-                .bind_relation_name("lix_key_value")
-                .expect("entity surface should bind")
-                .read_semantics,
-            SurfaceReadSemantics::WorkspaceEffective
-        );
-        assert_eq!(
-            registry
-                .bind_relation_name("lix_state_history")
-                .expect("lix_state_history should bind")
-                .read_semantics,
-            SurfaceReadSemantics::CanonicalHistory
-        );
-        assert_eq!(
-            registry
-                .bind_relation_name("lix_version")
-                .expect("lix_version should bind")
-                .read_semantics,
-            SurfaceReadSemantics::CommittedGraph
-        );
-        assert_eq!(
-            registry
-                .bind_relation_name("lix_working_changes")
-                .expect("lix_working_changes should bind")
-                .read_semantics,
-            SurfaceReadSemantics::WorkspaceChanges
-        );
-    }
-
-    #[test]
-    fn dynamic_entity_registration_bumps_catalog_epoch_and_tracks_binding_epoch() {
-        let mut registry = crate::surfaces::build_builtin_surface_registry();
-        assert_eq!(registry.catalog_epoch(), CatalogEpoch::default());
-
-        let epoch = crate::surfaces::register_dynamic_entity_surface_spec(
-            &mut registry,
-            DynamicEntitySurfaceSpec {
-                schema_key: "lix_key_value".to_string(),
-                visible_columns: vec!["key".to_string(), "value".to_string()],
-                column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
-            },
-        );
-
-        assert_eq!(epoch.0, 1);
-        let binding = registry
-            .bind_relation_name("lix_key_value")
-            .expect("dynamic surface should bind");
-        assert_eq!(binding.catalog_epoch, Some(epoch));
-        assert_eq!(
-            binding.implicit_overrides.fixed_schema_key.as_deref(),
-            Some("lix_key_value")
-        );
-    }
-
-    #[test]
-    fn builtin_registry_bootstraps_builtin_entity_surfaces() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-        let binding = registry
-            .bind_relation_name("lix_key_value")
-            .expect("builtin schema-derived entity surface should bind");
-
-        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
-        assert_eq!(
-            binding.implicit_overrides.fixed_schema_key.as_deref(),
-            Some("lix_key_value")
-        );
-    }
-
-    #[test]
-    fn builtin_registry_exposes_registered_schema_by_version_entity_surface() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-        let binding = registry
-            .bind_relation_name("lix_registered_schema_by_version")
-            .expect("registered schema by-version surface should bind");
-
-        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
-        assert_eq!(
-            binding.descriptor.surface_variant,
-            SurfaceVariant::ByVersion
-        );
-        assert_eq!(
-            binding.implicit_overrides.fixed_schema_key.as_deref(),
-            Some("lix_registered_schema")
-        );
-    }
-
-    #[test]
-    fn builtin_registry_exposes_registered_schema_default_entity_surface() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-        let binding = registry
-            .bind_relation_name("lix_registered_schema")
-            .expect("registered schema default surface should bind");
-
-        assert_eq!(binding.descriptor.surface_family, SurfaceFamily::Entity);
-        assert_eq!(binding.descriptor.surface_variant, SurfaceVariant::Default);
-        assert_eq!(
-            binding.implicit_overrides.fixed_schema_key.as_deref(),
-            Some("lix_registered_schema")
-        );
-    }
-
-    #[test]
-    fn derived_builtin_entity_surfaces_are_read_only() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-        for surface in [
-            "lix_commit",
-            "lix_commit_by_version",
-            "lix_change_set",
-            "lix_change_set_by_version",
-            "lix_change_author",
-            "lix_change_author_by_version",
-            "lix_change_set_element",
-            "lix_change_set_element_by_version",
-            "lix_commit_edge",
-            "lix_commit_edge_by_version",
-        ] {
-            let binding = registry
-                .bind_relation_name(surface)
-                .expect("derived builtin surface should bind");
-            assert_eq!(binding.capability, SurfaceCapability::ReadOnly);
-            assert!(
-                !binding.resolution_capabilities.semantic_write,
-                "derived builtin surface should not permit semantic writes: {surface}"
-            );
-        }
-    }
-
-    #[test]
-    fn builtin_public_surface_names_are_unique() {
-        let names = builtin_public_surface_names();
-        let mut seen = HashSet::new();
-        for name in names {
-            assert!(
-                seen.insert(name.clone()),
-                "duplicate public surface: {name}"
-            );
-        }
-    }
-
-    #[test]
-    fn filesystem_surface_columns_match_public_contracts() {
-        assert_eq!(
-            builtin_public_surface_columns("lix_file").expect("lix_file columns"),
-            vec![
-                "id",
-                "directory_id",
-                "name",
-                "extension",
-                "path",
-                "data",
-                "metadata",
-                "hidden",
-                "lixcol_entity_id",
-                "lixcol_schema_key",
-                "lixcol_file_id",
-                "lixcol_plugin_key",
-                "lixcol_schema_version",
-                "lixcol_global",
-                "lixcol_change_id",
-                "lixcol_created_at",
-                "lixcol_updated_at",
-                "lixcol_commit_id",
-                "lixcol_writer_key",
-                "lixcol_untracked",
-                "lixcol_metadata",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-        );
-        assert_eq!(
-            builtin_public_surface_columns("lix_file_history_by_version")
-                .expect("lix_file_history_by_version columns"),
-            vec![
-                "id",
-                "path",
-                "data",
-                "metadata",
-                "hidden",
-                "lixcol_entity_id",
-                "lixcol_schema_key",
-                "lixcol_file_id",
-                "lixcol_version_id",
-                "lixcol_plugin_key",
-                "lixcol_schema_version",
-                "lixcol_change_id",
-                "lixcol_metadata",
-                "lixcol_commit_id",
-                "lixcol_commit_created_at",
-                "lixcol_root_commit_id",
-                "lixcol_depth",
-            ]
-            .into_iter()
-            .map(str::to_string)
-            .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
-    fn binds_object_names_using_last_relation_segment() {
-        let registry = crate::surfaces::build_builtin_surface_registry();
-        let binding = registry
-            .bind_object_name(&ObjectName(vec![
-                ObjectNamePart::Identifier(Ident::new("main")),
-                ObjectNamePart::Identifier(Ident::new("lix_state")),
-            ]))
-            .expect("object name should bind");
-
-        assert_eq!(binding.descriptor.public_name, "lix_state");
-    }
+fn version_column_types() -> BTreeMap<String, SurfaceColumnType> {
+    BTreeMap::from([
+        ("id".to_string(), SurfaceColumnType::String),
+        ("name".to_string(), SurfaceColumnType::String),
+        ("hidden".to_string(), SurfaceColumnType::Boolean),
+        ("commit_id".to_string(), SurfaceColumnType::String),
+    ])
 }

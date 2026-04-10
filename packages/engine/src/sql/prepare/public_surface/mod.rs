@@ -2,6 +2,9 @@
 
 pub(crate) mod routing;
 
+use crate::catalog::{
+    SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
+};
 use crate::common::errors::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
     sql_unknown_table_error,
@@ -14,9 +17,6 @@ use crate::contracts::change::TrackedChangeView;
 use crate::contracts::state_commit_stream::{
     state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamRuntimeMetadata,
-};
-use crate::contracts::surface::{
-    SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
 #[cfg(test)]
 use crate::contracts::traits::SqlPreparationMetadataReader;
@@ -167,7 +167,7 @@ pub(crate) enum PublicExecutionRoute {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BoundPublicReadSummary {
-    bound_surface_bindings: Vec<crate::contracts::surface::SurfaceBinding>,
+    bound_surface_bindings: Vec<crate::catalog::SurfaceBinding>,
     internal_relations: Vec<String>,
     external_relations: Vec<String>,
     requested_history_root_commit_ids: Vec<String>,
@@ -609,7 +609,7 @@ fn merge_surface_read_freshness(
 }
 
 fn bound_surface_freshness_contract(
-    bindings: &[crate::contracts::surface::SurfaceBinding],
+    bindings: &[crate::catalog::SurfaceBinding],
 ) -> Option<SurfaceReadFreshness> {
     let mut bindings = bindings.iter();
     let first = bindings.next()?;
@@ -1519,7 +1519,7 @@ pub(crate) fn public_write_preparation_error(
 }
 
 fn public_write_preparation_error_for_surface(
-    surface_binding: &crate::contracts::surface::SurfaceBinding,
+    surface_binding: &crate::catalog::SurfaceBinding,
     operation_kind: WriteOperationKind,
     message: &str,
 ) -> Option<LixError> {
@@ -1744,10 +1744,10 @@ mod tests {
         prepare_public_execution, prepare_public_read, prepare_public_read_strict,
         PreparedPublicExecution, PreparedPublicReadExecution,
     };
+    use crate::catalog::SurfaceReadFreshness;
     use crate::contracts::artifacts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
-    use crate::contracts::surface::SurfaceReadFreshness;
     use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
     use crate::live_state::{self, mark_mode_with_backend};
     use crate::schema::LixCommit;
