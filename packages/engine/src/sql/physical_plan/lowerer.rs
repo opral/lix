@@ -1,9 +1,10 @@
-use crate::common::errors::sql_unknown_column_error;
-use crate::contracts::artifacts::EffectiveStateRequest;
-use crate::contracts::surface::{
+use crate::catalog::{bind_named_relation, RelationBindContext};
+use crate::catalog::{
     SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
+use crate::common::errors::sql_unknown_column_error;
+use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
@@ -21,14 +22,9 @@ use crate::sql::physical_plan::public_surface_sql_support::{
 };
 use crate::sql::physical_plan::source_sql::{
     build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
+    lower_catalog_relation_binding_to_source_sql,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
-use crate::surface_sql::filesystem::{
-    build_filesystem_directory_projection_sql, build_filesystem_file_projection_sql,
-};
-use crate::surface_sql::version::{
-    build_admin_version_source_sql, build_admin_version_source_sql_with_current_heads,
-};
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
@@ -955,24 +951,21 @@ fn build_filesystem_surface_sql(
     active_version_id: Option<&str>,
     surface: FilesystemPublicSurface,
 ) -> Result<String, LixError> {
-    let scoped_active_version_id = if surface.needs_active_version_id() {
-        active_version_id
-    } else {
-        None
+    let relation_name = match (surface.kind(), surface.needs_active_version_id()) {
+        (FilesystemKind::File, true) => "lix_file",
+        (FilesystemKind::File, false) => "lix_file_by_version",
+        (FilesystemKind::Directory, true) => "lix_directory",
+        (FilesystemKind::Directory, false) => "lix_directory_by_version",
     };
-    match surface.kind() {
-        FilesystemKind::File => build_filesystem_file_projection_sql(
-            surface.projection_scope(),
-            scoped_active_version_id,
-            false,
-            dialect,
-        ),
-        FilesystemKind::Directory => build_filesystem_directory_projection_sql(
-            surface.projection_scope(),
-            scoped_active_version_id,
-            dialect,
-        ),
-    }
+    let binding = bind_named_relation(
+        relation_name,
+        RelationBindContext {
+            active_version_id,
+            current_heads: None,
+        },
+    )?
+    .expect("filesystem relation must bind to a catalog relation");
+    lower_catalog_relation_binding_to_source_sql(dialect, &binding)
 }
 
 fn build_state_source_sql(
@@ -1003,7 +996,11 @@ fn build_admin_source_sql(
     dialect: SqlDialect,
 ) -> Result<String, LixError> {
     Ok(match kind {
-        CanonicalAdminKind::Version => build_admin_version_source_sql(dialect),
+        CanonicalAdminKind::Version => {
+            let binding = bind_named_relation("lix_version", RelationBindContext::default())?
+                .expect("lix_version must bind to a catalog relation");
+            lower_catalog_relation_binding_to_source_sql(dialect, &binding)?
+        }
     })
 }
 
@@ -1014,7 +1011,15 @@ fn build_admin_source_sql_with_current_heads(
 ) -> Result<String, LixError> {
     Ok(match kind {
         CanonicalAdminKind::Version => {
-            build_admin_version_source_sql_with_current_heads(dialect, Some(current_version_heads))
+            let binding = bind_named_relation(
+                "lix_version",
+                RelationBindContext {
+                    active_version_id: None,
+                    current_heads: Some(current_version_heads),
+                },
+            )?
+            .expect("lix_version must bind to a catalog relation");
+            lower_catalog_relation_binding_to_source_sql(dialect, &binding)?
         }
     })
 }
@@ -1418,7 +1423,7 @@ mod tests {
         lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
         LoweredReadProgram,
     };
-    use crate::contracts::surface::SurfaceRegistry;
+    use crate::catalog::SurfaceRegistry;
     use crate::sql::binder::{
         bind_broad_public_read_statement_with_registry, bind_statement,
         forbid_broad_binding_for_test,
@@ -1970,26 +1975,24 @@ mod tests {
         let mut registry = crate::surfaces::build_builtin_surface_registry();
         crate::surfaces::register_dynamic_entity_surface_spec(
             &mut registry,
-            crate::contracts::surface::DynamicEntitySurfaceSpec {
+            crate::catalog::DynamicEntitySurfaceSpec {
                 schema_key: "message".to_string(),
                 visible_columns: vec!["body".to_string(), "id".to_string()],
                 column_types: BTreeMap::new(),
                 predicate_overrides: vec![
-                    crate::contracts::surface::SurfaceOverridePredicate {
+                    crate::catalog::SurfaceOverridePredicate {
                         column: "file_id".to_string(),
-                        value: crate::contracts::surface::SurfaceOverrideValue::String(
-                            "inlang".to_string(),
-                        ),
+                        value: crate::catalog::SurfaceOverrideValue::String("inlang".to_string()),
                     },
-                    crate::contracts::surface::SurfaceOverridePredicate {
+                    crate::catalog::SurfaceOverridePredicate {
                         column: "plugin_key".to_string(),
-                        value: crate::contracts::surface::SurfaceOverrideValue::String(
+                        value: crate::catalog::SurfaceOverrideValue::String(
                             "inlang_sdk".to_string(),
                         ),
                     },
-                    crate::contracts::surface::SurfaceOverridePredicate {
+                    crate::catalog::SurfaceOverridePredicate {
                         column: "global".to_string(),
-                        value: crate::contracts::surface::SurfaceOverrideValue::Boolean(true),
+                        value: crate::catalog::SurfaceOverrideValue::Boolean(true),
                     },
                 ],
             },

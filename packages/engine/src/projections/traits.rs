@@ -38,9 +38,9 @@ mod tests {
     };
     use crate::Value;
     use crate::{
+        catalog::{SurfaceFamily, SurfaceVariant},
         contracts::artifacts::RowIdentity,
         contracts::artifacts::UntrackedRow,
-        contracts::surface::{SurfaceFamily, SurfaceVariant},
     };
 
     #[test]

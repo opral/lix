@@ -5,11 +5,11 @@ use self::insert_planning::{
     plan_file_insert_batch,
 };
 use super::*;
+use crate::catalog::{bind_named_relation, FilesystemProjectionScope, RelationBindContext};
 use crate::common::paths::filesystem::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::PendingView;
 use crate::execution::write::filesystem::query::{
     ensure_no_directory_at_file_path, ensure_no_file_at_directory_path, load_directory_row_by_id,
@@ -25,6 +25,7 @@ use crate::session::write_resolution::prepared_artifacts::{
     resolve_placeholder_index, DirectoryInsertAssignments, DirectoryUpdateAssignments,
     FileInsertAssignments, FileUpdateAssignments, FilesystemWriteIntent, PlaceholderState,
 };
+use crate::sql::lower_catalog_relation_binding_to_source_sql;
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};
@@ -103,6 +104,17 @@ fn filesystem_write_lookup_scope(planned_write: &PlannedWrite) -> FilesystemProj
         }
         _ => FilesystemProjectionScope::ExplicitVersion,
     }
+}
+
+fn filesystem_projection_sql(
+    backend: &dyn LixBackend,
+    relation_name: &str,
+) -> Result<String, WriteResolveError> {
+    let binding = bind_named_relation(relation_name, RelationBindContext::default())
+        .map_err(write_resolve_backend_error)?
+        .expect("filesystem public relation must bind to a catalog relation");
+    lower_catalog_relation_binding_to_source_sql(backend.dialect(), &binding)
+        .map_err(write_resolve_backend_error)
 }
 
 async fn resolved_filesystem_version_id(
@@ -365,14 +377,27 @@ async fn resolve_existing_directory_write(
         WriteOperationKind::Delete => {
             let mut descendant_directories = BTreeMap::new();
             let mut descendant_files = BTreeMap::new();
+            let directory_projection_sql =
+                filesystem_projection_sql(backend, "lix_directory_by_version")?;
+            let file_projection_sql = filesystem_projection_sql(backend, "lix_file_by_version")?;
             for current_row in current_rows {
-                for row in
-                    load_directory_rows_under_path(backend, &version_id, &current_row.path).await?
+                for row in load_directory_rows_under_path(
+                    backend,
+                    &directory_projection_sql,
+                    &version_id,
+                    &current_row.path,
+                )
+                .await?
                 {
                     descendant_directories.entry(row.id.clone()).or_insert(row);
                 }
-                for row in
-                    load_file_rows_under_path(backend, &version_id, &current_row.path).await?
+                for row in load_file_rows_under_path(
+                    backend,
+                    &file_projection_sql,
+                    &version_id,
+                    &current_row.path,
+                )
+                .await?
                 {
                     descendant_files.entry(row.id.clone()).or_insert(row);
                 }

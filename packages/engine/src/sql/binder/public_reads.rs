@@ -1,4 +1,4 @@
-use crate::contracts::surface::SurfaceRegistry;
+use crate::catalog::SurfaceRegistry;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadCte, BroadPublicReadDistinct, BroadPublicReadGroupBy,
     BroadPublicReadGroupByKind, BroadPublicReadJoin, BroadPublicReadJoinConstraint,

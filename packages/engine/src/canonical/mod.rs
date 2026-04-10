@@ -79,3 +79,7 @@ pub(crate) use checkpoint_labels::{
     CHECKPOINT_LABEL_SCHEMA_KEY,
 };
 pub(crate) use init::{init, seed_bootstrap};
+#[allow(unused_imports)]
+pub(crate) use read::{
+    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
+};

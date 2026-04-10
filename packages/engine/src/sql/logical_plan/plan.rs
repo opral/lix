@@ -1,5 +1,5 @@
+use crate::catalog::SurfaceBinding;
 use crate::contracts::artifacts::EffectiveStateRequest;
-use crate::contracts::surface::SurfaceBinding;
 use crate::sql::logical_plan::dependency_spec::DependencySpec;
 use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
 use crate::sql::logical_plan::public_ir::{

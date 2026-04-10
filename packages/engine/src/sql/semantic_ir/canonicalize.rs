@@ -1,4 +1,4 @@
-use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
+use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
@@ -653,8 +653,7 @@ fn reject_filesystem_history_write(
     operation: &str,
 ) -> Result<(), CanonicalizeError> {
     if surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
-        && surface_binding.descriptor.surface_variant
-            == crate::contracts::surface::SurfaceVariant::History
+        && surface_binding.descriptor.surface_variant == crate::catalog::SurfaceVariant::History
     {
         return Err(CanonicalizeError::unsupported(format!(
             "{} does not support {operation}",
@@ -1875,7 +1874,7 @@ fn expr_to_u64(expr: &Expr) -> Result<u64, CanonicalizeError> {
 #[cfg(test)]
 mod tests {
     use super::{canonicalize_read, canonicalize_write};
-    use crate::contracts::surface::DynamicEntitySurfaceSpec;
+    use crate::catalog::DynamicEntitySurfaceSpec;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::{
         MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,

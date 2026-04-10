@@ -37,7 +37,7 @@ impl<'a> TransactionReadModel<'a> {
 
     async fn bootstrap_public_surface_registry(
         &self,
-    ) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
+    ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
             return crate::surfaces::load_public_surface_registry_with_backend(self.base).await;
         }
@@ -363,7 +363,7 @@ impl<'a> TransactionReadModel<'a> {
 pub(crate) async fn build_surface_registry(
     base: &dyn LixBackend,
     pending_transaction_view: Option<&dyn PendingView>,
-) -> Result<crate::contracts::surface::SurfaceRegistry, LixError> {
+) -> Result<crate::catalog::SurfaceRegistry, LixError> {
     TransactionReadModel::new(base, pending_transaction_view)
         .bootstrap_public_surface_registry()
         .await

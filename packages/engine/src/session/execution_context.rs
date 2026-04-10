@@ -5,8 +5,8 @@ use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex;
 
+use crate::catalog::SurfaceRegistry;
 use crate::contracts::artifacts::{ExecuteOptions, SessionStateDelta};
-use crate::contracts::surface::SurfaceRegistry;
 use crate::execution::write::BufferedWriteExecutionInput;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::sql::binder::RuntimeBindingValues;

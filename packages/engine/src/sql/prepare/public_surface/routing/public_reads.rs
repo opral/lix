@@ -1,4 +1,4 @@
-use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
+use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::logical_plan::public_ir::{

@@ -1,8 +1,8 @@
+use crate::catalog::FilesystemProjectionScope;
 use crate::common::paths::filesystem::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::PendingView;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::execution::write::filesystem::query::{

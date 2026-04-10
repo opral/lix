@@ -4,11 +4,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
+use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
 use crate::common::error::LixError;
 use crate::common::types::Value;
-use crate::contracts::surface::{
-    SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant,
-};
 use crate::contracts::transaction_mode::TransactionMode;
 use crate::contracts::ReplayCursor;
 
@@ -163,12 +161,6 @@ pub(crate) enum SessionExecutionMode {
     CommittedRead,
     CommittedRuntimeMutation,
     WriteTransaction,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FilesystemProjectionScope {
-    ActiveVersion,
-    ExplicitVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
@@ -2205,7 +2197,7 @@ mod tests {
         ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
         ResultContract,
     };
-    use crate::contracts::surface::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
+    use crate::catalog::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
     use crate::Value;
 
     #[test]

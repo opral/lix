@@ -1,4 +1,4 @@
-pub(crate) const INTERNAL_BINARY_BLOB_STORE: &str = "lix_internal_binary_blob_store";
+pub(crate) use crate::common::naming::INTERNAL_BINARY_BLOB_STORE;
 pub(crate) const INTERNAL_BINARY_BLOB_MANIFEST: &str = "lix_internal_binary_blob_manifest";
 pub(crate) const INTERNAL_BINARY_CHUNK_STORE: &str = "lix_internal_binary_chunk_store";
 pub(crate) const INTERNAL_BINARY_BLOB_MANIFEST_CHUNK: &str =

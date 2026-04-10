@@ -1,8 +1,8 @@
 pub(crate) mod effective_state;
 pub(crate) mod prepared_artifacts;
 
+use crate::catalog::SurfaceFamily;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::surface::SurfaceFamily;
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
 use crate::contracts::version_artifacts::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -920,7 +920,7 @@ fn surface_forces_global_write_scope(planned_write: &PlannedWrite) -> bool {
         .iter()
         .any(|predicate| {
             predicate.column == "global"
-                && predicate.value == crate::contracts::surface::SurfaceOverrideValue::Boolean(true)
+                && predicate.value == crate::catalog::SurfaceOverrideValue::Boolean(true)
         })
 }
 
@@ -935,7 +935,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
     }
 
     match planned_write.command.target.default_scope {
-        crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => planned_write
+        crate::catalog::DefaultScopeSemantics::ActiveVersion => planned_write
             .command
             .execution_context
             .requested_version_id
@@ -946,22 +946,20 @@ pub(super) fn resolved_version_id_for_insert_payload(
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
             }),
-        crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => payload
+        crate::catalog::DefaultScopeSemantics::ExplicitVersion => payload
             .get("version_id")
             .and_then(text_from_value)
             .map(Some)
             .ok_or_else(|| WriteResolveError {
                 message: "public write resolver requires a concrete version_id".to_string(),
             }),
-        crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin => {
+        crate::catalog::DefaultScopeSemantics::GlobalAdmin => {
             Ok(Some(GLOBAL_VERSION_ID.to_string()))
         }
-        crate::contracts::surface::DefaultScopeSemantics::History
-        | crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => {
-            Err(WriteResolveError {
-                message: "public write resolver requires a bounded scope proof".to_string(),
-            })
-        }
+        crate::catalog::DefaultScopeSemantics::History
+        | crate::catalog::DefaultScopeSemantics::WorkingChanges => Err(WriteResolveError {
+            message: "public write resolver requires a bounded scope proof".to_string(),
+        }),
     }
 }
 

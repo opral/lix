@@ -1,5 +1,5 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
-use crate::contracts::artifacts::FilesystemProjectionScope;
+use crate::catalog::FilesystemProjectionScope;
 use crate::contracts::plugin::{select_best_glob_match, InstalledPlugin, PluginContentType};
 use crate::contracts::traits::FilesystemPluginMaterializer;
 use crate::execution::write::filesystem::query::load_file_row_by_id;

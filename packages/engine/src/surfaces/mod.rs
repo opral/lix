@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use serde_json::Value as JsonValue;
 
-use crate::contracts::surface::{
+use crate::catalog::{
     builtin_surface_descriptors, entity_surface_descriptors, CatalogEpoch, CatalogSource,
     DynamicEntitySurfaceSpec, SurfaceColumnType, SurfaceOverridePredicate, SurfaceOverrideValue,
     SurfaceRegistry,
@@ -262,7 +262,7 @@ fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnTy
 #[cfg(test)]
 mod tests {
     use super::{entity_surface_spec_from_schema, load_public_surface_registry_with_backend};
-    use crate::contracts::surface::{SurfaceFamily, SurfaceOverrideValue};
+    use crate::catalog::{SurfaceFamily, SurfaceOverrideValue};
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;

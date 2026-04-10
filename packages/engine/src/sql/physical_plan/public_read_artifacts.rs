@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use crate::catalog::SurfaceFamily;
 use crate::contracts::artifacts::EffectiveStateRequest;
-use crate::contracts::surface::SurfaceFamily;
 use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;

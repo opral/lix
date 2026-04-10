@@ -32,10 +32,10 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
+use crate::catalog::SurfaceRegistry;
 use crate::common::errors;
 use crate::contracts::artifacts::ExecuteOptions;
 use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
-use crate::contracts::surface::SurfaceRegistry;
 use crate::execution::read::execute_prepared_read_program_in_committed_read_transaction;
 use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
 use crate::execution::write::{
