@@ -11,22 +11,6 @@ use crate::common::errors::classification::is_missing_relation_error;
 use crate::schema::LixCommit;
 use crate::{LixError, Value};
 
-/// Canonical committed row resolved from commit-graph facts plus local
-/// version-head selection.
-///
-/// This type intentionally excludes workspace-owned selectors and annotations.
-/// Callers that need workspace overlays such as `writer_key` must apply them in
-/// a separate effective-state layer.
-#[derive(Debug, Clone, PartialEq)]
-pub(crate) struct ExactCommittedStateRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) values: BTreeMap<String, Value>,
-    pub(crate) source_change_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CommitLineageEntry {
     pub(crate) id: String,
@@ -57,20 +41,6 @@ pub(crate) struct ExactCommittedStateRowRequest {
 }
 
 pub(crate) use crate::backend::QueryExecutor as CommitQueryExecutor;
-
-pub(crate) async fn load_exact_committed_state_row_from_commit_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
-    head_commit_id: &str,
-    request: &ExactCommittedStateRowRequest,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let change =
-        load_exact_committed_change_from_commit_with_executor(executor, head_commit_id, request)
-            .await?;
-    change
-        .map(|change| exact_committed_state_row_from_change(change, &request.version_id))
-        .transpose()
-        .map(|row| row.flatten())
-}
 
 pub(crate) async fn load_exact_committed_change_from_commit_with_executor(
     executor: &mut dyn CommitQueryExecutor,
@@ -218,54 +188,6 @@ fn canonical_change_matches_request(
     true
 }
 
-fn exact_committed_state_row_from_change(
-    change: CommittedCanonicalChangeRow,
-    version_id: &str,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
-    let Some(snapshot_content) = change.snapshot_content else {
-        return Ok(None);
-    };
-
-    let mut values = BTreeMap::new();
-    values.insert(
-        "entity_id".to_string(),
-        Value::Text(change.entity_id.clone()),
-    );
-    values.insert(
-        "schema_key".to_string(),
-        Value::Text(change.schema_key.clone()),
-    );
-    values.insert(
-        "schema_version".to_string(),
-        Value::Text(change.schema_version.clone()),
-    );
-    values.insert("file_id".to_string(), Value::Text(change.file_id.clone()));
-    values.insert(
-        "version_id".to_string(),
-        Value::Text(version_id.to_string()),
-    );
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(change.plugin_key.clone()),
-    );
-    values.insert(
-        "snapshot_content".to_string(),
-        Value::Text(snapshot_content),
-    );
-    if let Some(metadata) = change.metadata.clone() {
-        values.insert("metadata".to_string(), Value::Text(metadata));
-    }
-
-    Ok(Some(ExactCommittedStateRow {
-        entity_id: change.entity_id,
-        schema_key: change.schema_key,
-        file_id: change.file_id,
-        version_id: version_id.to_string(),
-        values,
-        source_change_id: Some(change.id),
-    }))
-}
-
 pub(crate) async fn load_commit_lineage_entry_by_id(
     executor: &mut dyn CommitQueryExecutor,
     commit_id: &str,
@@ -366,7 +288,8 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::version_ops::committed_state::load_exact_committed_state_row_at_version_head_with_executor;
+    use crate::canonical::CanonicalStateIdentity;
+    use crate::session::version_ops::committed_state::load_exact_canonical_row_at_version_head_with_executor;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
@@ -385,9 +308,28 @@ mod tests {
     async fn load_exact_committed_state_row_at_version_head(
         backend: &TestSqliteBackend,
         request: &ExactCommittedStateRowRequest,
-    ) -> Result<Option<ExactCommittedStateRow>, LixError> {
+    ) -> Result<Option<crate::canonical::CanonicalStateRow>, LixError> {
         let mut executor = backend;
-        load_exact_committed_state_row_at_version_head_with_executor(&mut executor, request).await
+        let file_id = request
+            .exact_filters
+            .get("file_id")
+            .and_then(|value| match value {
+                Value::Text(text) => Some(text.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                LixError::unknown("test exact committed state request requires file_id")
+            })?;
+        load_exact_canonical_row_at_version_head_with_executor(
+            &mut executor,
+            &request.version_id,
+            &CanonicalStateIdentity {
+                entity_id: request.entity_id.clone(),
+                schema_key: request.schema_key.clone(),
+                file_id,
+            },
+        )
+        .await
     }
 
     async fn seed_committed_history_fixture(
@@ -616,7 +558,7 @@ mod tests {
             "canonical exact-state lookup should not depend on live commit-family mirrors"
         );
         assert_eq!(row.entity_id, "file-1");
-        assert_eq!(row.source_change_id.as_deref(), Some("change-fallback"));
+        assert_eq!(row.source_change_id, "change-fallback");
     }
 
     #[tokio::test]
@@ -635,7 +577,7 @@ mod tests {
         .expect("deep canonical exact-state lookup should return a row");
 
         assert_eq!(row.entity_id, "file-1");
-        assert_eq!(row.source_change_id.as_deref(), Some("change-deep-root"));
+        assert_eq!(row.source_change_id, "change-deep-root");
     }
 
     #[tokio::test]
@@ -808,9 +750,7 @@ mod tests {
         .expect("canonical exact-state lookup should succeed")
         .expect("canonical exact-state lookup should return a row");
 
-        assert!(
-            !row.values.contains_key("writer_key"),
-            "canonical committed rows should not carry workspace writer_key annotation"
-        );
+        assert_eq!(row.source_change_id, "change-fallback");
+        assert_eq!(row.schema_key, "lix_file_descriptor");
     }
 }

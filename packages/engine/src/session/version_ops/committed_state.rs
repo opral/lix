@@ -1,9 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::read::{
-    load_exact_committed_state_row_from_commit_with_executor, CommitQueryExecutor,
-    ExactCommittedStateRow, ExactCommittedStateRowRequest,
-};
+use crate::backend::QueryExecutor;
+use crate::canonical::{load_exact_row_at_commit, CanonicalStateIdentity, CanonicalStateRow};
 use crate::version_state::load_local_version_head_commit_id_with_executor;
 use crate::{LixError, VersionId};
 
@@ -19,7 +17,7 @@ pub struct VersionInfo {
 }
 
 pub(crate) async fn load_version_info_for_versions(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     version_ids: &BTreeSet<String>,
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
     let mut versions = BTreeMap::new();
@@ -57,16 +55,16 @@ pub(crate) async fn load_version_info_for_versions(
     Ok(versions)
 }
 
-pub(crate) async fn load_exact_committed_state_row_at_version_head_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
-    request: &ExactCommittedStateRowRequest,
-) -> Result<Option<ExactCommittedStateRow>, LixError> {
+pub(crate) async fn load_exact_canonical_row_at_version_head_with_executor(
+    executor: &mut dyn QueryExecutor,
+    version_id: &str,
+    identity: &CanonicalStateIdentity,
+) -> Result<Option<CanonicalStateRow>, LixError> {
     let Some(head_commit_id) =
-        load_local_version_head_commit_id_with_executor(executor, &request.version_id).await?
+        load_local_version_head_commit_id_with_executor(executor, version_id).await?
     else {
         return Ok(None);
     };
 
-    load_exact_committed_state_row_from_commit_with_executor(executor, &head_commit_id, request)
-        .await
+    load_exact_row_at_commit(executor, &head_commit_id, identity).await
 }

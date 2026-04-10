@@ -36,15 +36,50 @@
 //! `lix_commit_edge` as read-only query surfaces for SQL/public reads, but it
 //! does not own the meaning of those facts.
 //!
-pub(crate) mod checkpoint_labels;
-pub(crate) mod graph;
+mod api;
+mod checkpoint_labels;
+mod graph;
 mod init;
-pub(crate) mod journal;
+mod journal;
 pub(crate) mod json;
-pub(crate) mod read;
+mod read;
 
-pub(crate) const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
+const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
     "lix_internal_entity_state_timeline_breakpoint";
-pub(crate) const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
+const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
+const CHANGE_TABLE: &str = "lix_internal_change";
+const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
+const COMMIT_GRAPH_NODE_TABLE: &str = "lix_internal_commit_graph_node";
 
+pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
+    &[
+        CHANGE_TABLE,
+        COMMIT_GRAPH_NODE_TABLE,
+        ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,
+        SNAPSHOT_TABLE,
+        TIMELINE_STATUS_TABLE,
+    ]
+}
+
+#[allow(unused_imports)]
+pub(crate) use api::{
+    append_changes, load_change, load_commit, load_exact_row_at_commit, load_history,
+    load_visible_state, resolve_merge_base, CanonicalAppendSummary, CanonicalChange,
+    CanonicalChangeWrite, CanonicalCommit, CanonicalContentMode, CanonicalHistoryContentMode,
+    CanonicalHistoryRequest, CanonicalHistoryRootSelection, CanonicalHistoryRow,
+    CanonicalRootCommit, CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode,
+    CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
+    CanonicalVisibleStateRow,
+};
+#[allow(unused_imports)]
+pub(crate) use checkpoint_labels::{
+    checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, checkpoint_label_snapshot,
+    seed_bootstrap as seed_checkpoint_labels_bootstrap, CheckpointVersionHeadFact,
+    CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY, CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME,
+    CHECKPOINT_LABEL_SCHEMA_KEY,
+};
+#[allow(unused_imports)]
+pub(crate) use read::{
+    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
+};
 pub(crate) use init::{init, seed_bootstrap};

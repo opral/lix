@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
-
+use crate::backend::QueryExecutor;
+use crate::canonical::CanonicalStateIdentity;
 use crate::execution::write::filesystem::runtime::{
     ExactFilesystemDescriptorState, FilesystemDescriptorState, FILESYSTEM_DESCRIPTOR_FILE_ID,
-    FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY,
+    FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::live_state::key_value_schema_key;
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
@@ -10,11 +10,10 @@ use crate::runtime::deterministic_mode::deterministic_sequence_key;
 use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
-use crate::canonical::read::{CommitQueryExecutor, ExactCommittedStateRowRequest};
-use crate::session::version_ops::load_exact_committed_state_row_at_version_head_with_executor;
+use crate::session::version_ops::load_exact_canonical_row_at_version_head_with_executor;
 
 pub(crate) async fn load_create_commit_deterministic_sequence_start(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
 ) -> Result<Option<i64>, LixError> {
     let untracked = load_exact_untracked_row_with_executor(
         executor,
@@ -41,37 +40,24 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
         return Ok(Some(value));
     }
 
-    let tracked = load_exact_committed_state_row_at_version_head_with_executor(
+    let tracked = load_exact_canonical_row_at_version_head_with_executor(
         executor,
-        &ExactCommittedStateRowRequest {
+        GLOBAL_VERSION_ID,
+        &CanonicalStateIdentity {
             entity_id: deterministic_sequence_key().to_string(),
             schema_key: key_value_schema_key().to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            exact_filters: BTreeMap::from([
-                (
-                    "file_id".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-                ),
-                (
-                    "plugin_key".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-                ),
-            ]),
+            file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
         },
     )
     .await?;
-    let Some(snapshot_content) = tracked
-        .as_ref()
-        .and_then(|row| row.values.get("snapshot_content"))
-        .and_then(value_as_text)
-    else {
+    let Some(snapshot_content) = tracked.as_ref().map(|row| row.snapshot_content.clone()) else {
         return Ok(Some(0));
     };
     parse_deterministic_sequence_snapshot(&snapshot_content).map(Some)
 }
 
 pub(crate) async fn load_untracked_file_descriptor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, LixError> {
@@ -100,13 +86,6 @@ pub(crate) async fn load_untracked_file_descriptor(
         },
         untracked: true,
     }))
-}
-
-fn value_as_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Text(text) if !text.is_empty() => Some(text.clone()),
-        _ => None,
-    }
 }
 
 fn value_as_bool(value: Option<&Value>) -> Option<bool> {

@@ -85,7 +85,7 @@ pub(crate) fn object_name_is_protected_builtin_ddl_target(name: &ObjectName) -> 
 
 pub(crate) fn builtin_relation_inventory() -> BuiltinRelationInventory {
     BuiltinRelationInventory {
-        exact_internal_relations: builtin_internal_exact_relation_names().to_vec(),
+        exact_internal_relations: builtin_internal_exact_relation_names(),
         internal_relation_families: builtin_internal_relation_families().to_vec(),
         protected_builtin_public_surfaces: protected_builtin_public_surface_names(),
     }
@@ -99,17 +99,14 @@ pub(crate) fn relation_policy_choice_summary() -> &'static str {
     }
 }
 
-pub(crate) fn builtin_internal_exact_relation_names() -> &'static [&'static str] {
+fn non_canonical_internal_exact_relation_names() -> &'static [&'static str] {
     &[
         crate::binary_cas::schema::INTERNAL_BINARY_BLOB_MANIFEST,
         crate::binary_cas::schema::INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,
         crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE,
         crate::binary_cas::schema::INTERNAL_BINARY_CHUNK_STORE,
         crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF,
-        crate::canonical::journal::CHANGE_TABLE,
-        crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE,
         crate::session::version_ops::commit::COMMIT_IDEMPOTENCY_TABLE,
-        crate::canonical::ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,
         crate::live_state::FILE_DATA_CACHE_TABLE,
         crate::live_state::FILE_LIXCOL_CACHE_TABLE,
         crate::live_state::FILE_PATH_CACHE_TABLE,
@@ -117,11 +114,15 @@ pub(crate) fn builtin_internal_exact_relation_names() -> &'static [&'static str]
         crate::live_state::LIVE_STATE_STATUS_TABLE,
         crate::session::observe::OBSERVE_TICK_TABLE,
         crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-        crate::canonical::journal::SNAPSHOT_TABLE,
-        crate::canonical::TIMELINE_STATUS_TABLE,
         crate::session::version_ops::undo_redo::UNDO_REDO_OPERATION_TABLE,
         crate::session::workspace::WORKSPACE_METADATA_TABLE,
     ]
+}
+
+pub(crate) fn builtin_internal_exact_relation_names() -> Vec<&'static str> {
+    let mut relations = crate::canonical::internal_exact_relation_names().to_vec();
+    relations.extend_from_slice(non_canonical_internal_exact_relation_names());
+    relations
 }
 
 pub(crate) fn builtin_internal_relation_families() -> &'static [InternalRelationFamily] {
@@ -252,7 +253,7 @@ mod tests {
     #[test]
     fn inventory_lists_exact_internal_relations_once() {
         let exact_relations = builtin_internal_exact_relation_names();
-        assert!(exact_relations.contains(&crate::canonical::journal::SNAPSHOT_TABLE));
+        assert!(exact_relations.contains(&"lix_internal_snapshot"));
         assert!(exact_relations.contains(&crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE));
 
         let unique = exact_relations

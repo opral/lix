@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::canonical::read::{
-    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRowRequest,
+use crate::canonical::{
+    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
 use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::common::text::escape_sql_string;
@@ -45,7 +45,7 @@ pub(crate) async fn load_version_descriptor_with_executor(
     else {
         return Ok(None);
     };
-    let row = load_exact_committed_state_row_from_commit_with_executor(
+    let row = load_exact_committed_change_from_commit_with_executor(
         executor,
         &global_head_commit_id,
         &ExactCommittedStateRowRequest {
@@ -72,13 +72,10 @@ pub(crate) async fn load_version_descriptor_with_executor(
     let Some(row) = row else {
         return Ok(None);
     };
-    let Some(Value::Text(snapshot_content)) = row.values.get("snapshot_content") else {
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
     };
-    Ok(Some(parse_descriptor_row(
-        snapshot_content,
-        row.source_change_id,
-    )?))
+    Ok(Some(parse_descriptor_row(snapshot_content, Some(row.id))?))
 }
 
 pub(crate) async fn load_all_version_descriptors_with_executor(
