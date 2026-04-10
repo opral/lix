@@ -2,12 +2,12 @@ use std::collections::BTreeMap;
 
 use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
-use crate::version_state::{
+use crate::contracts::version_artifacts::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_ref_file_id, version_ref_plugin_key,
     version_ref_schema_key, version_ref_schema_version, version_ref_storage_version_id,
-    GLOBAL_VERSION_ID,
 };
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
 
 pub(crate) fn build_admin_version_source_sql(dialect: SqlDialect) -> String {

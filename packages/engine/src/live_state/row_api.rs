@@ -25,10 +25,14 @@ use super::untracked::{
 use super::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use super::{
     load_exact_tracked_row_with_backend, load_exact_tracked_tombstone_with_executor,
-    scan_tracked_rows_with_backend, scan_tracked_tombstones_with_executor, RowIdentity,
+    load_exact_untracked_row_with_executor, scan_tracked_rows_with_backend,
+    scan_tracked_tombstones_with_executor, RowIdentity,
 };
+use crate::contracts::version_artifacts::{
+    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id,
+};
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::schema::{schema_key_from_definition, SchemaKey};
-use crate::version_state::{load_local_version_head_commit_id_with_executor, GLOBAL_VERSION_ID};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RowReadMode {
@@ -499,7 +503,7 @@ async fn load_exact_tracked_row_from_canonical_for_lane(
     let storage_version_id = lane_version_id(&request.version_id, lane);
     let mut executor = backend;
     let Some(head_commit_id) =
-        load_local_version_head_commit_id_with_executor(&mut executor, &storage_version_id).await?
+        load_version_head_commit_id_from_live_row(&mut executor, &storage_version_id).await?
     else {
         return Ok(EffectiveLaneOutcome::Missing);
     };
@@ -536,6 +540,37 @@ async fn load_exact_tracked_row_from_canonical_for_lane(
     };
 
     canonical_effective_lane_outcome_from_visible_row(backend, storage_version_id, lane, row).await
+}
+
+async fn load_version_head_commit_id_from_live_row(
+    executor: &mut dyn crate::backend::QueryExecutor,
+    version_id: &str,
+) -> Result<Option<String>, LixError> {
+    let Some(row) = load_exact_untracked_row_with_executor(
+        executor,
+        &ExactUntrackedRowRequest {
+            schema_key: version_ref_schema_key().to_string(),
+            version_id: version_ref_storage_version_id().to_string(),
+            entity_id: version_id.to_string(),
+            file_id: Some(version_ref_file_id().to_string()),
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let Some(commit_id) = row
+        .property_text("commit_id")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("local version head for '{version_id}' has empty commit_id"),
+        ));
+    };
+
+    Ok(Some(commit_id))
 }
 
 fn canonical_visible_state_row_matches_query(

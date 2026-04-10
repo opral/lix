@@ -157,18 +157,6 @@ pub(crate) fn snapshot_select_expr_for_schema(
     )
 }
 
-#[cfg(test)]
-pub(crate) fn normalized_values_for_schema(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-    snapshot_content: Option<&str>,
-) -> Result<std::collections::BTreeMap<String, Value>, LixError> {
-    super::storage::normalized_live_column_values(
-        &schema_layout(schema_key, schema_definition)?,
-        snapshot_content,
-    )
-}
-
 pub(crate) fn logical_snapshot_from_projected_row_with_contract(
     access: Option<&LiveReadContract>,
     schema_key: &str,
@@ -183,18 +171,6 @@ pub(crate) fn logical_snapshot_from_projected_row_with_contract(
         snapshot_index,
         normalized_start_index,
     )
-}
-
-#[cfg(test)]
-pub(crate) fn schema_column_names(
-    schema_key: &str,
-    schema_definition: Option<&JsonValue>,
-) -> Result<Vec<String>, LixError> {
-    Ok(schema_layout(schema_key, schema_definition)?
-        .columns
-        .into_iter()
-        .map(|column| column.column_name)
-        .collect())
 }
 
 fn schema_layout(

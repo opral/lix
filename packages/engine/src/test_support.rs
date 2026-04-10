@@ -654,9 +654,11 @@ mod tests {
         .expect("live-state status seed should succeed");
 
         let frontier =
-            crate::version_state::load_current_committed_version_frontier_with_backend(&backend)
-                .await
-                .expect("frontier load should succeed");
+            crate::session::version_ops::load_current_committed_version_frontier_with_backend(
+                &backend,
+            )
+            .await
+            .expect("frontier load should succeed");
         assert_eq!(
             frontier.version_heads.get("main").map(String::as_str),
             Some("commit-1")

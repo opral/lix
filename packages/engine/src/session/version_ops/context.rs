@@ -5,9 +5,9 @@ use crate::session::version_ops::commit::{
     CreateCommitWriteLane,
 };
 use crate::session::workspace::require_workspace_active_version_id;
-use crate::version_state::load_committed_version_ref_with_executor;
 use crate::{LixError, SessionTransaction};
 
+use super::committed_state::load_version_head_commit_id_with_executor;
 use super::descriptors::{version_exists_with_backend, version_exists_with_executor};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,24 +142,18 @@ pub(crate) async fn load_version_context_with_executor(
     executor: &mut dyn QueryExecutor,
     target: ResolvedVersionTarget,
 ) -> Result<Option<VersionContext>, LixError> {
-    let Some(version_ref) =
-        load_committed_version_ref_with_executor(executor, &target.version_id).await?
+    let Some(commit_id) =
+        load_version_head_commit_id_with_executor(executor, &target.version_id).await?
     else {
         return Ok(None);
     };
-    if version_ref.commit_id.trim().is_empty() {
-        return Ok(None);
-    }
     // The replica-local version head currently names the committed tip that
     // also anchors version-scoped history reads, so the resolved head and
     // history root are explicit facts even though they coincide today.
     Ok(Some(VersionContext {
-        target: ResolvedVersionTarget {
-            version_id: version_ref.version_id,
-            source: target.source,
-        },
-        history_root_commit_id: version_ref.commit_id.clone(),
-        head_commit_id: version_ref.commit_id,
+        target,
+        history_root_commit_id: commit_id.clone(),
+        head_commit_id: commit_id,
     }))
 }
 

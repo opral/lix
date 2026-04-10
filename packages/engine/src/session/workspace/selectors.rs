@@ -1,5 +1,5 @@
+use crate::contracts::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::surface_sql::version::build_admin_version_source_sql;
-use crate::version_state::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";

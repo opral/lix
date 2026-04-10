@@ -13,6 +13,7 @@ use crate::contracts::artifacts::{
 use crate::contracts::change::TrackedChangeView;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::traits::{CompiledSchemaCache, PendingView};
+use crate::contracts::version_artifacts::parse_active_version_snapshot;
 use crate::execution::write::buffered::TrackedTxnUnit;
 use crate::execution::write::filesystem::runtime::{
     resolve_binary_blob_writes_in_transaction, BinaryBlobWrite,
@@ -30,7 +31,6 @@ use crate::session::version_ops::commit::{
     CreateCommitPreconditions, CreateCommitWriteLane, StagedChange,
 };
 use crate::session::write_validation::validate_commit_time_write;
-use crate::version_state::parse_active_version_snapshot;
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
@@ -322,7 +322,7 @@ pub(crate) async fn execute_public_tracked_append(
         matches!(append_outcome.disposition, CreateCommitDisposition::Applied);
 
     if plugin_changes_committed {
-        crate::version_state::checkpoints::cache::apply_public_version_last_checkpoint_side_effects(
+        crate::session::checkpoint_ops::cache::apply_public_version_last_checkpoint_side_effects(
             transaction,
             &unit.public_write,
             &ChangeBatch {

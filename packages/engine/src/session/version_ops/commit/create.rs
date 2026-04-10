@@ -5,6 +5,8 @@ use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::{append_changes, CanonicalChangeWrite, CanonicalStateIdentity};
 use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
 use crate::contracts::functions::LixFunctionProvider;
+use crate::contracts::version_artifacts::version_ref_snapshot_content;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::execution::write::filesystem::runtime::{
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
@@ -17,11 +19,9 @@ use crate::runtime::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
 };
 use crate::session::version_ops::{
-    load_exact_canonical_row_at_version_head_with_executor, load_version_info_for_versions,
-    VersionInfo, VersionSnapshot,
-};
-use crate::version_state::{
-    load_committed_version_head_commit_id, version_ref_snapshot_content, GLOBAL_VERSION_ID,
+    load_exact_canonical_row_at_version_head_with_executor,
+    load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
+    VersionSnapshot,
 };
 use crate::SqlDialect;
 use crate::{
@@ -852,7 +852,7 @@ async fn load_create_commit_preflight_state(
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
-    let current_head = load_committed_version_head_commit_id(executor, lane_entity_id)
+    let current_head = load_version_head_commit_id_with_executor(executor, lane_entity_id)
         .await
         .map_err(backend_error)?;
     let current_head_snapshot = current_head
@@ -1294,6 +1294,7 @@ mod tests {
     use crate::canonical::CanonicalChangeWrite;
     use crate::contracts::artifacts::OptionalTextPatch;
     use crate::contracts::functions::LixFunctionProvider;
+    use crate::contracts::GLOBAL_VERSION_ID;
     use crate::execution::write::filesystem::runtime::{
         FilesystemTransactionFileState, FilesystemTransactionState,
     };
@@ -1302,7 +1303,6 @@ mod tests {
         init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::version_state::GLOBAL_VERSION_ID;
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
         LixBackend, LixBackendTransaction, LixError, Value, VersionId,
@@ -1450,22 +1450,24 @@ mod tests {
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
             file_id: Some(
-                crate::version_state::version_descriptor_file_id()
+                crate::contracts::version_artifacts::version_descriptor_file_id()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
             plugin_key: Some(
-                crate::version_state::version_descriptor_plugin_key()
+                crate::contracts::version_artifacts::version_descriptor_plugin_key()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
-            snapshot_content: Some(crate::version_state::version_descriptor_snapshot_content(
-                "version-a",
-                "Version A",
-                false,
-            )),
+            snapshot_content: Some(
+                crate::contracts::version_artifacts::version_descriptor_snapshot_content(
+                    "version-a",
+                    "Version A",
+                    false,
+                ),
+            ),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.try_into().unwrap(),
             writer_key: Some("writer-a".to_string()),
@@ -1753,7 +1755,10 @@ mod tests {
             .to_string(),
             "current_head_fingerprint",
             "fp-1",
-            &crate::version_state::version_ref_snapshot_content("version-a", "commit-456"),
+            &crate::contracts::version_artifacts::version_ref_snapshot_content(
+                "version-a",
+                "commit-456",
+            ),
             "commit-456",
         )
         .await;
