@@ -6,7 +6,7 @@
 
 #![allow(dead_code)]
 
-use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+use crate::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::projections::{
     DerivedRow, ProjectionInput, ProjectionInputSpec, ProjectionRegistration,
     ProjectionSurfaceSpec, ProjectionTrait,
@@ -68,7 +68,7 @@ mod tests {
         LixDirectoryProjection, DIRECTORY_BY_VERSION_SURFACE_NAME, DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
         DIRECTORY_SURFACE_NAME,
     };
-    use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+    use crate::catalog::{SurfaceFamily, SurfaceVariant};
     use crate::projections::{ProjectionInputSpec, ProjectionTrait};
 
     #[test]

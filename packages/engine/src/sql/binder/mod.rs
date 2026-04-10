@@ -7,7 +7,7 @@ pub(crate) mod classifier;
 pub(crate) mod public_reads;
 pub(crate) mod runtime;
 
-use crate::contracts::surface::SurfaceRegistry;
+use crate::catalog::SurfaceRegistry;
 use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
 use crate::{LixError, Value};

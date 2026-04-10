@@ -6,7 +6,6 @@ pub(crate) mod functions;
 pub(crate) mod plugin;
 pub(crate) mod replay_cursor;
 pub(crate) mod state_commit_stream;
-pub(crate) mod surface;
 pub(crate) mod traits;
 pub(crate) mod transaction_mode;
 

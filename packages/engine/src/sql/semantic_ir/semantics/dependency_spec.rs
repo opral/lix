@@ -1,5 +1,5 @@
+use crate::catalog::{SurfaceBinding, SurfaceFamily};
 use crate::contracts::artifacts::SessionDependency;
-use crate::contracts::surface::{SurfaceBinding, SurfaceFamily};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
     CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
@@ -218,7 +218,7 @@ fn dependency_spec_for_working_changes_scan() -> DependencySpec {
 
 fn dependency_spec_for_filesystem_scan(
     kind: FilesystemKind,
-    binding: &crate::contracts::surface::SurfaceBinding,
+    binding: &crate::catalog::SurfaceBinding,
 ) -> DependencySpec {
     let mut spec = DependencySpec {
         relations: [binding.descriptor.public_name.clone()]
@@ -278,17 +278,15 @@ fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> Dependenc
             spec.schema_keys.insert(schema_key);
         }
         let version_scope = match binding.default_scope {
-            crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => {
+            crate::catalog::DefaultScopeSemantics::ActiveVersion => {
                 Some(VersionScope::ActiveVersion)
             }
-            crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => {
+            crate::catalog::DefaultScopeSemantics::ExplicitVersion => {
                 Some(VersionScope::ExplicitVersion)
             }
-            crate::contracts::surface::DefaultScopeSemantics::History => {
-                Some(VersionScope::History)
-            }
-            crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin
-            | crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => None,
+            crate::catalog::DefaultScopeSemantics::History => Some(VersionScope::History),
+            crate::catalog::DefaultScopeSemantics::GlobalAdmin
+            | crate::catalog::DefaultScopeSemantics::WorkingChanges => None,
         };
         if version_scope
             .is_some_and(|scope| state_like_surface_depends_on_active_version(binding, scope))
@@ -583,8 +581,8 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 #[cfg(test)]
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
+    use crate::catalog::SurfaceRegistry;
     use crate::contracts::artifacts::SessionDependency;
-    use crate::contracts::surface::SurfaceRegistry;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::logical_plan::DependencyPrecision;

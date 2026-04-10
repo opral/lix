@@ -121,7 +121,7 @@ fn schema_default_version_ids(
 #[cfg(test)]
 mod tests {
     use super::hydrate_projection_input_with_backend;
-    use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
+    use crate::catalog::{SurfaceFamily, SurfaceVariant};
     use crate::live_state;
     use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
     use crate::projections::{

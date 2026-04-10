@@ -33,3 +33,5 @@ pub(crate) mod physical_plan;
 pub(crate) mod prepare;
 pub(crate) mod semantic_ir;
 pub(crate) mod support;
+
+pub(crate) use physical_plan::source_sql::lower_catalog_relation_binding_to_source_sql;

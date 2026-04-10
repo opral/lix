@@ -1,7 +1,7 @@
+use crate::catalog::SurfaceBinding;
 use crate::contracts::artifacts::{
     DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest,
 };
-use crate::contracts::surface::SurfaceBinding;
 use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
 

@@ -9,7 +9,7 @@
 
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 
-use crate::contracts::surface::{CatalogSource, SurfaceRegistry};
+use crate::catalog::{CatalogSource, SurfaceRegistry};
 
 use super::build_builtin_surface_registry;
 
@@ -174,10 +174,10 @@ fn object_name_to_relation_name(name: &ObjectName) -> Option<String> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use crate::common::naming::tracked_relation_name;
-    use crate::contracts::surface::{
+    use crate::catalog::{
         entity_surface_descriptors, CatalogSource, DynamicEntitySurfaceSpec, SurfaceRegistry,
     };
+    use crate::common::naming::tracked_relation_name;
 
     use super::{
         builtin_internal_exact_relation_names, builtin_internal_relation_families,

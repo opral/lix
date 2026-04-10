@@ -1,4 +1,4 @@
-use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::version_state::GLOBAL_VERSION_ID;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 

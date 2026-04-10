@@ -1,6 +1,5 @@
-use crate::contracts::artifacts::FilesystemProjectionScope;
+use crate::catalog::SurfaceBinding;
 use crate::contracts::artifacts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionRead};
-use crate::contracts::surface::SurfaceBinding;
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};
@@ -381,15 +380,6 @@ impl FilesystemPublicSurface {
                 VersionScope::ExplicitVersion,
             ) => Some(surface),
             _ => None,
-        }
-    }
-
-    pub(crate) fn projection_scope(self) -> FilesystemProjectionScope {
-        match self {
-            Self::File | Self::Directory => FilesystemProjectionScope::ActiveVersion,
-            Self::FileByVersion | Self::DirectoryByVersion => {
-                FilesystemProjectionScope::ExplicitVersion
-            }
         }
     }
 

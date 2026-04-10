@@ -1074,7 +1074,7 @@ fn direct_state_history_field_from_column_name(
 }
 
 fn direct_entity_history_field_from_column_name(
-    surface_binding: &crate::contracts::surface::SurfaceBinding,
+    surface_binding: &crate::catalog::SurfaceBinding,
     column: &str,
 ) -> Option<PreparedDirectEntityHistoryField> {
     let lowercase = column.to_ascii_lowercase();

@@ -1,4 +1,5 @@
 use super::*;
+use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::contracts::artifacts::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryVersionScope, PendingViewReadQuery, PendingViewReadStorage,
@@ -6,7 +7,6 @@ use crate::contracts::artifacts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
     StateHistoryVersionScope,
 };
-use crate::contracts::surface::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
 use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::explain::{
     build_public_read_explain_artifacts, unwrap_explain_statement, ExplainStage,
@@ -2116,10 +2116,7 @@ fn direct_state_history_result_columns(
                 .column_types
                 .iter()
                 .map(
-                    |(name, column_type): (
-                        &String,
-                        &crate::contracts::surface::SurfaceColumnType,
-                    )| {
+                    |(name, column_type): (&String, &crate::catalog::SurfaceColumnType)| {
                         (
                             name.clone(),
                             direct_lowered_result_column_from_surface_type(*column_type),
@@ -2149,23 +2146,23 @@ fn direct_state_history_result_columns(
 }
 
 fn direct_lowered_result_column_from_surface_type(
-    column_type: crate::contracts::surface::SurfaceColumnType,
+    column_type: crate::catalog::SurfaceColumnType,
 ) -> LoweredResultColumn {
     match column_type {
-        crate::contracts::surface::SurfaceColumnType::Boolean => LoweredResultColumn::Boolean,
-        crate::contracts::surface::SurfaceColumnType::String
-        | crate::contracts::surface::SurfaceColumnType::Integer
-        | crate::contracts::surface::SurfaceColumnType::Number
-        | crate::contracts::surface::SurfaceColumnType::Json => LoweredResultColumn::Untyped,
+        crate::catalog::SurfaceColumnType::Boolean => LoweredResultColumn::Boolean,
+        crate::catalog::SurfaceColumnType::String
+        | crate::catalog::SurfaceColumnType::Integer
+        | crate::catalog::SurfaceColumnType::Number
+        | crate::catalog::SurfaceColumnType::Json => LoweredResultColumn::Untyped,
     }
 }
 
 fn direct_surface_column_type(
     surface_binding: &SurfaceBinding,
     column: &str,
-) -> Option<crate::contracts::surface::SurfaceColumnType> {
+) -> Option<crate::catalog::SurfaceColumnType> {
     surface_binding.column_types.iter().find_map(
-        |(candidate, kind): (&String, &crate::contracts::surface::SurfaceColumnType)| {
+        |(candidate, kind): (&String, &crate::catalog::SurfaceColumnType)| {
             candidate.eq_ignore_ascii_case(column).then_some(*kind)
         },
     )

@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use sqlparser::ast::Statement;
 
 use crate::backend::QueryExecutor;
+use crate::catalog::SurfaceRegistry;
 use crate::contracts::artifacts::PreparedPublicReadArtifact;
-use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::{PendingView, SqlPreparationMetadataReader};
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
 use crate::sql::prepare::{

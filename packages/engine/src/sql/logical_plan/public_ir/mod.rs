@@ -1,6 +1,4 @@
-use crate::contracts::surface::{
-    DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant,
-};
+use crate::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
 use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
@@ -916,7 +914,7 @@ mod tests {
         CanonicalStateScan, EntityProjectionSpec, PlannedFilesystemFile, PlannedFilesystemState,
         VersionScope,
     };
-    use crate::contracts::surface::DynamicEntitySurfaceSpec;
+    use crate::catalog::DynamicEntitySurfaceSpec;
     use std::collections::BTreeMap;
 
     #[test]

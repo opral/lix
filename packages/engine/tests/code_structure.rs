@@ -14,6 +14,23 @@ struct ForbiddenDependencyRule {
 
 const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     ForbiddenDependencyRule {
+        from_scope: "catalog",
+        reason: "catalog is the semantic owner for public named relations and must not depend on lowering, orchestration, or runtime owners",
+        forbidden_scopes: &[
+            "backend",
+            "canonical",
+            "engine",
+            "execution",
+            "init",
+            "live_state",
+            "projections",
+            "runtime",
+            "session",
+            "sql",
+            "surfaces",
+        ],
+    },
+    ForbiddenDependencyRule {
         from_scope: "backend",
         reason: "backend is a lower persistence owner; shared SQL helpers must move to neutral foundation and runtime must stay above it",
         forbidden_scopes: &["runtime", "sql"],
@@ -1586,7 +1603,7 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 }
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
-    ["live_state"].into_iter().collect()
+    ["catalog", "live_state"].into_iter().collect()
 }
 
 fn violations_for_sealed_owners(
@@ -1912,6 +1929,67 @@ fn phase_c_committed_read_handoff_stays_above_read_runtime() {
     assert!(
         !read_runtime_source.contains("TransactionBackendAdapter"),
         "Phase C regression: read_runtime should normalize prepared-read errors from neutral diagnostic contracts, not backend adapters"
+    );
+}
+
+#[test]
+fn plan81_surface_sql_owner_stays_removed() {
+    assert!(
+        !src_root().join("surface_sql/mod.rs").exists(),
+        "Plan 81 regression: src/surface_sql/mod.rs should stay removed"
+    );
+    assert!(
+        !src_root().join("surface_sql/version.rs").exists(),
+        "Plan 81 regression: src/surface_sql/version.rs should stay removed"
+    );
+    assert!(
+        !src_root().join("surface_sql/filesystem.rs").exists(),
+        "Plan 81 regression: src/surface_sql/filesystem.rs should stay removed"
+    );
+
+    let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
+    assert!(
+        !lib_source.contains("mod surface_sql;"),
+        "Plan 81 regression: src/lib.rs should not reintroduce a surface_sql root module"
+    );
+
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::surface_sql::")
+                || sanitized.contains("use crate::surface_sql")
+                || sanitized.contains("surface_sql::"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 81 regression: surface_sql should stay removed, but these files still reference it:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan81_catalog_relation_lowering_uses_root_owned_sql_api_outside_sql() {
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter(|(relative_path, _)| !relative_path.starts_with("sql/"))
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::sql::physical_plan::source_sql::")
+                || sanitized.contains("use crate::sql::physical_plan::source_sql")
+                || sanitized.contains("crate::sql::physical_plan::catalog_relation_sql::")
+                || sanitized.contains("use crate::sql::physical_plan::catalog_relation_sql"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 81 regression: non-sql code should reach lowering through crate::sql::* root APIs, not sql child modules:\n{}",
+        offenders.join("\n"),
     );
 }
 
