@@ -47,7 +47,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "runtime",
             "session",
             "sql",
-            "version_state",
         ],
     },
     ForbiddenDependencyRule {
@@ -86,7 +85,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "runtime",
             "session",
             "sql",
-            "version_state",
         ],
     },
     ForbiddenDependencyRule {
@@ -106,7 +104,6 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "runtime",
     "session",
     "sql",
-    "version_state",
 ];
 
 const SEALED_OWNER_SNAPSHOT_PATH: &str = "tests/sealed_owner_violations.txt";
@@ -1621,7 +1618,7 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 }
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
-    ["catalog", "live_state"].into_iter().collect()
+    ["canonical", "catalog", "live_state"].into_iter().collect()
 }
 
 fn violations_for_sealed_owners(
@@ -1869,40 +1866,37 @@ fn execution_forbidden_rule_covers_closed_handoff_edges() {
 }
 
 #[test]
-fn target_core_graph_lists_current_cycles() {
+fn target_core_graph_excludes_removed_version_state_root() {
     let graph = analyze_engine_dependency_graph();
     let filtered_graph = target_core_graph(&graph);
     let target_core_modules: Vec<String> = TARGET_CORE_MODULES
         .iter()
         .map(|module| (*module).to_string())
         .collect();
-    let cyclic_components: Vec<StronglyConnectedComponent> =
-        tarjan(&target_core_modules, &filtered_graph)
-            .into_iter()
-            .filter(|component| component.len() > 1)
-            .map(|component| {
-                let members: BTreeSet<String> = component.into_iter().collect();
-                let mut modules: Vec<String> = members.iter().cloned().collect();
-                modules.sort();
-
-                let internal_edges: Vec<DependencyEdge> = graph
-                    .edges
-                    .iter()
-                    .filter(|edge| members.contains(&edge.from) && members.contains(&edge.to))
-                    .cloned()
-                    .collect();
-
-                StronglyConnectedComponent {
-                    modules,
-                    internal_edges,
-                }
-            })
-            .collect();
 
     assert!(
-        cyclic_components.is_empty(),
-        "target core graph still has cycles: {:#?}",
-        cyclic_components,
+        !target_core_modules
+            .iter()
+            .any(|module| module == "version_state"),
+        "target core modules should no longer include version_state: {:?}",
+        target_core_modules,
+    );
+    assert!(
+        !filtered_graph.contains_key("version_state"),
+        "target core graph should not include removed version_state root: {:?}",
+        filtered_graph,
+    );
+    assert!(
+        graph
+            .edges
+            .iter()
+            .all(|edge| edge.from != "version_state" && edge.to != "version_state"),
+        "engine dependency graph should not include version_state edges: {:?}",
+        graph
+            .edges
+            .iter()
+            .filter(|edge| edge.from == "version_state" || edge.to == "version_state")
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -2230,7 +2224,6 @@ fn plan82_relation_policy_composes_internal_inventory_from_owner_roots() {
         "crate::canonical::internal_exact_relation_names()",
         "crate::live_state::internal_exact_relation_names()",
         "crate::binary_cas::internal_exact_relation_names()",
-        "crate::version_state::internal_exact_relation_names()",
     ] {
         assert!(
             sanitized.contains(required),
@@ -2273,27 +2266,6 @@ fn phase_c_read_preparation_stops_reaching_runtime_and_version_owners() {
                 .contains(&"sql/prepare/prepared_read.rs".to_string()),
             "Phase C regression: sql -> runtime still flows through sql/prepare/prepared_read.rs: {:?}",
             sql_runtime_edge.via_files,
-        );
-    }
-
-    if let Some(sql_version_edge) = graph
-        .edges
-        .iter()
-        .find(|edge| edge.from == "sql" && edge.to == "version_state")
-    {
-        assert!(
-            !sql_version_edge
-                .via_files
-                .contains(&"sql/prepare/prepared_read.rs".to_string()),
-            "Phase C regression: sql -> version_state still flows through sql/prepare/prepared_read.rs: {:?}",
-            sql_version_edge.via_files,
-        );
-        assert!(
-            !sql_version_edge
-                .via_files
-                .contains(&"sql/prepare/compiler_metadata.rs".to_string()),
-            "Phase C regression: sql -> version_state still flows through sql/prepare/compiler_metadata.rs: {:?}",
-            sql_version_edge.via_files,
         );
     }
 }

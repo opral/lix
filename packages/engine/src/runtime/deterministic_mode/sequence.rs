@@ -3,11 +3,11 @@ use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::PreparedBatch;
 use crate::contracts::functions::LixFunctionProvider;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::payload_column_name_for_schema;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";

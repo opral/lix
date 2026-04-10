@@ -16,7 +16,6 @@ pub mod session;
 pub(crate) mod sql;
 #[cfg(test)]
 mod test_support;
-pub(crate) mod version_state;
 
 pub mod image {
     pub use crate::backend::{ImageChunkReader, ImageChunkWriter};

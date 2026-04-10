@@ -31,7 +31,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .await?;
 
         let main_version_id = match self
-            .find_version_id_by_name(crate::version_state::DEFAULT_ACTIVE_VERSION_NAME)
+            .find_version_id_by_name(crate::contracts::DEFAULT_ACTIVE_VERSION_NAME)
             .await?
         {
             Some(version_id) => version_id,
@@ -40,7 +40,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 self.seed_canonical_version_descriptor(
                     &bootstrap_commit_id,
                     &generated_main_id,
-                    crate::version_state::DEFAULT_ACTIVE_VERSION_NAME,
+                    crate::contracts::DEFAULT_ACTIVE_VERSION_NAME,
                 )
                 .await?;
                 generated_main_id
@@ -49,15 +49,12 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
         self.seed_canonical_version_descriptor(
             &bootstrap_commit_id,
-            crate::version_state::GLOBAL_VERSION_ID,
-            crate::version_state::GLOBAL_VERSION_ID,
+            crate::contracts::GLOBAL_VERSION_ID,
+            crate::contracts::GLOBAL_VERSION_ID,
         )
         .await?;
-        self.seed_local_version_head(
-            crate::version_state::GLOBAL_VERSION_ID,
-            &bootstrap_commit_id,
-        )
-        .await?;
+        self.seed_local_version_head(crate::contracts::GLOBAL_VERSION_ID, &bootstrap_commit_id)
+            .await?;
         self.seed_local_version_head(&main_version_id, &bootstrap_commit_id)
             .await?;
 
@@ -166,11 +163,13 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = LiveRow {
             entity_id: version_id.to_string(),
-            schema_key: crate::version_state::version_ref_schema_key().to_string(),
-            schema_version: crate::version_state::version_ref_schema_version().to_string(),
-            file_id: crate::version_state::version_ref_file_id().to_string(),
-            version_id: crate::version_state::version_ref_storage_version_id().to_string(),
-            plugin_key: crate::version_state::version_ref_plugin_key().to_string(),
+            schema_key: crate::contracts::version_artifacts::version_ref_schema_key().to_string(),
+            schema_version: crate::contracts::version_artifacts::version_ref_schema_version()
+                .to_string(),
+            file_id: crate::contracts::version_artifacts::version_ref_file_id().to_string(),
+            version_id: crate::contracts::version_artifacts::version_ref_storage_version_id()
+                .to_string(),
+            plugin_key: crate::contracts::version_artifacts::version_ref_plugin_key().to_string(),
             metadata: None,
             change_id: None,
             writer_key: None,
@@ -178,9 +177,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             untracked: true,
             created_at: Some(timestamp.clone()),
             updated_at: Some(timestamp),
-            snapshot_content: Some(crate::version_state::version_ref_snapshot_content(
-                version_id, commit_id,
-            )),
+            snapshot_content: Some(
+                crate::contracts::version_artifacts::version_ref_snapshot_content(
+                    version_id, commit_id,
+                ),
+            ),
         };
         write_live_rows(self.backend_transaction_mut()?, &[row]).await
     }

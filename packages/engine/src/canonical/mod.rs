@@ -66,7 +66,6 @@ pub(crate) use init::{init, seed_bootstrap};
 pub(crate) use read::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
-
 pub(crate) const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
     "lix_internal_entity_state_timeline_breakpoint";
 pub(crate) const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";

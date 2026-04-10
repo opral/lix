@@ -1,6 +1,6 @@
 use crate::catalog::{bind_named_relation, RelationBindContext};
+use crate::contracts::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
-use crate::version_state::DEFAULT_ACTIVE_VERSION_NAME;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WORKSPACE_METADATA_TABLE: &str = "lix_internal_workspace_metadata";

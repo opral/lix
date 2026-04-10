@@ -6,12 +6,15 @@ use crate::canonical::{
 };
 use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::common::text::escape_sql_string;
-use crate::sql::lower_catalog_relation_binding_to_source_sql;
-use crate::version_state::{
-    load_all_local_version_refs_with_executor, load_local_version_head_commit_id_with_executor,
+use crate::contracts::version_artifacts::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version, GLOBAL_VERSION_ID,
+    version_descriptor_schema_key, version_descriptor_schema_version,
 };
+use crate::contracts::GLOBAL_VERSION_ID;
+use crate::session::version_ops::{
+    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
+};
+use crate::sql::lower_catalog_relation_binding_to_source_sql;
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,7 +44,7 @@ pub(crate) async fn load_version_descriptor_with_executor(
     version_id: &str,
 ) -> Result<Option<VersionDescriptorRow>, LixError> {
     let Some(global_head_commit_id) =
-        load_local_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
+        load_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
     else {
         return Ok(None);
     };
@@ -82,9 +85,12 @@ pub(crate) async fn load_all_version_descriptors_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<VersionDescriptorRow>, LixError> {
     let mut descriptors = Vec::new();
-    for version_ref in load_all_local_version_refs_with_executor(executor).await? {
+    let Some(version_heads) = load_version_head_commit_map_with_executor(executor).await? else {
+        return Ok(descriptors);
+    };
+    for version_id in version_heads.keys() {
         if let Some(descriptor) =
-            load_version_descriptor_with_executor(executor, &version_ref.version_id).await?
+            load_version_descriptor_with_executor(executor, version_id).await?
         {
             descriptors.push(descriptor);
         }
@@ -111,7 +117,7 @@ pub(crate) async fn load_checkpoint_version_heads_with_executor(
     let mut heads = Vec::new();
 
     let Some(global_head_commit_id) =
-        load_local_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
+        load_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
     else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -128,8 +134,7 @@ pub(crate) async fn load_checkpoint_version_heads_with_executor(
             continue;
         }
         let Some(head_commit_id) =
-            load_local_version_head_commit_id_with_executor(executor, &descriptor.version_id)
-                .await?
+            load_version_head_commit_id_with_executor(executor, &descriptor.version_id).await?
         else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",

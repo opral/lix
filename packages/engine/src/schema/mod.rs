@@ -11,7 +11,7 @@ pub(crate) use annotations::overrides::{
     DynamicEntitySurfaceOverride, LixcolOverrideValue, SchemaAnnotationEvaluator,
 };
 pub(crate) use builtin::{
-    builtin_schema_definition, builtin_schema_json, builtin_schema_keys, decode_lixcol_literal,
+    builtin_schema_definition, builtin_schema_keys, decode_lixcol_literal,
     lix_state_surface_schema_definition, LixActiveVersion, LixCommit, LixVersionDescriptor,
     LixVersionRef,
 };

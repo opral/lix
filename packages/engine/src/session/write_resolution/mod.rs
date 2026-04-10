@@ -4,6 +4,13 @@ pub(crate) mod prepared_artifacts;
 use crate::catalog::SurfaceFamily;
 use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::contracts::traits::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
+use crate::contracts::version_artifacts::{
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
+    version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
+    version_ref_snapshot_content,
+};
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::execution::write::filesystem::query::FilesystemQueryError;
 use crate::session::write_resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
@@ -11,12 +18,6 @@ use crate::session::write_resolution::prepared_artifacts::{
     PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef, ResolvedWritePartition,
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
-};
-use crate::version_state::{
-    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
-    version_ref_plugin_key, version_ref_schema_key, version_ref_schema_version,
-    version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
 use crate::{LixBackend, Value};
 use async_trait::async_trait;

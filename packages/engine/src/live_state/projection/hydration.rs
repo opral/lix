@@ -1,4 +1,3 @@
-use crate::live_state::shared::version_heads::load_current_committed_version_frontier_with_backend;
 use crate::live_state::tracked::{
     scan_rows_with_backend as scan_tracked_rows_with_backend, TrackedScanRequest,
 };
@@ -10,13 +9,14 @@ use crate::projections::{
     ProjectionHydratedRow, ProjectionInput, ProjectionInputRows, ProjectionInputSpec,
     ProjectionInputVersionScope, ProjectionStorageKind, ProjectionTrait,
 };
+use crate::session::version_ops::load_current_committed_version_frontier_with_backend;
 use crate::{LixBackend, LixError};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
 ///
-/// Projection definitions stay storage-free. `live_state` owns the committed
-/// state lookups and resolves per-input scope such as global-only or current
-/// committed local-version rows.
+/// Projection definitions stay storage-free. `session::version_ops` owns the
+/// committed frontier lookups and resolves per-input scope such as global-only
+/// or current committed local-version rows.
 pub(crate) async fn hydrate_projection_input_with_backend(
     backend: &dyn LixBackend,
     projection: &dyn ProjectionTrait,
@@ -53,7 +53,7 @@ impl ProjectionHydrationContext {
     fn version_ids_for_spec(&self, spec: &ProjectionInputSpec) -> Vec<String> {
         match spec.version_scope {
             ProjectionInputVersionScope::Global => {
-                vec![crate::version_state::GLOBAL_VERSION_ID.to_string()]
+                vec![crate::contracts::GLOBAL_VERSION_ID.to_string()]
             }
             ProjectionInputVersionScope::CurrentCommittedFrontier => {
                 self.current_committed_version_ids.clone()
@@ -113,7 +113,7 @@ fn schema_default_version_ids(
 ) -> Vec<String> {
     match builtin_schema_storage_metadata(&spec.schema_key).map(|metadata| metadata.storage_lane) {
         Some(BuiltinSchemaStorageLane::Global) | None => {
-            vec![crate::version_state::GLOBAL_VERSION_ID.to_string()]
+            vec![crate::contracts::GLOBAL_VERSION_ID.to_string()]
         }
         Some(BuiltinSchemaStorageLane::Local) => current_committed_version_ids.to_vec(),
     }
@@ -302,7 +302,7 @@ mod tests {
             metadata: None,
             change_id: Some(change_id.to_string()),
             writer_key: None,
-            global: version_id == crate::version_state::GLOBAL_VERSION_ID,
+            global: version_id == crate::contracts::GLOBAL_VERSION_ID,
             untracked: false,
             created_at: Some(timestamp.to_string()),
             updated_at: Some(timestamp.to_string()),
@@ -330,7 +330,7 @@ mod tests {
             metadata: None,
             change_id: None,
             writer_key: None,
-            global: version_id == crate::version_state::GLOBAL_VERSION_ID,
+            global: version_id == crate::contracts::GLOBAL_VERSION_ID,
             untracked: true,
             created_at: Some(timestamp.to_string()),
             updated_at: Some(timestamp.to_string()),
@@ -357,16 +357,16 @@ mod tests {
         live_state::write_live_rows(
             transaction.as_mut(),
             &[bootstrap_tracked_live_row(
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
                 &version_descriptor_file_id(),
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_descriptor_plugin_key(),
                 "change-global",
                 &version_descriptor_snapshot_content(
-                    crate::version_state::GLOBAL_VERSION_ID,
-                    crate::version_state::GLOBAL_VERSION_ID,
+                    crate::contracts::GLOBAL_VERSION_ID,
+                    crate::contracts::GLOBAL_VERSION_ID,
                     true,
                 ),
                 "2026-04-01T00:00:00Z",
@@ -381,12 +381,12 @@ mod tests {
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
                 &version_descriptor_file_id(),
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_descriptor_plugin_key(),
                 "change-main",
                 &version_descriptor_snapshot_content(
                     "version-main",
-                    crate::version_state::DEFAULT_ACTIVE_VERSION_NAME,
+                    crate::contracts::DEFAULT_ACTIVE_VERSION_NAME,
                     false,
                 ),
                 "2026-04-01T00:00:01Z",
@@ -397,16 +397,13 @@ mod tests {
         live_state::write_live_rows(
             transaction.as_mut(),
             &[bootstrap_untracked_live_row(
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
-                &version_ref_snapshot_content(
-                    crate::version_state::GLOBAL_VERSION_ID,
-                    "commit-global",
-                ),
+                &version_ref_snapshot_content(crate::contracts::GLOBAL_VERSION_ID, "commit-global"),
                 "2026-04-01T00:00:02Z",
             )],
         )
@@ -419,7 +416,7 @@ mod tests {
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
                 &version_ref_snapshot_content("version-main", "commit-main"),
                 "2026-04-01T00:00:03Z",
@@ -460,7 +457,7 @@ mod tests {
         assert!(
             descriptor_ids
                 .iter()
-                .any(|id| id == crate::version_state::GLOBAL_VERSION_ID),
+                .any(|id| id == crate::contracts::GLOBAL_VERSION_ID),
             "tracked descriptor hydration should include global"
         );
 
@@ -469,7 +466,7 @@ mod tests {
             .find_map(|row| {
                 row.values().get("name").and_then(|value| match value {
                     crate::Value::Text(name)
-                        if name == crate::version_state::DEFAULT_ACTIVE_VERSION_NAME =>
+                        if name == crate::contracts::DEFAULT_ACTIVE_VERSION_NAME =>
                     {
                         Some(row.identity().entity_id)
                     }
@@ -485,7 +482,7 @@ mod tests {
         assert!(
             ref_ids
                 .iter()
-                .any(|id| id == crate::version_state::GLOBAL_VERSION_ID),
+                .any(|id| id == crate::contracts::GLOBAL_VERSION_ID),
             "untracked ref hydration should include global"
         );
         assert!(
@@ -517,7 +514,7 @@ mod tests {
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
                 &version_ref_snapshot_content("version-main", "commit-main"),
                 "2026-04-02T00:00:00Z",
@@ -532,7 +529,7 @@ mod tests {
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::version_state::GLOBAL_VERSION_ID,
+                crate::contracts::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
                 &version_ref_snapshot_content("version-dev", "commit-dev"),
                 "2026-04-02T00:00:01Z",

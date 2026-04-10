@@ -252,6 +252,12 @@ mod tests {
         PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
         ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
     };
+    use crate::contracts::version_artifacts::{
+        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+        version_descriptor_schema_version, version_descriptor_snapshot_content,
+        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+        version_ref_schema_version, version_ref_snapshot_content,
+    };
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
     use crate::schema::LixCommit;
@@ -259,12 +265,6 @@ mod tests {
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionBindings,
         CanonicalChangeSeed, TestSqliteBackend,
-    };
-    use crate::version_state::{
-        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-        version_descriptor_schema_version, version_descriptor_snapshot_content,
-        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-        version_ref_schema_version, version_ref_snapshot_content,
     };
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionMode, Value};
 
@@ -384,7 +384,7 @@ mod tests {
             &[
                 VersionCaseDescriptor {
                     id: "version-main",
-                    name: Some(crate::version_state::DEFAULT_ACTIVE_VERSION_NAME),
+                    name: Some(crate::contracts::DEFAULT_ACTIVE_VERSION_NAME),
                     hidden: false,
                     current_commit_id: Some("commit-main"),
                 },
@@ -460,7 +460,7 @@ mod tests {
             &[
                 VersionCaseDescriptor {
                     id: "version-main",
-                    name: Some(crate::version_state::DEFAULT_ACTIVE_VERSION_NAME),
+                    name: Some(crate::contracts::DEFAULT_ACTIVE_VERSION_NAME),
                     hidden: false,
                     current_commit_id: Some("commit-main"),
                 },
@@ -600,8 +600,8 @@ mod tests {
 
         let global_head_commit_id = "commit-global-head";
         let mut all_descriptors = vec![VersionCaseDescriptor {
-            id: crate::version_state::GLOBAL_VERSION_ID,
-            name: Some(crate::version_state::GLOBAL_VERSION_ID),
+            id: crate::contracts::GLOBAL_VERSION_ID,
+            name: Some(crate::contracts::GLOBAL_VERSION_ID),
             hidden: true,
             current_commit_id: Some(global_head_commit_id),
         }];
@@ -617,7 +617,7 @@ mod tests {
                     file_id: version_descriptor_file_id().to_string(),
                     schema_key: version_descriptor_schema_key().to_string(),
                     schema_version: version_descriptor_schema_version().to_string(),
-                    version_id: crate::version_state::GLOBAL_VERSION_ID.to_string(),
+                    version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
                     plugin_key: version_descriptor_plugin_key().to_string(),
                     metadata: None,
                     change_id: Some(format!("change-{}", descriptor.id)),
@@ -640,7 +640,7 @@ mod tests {
                         file_id: version_ref_file_id().to_string(),
                         schema_key: version_ref_schema_key().to_string(),
                         schema_version: version_ref_schema_version().to_string(),
-                        version_id: crate::version_state::GLOBAL_VERSION_ID.to_string(),
+                        version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
                         plugin_key: version_ref_plugin_key().to_string(),
                         metadata: None,
                         change_id: None,
@@ -661,7 +661,7 @@ mod tests {
         transaction.commit().await?;
 
         let mut current_heads = BTreeMap::from([(
-            crate::version_state::GLOBAL_VERSION_ID.to_string(),
+            crate::contracts::GLOBAL_VERSION_ID.to_string(),
             global_head_commit_id.to_string(),
         )]);
         for descriptor in descriptors {

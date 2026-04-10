@@ -6,13 +6,13 @@ use crate::contracts::artifacts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
     StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
-use crate::version_state::{
+
+use super::context::resolve_target_version_with_backend;
+use super::history_roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
 use crate::{LixBackend, LixError};
-
-use super::context::resolve_target_version_with_backend;
 
 pub(crate) async fn load_state_history_rows(
     backend: &dyn LixBackend,

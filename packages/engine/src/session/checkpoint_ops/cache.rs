@@ -76,7 +76,8 @@ fn version_checkpoint_rows_from_resolved_write(
             .iter()
             .flat_map(|partition| partition.intended_post_state.iter())
             .filter(|row| {
-                row.schema_key == crate::version_state::version_ref_schema_key() && !row.tombstone
+                row.schema_key == crate::contracts::version_artifacts::version_ref_schema_key()
+                    && !row.tombstone
             })
             .filter_map(|row| {
                 row.values
@@ -106,7 +107,9 @@ fn version_checkpoint_rows_from_resolved_write(
     batch
         .changes
         .iter()
-        .filter(|change| change.schema_key == crate::version_state::version_ref_schema_key())
+        .filter(|change| {
+            change.schema_key == crate::contracts::version_artifacts::version_ref_schema_key()
+        })
         .filter_map(|change| {
             change.snapshot_content.as_deref().and_then(|snapshot| {
                 serde_json::from_str::<serde_json::Value>(snapshot)

@@ -20,6 +20,10 @@ use crate::contracts::state_commit_stream::{
 };
 #[cfg(test)]
 use crate::contracts::traits::SqlPreparationMetadataReader;
+use crate::contracts::version_artifacts::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 use crate::schema::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
@@ -52,10 +56,6 @@ use crate::sql::semantic_ir::{
     PublicWriteSemantics,
 };
 use crate::sql::{classify_relation_name, protected_builtin_public_surface_names, RelationPolicy};
-use crate::version_state::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
-};
 #[cfg(test)]
 use crate::LixBackend;
 use crate::{LixError, SqlDialect, Value};
@@ -1746,6 +1746,13 @@ mod tests {
     use crate::contracts::artifacts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
+    use crate::contracts::version_artifacts::{
+        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+        version_descriptor_schema_version, version_descriptor_snapshot_content,
+        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+        version_ref_schema_version, version_ref_snapshot_content,
+    };
+    use crate::contracts::GLOBAL_VERSION_ID;
     use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
     use crate::live_state::{self, mark_mode_with_backend};
     use crate::schema::LixCommit;
@@ -1764,12 +1771,6 @@ mod tests {
     use crate::test_support::{
         seed_canonical_change_row, BuiltinReadExecutionBindings, CanonicalChangeSeed,
         TestSqliteBackend,
-    };
-    use crate::version_state::{
-        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-        version_descriptor_schema_version, version_descriptor_snapshot_content,
-        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-        version_ref_schema_version, version_ref_snapshot_content, GLOBAL_VERSION_ID,
     };
     use crate::{LixBackend, LixError, Session, SqlDialect, Value};
     use async_trait::async_trait;
