@@ -1,5 +1,5 @@
+use crate::catalog::SurfaceRegistry;
 use crate::contracts::functions::DynFunctionProvider;
-use crate::contracts::surface::SurfaceRegistry;
 use crate::sql::explain::{
     build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
@@ -316,7 +316,7 @@ async fn compile_execution_with_context(
 
 async fn prepare_public_execution_for_compile(
     dialect: SqlDialect,
-    registry: &crate::contracts::surface::SurfaceRegistry,
+    registry: &crate::catalog::SurfaceRegistry,
     compiler_metadata: &SqlCompilerMetadata,
     statements: &[Statement],
     params: &[Value],

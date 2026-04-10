@@ -1,10 +1,10 @@
 use crate::backend::TransactionBackendAdapter;
+use crate::catalog::SurfaceReadFreshness;
 use crate::common::errors::classification::sanitize_lowered_public_sql_error_description;
 use crate::contracts::artifacts::{
     PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
-use crate::contracts::surface::SurfaceReadFreshness;
 use crate::contracts::traits::{LiveStateQueryBackend, PendingPublicReadTransaction, PendingView};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;

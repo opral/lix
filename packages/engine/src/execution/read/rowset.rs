@@ -247,6 +247,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{execute_read_time_projection_read, execute_read_time_projection_rows};
+    use crate::catalog::{bind_named_relation, RelationBindContext};
     use crate::contracts::artifacts::{
         PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
         ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
@@ -260,7 +261,7 @@ mod tests {
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
     use crate::schema::LixCommit;
-    use crate::surface_sql::version::build_admin_version_source_sql_with_current_heads;
+    use crate::sql::lower_catalog_relation_binding_to_source_sql;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionBindings,
         CanonicalChangeSeed, TestSqliteBackend,
@@ -542,10 +543,16 @@ mod tests {
         current_heads: &BTreeMap<String, String>,
         template: &str,
     ) -> Result<QueryResult, LixError> {
-        let source_sql = build_admin_version_source_sql_with_current_heads(
-            SqlDialect::Sqlite,
-            Some(current_heads),
-        );
+        let binding = bind_named_relation(
+            "lix_version",
+            RelationBindContext {
+                active_version_id: None,
+                current_heads: Some(current_heads),
+            },
+        )?
+        .expect("lix_version must bind to a catalog relation");
+        let source_sql =
+            lower_catalog_relation_binding_to_source_sql(SqlDialect::Sqlite, &binding)?;
         let sql = template.replace("{source_sql}", &source_sql);
         Ok(normalize_sqlite_version_hidden(
             backend.execute(&sql, &[]).await?,

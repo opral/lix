@@ -1,6 +1,6 @@
 mod boot;
 
-use crate::contracts::surface::SurfaceRegistry;
+use crate::catalog::SurfaceRegistry;
 use crate::projections::ProjectionRegistry;
 use crate::runtime::deterministic_mode::global_deterministic_settings_storage_scope;
 use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
@@ -266,7 +266,7 @@ impl Engine {
         &self.boot_key_values
     }
 
-    pub(crate) fn public_surface_registry(&self) -> crate::contracts::surface::SurfaceRegistry {
+    pub(crate) fn public_surface_registry(&self) -> crate::catalog::SurfaceRegistry {
         self.runtime.public_surface_registry()
     }
 

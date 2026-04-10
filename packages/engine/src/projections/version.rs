@@ -8,8 +8,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::contracts::artifacts::{RowIdentity, UntrackedRow};
-use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
 use crate::projections::{
     DerivedRow, ProjectionHydratedRow, ProjectionInput, ProjectionInputSpec, ProjectionLifecycle,
     ProjectionRegistration, ProjectionSurfaceSpec, ProjectionTrait,

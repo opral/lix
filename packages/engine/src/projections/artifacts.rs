@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
+use crate::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::common::types::Value;
 use crate::contracts::artifacts::{RowIdentity, TrackedRow, UntrackedRow};
-use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
 
 /// Projection execution lifecycle.
 ///
@@ -246,8 +246,8 @@ mod tests {
         ProjectionInputSpec, ProjectionInputVersionScope, ProjectionLifecycle,
         ProjectionRegistration, ProjectionStorageKind, ProjectionSurfaceSpec,
     };
+    use crate::catalog::{SurfaceFamily, SurfaceVariant};
     use crate::contracts::artifacts::{RowIdentity, TrackedRow, UntrackedRow};
-    use crate::contracts::surface::{SurfaceFamily, SurfaceVariant};
     use crate::Value;
 
     #[test]

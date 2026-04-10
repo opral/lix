@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::catalog::SurfaceRegistry;
 use crate::contracts::functions::{clone_boxed_function_provider, SharedFunctionProvider};
-use crate::contracts::surface::SurfaceRegistry;
 use crate::contracts::traits::CompiledSchemaCache;
 use crate::image::ImageChunkWriter;
 use crate::projections::ProjectionRegistry;

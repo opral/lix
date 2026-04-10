@@ -3,6 +3,11 @@
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
 //! and compiler-owned explain payload/template generation.
 
+use crate::catalog::{
+    bind_surface_relation, FilesystemRelationKind, RelationBindContext, RelationBinding,
+    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
+    SurfaceVariant,
+};
 use crate::contracts::artifacts::{
     ChangeBatch, CommitPreconditions, DirectoryHistoryRequest, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
@@ -10,10 +15,6 @@ use crate::contracts::artifacts::{
     PreparedStatement, PublicChange, ReadTimeProjectionRead, SemanticEffect, SessionDependency,
     SessionStateDelta, StateCommitStreamChange, StateHistoryContentMode, StateHistoryLineageScope,
     StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
-};
-use crate::contracts::surface::{
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
-    SurfaceVariant,
 };
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
@@ -432,6 +433,43 @@ pub(crate) struct SurfaceBindingSnapshot {
     pub(crate) hidden_columns: Vec<String>,
     pub(crate) fixed_schema_key: Option<String>,
     pub(crate) expose_version_id: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
+pub(crate) enum ExplainRelationBindingSnapshot {
+    SchemaRelation(ExplainSchemaRelationBindingSnapshot),
+    VersionRelation(ExplainVersionRelationBindingSnapshot),
+    FilesystemRelation(ExplainFilesystemRelationBindingSnapshot),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainSchemaRelationBindingSnapshot {
+    pub(crate) public_name: String,
+    pub(crate) schema_key: String,
+    pub(crate) surface_family: ExplainSurfaceFamily,
+    pub(crate) surface_variant: ExplainSurfaceVariant,
+    pub(crate) default_scope: String,
+    pub(crate) expose_version_id: bool,
+    pub(crate) visible_columns: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainVersionRelationBindingSnapshot {
+    pub(crate) global_version_id: String,
+    pub(crate) descriptor_schema_key: String,
+    pub(crate) head_source_kind: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ExplainFilesystemRelationBindingSnapshot {
+    pub(crate) kind: String,
+    pub(crate) scope: String,
+    pub(crate) active_version_id: Option<String>,
+    pub(crate) global_version_id: String,
+    pub(crate) file_descriptor_schema_key: String,
+    pub(crate) directory_descriptor_schema_key: String,
+    pub(crate) binary_blob_ref_schema_key: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1688,6 +1726,7 @@ pub(crate) struct ExplainBroadPublicReadRelationSummarySnapshot {
 pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) strategy: ExplainPublicReadStrategy,
     pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
+    pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1721,6 +1760,7 @@ pub(crate) enum ExplainSemanticStatement {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadSemantics {
     pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
+    pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
     pub(crate) structured_read: Option<Box<StructuredPublicReadSnapshot>>,
@@ -2784,6 +2824,7 @@ fn public_read_semantics_snapshot(semantics: &PublicReadSemantics) -> ExplainPub
             .iter()
             .map(surface_binding_snapshot)
             .collect(),
+        relation_bindings: surface_relation_binding_snapshots(&semantics.surface_bindings),
         broad_statement: semantics
             .broad_statement
             .as_deref()
@@ -4570,6 +4611,9 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadStrategy::Structured,
                     surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
+                    relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
+                        &read.surface_binding,
+                    )),
                     broad_statement: None,
                     broad_relation_summary: None,
                     read: Some(Box::new(structured_public_read_snapshot(read))),
@@ -4596,6 +4640,9 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadStrategy::DirectHistory,
                     surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
+                    relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
+                        &read.surface_binding,
+                    )),
                     broad_statement: None,
                     broad_relation_summary: None,
                     read: Some(Box::new(structured_public_read_snapshot(read))),
@@ -4623,6 +4670,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                         .iter()
                         .map(surface_binding_snapshot)
                         .collect(),
+                    relation_bindings: surface_relation_binding_snapshots(surface_bindings),
                     broad_statement: Some(Box::new(broad_public_read_statement_snapshot(
                         broad_statement,
                     ))),
@@ -5526,6 +5574,78 @@ fn surface_binding_snapshot(binding: &SurfaceBinding) -> SurfaceBindingSnapshot 
     }
 }
 
+fn surface_relation_binding_snapshots(
+    bindings: &[SurfaceBinding],
+) -> Vec<ExplainRelationBindingSnapshot> {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            bind_surface_relation(binding, RelationBindContext::default())
+                .ok()
+                .flatten()
+                .map(|relation_binding| relation_binding_snapshot(&relation_binding))
+        })
+        .collect()
+}
+
+fn relation_binding_snapshot(binding: &RelationBinding) -> ExplainRelationBindingSnapshot {
+    match binding {
+        RelationBinding::SchemaRelation(binding) => {
+            ExplainRelationBindingSnapshot::SchemaRelation(ExplainSchemaRelationBindingSnapshot {
+                public_name: binding.public_name.clone(),
+                schema_key: binding.schema_key.clone(),
+                surface_family: surface_family_snapshot(binding.surface_family),
+                surface_variant: surface_variant_snapshot(binding.surface_variant),
+                default_scope: default_scope_name(binding.default_scope).to_string(),
+                expose_version_id: binding.expose_version_id,
+                visible_columns: binding.visible_columns.clone(),
+            })
+        }
+        RelationBinding::VersionRelation(binding) => {
+            ExplainRelationBindingSnapshot::VersionRelation(ExplainVersionRelationBindingSnapshot {
+                global_version_id: binding.global_version_id.clone(),
+                descriptor_schema_key: binding.descriptor_source.schema_key.clone(),
+                head_source_kind: match &binding.head_source {
+                    crate::catalog::VersionHeadSourceBinding::StoredRefs(_) => {
+                        "stored_refs".to_string()
+                    }
+                    crate::catalog::VersionHeadSourceBinding::InlineCurrentHeads(_) => {
+                        "inline_current_heads".to_string()
+                    }
+                },
+            })
+        }
+        RelationBinding::FilesystemRelation(binding) => {
+            ExplainRelationBindingSnapshot::FilesystemRelation(
+                ExplainFilesystemRelationBindingSnapshot {
+                    kind: match binding.kind {
+                        FilesystemRelationKind::File => "file".to_string(),
+                        FilesystemRelationKind::Directory => "directory".to_string(),
+                    },
+                    scope: match binding.scope {
+                        crate::catalog::FilesystemProjectionScope::ActiveVersion => {
+                            "active_version".to_string()
+                        }
+                        crate::catalog::FilesystemProjectionScope::ExplicitVersion => {
+                            "explicit_version".to_string()
+                        }
+                    },
+                    active_version_id: binding
+                        .active_version_id
+                        .as_ref()
+                        .map(|value| value.as_str().to_string()),
+                    global_version_id: binding.global_version_id.clone(),
+                    file_descriptor_schema_key: binding.file_descriptor_schema_key.clone(),
+                    directory_descriptor_schema_key: binding
+                        .directory_descriptor_schema_key
+                        .clone(),
+                    binary_blob_ref_schema_key: binding.binary_blob_ref_schema_key.clone(),
+                },
+            )
+        }
+    }
+}
+
 fn dependency_spec_snapshot(spec: &DependencySpec) -> DependencySpecSnapshot {
     DependencySpecSnapshot {
         relations: spec.relations.iter().cloned().collect(),
@@ -5668,13 +5788,13 @@ fn surface_read_freshness_name(freshness: SurfaceReadFreshness) -> &'static str 
     }
 }
 
-fn default_scope_name(scope: crate::contracts::surface::DefaultScopeSemantics) -> &'static str {
+fn default_scope_name(scope: crate::catalog::DefaultScopeSemantics) -> &'static str {
     match scope {
-        crate::contracts::surface::DefaultScopeSemantics::ActiveVersion => "active_version",
-        crate::contracts::surface::DefaultScopeSemantics::ExplicitVersion => "explicit_version",
-        crate::contracts::surface::DefaultScopeSemantics::History => "history",
-        crate::contracts::surface::DefaultScopeSemantics::GlobalAdmin => "global_admin",
-        crate::contracts::surface::DefaultScopeSemantics::WorkingChanges => "working_changes",
+        crate::catalog::DefaultScopeSemantics::ActiveVersion => "active_version",
+        crate::catalog::DefaultScopeSemantics::ExplicitVersion => "explicit_version",
+        crate::catalog::DefaultScopeSemantics::History => "history",
+        crate::catalog::DefaultScopeSemantics::GlobalAdmin => "global_admin",
+        crate::catalog::DefaultScopeSemantics::WorkingChanges => "working_changes",
     }
 }
 

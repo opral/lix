@@ -2,6 +2,7 @@ mod api;
 mod backend;
 mod binary_cas;
 pub(crate) mod canonical;
+pub(crate) mod catalog;
 mod common;
 pub(crate) mod contracts;
 mod engine;
@@ -13,7 +14,6 @@ mod runtime;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
-mod surface_sql;
 pub(crate) mod surfaces;
 #[cfg(test)]
 mod test_support;

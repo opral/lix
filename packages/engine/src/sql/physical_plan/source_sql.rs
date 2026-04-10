@@ -1,8 +1,8 @@
 //! Compiler-owned public surface source SQL builders.
 
+use crate::catalog::{RelationBinding, SurfaceBinding, SurfaceVariant};
 use crate::common::naming::tracked_relation_name;
 use crate::contracts::artifacts::EffectiveStateRequest;
-use crate::contracts::surface::{SurfaceBinding, SurfaceVariant};
 use crate::contracts::version_artifacts::{
     version_descriptor_schema_key, version_ref_file_id, version_ref_plugin_key,
     version_ref_schema_key, version_ref_schema_version,
@@ -11,6 +11,9 @@ use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
     snapshot_select_expr_for_schema, WRITER_KEY_TABLE,
+};
+use crate::sql::physical_plan::catalog_relation_sql::{
+    build_filesystem_relation_sql, build_version_relation_sql,
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_payload_alias, entity_surface_uses_payload_alias, escape_sql_string,
@@ -22,6 +25,23 @@ use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Expr;
 use std::collections::BTreeMap;
+
+pub(crate) fn lower_catalog_relation_binding_to_source_sql(
+    dialect: SqlDialect,
+    binding: &RelationBinding,
+) -> Result<String, LixError> {
+    match binding {
+        RelationBinding::VersionRelation(binding) => Ok(build_version_relation_sql(dialect, binding)),
+        RelationBinding::FilesystemRelation(binding) => build_filesystem_relation_sql(binding, dialect),
+        RelationBinding::SchemaRelation(binding) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "sql source lowering for schema relation '{}' is handled by state/entity lowerers, not direct catalog source lowering",
+                binding.public_name
+            ),
+        )),
+    }
+}
 
 pub(crate) fn build_effective_public_read_source_sql(
     dialect: SqlDialect,

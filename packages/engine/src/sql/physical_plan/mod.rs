@@ -2,6 +2,7 @@
 //!
 //! Backend lowering hangs off this stage root.
 
+mod catalog_relation_sql;
 pub(crate) mod lowerer;
 pub(crate) mod plan;
 mod public_read_artifacts;
