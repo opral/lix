@@ -1603,7 +1603,9 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 }
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
-    ["canonical", "catalog", "live_state"].into_iter().collect()
+    ["canonical", "catalog", "live_state", "sql"]
+        .into_iter()
+        .collect()
 }
 
 fn violations_for_sealed_owners(
@@ -1756,7 +1758,7 @@ fn builtin_catalog_projection_registry_is_only_used_at_registry_owners() {
         })
         .collect();
 
-    let expected_paths: BTreeSet<String> = ["api/lix.rs", "catalog/declaration.rs"]
+    let expected_paths: BTreeSet<String> = ["api/lix.rs", "catalog/api.rs", "catalog/declaration.rs"]
         .into_iter()
         .map(str::to_string)
         .collect();
@@ -2035,6 +2037,97 @@ fn plan82_catalog_root_stays_the_only_public_entrypoint_outside_owner() {
     assert!(
         offenders.is_empty(),
         "Plan 82 regression: code outside catalog should depend on crate::catalog::* root APIs, not crate::catalog::child::*:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan84_sql_uses_catalog_root_facade_not_binding_helpers() {
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter(|(relative_path, _)| relative_path.starts_with("sql/"))
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("bind_named_relation(")
+                || sanitized.contains("bind_surface_relation(")
+                || sanitized.contains("bind_registry_relation(")
+                || sanitized.contains("use crate::catalog::{bind_named_relation")
+                || sanitized.contains("use crate::catalog::{bind_surface_relation")
+                || sanitized.contains("use crate::catalog::{bind_registry_relation")
+                || sanitized.contains("use crate::catalog::bind_named_relation")
+                || sanitized.contains("use crate::catalog::bind_surface_relation")
+                || sanitized.contains("use crate::catalog::bind_registry_relation"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 84 regression: sql/* should use the root catalog compiler facade instead of binding helpers:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan84_non_live_state_code_uses_live_state_root_not_child_modules() {
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter(|(relative_path, _)| !relative_path.starts_with("live_state/"))
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::live_state::projection::")
+                || sanitized.contains("crate::live_state::pending_reads::")
+                || sanitized.contains("crate::live_state::storage::")
+                || sanitized.contains("crate::live_state::raw::")
+                || sanitized.contains("crate::live_state::schema_access::")
+                || sanitized.contains("crate::live_state::shared::")
+                || sanitized.contains("use crate::live_state::projection::")
+                || sanitized.contains("use crate::live_state::pending_reads::")
+                || sanitized.contains("use crate::live_state::storage::")
+                || sanitized.contains("use crate::live_state::raw::")
+                || sanitized.contains("use crate::live_state::schema_access::")
+                || sanitized.contains("use crate::live_state::shared::"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 84 regression: non-live_state production code should use root live_state APIs, not child modules:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan84_non_sql_code_uses_sql_root_not_stage_modules() {
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter(|(relative_path, _)| !relative_path.starts_with("sql/"))
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::sql::parser::")
+                || sanitized.contains("crate::sql::support::")
+                || sanitized.contains("crate::sql::binder::")
+                || sanitized.contains("crate::sql::prepare::")
+                || sanitized.contains("crate::sql::semantic_ir::")
+                || sanitized.contains("crate::sql::logical_plan::")
+                || sanitized.contains("crate::sql::physical_plan::")
+                || sanitized.contains("crate::sql::explain::")
+                || sanitized.contains("use crate::sql::parser::")
+                || sanitized.contains("use crate::sql::support::")
+                || sanitized.contains("use crate::sql::binder::")
+                || sanitized.contains("use crate::sql::prepare::")
+                || sanitized.contains("use crate::sql::semantic_ir::")
+                || sanitized.contains("use crate::sql::logical_plan::")
+                || sanitized.contains("use crate::sql::physical_plan::")
+                || sanitized.contains("use crate::sql::explain::"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 84 regression: non-sql production code should use root sql APIs, not sql stage modules:\n{}",
         offenders.join("\n"),
     );
 }
@@ -2355,7 +2448,7 @@ fn phase_f_session_selector_reads_stays_as_orchestration_only() {
         "build_surface_registry(",
         "load_sql_compiler_metadata(",
         "load_active_history_root_commit_id_for_preparation(",
-        "try_prepare_public_read_with_registry_and_internal_access(",
+        "prepare_public_read(",
         "prepare_public_read_artifact(",
     ] {
         assert!(

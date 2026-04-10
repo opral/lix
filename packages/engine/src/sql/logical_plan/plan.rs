@@ -10,19 +10,39 @@ use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SurfaceReadPlan {
+    pub(crate) read: StructuredPublicRead,
+    pub(crate) dependency_spec: Option<DependencySpec>,
+    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
+    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
+}
+
+impl SurfaceReadPlan {
+    pub(crate) fn structured_read(&self) -> &StructuredPublicRead {
+        &self.read
+    }
+
+    pub(crate) fn dependency_spec(&self) -> Option<&DependencySpec> {
+        self.dependency_spec.as_ref()
+    }
+
+    pub(crate) fn effective_state_request(&self) -> Option<&EffectiveStateRequest> {
+        self.effective_state_request.as_ref()
+    }
+
+    pub(crate) fn effective_state_plan(&self) -> Option<&EffectiveStatePlan> {
+        self.effective_state_plan.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PublicReadLogicalPlan {
     Structured {
-        read: StructuredPublicRead,
-        dependency_spec: Option<DependencySpec>,
-        effective_state_request: Option<EffectiveStateRequest>,
-        effective_state_plan: Option<EffectiveStatePlan>,
+        plan: SurfaceReadPlan,
     },
     DirectHistory {
-        read: StructuredPublicRead,
+        plan: SurfaceReadPlan,
         direct_plan: DirectPublicReadPlan,
-        dependency_spec: Option<DependencySpec>,
-        effective_state_request: Option<EffectiveStateRequest>,
-        effective_state_plan: Option<EffectiveStatePlan>,
     },
     Broad {
         broad_statement: Box<BroadPublicReadStatement>,
@@ -32,53 +52,38 @@ pub(crate) enum PublicReadLogicalPlan {
 }
 
 impl PublicReadLogicalPlan {
-    pub(crate) fn dependency_spec(&self) -> Option<&DependencySpec> {
+    pub(crate) fn surface_read_plan(&self) -> Option<&SurfaceReadPlan> {
         match self {
-            Self::Structured {
-                dependency_spec, ..
-            }
-            | Self::DirectHistory {
-                dependency_spec, ..
-            }
-            | Self::Broad {
-                dependency_spec, ..
-            } => dependency_spec.as_ref(),
+            Self::Structured { plan } | Self::DirectHistory { plan, .. } => Some(plan),
+            Self::Broad { .. } => None,
         }
     }
 
+    pub(crate) fn dependency_spec(&self) -> Option<&DependencySpec> {
+        self.surface_read_plan()
+            .and_then(SurfaceReadPlan::dependency_spec)
+            .or_else(|| match self {
+                Self::Broad {
+                    dependency_spec, ..
+                } => dependency_spec.as_ref(),
+                _ => None,
+            })
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
-        match self {
-            Self::Structured { read, .. } | Self::DirectHistory { read, .. } => Some(read),
-            Self::Broad { .. } => None,
-        }
+        self.surface_read_plan()
+            .map(SurfaceReadPlan::structured_read)
     }
 
     pub(crate) fn effective_state_request(&self) -> Option<&EffectiveStateRequest> {
-        match self {
-            Self::Structured {
-                effective_state_request,
-                ..
-            }
-            | Self::DirectHistory {
-                effective_state_request,
-                ..
-            } => effective_state_request.as_ref(),
-            Self::Broad { .. } => None,
-        }
+        self.surface_read_plan()
+            .and_then(SurfaceReadPlan::effective_state_request)
     }
 
     pub(crate) fn effective_state_plan(&self) -> Option<&EffectiveStatePlan> {
-        match self {
-            Self::Structured {
-                effective_state_plan,
-                ..
-            }
-            | Self::DirectHistory {
-                effective_state_plan,
-                ..
-            } => effective_state_plan.as_ref(),
-            Self::Broad { .. } => None,
-        }
+        self.surface_read_plan()
+            .and_then(SurfaceReadPlan::effective_state_plan)
     }
 }
 

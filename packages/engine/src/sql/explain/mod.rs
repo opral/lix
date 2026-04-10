@@ -4,9 +4,9 @@
 //! and compiler-owned explain payload/template generation.
 
 use crate::catalog::{
-    bind_surface_relation, FilesystemRelationKind, RelationBindContext, RelationBinding,
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceReadSemantics,
-    SurfaceVariant,
+    builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationKind,
+    RelationBindContext, RelationBinding, SurfaceBinding, SurfaceCapability, SurfaceFamily,
+    SurfaceReadFreshness, SurfaceReadSemantics, SurfaceVariant,
 };
 use crate::contracts::artifacts::{
     ChangeBatch, CommitPreconditions, DirectoryHistoryRequest, EffectiveStateRequest,
@@ -1723,6 +1723,14 @@ pub(crate) struct ExplainBroadPublicReadRelationSummarySnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct ExplainSurfaceReadPlanSnapshot {
+    pub(crate) read: Box<StructuredPublicReadSnapshot>,
+    pub(crate) dependency_spec: Option<Box<DependencySpecSnapshot>>,
+    pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
+    pub(crate) effective_state_plan: Option<Box<EffectiveStatePlanSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) strategy: ExplainPublicReadStrategy,
     pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
@@ -1731,6 +1739,8 @@ pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_relation_summary: Option<Box<ExplainBroadPublicReadRelationSummarySnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) surface_read_plan: Option<Box<ExplainSurfaceReadPlanSnapshot>>,
     pub(crate) read: Option<Box<StructuredPublicReadSnapshot>>,
     pub(crate) dependency_spec: Option<Box<DependencySpecSnapshot>>,
     pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
@@ -1763,6 +1773,8 @@ pub(crate) struct ExplainPublicReadSemantics {
     pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) surface_read_plan: Option<Box<ExplainSurfaceReadPlanSnapshot>>,
     pub(crate) structured_read: Option<Box<StructuredPublicReadSnapshot>>,
     pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
     pub(crate) effective_state_plan: Option<Box<EffectiveStatePlanSnapshot>>,
@@ -2830,19 +2842,50 @@ fn public_read_semantics_snapshot(semantics: &PublicReadSemantics) -> ExplainPub
             .as_deref()
             .map(broad_public_read_statement_snapshot)
             .map(Box::new),
-        structured_read: semantics
-            .structured_read
+        surface_read_plan: semantics
+            .surface_read_plan
             .as_ref()
-            .map(structured_public_read_snapshot)
+            .map(surface_read_plan_snapshot)
+            .map(Box::new),
+        structured_read: semantics
+            .surface_read_plan
+            .as_ref()
+            .map(|plan| structured_public_read_snapshot(plan.structured_read()))
             .map(Box::new),
         effective_state_request: semantics
-            .effective_state_request
+            .surface_read_plan
             .as_ref()
-            .map(effective_state_request_snapshot)
+            .and_then(|plan| {
+                plan.effective_state_request()
+                    .map(effective_state_request_snapshot)
+            })
             .map(Box::new),
         effective_state_plan: semantics
-            .effective_state_plan
+            .surface_read_plan
             .as_ref()
+            .and_then(|plan| {
+                plan.effective_state_plan()
+                    .map(effective_state_plan_snapshot)
+            })
+            .map(Box::new),
+    }
+}
+
+fn surface_read_plan_snapshot(
+    plan: &crate::sql::logical_plan::SurfaceReadPlan,
+) -> ExplainSurfaceReadPlanSnapshot {
+    ExplainSurfaceReadPlanSnapshot {
+        read: Box::new(structured_public_read_snapshot(plan.structured_read())),
+        dependency_spec: plan
+            .dependency_spec()
+            .map(dependency_spec_snapshot)
+            .map(Box::new),
+        effective_state_request: plan
+            .effective_state_request()
+            .map(effective_state_request_snapshot)
+            .map(Box::new),
+        effective_state_plan: plan
+            .effective_state_plan()
             .map(effective_state_plan_snapshot)
             .map(Box::new),
     }
@@ -4603,63 +4646,58 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
     match plan {
         LogicalPlan::PublicRead(plan) => {
             ExplainLogicalPlanSnapshot::PublicRead(Box::new(match plan {
-                PublicReadLogicalPlan::Structured {
-                    read,
-                    dependency_spec,
-                    effective_state_request,
-                    effective_state_plan,
-                } => ExplainPublicReadLogicalPlan {
+                PublicReadLogicalPlan::Structured { plan } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadStrategy::Structured,
-                    surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
+                    surface_bindings: vec![surface_binding_snapshot(&plan.read.surface_binding)],
                     relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
-                        &read.surface_binding,
+                        &plan.read.surface_binding,
                     )),
                     broad_statement: None,
                     broad_relation_summary: None,
-                    read: Some(Box::new(structured_public_read_snapshot(read))),
-                    dependency_spec: dependency_spec
-                        .as_ref()
+                    surface_read_plan: Some(Box::new(surface_read_plan_snapshot(plan))),
+                    read: Some(Box::new(structured_public_read_snapshot(&plan.read))),
+                    dependency_spec: plan
+                        .dependency_spec()
                         .map(dependency_spec_snapshot)
                         .map(Box::new),
-                    effective_state_request: effective_state_request
-                        .as_ref()
+                    effective_state_request: plan
+                        .effective_state_request()
                         .map(effective_state_request_snapshot)
                         .map(Box::new),
-                    effective_state_plan: effective_state_plan
-                        .as_ref()
+                    effective_state_plan: plan
+                        .effective_state_plan()
                         .map(effective_state_plan_snapshot)
                         .map(Box::new),
                     direct_plan: None,
                 },
-                PublicReadLogicalPlan::DirectHistory {
-                    read,
-                    direct_plan,
-                    dependency_spec,
-                    effective_state_request,
-                    effective_state_plan,
-                } => ExplainPublicReadLogicalPlan {
-                    strategy: ExplainPublicReadStrategy::DirectHistory,
-                    surface_bindings: vec![surface_binding_snapshot(&read.surface_binding)],
-                    relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
-                        &read.surface_binding,
-                    )),
-                    broad_statement: None,
-                    broad_relation_summary: None,
-                    read: Some(Box::new(structured_public_read_snapshot(read))),
-                    dependency_spec: dependency_spec
-                        .as_ref()
-                        .map(dependency_spec_snapshot)
-                        .map(Box::new),
-                    effective_state_request: effective_state_request
-                        .as_ref()
-                        .map(effective_state_request_snapshot)
-                        .map(Box::new),
-                    effective_state_plan: effective_state_plan
-                        .as_ref()
-                        .map(effective_state_plan_snapshot)
-                        .map(Box::new),
-                    direct_plan: Some(Box::new(direct_public_read_plan_snapshot(direct_plan))),
-                },
+                PublicReadLogicalPlan::DirectHistory { plan, direct_plan } => {
+                    ExplainPublicReadLogicalPlan {
+                        strategy: ExplainPublicReadStrategy::DirectHistory,
+                        surface_bindings: vec![surface_binding_snapshot(
+                            &plan.read.surface_binding,
+                        )],
+                        relation_bindings: surface_relation_binding_snapshots(
+                            std::slice::from_ref(&plan.read.surface_binding),
+                        ),
+                        broad_statement: None,
+                        broad_relation_summary: None,
+                        surface_read_plan: Some(Box::new(surface_read_plan_snapshot(plan))),
+                        read: Some(Box::new(structured_public_read_snapshot(&plan.read))),
+                        dependency_spec: plan
+                            .dependency_spec()
+                            .map(dependency_spec_snapshot)
+                            .map(Box::new),
+                        effective_state_request: plan
+                            .effective_state_request()
+                            .map(effective_state_request_snapshot)
+                            .map(Box::new),
+                        effective_state_plan: plan
+                            .effective_state_plan()
+                            .map(effective_state_plan_snapshot)
+                            .map(Box::new),
+                        direct_plan: Some(Box::new(direct_public_read_plan_snapshot(direct_plan))),
+                    }
+                }
                 PublicReadLogicalPlan::Broad {
                     broad_statement,
                     surface_bindings,
@@ -4677,6 +4715,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                     broad_relation_summary: Some(Box::new(
                         broad_public_read_relation_summary_snapshot(broad_statement),
                     )),
+                    surface_read_plan: None,
                     read: None,
                     dependency_spec: dependency_spec
                         .as_ref()
@@ -4739,7 +4778,7 @@ fn read_time_projection_read_snapshot(
     read: &ReadTimeProjectionRead,
 ) -> ExplainReadTimeProjectionReadSnapshot {
     ExplainReadTimeProjectionReadSnapshot {
-        surface_name: read.surface.public_name().to_string(),
+        surface_name: read.surface_name.clone(),
         projection_count: read.query.projections.len(),
         filter_count: read.query.filters.len(),
         order_by_count: read.query.order_by.len(),
@@ -5580,7 +5619,8 @@ fn surface_relation_binding_snapshots(
     bindings
         .iter()
         .filter_map(|binding| {
-            bind_surface_relation(binding, RelationBindContext::default())
+            builtin_catalog_compiler_facade()
+                .bind_surface_runtime_relation(binding, RelationBindContext::default())
                 .ok()
                 .flatten()
                 .map(|relation_binding| relation_binding_snapshot(&relation_binding))

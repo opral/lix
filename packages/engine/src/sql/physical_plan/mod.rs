@@ -17,7 +17,7 @@ pub(crate) use plan::{
     UntrackedWriteExecution,
 };
 pub(crate) use public_read_artifacts::{
-    select_specialized_public_read_artifact, CompilerOwnedPublicReadExecutionSelection,
-    SpecializedPublicReadArtifactSelection,
+    compile_derived_rowset_execution, compile_general_public_read_execution,
+    CompilerOwnedPublicReadExecutionSelection,
 };
-pub(crate) use rowset_query::compile_public_rowset_query;
+pub(crate) use rowset_query::{compile_public_rowset_query, try_compile_read_time_projection_read};

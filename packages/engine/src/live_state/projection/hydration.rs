@@ -11,9 +11,9 @@ use crate::live_state::tracked::{
 use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
+use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::session::version_ops::load_current_committed_version_frontier_with_backend;
-use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::{LixBackend, LixError, Value};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
@@ -223,12 +223,7 @@ async fn overlay_writer_keys_on_source_rows_with_backend(
         .collect::<std::collections::BTreeSet<_>>();
     let annotations = load_writer_key_annotations(backend, &row_identities).await?;
     for row in rows {
-        row.set_writer_key(
-            annotations
-                .get(row.identity())
-                .cloned()
-                .flatten(),
-        );
+        row.set_writer_key(annotations.get(row.identity()).cloned().flatten());
     }
     Ok(())
 }

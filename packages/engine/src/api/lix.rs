@@ -555,8 +555,8 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
         &'a self,
         functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
         surface_registry: &'a SurfaceRegistry,
-    ) -> crate::sql::prepare::SqlPreparationSeed<'a> {
-        crate::sql::prepare::SqlPreparationSeed {
+    ) -> crate::sql::SqlPreparationSeed<'a> {
+        crate::sql::SqlPreparationSeed {
             dialect: self.backend().dialect(),
             functions: crate::contracts::functions::clone_boxed_function_provider(functions),
             surface_registry,
@@ -754,7 +754,7 @@ impl ImageChunkWriter for VecImageWriter {
 
 #[cfg(test)]
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
-    let Ok(statements) = crate::sql::parser::parse_sql(sql) else {
+    let Ok(statements) = crate::sql::parse_sql(sql) else {
         return false;
     };
     crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(&statements)

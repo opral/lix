@@ -1,7 +1,7 @@
-use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::catalog::{
-    SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
-    SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
+    builtin_catalog_compiler_facade, CatalogCompilerApi, RelationBindContext, SurfaceBinding,
+    SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue,
+    SurfaceRegistry, SurfaceVariant,
 };
 use crate::common::errors::sql_unknown_column_error;
 use crate::contracts::artifacts::EffectiveStateRequest;
@@ -957,14 +957,15 @@ fn build_filesystem_surface_sql(
         (FilesystemKind::Directory, true) => "lix_directory",
         (FilesystemKind::Directory, false) => "lix_directory_by_version",
     };
-    let binding = bind_named_relation(
-        relation_name,
-        RelationBindContext {
-            active_version_id,
-            current_heads: None,
-        },
-    )?
-    .expect("filesystem relation must bind to a catalog relation");
+    let binding = builtin_catalog_compiler_facade()
+        .bind_relation(
+            relation_name,
+            RelationBindContext {
+                active_version_id,
+                current_heads: None,
+            },
+        )?
+        .expect("filesystem relation must bind to a catalog relation");
     lower_catalog_relation_binding_to_source_sql(dialect, &binding)
 }
 
@@ -997,7 +998,8 @@ fn build_admin_source_sql(
 ) -> Result<String, LixError> {
     Ok(match kind {
         CanonicalAdminKind::Version => {
-            let binding = bind_named_relation("lix_version", RelationBindContext::default())?
+            let binding = builtin_catalog_compiler_facade()
+                .bind_relation("lix_version", RelationBindContext::default())?
                 .expect("lix_version must bind to a catalog relation");
             lower_catalog_relation_binding_to_source_sql(dialect, &binding)?
         }
@@ -1011,14 +1013,15 @@ fn build_admin_source_sql_with_current_heads(
 ) -> Result<String, LixError> {
     Ok(match kind {
         CanonicalAdminKind::Version => {
-            let binding = bind_named_relation(
-                "lix_version",
-                RelationBindContext {
-                    active_version_id: None,
-                    current_heads: Some(current_version_heads),
-                },
-            )?
-            .expect("lix_version must bind to a catalog relation");
+            let binding = builtin_catalog_compiler_facade()
+                .bind_relation(
+                    "lix_version",
+                    RelationBindContext {
+                        active_version_id: None,
+                        current_heads: Some(current_version_heads),
+                    },
+                )?
+                .expect("lix_version must bind to a catalog relation");
             lower_catalog_relation_binding_to_source_sql(dialect, &binding)?
         }
     })

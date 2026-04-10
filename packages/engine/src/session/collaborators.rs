@@ -11,7 +11,7 @@ use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::streams::{
     StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::sql::prepare::SqlPreparationSeed;
+use crate::sql::SqlPreparationSeed;
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode};
 
 #[async_trait(?Send)]

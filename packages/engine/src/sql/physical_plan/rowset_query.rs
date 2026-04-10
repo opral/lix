@@ -1,8 +1,9 @@
+use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
 use crate::contracts::artifacts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
-    ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
+    ReadTimeProjectionReadQuery,
 };
-use crate::sql::logical_plan::public_ir::StructuredPublicRead;
+use crate::sql::logical_plan::SurfaceReadPlan;
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
@@ -19,8 +20,9 @@ pub(crate) struct CompiledPublicRowsetQuery {
 }
 
 pub(crate) fn compile_public_rowset_query(
-    structured_read: &StructuredPublicRead,
+    surface_read_plan: &SurfaceReadPlan,
 ) -> Option<CompiledPublicRowsetQuery> {
+    let structured_read = surface_read_plan.structured_read();
     let table_alias = structured_read
         .query
         .source_alias
@@ -61,11 +63,15 @@ pub(crate) fn compile_public_rowset_query(
 }
 
 pub(crate) fn try_compile_read_time_projection_read(
-    structured_read: &StructuredPublicRead,
+    surface_read_plan: &SurfaceReadPlan,
 ) -> Option<ReadTimeProjectionRead> {
-    let surface = ReadTimeProjectionSurface::from_public_name(
-        &structured_read.surface_binding.descriptor.public_name,
-    )?;
+    let structured_read = surface_read_plan.structured_read();
+    let surface_name = structured_read
+        .surface_binding
+        .descriptor
+        .public_name
+        .clone();
+    builtin_catalog_compiler_facade().derived_surface_definition(&surface_name)?;
     match &structured_read.query.group_by {
         GroupByExpr::Expressions(expressions, modifiers)
             if expressions.is_empty() && modifiers.is_empty() => {}
@@ -75,7 +81,7 @@ pub(crate) fn try_compile_read_time_projection_read(
         return None;
     }
 
-    let query = compile_public_rowset_query(structured_read)?;
+    let query = compile_public_rowset_query(surface_read_plan)?;
     let uses_count_all = query
         .projections
         .iter()
@@ -90,7 +96,7 @@ pub(crate) fn try_compile_read_time_projection_read(
     }
 
     Some(ReadTimeProjectionRead {
-        surface,
+        surface_name,
         requested_version_id: structured_read.requested_version_id.clone(),
         query: ReadTimeProjectionReadQuery {
             projections: query.projections,

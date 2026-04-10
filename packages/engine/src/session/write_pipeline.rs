@@ -44,21 +44,17 @@ use crate::session::write_validation::{
     validate_batch_local_write, validate_inserts, validate_update_inputs,
 };
 use crate::session::SessionWriteSelectorResolver;
-use crate::sql::binder::bind_sql;
-use crate::sql::explain::{
-    build_public_write_explain_artifacts, prepare_analyzed_explain_template,
-    prepare_plain_explain_template, stage_timing, ExplainStage, PublicWriteExplainBuildInput,
-};
-use crate::sql::prepare::{
-    build_public_write_execution, build_public_write_invariant_trace,
-    compile_execution_from_template_instance_with_context, finalize_public_write_execution,
+use crate::sql::bind_sql;
+use crate::sql::{
+    build_change_batches, build_public_write_execution,
+    compile_execution_from_template_instance_with_context, compiled_explain_diagnostics,
+    derive_commit_preconditions, finalize_public_write_execution,
     load_sql_compiler_metadata_with_reader_and_pending_view, prepare_public_read_artifact,
     public_authoritative_write_error, public_write_preparation_error,
-    BoundStatementTemplateInstance, CompiledExecution, PreparationPolicy, SqlCompilerMetadata,
-    UpdateValidationPlan,
-};
-use crate::sql::semantic_ir::semantics::changes::{
-    build_change_batches, derive_commit_preconditions,
+    refresh_materialized_public_write_explain, BoundStatementTemplateInstance, CompiledExecution,
+    InsertOnConflictAction, PreparationPolicy, PreparedPublicWrite, PreparedPublicWriteExecution,
+    PublicWriteExecutionPartition, ResolvedWritePlan, SqlCompilerMetadata, UpdateValidationPlan,
+    WriteOperationKind,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
@@ -638,25 +634,10 @@ fn prepared_write_step_from_compiled_execution(
     mut diagnostic_context: PreparedWriteDiagnosticContext,
     writer_key: Option<String>,
 ) -> Result<PreparedWriteStep, LixError> {
-    diagnostic_context.plain_explain_template = compiled
-        .plain_explain()
-        .map(prepare_plain_explain_template)
-        .transpose()?
-        .flatten();
-    diagnostic_context.analyzed_explain_template = compiled
-        .analyzed_explain()
-        .map(prepare_analyzed_explain_template)
-        .transpose()?
-        .flatten();
-    diagnostic_context.explain_mode = compiled.explain().and_then(|explain| {
-        explain.request().map(|request| {
-            if request.requires_execution() {
-                PreparedExplainMode::Analyze
-            } else {
-                PreparedExplainMode::Plain
-            }
-        })
-    });
+    let explain_diagnostics = compiled_explain_diagnostics(&compiled)?;
+    diagnostic_context.plain_explain_template = explain_diagnostics.plain_template;
+    diagnostic_context.analyzed_explain_template = explain_diagnostics.analyzed_template;
+    diagnostic_context.explain_mode = explain_diagnostics.explain_mode;
 
     let artifact = if let Some(public_read) = compiled.public_read() {
         PreparedWriteArtifact::PublicRead(prepare_public_read_artifact(public_read, dialect)?)
@@ -777,7 +758,7 @@ fn prepared_public_surface_registry_mutations_from_public_write(
 }
 
 fn prepared_public_write_artifact_from_prepared_public_write(
-    public_write: &crate::sql::prepare::PreparedPublicWrite,
+    public_write: &PreparedPublicWrite,
 ) -> PreparedPublicWriteArtifact {
     PreparedPublicWriteArtifact {
         contract: PreparedPublicWriteContract {
@@ -820,13 +801,11 @@ fn prepared_public_write_artifact_from_prepared_public_write(
 }
 
 fn prepared_public_write_execution_artifact_from_sql(
-    execution: &crate::sql::physical_plan::PreparedPublicWriteExecution,
+    execution: &PreparedPublicWriteExecution,
 ) -> PreparedPublicWriteExecutionArtifact {
     match execution {
-        crate::sql::physical_plan::PreparedPublicWriteExecution::Noop => {
-            PreparedPublicWriteExecutionArtifact::Noop
-        }
-        crate::sql::physical_plan::PreparedPublicWriteExecution::Materialize(materialization) => {
+        PreparedPublicWriteExecution::Noop => PreparedPublicWriteExecutionArtifact::Noop,
+        PreparedPublicWriteExecution::Materialize(materialization) => {
             PreparedPublicWriteExecutionArtifact::Materialize(PreparedPublicWriteMaterialization {
                 partitions: materialization
                     .partitions
@@ -839,10 +818,10 @@ fn prepared_public_write_execution_artifact_from_sql(
 }
 
 fn prepared_public_write_execution_partition_from_sql(
-    partition: &crate::sql::physical_plan::PublicWriteExecutionPartition,
+    partition: &PublicWriteExecutionPartition,
 ) -> PreparedPublicWriteExecutionPartition {
     match partition {
-        crate::sql::physical_plan::PublicWriteExecutionPartition::Tracked(tracked) => {
+        PublicWriteExecutionPartition::Tracked(tracked) => {
             PreparedPublicWriteExecutionPartition::Tracked(PreparedTrackedWriteExecution {
                 schema_live_table_requirements: tracked.schema_live_table_requirements.clone(),
                 change_batch: tracked.change_batch.clone(),
@@ -850,7 +829,7 @@ fn prepared_public_write_execution_partition_from_sql(
                 semantic_effects: tracked.semantic_effects.clone(),
             })
         }
-        crate::sql::physical_plan::PublicWriteExecutionPartition::Untracked(untracked) => {
+        PublicWriteExecutionPartition::Untracked(untracked) => {
             PreparedPublicWriteExecutionPartition::Untracked(PreparedUntrackedWriteExecution {
                 intended_post_state: untracked.intended_post_state.clone(),
                 semantic_effects: untracked.semantic_effects.clone(),
@@ -862,7 +841,7 @@ fn prepared_public_write_execution_partition_from_sql(
 }
 
 fn prepared_resolved_write_plan_from_sql(
-    resolved: &crate::sql::logical_plan::public_ir::ResolvedWritePlan,
+    resolved: &ResolvedWritePlan,
 ) -> PreparedResolvedWritePlan {
     PreparedResolvedWritePlan {
         partitions: resolved
@@ -879,32 +858,20 @@ fn prepared_resolved_write_plan_from_sql(
     }
 }
 
-fn prepared_write_operation_kind_from_sql(
-    kind: crate::sql::logical_plan::public_ir::WriteOperationKind,
-) -> PreparedWriteOperationKind {
+fn prepared_write_operation_kind_from_sql(kind: WriteOperationKind) -> PreparedWriteOperationKind {
     match kind {
-        crate::sql::logical_plan::public_ir::WriteOperationKind::Insert => {
-            PreparedWriteOperationKind::Insert
-        }
-        crate::sql::logical_plan::public_ir::WriteOperationKind::Update => {
-            PreparedWriteOperationKind::Update
-        }
-        crate::sql::logical_plan::public_ir::WriteOperationKind::Delete => {
-            PreparedWriteOperationKind::Delete
-        }
+        WriteOperationKind::Insert => PreparedWriteOperationKind::Insert,
+        WriteOperationKind::Update => PreparedWriteOperationKind::Update,
+        WriteOperationKind::Delete => PreparedWriteOperationKind::Delete,
     }
 }
 
 fn prepared_insert_on_conflict_action_from_sql(
-    action: crate::sql::logical_plan::public_ir::InsertOnConflictAction,
+    action: InsertOnConflictAction,
 ) -> PreparedInsertOnConflictAction {
     match action {
-        crate::sql::logical_plan::public_ir::InsertOnConflictAction::DoUpdate => {
-            PreparedInsertOnConflictAction::DoUpdate
-        }
-        crate::sql::logical_plan::public_ir::InsertOnConflictAction::DoNothing => {
-            PreparedInsertOnConflictAction::DoNothing
-        }
+        InsertOnConflictAction::DoUpdate => PreparedInsertOnConflictAction::DoUpdate,
+        InsertOnConflictAction::DoNothing => PreparedInsertOnConflictAction::DoNothing,
     }
 }
 
@@ -923,9 +890,9 @@ async fn materialize_prepared_public_write<P>(
     backend: &dyn crate::LixBackend,
     projection_registry: &CatalogProjectionRegistry,
     pending_transaction_view: Option<&PendingTransactionView>,
-    public_write: &crate::sql::prepare::PreparedPublicWrite,
+    public_write: &PreparedPublicWrite,
     functions: SharedFunctionProvider<P>,
-) -> Result<crate::sql::prepare::PreparedPublicWrite, LixError>
+) -> Result<PreparedPublicWrite, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -980,9 +947,7 @@ where
         .as_ref()
         .expect("public write materialization requires a resolved write plan")
         .filesystem_state();
-    if let crate::sql::physical_plan::PreparedPublicWriteExecution::Materialize(materialization) =
-        &mut execution
-    {
+    if let PreparedPublicWriteExecution::Materialize(materialization) = &mut execution {
         finalize_public_write_execution(
             materialization,
             &public_write.planned_write,
@@ -990,25 +955,12 @@ where
         )?;
     }
 
-    let mut stage_timings = public_write.explain_plan.stage_timings.clone();
-    stage_timings.push(stage_timing(
-        ExplainStage::PhysicalPlanning,
-        physical_started.elapsed(),
-    ));
-
-    public_write.change_batches = change_batches.clone();
-    public_write.execution = execution.clone();
-    public_write.explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
-        request: public_write.explain_plan.request.clone(),
-        semantics: public_write.explain_plan.semantics.clone(),
-        planned_write: public_write.planned_write.clone(),
+    refresh_materialized_public_write_explain(
+        &mut public_write,
         execution,
         change_batches,
-        invariant_trace: Some(build_public_write_invariant_trace(
-            &public_write.planned_write,
-        )),
-        stage_timings,
-    });
+        physical_started.elapsed(),
+    );
 
     Ok(public_write)
 }

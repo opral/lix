@@ -24,6 +24,7 @@ pub(crate) use direct_reads::{
 };
 pub(crate) use plan::{
     InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
+    SurfaceReadPlan,
 };
 pub(crate) use result_contract::{result_contract_for_statements, ResultContract};
 pub(crate) use verify::verify_logical_plan;

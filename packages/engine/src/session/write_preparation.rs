@@ -26,10 +26,12 @@ use crate::session::write_pipeline::{
     PreparedWriteExecutionBoundary,
 };
 #[cfg(test)]
-use crate::sql::parser::parse_sql_with_timing;
+use crate::sql::parse_sql_with_timing;
 #[cfg(test)]
-use crate::sql::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};
-use crate::sql::prepare::{BoundStatementTemplateInstance, ExecutionProgram};
+use crate::sql::PlaceholderState;
+use crate::sql::{BoundStatementTemplateInstance, ExecutionProgram};
+#[cfg(test)]
+use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +158,7 @@ async fn execute_execution_program_with_buffered_write_scope(
         results.push(result);
     }
 
-    if crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(
+    if crate::sql::should_invalidate_installed_plugins_cache_for_statements(
         program.source_statements(),
     ) {
         write_transaction.mark_installed_plugins_cache_invalidation_pending();
@@ -448,7 +450,7 @@ fn bind_single_statement_template(
                 parsed_statements[0].clone(),
                 dialect,
                 params.len(),
-                crate::sql::parser::placeholders::PlaceholderState::new(),
+                PlaceholderState::new(),
             )?;
             context.cache_statement_template(cache_key, template.clone());
             template

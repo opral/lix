@@ -9,9 +9,9 @@ use crate::catalog::SurfaceRegistry;
 use crate::contracts::artifacts::{ExecuteOptions, SessionStateDelta};
 use crate::execution::write::BufferedWriteExecutionInput;
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::sql::binder::RuntimeBindingValues;
+use crate::sql::RuntimeBindingValues;
 #[cfg(test)]
-use crate::sql::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};
+use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
 use crate::LixError;
 
 pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;

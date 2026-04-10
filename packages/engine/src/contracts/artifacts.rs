@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
+use crate::catalog::{SurfaceBinding, SurfaceReadFreshness};
 use crate::common::error::LixError;
 use crate::common::types::Value;
 use crate::contracts::transaction_mode::TransactionMode;
@@ -303,63 +303,6 @@ pub(crate) struct PendingViewOrderClause {
     pub(crate) descending: bool,
 }
 
-/// Public surface family currently served from `ReadTime` projection output.
-///
-/// Phase B of Plan 33 resolves the current version-surface ambiguity
-/// explicitly: the first projection-backed public serving cut targets the real
-/// builtin `lix_version` surface, not a stale `lix_version_by_version` alias.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub(crate) enum ReadTimeProjectionSurface {
-    LixVersion,
-    LixFile,
-    LixFileByVersion,
-    LixDirectory,
-    LixDirectoryByVersion,
-}
-
-#[allow(dead_code)]
-impl ReadTimeProjectionSurface {
-    pub(crate) fn from_public_name(public_name: &str) -> Option<Self> {
-        match public_name {
-            "lix_version" => Some(Self::LixVersion),
-            "lix_file" => Some(Self::LixFile),
-            "lix_file_by_version" => Some(Self::LixFileByVersion),
-            "lix_directory" => Some(Self::LixDirectory),
-            "lix_directory_by_version" => Some(Self::LixDirectoryByVersion),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn public_name(self) -> &'static str {
-        match self {
-            Self::LixVersion => "lix_version",
-            Self::LixFile => "lix_file",
-            Self::LixFileByVersion => "lix_file_by_version",
-            Self::LixDirectory => "lix_directory",
-            Self::LixDirectoryByVersion => "lix_directory_by_version",
-        }
-    }
-
-    pub(crate) fn surface_family(self) -> SurfaceFamily {
-        match self {
-            Self::LixVersion => SurfaceFamily::Admin,
-            Self::LixFile
-            | Self::LixFileByVersion
-            | Self::LixDirectory
-            | Self::LixDirectoryByVersion => SurfaceFamily::Filesystem,
-        }
-    }
-
-    pub(crate) fn surface_variant(self) -> SurfaceVariant {
-        match self {
-            Self::LixVersion => SurfaceVariant::Default,
-            Self::LixFile | Self::LixDirectory => SurfaceVariant::Default,
-            Self::LixFileByVersion | Self::LixDirectoryByVersion => SurfaceVariant::ByVersion,
-        }
-    }
-}
-
 /// Runtime-neutral query shape over rows derived from a `ReadTime` projection.
 ///
 /// This intentionally mirrors the first bounded serving cut for `lix_version`:
@@ -379,7 +322,7 @@ pub(crate) struct ReadTimeProjectionReadQuery {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ReadTimeProjectionRead {
-    pub(crate) surface: ReadTimeProjectionSurface,
+    pub(crate) surface_name: String,
     pub(crate) requested_version_id: Option<String>,
     pub(crate) query: ReadTimeProjectionReadQuery,
 }
@@ -705,12 +648,33 @@ impl PreparedDirectPublicRead {
 ///
 /// This intentionally stays on contract-owned DTOs. It does not depend on
 /// SQL AST, binder output, logical-plan IR, or executor-private wrapper types.
+/// Closed execution contract for compiler-selected derived-rowset reads.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedDerivedRowsetReadArtifact {
+    pub(crate) read: ReadTimeProjectionRead,
+}
+
+/// Closed execution contract for compiler-selected lowered read programs.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedGeneralProgramReadArtifact {
+    pub(crate) prepared_batch: PreparedBatch,
+}
+
+/// Closed execution contract for compiler-selected direct history reads.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct PreparedDirectHistoryReadArtifact {
+    pub(crate) plan: PreparedDirectPublicRead,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) enum PreparedPublicReadExecutionArtifact {
-    ReadTimeProjection(ReadTimeProjectionRead),
-    LoweredSql(PreparedBatch),
-    Direct(PreparedDirectPublicRead),
+    DerivedRowset(PreparedDerivedRowsetReadArtifact),
+    GeneralProgram(PreparedGeneralProgramReadArtifact),
+    DirectHistory(PreparedDirectHistoryReadArtifact),
 }
 
 /// Runtime-neutral prepared public-read package.
@@ -2208,36 +2172,33 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        FileHistoryRequest, PreparedBatch, PreparedDirectPublicRead, PreparedExplainMode,
+        FileHistoryRequest, PreparedBatch, PreparedDerivedRowsetReadArtifact,
+        PreparedDirectHistoryReadArtifact, PreparedDirectPublicRead, PreparedExplainMode,
         PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
         PreparedPublicReadArtifact, PreparedPublicReadContract,
         PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
         PreparedReadStep, PreparedStatement, ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext,
-        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ReadTimeProjectionSurface,
-        ResultContract,
+        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ResultContract,
     };
-    use crate::catalog::{SurfaceFamily, SurfaceReadFreshness, SurfaceVariant};
+    use crate::catalog::SurfaceReadFreshness;
     use crate::Value;
 
     #[test]
-    fn read_time_projection_surface_maps_only_real_lix_version_surface() {
-        let surface = ReadTimeProjectionSurface::from_public_name("lix_version")
-            .expect("lix_version should map to read-time projection surface");
+    fn read_time_projection_read_uses_catalog_owned_surface_name() {
+        let registry = crate::catalog::builtin_catalog_projection_registry();
+        let registration = registry
+            .registration_for_surface("lix_version")
+            .expect("lix_version should be catalog-declared");
 
-        assert_eq!(surface, ReadTimeProjectionSurface::LixVersion);
-        assert_eq!(surface.public_name(), "lix_version");
-        assert_eq!(surface.surface_family(), SurfaceFamily::Admin);
-        assert_eq!(surface.surface_variant(), SurfaceVariant::Default);
-        assert_eq!(
-            ReadTimeProjectionSurface::from_public_name("lix_version_by_version"),
-            None
-        );
+        let surfaces = registration.projection().surfaces();
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].public_name, "lix_version");
     }
 
     #[test]
     fn read_time_projection_read_keeps_query_shape_runtime_neutral() {
         let artifact = ReadTimeProjectionRead {
-            surface: ReadTimeProjectionSurface::LixVersion,
+            surface_name: "lix_version".into(),
             requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![super::PendingViewProjection::Column {
@@ -2256,7 +2217,7 @@ mod tests {
             },
         };
 
-        assert_eq!(artifact.surface.public_name(), "lix_version");
+        assert_eq!(artifact.surface_name, "lix_version");
         assert_eq!(artifact.query.projections.len(), 1);
         assert_eq!(artifact.query.filters.len(), 1);
         assert_eq!(artifact.query.order_by.len(), 1);
@@ -2274,26 +2235,28 @@ mod tests {
             freshness_contract: SurfaceReadFreshness::AllowsStaleProjection,
             surface_bindings: vec!["lix_version".into()],
             public_output_columns: None,
-            execution: PreparedPublicReadExecutionArtifact::ReadTimeProjection(
-                ReadTimeProjectionRead {
-                    surface: ReadTimeProjectionSurface::LixVersion,
-                    requested_version_id: None,
-                    query: ReadTimeProjectionReadQuery {
-                        projections: vec![super::PendingViewProjection::Column {
-                            source_column: "id".into(),
-                            output_column: "id".into(),
-                        }],
-                        filters: vec![],
-                        order_by: vec![],
-                        limit: None,
+            execution: PreparedPublicReadExecutionArtifact::DerivedRowset(
+                PreparedDerivedRowsetReadArtifact {
+                    read: ReadTimeProjectionRead {
+                        surface_name: "lix_version".into(),
+                        requested_version_id: None,
+                        query: ReadTimeProjectionReadQuery {
+                            projections: vec![super::PendingViewProjection::Column {
+                                source_column: "id".into(),
+                                output_column: "id".into(),
+                            }],
+                            filters: vec![],
+                            order_by: vec![],
+                            limit: None,
+                        },
                     },
                 },
             ),
         };
 
         match artifact.execution {
-            PreparedPublicReadExecutionArtifact::ReadTimeProjection(read) => {
-                assert_eq!(read.surface.public_name(), "lix_version");
+            PreparedPublicReadExecutionArtifact::DerivedRowset(artifact) => {
+                assert_eq!(artifact.read.surface_name, "lix_version");
             }
             _ => panic!("expected read-time projection execution artifact"),
         }
@@ -2360,19 +2323,23 @@ mod tests {
                 freshness_contract: SurfaceReadFreshness::RequiresFreshProjection,
                 surface_bindings: vec!["lix_file".into()],
                 public_output_columns: None,
-                execution: PreparedPublicReadExecutionArtifact::Direct(
-                    PreparedDirectPublicRead::FileHistory(PreparedFileHistoryDirectReadPlan {
-                        request: FileHistoryRequest::default(),
-                        predicates: Vec::new(),
-                        projections: Vec::new(),
-                        wildcard_projection: true,
-                        wildcard_columns: vec!["id".into()],
-                        sort_keys: Vec::new(),
-                        limit: None,
-                        offset: 0,
-                        aggregate: None,
-                        aggregate_output_name: None,
-                    }),
+                execution: PreparedPublicReadExecutionArtifact::DirectHistory(
+                    PreparedDirectHistoryReadArtifact {
+                        plan: PreparedDirectPublicRead::FileHistory(
+                            PreparedFileHistoryDirectReadPlan {
+                                request: FileHistoryRequest::default(),
+                                predicates: Vec::new(),
+                                projections: Vec::new(),
+                                wildcard_projection: true,
+                                wildcard_columns: vec!["id".into()],
+                                sort_keys: Vec::new(),
+                                limit: None,
+                                offset: 0,
+                                aggregate: None,
+                                aggregate_output_name: None,
+                            },
+                        ),
+                    },
                 ),
             }),
             diagnostic_context: ReadDiagnosticContext {
@@ -2417,8 +2384,10 @@ mod tests {
         assert_eq!(program.transaction_mode, crate::TransactionMode::Deferred);
         match &program.steps[0].artifact {
             PreparedReadArtifact::Public(public) => match &public.execution {
-                PreparedPublicReadExecutionArtifact::Direct(
-                    PreparedDirectPublicRead::FileHistory(_),
+                PreparedPublicReadExecutionArtifact::DirectHistory(
+                    PreparedDirectHistoryReadArtifact {
+                        plan: PreparedDirectPublicRead::FileHistory(_),
+                    },
                 ) => {
                     assert_eq!(public.surface_bindings, vec!["lix_file".to_string()]);
                 }

@@ -10,7 +10,7 @@ use crate::runtime::TransactionBackendAdapter;
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
-use crate::sql::parser::parse_sql;
+use crate::sql::parse_sql;
 use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 

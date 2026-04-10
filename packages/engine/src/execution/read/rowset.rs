@@ -26,7 +26,7 @@ fn execute_read_time_projection_rows(
 ) -> Result<QueryResult, LixError> {
     let mut rows = rows
         .into_iter()
-        .filter(|row| row.surface_name == artifact.surface.public_name())
+        .filter(|row| row.surface_name == artifact.surface_name)
         .filter(|row| {
             artifact
                 .query
@@ -252,7 +252,7 @@ mod tests {
     use crate::catalog::{bind_named_relation, RelationBindContext};
     use crate::contracts::artifacts::{
         PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
-        ReadTimeProjectionReadQuery, ReadTimeProjectionSurface, RowIdentity,
+        ReadTimeProjectionReadQuery, RowIdentity,
     };
     use crate::contracts::version_artifacts::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn executes_projection_filter_order_and_limit_over_supplied_rows() {
         let artifact = ReadTimeProjectionRead {
-            surface: ReadTimeProjectionSurface::LixVersion,
+            surface_name: "lix_version".into(),
             requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![
@@ -346,7 +346,7 @@ mod tests {
     #[test]
     fn counts_rows_after_filters_in_bounded_rowset_runtime() {
         let artifact = ReadTimeProjectionRead {
-            surface: ReadTimeProjectionSurface::LixVersion,
+            surface_name: "lix_version".into(),
             requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![PendingViewProjection::CountAll {
@@ -404,7 +404,7 @@ mod tests {
         .expect("version projection case should seed");
 
         let artifact = ReadTimeProjectionRead {
-            surface: ReadTimeProjectionSurface::LixVersion,
+            surface_name: "lix_version".into(),
             requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![
@@ -487,7 +487,7 @@ mod tests {
         .expect("version projection case should seed");
 
         let artifact = ReadTimeProjectionRead {
-            surface: ReadTimeProjectionSurface::LixVersion,
+            surface_name: "lix_version".into(),
             requested_version_id: None,
             query: ReadTimeProjectionReadQuery {
                 projections: vec![PendingViewProjection::CountAll {

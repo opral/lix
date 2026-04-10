@@ -14,9 +14,9 @@ use crate::contracts::artifacts::PreparedPublicReadArtifact;
 use crate::contracts::traits::{PendingView, SqlPreparationMetadataReader};
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
 use crate::session::version_ops::load_version_head_commit_map_with_executor;
-use crate::sql::prepare::{
-    load_sql_compiler_metadata, prepare_public_read_artifact,
-    try_prepare_public_read_with_registry_and_internal_access, SqlCompilerMetadata,
+use crate::sql::{
+    load_sql_compiler_metadata, prepare_public_read, prepare_public_read_artifact,
+    SqlCompilerMetadata,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -71,7 +71,7 @@ async fn prepare_required_active_public_read_artifact_with_reader(
     let active_history_root_commit_id = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;
-    let prepared = try_prepare_public_read_with_registry_and_internal_access(
+    let prepared = prepare_public_read(
         dialect,
         &collaborators.registry,
         &collaborators.compiler_metadata,

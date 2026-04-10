@@ -2,9 +2,8 @@ use crate::common::errors;
 use crate::common::wire::WireValue;
 use crate::contracts::artifacts::SessionDependency;
 use crate::session::Session;
-use crate::sql::parser::parse_sql_statements;
-use crate::sql::prepare::dependency_spec::{
-    dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
+use crate::sql::{
+    dependency_spec_to_state_commit_stream_filter, derive_dependency_spec, parse_sql_statements,
 };
 use crate::streams::StateCommitStream;
 use crate::{LixError, QueryResult, Value};
@@ -765,7 +764,7 @@ fn build_shared_observe_source(
         });
     }
 
-    let dependency_spec = derive_dependency_spec_from_statements(&statements, &query.params)?;
+    let dependency_spec = derive_dependency_spec(&statements, &query.params)?;
     let filter = dependency_spec_to_state_commit_stream_filter(&dependency_spec);
     let writer_key_filter = ObserveWriterKeyFilter {
         include: filter.writer_keys.iter().cloned().collect(),

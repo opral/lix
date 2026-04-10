@@ -17,9 +17,9 @@ use crate::session::read_preparation::{
 };
 use crate::session::state_selector::try_resolve_state_selector_rows_with_backend;
 use crate::session::write_resolution::{WriteResolveError, WriteSelectorResolver};
-use crate::sql::logical_plan::public_ir::{CanonicalStateRowKey, PlannedWrite, ScopeProof};
-use crate::sql::semantic_ir::semantics::surface_semantics::{
-    public_selector_column_name, public_selector_version_column,
+use crate::sql::{
+    public_selector_column_name, public_selector_version_column, CanonicalStateRowKey,
+    PlannedWrite, ScopeProof,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 

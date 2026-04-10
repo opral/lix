@@ -7,18 +7,16 @@ use crate::catalog::{
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::common::errors::schema_not_registered_error;
-use crate::contracts::artifacts::EffectiveStateRequest;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract,
     ReadPlan, StructuredPublicRead,
 };
 use crate::sql::logical_plan::{
     DependencySpec, DirectPublicReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
+    SurfaceReadPlan,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
-use crate::sql::semantic_ir::semantics::effective_state_resolver::{
-    build_effective_state, EffectiveStatePlan,
-};
+use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
 use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAnalysisError};
 use crate::LixError;
 use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, TableFactor};
@@ -28,9 +26,7 @@ use std::collections::BTreeSet;
 pub(crate) struct PublicReadSemantics {
     pub(crate) surface_bindings: Vec<SurfaceBinding>,
     pub(crate) broad_statement: Option<Box<BroadPublicReadStatement>>,
-    pub(crate) structured_read: Option<StructuredPublicRead>,
-    pub(crate) effective_state_request: Option<EffectiveStateRequest>,
-    pub(crate) effective_state_plan: Option<EffectiveStatePlan>,
+    pub(crate) surface_read_plan: Option<SurfaceReadPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,19 +42,16 @@ pub(crate) enum StructuredPublicReadPreparation {
 }
 
 impl StructuredPublicReadAnalysis {
-    pub(crate) fn structured_read(&self) -> &StructuredPublicRead {
+    pub(crate) fn surface_read_plan(&self) -> &SurfaceReadPlan {
         self.semantics
-            .structured_read
+            .surface_read_plan
             .as_ref()
-            .expect("structured public read analysis always has a structured read")
+            .expect("structured public read analysis always has a surface read plan")
     }
 
     pub(crate) fn logical_plan(&self) -> PublicReadLogicalPlan {
         PublicReadLogicalPlan::Structured {
-            read: self.structured_read().clone(),
-            dependency_spec: self.dependency_spec.clone(),
-            effective_state_request: self.semantics.effective_state_request.clone(),
-            effective_state_plan: self.semantics.effective_state_plan.clone(),
+            plan: self.surface_read_plan().clone(),
         }
     }
 
@@ -67,11 +60,8 @@ impl StructuredPublicReadAnalysis {
         direct_plan: DirectPublicReadPlan,
     ) -> PublicReadLogicalPlan {
         PublicReadLogicalPlan::DirectHistory {
-            read: self.structured_read().clone(),
+            plan: self.surface_read_plan().clone(),
             direct_plan,
-            dependency_spec: self.dependency_spec.clone(),
-            effective_state_request: self.semantics.effective_state_request.clone(),
-            effective_state_plan: self.semantics.effective_state_plan.clone(),
         }
     }
 }
@@ -119,6 +109,12 @@ pub(crate) async fn prepare_structured_public_read_analysis(
         }
     }
     let effective_state = build_effective_state(&structured_read, dependency_spec.as_ref());
+    let surface_read_plan = SurfaceReadPlan {
+        read: structured_read.clone(),
+        dependency_spec: dependency_spec.clone(),
+        effective_state_request: effective_state.as_ref().map(|(request, _)| request.clone()),
+        effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
+    };
 
     Ok(StructuredPublicReadPreparation::Prepared(
         StructuredPublicReadAnalysis {
@@ -126,11 +122,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
             semantics: PublicReadSemantics {
                 surface_bindings: vec![structured_read.surface_binding.clone()],
                 broad_statement: None,
-                structured_read: Some(structured_read),
-                effective_state_request: effective_state
-                    .as_ref()
-                    .map(|(request, _)| request.clone()),
-                effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
+                surface_read_plan: Some(surface_read_plan),
             },
             dependency_spec,
         },

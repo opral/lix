@@ -28,9 +28,9 @@ pub(crate) use runtime::{
     advance_placeholder_state_for_statement_ast, is_transaction_control_statement,
 };
 pub(crate) use runtime::{
-    bind_sql, bind_sql_with_state, bind_sql_with_state_and_appended_params,
-    bind_statement_binding_template, compile_statement_binding_template_with_state,
-    insert_values_rows_mut, RuntimeBindingValues, StatementBindingTemplate,
+    bind_sql_with_state, bind_sql_with_state_and_appended_params, bind_statement_binding_template,
+    compile_statement_binding_template_with_state, insert_values_rows_mut, RuntimeBindingValues,
+    StatementBindingTemplate,
 };
 
 pub(crate) fn bind_statement(

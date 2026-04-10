@@ -11,7 +11,7 @@ use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
 use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::session::SessionWriteSelectorResolver;
-use crate::sql::logical_plan::public_ir::{PlannedWrite, ResolvedWritePlan};
+use crate::sql::{PlannedWrite, ResolvedWritePlan};
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
@@ -253,21 +253,19 @@ impl crate::execution::read::ReadExecutionBindings for BuiltinReadExecutionBindi
         backend: &dyn LixBackend,
         artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
     ) -> Result<Vec<crate::execution::read::ReadTimeProjectionRow>, LixError> {
-        Ok(
-            crate::live_state::projection::dispatch::derive_read_time_projection_rows_with_backend(
-                backend,
-                crate::catalog::builtin_catalog_projection_registry(),
-                artifact,
-            )
-            .await?
-            .into_iter()
-            .map(|row| crate::execution::read::ReadTimeProjectionRow {
-                surface_name: row.surface_name,
-                identity: row.identity,
-                values: row.values,
-            })
-            .collect(),
+        Ok(crate::live_state::derive_read_time_surface_rows(
+            backend,
+            crate::catalog::builtin_catalog_projection_registry(),
+            artifact,
         )
+        .await?
+        .into_iter()
+        .map(|row| crate::execution::read::ReadTimeProjectionRow {
+            surface_name: row.surface_name,
+            identity: row.identity,
+            values: row.values,
+        })
+        .collect())
     }
 }
 
