@@ -7,7 +7,7 @@
 //! Post-Plan-20 dependency rules:
 //!
 //! - compiler-core SQL may depend on owner-owned contracts from
-//!   `canonical/read/*`, `version_state/*`, `session/version_ops/*`,
+//!   `canonical/read/*`, `session/version_ops/*`,
 //!   root-level `live_state`, and `live_state::writer_key::*` where
 //!   row-serving writer-key facts are required
 //! - compiler-core SQL must not depend on `commit/*`

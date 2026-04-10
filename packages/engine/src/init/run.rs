@@ -12,11 +12,11 @@ use crate::live_state::{
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::runtime::TransactionBackendAdapter;
+use crate::session::checkpoint_ops;
 use crate::session::observe;
 use crate::session::version_ops;
 use crate::session::version_ops::commit;
 use crate::session::workspace;
-use crate::version_state;
 use crate::{LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;
@@ -59,11 +59,9 @@ pub(crate) async fn init(engine: &Engine) -> Result<(), LixError> {
             observe::init(&backend)
                 .await
                 .map_err(|error| init_step_error("observe::init", error))?;
-            version_state::checkpoints::cache::init(&backend)
+            checkpoint_ops::init(&backend)
                 .await
-                .map_err(|error| {
-                    init_step_error("version_state::checkpoints::cache::init", error)
-                })?;
+                .map_err(|error| init_step_error("session::checkpoint_ops::init", error))?;
             version_ops::init(&backend)
                 .await
                 .map_err(|error| init_step_error("session::version_ops::init", error))?;

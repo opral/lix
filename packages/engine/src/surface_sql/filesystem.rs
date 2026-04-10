@@ -2,9 +2,10 @@ use crate::binary_cas::schema::INTERNAL_BINARY_BLOB_STORE;
 use crate::common::naming::tracked_relation_name;
 use crate::common::text::escape_sql_string;
 use crate::contracts::artifacts::FilesystemProjectionScope;
+use crate::contracts::version_artifacts::version_descriptor_schema_key;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::{payload_column_name_for_schema, WRITER_KEY_TABLE};
 use crate::sql::physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;
-use crate::version_state::{version_descriptor_schema_key, GLOBAL_VERSION_ID};
 use crate::{LixError, SqlDialect};
 
 pub(crate) const LIVE_FILE_PREFETCH_BLOB_HASH_COLUMN: &str = "__lix_blob_hash";

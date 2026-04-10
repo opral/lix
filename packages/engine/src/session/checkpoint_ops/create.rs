@@ -4,8 +4,8 @@ use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::super::version_ops::context::require_target_version_context_in_transaction;
@@ -65,7 +65,7 @@ async fn create_checkpoint_in_transaction(
         ensure_checkpoint_label_on_commit(tx, &global_commit_id).await?;
     }
     // Keep the derived checkpoint-history cache warm for the active version.
-    crate::version_state::checkpoints::cache::upsert_last_checkpoint_for_version_in_transaction(
+    crate::session::checkpoint_ops::cache::upsert_last_checkpoint_for_version_in_transaction(
         tx.backend_transaction_mut()?,
         &version_id,
         &local_commit_id,
@@ -73,7 +73,7 @@ async fn create_checkpoint_in_transaction(
     .await?;
     // The global lane mirrors the same derived cache contract and remains
     // rebuildable from canonical heads plus canonical checkpoint labels.
-    crate::version_state::checkpoints::cache::upsert_last_checkpoint_for_version_in_transaction(
+    crate::session::checkpoint_ops::cache::upsert_last_checkpoint_for_version_in_transaction(
         tx.backend_transaction_mut()?,
         GLOBAL_VERSION_ID,
         &global_commit_id,

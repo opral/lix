@@ -4,6 +4,7 @@ use crate::common::paths::filesystem::{
 };
 use crate::contracts::artifacts::FilesystemProjectionScope;
 use crate::contracts::traits::PendingView;
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::execution::write::filesystem::query::{
     load_directory_descriptors_by_parent_name_pairs,
     load_file_descriptors_by_directory_name_extension_triplets,
@@ -14,7 +15,6 @@ use crate::execution::write::filesystem::query::{
 use crate::session::write_resolution::prepared_artifacts::{
     DirectoryInsertAssignments, FileInsertAssignments,
 };
-use crate::version_state::GLOBAL_VERSION_ID;
 use crate::LixBackend;
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -110,7 +110,7 @@ fn non_canonical_internal_exact_relation_names() -> &'static [&'static str] {
         crate::live_state::FILE_DATA_CACHE_TABLE,
         crate::live_state::FILE_LIXCOL_CACHE_TABLE,
         crate::live_state::FILE_PATH_CACHE_TABLE,
-        crate::version_state::checkpoints::cache::LAST_CHECKPOINT_TABLE,
+        crate::session::checkpoint_ops::cache::LAST_CHECKPOINT_TABLE,
         crate::live_state::LIVE_STATE_STATUS_TABLE,
         crate::session::observe::OBSERVE_TICK_TABLE,
         crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE,

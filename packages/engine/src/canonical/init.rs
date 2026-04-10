@@ -1,10 +1,11 @@
 use crate::backend::ddl::execute_ddl_batch;
+use crate::contracts::version_artifacts::{
+    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+    version_descriptor_schema_version, version_descriptor_snapshot_content,
+};
+use crate::contracts::GLOBAL_VERSION_ID;
 use crate::init::seed::read_scalar_count;
 use crate::init::InitExecutor;
-use crate::version_state::{
-    version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-    version_descriptor_schema_version, version_descriptor_snapshot_content, GLOBAL_VERSION_ID,
-};
 use crate::Value;
 use crate::{LixBackend, LixError};
 

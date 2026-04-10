@@ -1,13 +1,13 @@
-//! Replica-local root resolution over committed version-head state.
+//! Session-owned root resolution over committed version-head state.
 //!
 //! This module maps requested lineage scopes and version scopes onto the local
-//! committed heads selected by `version_state/heads.rs`.
+//! committed heads selected by session-owned version-head helpers.
 
 use crate::backend::QueryExecutor;
 use crate::{LixBackend, LixError};
 
-use super::heads::{
-    load_all_committed_version_refs_with_executor, load_committed_version_ref_with_executor,
+use super::{
+    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,15 +107,13 @@ async fn load_scoped_root_version_refs_with_executor(
         Some(version_ids) => {
             let mut rows = Vec::new();
             for version_id in version_ids {
-                if let Some(row) =
-                    load_committed_version_ref_with_executor(executor, version_id).await?
+                if let Some(commit_id) =
+                    load_version_head_commit_id_with_executor(executor, version_id).await?
                 {
-                    if !row.commit_id.is_empty() {
-                        rows.push(ResolvedRootCommit {
-                            commit_id: row.commit_id,
-                            version_id: row.version_id,
-                        });
-                    }
+                    rows.push(ResolvedRootCommit {
+                        commit_id,
+                        version_id: version_id.clone(),
+                    });
                 }
             }
             rows
@@ -133,12 +131,13 @@ async fn load_scoped_root_version_refs_with_executor(
 async fn load_all_root_version_refs_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<ResolvedRootCommit>, LixError> {
-    Ok(load_all_committed_version_refs_with_executor(executor)
+    Ok(load_version_head_commit_map_with_executor(executor)
         .await?
+        .unwrap_or_default()
         .into_iter()
-        .map(|row| ResolvedRootCommit {
-            commit_id: row.commit_id,
-            version_id: row.version_id,
+        .map(|(version_id, commit_id)| ResolvedRootCommit {
+            commit_id,
+            version_id,
         })
         .collect())
 }
@@ -265,12 +264,12 @@ mod tests {
             },
             vec![
                 ResolvedRootCommit {
-                    commit_id: "commit-main".to_string(),
-                    version_id: "main".to_string(),
-                },
-                ResolvedRootCommit {
                     commit_id: "commit-feature".to_string(),
                     version_id: "feature".to_string(),
+                },
+                ResolvedRootCommit {
+                    commit_id: "commit-main".to_string(),
+                    version_id: "main".to_string(),
                 },
             ],
         );
@@ -279,26 +278,27 @@ mod tests {
             facts.traversal,
             HistoryRootTraversal::ResolvedRootCommits(vec![
                 ResolvedRootCommit {
-                    commit_id: "commit-main".to_string(),
-                    version_id: "main".to_string(),
-                },
-                ResolvedRootCommit {
                     commit_id: "commit-feature".to_string(),
                     version_id: "feature".to_string(),
+                },
+                ResolvedRootCommit {
+                    commit_id: "commit-main".to_string(),
+                    version_id: "main".to_string(),
                 },
             ])
         );
     }
 
     #[test]
-    fn explicit_requested_roots_keep_requested_ids_and_version_ref_mapping() {
+    fn active_version_requested_roots_keep_requested_ids_for_any_version_scope() {
         let facts = build_history_root_facts(
             RootCommitResolutionRequest {
                 lineage_scope: RootLineageScope::ActiveVersion,
                 active_version_id: Some("main"),
                 root_scope: RootCommitScope::RequestedRoots(&[
-                    "commit-feature".to_string(),
-                    "commit-main".to_string(),
+                    "commit-z".to_string(),
+                    "commit-a".to_string(),
+                    "commit-z".to_string(),
                 ]),
                 version_scope: RootVersionScope::Any,
             },
@@ -311,8 +311,8 @@ mod tests {
         assert_eq!(
             facts.traversal,
             HistoryRootTraversal::RequestedRootCommitIds(vec![
-                "commit-feature".to_string(),
-                "commit-main".to_string(),
+                "commit-a".to_string(),
+                "commit-z".to_string(),
             ])
         );
         assert_eq!(
@@ -325,7 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn explicit_roots_with_requested_versions_intersect_with_scoped_version_refs() {
+    fn requested_versions_and_roots_intersect_resolved_root_commits() {
         let facts = build_history_root_facts(
             RootCommitResolutionRequest {
                 lineage_scope: RootLineageScope::Standard,
