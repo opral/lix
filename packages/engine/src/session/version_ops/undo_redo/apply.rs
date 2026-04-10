@@ -1,10 +1,9 @@
 use std::collections::BTreeMap;
 
-use crate::canonical::read::{
-    load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    load_exact_committed_state_row_from_commit_with_executor, CommitLineageEntry,
-    CommitQueryExecutor, CommittedCanonicalChangeRow, ExactCommittedStateRow,
-    ExactCommittedStateRowRequest,
+use crate::backend::QueryExecutor;
+use crate::canonical::{
+    load_change, load_commit, load_exact_row_at_commit, CanonicalChange, CanonicalStateIdentity,
+    CanonicalStateRow,
 };
 use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::execution_state::ExecutionRuntimeState;
@@ -62,8 +61,8 @@ struct SemanticUndoRedoStacks {
 
 #[derive(Debug, Clone, PartialEq)]
 struct TargetCommitChangeEffect {
-    forward_change: CommittedCanonicalChangeRow,
-    previous_row: Option<ExactCommittedStateRow>,
+    forward_change: CanonicalChange,
+    previous_row: Option<CanonicalStateRow>,
     forward_operation: StateCommitStreamOperation,
 }
 
@@ -593,14 +592,14 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
 async fn load_linear_commit_lineage<E>(
     executor: &mut E,
     head_commit_id: &str,
-) -> Result<Vec<CommitLineageEntry>, LixError>
+) -> Result<Vec<crate::canonical::CanonicalCommit>, LixError>
 where
-    E: CommitQueryExecutor,
+    E: QueryExecutor,
 {
     let mut lineage = Vec::new();
     let mut current_commit_id = Some(head_commit_id.to_string());
     while let Some(commit_id) = current_commit_id.take() {
-        let Some(commit) = load_commit_lineage_entry_by_id(executor, &commit_id).await? else {
+        let Some(commit) = load_commit(executor, &commit_id).await? else {
             return Err(LixError::unknown(format!(
                 "commit '{}' is missing from lineage lookup",
                 commit_id
@@ -622,13 +621,11 @@ where
 
 async fn load_target_commit_change_effects(
     transaction: &mut dyn LixBackendTransaction,
-    version_id: &str,
+    _version_id: &str,
     target_commit_id: &str,
 ) -> Result<Vec<TargetCommitChangeEffect>, LixError> {
     let mut executor = TransactionBackendAdapter::new(transaction);
-    let Some(target_commit) =
-        load_commit_lineage_entry_by_id(&mut executor, target_commit_id).await?
-    else {
+    let Some(target_commit) = load_commit(&mut executor, target_commit_id).await? else {
         return Err(LixError::unknown(format!(
             "target commit '{}' is missing",
             target_commit_id
@@ -645,40 +642,19 @@ async fn load_target_commit_change_effects(
 
     let mut effects = Vec::with_capacity(target_commit.change_ids.len());
     for change_id in &target_commit.change_ids {
-        let Some(forward_change) =
-            load_canonical_change_row_by_id(&mut executor, change_id).await?
-        else {
+        let Some(forward_change) = load_change(&mut executor, change_id).await? else {
             return Err(LixError::unknown(format!(
                 "target commit '{}' references missing change '{}'",
                 target_commit_id, change_id
             )));
         };
         let previous_row = if let Some(parent_commit_id) = parent_commit_id.as_deref() {
-            let request = ExactCommittedStateRowRequest {
+            let identity = CanonicalStateIdentity {
                 entity_id: forward_change.entity_id.clone(),
                 schema_key: forward_change.schema_key.clone(),
-                version_id: version_id.to_string(),
-                exact_filters: BTreeMap::from([
-                    (
-                        "file_id".to_string(),
-                        Value::Text(forward_change.file_id.clone()),
-                    ),
-                    (
-                        "plugin_key".to_string(),
-                        Value::Text(forward_change.plugin_key.clone()),
-                    ),
-                    (
-                        "schema_version".to_string(),
-                        Value::Text(forward_change.schema_version.clone()),
-                    ),
-                ]),
+                file_id: forward_change.file_id.clone(),
             };
-            load_exact_committed_state_row_from_commit_with_executor(
-                &mut executor,
-                parent_commit_id,
-                &request,
-            )
-            .await?
+            load_exact_row_at_commit(&mut executor, parent_commit_id, &identity).await?
         } else {
             None
         };
@@ -695,7 +671,7 @@ async fn load_target_commit_change_effects(
 
 fn build_forward_proposed_change(
     version_id: &str,
-    change: &CommittedCanonicalChangeRow,
+    change: &CanonicalChange,
 ) -> Result<StagedChange, LixError> {
     Ok(StagedChange {
         id: None,
@@ -723,14 +699,14 @@ fn build_forward_proposed_change(
 
 fn build_restore_proposed_change(
     version_id: &str,
-    row: &ExactCommittedStateRow,
+    row: &CanonicalStateRow,
 ) -> Result<StagedChange, LixError> {
     Ok(StagedChange {
         id: None,
         entity_id: require_identity(row.entity_id.clone(), "undo restore entity_id")?,
         schema_key: require_identity(row.schema_key.clone(), "undo restore schema_key")?,
         schema_version: Some(require_identity(
-            required_snapshot_text(row.values.get("schema_version"), "schema_version")?,
+            row.schema_version.clone(),
             "undo restore schema_version",
         )?),
         file_id: Some(require_identity(
@@ -738,17 +714,11 @@ fn build_restore_proposed_change(
             "undo restore file_id",
         )?),
         plugin_key: Some(require_identity(
-            required_snapshot_text(row.values.get("plugin_key"), "plugin_key")?,
+            row.plugin_key.clone(),
             "undo restore plugin_key",
         )?),
-        snapshot_content: Some(required_snapshot_text(
-            row.values.get("snapshot_content"),
-            "snapshot_content",
-        )?),
-        metadata: row
-            .values
-            .get("metadata")
-            .and_then(|value| value_as_text(Some(value))),
+        snapshot_content: Some(row.snapshot_content.clone()),
+        metadata: row.metadata.clone(),
         version_id: require_identity(version_id.to_string(), "undo restore version_id")?,
         writer_key: None,
         created_at: None,
@@ -757,7 +727,7 @@ fn build_restore_proposed_change(
 
 fn build_tombstone_proposed_change(
     version_id: &str,
-    change: &CommittedCanonicalChangeRow,
+    change: &CanonicalChange,
 ) -> Result<StagedChange, LixError> {
     Ok(StagedChange {
         id: None,
@@ -785,8 +755,8 @@ fn build_tombstone_proposed_change(
 
 fn classify_forward_operation(
     target_commit_id: &str,
-    change: &CommittedCanonicalChangeRow,
-    previous_row: Option<&ExactCommittedStateRow>,
+    change: &CanonicalChange,
+    previous_row: Option<&CanonicalStateRow>,
 ) -> Result<StateCommitStreamOperation, LixError> {
     match (previous_row.is_some(), change.snapshot_content.is_some()) {
         (false, true) => Ok(StateCommitStreamOperation::Insert),
@@ -797,10 +767,6 @@ fn classify_forward_operation(
             target_commit_id, change.id
         ))),
     }
-}
-
-fn required_snapshot_text(value: Option<&Value>, field: &str) -> Result<String, LixError> {
-    value_as_text(value).ok_or_else(|| LixError::unknown(format!("missing {field}")))
 }
 
 fn require_identity<T>(value: impl Into<String>, context: &str) -> Result<T, LixError>
@@ -814,14 +780,4 @@ where
             value
         ))
     })
-}
-
-fn value_as_text(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::Text(value)) => Some(value.clone()),
-        Some(Value::Integer(value)) => Some(value.to_string()),
-        Some(Value::Boolean(value)) => Some(value.to_string()),
-        Some(Value::Real(value)) => Some(value.to_string()),
-        _ => None,
-    }
 }

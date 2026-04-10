@@ -1,14 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::backend::QueryExecutor;
 use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
-use crate::canonical::graph::{
-    build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
-};
-use crate::canonical::journal::{
-    build_prepared_batch_from_canonical_output, CanonicalCommitOutput,
-};
-use crate::canonical::json::CanonicalJson;
-use crate::canonical::read::{CommitQueryExecutor, ExactCommittedStateRowRequest};
+use crate::canonical::{append_changes, CanonicalChangeWrite, CanonicalStateIdentity};
 use crate::contracts::artifacts::{MutationRow, OptionalTextPatch};
 use crate::contracts::functions::LixFunctionProvider;
 use crate::execution::write::filesystem::runtime::{
@@ -16,21 +10,23 @@ use crate::execution::write::filesystem::runtime::{
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
     FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
-    FILESYSTEM_DESCRIPTOR_PLUGIN_KEY, FILESYSTEM_FILE_SCHEMA_KEY, FILESYSTEM_FILE_SCHEMA_VERSION,
+    FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::execution::write::transaction::execute_write_program_with_transaction;
 use crate::runtime::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
 };
 use crate::session::version_ops::{
-    load_exact_committed_state_row_at_version_head_with_executor, load_version_info_for_versions,
+    load_exact_canonical_row_at_version_head_with_executor, load_version_info_for_versions,
     VersionInfo, VersionSnapshot,
 };
 use crate::version_state::{
     load_committed_version_head_commit_id, version_ref_snapshot_content, GLOBAL_VERSION_ID,
 };
 use crate::SqlDialect;
-use crate::{CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{
+    CanonicalJson, CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value,
+};
 use async_trait::async_trait;
 
 use super::generate::generate_commit;
@@ -128,7 +124,7 @@ pub(crate) struct OperationalCommitApplyInput {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreateCommitAppliedOutput {
-    pub(crate) canonical_output: CanonicalCommitOutput,
+    pub(crate) canonical_changes: Vec<CanonicalChangeWrite>,
     pub(crate) operational_apply_input: OperationalCommitApplyInput,
     pub(crate) pending_public_commit_seed: Option<PendingPublicCommitSeed>,
 }
@@ -376,19 +372,14 @@ pub(crate) async fn create_commit(
     )
     .map_err(backend_error)?;
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
-    let canonical_output = generated_commit.canonical_output;
+    let canonical_changes = generated_commit.canonical_changes;
     let updated_version_refs = generated_commit.updated_version_refs;
     let receipt = build_canonical_commit_receipt(
         committed_head.clone(),
-        &canonical_output,
+        &canonical_changes,
         &updated_version_refs,
         &affected_versions.iter().cloned().collect::<Vec<_>>(),
     )?;
-    let mut executor = &mut *transaction;
-    let commit_graph_rows =
-        resolve_commit_graph_node_write_rows_with_executor(&mut executor, &canonical_output)
-            .await
-            .map_err(backend_error)?;
     let idempotency_write = CommitIdempotencyWrite {
         write_lane: lane_storage_key(&concrete_lane),
         idempotency_key: resolved_idempotency.legacy_key.clone(),
@@ -401,37 +392,32 @@ pub(crate) async fn create_commit(
     let observe_tick = args.should_emit_observe_tick.then(|| ObserveTickWrite {
         writer_key: args.observe_tick_writer_key.clone(),
     });
-    let pending_public_commit_seed = build_pending_public_commit_seed(&canonical_output)?;
-    let mut prepared_batch = build_prepared_batch_from_canonical_output(
-        &canonical_output,
-        functions,
-        transaction.dialect(),
-    )
-    .map_err(backend_error)?;
+    let pending_public_commit_seed = build_pending_public_commit_seed(&canonical_changes)?;
+    append_changes(transaction, &canonical_changes, functions)
+        .await
+        .map_err(backend_error)?;
     let deterministic_sequence_highest_seen =
         functions.deterministic_sequence_persist_highest_seen();
-    prepared_batch.extend(
-        build_commit_graph_node_prepared_batch(&commit_graph_rows, transaction.dialect())
-            .map_err(backend_error)?,
-    );
-    prepared_batch.append_sql(insert_idempotency_row_sql(&idempotency_write));
+    let mut write_program = crate::backend::program::WriteProgram::new();
+    write_program.push_statement(insert_idempotency_row_sql(&idempotency_write), Vec::new());
     if let Some(highest_seen) = deterministic_sequence_highest_seen {
-        prepared_batch.append_sql(build_ensure_runtime_sequence_row_sql(
-            highest_seen,
-            transaction.dialect(),
-        ));
-        prepared_batch.append_sql(build_update_runtime_sequence_highest_sql(
-            highest_seen,
-            transaction.dialect(),
-        ));
+        write_program.push_statement(
+            build_ensure_runtime_sequence_row_sql(highest_seen, transaction.dialect()),
+            Vec::new(),
+        );
+        write_program.push_statement(
+            build_update_runtime_sequence_highest_sql(highest_seen, transaction.dialect()),
+            Vec::new(),
+        );
     }
     if let Some(observe_tick) = observe_tick.as_ref() {
-        prepared_batch.append_sql(build_observe_tick_insert_sql(
-            observe_tick.writer_key.as_deref(),
-        ));
+        write_program.push_statement(
+            build_observe_tick_insert_sql(observe_tick.writer_key.as_deref()),
+            Vec::new(),
+        );
     }
     let applied_output = CreateCommitAppliedOutput {
-        canonical_output,
+        canonical_changes,
         operational_apply_input: OperationalCommitApplyInput {
             idempotency_write,
             deterministic_sequence_highest_seen,
@@ -454,10 +440,10 @@ pub(crate) async fn create_commit(
             data: payload.data,
         })
         .collect::<Vec<_>>();
-    let mut write_program =
+    write_program.extend(
         build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)
-            .map_err(backend_error)?;
-    write_program.push_batch(prepared_batch);
+            .map_err(backend_error)?,
+    );
     execute_write_program_with_transaction(transaction, write_program)
         .await
         .map_err(backend_error)?;
@@ -471,10 +457,9 @@ pub(crate) async fn create_commit(
 }
 
 fn build_pending_public_commit_seed(
-    canonical_output: &CanonicalCommitOutput,
+    canonical_changes: &[CanonicalChangeWrite],
 ) -> Result<Option<PendingPublicCommitSeed>, CreateCommitError> {
-    let Some(commit_row) = canonical_output
-        .changes
+    let Some(commit_row) = canonical_changes
         .iter()
         .find(|row| row.schema_key == "lix_commit")
     else {
@@ -501,8 +486,7 @@ fn build_pending_public_commit_seed(
             kind: CreateCommitErrorKind::Internal,
             message: "public commit seed snapshot is missing change_set_id".to_string(),
         })?;
-    let commit_change_id = canonical_output
-        .changes
+    let commit_change_id = canonical_changes
         .iter()
         .find(|row| row.schema_key == "lix_commit" && row.entity_id == commit_row.entity_id)
         .map(|row| row.id.clone())
@@ -542,7 +526,7 @@ struct TransactionCommitExecutor<'a> {
 }
 
 #[async_trait(?Send)]
-impl CommitQueryExecutor for TransactionCommitExecutor<'_> {
+impl QueryExecutor for TransactionCommitExecutor<'_> {
     fn dialect(&self) -> SqlDialect {
         self.transaction.dialect()
     }
@@ -606,7 +590,7 @@ fn resolve_staged_changes(
 }
 
 async fn normalize_staged_changes(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     changes: &[StagedChange],
 ) -> Result<Vec<StagedChange>, CreateCommitError> {
     let mut normalized = Vec::with_capacity(changes.len());
@@ -620,35 +604,25 @@ async fn normalize_staged_changes(
 }
 
 async fn staged_change_is_noop(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     change: &StagedChange,
 ) -> Result<bool, CreateCommitError> {
     let Some(file_id) = change.file_id.clone() else {
         return Ok(false);
     };
-    let Some(plugin_key) = change.plugin_key.clone() else {
+    let Some(_plugin_key) = change.plugin_key.clone() else {
         return Ok(false);
     };
-    let Some(schema_version) = change.schema_version.clone() else {
+    let Some(_schema_version) = change.schema_version.clone() else {
         return Ok(false);
     };
-    let current = load_exact_committed_state_row_at_version_head_with_executor(
+    let current = load_exact_canonical_row_at_version_head_with_executor(
         executor,
-        &ExactCommittedStateRowRequest {
+        change.version_id.as_str(),
+        &CanonicalStateIdentity {
             entity_id: change.entity_id.to_string(),
             schema_key: change.schema_key.to_string(),
-            version_id: change.version_id.to_string(),
-            exact_filters: BTreeMap::from([
-                ("file_id".to_string(), Value::Text(file_id.to_string())),
-                (
-                    "plugin_key".to_string(),
-                    Value::Text(plugin_key.to_string()),
-                ),
-                (
-                    "schema_version".to_string(),
-                    Value::Text(schema_version.to_string()),
-                ),
-            ]),
+            file_id: file_id.to_string(),
         },
     )
     .await
@@ -663,23 +637,13 @@ async fn staged_change_is_noop(
                 return Ok(true);
             }
 
-            let global_current = load_exact_committed_state_row_at_version_head_with_executor(
+            let global_current = load_exact_canonical_row_at_version_head_with_executor(
                 executor,
-                &ExactCommittedStateRowRequest {
+                GLOBAL_VERSION_ID,
+                &CanonicalStateIdentity {
                     entity_id: change.entity_id.to_string(),
                     schema_key: change.schema_key.to_string(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
-                    exact_filters: BTreeMap::from([
-                        ("file_id".to_string(), Value::Text(file_id.to_string())),
-                        (
-                            "plugin_key".to_string(),
-                            Value::Text(plugin_key.to_string()),
-                        ),
-                        (
-                            "schema_version".to_string(),
-                            Value::Text(schema_version.to_string()),
-                        ),
-                    ]),
+                    file_id: file_id.to_string(),
                 },
             )
             .await
@@ -688,17 +652,14 @@ async fn staged_change_is_noop(
             Ok(global_current.is_none())
         }
         Some(current) => {
-            let current_snapshot = current
-                .values
-                .get("snapshot_content")
-                .and_then(value_as_text);
-            let current_metadata = current.values.get("metadata").and_then(value_as_text);
+            let current_snapshot = Some(current.snapshot_content.as_str());
+            let current_metadata = current.metadata.as_deref();
             Ok(canonicalize_change_payload(
                 change.snapshot_content.as_deref(),
                 &change.schema_key,
                 "snapshot_content",
             )? == canonicalize_change_payload(
-                current_snapshot.as_deref(),
+                current_snapshot,
                 &change.schema_key,
                 "snapshot_content",
             )? && canonicalize_change_payload(
@@ -706,7 +667,7 @@ async fn staged_change_is_noop(
                 &change.schema_key,
                 "metadata",
             )? == canonicalize_change_payload(
-                current_metadata.as_deref(),
+                current_metadata,
                 &change.schema_key,
                 "metadata",
             )?)
@@ -880,7 +841,7 @@ struct CreateCommitPreflightState {
 }
 
 async fn load_create_commit_preflight_state(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &CreateCommitPreconditions,
     filesystem_state: &FilesystemTransactionState,
@@ -971,7 +932,7 @@ fn parse_file_descriptor_preflight_row(
 }
 
 async fn load_create_commit_existing_replay(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &CreateCommitPreconditions,
     current_head_snapshot: Option<&str>,
@@ -1013,7 +974,7 @@ async fn load_create_commit_existing_replay(
 }
 
 async fn load_create_commit_deterministic_sequence_start(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
 ) -> Result<Option<i64>, CreateCommitError> {
     load_create_commit_deterministic_sequence_start_impl(executor)
         .await
@@ -1021,7 +982,7 @@ async fn load_create_commit_deterministic_sequence_start(
 }
 
 async fn load_create_commit_file_descriptors(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     filesystem_state: &FilesystemTransactionState,
     lane_entity_id: &str,
 ) -> Result<BTreeMap<String, ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1048,7 +1009,7 @@ async fn load_create_commit_file_descriptors(
 }
 
 async fn load_create_commit_file_descriptor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     file_id: &str,
     lane_entity_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1071,7 +1032,7 @@ async fn load_create_commit_file_descriptor(
 }
 
 async fn load_untracked_file_descriptor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1081,30 +1042,17 @@ async fn load_untracked_file_descriptor(
 }
 
 async fn load_tracked_file_descriptor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
-    let row = load_exact_committed_state_row_at_version_head_with_executor(
+    let row = load_exact_canonical_row_at_version_head_with_executor(
         executor,
-        &ExactCommittedStateRowRequest {
+        version_id,
+        &CanonicalStateIdentity {
             entity_id: file_id.to_string(),
             schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-            version_id: version_id.to_string(),
-            exact_filters: BTreeMap::from([
-                (
-                    "file_id".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-                ),
-                (
-                    "plugin_key".to_string(),
-                    Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-                ),
-                (
-                    "schema_version".to_string(),
-                    Value::Text(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
-                ),
-            ]),
+            file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
         },
     )
     .await
@@ -1112,11 +1060,8 @@ async fn load_tracked_file_descriptor(
     let Some(row) = row else {
         return Ok(None);
     };
-    let Some(snapshot_content) = row.values.get("snapshot_content").and_then(value_as_text) else {
-        return Ok(None);
-    };
-    let metadata = row.values.get("metadata").and_then(value_as_text);
-    parse_file_descriptor_preflight_row(&snapshot_content, metadata, false).map(Some)
+    parse_file_descriptor_preflight_row(&row.snapshot_content, row.metadata.clone(), false)
+        .map(Some)
 }
 
 fn validate_change_versions(
@@ -1263,15 +1208,17 @@ fn extract_committed_head_id(
 
 fn build_canonical_commit_receipt(
     commit_id: String,
-    canonical_output: &CanonicalCommitOutput,
+    canonical_changes: &[CanonicalChangeWrite],
     updated_version_refs: &[UpdatedVersionRef],
     affected_versions: &[String],
 ) -> Result<CanonicalCommitReceipt, CreateCommitError> {
-    let replay_cursor = latest_replay_cursor_from_change_rows(&canonical_output.changes)
-        .ok_or_else(|| CreateCommitError {
-            kind: CreateCommitErrorKind::Internal,
-            message: "canonical commit receipt requires at least one canonical change row"
-                .to_string(),
+    let replay_cursor =
+        latest_replay_cursor_from_change_rows(canonical_changes).ok_or_else(|| {
+            CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
+                message: "canonical commit receipt requires at least one canonical change row"
+                    .to_string(),
+            }
         })?;
     Ok(CanonicalCommitReceipt {
         commit_id,
@@ -1344,7 +1291,7 @@ mod tests {
         CreateCommitIdempotencyKey, CreateCommitInvariantChecker, CreateCommitPreconditions,
         CreateCommitWriteLane,
     };
-    use crate::canonical::journal::{CanonicalCommitOutput, ChangeRow};
+    use crate::canonical::CanonicalChangeWrite;
     use crate::contracts::artifacts::OptionalTextPatch;
     use crate::contracts::functions::LixFunctionProvider;
     use crate::execution::write::filesystem::runtime::{
@@ -2113,32 +2060,30 @@ mod tests {
 
     #[test]
     fn canonical_commit_receipt_uses_latest_change_as_replay_cursor() {
-        let canonical_output = CanonicalCommitOutput {
-            changes: vec![
-                ChangeRow {
-                    id: "change-1".to_string(),
-                    entity_id: EntityId::new("entity-1").expect("valid entity id"),
-                    schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
-                    schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
-                    file_id: FileId::new("lix").expect("valid file id"),
-                    plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
-                    snapshot_content: None,
-                    metadata: None,
-                    created_at: "2026-03-06T14:22:00.000Z".to_string(),
-                },
-                ChangeRow {
-                    id: "change-2".to_string(),
-                    entity_id: EntityId::new("entity-2").expect("valid entity id"),
-                    schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
-                    schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
-                    file_id: FileId::new("lix").expect("valid file id"),
-                    plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
-                    snapshot_content: None,
-                    metadata: None,
-                    created_at: "2026-03-06T14:22:01.000Z".to_string(),
-                },
-            ],
-        };
+        let canonical_changes = vec![
+            CanonicalChangeWrite {
+                id: "change-1".to_string(),
+                entity_id: EntityId::new("entity-1").expect("valid entity id"),
+                schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
+                schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
+                file_id: FileId::new("lix").expect("valid file id"),
+                plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
+                snapshot_content: None,
+                metadata: None,
+                created_at: "2026-03-06T14:22:00.000Z".to_string(),
+            },
+            CanonicalChangeWrite {
+                id: "change-2".to_string(),
+                entity_id: EntityId::new("entity-2").expect("valid entity id"),
+                schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
+                schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
+                file_id: FileId::new("lix").expect("valid file id"),
+                plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
+                snapshot_content: None,
+                metadata: None,
+                created_at: "2026-03-06T14:22:01.000Z".to_string(),
+            },
+        ];
         let updated_version_refs = vec![UpdatedVersionRef {
             version_id: VersionId::new("version-a").expect("valid version id"),
             commit_id: "commit-123".to_string(),
@@ -2148,7 +2093,7 @@ mod tests {
 
         let receipt = build_canonical_commit_receipt(
             "commit-123".to_string(),
-            &canonical_output,
+            &canonical_changes,
             &updated_version_refs,
             &affected_versions,
         )

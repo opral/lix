@@ -31,6 +31,7 @@ pub(crate) fn build_state_history_source_sql(
     dialect: SqlDialect,
     root_facts: &CanonicalHistoryRootFacts,
     content_mode: CanonicalHistoryContentMode,
+    include_tombstones: bool,
     max_depth: Option<i64>,
 ) -> Result<String, LixError> {
     let max_depth_filter_sql = max_depth
@@ -71,6 +72,12 @@ pub(crate) fn build_state_history_source_sql(
         "root_version_id",
     );
     let requested_commits_cte_sql = build_requested_commits_cte_sql(root_facts)?;
+
+    let tombstone_filter_sql = if include_tombstones {
+        String::new()
+    } else {
+        "WHERE h.snapshot_id != 'no-content'".to_string()
+    };
 
     Ok(format!(
         "WITH RECURSIVE \
@@ -250,10 +257,11 @@ pub(crate) fn build_state_history_source_sql(
            h.commit_created_at AS commit_created_at, \
            h.root_commit_id AS root_commit_id, \
            h.depth AS depth, \
-           h.version_id AS version_id \
+           h.version_id AS version_id, \
+           CASE WHEN h.snapshot_id = 'no-content' THEN 1 ELSE 0 END AS is_tombstone \
          FROM history_rows h \
          {snapshot_join}\
-         WHERE h.snapshot_id != 'no-content'",
+         {tombstone_filter_sql}",
         root_version_refs_cte_sql = root_version_refs_cte_sql,
         requested_commits_cte_sql = requested_commits_cte_sql,
         parent_join_sql = parent_join_sql,
@@ -264,6 +272,7 @@ pub(crate) fn build_state_history_source_sql(
         max_depth_filter_sql = max_depth_filter_sql,
         snapshot_projection = snapshot_projection,
         snapshot_join = snapshot_join,
+        tombstone_filter_sql = tombstone_filter_sql,
     ))
 }
 
@@ -445,6 +454,7 @@ mod tests {
                 }],
             },
             CanonicalHistoryContentMode::IncludeSnapshotContent,
+            false,
             Some(32),
         )
         .expect("canonical history SQL should build");
@@ -474,6 +484,7 @@ mod tests {
                 root_version_refs: Vec::new(),
             },
             CanonicalHistoryContentMode::MetadataOnly,
+            false,
             None,
         )
         .expect("canonical history SQL should build");
@@ -495,11 +506,34 @@ mod tests {
                 }],
             },
             CanonicalHistoryContentMode::MetadataOnly,
+            false,
             None,
         )
         .expect("canonical history SQL should build");
 
         assert!(!sql.contains("walk.commit_depth < 512"));
         assert!(!sql.contains("walk.commit_depth < {max_depth}"));
+    }
+
+    #[test]
+    fn canonical_history_can_optionally_include_tombstones() {
+        let sql = build_state_history_source_sql(
+            SqlDialect::Sqlite,
+            &CanonicalHistoryRootFacts {
+                traversal: CanonicalHistoryRootSelection::AllRoots,
+                root_version_refs: vec![CanonicalRootCommit {
+                    commit_id: "commit-main".to_string(),
+                    version_id: "main".to_string(),
+                }],
+            },
+            CanonicalHistoryContentMode::IncludeSnapshotContent,
+            true,
+            None,
+        )
+        .expect("canonical history SQL should build");
+
+        assert!(sql
+            .contains("CASE WHEN h.snapshot_id = 'no-content' THEN 1 ELSE 0 END AS is_tombstone"));
+        assert!(!sql.contains("WHERE h.snapshot_id != 'no-content'"));
     }
 }

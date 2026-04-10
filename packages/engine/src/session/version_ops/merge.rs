@@ -1,9 +1,8 @@
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeSet, VecDeque};
 
-use crate::canonical::read::{
-    load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    load_exact_committed_state_row_from_commit_with_executor, ExactCommittedStateRow,
-    ExactCommittedStateRowRequest,
+use crate::canonical::{
+    load_change, load_commit, load_exact_row_at_commit, resolve_merge_base, CanonicalStateIdentity,
+    CanonicalStateRow,
 };
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
@@ -138,11 +137,12 @@ async fn merge_version_in_transaction(
 
     let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
 
-    let source_depths = load_commit_depths(&mut executor, &source_head).await?;
-    let target_depths = load_commit_depths(&mut executor, &target_head).await?;
-    let merge_base_commit_id = resolve_merge_base(&source_depths, &target_depths);
+    let merge_base_commit_id =
+        resolve_merge_base(&mut executor, &source_head, &target_head).await?;
 
-    if source_version_id == target_version_id || target_depths.contains_key(&source_head) {
+    if source_version_id == target_version_id
+        || merge_base_commit_id.as_deref() == Some(source_head.as_str())
+    {
         return Ok(MergeVersionResult {
             outcome: MergeOutcome::AlreadyUpToDate,
             source_version_id,
@@ -157,7 +157,7 @@ async fn merge_version_in_transaction(
         });
     }
 
-    if source_depths.contains_key(&target_head) {
+    if merge_base_commit_id.as_deref() == Some(target_head.as_str()) {
         tx.execute(
             "UPDATE lix_version SET commit_id = $1 WHERE id = $2",
             &[
@@ -231,24 +231,13 @@ async fn merge_version_in_transaction(
         let base_state = load_visible_entity_state_at_commit(
             &mut executor,
             merge_base_commit_id.as_deref(),
-            &source_version_id,
             &entity,
         )
         .await?;
-        let source_state = load_visible_entity_state_at_commit(
-            &mut executor,
-            Some(&source_head),
-            &source_version_id,
-            &entity,
-        )
-        .await?;
-        let target_state = load_visible_entity_state_at_commit(
-            &mut executor,
-            Some(&target_head),
-            &target_version_id,
-            &entity,
-        )
-        .await?;
+        let source_state =
+            load_visible_entity_state_at_commit(&mut executor, Some(&source_head), &entity).await?;
+        let target_state =
+            load_visible_entity_state_at_commit(&mut executor, Some(&target_head), &entity).await?;
 
         match classify_merge_decision(
             base_state.as_ref().map(|(state, _)| state),
@@ -374,50 +363,6 @@ async fn merge_version_in_transaction(
     })
 }
 
-async fn load_commit_depths(
-    executor: &mut TransactionBackendAdapter<'_>,
-    head_commit_id: &str,
-) -> Result<BTreeMap<String, usize>, LixError> {
-    let mut depths = BTreeMap::new();
-    let mut queue = VecDeque::from([(head_commit_id.to_string(), 0usize)]);
-    while let Some((commit_id, depth)) = queue.pop_front() {
-        if depths.contains_key(&commit_id) {
-            continue;
-        }
-        depths.insert(commit_id.clone(), depth);
-        let entry = load_commit_lineage_entry_by_id(executor, &commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::unknown(format!("missing commit lineage entry for '{}'", commit_id))
-            })?;
-        let mut parents = entry.parent_commit_ids;
-        parents.sort();
-        for parent_id in parents {
-            queue.push_back((parent_id, depth + 1));
-        }
-    }
-    Ok(depths)
-}
-
-fn resolve_merge_base(
-    source_depths: &BTreeMap<String, usize>,
-    target_depths: &BTreeMap<String, usize>,
-) -> Option<String> {
-    source_depths
-        .iter()
-        .filter_map(|(commit_id, source_depth)| {
-            target_depths.get(commit_id).map(|target_depth| {
-                (
-                    source_depth + target_depth,
-                    std::cmp::max(*source_depth, *target_depth),
-                    commit_id.clone(),
-                )
-            })
-        })
-        .min()
-        .map(|(_, _, commit_id)| commit_id)
-}
-
 async fn collect_candidate_entities(
     executor: &mut TransactionBackendAdapter<'_>,
     head_commit_id: &str,
@@ -433,13 +378,11 @@ async fn collect_candidate_entities(
         if stop_at_commit_id == Some(commit_id.as_str()) {
             continue;
         }
-        let entry = load_commit_lineage_entry_by_id(executor, &commit_id)
-            .await?
-            .ok_or_else(|| {
-                LixError::unknown(format!("missing commit lineage entry for '{}'", commit_id))
-            })?;
+        let entry = load_commit(executor, &commit_id).await?.ok_or_else(|| {
+            LixError::unknown(format!("missing commit lineage entry for '{}'", commit_id))
+        })?;
         for change_id in entry.change_ids {
-            let Some(change) = load_canonical_change_row_by_id(executor, &change_id).await? else {
+            let Some(change) = load_change(executor, &change_id).await? else {
                 return Err(LixError::unknown(format!(
                     "missing canonical change row '{}'",
                     change_id
@@ -463,23 +406,18 @@ async fn collect_candidate_entities(
 async fn load_visible_entity_state_at_commit(
     executor: &mut TransactionBackendAdapter<'_>,
     head_commit_id: Option<&str>,
-    version_id: &str,
     entity: &EntityKey,
-) -> Result<Option<(VisibleEntityState, ExactCommittedStateRow)>, LixError> {
+) -> Result<Option<(VisibleEntityState, CanonicalStateRow)>, LixError> {
     let Some(head_commit_id) = head_commit_id else {
         return Ok(None);
     };
-    let Some(row) = load_exact_committed_state_row_from_commit_with_executor(
+    let Some(row) = load_exact_row_at_commit(
         executor,
         head_commit_id,
-        &ExactCommittedStateRowRequest {
+        &CanonicalStateIdentity {
             entity_id: entity.entity_id.clone(),
             schema_key: entity.schema_key.clone(),
-            version_id: version_id.to_string(),
-            exact_filters: BTreeMap::from([(
-                "file_id".to_string(),
-                Value::Text(entity.file_id.clone()),
-            )]),
+            file_id: entity.file_id.clone(),
         },
     )
     .await?
@@ -490,21 +428,13 @@ async fn load_visible_entity_state_at_commit(
     Ok(Some((state, row)))
 }
 
-fn visible_state_from_exact_row(
-    row: &ExactCommittedStateRow,
-) -> Result<VisibleEntityState, LixError> {
-    let schema_version = required_text(row.values.get("schema_version"), "schema_version")?;
-    let plugin_key = required_text(row.values.get("plugin_key"), "plugin_key")?;
-    let snapshot_content = required_text(row.values.get("snapshot_content"), "snapshot_content")?;
-    let change_id = row.source_change_id.clone().ok_or_else(|| {
-        LixError::unknown("exact committed state row is missing source_change_id")
-    })?;
+fn visible_state_from_exact_row(row: &CanonicalStateRow) -> Result<VisibleEntityState, LixError> {
     Ok(VisibleEntityState {
-        change_id,
-        schema_version,
-        plugin_key,
-        snapshot_content,
-        metadata: row.values.get("metadata").and_then(value_ref_as_text),
+        change_id: row.source_change_id.clone(),
+        schema_version: row.schema_version.clone(),
+        plugin_key: row.plugin_key.clone(),
+        snapshot_content: row.snapshot_content.clone(),
+        metadata: row.metadata.clone(),
     })
 }
 
@@ -537,26 +467,20 @@ fn classify_merge_decision(
 
 fn proposed_change_from_exact_row(
     version_id: &str,
-    row: &ExactCommittedStateRow,
+    row: &CanonicalStateRow,
 ) -> Result<StagedChange, LixError> {
     Ok(StagedChange {
         id: None,
         entity_id: parse_identity(row.entity_id.clone(), "merge entity_id")?,
         schema_key: parse_identity(row.schema_key.clone(), "merge schema_key")?,
         schema_version: Some(parse_identity(
-            required_text(row.values.get("schema_version"), "schema_version")?,
+            row.schema_version.clone(),
             "merge schema_version",
         )?),
         file_id: Some(parse_identity(row.file_id.clone(), "merge file_id")?),
-        plugin_key: Some(parse_identity(
-            required_text(row.values.get("plugin_key"), "plugin_key")?,
-            "merge plugin_key",
-        )?),
-        snapshot_content: Some(required_text(
-            row.values.get("snapshot_content"),
-            "snapshot_content",
-        )?),
-        metadata: row.values.get("metadata").and_then(value_ref_as_text),
+        plugin_key: Some(parse_identity(row.plugin_key.clone(), "merge plugin_key")?),
+        snapshot_content: Some(row.snapshot_content.clone()),
+        metadata: row.metadata.clone(),
         version_id: parse_identity(version_id.to_string(), "merge version_id")?,
         writer_key: None,
         created_at: None,
@@ -595,22 +519,18 @@ fn tombstone_change_from_state(
 fn stream_change_from_row(
     operation: StateCommitStreamOperation,
     version_id: &str,
-    row: &ExactCommittedStateRow,
+    row: &CanonicalStateRow,
 ) -> Result<StateCommitStreamChange, LixError> {
     Ok(StateCommitStreamChange {
         operation,
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
-        schema_version: required_text(row.values.get("schema_version"), "schema_version")?,
+        schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
         version_id: version_id.to_string(),
-        plugin_key: required_text(row.values.get("plugin_key"), "plugin_key")?,
+        plugin_key: row.plugin_key.clone(),
         snapshot_content: Some(
-            serde_json::from_str(&required_text(
-                row.values.get("snapshot_content"),
-                "snapshot_content",
-            )?)
-            .map_err(|error| {
+            serde_json::from_str(&row.snapshot_content).map_err(|error| {
                 LixError::unknown(format!(
                     "merge_version expected JSON snapshot_content text: {error}"
                 ))
@@ -663,24 +583,6 @@ fn normalize_required_text(value: String, field: &str) -> Result<String, LixErro
         ));
     }
     Ok(value)
-}
-
-fn required_text(value: Option<&Value>, field: &str) -> Result<String, LixError> {
-    value_as_text(value).ok_or_else(|| LixError::unknown(format!("missing {field}")))
-}
-
-fn value_as_text(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::Text(text)) => Some(text.clone()),
-        Some(Value::Integer(value)) => Some(value.to_string()),
-        Some(Value::Boolean(value)) => Some(value.to_string()),
-        Some(Value::Real(value)) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn value_ref_as_text(value: &Value) -> Option<String> {
-    value_as_text(Some(value))
 }
 
 fn parse_identity<T>(value: String, context: &str) -> Result<T, LixError>

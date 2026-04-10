@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::canonical::read::CommitQueryExecutor;
+use crate::backend::QueryExecutor;
 use crate::live_state::writer_key::load_writer_key_annotations_with_executor;
 use crate::{LixBackend, LixError, Value};
 
@@ -143,7 +143,7 @@ pub(crate) async fn scan_live_rows(
 }
 
 async fn scan_live_rows_with_executor_ref(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     storage: LiveStorageLane,
     schema_key: &str,
     version_id: &str,
@@ -185,7 +185,7 @@ async fn scan_live_rows_with_executor_ref(
 }
 
 async fn overlay_writer_key_annotations_on_tracked_rows_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     mut rows: Vec<TrackedRow>,
 ) -> Result<Vec<TrackedRow>, LixError> {
     if rows.is_empty() {
@@ -209,7 +209,7 @@ async fn overlay_writer_key_annotations_on_tracked_rows_with_executor(
 }
 
 async fn overlay_writer_key_annotations_on_untracked_rows_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut dyn QueryExecutor,
     mut rows: Vec<UntrackedRow>,
 ) -> Result<Vec<UntrackedRow>, LixError> {
     if rows.is_empty() {
