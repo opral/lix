@@ -2460,7 +2460,7 @@ mod tests {
                     .expect_err("projection-backed state read should reject stale live_state");
                 assert_eq!(
                     stale_error.code,
-                    crate::common::errors::ErrorCode::LiveStateNotReady.as_str()
+                    crate::common::ErrorCode::LiveStateNotReady.as_str()
                 );
                 assert!(
                     stale_error.description.contains("lix_key_value"),

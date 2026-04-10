@@ -180,7 +180,7 @@ impl Runtime {
                 Ordering::SeqCst,
             )
             .map(|_| ())
-            .map_err(|_| crate::common::errors::already_initialized_error())
+            .map_err(|_| crate::common::already_initialized_error())
     }
 
     pub(crate) fn mark_init_completed(&self) {

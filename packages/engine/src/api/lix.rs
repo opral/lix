@@ -255,7 +255,7 @@ impl Lix {
     pub(crate) fn workspace_session(&self) -> Result<&Arc<Session>, LixError> {
         self.workspace_session
             .get()
-            .ok_or_else(crate::common::errors::not_initialized_error)
+            .ok_or_else(crate::common::not_initialized_error)
     }
 
     /// Opens the repository and eagerly initializes the workspace session used
@@ -284,7 +284,7 @@ impl Lix {
         if crate::live_state::load_mode_with_backend(self.backend().as_ref()).await?
             == crate::live_state::LiveStateMode::Uninitialized
         {
-            return Err(crate::common::errors::not_initialized_error());
+            return Err(crate::common::not_initialized_error());
         }
         self.refresh_public_surface_registry().await?;
         let _ = self.opened_workspace_session().await?;
@@ -652,7 +652,7 @@ impl crate::session::collaborators::SessionServices for LixRuntimeSessionService
         if crate::live_state::load_mode_with_backend(self.runtime.backend().as_ref()).await?
             == crate::live_state::LiveStateMode::Uninitialized
         {
-            return Err(crate::common::errors::not_initialized_error());
+            return Err(crate::common::not_initialized_error());
         }
         Ok(())
     }

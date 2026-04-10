@@ -1,4 +1,4 @@
-use crate::common::errors;
+use crate::common::unexpected_statement_count_error;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
@@ -81,7 +81,7 @@ async fn create_version_in_transaction(
 async fn generate_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
     let generated = tx.execute("SELECT lix_uuid_v7()", &[]).await?;
     let [statement] = generated.statements.as_slice() else {
-        return Err(errors::unexpected_statement_count_error(
+        return Err(unexpected_statement_count_error(
             "generated uuid query",
             1,
             generated.statements.len(),

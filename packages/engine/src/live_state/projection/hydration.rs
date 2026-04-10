@@ -3,7 +3,7 @@ use crate::catalog::{
     CatalogProjectionInputRows, CatalogProjectionInputSpec, CatalogProjectionInputVersionScope,
     CatalogProjectionSourceRow, CatalogProjectionStorageKind,
 };
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::live_state::tracked::{
     scan_rows_with_backend as scan_tracked_rows_with_backend,
     scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,

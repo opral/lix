@@ -16,7 +16,7 @@ use crate::canonical::read::{
     CanonicalRootCommit as ReadCanonicalRootCommit, CommitLineageEntry,
     ExactCommittedStateRowRequest,
 };
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::contracts::LixFunctionProvider;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 

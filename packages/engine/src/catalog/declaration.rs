@@ -1,8 +1,8 @@
 use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{SurfaceFamily, SurfaceVariant};
-use crate::common::error::LixError;
-use crate::common::types::Value;
+use crate::common::LixError;
+use crate::common::Value;
 use crate::contracts::RowIdentity;
 
 /// Catalog-owned declaration contracts for derived public surfaces.

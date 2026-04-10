@@ -178,10 +178,8 @@ pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
     let snapshot = load_live_state_snapshot(backend).await?;
     match evaluate_live_state_snapshot(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
-        LiveStateReadiness::Uninitialized => Err(crate::common::errors::not_initialized_error()),
-        LiveStateReadiness::NeedsRebuild => {
-            Err(crate::common::errors::live_state_not_ready_error())
-        }
+        LiveStateReadiness::Uninitialized => Err(crate::common::not_initialized_error()),
+        LiveStateReadiness::NeedsRebuild => Err(crate::common::live_state_not_ready_error()),
     }
 }
 
@@ -191,10 +189,8 @@ pub(crate) async fn require_ready_in_transaction(
     let snapshot = load_live_state_snapshot_in_transaction(transaction).await?;
     match evaluate_live_state_transaction_eligibility(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
-        LiveStateReadiness::Uninitialized => Err(crate::common::errors::not_initialized_error()),
-        LiveStateReadiness::NeedsRebuild => {
-            Err(crate::common::errors::live_state_not_ready_error())
-        }
+        LiveStateReadiness::Uninitialized => Err(crate::common::not_initialized_error()),
+        LiveStateReadiness::NeedsRebuild => Err(crate::common::live_state_not_ready_error()),
     }
 }
 
@@ -938,7 +934,7 @@ mod tests {
             .expect_err("needs_rebuild should fail");
         assert_eq!(
             error.code,
-            crate::common::errors::ErrorCode::LiveStateNotReady.as_str()
+            crate::common::ErrorCode::LiveStateNotReady.as_str()
         );
         transaction
             .rollback()

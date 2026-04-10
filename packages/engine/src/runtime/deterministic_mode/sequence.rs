@@ -1,4 +1,4 @@
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::PreparedBatch;
 use crate::contracts::GLOBAL_VERSION_ID;

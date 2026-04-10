@@ -7,8 +7,8 @@ use serde_json::{json, Value as JsonValue};
 use zip::read::ZipArchive;
 
 use crate::catalog::{SurfaceBinding, SurfaceRegistry};
-use crate::common::fingerprint::stable_content_fingerprint_hex;
-use crate::common::paths::filesystem::{NormalizedDirectoryPath, ParsedFilePath};
+use crate::common::stable_content_fingerprint_hex;
+use crate::common::{NormalizedDirectoryPath, ParsedFilePath};
 use crate::contracts::{
     parse_plugin_manifest_json, plugin_storage_archive_file_id, plugin_storage_archive_path,
     PluginManifest, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,

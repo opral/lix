@@ -1,4 +1,4 @@
-use crate::common::errors;
+use crate::common::unexpected_statement_count_error;
 use crate::init::InitExecutor;
 use crate::live_state::register_schema;
 use crate::schema::{builtin_schema_definition, builtin_schema_keys};
@@ -40,7 +40,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 )
                 .await?;
             let [statement] = existing.statements.as_slice() else {
-                return Err(errors::unexpected_statement_count_error(
+                return Err(unexpected_statement_count_error(
                     "builtin schema existence query",
                     1,
                     existing.statements.len(),
