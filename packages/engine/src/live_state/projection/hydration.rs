@@ -3,7 +3,7 @@ use crate::catalog::{
     CatalogProjectionInputRows, CatalogProjectionInputSpec, CatalogProjectionInputVersionScope,
     CatalogProjectionSourceRow, CatalogProjectionStorageKind,
 };
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::live_state::tracked::{
     scan_rows_with_backend as scan_tracked_rows_with_backend,
     scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,
@@ -123,7 +123,7 @@ async fn hydrate_input_rows_with_backend(
                         .map(|row| {
                             CatalogProjectionSourceRow::new(
                                 CatalogProjectionStorageKind::Tracked,
-                                crate::contracts::artifacts::RowIdentity::from_tracked_row(&row),
+                                crate::contracts::RowIdentity::from_tracked_row(&row),
                                 row.schema_key.clone(),
                                 row.version_id.clone(),
                                 row.values,
@@ -148,7 +148,7 @@ async fn hydrate_input_rows_with_backend(
                         .map(|row| {
                             CatalogProjectionSourceRow::new(
                                 CatalogProjectionStorageKind::Tracked,
-                                crate::contracts::artifacts::RowIdentity {
+                                crate::contracts::RowIdentity {
                                     entity_id: row.entity_id.clone(),
                                     schema_key: row.schema_key.clone(),
                                     version_id: row.version_id.clone(),
@@ -187,7 +187,7 @@ async fn hydrate_input_rows_with_backend(
                 .map(|row| {
                     CatalogProjectionSourceRow::new(
                         CatalogProjectionStorageKind::Untracked,
-                        crate::contracts::artifacts::RowIdentity::from_untracked_row(&row),
+                        crate::contracts::RowIdentity::from_untracked_row(&row),
                         row.schema_key.clone(),
                         row.version_id.clone(),
                         row.values,

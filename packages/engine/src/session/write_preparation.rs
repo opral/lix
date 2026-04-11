@@ -3,11 +3,11 @@ use std::time::Duration;
 use sqlparser::ast::Statement;
 
 use crate::backend::TransactionBackendAdapter;
-use crate::contracts::artifacts::{
+use crate::contracts::PendingView;
+use crate::contracts::{
     PendingPublicCommitSession, PreparedPublicWriteExecutionPartition, PreparedWriteStep,
     SessionStateDelta,
 };
-use crate::contracts::traits::PendingView;
 use crate::execution::write::buffered_write_transaction::{
     BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
 };
@@ -567,7 +567,7 @@ impl SqlBufferedWriteScope<'_, '_> {
 
     fn buffered_write_commit_outcome_mut(
         &mut self,
-    ) -> &mut crate::execution::write::TransactionCommitOutcome {
+    ) -> &mut crate::contracts::TransactionCommitOutcome {
         match self {
             Self::Owned(write_transaction) => write_transaction.buffered_write_commit_outcome_mut(),
             Self::Borrowed(write_transaction) => {

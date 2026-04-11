@@ -10,8 +10,8 @@ use sqlparser::ast::Statement;
 
 use crate::backend::QueryExecutor;
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::artifacts::PreparedPublicReadArtifact;
-use crate::contracts::traits::{PendingView, SqlPreparationMetadataReader};
+use crate::contracts::PreparedPublicReadArtifact;
+use crate::contracts::{PendingView, SqlPreparationMetadataReader};
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
 use crate::session::version_ops::load_version_head_commit_map_with_executor;
 use crate::sql::{

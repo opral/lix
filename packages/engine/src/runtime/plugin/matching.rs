@@ -1,5 +1,5 @@
 #[allow(unused_imports)]
-pub(crate) use crate::contracts::plugin::{glob_matches_path, select_best_glob_match};
+pub(crate) use crate::contracts::{glob_matches_path, select_best_glob_match};
 
 #[cfg(test)]
 mod tests {

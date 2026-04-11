@@ -6,15 +6,15 @@ use jsonschema::JSONSchema;
 
 use crate::backend::TransactionBackendAdapter;
 use crate::catalog::CatalogProjectionRegistry;
-use crate::common::text::escape_sql_string;
-use crate::contracts::artifacts::{
+use crate::common::escape_sql_string;
+use crate::contracts::parse_active_version_snapshot;
+use crate::contracts::TrackedChangeView;
+use crate::contracts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PendingPublicCommitSession,
     PreparedPublicReadArtifact, PreparedPublicWriteArtifact, PublicChange, SchemaKey, WriteLane,
 };
-use crate::contracts::change::TrackedChangeView;
-use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::traits::{CompiledSchemaCache, PendingView};
-use crate::contracts::version_artifacts::parse_active_version_snapshot;
+use crate::contracts::{CompiledSchemaCache, PendingView};
+use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::execution::write::buffered::TrackedTxnUnit;
 use crate::execution::write::filesystem::runtime::{
     resolve_binary_blob_writes_in_transaction, BinaryBlobWrite,
@@ -157,7 +157,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
     public_read: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.execution_mode() {
-        crate::contracts::artifacts::PublicReadExecutionMode::PendingView => {
+        crate::contracts::PublicReadExecutionMode::PendingView => {
             crate::session::pending_reads::execute_prepared_public_read_with_pending_view_in_transaction(
                 transaction,
                 pending_view,
@@ -165,7 +165,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
             )
             .await
         }
-        crate::contracts::artifacts::PublicReadExecutionMode::Committed(_) => {
+        crate::contracts::PublicReadExecutionMode::Committed(_) => {
             let bindings = CatalogProjectionRegistryReadExecutionBindings::new(projection_registry);
             crate::execution::read::execute_prepared_public_read_artifact_in_transaction(
                 transaction,
@@ -484,7 +484,7 @@ fn tracked_writer_key_updates_for_unit(
             continue;
         };
         for partition in &resolved.partitions {
-            if partition.execution_mode != crate::contracts::artifacts::WriteMode::Tracked {
+            if partition.execution_mode != crate::contracts::WriteMode::Tracked {
                 continue;
             }
             updates.extend(partition.writer_key_updates.iter().map(

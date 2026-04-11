@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::traits::PendingView;
+use crate::contracts::PendingView;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
 use crate::runtime::wasm::NoopWasmRuntime;
@@ -247,25 +247,27 @@ pub(crate) struct BuiltinReadExecutionBindings;
 
 #[cfg(test)]
 #[async_trait(?Send)]
-impl crate::execution::read::ReadExecutionBindings for BuiltinReadExecutionBindings {
+impl crate::contracts::ReadExecutionBindings for BuiltinReadExecutionBindings {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
-    ) -> Result<Vec<crate::execution::read::ReadTimeProjectionRow>, LixError> {
-        Ok(crate::live_state::derive_read_time_surface_rows(
-            backend,
-            crate::catalog::builtin_catalog_projection_registry(),
-            artifact,
+        artifact: &crate::contracts::ReadTimeProjectionRead,
+    ) -> Result<Vec<crate::contracts::ReadTimeProjectionRow>, LixError> {
+        Ok(
+            crate::live_state::derive_read_time_surface_rows(
+                backend,
+                crate::catalog::builtin_catalog_projection_registry(),
+                artifact,
+            )
+            .await?
+            .into_iter()
+            .map(|row| crate::contracts::ReadTimeProjectionRow {
+                surface_name: row.surface_name,
+                identity: row.identity,
+                values: row.values,
+            })
+            .collect(),
         )
-        .await?
-        .into_iter()
-        .map(|row| crate::execution::read::ReadTimeProjectionRow {
-            surface_name: row.surface_name,
-            identity: row.identity,
-            values: row.values,
-        })
-        .collect())
     }
 }
 

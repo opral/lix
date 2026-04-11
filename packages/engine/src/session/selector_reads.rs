@@ -7,8 +7,8 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::traits::PendingView;
-use crate::execution::read::{
+use crate::contracts::PendingView;
+use crate::contracts::{
     PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
 };
 use crate::session::read_preparation::{
@@ -82,7 +82,7 @@ impl ReadExecutionBindings for SessionWriteSelectorResolver<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::contracts::artifacts::ReadTimeProjectionRead,
+        artifact: &crate::contracts::ReadTimeProjectionRead,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
         crate::session::read_execution_bindings::derive_read_time_projection_rows_with_registry(
             self.projection_registry,

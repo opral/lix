@@ -2,7 +2,7 @@ mod runtime_prep;
 
 pub mod timestamp;
 pub mod uuid_v7;
-pub use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
+pub use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemFunctionProvider;

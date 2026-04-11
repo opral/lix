@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::contracts::artifacts::{
+use crate::contracts::{
     coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
     IdempotencyKey, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
     PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
@@ -8,7 +8,7 @@ use crate::contracts::artifacts::{
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteStep,
     ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
 };
-use crate::contracts::traits::{PendingSemanticRow, PendingSemanticStorage};
+use crate::contracts::{PendingSemanticRow, PendingSemanticStorage};
 use crate::execution::write::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,

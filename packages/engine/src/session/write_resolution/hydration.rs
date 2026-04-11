@@ -1,5 +1,5 @@
 use super::effective_state::resolve_exact_effective_state_row_with_pending_overlay;
-use crate::contracts::traits::PendingStateOverlay;
+use crate::contracts::PendingStateOverlay;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::session::write_resolution::prepared_artifacts::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,

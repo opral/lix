@@ -137,21 +137,21 @@ impl StateContextColumn {
     }
 }
 
-pub(crate) const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix/plugins/";
-pub(crate) const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
+pub const PLUGIN_STORAGE_ROOT_DIRECTORY_PATH: &str = "/.lix/plugins/";
+pub const PLUGIN_ARCHIVE_FILE_EXTENSION: &str = ".lixplugin";
 
-pub(crate) fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
+pub fn plugin_storage_archive_file_id(plugin_key: &str) -> String {
     format!("lix_plugin_archive::{plugin_key}")
 }
 
-pub(crate) fn plugin_storage_archive_path(plugin_key: &str) -> Result<String, LixError> {
+pub fn plugin_storage_archive_path(plugin_key: &str) -> Result<String, LixError> {
     validate_plugin_key_segment(plugin_key)?;
     Ok(format!(
         "{PLUGIN_STORAGE_ROOT_DIRECTORY_PATH}{plugin_key}{PLUGIN_ARCHIVE_FILE_EXTENSION}"
     ))
 }
 
-pub(crate) fn plugin_key_from_archive_path(path: &str) -> Option<String> {
+pub fn plugin_key_from_archive_path(path: &str) -> Option<String> {
     let file_name = path.strip_prefix(PLUGIN_STORAGE_ROOT_DIRECTORY_PATH)?;
     let plugin_key = file_name.strip_suffix(PLUGIN_ARCHIVE_FILE_EXTENSION)?;
     if plugin_key.is_empty()
@@ -165,7 +165,7 @@ pub(crate) fn plugin_key_from_archive_path(path: &str) -> Option<String> {
     Some(plugin_key.to_string())
 }
 
-pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
+pub fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginManifest, LixError> {
     let manifest_json: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Plugin manifest must be valid JSON: {error}"),
@@ -191,7 +191,7 @@ pub(crate) fn parse_plugin_manifest_json(raw: &str) -> Result<ValidatedPluginMan
     })
 }
 
-pub(crate) fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
+pub fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
     path: &str,
     file_content_type: Option<C>,
     candidates: &'a [T],
@@ -233,7 +233,7 @@ pub(crate) fn select_best_glob_match<'a, T, C: Copy + PartialEq>(
     selected
 }
 
-pub(crate) fn glob_matches_path(glob: &str, path: &str) -> bool {
+pub fn glob_matches_path(glob: &str, path: &str) -> bool {
     let normalized_glob = glob.trim();
     let normalized_path = path.trim();
     if normalized_glob.is_empty() || normalized_path.is_empty() {

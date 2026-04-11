@@ -1,4 +1,5 @@
-use crate::common::errors::classification::{
+use crate::contracts::SqlPreparationMetadataReader;
+use crate::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::contracts::artifacts::{
@@ -19,7 +20,6 @@ use crate::contracts::artifacts::{
     PreparedStateHistorySortKey, PreparedStateHistorySortValue, PreparedStatement,
     PublicReadResultColumn, PublicReadResultColumns, ReadDiagnosticContext,
 };
-use crate::contracts::traits::SqlPreparationMetadataReader;
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,

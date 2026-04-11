@@ -2,7 +2,7 @@ use crate::canonical::{
     load_history, CanonicalHistoryContentMode, CanonicalHistoryRequest,
     CanonicalHistoryRootSelection, CanonicalRootCommit,
 };
-use crate::contracts::artifacts::{
+use crate::contracts::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
     StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };

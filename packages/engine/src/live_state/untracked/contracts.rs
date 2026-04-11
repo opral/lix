@@ -2,13 +2,13 @@
 use async_trait::async_trait;
 
 #[cfg(test)]
-pub use crate::contracts::artifacts::BatchRowRequest as BatchUntrackedRowRequest;
-pub use crate::contracts::artifacts::{
+pub use crate::contracts::BatchRowRequest as BatchUntrackedRowRequest;
+#[cfg(test)]
+pub(crate) use crate::contracts::UntrackedReadView;
+pub use crate::contracts::{
     ExactRowRequest as ExactUntrackedRowRequest, ScanRequest as UntrackedScanRequest, UntrackedRow,
     UntrackedWriteOperation, UntrackedWriteRow,
 };
-#[cfg(test)]
-pub(crate) use crate::contracts::traits::UntrackedReadView;
 #[cfg(test)]
 use crate::LixBackend;
 #[cfg(test)]

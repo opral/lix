@@ -70,7 +70,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             }
         };
         let [statement] = existing.statements.as_slice() else {
-            return Err(crate::common::errors::unexpected_statement_count_error(
+            return Err(crate::common::unexpected_statement_count_error(
                 "system directory existence query",
                 1,
                 existing.statements.len(),

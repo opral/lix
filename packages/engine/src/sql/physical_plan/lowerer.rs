@@ -3,8 +3,8 @@ use crate::catalog::{
     SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue,
     SurfaceRegistry, SurfaceVariant,
 };
-use crate::common::errors::sql_unknown_column_error;
-use crate::contracts::artifacts::EffectiveStateRequest;
+use crate::contracts::EffectiveStateRequest;
+use crate::diagnostics::sql_unknown_column_error;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,

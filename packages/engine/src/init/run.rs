@@ -26,7 +26,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
 
     if load_mode_with_backend(lix.backend().as_ref()).await? != LiveStateMode::Uninitialized {
         lix.reset_init_state();
-        return Err(crate::common::errors::already_initialized_error());
+        return Err(crate::common::already_initialized_error());
     }
 
     let mut transaction = lix
@@ -71,7 +71,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
         {
             let backend = TransactionBackendAdapter::new(transaction.as_mut());
             if !try_claim_bootstrap_with_backend(&backend).await? {
-                return Err(crate::common::errors::already_initialized_error());
+                return Err(crate::common::already_initialized_error());
             }
         }
         claimed_bootstrap = true;
@@ -179,9 +179,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
 pub(crate) async fn init_if_needed(lix: &Lix) -> Result<bool, LixError> {
     match init(lix).await {
         Ok(()) => Ok(true),
-        Err(error)
-            if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() =>
-        {
+        Err(error) if error.code == crate::common::ErrorCode::AlreadyInitialized.as_str() => {
             lix.wait_for_concurrent_init_ready().await?;
             lix.refresh_public_surface_registry().await?;
             let _ = lix.opened_workspace_session().await?;
@@ -211,14 +209,14 @@ impl Lix {
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
-        if error.code == crate::common::errors::ErrorCode::AlreadyInitialized.as_str() {
+        if error.code == crate::common::ErrorCode::AlreadyInitialized.as_str() {
             return error;
         }
         if is_init_conflict_error(&error.description) {
-            return crate::common::errors::already_initialized_error();
+            return crate::common::already_initialized_error();
         }
         if is_init_locked_error(&error.description) {
-            return crate::common::errors::already_initialized_error();
+            return crate::common::already_initialized_error();
         }
         error
     }
@@ -232,21 +230,21 @@ impl Lix {
                 LiveStateMode::Ready => return Ok(()),
                 LiveStateMode::Bootstrapping => {
                     if attempt + 1 == ATTEMPTS {
-                        return Err(crate::common::errors::live_state_not_ready_error());
+                        return Err(crate::common::live_state_not_ready_error());
                     }
                 }
                 LiveStateMode::Uninitialized => {
                     if attempt + 1 == ATTEMPTS {
-                        return Err(crate::common::errors::not_initialized_error());
+                        return Err(crate::common::not_initialized_error());
                     }
                 }
                 LiveStateMode::NeedsRebuild | LiveStateMode::Rebuilding => {
-                    return Err(crate::common::errors::live_state_not_ready_error())
+                    return Err(crate::common::live_state_not_ready_error())
                 }
             }
             std::thread::sleep(Duration::from_millis(DELAY_MS));
         }
-        Err(crate::common::errors::live_state_not_ready_error())
+        Err(crate::common::live_state_not_ready_error())
     }
 }
 

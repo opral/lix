@@ -1,10 +1,10 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::artifacts::{PendingPublicCommitSession, PlanEffects, SessionStateDelta};
-use crate::contracts::change::TrackedChangeView;
-use crate::contracts::state_commit_stream::{
+use crate::contracts::TrackedChangeView;
+use crate::contracts::{
     state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
 };
+use crate::contracts::{PendingPublicCommitSession, PlanEffects, SessionStateDelta};
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::runtime::SqlExecutionOutcome;
@@ -59,7 +59,7 @@ pub(super) async fn run_public_tracked_append_txn_with_transaction(
 
 fn plan_effects_from_tracked_changes<Change: TrackedChangeView>(
     changes: &[Change],
-    stream_operation: crate::contracts::artifacts::StateCommitStreamOperation,
+    stream_operation: crate::contracts::StateCommitStreamOperation,
     writer_key: Option<&str>,
     next_active_version_id: Option<String>,
 ) -> Result<PlanEffects, LixError> {

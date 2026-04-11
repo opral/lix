@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{PendingPublicCommitSession, PlanEffects};
+use crate::contracts::{PendingPublicCommitSession, PlanEffects};
 use crate::execution::write::WriteExecutionBindings;
 use crate::{LixBackendTransaction, LixError};
 

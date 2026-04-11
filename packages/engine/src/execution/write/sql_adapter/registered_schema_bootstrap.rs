@@ -1,5 +1,5 @@
-use crate::common::text::escape_sql_string;
-use crate::contracts::artifacts::{MutationRow, PlannedStateRow};
+use crate::common::escape_sql_string;
+use crate::contracts::{MutationRow, PlannedStateRow};
 use crate::{LixBackendTransaction, LixError, Value};
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";

@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::ExecuteOptions;
+use crate::contracts::ExecuteOptions;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::live_state::{

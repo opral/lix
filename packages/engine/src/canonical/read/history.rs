@@ -1,4 +1,4 @@
-use crate::common::text::escape_sql_string;
+use crate::common::escape_sql_string;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect};
 

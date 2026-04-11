@@ -13,8 +13,15 @@ use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use crate::backend::TransactionBackendAdapter;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
-use crate::common::errors::classification::normalize_sql_error_with_backend_and_relation_names;
-use crate::contracts::artifacts::{
+use crate::contracts::PreparedWriteRuntimeState;
+use crate::contracts::{
+    clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
+};
+use crate::contracts::{
+    CompiledSchemaCache, LiveReadShapeContract, LiveStateQueryBackend, PendingView,
+    SqlPreparationMetadataReader,
+};
+use crate::contracts::{
     PreparedBatch, PreparedExplainMode, PreparedInsertOnConflictAction,
     PreparedInternalWriteArtifact, PreparedPublicSurfaceRegistryEffect,
     PreparedPublicSurfaceRegistryMutation, PreparedPublicWriteArtifact,
@@ -25,16 +32,8 @@ use crate::contracts::artifacts::{
     PreparedWriteOperationKind, PreparedWriteStatementKind, PreparedWriteStep,
     UpdateValidationInput, UpdateValidationInputRow,
 };
-use crate::contracts::functions::{
-    clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
-};
-use crate::contracts::traits::{
-    CompiledSchemaCache, LiveReadShapeContract, LiveStateQueryBackend, PendingView,
-    SqlPreparationMetadataReader,
-};
-use crate::execution::write::{
-    PendingTransactionView, PreparedWriteExecutionStep, PreparedWriteRuntimeState,
-};
+use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
+use crate::execution::write::{PendingTransactionView, PreparedWriteExecutionStep};
 use crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::session::collaborators::WriteExecutionCollaborators;
@@ -876,7 +875,7 @@ fn prepared_insert_on_conflict_action_from_sql(
 }
 
 fn planned_row_optional_json_text_value<'a>(
-    row: &'a crate::contracts::artifacts::PlannedStateRow,
+    row: &'a crate::contracts::PlannedStateRow,
     key: &str,
 ) -> Option<Cow<'a, str>> {
     match row.values.get(key) {

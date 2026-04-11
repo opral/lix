@@ -1,5 +1,5 @@
-use crate::common::naming::tracked_relation_name;
 use crate::live_state::key_value_schema_key;
+use crate::live_state::tracked_relation_name;
 use crate::runtime::deterministic_mode::PersistedKeyValueStorageScope;
 
 const GLOBAL_VERSION_ID: &str = "global";

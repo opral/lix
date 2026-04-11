@@ -1,6 +1,6 @@
 use serde_json::Value as JsonValue;
 
-pub use crate::contracts::artifacts::SchemaKey;
+pub use crate::contracts::SchemaKey;
 use crate::LixError;
 
 pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixError> {

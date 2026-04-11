@@ -30,55 +30,55 @@ struct ActiveVersionSchemaMetadata {
     storage_version_id: String,
 }
 
-pub(crate) fn version_descriptor_schema_key() -> &'static str {
+pub fn version_descriptor_schema_key() -> &'static str {
     &version_descriptor_schema_metadata().schema_key
 }
 
-pub(crate) fn version_descriptor_schema_version() -> &'static str {
+pub fn version_descriptor_schema_version() -> &'static str {
     &version_descriptor_schema_metadata().schema_version
 }
 
-pub(crate) fn version_descriptor_file_id() -> &'static str {
+pub fn version_descriptor_file_id() -> &'static str {
     &version_descriptor_schema_metadata().file_id
 }
 
-pub(crate) fn version_descriptor_plugin_key() -> &'static str {
+pub fn version_descriptor_plugin_key() -> &'static str {
     &version_descriptor_schema_metadata().plugin_key
 }
 
-pub(crate) fn version_ref_schema_key() -> &'static str {
+pub fn version_ref_schema_key() -> &'static str {
     &version_ref_schema_metadata().schema_key
 }
 
-pub(crate) fn version_ref_schema_version() -> &'static str {
+pub fn version_ref_schema_version() -> &'static str {
     &version_ref_schema_metadata().schema_version
 }
 
-pub(crate) fn version_ref_file_id() -> &'static str {
+pub fn version_ref_file_id() -> &'static str {
     &version_ref_schema_metadata().file_id
 }
 
-pub(crate) fn version_ref_plugin_key() -> &'static str {
+pub fn version_ref_plugin_key() -> &'static str {
     &version_ref_schema_metadata().plugin_key
 }
 
-pub(crate) fn version_ref_storage_version_id() -> &'static str {
+pub fn version_ref_storage_version_id() -> &'static str {
     &version_ref_schema_metadata().storage_version_id
 }
 
-pub(crate) fn active_version_schema_key() -> &'static str {
+pub fn active_version_schema_key() -> &'static str {
     &active_version_schema_metadata().schema_key
 }
 
-pub(crate) fn active_version_file_id() -> &'static str {
+pub fn active_version_file_id() -> &'static str {
     &active_version_schema_metadata().file_id
 }
 
-pub(crate) fn active_version_storage_version_id() -> &'static str {
+pub fn active_version_storage_version_id() -> &'static str {
     &active_version_schema_metadata().storage_version_id
 }
 
-pub(crate) fn version_descriptor_snapshot_content(id: &str, name: &str, hidden: bool) -> String {
+pub fn version_descriptor_snapshot_content(id: &str, name: &str, hidden: bool) -> String {
     serde_json::to_string(&LixVersionDescriptor {
         id: id.to_string(),
         name: Some(name.to_string()),
@@ -87,7 +87,7 @@ pub(crate) fn version_descriptor_snapshot_content(id: &str, name: &str, hidden: 
     .expect("lix_version_descriptor snapshot serialization must succeed")
 }
 
-pub(crate) fn parse_version_descriptor_snapshot(
+pub fn parse_version_descriptor_snapshot(
     snapshot_content: &str,
 ) -> Result<LixVersionDescriptor, LixError> {
     serde_json::from_str(snapshot_content).map_err(|error| LixError {
@@ -96,7 +96,7 @@ pub(crate) fn parse_version_descriptor_snapshot(
     })
 }
 
-pub(crate) fn version_ref_snapshot_content(id: &str, commit_id: &str) -> String {
+pub fn version_ref_snapshot_content(id: &str, commit_id: &str) -> String {
     serde_json::to_string(&LixVersionRef {
         id: id.to_string(),
         commit_id: commit_id.to_string(),
@@ -104,7 +104,7 @@ pub(crate) fn version_ref_snapshot_content(id: &str, commit_id: &str) -> String 
     .expect("lix_version_ref snapshot serialization must succeed")
 }
 
-pub(crate) fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
+pub fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
     let parsed: LixActiveVersion =
         serde_json::from_str(snapshot_content).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

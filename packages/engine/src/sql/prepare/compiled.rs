@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::PreparedStatement;
+use crate::contracts::PreparedStatement;
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
 

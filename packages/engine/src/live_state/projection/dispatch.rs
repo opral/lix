@@ -2,7 +2,7 @@ use crate::catalog::{
     CatalogDerivedRow, CatalogProjectionLifecycle, CatalogProjectionRegistry,
     RegisteredCatalogProjection,
 };
-use crate::contracts::artifacts::ReadTimeProjectionRead;
+use crate::contracts::ReadTimeProjectionRead;
 use crate::live_state::projection::hydration::hydrate_projection_input_with_backend;
 use crate::{LixBackend, LixError};
 

@@ -15,10 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
-use crate::contracts::artifacts::RowIdentity;
-use crate::contracts::change::TrackedChangeView;
+use crate::contracts::RowIdentity;
+use crate::contracts::TrackedChangeView;
 #[cfg(test)]
-pub(crate) use crate::contracts::traits::WriterKeyReadView;
+pub(crate) use crate::contracts::WriterKeyReadView;
 use crate::live_state::LiveRow;
 use crate::{LixBackend, LixError, Value};
 

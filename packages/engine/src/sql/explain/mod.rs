@@ -8,7 +8,7 @@ use crate::catalog::{
     RelationBindContext, RelationBinding, SurfaceBinding, SurfaceCapability, SurfaceFamily,
     SurfaceReadFreshness, SurfaceReadSemantics, SurfaceVariant,
 };
-use crate::contracts::artifacts::{
+use crate::contracts::{
     ChangeBatch, CommitPreconditions, DirectoryHistoryRequest, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PreparedExplainTemplate,

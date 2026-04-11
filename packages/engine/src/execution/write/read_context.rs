@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::contracts::artifacts::{
+use crate::contracts::{
     matches_constraints, BatchRowRequest, RowIdentity, ScanRequest, TrackedRow,
     TrackedTombstoneMarker, UntrackedRow,
 };
-use crate::contracts::traits::{
+use crate::contracts::{
     LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
 };
 use crate::LixError;

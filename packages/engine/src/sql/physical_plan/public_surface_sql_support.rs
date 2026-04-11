@@ -245,7 +245,7 @@ pub(crate) fn render_identifier(value: &str) -> String {
 }
 
 pub(crate) fn escape_sql_string(value: &str) -> String {
-    crate::common::text::escape_sql_string(value)
+    crate::common::escape_sql_string(value)
 }
 
 pub(crate) fn quote_ident(value: &str) -> String {

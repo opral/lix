@@ -136,7 +136,7 @@ fn classify_registry_surface_name(
 }
 
 fn is_internal_storage_relation_name(normalized_relation_name: &str) -> bool {
-    normalized_relation_name.starts_with(crate::common::naming::INTERNAL_RELATION_PREFIX)
+    normalized_relation_name.starts_with(crate::live_state::INTERNAL_RELATION_PREFIX)
         || builtin_internal_exact_relation_names()
             .iter()
             .any(|name| *name == normalized_relation_name)
@@ -160,7 +160,7 @@ mod tests {
     use crate::catalog::{
         entity_surface_descriptors, CatalogSource, DynamicEntitySurfaceSpec, SurfaceRegistry,
     };
-    use crate::common::naming::tracked_relation_name;
+    use crate::live_state::tracked_relation_name;
 
     use super::{
         builtin_internal_exact_relation_names, builtin_internal_relation_families,

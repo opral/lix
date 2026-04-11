@@ -28,10 +28,10 @@ use super::{
     load_exact_untracked_row_with_executor, scan_tracked_rows_with_backend,
     scan_tracked_tombstones_with_executor, RowIdentity,
 };
-use crate::contracts::version_artifacts::{
+use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{
     version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::schema::{schema_key_from_definition, SchemaKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

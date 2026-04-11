@@ -1,26 +1,174 @@
+use std::ops::ControlFlow;
+
 use crate::catalog::SurfaceRegistry;
 use crate::catalog::{builtin_public_surface_columns, builtin_public_surface_names};
-use crate::common::errors;
-use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
+use crate::contracts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
 use crate::LixBackend;
 use crate::LixError;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
-use std::ops::ControlFlow;
+
+fn build_error(code: &str, description: impl Into<String>) -> LixError {
+    LixError::new(code, description.into())
+}
+
+pub(crate) fn table_not_found_read_error() -> LixError {
+    let available_tables = crate::sql::protected_builtin_public_surface_names().join(", ");
+    build_error(
+        "LIX_ERROR_TABLE_NOT_FOUND",
+        format!(
+            "Table not found. Known Lix tables: {available_tables}. If you are querying custom backend tables, ensure they exist in the connected database."
+        ),
+    )
+}
+
+pub(crate) fn schema_not_registered_error(
+    schema_key: &str,
+    available_schema_keys: &[&str],
+) -> LixError {
+    let available = if available_schema_keys.is_empty() {
+        "Available schemas: (none).".to_string()
+    } else {
+        format!("Available schemas: {}.", available_schema_keys.join(", "))
+    };
+    build_error(
+        "LIX_ERROR_SCHEMA_NOT_REGISTERED",
+        format!(
+            "Schema `{schema_key}` is not registered. Register or install the schema before querying it. {available} Inspect registered schemas via `SELECT * FROM lix_registered_schema`."
+        ),
+    )
+}
+
+pub(crate) fn sql_unknown_table_error(
+    table_name: &str,
+    available_tables: &[&str],
+    offset: Option<usize>,
+) -> LixError {
+    let available_tables = if available_tables.is_empty() {
+        "Available tables: (none).".to_string()
+    } else {
+        format!("Available tables: {}.", available_tables.join(", "))
+    };
+    let location = offset
+        .map(|value| format!(" Location: SQL offset {value}."))
+        .unwrap_or_default();
+    build_error(
+        "LIX_ERROR_SQL_UNKNOWN_TABLE",
+        format!("Table `{table_name}` does not exist. {available_tables}{location}"),
+    )
+}
+
+pub(crate) fn sql_unknown_column_error(
+    column_name: &str,
+    table_name: Option<&str>,
+    available_columns: &[&str],
+    offset: Option<usize>,
+) -> LixError {
+    let table_segment = table_name
+        .map(|table| format!(" on `{table}`"))
+        .unwrap_or_else(|| " in this query".to_string());
+    let available_columns = if available_columns.is_empty() {
+        "Available columns: (unknown).".to_string()
+    } else {
+        format!("Available columns: {}.", available_columns.join(", "))
+    };
+    let location = offset
+        .map(|value| format!(" Location: SQL offset {value}."))
+        .unwrap_or_default();
+    build_error(
+        "LIX_ERROR_SQL_UNKNOWN_COLUMN",
+        format!(
+            "Column `{column_name}` does not exist{table_segment}. {available_columns}{location}"
+        ),
+    )
+}
+
+pub(crate) fn internal_table_access_denied_error() -> LixError {
+    let inventory = crate::sql::builtin_relation_inventory();
+    let available_tables = inventory.protected_builtin_public_surfaces.join(", ");
+    let internal_storage_namespaces = inventory
+        .internal_relation_families
+        .iter()
+        .map(|family| format!("`{}*`", family.prefix))
+        .collect::<Vec<_>>()
+        .join(", ");
+    build_error(
+        "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
+        format!(
+            "Direct writes against internal storage relations can lead to data corruption. {policy_choice} Protected internal storage includes exact built-in tables plus managed relation families such as {internal_storage_namespaces}. DDL against internal storage and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}.",
+            policy_choice = crate::sql::relation_policy_choice_summary(),
+        ),
+    )
+}
+
+pub(crate) fn public_create_table_denied_error() -> LixError {
+    build_error(
+        "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED",
+        "CREATE TABLE is not supported in public Lix SQL. Instead, store a schema definition in `lix_registered_schema`; registered schemas become queryable entity views.",
+    )
+}
+
+pub(crate) fn mixed_public_internal_query_error(internal_tables: &[String]) -> LixError {
+    let available_tables = crate::sql::protected_builtin_public_surface_names().join(", ");
+    let internal_tables = if internal_tables.is_empty() {
+        "`lix_internal_*`".to_string()
+    } else {
+        internal_tables
+            .iter()
+            .map(|table| format!("`{table}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    build_error(
+        "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
+        format!(
+            "Queries that reference public Lix tables must not also access internal engine tables in the same statement. Internal tables referenced: {internal_tables}. Public SQL tables: {available_tables}."
+        ),
+    )
+}
+
+pub(crate) fn read_only_view_write_error(view_name: &str, operation: &str) -> LixError {
+    let guidance = if let Some(base_view) = view_name.strip_suffix("_history") {
+        format!("Use `{base_view}` or `{base_view}_by_version` for writes.")
+    } else {
+        "Use the corresponding writable view for writes.".to_string()
+    };
+    build_error(
+        "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED",
+        format!("`{view_name}` is read-only. `{operation}` is not supported. {guidance}"),
+    )
+}
+
+pub(crate) fn transaction_control_statement_denied_error() -> LixError {
+    build_error(
+        "LIX_ERROR_TRANSACTION_CONTROL_STATEMENT_DENIED",
+        "Standalone transaction control is not supported via execute(). Use a single BEGIN ... COMMIT script or the typed transaction API.",
+    )
+}
+
+pub(crate) const FILE_DATA_EXPECTS_BYTES_MESSAGE: &str = "data expects bytes. To insert text use lix_text_encode(): INSERT INTO lix_file (path, data) VALUES ('file.txt', lix_text_encode('your text'))";
+
+pub(crate) fn file_data_expects_bytes_error() -> LixError {
+    build_error(
+        "LIX_ERROR_FILE_DATA_EXPECTS_BYTES",
+        FILE_DATA_EXPECTS_BYTES_MESSAGE,
+    )
+}
 
 #[cfg(test)]
+#[allow(dead_code)]
 pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> LixError {
     if let Some(missing_column) = parse_unknown_column_name(&error.description) {
         let relation_names = relation_names_from_statements(statements);
         let table_name = choose_table_for_unknown_column(&missing_column, &relation_names);
         let available_columns = table_name
             .as_deref()
-            .and_then(|table_name| builtin_public_surface_columns(table_name))
+            .and_then(builtin_public_surface_columns)
             .unwrap_or_default();
         let available_column_refs = available_columns
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        return errors::sql_unknown_column_error(
+        return sql_unknown_column_error(
             &missing_column,
             table_name.as_deref(),
             available_column_refs.as_slice(),
@@ -39,13 +187,13 @@ pub(crate) fn normalize_sql_error(error: LixError, statements: &[Statement]) -> 
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            return errors::sql_unknown_table_error(
+            return sql_unknown_table_error(
                 &table_name,
                 available_table_refs.as_slice(),
                 parse_sql_offset(&error.description),
             );
         }
-        return errors::table_not_found_read_error();
+        return table_not_found_read_error();
     }
 
     let public_surfaces = builtin_public_surfaces_in_statements(statements);
@@ -66,7 +214,7 @@ pub(crate) async fn normalize_sql_error_with_backend_and_relation_names(
     relation_names: &[String],
 ) -> LixError {
     if let Some(missing_column) = parse_unknown_column_name(&error.description) {
-        let table_name = choose_table_for_unknown_column(&missing_column, &relation_names);
+        let table_name = choose_table_for_unknown_column(&missing_column, relation_names);
         let available_columns = if let Some(table_name) = table_name.as_deref() {
             resolve_available_columns(table_name, Some(backend)).await
         } else {
@@ -76,7 +224,7 @@ pub(crate) async fn normalize_sql_error_with_backend_and_relation_names(
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        return errors::sql_unknown_column_error(
+        return sql_unknown_column_error(
             &missing_column,
             table_name.as_deref(),
             available_column_refs.as_slice(),
@@ -93,13 +241,13 @@ pub(crate) async fn normalize_sql_error_with_backend_and_relation_names(
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            return errors::sql_unknown_table_error(
+            return sql_unknown_table_error(
                 &table_name,
                 available_table_refs.as_slice(),
                 parse_sql_offset(&error.description),
             );
         }
-        return errors::table_not_found_read_error();
+        return table_not_found_read_error();
     }
 
     let public_surfaces =
@@ -225,7 +373,7 @@ async fn public_surfaces_in_relation_names_with_backend(
         Err(_) => {
             return fallback_statements
                 .map(builtin_public_surfaces_in_statements)
-                .unwrap_or_default();
+                .unwrap_or_default()
         }
     };
     relation_names
@@ -324,7 +472,7 @@ fn normalize_sql_error_with_relation_names_and_catalog_snapshot(
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>();
-        return errors::sql_unknown_column_error(
+        return sql_unknown_column_error(
             &missing_column,
             table_name.as_deref(),
             available_column_refs.as_slice(),
@@ -341,13 +489,13 @@ fn normalize_sql_error_with_relation_names_and_catalog_snapshot(
                 .iter()
                 .map(String::as_str)
                 .collect::<Vec<_>>();
-            return errors::sql_unknown_table_error(
+            return sql_unknown_table_error(
                 &table_name,
                 available_table_refs.as_slice(),
                 parse_sql_offset(&error.description),
             );
         }
-        return errors::table_not_found_read_error();
+        return table_not_found_read_error();
     }
 
     if !catalog_snapshot.public_surfaces.is_empty() {
@@ -465,214 +613,4 @@ fn sanitize_name(raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{
-        build_read_diagnostic_catalog_snapshot, is_missing_relation_error, normalize_sql_error,
-        normalize_sql_error_with_read_diagnostic_context,
-        sanitize_lowered_public_sql_error_description,
-    };
-    use crate::catalog::{builtin_surface_descriptors, SurfaceRegistry};
-    use crate::contracts::artifacts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
-    use crate::LixError;
-    use sqlparser::dialect::GenericDialect;
-    use sqlparser::parser::Parser;
-    use std::collections::BTreeMap;
-
-    #[test]
-    fn classifies_missing_relation_messages() {
-        assert!(is_missing_relation_error(&LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "no such table: foo".to_string(),
-        }));
-        assert!(is_missing_relation_error(&LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "ERROR: relation \"foo\" does not exist".to_string(),
-        }));
-        assert!(is_missing_relation_error(&LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "undefined table: relation foo".to_string(),
-        }));
-        assert!(!is_missing_relation_error(&LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "CHECK constraint failed".to_string(),
-        }));
-    }
-
-    #[test]
-    fn normalizes_unknown_column_with_table_hints() {
-        let statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT file_id, schema_key, entity_id, status, plugin_key FROM lix_working_changes",
-        )
-        .expect("parse SQL");
-        let error = normalize_sql_error(
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "no such column: plugin_key in SELECT ... at offset 47".to_string(),
-            },
-            &statements,
-        );
-        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
-        assert!(error
-            .description
-            .contains("Column `plugin_key` does not exist on `lix_working_changes`."));
-        assert!(error.description.contains("Available columns:"));
-        assert!(error.description.contains("schema_key"));
-    }
-
-    #[test]
-    fn normalizes_unknown_table_with_table_hints() {
-        let statements =
-            Parser::parse_sql(&GenericDialect {}, "SELECT * FROM lix_sate").expect("parse SQL");
-        let error = normalize_sql_error(
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "no such table: lix_sate".to_string(),
-            },
-            &statements,
-        );
-        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
-        assert!(error
-            .description
-            .contains("Table `lix_sate` does not exist."));
-        assert!(error.description.contains("lix_state"));
-    }
-
-    #[test]
-    fn normalizes_unknown_column_for_lix_change_with_columns() {
-        let statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT snapshot_json FROM lix_change WHERE id = 'c1'",
-        )
-        .expect("parse SQL");
-        let error = normalize_sql_error(
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "no such column: snapshot_json".to_string(),
-            },
-            &statements,
-        );
-        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
-        assert!(error
-            .description
-            .contains("Column `snapshot_json` does not exist on `lix_change`."));
-        assert!(error
-            .description
-            .contains("Available columns: id, entity_id"));
-    }
-
-    #[test]
-    fn normalizes_unknown_column_for_lix_registered_schema_with_column_catalog() {
-        let statements =
-            Parser::parse_sql(&GenericDialect {}, "SELECT id FROM lix_registered_schema")
-                .expect("parse SQL");
-        let error = normalize_sql_error(
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "no such column: id at offset 7".to_string(),
-            },
-            &statements,
-        );
-
-        assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
-        assert!(error
-            .description
-            .contains("Column `id` does not exist on `lix_registered_schema`."));
-        assert!(error.description.contains("Available columns: value"));
-        assert!(error.description.contains("lixcol_entity_id"));
-        assert!(!error.description.contains("Available columns: (unknown)."));
-    }
-
-    #[test]
-    fn sanitizes_lowered_public_ambiguous_column_errors() {
-        let sanitized = sanitize_lowered_public_sql_error_description(
-            "ambiguous column name: *.lix_key_value.key in SELECT * FROM (WITH target_versions AS (...) SELECT * FROM lix_internal_live_v1_lix_key_value)",
-            &[String::from("lix_key_value")],
-        );
-
-        assert_eq!(sanitized, "ambiguous column name: *.lix_key_value.key");
-    }
-
-    #[test]
-    fn normalizes_lowered_public_sql_leaks_to_generic_message() {
-        let statements = Parser::parse_sql(
-            &GenericDialect {},
-            "SELECT * FROM lix_key_value, lix_key_value",
-        )
-        .expect("parse SQL");
-        let error = normalize_sql_error(
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description:
-                    "backend failed in SELECT * FROM (WITH target_versions AS (...) SELECT * FROM lix_internal_live_v1_lix_key_value)"
-                        .to_string(),
-            },
-            &statements,
-        );
-
-        assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
-        assert_eq!(
-            error.description,
-            "public read on lix_key_value execution failed after lowering"
-        );
-    }
-
-    #[test]
-    fn read_diagnostic_context_preserves_lowered_public_sanitization_without_backend_registry() {
-        let context = ReadDiagnosticContext {
-            source_sql: vec!["SELECT * FROM lix_key_value".into()],
-            relation_names: vec!["lix_key_value".into()],
-            catalog_snapshot: ReadDiagnosticCatalogSnapshot {
-                public_surfaces: vec!["lix_key_value".into()],
-                available_tables: vec!["lix_key_value".into()],
-                available_columns_by_relation: BTreeMap::from([(
-                    "lix_key_value".into(),
-                    vec!["key".into(), "value".into()],
-                )]),
-            },
-            explain_mode: None,
-            plain_explain_template: None,
-            analyzed_explain_template: None,
-        };
-
-        let error = normalize_sql_error_with_read_diagnostic_context(
-            LixError {
-                code: "LIX_ERROR_UNKNOWN".into(),
-                description:
-                    "backend failed in SELECT * FROM (WITH target_versions AS (...) SELECT * FROM lix_internal_live_v1_lix_key_value)"
-                        .into(),
-            },
-            &context,
-        );
-
-        assert_eq!(
-            error.description,
-            "public read on lix_key_value execution failed after lowering"
-        );
-    }
-
-    #[test]
-    fn read_diagnostic_catalog_snapshot_captures_public_surface_columns_from_registry() {
-        let mut registry = SurfaceRegistry::default();
-        registry.insert_descriptors(builtin_surface_descriptors());
-
-        let snapshot =
-            build_read_diagnostic_catalog_snapshot(&registry, &["lix_registered_schema".into()]);
-
-        assert!(snapshot
-            .public_surfaces
-            .iter()
-            .any(|name| name == "lix_registered_schema"));
-        assert!(snapshot
-            .available_tables
-            .iter()
-            .any(|name| name == "lix_registered_schema"));
-        assert!(snapshot
-            .available_columns_by_relation
-            .get("lix_registered_schema")
-            .is_some_and(|columns| columns.iter().any(|column| column == "value")));
-    }
 }

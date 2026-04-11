@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{
+use crate::contracts::{
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
 };
 use crate::execution::write::filesystem::runtime::{
