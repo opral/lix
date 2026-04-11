@@ -1615,8 +1615,8 @@ fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
         "live_state",
         "schema",
     ]
-        .into_iter()
-        .collect()
+    .into_iter()
+    .collect()
 }
 
 fn violations_for_sealed_owners(

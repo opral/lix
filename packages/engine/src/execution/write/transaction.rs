@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::backend::{
-    LixBackend, LixBackendTransaction, QueryExecutor,
     execute_write_program_with_transaction as execute_backend_write_program_with_transaction,
+    LixBackend, LixBackendTransaction, QueryExecutor,
 };
 use crate::catalog::FilesystemProjectionScope;
 use crate::common::NormalizedDirectoryPath;

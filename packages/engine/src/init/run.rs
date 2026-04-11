@@ -24,8 +24,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     async fn load_checkpoint_version_heads_for_init(
         &mut self,
     ) -> Result<Vec<crate::canonical::CheckpointVersionHeadFact>, LixError> {
-        let mut backend =
-            crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
+        let mut backend = crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
         Ok(
             crate::session::version_ops::descriptors::load_checkpoint_version_heads_with_executor(
                 &mut backend,
