@@ -253,21 +253,19 @@ impl crate::contracts::ReadExecutionBindings for BuiltinReadExecutionBindings {
         backend: &dyn LixBackend,
         artifact: &crate::contracts::ReadTimeProjectionRead,
     ) -> Result<Vec<crate::contracts::ReadTimeProjectionRow>, LixError> {
-        Ok(
-            crate::live_state::derive_read_time_surface_rows(
-                backend,
-                crate::catalog::builtin_catalog_projection_registry(),
-                artifact,
-            )
-            .await?
-            .into_iter()
-            .map(|row| crate::contracts::ReadTimeProjectionRow {
-                surface_name: row.surface_name,
-                identity: row.identity,
-                values: row.values,
-            })
-            .collect(),
+        Ok(crate::live_state::derive_read_time_surface_rows(
+            backend,
+            crate::catalog::builtin_catalog_projection_registry(),
+            artifact,
         )
+        .await?
+        .into_iter()
+        .map(|row| crate::contracts::ReadTimeProjectionRow {
+            surface_name: row.surface_name,
+            identity: row.identity,
+            values: row.values,
+        })
+        .collect())
     }
 }
 

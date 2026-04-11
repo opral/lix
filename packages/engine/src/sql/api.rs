@@ -9,7 +9,9 @@ use std::time::Duration;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::artifacts::{ChangeBatch, PreparedExplainMode, PreparedExplainTemplate};
+use crate::contracts::{
+    ChangeBatch, PreparedExplainMode, PreparedExplainTemplate, StateCommitStreamFilter,
+};
 use crate::{LixError, SqlDialect, Value};
 
 pub(crate) use super::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
@@ -178,7 +180,7 @@ pub(crate) fn derive_dependency_spec(
 /// filter for observe/session invalidation workflows.
 pub(crate) fn dependency_spec_to_state_commit_stream_filter(
     spec: &DependencySpec,
-) -> crate::contracts::state_commit_stream::StateCommitStreamFilter {
+) -> StateCommitStreamFilter {
     super::prepare::dependency_spec::dependency_spec_to_state_commit_stream_filter(spec)
 }
 

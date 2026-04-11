@@ -1,5 +1,5 @@
 use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
-use crate::contracts::artifacts::ReadTimeProjectionRead;
+use crate::contracts::ReadTimeProjectionRead;
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::logical_plan::public_ir::{
