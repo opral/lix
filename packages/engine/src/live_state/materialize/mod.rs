@@ -20,7 +20,6 @@ pub use types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 
-use crate::backend::TransactionBackendAdapter;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub async fn rebuild_plan(
@@ -34,7 +33,7 @@ pub(crate) async fn rebuild_plan_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
-    let mut executor = TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::backend::transaction_backend_view(transaction);
     plan::live_state_rebuild_plan_with_executor(&mut executor, req).await
 }
 

@@ -1,8 +1,8 @@
-use crate::backend::storage_sql::tables;
 use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE, INTERNAL_BINARY_FILE_VERSION_REF,
 };
+use crate::catalog::state_by_version_relation_name;
 use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 
 #[async_trait::async_trait(?Send)]
@@ -86,7 +86,7 @@ async fn state_by_version_relation_exists_in_transaction(
                      WHERE name = $1 \
                        AND type IN ('table', 'view') \
                      LIMIT 1",
-                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
+                    &[Value::Text(state_by_version_relation_name().to_string())],
                 )
                 .await?;
             Ok(!result.rows.is_empty())
@@ -100,7 +100,7 @@ async fn state_by_version_relation_exists_in_transaction(
                      WHERE n.nspname = current_schema() \
                        AND c.relname = $1 \
                      LIMIT 1",
-                    &[Value::Text(tables::state::STATE_BY_VERSION.to_string())],
+                    &[Value::Text(state_by_version_relation_name().to_string())],
                 )
                 .await?;
             Ok(!result.rows.is_empty())
@@ -132,7 +132,7 @@ fn delete_unreferenced_binary_file_version_ref_sql(state_blob_hash_expr: &str) -
                AND r.version_id = {}.version_id \
                AND r.blob_hash = {}.blob_hash\
         )",
-        tables::state::STATE_BY_VERSION,
+        state_by_version_relation_name(),
         INTERNAL_BINARY_FILE_VERSION_REF,
         INTERNAL_BINARY_FILE_VERSION_REF,
         INTERNAL_BINARY_FILE_VERSION_REF,
@@ -155,7 +155,7 @@ fn delete_unreferenced_binary_blob_manifest_chunk_sql(state_blob_hash_expr: &str
              FROM referenced r \
              WHERE r.blob_hash = {}.blob_hash\
         )",
-        tables::state::STATE_BY_VERSION,
+        state_by_version_relation_name(),
         INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,
         INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,
     )
@@ -195,7 +195,7 @@ fn delete_unreferenced_binary_blob_manifest_sql(state_blob_hash_expr: &str) -> S
              FROM {} mc \
              WHERE mc.blob_hash = {}.blob_hash\
         )",
-        tables::state::STATE_BY_VERSION,
+        state_by_version_relation_name(),
         INTERNAL_BINARY_BLOB_MANIFEST,
         INTERNAL_BINARY_BLOB_MANIFEST,
         INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,

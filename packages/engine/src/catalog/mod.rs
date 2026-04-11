@@ -23,6 +23,8 @@ pub(crate) use api::{builtin_catalog_compiler_facade, CatalogCompilerApi, Catalo
 
 #[allow(unused_imports)]
 pub(crate) use registry::*;
+#[allow(unused_imports)]
+pub(crate) use state::state_by_version_relation_name;
 
 #[allow(unused_imports)]
 pub(crate) use binding::{

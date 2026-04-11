@@ -4,7 +4,6 @@ use std::sync::{Arc, RwLock};
 use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
-use crate::backend::TransactionBackendAdapter;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::common::escape_sql_string;
 use crate::contracts::parse_active_version_snapshot;
@@ -509,7 +508,7 @@ async fn tracked_live_rows_for_writer_key_updates(
     transaction: &mut dyn LixBackendTransaction,
     updates: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<Vec<crate::live_state::LiveRow>, LixError> {
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     let mut rows = Vec::with_capacity(updates.len());
     for (row_identity, writer_key) in updates {
         let row = crate::live_state::load_exact_live_row(

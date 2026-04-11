@@ -10,7 +10,6 @@ use crate::live_state::{
     rebuild_scope_in_transaction, try_claim_bootstrap_with_backend, LiveStateMode,
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
-use crate::runtime::TransactionBackendAdapter;
 use crate::session::checkpoint_ops;
 use crate::session::observe;
 use crate::session::version_ops;
@@ -20,6 +19,27 @@ use crate::{Lix, LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;
 use super::InitExecutor;
+
+impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
+    async fn load_checkpoint_version_heads_for_init(
+        &mut self,
+    ) -> Result<Vec<crate::canonical::CheckpointVersionHeadFact>, LixError> {
+        let mut backend =
+            crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
+        Ok(
+            crate::session::version_ops::descriptors::load_checkpoint_version_heads_with_executor(
+                &mut backend,
+            )
+            .await?
+            .into_iter()
+            .map(|head| crate::canonical::CheckpointVersionHeadFact {
+                version_id: head.version_id,
+                head_commit_id: head.head_commit_id,
+            })
+            .collect(),
+        )
+    }
+}
 
 pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
     lix.try_mark_init_in_progress()?;
@@ -36,7 +56,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
     let mut claimed_bootstrap = false;
     let init_result = async {
         {
-            let backend = TransactionBackendAdapter::new(transaction.as_mut());
+            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
             prepare_backend_for_init(&backend)
                 .await
                 .map_err(|error| init_step_error("prepare_backend_for_init", error))?;
@@ -69,7 +89,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
                 .map_err(|error| init_step_error("workspace::init", error))?;
         }
         {
-            let backend = TransactionBackendAdapter::new(transaction.as_mut());
+            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
             if !try_claim_bootstrap_with_backend(&backend).await? {
                 return Err(crate::common::already_initialized_error());
             }
@@ -90,25 +110,15 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
         canonical::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("canonical::seed_bootstrap", error))?;
-        let checkpoint_version_heads = {
-            let mut backend = init.backend_adapter();
-            crate::session::version_ops::descriptors::load_checkpoint_version_heads_with_executor(
-                &mut backend,
-            )
+        let checkpoint_version_heads = init
+            .load_checkpoint_version_heads_for_init()
             .await
             .map_err(|error| {
                 init_step_error(
                     "session::version_ops::load_checkpoint_version_heads_with_executor",
                     error,
                 )
-            })?
-            .into_iter()
-            .map(|head| crate::canonical::CheckpointVersionHeadFact {
-                version_id: head.version_id,
-                head_commit_id: head.head_commit_id,
-            })
-            .collect::<Vec<_>>()
-        };
+            })?;
         canonical::seed_checkpoint_labels_bootstrap(&mut init, &checkpoint_version_heads)
             .await
             .map_err(|error| {
@@ -125,7 +135,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
             .map_err(|error| init_step_error("persist_runtime_state", error))?;
         drop(init);
         {
-            let backend = TransactionBackendAdapter::new(transaction.as_mut());
+            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
             mark_mode_with_backend(&backend, LiveStateMode::Rebuilding)
                 .await
                 .map_err(|error| init_step_error("mark_live_state_rebuilding", error))?;
@@ -141,7 +151,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
         .await
         .map_err(|error| init_step_error("live_state::rebuild_scope_in_transaction", error))?;
         {
-            let backend = TransactionBackendAdapter::new(transaction.as_mut());
+            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
             let cursor = load_latest_live_state_replay_cursor_with_backend(&backend)
                 .await?
                 .ok_or_else(|| {

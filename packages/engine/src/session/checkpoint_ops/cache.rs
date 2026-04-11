@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::backend::ddl::execute_ddl_batch;
+use crate::backend::execute_ddl_batch;
 use crate::common::escape_sql_string;
 use crate::contracts::{ChangeBatch, PreparedPublicWriteArtifact, PreparedWriteOperationKind};
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};

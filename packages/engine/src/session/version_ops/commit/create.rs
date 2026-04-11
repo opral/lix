@@ -398,7 +398,7 @@ pub(crate) async fn create_commit(
         .map_err(backend_error)?;
     let deterministic_sequence_highest_seen =
         functions.deterministic_sequence_persist_highest_seen();
-    let mut write_program = crate::backend::program::WriteProgram::new();
+    let mut write_program = crate::backend::WriteProgram::new();
     write_program.push_statement(insert_idempotency_row_sql(&idempotency_write), Vec::new());
     if let Some(highest_seen) = deterministic_sequence_highest_seen {
         write_program.push_statement(

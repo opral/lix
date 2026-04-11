@@ -40,21 +40,16 @@ pub use schema::{
 
 pub use api::BootKeyValue;
 pub use api::{InitResult, Lix, LixConfig};
-pub use backend::prepared::{PreparedBatch, PreparedStatement};
-pub use backend::LixBackend;
-pub use backend::LixBackendTransaction;
-pub use canonical::json::CanonicalJson;
-pub use common::dialect::SqlDialect;
-pub use common::error::LixError;
-pub use common::identity::{
+pub use backend::{LixBackend, LixBackendTransaction, PreparedBatch, PreparedStatement};
+pub use canonical::CanonicalJson;
+pub use common::LixError;
+pub use common::SqlDialect;
+pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
-pub use common::types::{ExecuteResult, QueryResult, Value};
-pub use common::wire::{WireQueryResult, WireValue};
-pub use contracts::artifacts::CommittedVersionFrontier;
-pub use contracts::artifacts::ExecuteOptions;
-pub use contracts::transaction_mode::TransactionMode;
-pub use contracts::ReplayCursor;
+pub use common::{ExecuteResult, QueryResult, Value};
+pub use common::{WireQueryResult, WireValue};
+pub use contracts::{CommittedVersionFrontier, ExecuteOptions, ReplayCursor, TransactionMode};
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,

@@ -1,4 +1,3 @@
-use crate::backend::TransactionBackendAdapter;
 use crate::catalog::SurfaceReadFreshness;
 use crate::contracts::ReadExecutionBindings;
 use crate::contracts::{LiveStateQueryBackend, PendingPublicReadTransaction};
@@ -18,7 +17,7 @@ pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     artifact: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
     ensure_surface_read_freshness_in_transaction(transaction, artifact).await?;
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     execute_prepared_public_read_artifact_without_freshness_check_with_backend(
         &backend, bindings, artifact,
     )
@@ -187,7 +186,7 @@ async fn ensure_surface_read_freshness_in_transaction(
         return Ok(());
     }
 
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     let status = (&backend as &dyn crate::LixBackend)
         .load_live_state_projection_status()
         .await?;

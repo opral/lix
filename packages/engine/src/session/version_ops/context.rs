@@ -1,5 +1,4 @@
 use crate::backend::{LixBackend, QueryExecutor};
-use crate::runtime::TransactionBackendAdapter;
 use crate::session::version_ops::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
     CreateCommitWriteLane,
@@ -181,7 +180,7 @@ pub(crate) async fn require_target_version_context_in_transaction(
 ) -> Result<VersionContext, LixError> {
     let target =
         resolve_target_version_in_transaction(tx, requested_version_id, field_name).await?;
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let mut executor = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
     require_version_context_with_executor(&mut executor, target, subject).await
 }
 
@@ -261,7 +260,7 @@ pub(crate) async fn require_version_context_pair_in_transaction(
     let target =
         resolve_target_version_in_transaction(tx, Some(target_version_id), target_field_name)
             .await?;
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let mut executor = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
     let source_context =
         require_version_context_with_executor(&mut executor, source, "source version").await?;
     let target_context =

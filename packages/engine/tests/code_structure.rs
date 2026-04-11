@@ -1207,6 +1207,8 @@ fn production_source_files() -> Vec<(String, String)> {
     let top_level_modules = parse_top_level_modules(&lib_source);
     let mut files = Vec::new();
 
+    files.push(("lib.rs".to_string(), strip_test_code(&lib_source)));
+
     for module_name in top_level_modules {
         for absolute_path in rust_files_for_top_level_module(&module_name) {
             let relative_path = absolute_path
@@ -1604,6 +1606,7 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
     [
+        "backend",
         "canonical",
         "catalog",
         "common",
@@ -1671,9 +1674,12 @@ fn sealed_owner_import_rule_lists_current_violations() {
     let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
     let expected = fs::read_to_string(&snapshot_path).unwrap_or_default();
 
-    if actual != expected {
-        fs::write(&snapshot_path, &actual).expect("sealed-owner snapshot should be writable");
-    }
+    assert_eq!(
+        actual, expected,
+        "sealed-owner snapshot drifted.\n\nReview the current violations and update `{}` intentionally.\n\nCurrent violations:\n{}",
+        SEALED_OWNER_SNAPSHOT_PATH,
+        actual
+    );
 }
 
 #[test]

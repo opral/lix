@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, VecDeque};
 
+use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, resolve_merge_base, CanonicalStateIdentity,
     CanonicalStateRow,
@@ -12,7 +13,6 @@ use crate::live_state::{
 };
 use crate::runtime::functions::LixFunctionProvider;
 use crate::runtime::streams::{StateCommitStreamChange, StateCommitStreamOperation};
-use crate::runtime::TransactionBackendAdapter;
 use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
@@ -135,7 +135,7 @@ async fn merge_version_in_transaction(
     let source_head = pair.source.head_commit_id().to_string();
     let target_head = pair.target.head_commit_id().to_string();
 
-    let mut executor = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let mut executor = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
 
     let merge_base_commit_id =
         resolve_merge_base(&mut executor, &source_head, &target_head).await?;
@@ -300,7 +300,7 @@ async fn merge_version_in_transaction(
     let active_account_ids = tx.context.active_account_ids.clone();
     let (target_head_after_commit_id, created_merge_commit_id, receipt) = {
         let transaction = tx.backend_transaction_mut()?;
-        let backend = TransactionBackendAdapter::new(transaction);
+        let backend = crate::backend::transaction_backend_view(transaction);
         let (_settings, functions) = collaborators
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
@@ -364,7 +364,7 @@ async fn merge_version_in_transaction(
 }
 
 async fn collect_candidate_entities(
-    executor: &mut TransactionBackendAdapter<'_>,
+    executor: &mut dyn QueryExecutor,
     head_commit_id: &str,
     stop_at_commit_id: Option<&str>,
 ) -> Result<BTreeSet<EntityKey>, LixError> {
@@ -404,7 +404,7 @@ async fn collect_candidate_entities(
 }
 
 async fn load_visible_entity_state_at_commit(
-    executor: &mut TransactionBackendAdapter<'_>,
+    executor: &mut dyn QueryExecutor,
     head_commit_id: Option<&str>,
     entity: &EntityKey,
 ) -> Result<Option<(VisibleEntityState, CanonicalStateRow)>, LixError> {

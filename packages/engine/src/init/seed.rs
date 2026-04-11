@@ -6,7 +6,6 @@ use crate::live_state::{
     write_live_rows, LiveRow,
 };
 use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::TransactionBackendAdapter;
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
@@ -80,10 +79,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .await
     }
 
-    pub(crate) fn backend_adapter(&mut self) -> TransactionBackendAdapter<'_> {
-        TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut())
-    }
-
     pub(crate) fn backend_transaction_mut(
         &mut self,
     ) -> Result<&mut dyn LixBackendTransaction, LixError> {
@@ -128,7 +123,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(runtime_state);
         }
         let backend =
-            TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
+            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
         let (settings, functions) = self
             .lix
             .prepare_runtime_functions_with_backend(&backend)
@@ -141,7 +136,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
     pub(crate) async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {
         let mut backend =
-            TransactionBackendAdapter::new(self.write_transaction.backend_transaction_mut());
+            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
         if let Some(commit_id) =
             load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         {
@@ -176,7 +171,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn load_global_version_commit_id(&mut self) -> Result<String, LixError> {
-        let mut backend = self.backend_adapter();
+        let mut backend =
+            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
         let Some(commit_id) =
             load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         else {
@@ -187,6 +183,19 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             });
         };
         Ok(commit_id)
+    }
+
+    pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<Option<String>, LixError> {
+        let mut backend =
+            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
+        crate::canonical::resolve_last_checkpoint_commit_id_for_tip_with_executor(
+            &mut backend,
+            commit_id,
+        )
+        .await
     }
 
     pub(crate) async fn insert_bootstrap_key_value(

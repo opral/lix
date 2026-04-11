@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
-use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::canonical::journal::CanonicalCommitOutput;
 use crate::canonical::read::CommitQueryExecutor;
 use crate::Value as EngineValue;

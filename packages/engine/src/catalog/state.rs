@@ -6,6 +6,10 @@ use crate::catalog::{
     SurfaceResolutionCapabilities, SurfaceTraits, SurfaceVariant,
 };
 
+pub(crate) fn state_by_version_relation_name() -> &'static str {
+    "lix_state_by_version"
+}
+
 pub(crate) fn state_surface_descriptor(name: &str, variant: SurfaceVariant) -> SurfaceDescriptor {
     let (default_scope, capability, exposes_version_column, exposes_history_columns) = match variant
     {

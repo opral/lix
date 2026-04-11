@@ -29,6 +29,6 @@ pub(crate) async fn persist_resolved_binary_blob_writes_in_transaction(
 pub(crate) fn build_binary_blob_fastcdc_write_program(
     dialect: SqlDialect,
     payloads: &[BinaryBlobWriteInput<'_>],
-) -> Result<crate::backend::program::WriteProgram, LixError> {
+) -> Result<crate::backend::WriteProgram, LixError> {
     crate::binary_cas::write::build_binary_blob_fastcdc_write_program(dialect, payloads)
 }

@@ -8,7 +8,6 @@ use crate::canonical::{
 use crate::contracts::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::runtime::functions::LixFunctionProvider;
-use crate::runtime::TransactionBackendAdapter;
 use crate::session::version_ops::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };
@@ -398,7 +397,7 @@ async fn checkpoint_runtime_state(
     }
 
     let collaborators = tx.collaborators();
-    let backend = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
     let runtime_state = collaborators
         .prepare_execution_runtime_state(&backend)
         .await?;
@@ -428,7 +427,7 @@ async fn ensure_version_exists_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<(), LixError> {
-    let mut executor = TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::backend::transaction_backend_view(transaction);
     crate::session::version_ops::context::ensure_version_exists_with_executor(
         &mut executor,
         version_id,
@@ -440,7 +439,7 @@ async fn rebuild_semantic_undo_redo_stacks(
     transaction: &mut dyn LixBackendTransaction,
     version_id: &str,
 ) -> Result<SemanticUndoRedoStacks, LixError> {
-    let mut executor = TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::backend::transaction_backend_view(transaction);
     let Some(version_context) = load_version_context_with_executor(
         &mut executor,
         ResolvedVersionTarget {
@@ -624,7 +623,7 @@ async fn load_target_commit_change_effects(
     _version_id: &str,
     target_commit_id: &str,
 ) -> Result<Vec<TargetCommitChangeEffect>, LixError> {
-    let mut executor = TransactionBackendAdapter::new(transaction);
+    let mut executor = crate::backend::transaction_backend_view(transaction);
     let Some(target_commit) = load_commit(&mut executor, target_commit_id).await? else {
         return Err(LixError::unknown(format!(
             "target commit '{}' is missing",

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::backend::ddl::execute_ddl_batch;
+use crate::backend::execute_ddl_batch;
 use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::live_state::tracked::{
     load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
