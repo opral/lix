@@ -57,12 +57,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         for version_head in version_heads {
             let version_id = version_head.version_id.as_str();
             let commit_id = version_head.head_commit_id.as_str();
-            let checkpoint_commit_id = {
-                let mut backend = self.backend_adapter();
-                resolve_last_checkpoint_commit_id_for_tip_with_executor(&mut backend, &commit_id)
-                    .await?
-            }
-            .unwrap_or_else(|| commit_id.to_string());
+            let checkpoint_commit_id = self
+                .resolve_last_checkpoint_commit_id_for_tip(commit_id)
+                .await?
+                .unwrap_or_else(|| commit_id.to_string());
             self.insert_last_checkpoint_for_version(version_id, &checkpoint_commit_id)
                 .await?;
         }

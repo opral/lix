@@ -4,7 +4,7 @@
 //! model boundary. It persists canonical changes into local storage so replay
 //! systems can rebuild derived state from them later.
 
-use crate::backend::prepared::{PreparedBatch, PreparedStatement};
+use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::contracts::LixFunctionProvider;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,

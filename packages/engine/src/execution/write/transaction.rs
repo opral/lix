@@ -5,7 +5,10 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
+use crate::backend::{
+    LixBackend, LixBackendTransaction, QueryExecutor,
+    execute_write_program_with_transaction as execute_backend_write_program_with_transaction,
+};
 use crate::catalog::FilesystemProjectionScope;
 use crate::common::NormalizedDirectoryPath;
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
@@ -17,7 +20,7 @@ pub use super::contracts::TransactionDelta;
 pub use super::execution::WriteTransaction;
 #[cfg(test)]
 pub use super::read_context::ReadContext;
-pub(crate) use crate::backend::program::WriteProgram;
+pub(crate) use crate::backend::WriteProgram;
 
 pub(crate) async fn lookup_directory_id_by_path_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
@@ -25,7 +28,7 @@ pub(crate) async fn lookup_directory_id_by_path_in_transaction(
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, LixError> {
-    let backend = crate::backend::TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     crate::execution::write::filesystem::query::lookup_directory_id_by_path(
         &backend, version_id, path, scope,
     )
@@ -107,8 +110,7 @@ pub(crate) async fn execute_write_program_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
     program: WriteProgram,
 ) -> Result<QueryResult, LixError> {
-    crate::backend::program_runner::execute_write_program_with_transaction(transaction, program)
-        .await
+    execute_backend_write_program_with_transaction(transaction, program).await
 }
 
 pub(crate) async fn normalize_sql_error_with_transaction_and_relation_names(

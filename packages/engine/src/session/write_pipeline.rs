@@ -10,7 +10,6 @@ use std::time::Instant;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
-use crate::backend::TransactionBackendAdapter;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::PreparedWriteRuntimeState;
@@ -194,7 +193,7 @@ pub(crate) async fn ensure_execution_runtime_state_for_write_scope(
         return Ok(());
     }
 
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     let runtime_state = collaborators
         .prepare_execution_runtime_state(&backend)
         .await?;
@@ -229,7 +228,7 @@ pub(crate) async fn prepare_buffered_write_execution_step(
         skip_side_effect_collection,
     )
     .await?;
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     let validated = validate_compiled_write_preparation(
         &backend,
         collaborators.compiled_schema_cache(),
@@ -294,7 +293,7 @@ async fn compile_write_preparation(
     }
 
     let dialect = transaction.dialect();
-    let backend = TransactionBackendAdapter::new(transaction);
+    let backend = crate::backend::transaction_backend_view(transaction);
     let preparation_context = collaborators
         .sql_preparation_seed(
             runtime_state.provider(),

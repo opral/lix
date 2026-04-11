@@ -1,4 +1,3 @@
-use crate::backend::TransactionBackendAdapter;
 use crate::canonical::load_commit as load_canonical_commit;
 use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
@@ -211,7 +210,7 @@ async fn checkpoint_runtime_state(
     }
 
     let collaborators = tx.collaborators();
-    let backend = TransactionBackendAdapter::new(tx.backend_transaction_mut()?);
+    let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
     let runtime_state = collaborators
         .prepare_execution_runtime_state(&backend)
         .await?;

@@ -1,4 +1,4 @@
-use crate::backend::ddl::execute_ddl_batch;
+use crate::backend::execute_ddl_batch;
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {

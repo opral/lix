@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::backend::prepared::PreparedBatch;
+use super::PreparedBatch;
 use crate::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]

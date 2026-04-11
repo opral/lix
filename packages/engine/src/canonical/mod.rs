@@ -44,6 +44,8 @@ mod journal;
 pub(crate) mod json;
 mod read;
 
+pub use json::CanonicalJson;
+
 #[allow(unused_imports)]
 pub(crate) use api::{
     append_changes, load_change, load_commit, load_exact_row_at_commit, load_history,
@@ -57,6 +59,7 @@ pub(crate) use api::{
 #[allow(unused_imports)]
 pub(crate) use checkpoint_labels::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, checkpoint_label_snapshot,
+    resolve_last_checkpoint_commit_id_for_tip_with_executor,
     seed_bootstrap as seed_checkpoint_labels_bootstrap, CheckpointVersionHeadFact,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY, CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME,
     CHECKPOINT_LABEL_SCHEMA_KEY,

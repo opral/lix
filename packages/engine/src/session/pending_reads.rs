@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use crate::backend::TransactionBackendAdapter;
 use crate::contracts::{
     PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
@@ -386,7 +385,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_view_in_transactio
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.execution_mode() {
         PublicReadExecutionMode::PendingView => {
-            let backend = TransactionBackendAdapter::new(transaction);
+            let backend = crate::backend::transaction_backend_view(transaction);
             TransactionReadModel::new(&backend, pending_view)
                 .execute_prepared_public_read(public_read)
                 .await

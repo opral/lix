@@ -1,4 +1,4 @@
-use crate::backend::ddl::{add_column_if_missing, execute_ddl_batch};
+use crate::backend::{add_column_if_missing, execute_ddl_batch};
 use crate::binary_cas::schema::INTERNAL_BINARY_CHUNK_STORE;
 use crate::{LixBackend, LixError};
 

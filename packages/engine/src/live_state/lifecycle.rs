@@ -1,6 +1,6 @@
 #![allow(dead_code)]
 
-use crate::backend::ddl::add_column_if_missing;
+use crate::backend::add_column_if_missing;
 use crate::contracts::{LiveStateMode, LiveStateProjectionStatus};
 use crate::diagnostics::is_missing_relation_error;
 use crate::{

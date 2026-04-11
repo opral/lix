@@ -9,9 +9,9 @@ pub(crate) mod types;
 pub(crate) mod wire;
 
 #[allow(unused_imports)]
-pub(crate) use dialect::SqlDialect;
+pub use dialect::SqlDialect;
 #[allow(unused_imports)]
-pub(crate) use error::LixError;
+pub use error::LixError;
 #[allow(unused_imports)]
 pub(crate) use errors::{
     already_initialized_error, live_state_not_ready_error, not_initialized_error,
@@ -20,9 +20,12 @@ pub(crate) use errors::{
 #[allow(unused_imports)]
 pub(crate) use fingerprint::stable_content_fingerprint_hex;
 #[allow(unused_imports)]
+pub use identity::{
+    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
+};
+#[allow(unused_imports)]
 pub(crate) use identity::{
-    derive_entity_id_from_json_paths, json_pointer_get, CanonicalPluginKey, CanonicalSchemaKey,
-    CanonicalSchemaVersion, EntityId, EntityIdDerivationError, FileId, VersionId,
+    derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
 };
 #[allow(unused_imports)]
 pub(crate) use paths::filesystem::{
@@ -33,6 +36,6 @@ pub(crate) use paths::filesystem::{
 #[allow(unused_imports)]
 pub(crate) use text::escape_sql_string;
 #[allow(unused_imports)]
-pub(crate) use types::{ExecuteResult, QueryResult, Value};
+pub use types::{ExecuteResult, QueryResult, Value};
 #[allow(unused_imports)]
-pub(crate) use wire::{WireQueryResult, WireValue};
+pub use wire::{WireQueryResult, WireValue};

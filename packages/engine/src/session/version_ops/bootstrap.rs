@@ -65,7 +65,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         name: &str,
     ) -> Result<Option<String>, LixError> {
-        let mut executor = self.backend_adapter();
+        let mut executor =
+            crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
         super::descriptors::find_version_id_by_name_with_executor(&mut executor, name).await
     }
 

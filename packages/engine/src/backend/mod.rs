@@ -1,18 +1,26 @@
-pub(crate) mod ddl;
-pub(crate) mod image;
-pub(crate) mod prepared;
-pub(crate) mod program;
-pub(crate) mod program_runner;
-pub(crate) mod storage_sql;
-pub(crate) mod transaction_adapter;
+mod ddl;
+mod image;
+mod prepared;
+mod program;
+mod program_runner;
+mod transaction_adapter;
 
 use async_trait::async_trait;
 
-use crate::backend::prepared::PreparedBatch;
 use crate::common::SqlDialect;
 pub use crate::contracts::TransactionMode;
 use crate::{LixError, QueryResult, Value};
+#[allow(unused_imports)]
+pub(crate) use ddl::{add_column_if_missing, execute_ddl_batch};
 pub use image::{ImageChunkReader, ImageChunkWriter};
+#[allow(unused_imports)]
+pub use prepared::{PreparedBatch, PreparedStatement};
+#[allow(unused_imports)]
+pub(crate) use program::WriteProgram;
+#[allow(unused_imports)]
+pub(crate) use program_runner::{
+    execute_write_program_with_backend, execute_write_program_with_transaction,
+};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
 
 #[async_trait(?Send)]
@@ -154,4 +162,10 @@ pub trait LixBackendTransaction {
     async fn commit(self: Box<Self>) -> Result<(), LixError>;
 
     async fn rollback(self: Box<Self>) -> Result<(), LixError>;
+}
+
+pub(crate) fn transaction_backend_view(
+    transaction: &mut dyn LixBackendTransaction,
+) -> TransactionBackendAdapter<'_> {
+    TransactionBackendAdapter::new(transaction)
 }
