@@ -122,8 +122,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         if let Some(runtime_state) = self.context.execution_runtime_state().cloned() {
             return Ok(runtime_state);
         }
-        let backend =
-            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
+        let backend = crate::backend::transaction_backend_view(
+            self.write_transaction.backend_transaction_mut(),
+        );
         let (settings, functions) = self
             .lix
             .prepare_runtime_functions_with_backend(&backend)
@@ -135,8 +136,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {
-        let mut backend =
-            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
+        let mut backend = crate::backend::transaction_backend_view(
+            self.write_transaction.backend_transaction_mut(),
+        );
         if let Some(commit_id) =
             load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         {
@@ -171,8 +173,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn load_global_version_commit_id(&mut self) -> Result<String, LixError> {
-        let mut backend =
-            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
+        let mut backend = crate::backend::transaction_backend_view(
+            self.write_transaction.backend_transaction_mut(),
+        );
         let Some(commit_id) =
             load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         else {
@@ -189,8 +192,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         commit_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let mut backend =
-            crate::backend::transaction_backend_view(self.write_transaction.backend_transaction_mut());
+        let mut backend = crate::backend::transaction_backend_view(
+            self.write_transaction.backend_transaction_mut(),
+        );
         crate::canonical::resolve_last_checkpoint_commit_id_for_tip_with_executor(
             &mut backend,
             commit_id,

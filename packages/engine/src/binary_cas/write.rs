@@ -1,4 +1,4 @@
-use crate::backend::{WriteProgram, execute_write_program_with_transaction};
+use crate::backend::{execute_write_program_with_transaction, WriteProgram};
 use crate::binary_cas::chunking::{fastcdc_chunk_ranges, should_materialize_chunk_cas};
 use crate::binary_cas::codec::{binary_blob_hash_hex, encode_binary_chunk_payload};
 use crate::binary_cas::schema::{

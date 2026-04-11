@@ -20,12 +20,12 @@ pub(crate) use errors::{
 #[allow(unused_imports)]
 pub(crate) use fingerprint::stable_content_fingerprint_hex;
 #[allow(unused_imports)]
-pub use identity::{
-    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
-};
-#[allow(unused_imports)]
 pub(crate) use identity::{
     derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError,
+};
+#[allow(unused_imports)]
+pub use identity::{
+    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
 #[allow(unused_imports)]
 pub(crate) use paths::filesystem::{
