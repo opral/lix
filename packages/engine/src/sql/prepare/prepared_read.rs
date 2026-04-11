@@ -1,8 +1,5 @@
 use crate::contracts::SqlPreparationMetadataReader;
-use crate::diagnostics::{
-    build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
-};
-use crate::contracts::artifacts::{
+use crate::contracts::{
     PreparedBatch, PreparedDerivedRowsetReadArtifact, PreparedDirectDirectoryHistoryField,
     PreparedDirectEntityHistoryField, PreparedDirectFileHistoryField,
     PreparedDirectHistoryReadArtifact, PreparedDirectPublicRead, PreparedDirectStateHistoryField,
@@ -19,6 +16,9 @@ use crate::contracts::artifacts::{
     PreparedStateHistoryProjection, PreparedStateHistoryProjectionValue,
     PreparedStateHistorySortKey, PreparedStateHistorySortValue, PreparedStatement,
     PublicReadResultColumn, PublicReadResultColumns, ReadDiagnosticContext,
+};
+use crate::diagnostics::{
+    build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::logical_plan::direct_reads::{

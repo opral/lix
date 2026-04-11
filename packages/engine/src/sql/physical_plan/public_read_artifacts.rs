@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::catalog::SurfaceFamily;
-use crate::contracts::artifacts::ReadTimeProjectionRead;
+use crate::contracts::ReadTimeProjectionRead;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;

@@ -1772,10 +1772,11 @@ fn builtin_catalog_projection_registry_is_only_used_at_registry_owners() {
         })
         .collect();
 
-    let expected_paths: BTreeSet<String> = ["api/lix.rs", "catalog/api.rs", "catalog/declaration.rs"]
-        .into_iter()
-        .map(str::to_string)
-        .collect();
+    let expected_paths: BTreeSet<String> =
+        ["api/lix.rs", "catalog/api.rs", "catalog/declaration.rs"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
 
     assert_eq!(
         usage_paths, expected_paths,

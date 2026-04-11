@@ -1,5 +1,5 @@
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
-use crate::contracts::artifacts::{
+use crate::contracts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
     ReadTimeProjectionReadQuery,
 };
