@@ -6,61 +6,61 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
-use crate::common::error::LixError;
-use crate::common::types::{QueryResult, Value};
+use crate::common::LixError;
+use crate::common::{QueryResult, Value};
+use crate::contracts::InstalledPlugin;
 #[cfg(test)]
-use crate::contracts::artifacts::{
+use crate::contracts::{
     EffectiveRowSet, EffectiveRowsRequest, RowIdentity, ScanRequest, TrackedRow,
     TrackedTombstoneMarker, UntrackedRow,
 };
-use crate::contracts::artifacts::{
+use crate::contracts::{
     LiveFilter, LiveSnapshotRow, LiveSnapshotStorage, LiveStateProjectionStatus, OptionalTextPatch,
     SchemaKey, SchemaRegistration, StateHistoryRequest, StateHistoryRow,
 };
-use crate::contracts::plugin::InstalledPlugin;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum PendingSemanticStorage {
+pub enum PendingSemanticStorage {
     Tracked,
     Untracked,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PendingSemanticRow {
-    pub(crate) storage: PendingSemanticStorage,
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) plugin_key: String,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) tombstone: bool,
+pub struct PendingSemanticRow {
+    pub storage: PendingSemanticStorage,
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub plugin_key: String,
+    pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
+    pub tombstone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingFilesystemDescriptorView {
-    pub(crate) directory_id: String,
-    pub(crate) name: String,
-    pub(crate) extension: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) hidden: bool,
+pub struct PendingFilesystemDescriptorView {
+    pub directory_id: String,
+    pub name: String,
+    pub extension: Option<String>,
+    pub metadata: Option<String>,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingFilesystemFileView {
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) untracked: bool,
-    pub(crate) descriptor: Option<PendingFilesystemDescriptorView>,
-    pub(crate) metadata_patch: OptionalTextPatch,
-    pub(crate) deleted: bool,
+pub struct PendingFilesystemFileView {
+    pub file_id: String,
+    pub version_id: String,
+    pub untracked: bool,
+    pub descriptor: Option<PendingFilesystemDescriptorView>,
+    pub metadata_patch: OptionalTextPatch,
+    pub deleted: bool,
 }
 
 #[cfg(test)]
 #[async_trait(?Send)]
-pub(crate) trait WriterKeyReadView {
+pub trait WriterKeyReadView {
     #[allow(dead_code)]
     async fn load_annotation(&self, row_identity: &RowIdentity)
         -> Result<Option<String>, LixError>;
@@ -71,7 +71,7 @@ pub(crate) trait WriterKeyReadView {
     ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError>;
 }
 
-pub(crate) trait PendingView {
+pub trait PendingView {
     fn has_overlays(&self) -> bool {
         false
     }
@@ -102,7 +102,7 @@ pub(crate) trait PendingView {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait FilesystemPluginMaterializer {
+pub trait FilesystemPluginMaterializer {
     async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError>;
 
     async fn apply_plugin_changes(
@@ -112,14 +112,14 @@ pub(crate) trait FilesystemPluginMaterializer {
     ) -> Result<Vec<u8>, LixError>;
 }
 
-pub(crate) trait CompiledSchemaCache {
+pub trait CompiledSchemaCache {
     fn get_compiled_schema(&self, key: &SchemaKey) -> Option<Arc<JSONSchema>>;
 
     fn insert_compiled_schema(&self, key: SchemaKey, schema: Arc<JSONSchema>);
 }
 
 #[async_trait(?Send)]
-pub(crate) trait SqlPreparationMetadataReader {
+pub trait SqlPreparationMetadataReader {
     async fn execute_preparation_query(
         &mut self,
         sql: &str,
@@ -136,7 +136,7 @@ pub(crate) trait SqlPreparationMetadataReader {
     ) -> Result<Option<String>, LixError>;
 }
 
-pub(crate) trait PendingStateOverlay {
+pub trait PendingStateOverlay {
     fn visible_semantic_rows(
         &self,
         storage: PendingSemanticStorage,
@@ -154,12 +154,12 @@ pub(crate) trait PendingStateOverlay {
     fn as_pending_view(&self) -> &dyn PendingView;
 }
 
-pub(crate) struct PendingStateOverlayRef<'a> {
+pub struct PendingStateOverlayRef<'a> {
     view: &'a dyn PendingView,
 }
 
 impl<'a> PendingStateOverlayRef<'a> {
-    pub(crate) fn new(view: &'a dyn PendingView) -> Self {
+    pub fn new(view: &'a dyn PendingView) -> Self {
         Self { view }
     }
 }
@@ -245,7 +245,7 @@ impl PendingStateOverlay for PendingStateOverlayRef<'_> {
     }
 }
 
-pub(crate) trait LiveReadShapeContract {
+pub trait LiveReadShapeContract {
     fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String;
 
     fn snapshot_from_projected_row(
@@ -259,10 +259,10 @@ pub(crate) trait LiveReadShapeContract {
 
 #[cfg(test)]
 #[async_trait(?Send)]
-pub(crate) trait TrackedReadView {
+pub trait TrackedReadView {
     async fn load_exact_rows(
         &self,
-        request: &crate::contracts::artifacts::BatchRowRequest,
+        request: &crate::contracts::BatchRowRequest,
     ) -> Result<Vec<TrackedRow>, LixError>;
 
     #[cfg(test)]
@@ -271,7 +271,7 @@ pub(crate) trait TrackedReadView {
 
 #[cfg(test)]
 #[async_trait(?Send)]
-pub(crate) trait TrackedTombstoneView {
+pub trait TrackedTombstoneView {
     async fn scan_tombstones(
         &self,
         request: &ScanRequest,
@@ -280,10 +280,10 @@ pub(crate) trait TrackedTombstoneView {
 
 #[cfg(test)]
 #[async_trait(?Send)]
-pub(crate) trait UntrackedReadView {
+pub trait UntrackedReadView {
     async fn load_exact_rows(
         &self,
-        request: &crate::contracts::artifacts::BatchRowRequest,
+        request: &crate::contracts::BatchRowRequest,
     ) -> Result<Vec<UntrackedRow>, LixError>;
 
     #[cfg(test)]
@@ -291,16 +291,16 @@ pub(crate) trait UntrackedReadView {
 }
 
 #[cfg(test)]
-pub(crate) struct LiveReadContext<'a> {
-    pub(crate) tracked: &'a dyn TrackedReadView,
-    pub(crate) untracked: &'a dyn UntrackedReadView,
-    pub(crate) tracked_tombstones: Option<&'a dyn TrackedTombstoneView>,
-    pub(crate) writer_keys: &'a dyn WriterKeyReadView,
+pub struct LiveReadContext<'a> {
+    pub tracked: &'a dyn TrackedReadView,
+    pub untracked: &'a dyn UntrackedReadView,
+    pub tracked_tombstones: Option<&'a dyn TrackedTombstoneView>,
+    pub writer_keys: &'a dyn WriterKeyReadView,
 }
 
 #[cfg(test)]
 impl<'a> LiveReadContext<'a> {
-    pub(crate) fn new(
+    pub fn new(
         tracked: &'a dyn TrackedReadView,
         untracked: &'a dyn UntrackedReadView,
         writer_keys: &'a dyn WriterKeyReadView,
@@ -313,7 +313,7 @@ impl<'a> LiveReadContext<'a> {
         }
     }
 
-    pub(crate) fn with_tracked_tombstones(
+    pub fn with_tracked_tombstones(
         mut self,
         tracked_tombstones: &'a dyn TrackedTombstoneView,
     ) -> Self {
@@ -324,7 +324,7 @@ impl<'a> LiveReadContext<'a> {
 
 #[cfg(test)]
 #[async_trait(?Send)]
-pub(crate) trait EffectiveRowsResolver {
+pub trait EffectiveRowsResolver {
     async fn resolve_effective_rows(
         &self,
         request: &EffectiveRowsRequest,
@@ -332,7 +332,7 @@ pub(crate) trait EffectiveRowsResolver {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait CommittedStateHistoryReader {
+pub trait CommittedStateHistoryReader {
     async fn load_committed_state_history_rows(
         &self,
         request: &StateHistoryRequest,
@@ -340,7 +340,7 @@ pub(crate) trait CommittedStateHistoryReader {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait LiveStateTransactionBridge {
+pub trait LiveStateTransactionBridge {
     async fn register_live_state_schema(
         &mut self,
         registration: &SchemaRegistration,
@@ -353,7 +353,7 @@ pub(crate) trait LiveStateTransactionBridge {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait LiveStateQueryBackend {
+pub trait LiveStateQueryBackend {
     async fn load_live_read_shape_for_table_name(
         &self,
         table_name: &str,
@@ -379,11 +379,11 @@ pub(crate) trait LiveStateQueryBackend {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait PendingPublicReadTransaction {
+pub trait PendingPublicReadTransaction {
     async fn require_live_state_ready(&mut self) -> Result<(), LixError>;
 }
 
 #[async_trait(?Send)]
-pub(crate) trait BlobDataReader {
+pub trait BlobDataReader {
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError>;
 }

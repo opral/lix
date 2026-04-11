@@ -4,7 +4,7 @@ mod storage;
 
 use serde_json::Value as JsonValue;
 
-use crate::common::errors::classification::is_missing_relation_error;
+use crate::diagnostics::is_missing_relation_error;
 use crate::runtime::functions::{timestamp::timestamp, uuid_v7::uuid_v7, LixFunctionProvider};
 use crate::{LixBackend, LixError};
 pub(crate) use scope::global_deterministic_settings_storage_scope;

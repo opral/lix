@@ -2,15 +2,15 @@
 use async_trait::async_trait;
 
 #[cfg(test)]
-pub use crate::contracts::artifacts::BatchRowRequest as BatchTrackedRowRequest;
-pub use crate::contracts::artifacts::{
+pub use crate::contracts::BatchRowRequest as BatchTrackedRowRequest;
+#[cfg(test)]
+pub(crate) use crate::contracts::TrackedReadView;
+#[cfg(test)]
+pub(crate) use crate::contracts::TrackedTombstoneView;
+pub use crate::contracts::{
     ExactRowRequest as ExactTrackedRowRequest, ScanRequest as TrackedScanRequest, TrackedRow,
     TrackedTombstoneMarker, TrackedWriteOperation, TrackedWriteRow,
 };
-#[cfg(test)]
-pub(crate) use crate::contracts::traits::TrackedReadView;
-#[cfg(test)]
-pub(crate) use crate::contracts::traits::TrackedTombstoneView;
 #[cfg(test)]
 use crate::LixBackend;
 #[cfg(test)]

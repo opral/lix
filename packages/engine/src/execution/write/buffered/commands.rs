@@ -1,4 +1,4 @@
-use crate::contracts::artifacts::{PreparedPublicSurfaceRegistryEffect, SessionStateDelta};
+use crate::contracts::{PreparedPublicSurfaceRegistryEffect, SessionStateDelta};
 use crate::execution::write::TransactionCommitOutcome;
 use crate::QueryResult;
 

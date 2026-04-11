@@ -1,11 +1,11 @@
-use crate::contracts::artifacts::{
+use crate::contracts::BlobDataReader;
+use crate::contracts::CommittedStateHistoryReader;
+use crate::contracts::{
     DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
     StateHistoryVersionScope,
 };
-use crate::contracts::traits::BlobDataReader;
-use crate::contracts::traits::CommittedStateHistoryReader;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;

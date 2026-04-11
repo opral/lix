@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
 use crate::backend::TransactionBackendAdapter;
-use crate::contracts::artifacts::{
+use crate::contracts::{
+    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+};
+use crate::contracts::{
     PendingViewFilter, PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery,
     PendingViewReadStorage, PreparedPublicReadArtifact, PublicReadExecutionMode,
     PublicReadResultColumn, PublicReadResultColumns,
-};
-use crate::contracts::traits::{
-    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
 use crate::live_state::{
     compile_live_read_contract_from_registered_snapshots, read_contract_from_definition,

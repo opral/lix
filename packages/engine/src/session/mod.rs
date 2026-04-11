@@ -34,14 +34,14 @@ use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::common::errors;
-use crate::contracts::artifacts::ExecuteOptions;
-use crate::contracts::artifacts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
+use crate::contracts::ExecuteOptions;
+use crate::contracts::TransactionCommitOutcome;
+use crate::contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
+use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::read::execute_prepared_read_program_in_committed_read_transaction;
 use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
 use crate::execution::write::{
     prepare_registered_schema_write_step, stage_prepared_write_step, SemanticWriteContext,
-    TransactionCommitOutcome,
 };
 use crate::image::ImageChunkWriter;
 use crate::runtime::execution_state::ExecutionRuntimeState;
@@ -440,7 +440,7 @@ impl Session {
             && contains_transaction_control_statement(&parsed_statements)
             && !explicit_transaction_script
         {
-            return Err(errors::transaction_control_statement_denied_error());
+            return Err(transaction_control_statement_denied_error());
         }
 
         let mut context = self.new_execution_context(options);
@@ -855,7 +855,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_state_commit_stream_changes(
         &mut self,
-        changes: Vec<crate::contracts::artifacts::StateCommitStreamChange>,
+        changes: Vec<crate::contracts::StateCommitStreamChange>,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()

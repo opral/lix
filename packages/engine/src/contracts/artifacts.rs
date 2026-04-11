@@ -7,8 +7,8 @@ use sqlparser::ast::{Expr, Statement};
 use crate::catalog::{SurfaceBinding, SurfaceReadFreshness};
 use crate::common::error::LixError;
 use crate::common::types::Value;
-use crate::contracts::transaction_mode::TransactionMode;
 use crate::contracts::ReplayCursor;
+use crate::contracts::TransactionMode;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {
@@ -71,11 +71,11 @@ impl CommittedVersionFrontier {
             .join(", ")
     }
 
-    pub(crate) fn to_json_string(&self) -> String {
+    pub fn to_json_string(&self) -> String {
         serde_json::to_string(self).expect("committed frontier serialization should succeed")
     }
 
-    pub(crate) fn from_json_str(value: &str) -> Result<Self, LixError> {
+    pub fn from_json_str(value: &str) -> Result<Self, LixError> {
         serde_json::from_str(value).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -157,7 +157,7 @@ pub enum SessionDependency {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SessionExecutionMode {
+pub enum SessionExecutionMode {
     CommittedRead,
     CommittedRuntimeMutation,
     WriteTransaction,
@@ -215,31 +215,31 @@ impl SessionStateDelta {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum EffectiveStateVersionScope {
+pub enum EffectiveStateVersionScope {
     ActiveVersion,
     ExplicitVersion,
     History,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct EffectiveStateRequest {
-    pub(crate) schema_set: BTreeSet<String>,
-    pub(crate) version_scope: EffectiveStateVersionScope,
-    pub(crate) include_global_overlay: bool,
-    pub(crate) include_untracked_overlay: bool,
-    pub(crate) include_tombstones: bool,
-    pub(crate) predicate_classes: Vec<String>,
-    pub(crate) required_columns: Vec<String>,
+pub struct EffectiveStateRequest {
+    pub schema_set: BTreeSet<String>,
+    pub version_scope: EffectiveStateVersionScope,
+    pub include_global_overlay: bool,
+    pub include_untracked_overlay: bool,
+    pub include_tombstones: bool,
+    pub predicate_classes: Vec<String>,
+    pub required_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CommittedReadMode {
+pub enum CommittedReadMode {
     CommittedOnly,
     MaterializedState,
 }
 
 impl CommittedReadMode {
-    pub(crate) fn transaction_mode(self) -> TransactionMode {
+    pub fn transaction_mode(self) -> TransactionMode {
         match self {
             Self::CommittedOnly => TransactionMode::Read,
             Self::MaterializedState => TransactionMode::Deferred,
@@ -248,31 +248,31 @@ impl CommittedReadMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicReadExecutionMode {
+pub enum PublicReadExecutionMode {
     PendingView,
     Committed(CommittedReadMode),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum PendingViewReadStorage {
+pub enum PendingViewReadStorage {
     Tracked,
     Untracked,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PendingViewReadQuery {
-    pub(crate) storage: PendingViewReadStorage,
-    pub(crate) schema_key: String,
-    pub(crate) version_id: String,
-    pub(crate) projections: Vec<PendingViewProjection>,
-    pub(crate) filters: Vec<PendingViewFilter>,
-    pub(crate) order_by: Vec<PendingViewOrderClause>,
-    pub(crate) limit: Option<usize>,
+pub struct PendingViewReadQuery {
+    pub storage: PendingViewReadStorage,
+    pub schema_key: String,
+    pub version_id: String,
+    pub projections: Vec<PendingViewProjection>,
+    pub filters: Vec<PendingViewFilter>,
+    pub order_by: Vec<PendingViewOrderClause>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PendingViewProjection {
+pub enum PendingViewProjection {
     Column {
         source_column: String,
         output_column: String,
@@ -283,7 +283,7 @@ pub(crate) enum PendingViewProjection {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PendingViewFilter {
+pub enum PendingViewFilter {
     Equals(String, Value),
     In(String, Vec<Value>),
     IsNull(String),
@@ -298,9 +298,9 @@ pub(crate) enum PendingViewFilter {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingViewOrderClause {
-    pub(crate) column: String,
-    pub(crate) descending: bool,
+pub struct PendingViewOrderClause {
+    pub column: String,
+    pub descending: bool,
 }
 
 /// Runtime-neutral query shape over rows derived from a `ReadTime` projection.
@@ -310,11 +310,11 @@ pub(crate) struct PendingViewOrderClause {
 /// surface.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct ReadTimeProjectionReadQuery {
-    pub(crate) projections: Vec<PendingViewProjection>,
-    pub(crate) filters: Vec<PendingViewFilter>,
-    pub(crate) order_by: Vec<PendingViewOrderClause>,
-    pub(crate) limit: Option<usize>,
+pub struct ReadTimeProjectionReadQuery {
+    pub projections: Vec<PendingViewProjection>,
+    pub filters: Vec<PendingViewFilter>,
+    pub order_by: Vec<PendingViewOrderClause>,
+    pub limit: Option<usize>,
 }
 
 /// Compiler-owned artifact for a public read that should be served from
@@ -329,7 +329,7 @@ pub(crate) struct ReadTimeProjectionRead {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectPublicReadKind {
+pub enum PreparedDirectPublicReadKind {
     StateHistory,
     EntityHistory,
     FileHistory,
@@ -338,7 +338,7 @@ pub(crate) enum PreparedDirectPublicReadKind {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectStateHistoryField {
+pub enum PreparedDirectStateHistoryField {
     EntityId,
     SchemaKey,
     FileId,
@@ -356,42 +356,42 @@ pub(crate) enum PreparedDirectStateHistoryField {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedStateHistoryAggregate {
+pub enum PreparedStateHistoryAggregate {
     Count,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedStateHistoryProjectionValue {
+pub enum PreparedStateHistoryProjectionValue {
     Field(PreparedDirectStateHistoryField),
     Aggregate(PreparedStateHistoryAggregate),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedStateHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) value: PreparedStateHistoryProjectionValue,
+pub struct PreparedStateHistoryProjection {
+    pub output_name: String,
+    pub value: PreparedStateHistoryProjectionValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedStateHistorySortValue {
+pub enum PreparedStateHistorySortValue {
     Field(PreparedDirectStateHistoryField),
     Aggregate(PreparedStateHistoryAggregate),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedStateHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) value: Option<PreparedStateHistorySortValue>,
-    pub(crate) descending: bool,
+pub struct PreparedStateHistorySortKey {
+    pub output_name: String,
+    pub value: Option<PreparedStateHistorySortValue>,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedStateHistoryPredicate {
+pub enum PreparedStateHistoryPredicate {
     Eq(PreparedDirectStateHistoryField, Value),
     NotEq(PreparedDirectStateHistoryField, Value),
     Gt(PreparedDirectStateHistoryField, Value),
@@ -405,7 +405,7 @@ pub(crate) enum PreparedStateHistoryPredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedStateHistoryAggregatePredicate {
+pub enum PreparedStateHistoryAggregatePredicate {
     Eq(PreparedStateHistoryAggregate, i64),
     NotEq(PreparedStateHistoryAggregate, i64),
     Gt(PreparedStateHistoryAggregate, i64),
@@ -416,44 +416,44 @@ pub(crate) enum PreparedStateHistoryAggregatePredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedStateHistoryDirectReadPlan {
-    pub(crate) request: StateHistoryRequest,
-    pub(crate) predicates: Vec<PreparedStateHistoryPredicate>,
-    pub(crate) projections: Vec<PreparedStateHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) group_by_fields: Vec<PreparedDirectStateHistoryField>,
-    pub(crate) having: Option<PreparedStateHistoryAggregatePredicate>,
-    pub(crate) sort_keys: Vec<PreparedStateHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
+pub struct PreparedStateHistoryDirectReadPlan {
+    pub request: StateHistoryRequest,
+    pub predicates: Vec<PreparedStateHistoryPredicate>,
+    pub projections: Vec<PreparedStateHistoryProjection>,
+    pub wildcard_projection: bool,
+    pub wildcard_columns: Vec<String>,
+    pub group_by_fields: Vec<PreparedDirectStateHistoryField>,
+    pub having: Option<PreparedStateHistoryAggregatePredicate>,
+    pub sort_keys: Vec<PreparedStateHistorySortKey>,
+    pub limit: Option<u64>,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectEntityHistoryField {
+pub enum PreparedDirectEntityHistoryField {
     Property(String),
     State(PreparedDirectStateHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedEntityHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) field: PreparedDirectEntityHistoryField,
+pub struct PreparedEntityHistoryProjection {
+    pub output_name: String,
+    pub field: PreparedDirectEntityHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedEntityHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) field: Option<PreparedDirectEntityHistoryField>,
-    pub(crate) descending: bool,
+pub struct PreparedEntityHistorySortKey {
+    pub output_name: String,
+    pub field: Option<PreparedDirectEntityHistoryField>,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedEntityHistoryPredicate {
+pub enum PreparedEntityHistoryPredicate {
     Eq(PreparedDirectEntityHistoryField, Value),
     NotEq(PreparedDirectEntityHistoryField, Value),
     Gt(PreparedDirectEntityHistoryField, Value),
@@ -467,21 +467,21 @@ pub(crate) enum PreparedEntityHistoryPredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedEntityHistoryDirectReadPlan {
-    pub(crate) surface_binding: SurfaceBinding,
-    pub(crate) request: StateHistoryRequest,
-    pub(crate) predicates: Vec<PreparedEntityHistoryPredicate>,
-    pub(crate) projections: Vec<PreparedEntityHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) sort_keys: Vec<PreparedEntityHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
+pub struct PreparedEntityHistoryDirectReadPlan {
+    pub surface_binding: SurfaceBinding,
+    pub request: StateHistoryRequest,
+    pub predicates: Vec<PreparedEntityHistoryPredicate>,
+    pub projections: Vec<PreparedEntityHistoryProjection>,
+    pub wildcard_projection: bool,
+    pub wildcard_columns: Vec<String>,
+    pub sort_keys: Vec<PreparedEntityHistorySortKey>,
+    pub limit: Option<u64>,
+    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectFileHistoryField {
+pub enum PreparedDirectFileHistoryField {
     Id,
     Path,
     Data,
@@ -503,22 +503,22 @@ pub(crate) enum PreparedDirectFileHistoryField {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedFileHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) field: PreparedDirectFileHistoryField,
+pub struct PreparedFileHistoryProjection {
+    pub output_name: String,
+    pub field: PreparedDirectFileHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedFileHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) field: Option<PreparedDirectFileHistoryField>,
-    pub(crate) descending: bool,
+pub struct PreparedFileHistorySortKey {
+    pub output_name: String,
+    pub field: Option<PreparedDirectFileHistoryField>,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedFileHistoryPredicate {
+pub enum PreparedFileHistoryPredicate {
     Eq(PreparedDirectFileHistoryField, Value),
     NotEq(PreparedDirectFileHistoryField, Value),
     Gt(PreparedDirectFileHistoryField, Value),
@@ -532,28 +532,28 @@ pub(crate) enum PreparedFileHistoryPredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedFileHistoryAggregate {
+pub enum PreparedFileHistoryAggregate {
     Count,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedFileHistoryDirectReadPlan {
-    pub(crate) request: FileHistoryRequest,
-    pub(crate) predicates: Vec<PreparedFileHistoryPredicate>,
-    pub(crate) projections: Vec<PreparedFileHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) sort_keys: Vec<PreparedFileHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) aggregate: Option<PreparedFileHistoryAggregate>,
-    pub(crate) aggregate_output_name: Option<String>,
+pub struct PreparedFileHistoryDirectReadPlan {
+    pub request: FileHistoryRequest,
+    pub predicates: Vec<PreparedFileHistoryPredicate>,
+    pub projections: Vec<PreparedFileHistoryProjection>,
+    pub wildcard_projection: bool,
+    pub wildcard_columns: Vec<String>,
+    pub sort_keys: Vec<PreparedFileHistorySortKey>,
+    pub limit: Option<u64>,
+    pub offset: u64,
+    pub aggregate: Option<PreparedFileHistoryAggregate>,
+    pub aggregate_output_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectDirectoryHistoryField {
+pub enum PreparedDirectDirectoryHistoryField {
     Id,
     ParentId,
     Name,
@@ -575,22 +575,22 @@ pub(crate) enum PreparedDirectDirectoryHistoryField {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedDirectoryHistoryProjection {
-    pub(crate) output_name: String,
-    pub(crate) field: PreparedDirectDirectoryHistoryField,
+pub struct PreparedDirectoryHistoryProjection {
+    pub output_name: String,
+    pub field: PreparedDirectDirectoryHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedDirectoryHistorySortKey {
-    pub(crate) output_name: String,
-    pub(crate) field: Option<PreparedDirectDirectoryHistoryField>,
-    pub(crate) descending: bool,
+pub struct PreparedDirectoryHistorySortKey {
+    pub output_name: String,
+    pub field: Option<PreparedDirectDirectoryHistoryField>,
+    pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectoryHistoryPredicate {
+pub enum PreparedDirectoryHistoryPredicate {
     Eq(PreparedDirectDirectoryHistoryField, Value),
     NotEq(PreparedDirectDirectoryHistoryField, Value),
     Gt(PreparedDirectDirectoryHistoryField, Value),
@@ -604,28 +604,28 @@ pub(crate) enum PreparedDirectoryHistoryPredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectoryHistoryAggregate {
+pub enum PreparedDirectoryHistoryAggregate {
     Count,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedDirectoryHistoryDirectReadPlan {
-    pub(crate) request: DirectoryHistoryRequest,
-    pub(crate) predicates: Vec<PreparedDirectoryHistoryPredicate>,
-    pub(crate) projections: Vec<PreparedDirectoryHistoryProjection>,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) sort_keys: Vec<PreparedDirectoryHistorySortKey>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) aggregate: Option<PreparedDirectoryHistoryAggregate>,
-    pub(crate) aggregate_output_name: Option<String>,
+pub struct PreparedDirectoryHistoryDirectReadPlan {
+    pub request: DirectoryHistoryRequest,
+    pub predicates: Vec<PreparedDirectoryHistoryPredicate>,
+    pub projections: Vec<PreparedDirectoryHistoryProjection>,
+    pub wildcard_projection: bool,
+    pub wildcard_columns: Vec<String>,
+    pub sort_keys: Vec<PreparedDirectoryHistorySortKey>,
+    pub limit: Option<u64>,
+    pub offset: u64,
+    pub aggregate: Option<PreparedDirectoryHistoryAggregate>,
+    pub aggregate_output_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedDirectPublicRead {
+pub enum PreparedDirectPublicRead {
     StateHistory(PreparedStateHistoryDirectReadPlan),
     EntityHistory(PreparedEntityHistoryDirectReadPlan),
     FileHistory(PreparedFileHistoryDirectReadPlan),
@@ -634,7 +634,7 @@ pub(crate) enum PreparedDirectPublicRead {
 
 #[allow(dead_code)]
 impl PreparedDirectPublicRead {
-    pub(crate) fn kind(&self) -> PreparedDirectPublicReadKind {
+    pub fn kind(&self) -> PreparedDirectPublicReadKind {
         match self {
             Self::StateHistory(_) => PreparedDirectPublicReadKind::StateHistory,
             Self::EntityHistory(_) => PreparedDirectPublicReadKind::EntityHistory,
@@ -680,52 +680,52 @@ pub(crate) enum PreparedPublicReadExecutionArtifact {
 /// Runtime-neutral prepared public-read package.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedPublicReadArtifact {
-    pub(crate) contract: PreparedPublicReadContract,
-    pub(crate) freshness_contract: SurfaceReadFreshness,
-    pub(crate) surface_bindings: Vec<String>,
-    pub(crate) public_output_columns: Option<Vec<String>>,
-    pub(crate) execution: PreparedPublicReadExecutionArtifact,
+pub struct PreparedPublicReadArtifact {
+    pub contract: PreparedPublicReadContract,
+    pub freshness_contract: SurfaceReadFreshness,
+    pub surface_bindings: Vec<String>,
+    pub public_output_columns: Option<Vec<String>>,
+    pub execution: PreparedPublicReadExecutionArtifact,
 }
 
 /// Runtime-neutral prepared internal-read package.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedInternalReadArtifact {
-    pub(crate) prepared_batch: PreparedBatch,
-    pub(crate) result_contract: ResultContract,
+pub struct PreparedInternalReadArtifact {
+    pub prepared_batch: PreparedBatch,
+    pub result_contract: ResultContract,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedExplainMode {
+pub enum PreparedExplainMode {
     Plain,
     Analyze,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
-pub(crate) struct PreparedAnalyzedRuntime {
-    pub(crate) execution_duration_us: u64,
-    pub(crate) output_row_count: usize,
-    pub(crate) output_column_count: usize,
+pub struct PreparedAnalyzedRuntime {
+    pub execution_duration_us: u64,
+    pub output_row_count: usize,
+    pub output_column_count: usize,
     #[serde(default)]
-    pub(crate) output_columns: Vec<String>,
+    pub output_columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[allow(dead_code)]
-pub(crate) enum PreparedExplainTemplate {
+pub enum PreparedExplainTemplate {
     Text { sections: Vec<(String, String)> },
     Json { base_json: JsonValue },
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[allow(dead_code)]
-pub(crate) struct ReadDiagnosticCatalogSnapshot {
-    pub(crate) public_surfaces: Vec<String>,
-    pub(crate) available_tables: Vec<String>,
-    pub(crate) available_columns_by_relation: BTreeMap<String, Vec<String>>,
+pub struct ReadDiagnosticCatalogSnapshot {
+    pub public_surfaces: Vec<String>,
+    pub available_tables: Vec<String>,
+    pub available_columns_by_relation: BTreeMap<String, Vec<String>>,
 }
 
 /// Diagnostic context handed to read runtime alongside a prepared read step.
@@ -735,40 +735,40 @@ pub(crate) struct ReadDiagnosticCatalogSnapshot {
 /// statement types.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[allow(dead_code)]
-pub(crate) struct ReadDiagnosticContext {
-    pub(crate) source_sql: Vec<String>,
-    pub(crate) relation_names: Vec<String>,
-    pub(crate) catalog_snapshot: ReadDiagnosticCatalogSnapshot,
-    pub(crate) explain_mode: Option<PreparedExplainMode>,
-    pub(crate) plain_explain_template: Option<PreparedExplainTemplate>,
-    pub(crate) analyzed_explain_template: Option<PreparedExplainTemplate>,
+pub struct ReadDiagnosticContext {
+    pub source_sql: Vec<String>,
+    pub relation_names: Vec<String>,
+    pub catalog_snapshot: ReadDiagnosticCatalogSnapshot,
+    pub explain_mode: Option<PreparedExplainMode>,
+    pub plain_explain_template: Option<PreparedExplainTemplate>,
+    pub analyzed_explain_template: Option<PreparedExplainTemplate>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedReadArtifact {
+pub enum PreparedReadArtifact {
     Public(PreparedPublicReadArtifact),
     Internal(PreparedInternalReadArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedReadStep {
-    pub(crate) transaction_mode: TransactionMode,
-    pub(crate) artifact: PreparedReadArtifact,
-    pub(crate) diagnostic_context: ReadDiagnosticContext,
+pub struct PreparedReadStep {
+    pub transaction_mode: TransactionMode,
+    pub artifact: PreparedReadArtifact,
+    pub diagnostic_context: ReadDiagnosticContext,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedReadProgram {
-    pub(crate) transaction_mode: TransactionMode,
-    pub(crate) steps: Vec<PreparedReadStep>,
+pub struct PreparedReadProgram {
+    pub transaction_mode: TransactionMode,
+    pub steps: Vec<PreparedReadStep>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedWriteStatementKind {
+pub enum PreparedWriteStatementKind {
     Query,
     Explain,
     Other,
@@ -776,7 +776,7 @@ pub(crate) enum PreparedWriteStatementKind {
 
 #[allow(dead_code)]
 impl PreparedWriteStatementKind {
-    pub(crate) fn for_statement(statement: &Statement) -> Self {
+    pub fn for_statement(statement: &Statement) -> Self {
         match statement {
             Statement::Query(_) => Self::Query,
             Statement::Explain { .. } => Self::Explain,
@@ -787,7 +787,7 @@ impl PreparedWriteStatementKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedWriteOperationKind {
+pub enum PreparedWriteOperationKind {
     Insert,
     Update,
     Delete,
@@ -795,7 +795,7 @@ pub(crate) enum PreparedWriteOperationKind {
 
 #[allow(dead_code)]
 impl PreparedWriteOperationKind {
-    pub(crate) fn state_commit_stream_operation(self) -> StateCommitStreamOperation {
+    pub fn state_commit_stream_operation(self) -> StateCommitStreamOperation {
         match self {
             Self::Insert => StateCommitStreamOperation::Insert,
             Self::Update => StateCommitStreamOperation::Update,
@@ -806,7 +806,7 @@ impl PreparedWriteOperationKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedInsertOnConflictAction {
+pub enum PreparedInsertOnConflictAction {
     DoUpdate,
     DoNothing,
 }
@@ -818,16 +818,16 @@ pub(crate) enum PreparedInsertOnConflictAction {
 /// compiler-owned statement structures.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[allow(dead_code)]
-pub(crate) struct PreparedWriteDiagnosticContext {
-    pub(crate) relation_names: Vec<String>,
-    pub(crate) explain_mode: Option<PreparedExplainMode>,
-    pub(crate) plain_explain_template: Option<PreparedExplainTemplate>,
-    pub(crate) analyzed_explain_template: Option<PreparedExplainTemplate>,
+pub struct PreparedWriteDiagnosticContext {
+    pub relation_names: Vec<String>,
+    pub explain_mode: Option<PreparedExplainMode>,
+    pub plain_explain_template: Option<PreparedExplainTemplate>,
+    pub analyzed_explain_template: Option<PreparedExplainTemplate>,
 }
 
 #[allow(dead_code)]
 impl PreparedWriteDiagnosticContext {
-    pub(crate) fn new(relation_names: Vec<String>) -> Self {
+    pub fn new(relation_names: Vec<String>) -> Self {
         Self {
             relation_names,
             explain_mode: None,
@@ -836,21 +836,21 @@ impl PreparedWriteDiagnosticContext {
         }
     }
 
-    pub(crate) fn relation_names(&self) -> &[String] {
+    pub fn relation_names(&self) -> &[String] {
         &self.relation_names
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedPublicSurfaceRegistryMutation {
+pub enum PreparedPublicSurfaceRegistryMutation {
     UpsertRegisteredSchemaSnapshot { snapshot: JsonValue },
     RemoveDynamicSchema { schema_key: String },
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedPublicSurfaceRegistryEffect {
+pub enum PreparedPublicSurfaceRegistryEffect {
     None,
     ApplyMutations(Vec<PreparedPublicSurfaceRegistryMutation>),
     ReloadFromStorage,
@@ -858,42 +858,42 @@ pub(crate) enum PreparedPublicSurfaceRegistryEffect {
 
 #[allow(dead_code)]
 impl PreparedPublicSurfaceRegistryEffect {
-    pub(crate) fn is_none(&self) -> bool {
+    pub fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedResolvedWritePartition {
-    pub(crate) execution_mode: WriteMode,
-    pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
-    pub(crate) intended_post_state: Vec<PlannedStateRow>,
-    pub(crate) writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
-    pub(crate) filesystem_state: PlannedFilesystemState,
+pub struct PreparedResolvedWritePartition {
+    pub execution_mode: WriteMode,
+    pub authoritative_pre_state_rows: Vec<PlannedStateRow>,
+    pub intended_post_state: Vec<PlannedStateRow>,
+    pub writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
+    pub filesystem_state: PlannedFilesystemState,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedResolvedWritePlan {
-    pub(crate) partitions: Vec<PreparedResolvedWritePartition>,
+pub struct PreparedResolvedWritePlan {
+    pub partitions: Vec<PreparedResolvedWritePartition>,
 }
 
 #[allow(dead_code)]
 impl PreparedResolvedWritePlan {
-    pub(crate) fn authoritative_pre_state_rows(&self) -> impl Iterator<Item = &PlannedStateRow> {
+    pub fn authoritative_pre_state_rows(&self) -> impl Iterator<Item = &PlannedStateRow> {
         self.partitions
             .iter()
             .flat_map(|partition| partition.authoritative_pre_state_rows.iter())
     }
 
-    pub(crate) fn intended_post_state(&self) -> impl Iterator<Item = &PlannedStateRow> {
+    pub fn intended_post_state(&self) -> impl Iterator<Item = &PlannedStateRow> {
         self.partitions
             .iter()
             .flat_map(|partition| partition.intended_post_state.iter())
     }
 
-    pub(crate) fn filesystem_state(&self) -> PlannedFilesystemState {
+    pub fn filesystem_state(&self) -> PlannedFilesystemState {
         let mut merged = PlannedFilesystemState::default();
         for partition in &self.partitions {
             merged.merge_from(&partition.filesystem_state);
@@ -904,63 +904,63 @@ impl PreparedResolvedWritePlan {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedPublicWriteContract {
-    pub(crate) operation_kind: PreparedWriteOperationKind,
-    pub(crate) target: SurfaceBinding,
-    pub(crate) on_conflict_action: Option<PreparedInsertOnConflictAction>,
-    pub(crate) requested_version_id: Option<String>,
-    pub(crate) active_account_ids: Vec<String>,
-    pub(crate) writer_key: Option<String>,
-    pub(crate) resolved_write_plan: Option<PreparedResolvedWritePlan>,
+pub struct PreparedPublicWriteContract {
+    pub operation_kind: PreparedWriteOperationKind,
+    pub target: SurfaceBinding,
+    pub on_conflict_action: Option<PreparedInsertOnConflictAction>,
+    pub requested_version_id: Option<String>,
+    pub active_account_ids: Vec<String>,
+    pub writer_key: Option<String>,
+    pub resolved_write_plan: Option<PreparedResolvedWritePlan>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedTrackedWriteExecution {
-    pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) change_batch: Option<ChangeBatch>,
-    pub(crate) create_preconditions: CommitPreconditions,
-    pub(crate) semantic_effects: PlanEffects,
+pub struct PreparedTrackedWriteExecution {
+    pub schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
+    pub change_batch: Option<ChangeBatch>,
+    pub create_preconditions: CommitPreconditions,
+    pub semantic_effects: PlanEffects,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedUntrackedWriteExecution {
-    pub(crate) intended_post_state: Vec<PlannedStateRow>,
-    pub(crate) semantic_effects: PlanEffects,
-    pub(crate) persist_filesystem_payloads_before_write: bool,
+pub struct PreparedUntrackedWriteExecution {
+    pub intended_post_state: Vec<PlannedStateRow>,
+    pub semantic_effects: PlanEffects,
+    pub persist_filesystem_payloads_before_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedPublicWriteExecutionPartition {
+pub enum PreparedPublicWriteExecutionPartition {
     Tracked(PreparedTrackedWriteExecution),
     Untracked(PreparedUntrackedWriteExecution),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedPublicWriteMaterialization {
-    pub(crate) partitions: Vec<PreparedPublicWriteExecutionPartition>,
+pub struct PreparedPublicWriteMaterialization {
+    pub partitions: Vec<PreparedPublicWriteExecutionPartition>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedPublicWriteExecutionArtifact {
+pub enum PreparedPublicWriteExecutionArtifact {
     Noop,
     Materialize(PreparedPublicWriteMaterialization),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedPublicWriteArtifact {
-    pub(crate) contract: PreparedPublicWriteContract,
-    pub(crate) execution: PreparedPublicWriteExecutionArtifact,
+pub struct PreparedPublicWriteArtifact {
+    pub contract: PreparedPublicWriteContract,
+    pub execution: PreparedPublicWriteExecutionArtifact,
 }
 
 #[allow(dead_code)]
 impl PreparedPublicWriteArtifact {
-    pub(crate) fn materialization(&self) -> Option<&PreparedPublicWriteMaterialization> {
+    pub fn materialization(&self) -> Option<&PreparedPublicWriteMaterialization> {
         match &self.execution {
             PreparedPublicWriteExecutionArtifact::Noop => None,
             PreparedPublicWriteExecutionArtifact::Materialize(materialization) => {
@@ -972,21 +972,21 @@ impl PreparedPublicWriteArtifact {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedInternalWriteArtifact {
-    pub(crate) prepared_batch: PreparedBatch,
-    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) mutations: Vec<MutationRow>,
-    pub(crate) has_update_validations: bool,
-    pub(crate) should_refresh_file_cache: bool,
-    pub(crate) read_only_query: bool,
-    pub(crate) filesystem_state: PlannedFilesystemState,
-    pub(crate) effects: PlanEffects,
-    pub(crate) writer_key: Option<String>,
+pub struct PreparedInternalWriteArtifact {
+    pub prepared_batch: PreparedBatch,
+    pub live_table_requirements: Vec<SchemaLiveTableRequirement>,
+    pub mutations: Vec<MutationRow>,
+    pub has_update_validations: bool,
+    pub should_refresh_file_cache: bool,
+    pub read_only_query: bool,
+    pub filesystem_state: PlannedFilesystemState,
+    pub effects: PlanEffects,
+    pub writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedWriteArtifact {
+pub enum PreparedWriteArtifact {
     PublicRead(PreparedPublicReadArtifact),
     PublicWrite(PreparedPublicWriteArtifact),
     Internal(PreparedInternalWriteArtifact),
@@ -994,31 +994,31 @@ pub(crate) enum PreparedWriteArtifact {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedWriteStep {
-    pub(crate) statement_kind: PreparedWriteStatementKind,
-    pub(crate) result_contract: ResultContract,
-    pub(crate) artifact: PreparedWriteArtifact,
-    pub(crate) diagnostic_context: PreparedWriteDiagnosticContext,
-    pub(crate) public_surface_registry_effect: PreparedPublicSurfaceRegistryEffect,
+pub struct PreparedWriteStep {
+    pub statement_kind: PreparedWriteStatementKind,
+    pub result_contract: ResultContract,
+    pub artifact: PreparedWriteArtifact,
+    pub diagnostic_context: PreparedWriteDiagnosticContext,
+    pub public_surface_registry_effect: PreparedPublicSurfaceRegistryEffect,
 }
 
 #[allow(dead_code)]
 impl PreparedWriteStep {
-    pub(crate) fn public_read(&self) -> Option<&PreparedPublicReadArtifact> {
+    pub fn public_read(&self) -> Option<&PreparedPublicReadArtifact> {
         match &self.artifact {
             PreparedWriteArtifact::PublicRead(read) => Some(read),
             PreparedWriteArtifact::PublicWrite(_) | PreparedWriteArtifact::Internal(_) => None,
         }
     }
 
-    pub(crate) fn public_write(&self) -> Option<&PreparedPublicWriteArtifact> {
+    pub fn public_write(&self) -> Option<&PreparedPublicWriteArtifact> {
         match &self.artifact {
             PreparedWriteArtifact::PublicWrite(write) => Some(write),
             PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::Internal(_) => None,
         }
     }
 
-    pub(crate) fn internal_write(&self) -> Option<&PreparedInternalWriteArtifact> {
+    pub fn internal_write(&self) -> Option<&PreparedInternalWriteArtifact> {
         match &self.artifact {
             PreparedWriteArtifact::Internal(internal) => Some(internal),
             PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::PublicWrite(_) => None,
@@ -1028,31 +1028,31 @@ impl PreparedWriteStep {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedWriteProgram {
-    pub(crate) steps: Vec<PreparedWriteStep>,
+pub struct PreparedWriteProgram {
+    pub steps: Vec<PreparedWriteStep>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicReadResultColumn {
+pub enum PublicReadResultColumn {
     Untyped,
     Boolean,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PublicReadResultColumns {
+pub enum PublicReadResultColumns {
     Static(Vec<PublicReadResultColumn>),
     ByColumnName(BTreeMap<String, PublicReadResultColumn>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PreparedPublicReadContract {
-    pub(crate) committed_mode: CommittedReadMode,
-    pub(crate) pending_view_query: Option<PendingViewReadQuery>,
-    pub(crate) result_columns: Option<PublicReadResultColumns>,
+pub struct PreparedPublicReadContract {
+    pub committed_mode: CommittedReadMode,
+    pub pending_view_query: Option<PendingViewReadQuery>,
+    pub result_columns: Option<PublicReadResultColumns>,
 }
 
 impl PreparedPublicReadContract {
-    pub(crate) fn execution_mode(&self) -> PublicReadExecutionMode {
+    pub fn execution_mode(&self) -> PublicReadExecutionMode {
         if self.pending_view_query.is_some() {
             PublicReadExecutionMode::PendingView
         } else {
@@ -1063,159 +1063,159 @@ impl PreparedPublicReadContract {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum StateHistoryContentMode {
+pub enum StateHistoryContentMode {
     MetadataOnly,
     #[default]
     IncludeSnapshotContent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum StateHistoryOrder {
+pub enum StateHistoryOrder {
     #[default]
     EntityFileSchemaDepthAsc,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum StateHistoryRootScope {
+pub enum StateHistoryRootScope {
     #[default]
     AllRoots,
     RequestedRoots(Vec<String>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum StateHistoryLineageScope {
+pub enum StateHistoryLineageScope {
     #[default]
     Standard,
     ActiveVersion,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum StateHistoryVersionScope {
+pub enum StateHistoryVersionScope {
     #[default]
     Any,
     RequestedVersions(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct StateHistoryRequest {
-    pub(crate) root_scope: StateHistoryRootScope,
-    pub(crate) lineage_scope: StateHistoryLineageScope,
-    pub(crate) active_version_id: Option<String>,
-    pub(crate) version_scope: StateHistoryVersionScope,
-    pub(crate) entity_ids: Vec<String>,
-    pub(crate) file_ids: Vec<String>,
-    pub(crate) schema_keys: Vec<String>,
-    pub(crate) plugin_keys: Vec<String>,
-    pub(crate) min_depth: Option<i64>,
-    pub(crate) max_depth: Option<i64>,
-    pub(crate) content_mode: StateHistoryContentMode,
-    pub(crate) order: StateHistoryOrder,
+pub struct StateHistoryRequest {
+    pub root_scope: StateHistoryRootScope,
+    pub lineage_scope: StateHistoryLineageScope,
+    pub active_version_id: Option<String>,
+    pub version_scope: StateHistoryVersionScope,
+    pub entity_ids: Vec<String>,
+    pub file_ids: Vec<String>,
+    pub schema_keys: Vec<String>,
+    pub plugin_keys: Vec<String>,
+    pub min_depth: Option<i64>,
+    pub max_depth: Option<i64>,
+    pub content_mode: StateHistoryContentMode,
+    pub order: StateHistoryOrder,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StateHistoryRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) schema_version: String,
-    pub(crate) change_id: String,
-    pub(crate) commit_id: String,
-    pub(crate) commit_created_at: String,
-    pub(crate) root_commit_id: String,
-    pub(crate) depth: i64,
-    pub(crate) version_id: String,
+pub struct StateHistoryRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub file_id: String,
+    pub plugin_key: String,
+    pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
+    pub schema_version: String,
+    pub change_id: String,
+    pub commit_id: String,
+    pub commit_created_at: String,
+    pub root_commit_id: String,
+    pub depth: i64,
+    pub version_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum FileHistoryContentMode {
+pub enum FileHistoryContentMode {
     #[default]
     MetadataOnly,
     IncludeData,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum FileHistoryLineageScope {
+pub enum FileHistoryLineageScope {
     #[default]
     ActiveVersion,
     Standard,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum FileHistoryRootScope {
+pub enum FileHistoryRootScope {
     #[default]
     AllRoots,
     RequestedRoots(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) enum FileHistoryVersionScope {
+pub enum FileHistoryVersionScope {
     #[default]
     Any,
     RequestedVersions(Vec<String>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct FileHistoryRequest {
-    pub(crate) lineage_scope: FileHistoryLineageScope,
-    pub(crate) active_version_id: Option<String>,
-    pub(crate) root_scope: FileHistoryRootScope,
-    pub(crate) version_scope: FileHistoryVersionScope,
-    pub(crate) file_ids: Vec<String>,
-    pub(crate) content_mode: FileHistoryContentMode,
+pub struct FileHistoryRequest {
+    pub lineage_scope: FileHistoryLineageScope,
+    pub active_version_id: Option<String>,
+    pub root_scope: FileHistoryRootScope,
+    pub version_scope: FileHistoryVersionScope,
+    pub file_ids: Vec<String>,
+    pub content_mode: FileHistoryContentMode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FileHistoryRow {
-    pub(crate) id: String,
-    pub(crate) path: Option<String>,
-    pub(crate) data: Option<Vec<u8>>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) hidden: Option<bool>,
-    pub(crate) lixcol_entity_id: String,
-    pub(crate) lixcol_schema_key: String,
-    pub(crate) lixcol_file_id: String,
-    pub(crate) lixcol_version_id: String,
-    pub(crate) lixcol_plugin_key: String,
-    pub(crate) lixcol_schema_version: String,
-    pub(crate) lixcol_change_id: String,
-    pub(crate) lixcol_metadata: Option<String>,
-    pub(crate) lixcol_commit_id: String,
-    pub(crate) lixcol_commit_created_at: String,
-    pub(crate) lixcol_root_commit_id: String,
-    pub(crate) lixcol_depth: i64,
+pub struct FileHistoryRow {
+    pub id: String,
+    pub path: Option<String>,
+    pub data: Option<Vec<u8>>,
+    pub metadata: Option<String>,
+    pub hidden: Option<bool>,
+    pub lixcol_entity_id: String,
+    pub lixcol_schema_key: String,
+    pub lixcol_file_id: String,
+    pub lixcol_version_id: String,
+    pub lixcol_plugin_key: String,
+    pub lixcol_schema_version: String,
+    pub lixcol_change_id: String,
+    pub lixcol_metadata: Option<String>,
+    pub lixcol_commit_id: String,
+    pub lixcol_commit_created_at: String,
+    pub lixcol_root_commit_id: String,
+    pub lixcol_depth: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct DirectoryHistoryRequest {
-    pub(crate) lineage_scope: FileHistoryLineageScope,
-    pub(crate) active_version_id: Option<String>,
-    pub(crate) root_scope: FileHistoryRootScope,
-    pub(crate) version_scope: FileHistoryVersionScope,
-    pub(crate) directory_ids: Vec<String>,
+pub struct DirectoryHistoryRequest {
+    pub lineage_scope: FileHistoryLineageScope,
+    pub active_version_id: Option<String>,
+    pub root_scope: FileHistoryRootScope,
+    pub version_scope: FileHistoryVersionScope,
+    pub directory_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DirectoryHistoryRow {
-    pub(crate) id: String,
-    pub(crate) parent_id: Option<String>,
-    pub(crate) name: String,
-    pub(crate) path: Option<String>,
-    pub(crate) hidden: Option<bool>,
-    pub(crate) lixcol_entity_id: String,
-    pub(crate) lixcol_schema_key: String,
-    pub(crate) lixcol_file_id: String,
-    pub(crate) lixcol_version_id: String,
-    pub(crate) lixcol_plugin_key: String,
-    pub(crate) lixcol_schema_version: String,
-    pub(crate) lixcol_change_id: String,
-    pub(crate) lixcol_metadata: Option<String>,
-    pub(crate) lixcol_commit_id: String,
-    pub(crate) lixcol_commit_created_at: String,
-    pub(crate) lixcol_root_commit_id: String,
-    pub(crate) lixcol_depth: i64,
+pub struct DirectoryHistoryRow {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub path: Option<String>,
+    pub hidden: Option<bool>,
+    pub lixcol_entity_id: String,
+    pub lixcol_schema_key: String,
+    pub lixcol_file_id: String,
+    pub lixcol_version_id: String,
+    pub lixcol_plugin_key: String,
+    pub lixcol_schema_version: String,
+    pub lixcol_change_id: String,
+    pub lixcol_metadata: Option<String>,
+    pub lixcol_commit_id: String,
+    pub lixcol_commit_created_at: String,
+    pub lixcol_root_commit_id: String,
+    pub lixcol_depth: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1228,23 +1228,23 @@ pub enum LiveStateMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveStateProjectionStatus {
-    pub(crate) mode: LiveStateMode,
-    pub(crate) applied_cursor: Option<ReplayCursor>,
-    pub(crate) latest_cursor: Option<ReplayCursor>,
-    pub(crate) applied_committed_frontier: Option<CommittedVersionFrontier>,
-    pub(crate) current_committed_frontier: CommittedVersionFrontier,
+pub struct LiveStateProjectionStatus {
+    pub mode: LiveStateMode,
+    pub applied_cursor: Option<ReplayCursor>,
+    pub latest_cursor: Option<ReplayCursor>,
+    pub applied_committed_frontier: Option<CommittedVersionFrontier>,
+    pub current_committed_frontier: CommittedVersionFrontier,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LiveSnapshotStorage {
+pub enum LiveSnapshotStorage {
     Tracked,
     Untracked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub(crate) enum LiveFilterField {
+pub enum LiveFilterField {
     EntityId,
     FileId,
     PluginKey,
@@ -1253,28 +1253,28 @@ pub(crate) enum LiveFilterField {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum LiveFilterOp {
+pub enum LiveFilterOp {
     Eq(Value),
     In(Vec<Value>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LiveFilter {
-    pub(crate) field: LiveFilterField,
-    pub(crate) operator: LiveFilterOp,
+pub struct LiveFilter {
+    pub field: LiveFilterField,
+    pub operator: LiveFilterOp,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LiveSnapshotRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) plugin_key: String,
-    pub(crate) metadata: Option<String>,
-    pub(crate) source_change_id: Option<String>,
-    pub(crate) snapshot: JsonValue,
+pub struct LiveSnapshotRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub source_change_id: Option<String>,
+    pub snapshot: JsonValue,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -1287,12 +1287,12 @@ pub struct SchemaRegistration {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SchemaRegistrationSet {
+pub struct SchemaRegistrationSet {
     inner: BTreeMap<String, SchemaRegistration>,
 }
 
 impl SchemaRegistrationSet {
-    pub(crate) fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
+    pub fn insert(&mut self, registration: impl Into<SchemaRegistration>) {
         let registration = registration.into();
         self.inner
             .entry(registration.schema_key().to_string())
@@ -1304,17 +1304,17 @@ impl SchemaRegistrationSet {
             .or_insert(registration);
     }
 
-    pub(crate) fn extend(&mut self, other: SchemaRegistrationSet) {
+    pub fn extend(&mut self, other: SchemaRegistrationSet) {
         for registration in other.inner.into_values() {
             self.insert(registration);
         }
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
 
-    pub(crate) fn values(&self) -> impl Iterator<Item = &SchemaRegistration> {
+    pub fn values(&self) -> impl Iterator<Item = &SchemaRegistration> {
         self.inner.values()
     }
 }
@@ -1362,7 +1362,7 @@ impl SchemaRegistration {
         }
     }
 
-    pub(crate) fn with_schema_definition(
+    pub fn with_schema_definition(
         schema_key: impl Into<String>,
         schema_definition: JsonValue,
     ) -> Self {
@@ -1373,7 +1373,7 @@ impl SchemaRegistration {
         }
     }
 
-    pub(crate) fn registered_snapshot(&self) -> Option<&JsonValue> {
+    pub fn registered_snapshot(&self) -> Option<&JsonValue> {
         self.registered_snapshot.as_ref()
     }
 
@@ -1381,7 +1381,7 @@ impl SchemaRegistration {
         self.schema_definition_override().is_some() || self.registered_snapshot().is_some()
     }
 
-    pub(crate) fn schema_definition_override(&self) -> Option<&JsonValue> {
+    pub fn schema_definition_override(&self) -> Option<&JsonValue> {
         match &self.source {
             SchemaRegistrationSource::StoredLayout => None,
             SchemaRegistrationSource::SchemaDefinition(schema_definition) => {
@@ -1392,16 +1392,16 @@ impl SchemaRegistration {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SchemaLiveTableRequirement {
-    pub(crate) schema_key: String,
-    pub(crate) schema_definition: Option<JsonValue>,
+pub struct SchemaLiveTableRequirement {
+    pub schema_key: String,
+    pub schema_definition: Option<JsonValue>,
 }
 
-pub(crate) fn is_untracked_live_table(_table_name: &str) -> bool {
+pub fn is_untracked_live_table(_table_name: &str) -> bool {
     false
 }
 
-pub(crate) fn coalesce_live_table_requirements(
+pub fn coalesce_live_table_requirements(
     requirements: &[SchemaLiveTableRequirement],
 ) -> Vec<SchemaLiveTableRequirement> {
     let mut by_schema = BTreeMap::<String, SchemaLiveTableRequirement>::new();
@@ -1419,86 +1419,86 @@ pub(crate) fn coalesce_live_table_requirements(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum MutationOperation {
+pub enum MutationOperation {
     Insert,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct MutationRow {
-    pub(crate) operation: MutationOperation,
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) plugin_key: String,
-    pub(crate) snapshot_content: Option<JsonValue>,
-    pub(crate) untracked: bool,
+pub struct MutationRow {
+    pub operation: MutationOperation,
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub plugin_key: String,
+    pub snapshot_content: Option<JsonValue>,
+    pub untracked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UpdateValidationPlan {
-    pub(crate) delete: bool,
-    pub(crate) table: String,
-    pub(crate) where_clause: Option<Expr>,
-    pub(crate) snapshot_content: Option<JsonValue>,
-    pub(crate) snapshot_patch: Option<BTreeMap<String, JsonValue>>,
+pub struct UpdateValidationPlan {
+    pub delete: bool,
+    pub table: String,
+    pub where_clause: Option<Expr>,
+    pub snapshot_content: Option<JsonValue>,
+    pub snapshot_patch: Option<BTreeMap<String, JsonValue>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UpdateValidationInputRow {
-    pub(crate) entity_id: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) base_snapshot: JsonValue,
+pub struct UpdateValidationInputRow {
+    pub entity_id: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub base_snapshot: JsonValue,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UpdateValidationInput {
-    pub(crate) plan: UpdateValidationPlan,
-    pub(crate) rows: Vec<UpdateValidationInputRow>,
+pub struct UpdateValidationInput {
+    pub plan: UpdateValidationPlan,
+    pub rows: Vec<UpdateValidationInputRow>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct PlannedStatementSet {
-    pub(crate) prepared_statements: Vec<PreparedStatement>,
-    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) mutations: Vec<MutationRow>,
-    pub(crate) update_validations: Vec<UpdateValidationPlan>,
+pub struct PlannedStatementSet {
+    pub prepared_statements: Vec<PreparedStatement>,
+    pub live_table_requirements: Vec<SchemaLiveTableRequirement>,
+    pub mutations: Vec<MutationRow>,
+    pub update_validations: Vec<UpdateValidationPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FilesystemPayloadChange {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) untracked: bool,
-    pub(crate) plugin_key: String,
-    pub(crate) snapshot_content: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) writer_key: Option<String>,
+pub struct FilesystemPayloadChange {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub untracked: bool,
+    pub plugin_key: String,
+    pub snapshot_content: Option<String>,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct PlanEffects {
-    pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) session_delta: SessionStateDelta,
-    pub(crate) file_cache_refresh_targets: BTreeSet<(String, String)>,
+pub struct PlanEffects {
+    pub state_commit_stream_changes: Vec<StateCommitStreamChange>,
+    pub session_delta: SessionStateDelta,
+    pub file_cache_refresh_targets: BTreeSet<(String, String)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ResultContract {
+pub enum ResultContract {
     Select,
     DmlNoReturning,
     DmlReturning,
     Other,
 }
 
-pub(crate) fn result_contract_for_statements(statements: &[Statement]) -> ResultContract {
+pub fn result_contract_for_statements(statements: &[Statement]) -> ResultContract {
     match statements.last() {
         Some(Statement::Query(_) | Statement::Explain { .. }) => ResultContract::Select,
         Some(Statement::Insert(insert)) => {
@@ -1527,13 +1527,13 @@ pub(crate) fn result_contract_for_statements(statements: &[Statement]) -> Result
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum WriteMode {
+pub enum WriteMode {
     Tracked,
     Untracked,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum WriteLane {
+pub enum WriteLane {
     ActiveVersion,
     SingleVersion(String),
     GlobalAdmin,
@@ -1555,46 +1555,46 @@ pub struct CommitPreconditions {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PlannedStateRow {
-    pub(crate) entity_id: String,
-    pub(crate) schema_key: String,
-    pub(crate) version_id: Option<String>,
-    pub(crate) values: BTreeMap<String, Value>,
-    pub(crate) writer_key: Option<String>,
-    pub(crate) tombstone: bool,
+pub struct PlannedStateRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub version_id: Option<String>,
+    pub values: BTreeMap<String, Value>,
+    pub writer_key: Option<String>,
+    pub tombstone: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedFilesystemDescriptor {
-    pub(crate) directory_id: String,
-    pub(crate) name: String,
-    pub(crate) extension: Option<String>,
-    pub(crate) metadata: Option<String>,
-    pub(crate) hidden: bool,
+pub struct PlannedFilesystemDescriptor {
+    pub directory_id: String,
+    pub name: String,
+    pub extension: Option<String>,
+    pub metadata: Option<String>,
+    pub hidden: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PlannedFilesystemFile {
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) untracked: bool,
-    pub(crate) descriptor: Option<PlannedFilesystemDescriptor>,
-    pub(crate) metadata_patch: OptionalTextPatch,
-    pub(crate) data: Option<Vec<u8>>,
-    pub(crate) deleted: bool,
+pub struct PlannedFilesystemFile {
+    pub file_id: String,
+    pub version_id: String,
+    pub untracked: bool,
+    pub descriptor: Option<PlannedFilesystemDescriptor>,
+    pub metadata_patch: OptionalTextPatch,
+    pub data: Option<Vec<u8>>,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct PlannedFilesystemState {
-    pub(crate) files: BTreeMap<(String, String), PlannedFilesystemFile>,
+pub struct PlannedFilesystemState {
+    pub files: BTreeMap<(String, String), PlannedFilesystemFile>,
 }
 
 impl PlannedFilesystemState {
-    pub(crate) fn merge_from(&mut self, next: &Self) {
+    pub fn merge_from(&mut self, next: &Self) {
         self.files.extend(next.files.clone());
     }
 
-    pub(crate) fn has_binary_payloads(&self) -> bool {
+    pub fn has_binary_payloads(&self) -> bool {
         self.files.values().any(|file| file.data.is_some())
     }
 }
@@ -1635,12 +1635,12 @@ pub struct ChangeBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OptionalTextPatch {
+pub enum OptionalTextPatch {
     Unchanged,
 }
 
 impl OptionalTextPatch {
-    pub(crate) fn apply(&self, current: Option<String>) -> Option<String> {
+    pub fn apply(&self, current: Option<String>) -> Option<String> {
         current
     }
 }
@@ -1705,7 +1705,7 @@ pub struct ScanRequest {
     pub required_columns: Vec<String>,
 }
 
-pub(crate) fn exact_row_constraints(request: &ExactRowRequest) -> Vec<ScanConstraint> {
+pub fn exact_row_constraints(request: &ExactRowRequest) -> Vec<ScanConstraint> {
     let mut constraints = vec![ScanConstraint {
         field: ScanField::EntityId,
         operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
@@ -1720,7 +1720,7 @@ pub(crate) fn exact_row_constraints(request: &ExactRowRequest) -> Vec<ScanConstr
 }
 
 #[cfg(test)]
-pub(crate) fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstraint> {
+pub fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstraint> {
     let mut constraints = vec![ScanConstraint {
         field: ScanField::EntityId,
         operator: ScanOperator::In(
@@ -1742,7 +1742,7 @@ pub(crate) fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstr
 }
 
 #[cfg(test)]
-pub(crate) fn entity_id_in_constraint<I>(entity_ids: I) -> ScanConstraint
+pub fn entity_id_in_constraint<I>(entity_ids: I) -> ScanConstraint
 where
     I: IntoIterator<Item = String>,
 {
@@ -2060,7 +2060,7 @@ pub struct EffectiveRowSet {
 }
 
 #[cfg(test)]
-pub(crate) fn values_from_snapshot_content(
+pub fn values_from_snapshot_content(
     snapshot_content: Option<&str>,
 ) -> Result<BTreeMap<String, Value>, LixError> {
     let Some(snapshot_content) = snapshot_content else {
@@ -2111,7 +2111,7 @@ fn value_as_text(value: &Value) -> Option<&str> {
     }
 }
 
-pub(crate) fn matches_constraints(
+pub fn matches_constraints(
     entity_id: &str,
     file_id: &str,
     plugin_key: &str,

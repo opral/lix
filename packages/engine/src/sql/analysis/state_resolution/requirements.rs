@@ -1,4 +1,4 @@
-use crate::contracts::execution_effects::derive_execution_runtime_effects;
+use crate::contracts::derive_execution_runtime_effects;
 use crate::sql::optimizer::optimize_state_resolution;
 use crate::sql::prepare::contracts::requirements::PlanRequirements;
 use sqlparser::ast::Statement;

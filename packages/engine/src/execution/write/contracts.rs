@@ -1,15 +1,13 @@
 use async_trait::async_trait;
 
-use crate::contracts::artifacts::{
-    CanonicalCommitReceipt, PendingPublicCommitSession, PreparedPublicReadArtifact, PublicChange,
-    SessionStateDelta, StateCommitStreamChange,
-};
+use crate::contracts::PendingView;
+use crate::contracts::TrackedCommitExecutionOutcome;
+use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::contracts::{PendingPublicCommitSession, PreparedPublicReadArtifact};
 #[cfg(test)]
-use crate::contracts::artifacts::{
+use crate::contracts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
-use crate::contracts::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::traits::PendingView;
 use crate::LixError;
 use crate::{LixBackendTransaction, QueryResult};
 
@@ -113,40 +111,6 @@ impl CommitOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
-pub struct TransactionCommitOutcome {
-    #[serde(default, skip_serializing_if = "SessionStateDelta::is_empty")]
-    pub session_delta: SessionStateDelta,
-    #[serde(default)]
-    pub invalidate_deterministic_settings_cache: bool,
-    #[serde(default)]
-    pub invalidate_installed_plugins_cache: bool,
-    #[serde(default)]
-    pub refresh_public_surface_registry: bool,
-    #[serde(default)]
-    pub state_commit_stream_changes: Vec<StateCommitStreamChange>,
-}
-
-impl TransactionCommitOutcome {
-    pub(crate) fn merge(&mut self, other: TransactionCommitOutcome) {
-        self.session_delta.merge(other.session_delta);
-        self.invalidate_deterministic_settings_cache |=
-            other.invalidate_deterministic_settings_cache;
-        self.invalidate_installed_plugins_cache |= other.invalidate_installed_plugins_cache;
-        self.refresh_public_surface_registry |= other.refresh_public_surface_registry;
-        self.state_commit_stream_changes
-            .extend(other.state_commit_stream_changes);
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub(crate) struct TrackedCommitExecutionOutcome {
-    pub(crate) receipt: Option<CanonicalCommitReceipt>,
-    pub(crate) applied_changes: Vec<PublicChange>,
-    pub(crate) plugin_changes_committed: bool,
-    pub(crate) next_active_version_id: Option<String>,
-}
-
 #[async_trait(?Send)]
 pub(crate) trait WriteExecutionBindings {
     async fn execute_prepared_public_read_with_pending_view(
@@ -185,79 +149,4 @@ pub(crate) trait WriteExecutionBindings {
 pub(crate) struct DeferredTransactionSideEffects {
     pub(crate) filesystem_state:
         crate::execution::write::filesystem::runtime::FilesystemTransactionState,
-}
-
-#[derive(Clone)]
-pub(crate) struct PreparedWriteRuntimeState {
-    deterministic_mode_enabled: bool,
-    functions: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
-}
-
-impl std::fmt::Debug for PreparedWriteRuntimeState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedWriteRuntimeState")
-            .field(
-                "deterministic_mode_enabled",
-                &self.deterministic_mode_enabled,
-            )
-            .finish_non_exhaustive()
-    }
-}
-
-impl PreparedWriteRuntimeState {
-    pub(crate) fn new(
-        deterministic_mode_enabled: bool,
-        functions: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
-    ) -> Self {
-        Self {
-            deterministic_mode_enabled,
-            functions,
-        }
-    }
-
-    pub(crate) fn functions(&self) -> &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>> {
-        &self.functions
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BufferedWriteExecutionInput {
-    writer_key: Option<String>,
-    active_version_id: String,
-    active_account_ids: Vec<String>,
-}
-
-impl BufferedWriteExecutionInput {
-    pub(crate) fn new(
-        writer_key: Option<String>,
-        active_version_id: impl Into<String>,
-        active_account_ids: Vec<String>,
-    ) -> Self {
-        Self {
-            writer_key,
-            active_version_id: active_version_id.into(),
-            active_account_ids,
-        }
-    }
-
-    pub(crate) fn writer_key(&self) -> Option<&str> {
-        self.writer_key.as_deref()
-    }
-
-    pub(crate) fn active_version_id(&self) -> &str {
-        &self.active_version_id
-    }
-
-    pub(crate) fn active_account_ids(&self) -> &[String] {
-        &self.active_account_ids
-    }
-
-    pub(crate) fn apply_session_delta(&mut self, delta: &SessionStateDelta) {
-        if let Some(version_id) = &delta.next_active_version_id {
-            self.active_version_id = version_id.clone();
-        }
-        if let Some(active_account_ids) = &delta.next_active_account_ids {
-            self.active_account_ids = active_account_ids.clone();
-        }
-    }
 }

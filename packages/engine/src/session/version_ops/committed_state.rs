@@ -5,7 +5,7 @@ use crate::canonical::{load_exact_row_at_commit, CanonicalStateIdentity, Canonic
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
 use crate::{LixError, VersionId};
 
-use crate::contracts::version_artifacts::{
+use crate::contracts::{
     version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id,
 };
 

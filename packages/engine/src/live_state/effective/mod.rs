@@ -3,7 +3,7 @@
 #[cfg(test)]
 mod resolve;
 
-pub use crate::contracts::artifacts::{
+pub use crate::contracts::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane,
 };

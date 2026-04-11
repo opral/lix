@@ -1,28 +1,16 @@
 use crate::backend::TransactionBackendAdapter;
 use crate::catalog::SurfaceReadFreshness;
-use crate::common::errors::classification::sanitize_lowered_public_sql_error_description;
-use crate::contracts::artifacts::{
+use crate::contracts::ReadExecutionBindings;
+use crate::contracts::{LiveStateQueryBackend, PendingPublicReadTransaction};
+use crate::contracts::{
     PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
-use crate::contracts::traits::{LiveStateQueryBackend, PendingPublicReadTransaction, PendingView};
+use crate::diagnostics::sanitize_lowered_public_sql_error_description;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::{
-    direct::execute_direct_public_read_with_backend, execute_read_time_projection_read,
-    ReadExecutionBindings,
-};
-
-#[async_trait(?Send)]
-pub(crate) trait PendingPublicReadExecutionBackend {
-    async fn execute_prepared_public_read_with_pending_view(
-        &self,
-        bindings: &dyn ReadExecutionBindings,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &PreparedPublicReadArtifact,
-    ) -> Result<QueryResult, LixError>;
-}
+use super::{direct::execute_direct_public_read_with_backend, execute_read_time_projection_read};
 
 pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
@@ -176,8 +164,7 @@ async fn ensure_surface_read_freshness(
     let status = backend.load_live_state_projection_status().await?;
     if matches!(
         status.mode,
-        crate::contracts::artifacts::LiveStateMode::Ready
-            | crate::contracts::artifacts::LiveStateMode::Bootstrapping
+        crate::contracts::LiveStateMode::Ready | crate::contracts::LiveStateMode::Bootstrapping
     ) {
         return Ok(());
     }
@@ -204,7 +191,7 @@ async fn ensure_surface_read_freshness_in_transaction(
     let status = (&backend as &dyn crate::LixBackend)
         .load_live_state_projection_status()
         .await?;
-    if status.mode == crate::contracts::artifacts::LiveStateMode::Bootstrapping {
+    if status.mode == crate::contracts::LiveStateMode::Bootstrapping {
         return Ok(());
     }
     Err(public_read_projection_stale_error(
@@ -215,7 +202,7 @@ async fn ensure_surface_read_freshness_in_transaction(
 
 fn public_read_projection_stale_error(
     surface_names: &[String],
-    status: &crate::contracts::artifacts::LiveStateProjectionStatus,
+    status: &crate::contracts::LiveStateProjectionStatus,
 ) -> LixError {
     let surfaces = if surface_names.is_empty() {
         "this public read".to_string()
@@ -228,7 +215,7 @@ fn public_read_projection_stale_error(
         format_optional_committed_frontier(status.applied_committed_frontier.as_ref());
     let current_frontier = format_committed_frontier(&status.current_committed_frontier);
     LixError::new(
-        crate::common::errors::ErrorCode::LiveStateNotReady.as_str(),
+        crate::common::ErrorCode::LiveStateNotReady.as_str(),
         format!(
             "Public read for {surfaces} requires fresh live-state projections, but live_state is {:?}. Applied committed frontier: {applied_frontier}. Current committed frontier: {current_frontier}. Applied replay cursor: {applied}. Latest replay cursor: {latest}. Canonical history/change reads may proceed while stale, but current-state projection reads must wait for replay or rebuild.",
             status.mode
@@ -256,7 +243,7 @@ fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> Stri
 
 async fn execute_prepared_batch_with_backend(
     backend: &dyn LixBackend,
-    batch: &crate::contracts::artifacts::PreparedBatch,
+    batch: &crate::contracts::PreparedBatch,
 ) -> Result<QueryResult, LixError> {
     let mut result = QueryResult {
         rows: Vec::new(),

@@ -1,10 +1,10 @@
-pub use crate::contracts::artifacts::{StateCommitStreamChange, StateCommitStreamOperation};
-pub use crate::contracts::state_commit_stream::StateCommitStreamFilter;
+pub use crate::contracts::StateCommitStreamFilter;
 #[cfg(test)]
-pub(crate) use crate::contracts::state_commit_stream::{
+pub(crate) use crate::contracts::{
     state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamRuntimeMetadata,
 };
+pub use crate::contracts::{StateCommitStreamChange, StateCommitStreamOperation};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -416,7 +416,7 @@ mod tests {
         state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
         StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
-    use crate::contracts::artifacts::PlannedStateRow;
+    use crate::contracts::PlannedStateRow;
     use crate::session::version_ops::commit::StagedChange;
     use crate::Value;
     use std::collections::BTreeMap;

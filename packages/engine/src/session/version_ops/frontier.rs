@@ -1,11 +1,10 @@
 use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
-use crate::common::errors::classification::is_missing_relation_error;
-use crate::common::naming::tracked_relation_name;
-use crate::contracts::artifacts::CommittedVersionFrontier;
-use crate::contracts::version_artifacts::version_ref_storage_version_id;
-use crate::live_state::builtin_schema_storage_metadata;
+use crate::contracts::version_ref_storage_version_id;
+use crate::contracts::CommittedVersionFrontier;
+use crate::diagnostics::is_missing_relation_error;
+use crate::live_state::{builtin_schema_storage_metadata, tracked_relation_name};
 use crate::{LixBackend, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

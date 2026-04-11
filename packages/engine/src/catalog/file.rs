@@ -103,7 +103,7 @@ impl CatalogProjectionDefinition for LixFileByVersionProjection {
 
 #[derive(Debug, Clone)]
 struct DerivedFileRow {
-    identity: crate::contracts::artifacts::RowIdentity,
+    identity: crate::contracts::RowIdentity,
     version_id: String,
     id: String,
     directory_id: Option<String>,
@@ -609,7 +609,7 @@ fn global_untracked(schema_key: &str) -> CatalogProjectionInputSpec {
 mod tests {
     use super::*;
     use crate::catalog::{CatalogProjectionContext, CatalogProjectionInputRows};
-    use crate::contracts::artifacts::RowIdentity;
+    use crate::contracts::RowIdentity;
 
     #[test]
     fn default_file_projection_derives_path_data_and_active_commit_id() {

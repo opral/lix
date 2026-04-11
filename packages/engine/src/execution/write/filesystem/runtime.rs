@@ -1,7 +1,7 @@
 use crate::catalog::FilesystemProjectionScope;
-use crate::common::fingerprint::stable_content_fingerprint_hex;
-use crate::contracts::artifacts::{FilesystemPayloadChange, MutationRow, OptionalTextPatch};
-use crate::contracts::traits::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
+use crate::common::stable_content_fingerprint_hex;
+use crate::contracts::{FilesystemPayloadChange, MutationRow, OptionalTextPatch};
+use crate::contracts::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::execution::write::filesystem::query::{
     load_file_row_by_id_without_path, resolve_file_id_by_path_in_version,
 };

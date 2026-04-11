@@ -1,12 +1,12 @@
-use crate::common::errors::classification::is_missing_relation_error;
-use crate::common::naming::tracked_relation_name;
-use crate::common::text::escape_sql_string;
-use crate::contracts::artifacts::PreparedBatch;
-use crate::contracts::functions::LixFunctionProvider;
+use crate::common::escape_sql_string;
+use crate::contracts::LixFunctionProvider;
+use crate::contracts::PreparedBatch;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::diagnostics::is_missing_relation_error;
 use crate::live_state::payload_column_name_for_schema;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+    tracked_relation_name,
 };
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 

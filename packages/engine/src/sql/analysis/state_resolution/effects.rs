@@ -1,5 +1,5 @@
-use crate::contracts::artifacts::SessionStateDelta;
-use crate::contracts::state_commit_stream::{
+use crate::contracts::SessionStateDelta;
+use crate::contracts::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
 
@@ -30,7 +30,7 @@ pub(crate) fn derive_effects_from_state_resolution(
 }
 
 fn direct_state_file_cache_refresh_targets(
-    mutations: &[crate::contracts::artifacts::MutationRow],
+    mutations: &[crate::contracts::MutationRow],
 ) -> BTreeSet<(String, String)> {
     mutations
         .iter()
@@ -45,7 +45,7 @@ fn direct_state_file_cache_refresh_targets(
 #[cfg(test)]
 mod tests {
     use super::derive_effects_from_state_resolution;
-    use crate::contracts::artifacts::PreparedStatement;
+    use crate::contracts::PreparedStatement;
     use crate::sql::prepare::contracts::planned_statement::{
         MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan,
     };

@@ -1,7 +1,7 @@
 use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::catalog::FilesystemProjectionScope;
-use crate::contracts::plugin::{select_best_glob_match, InstalledPlugin, PluginContentType};
-use crate::contracts::traits::FilesystemPluginMaterializer;
+use crate::contracts::FilesystemPluginMaterializer;
+use crate::contracts::{select_best_glob_match, InstalledPlugin, PluginContentType};
 use crate::execution::write::filesystem::query::load_file_row_by_id;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError};
@@ -313,8 +313,8 @@ async fn load_file_descriptors(
 #[cfg(test)]
 mod tests {
     use super::select_plugin_for_path;
-    use crate::contracts::plugin::glob_matches_path;
-    use crate::contracts::plugin::{InstalledPlugin, PluginContentType, PluginRuntime};
+    use crate::contracts::glob_matches_path;
+    use crate::contracts::{InstalledPlugin, PluginContentType, PluginRuntime};
 
     fn test_plugin(
         key: &str,

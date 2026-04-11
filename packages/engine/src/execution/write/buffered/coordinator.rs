@@ -1,6 +1,6 @@
-use crate::contracts::artifacts::CanonicalCommitReceipt;
-use crate::contracts::artifacts::{SchemaRegistration, SchemaRegistrationSet};
-use crate::contracts::traits::LiveStateTransactionBridge;
+use crate::contracts::CanonicalCommitReceipt;
+use crate::contracts::LiveStateTransactionBridge;
+use crate::contracts::{SchemaRegistration, SchemaRegistrationSet};
 use crate::{LixBackendTransaction, LixError};
 
 pub(crate) struct TransactionCoordinator<'a> {

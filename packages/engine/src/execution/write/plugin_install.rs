@@ -7,9 +7,16 @@ use serde_json::{json, Value as JsonValue};
 use zip::read::ZipArchive;
 
 use crate::catalog::{SurfaceBinding, SurfaceRegistry};
-use crate::common::fingerprint::stable_content_fingerprint_hex;
-use crate::common::paths::filesystem::{NormalizedDirectoryPath, ParsedFilePath};
-use crate::contracts::artifacts::{
+use crate::common::stable_content_fingerprint_hex;
+use crate::common::{NormalizedDirectoryPath, ParsedFilePath};
+use crate::contracts::{
+    parse_plugin_manifest_json, plugin_storage_archive_file_id, plugin_storage_archive_path,
+    PluginManifest, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
+};
+use crate::contracts::{
+    state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
+};
+use crate::contracts::{
     ChangeBatch, CommitPreconditions, IdempotencyKey, OptionalTextPatch, PlanEffects,
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
     PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
@@ -20,14 +27,7 @@ use crate::contracts::artifacts::{
     PreparedWriteStatementKind, PreparedWriteStep, PublicChange, ResultContract,
     SchemaLiveTableRequirement, SemanticEffect, StateCommitStreamOperation, WriteLane, WriteMode,
 };
-use crate::contracts::plugin::{
-    parse_plugin_manifest_json, plugin_storage_archive_file_id, plugin_storage_archive_path,
-    PluginManifest, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
-};
-use crate::contracts::state_commit_stream::{
-    state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
-};
-use crate::contracts::{schema_key_from_definition, validate_lix_schema_definition};
+use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::{LixError, Value};
 
 use super::{PlannedWriteDelta, PreparedWriteExecutionStep, PreparedWriteRuntimeState};
@@ -505,8 +505,7 @@ fn prepare_public_tracked_write_step(
                                 }),
                                 create_preconditions: CommitPreconditions {
                                     write_lane: WriteLane::GlobalAdmin,
-                                    expected_head:
-                                        crate::contracts::artifacts::ExpectedHead::CurrentHead,
+                                    expected_head: crate::contracts::ExpectedHead::CurrentHead,
                                     idempotency_key: semantic_idempotency_key(
                                         idempotency_purpose,
                                         &write_payload,

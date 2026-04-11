@@ -1,5 +1,5 @@
-use crate::contracts::artifacts::PendingPublicCommitSession;
-use crate::contracts::functions::LixFunctionProvider;
+use crate::contracts::LixFunctionProvider;
+use crate::contracts::PendingPublicCommitSession;
 use crate::execution::write::filesystem::runtime::{
     binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
 };
@@ -185,8 +185,8 @@ mod tests {
         CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
         CreateCommitPreconditions, CreateCommitWriteLane, PendingPublicCommitSession,
     };
-    use crate::contracts::artifacts::PendingPublicCommitLane;
-    use crate::contracts::functions::LixFunctionProvider;
+    use crate::contracts::LixFunctionProvider;
+    use crate::contracts::PendingPublicCommitLane;
     use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value};
     use async_trait::async_trait;
 
@@ -250,7 +250,7 @@ mod tests {
 
         async fn execute_batch(
             &mut self,
-            _batch: &crate::contracts::artifacts::PreparedBatch,
+            _batch: &crate::contracts::PreparedBatch,
         ) -> Result<QueryResult, LixError> {
             Ok(QueryResult {
                 rows: Vec::new(),

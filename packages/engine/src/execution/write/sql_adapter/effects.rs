@@ -1,8 +1,8 @@
-use crate::contracts::artifacts::{
+use crate::contracts::should_invalidate_deterministic_settings_cache;
+use crate::contracts::{
     PlannedFilesystemState, PreparedPublicWriteExecutionPartition, PreparedWriteStep,
     PublicReadExecutionMode,
 };
-use crate::contracts::state_commit_stream::should_invalidate_deterministic_settings_cache;
 use crate::execution::write::buffered::{
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
     BufferedWriteSessionEffects,
@@ -65,8 +65,8 @@ pub(crate) async fn complete_sql_command_execution(
     let clear_pending_public_commit_session = execution.plan_effects_override.is_none()
         && !matches!(
             step.statement_kind(),
-            crate::contracts::artifacts::PreparedWriteStatementKind::Query
-                | crate::contracts::artifacts::PreparedWriteStatementKind::Explain
+            crate::contracts::PreparedWriteStatementKind::Query
+                | crate::contracts::PreparedWriteStatementKind::Explain
         );
 
     let default_effects = step

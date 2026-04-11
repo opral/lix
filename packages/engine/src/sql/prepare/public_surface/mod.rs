@@ -5,24 +5,24 @@ pub(crate) mod routing;
 use crate::catalog::{
     SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
 };
-use crate::common::errors::{
-    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
-    sql_unknown_table_error,
+#[cfg(test)]
+use crate::contracts::SqlPreparationMetadataReader;
+use crate::contracts::TrackedChangeView;
+use crate::contracts::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
 };
-use crate::contracts::artifacts::{
-    ChangeBatch, CommitPreconditions, CommittedReadMode, EffectiveStateRequest, SessionStateDelta,
-    StateCommitStreamOperation,
-};
-use crate::contracts::change::TrackedChangeView;
-use crate::contracts::state_commit_stream::{
+use crate::contracts::{
     state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamRuntimeMetadata,
 };
-#[cfg(test)]
-use crate::contracts::traits::SqlPreparationMetadataReader;
-use crate::contracts::version_artifacts::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
+use crate::contracts::{
+    ChangeBatch, CommitPreconditions, CommittedReadMode, EffectiveStateRequest, SessionStateDelta,
+    StateCommitStreamOperation,
+};
+use crate::diagnostics::{
+    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
+    sql_unknown_table_error,
 };
 use crate::schema::builtin_schema_definition;
 use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
@@ -1736,16 +1736,16 @@ mod tests {
         PreparedPublicExecution, PreparedPublicReadExecution,
     };
     use crate::catalog::SurfaceReadFreshness;
-    use crate::contracts::artifacts::{
-        FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
-    };
-    use crate::contracts::version_artifacts::{
+    use crate::contracts::GLOBAL_VERSION_ID;
+    use crate::contracts::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
         version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
         version_ref_schema_version, version_ref_snapshot_content,
     };
-    use crate::contracts::GLOBAL_VERSION_ID;
+    use crate::contracts::{
+        FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
+    };
     use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
     use crate::live_state::{self, mark_mode_with_backend};
     use crate::schema::LixCommit;
@@ -2453,7 +2453,7 @@ mod tests {
                     .expect_err("projection-backed state read should reject stale live_state");
                 assert_eq!(
                     stale_error.code,
-                    crate::common::errors::ErrorCode::LiveStateNotReady.as_str()
+                    crate::common::ErrorCode::LiveStateNotReady.as_str()
                 );
                 assert!(
                     stale_error.description.contains("lix_key_value"),
@@ -2520,7 +2520,7 @@ mod tests {
             .dependency_spec()
             .expect("dependency spec should be derived")
             .session_dependencies
-            .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion));
+            .contains(&crate::contracts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -3083,7 +3083,7 @@ mod tests {
             .dependency_spec()
             .expect("filesystem dependency spec should be recorded")
             .session_dependencies
-            .contains(&crate::contracts::artifacts::SessionDependency::ActiveVersion));
+            .contains(&crate::contracts::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .explain
