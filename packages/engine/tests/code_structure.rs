@@ -1606,6 +1606,7 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
 
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
     [
+        "binary_cas",
         "backend",
         "canonical",
         "catalog",
