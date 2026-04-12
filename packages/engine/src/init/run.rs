@@ -2,7 +2,6 @@ use std::time::Duration;
 
 use crate::binary_cas;
 use crate::canonical;
-use crate::init::{init_builtin_schema_storage, seed_builtin_registered_schemas};
 use crate::live_state;
 use crate::live_state::{
     load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
@@ -10,33 +9,18 @@ use crate::live_state::{
     rebuild_scope_in_transaction, try_claim_bootstrap_with_backend, LiveStateMode,
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
-use crate::session::checkpoint_ops;
-use crate::session::observe;
-use crate::session::version_ops;
-use crate::session::version_ops::commit;
-use crate::session::workspace;
+use crate::session;
 use crate::{Lix, LixBackend, LixError, SqlDialect, TransactionMode};
 
 use super::filesystem;
-use super::InitExecutor;
+use super::seed::InitExecutor;
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     async fn load_checkpoint_version_heads_for_init(
         &mut self,
     ) -> Result<Vec<crate::canonical::CheckpointVersionHeadFact>, LixError> {
         let mut backend = crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
-        Ok(
-            crate::session::version_ops::descriptors::load_checkpoint_version_heads_with_executor(
-                &mut backend,
-            )
-            .await?
-            .into_iter()
-            .map(|head| crate::canonical::CheckpointVersionHeadFact {
-                version_id: head.version_id,
-                head_commit_id: head.head_commit_id,
-            })
-            .collect(),
-        )
+        session::load_checkpoint_version_heads_for_init(&mut backend).await
     }
 }
 
@@ -62,30 +46,18 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
             live_state::init(&backend)
                 .await
                 .map_err(|error| init_step_error("live_state::init", error))?;
-            init_builtin_schema_storage(&backend)
+            super::schema_bootstrap::init_builtin_schema_storage(&backend)
                 .await
                 .map_err(|error| init_step_error("init::init_builtin_schema_storage", error))?;
             canonical::init(&backend)
                 .await
                 .map_err(|error| init_step_error("canonical::init", error))?;
-            commit::init(&backend)
-                .await
-                .map_err(|error| init_step_error("commit::init", error))?;
             binary_cas::init(&backend)
                 .await
                 .map_err(|error| init_step_error("binary_cas::init", error))?;
-            observe::init(&backend)
+            session::init(&backend)
                 .await
-                .map_err(|error| init_step_error("observe::init", error))?;
-            checkpoint_ops::init(&backend)
-                .await
-                .map_err(|error| init_step_error("session::checkpoint_ops::init", error))?;
-            version_ops::init(&backend)
-                .await
-                .map_err(|error| init_step_error("session::version_ops::init", error))?;
-            workspace::init(&backend)
-                .await
-                .map_err(|error| init_step_error("workspace::init", error))?;
+                .map_err(|error| init_step_error("session::init", error))?;
         }
         {
             let backend = crate::backend::transaction_backend_view(transaction.as_mut());
@@ -97,16 +69,17 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
 
         let mut init = InitExecutor::new(lix, transaction.as_mut())
             .map_err(|error| init_step_error("init_executor", error))?;
-        seed_builtin_registered_schemas(&mut init)
+        init.seed_builtin_registered_schemas()
             .await
             .map_err(|error| init_step_error("init::seed_builtin_registered_schemas", error))?;
-        let default_active_version_id = version_ops::seed_bootstrap(&mut init)
+        let default_active_version_id = init
+            .seed_default_versions()
             .await
             .map_err(|error| init_step_error("session::version_ops::seed_bootstrap", error))?;
         filesystem::seed_bootstrap(&mut init)
             .await
             .map_err(|error| init_step_error("filesystem_bootstrap::seed_bootstrap", error))?;
-        canonical::seed_bootstrap(&mut init)
+        init.seed_commit_graph_nodes()
             .await
             .map_err(|error| init_step_error("canonical::seed_bootstrap", error))?;
         let checkpoint_version_heads = init
@@ -118,7 +91,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
                     error,
                 )
             })?;
-        canonical::seed_checkpoint_labels_bootstrap(&mut init, &checkpoint_version_heads)
+        init.seed_checkpoint_labels_bootstrap(&checkpoint_version_heads)
             .await
             .map_err(|error| {
                 init_step_error("canonical::seed_checkpoint_labels_bootstrap", error)
