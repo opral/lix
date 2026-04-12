@@ -297,7 +297,7 @@ async fn load_blob_data_by_hash_with_backend(
     for blob_hash in blob_hashes {
         rows.insert(
             blob_hash.clone(),
-            crate::binary_cas::read::load_binary_blob_data_by_hash(backend, blob_hash).await?,
+            crate::binary_cas::load_blob_data_by_hash(backend, blob_hash).await?,
         );
     }
     Ok(rows)

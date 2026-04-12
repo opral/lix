@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
-use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::append_changes;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::{PendingPublicCommitLane, PendingPublicCommitSession};
@@ -375,19 +374,20 @@ async fn execute_generated_commit_result(
     append_changes(transaction, &result.canonical_changes, functions).await?;
     let mut program = WriteProgram::new();
     if !binary_blob_writes.is_empty() {
-        let payloads = binary_blob_writes
+        let blob_writes = binary_blob_writes
             .iter()
             .map(BinaryBlobWrite::as_input)
-            .map(|payload| crate::binary_cas::support::BinaryBlobWriteInput {
+            .map(|payload| crate::binary_cas::BinaryBlobWrite {
                 file_id: payload.file_id,
                 version_id: payload.version_id,
                 data: payload.data,
             })
             .collect::<Vec<_>>();
-        program.extend(build_binary_blob_fastcdc_write_program(
+        crate::binary_cas::append_blob_writes_to_program(
+            &mut program,
             transaction.dialect(),
-            &payloads,
-        )?);
+            &blob_writes,
+        )?;
     }
     execute_write_program_with_transaction(transaction, program).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;

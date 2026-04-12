@@ -33,6 +33,7 @@ mod init;
 pub(crate) mod lifecycle;
 pub(crate) mod materialize;
 pub(crate) mod naming;
+mod plugin_archives;
 #[allow(dead_code)]
 pub(crate) mod projection;
 mod query_contracts;
@@ -73,6 +74,7 @@ pub use materialize::{
     LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
+pub(crate) use plugin_archives::PluginArchiveRef;
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
@@ -127,6 +129,12 @@ pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
 
 pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionStatus, LixError> {
     projection::projection_status(backend).await
+}
+
+pub(crate) async fn list_installed_plugin_archive_refs(
+    backend: &dyn LixBackend,
+) -> Result<Vec<PluginArchiveRef>, LixError> {
+    plugin_archives::list_installed_plugin_archive_refs(backend).await
 }
 
 pub(crate) async fn derive_read_time_surface_rows(
