@@ -14,8 +14,6 @@ use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
 use crate::common::escape_sql_string;
 use crate::diagnostics::is_missing_relation_error;
-use crate::init::seed::text_value;
-use crate::init::InitExecutor;
 use crate::{LixError, Value};
 
 use super::checkpoint_commit_label_entity_id;
@@ -24,49 +22,6 @@ use super::checkpoint_commit_label_entity_id;
 pub(crate) struct CheckpointVersionHeadFact {
     pub(crate) version_id: String,
     pub(crate) head_commit_id: String,
-}
-
-impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
-    pub(crate) async fn insert_last_checkpoint_for_version(
-        &mut self,
-        version_id: &str,
-        checkpoint_commit_id: &str,
-    ) -> Result<(), LixError> {
-        self.execute_backend(
-            "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
-             VALUES ($1, $2)",
-            &[
-                Value::Text(version_id.to_string()),
-                Value::Text(checkpoint_commit_id.to_string()),
-            ],
-        )
-        .await?;
-        Ok(())
-    }
-
-    pub(crate) async fn rebuild_internal_last_checkpoint_from_heads(
-        &mut self,
-        version_heads: &[CheckpointVersionHeadFact],
-    ) -> Result<(), LixError> {
-        // `lix_internal_last_checkpoint` is derived checkpoint-history state.
-        // Rebuild it from canonical version heads plus canonical checkpoint
-        // labels attached to commits.
-        self.execute_backend("DELETE FROM lix_internal_last_checkpoint", &[])
-            .await?;
-
-        for version_head in version_heads {
-            let version_id = version_head.version_id.as_str();
-            let commit_id = version_head.head_commit_id.as_str();
-            let checkpoint_commit_id = self
-                .resolve_last_checkpoint_commit_id_for_tip(commit_id)
-                .await?
-                .unwrap_or_else(|| commit_id.to_string());
-            self.insert_last_checkpoint_for_version(version_id, &checkpoint_commit_id)
-                .await?;
-        }
-
-        Ok(())
-    }
 }
 
 pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip_with_executor(
@@ -171,6 +126,25 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
         first.first(),
         "lix_internal_commit_graph_node.commit_id",
     )?))
+}
+
+fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
+    match value {
+        Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
+        Some(Value::Text(_)) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("{label} must not be empty"),
+        }),
+        Some(Value::Integer(number)) => Ok(number.to_string()),
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("{label} must be text-like, got {other:?}"),
+        }),
+        None => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("missing {label}"),
+        }),
+    }
 }
 
 #[cfg(test)]

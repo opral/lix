@@ -8,6 +8,7 @@
 pub(crate) mod checkpoint_ops;
 pub(crate) mod collaborators;
 pub(crate) mod execution_context;
+mod init;
 pub(crate) mod observe;
 pub(crate) mod pending_reads;
 pub(crate) mod plugin;
@@ -71,6 +72,8 @@ use crate::sql::{
     ExecutionProgram,
 };
 use crate::{ExecuteResult, LixError, Value};
+
+pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct AdditionalSessionOptions {

@@ -202,6 +202,563 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await
     }
 
+    pub(crate) async fn seed_builtin_registered_schemas(&mut self) -> Result<(), LixError> {
+        for schema_key in crate::schema::builtin_schema_keys() {
+            let schema =
+                crate::schema::builtin_schema_definition(schema_key).ok_or_else(|| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!("builtin schema '{schema_key}' is not available"),
+                })?;
+            let entity_id = builtin_schema_entity_id(schema)?;
+
+            let existing = self
+                .execute_internal(
+                    "SELECT 1 FROM lix_state_by_version \
+                     WHERE schema_key = 'lix_registered_schema' \
+                       AND entity_id = $1 \
+                       AND version_id = 'global' \
+                       AND snapshot_content IS NOT NULL \
+                     LIMIT 1",
+                    &[Value::Text(entity_id.clone())],
+                )
+                .await?;
+            let [statement] = existing.statements.as_slice() else {
+                return Err(crate::common::unexpected_statement_count_error(
+                    "builtin schema existence query",
+                    1,
+                    existing.statements.len(),
+                ));
+            };
+            if !statement.rows.is_empty() {
+                continue;
+            }
+
+            let snapshot_content = serde_json::json!({
+                "value": schema
+            })
+            .to_string();
+            self.execute_internal(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, created_at, updated_at, untracked\
+                 ) VALUES ($1, 'lix_registered_schema', 'lix', 'global', 'lix', $2, '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', true)",
+                &[
+                    Value::Text(entity_id),
+                    Value::Text(snapshot_content),
+                ],
+            )
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    pub(crate) async fn seed_default_versions(&mut self) -> Result<String, LixError> {
+        let initial_commit_id = match self.load_latest_commit_id().await? {
+            Some(commit_id) => commit_id,
+            None => {
+                let initial_change_set_id = self.generate_runtime_uuid().await?;
+                let initial_commit_id = self.generate_runtime_uuid().await?;
+                self.seed_initial_change_set(&initial_change_set_id).await?;
+                self.seed_initial_commit(&initial_commit_id, &initial_change_set_id)
+                    .await?;
+                initial_commit_id
+            }
+        };
+        self.assert_commit_change_set_integrity(&initial_commit_id)
+            .await?;
+
+        let main_version_id = match self
+            .find_version_id_by_name(crate::contracts::DEFAULT_ACTIVE_VERSION_NAME)
+            .await?
+        {
+            Some(version_id) => version_id,
+            None => {
+                let generated_main_id = self.generate_runtime_uuid().await?;
+                self.seed_canonical_version_descriptor(
+                    &initial_commit_id,
+                    &generated_main_id,
+                    crate::contracts::DEFAULT_ACTIVE_VERSION_NAME,
+                )
+                .await?;
+                generated_main_id
+            }
+        };
+
+        self.seed_canonical_version_descriptor(
+            &initial_commit_id,
+            crate::contracts::GLOBAL_VERSION_ID,
+            crate::contracts::GLOBAL_VERSION_ID,
+        )
+        .await?;
+        self.seed_local_version_head(crate::contracts::GLOBAL_VERSION_ID, &initial_commit_id)
+            .await?;
+        self.seed_local_version_head(&main_version_id, &initial_commit_id)
+            .await?;
+
+        Ok(main_version_id)
+    }
+
+    pub(crate) async fn find_version_id_by_name(
+        &mut self,
+        name: &str,
+    ) -> Result<Option<String>, LixError> {
+        let mut executor =
+            crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
+        crate::session::version_ops::descriptors::find_version_id_by_name_with_executor(
+            &mut executor,
+            name,
+        )
+        .await
+    }
+
+    pub(crate) async fn assert_commit_change_set_integrity(
+        &mut self,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let commit_row = self
+            .execute_backend(
+                "SELECT s.content \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL",
+                &[Value::Text(commit_id.to_string())],
+            )
+            .await?;
+        let [row] = commit_row.rows.as_slice() else {
+            return Err(if commit_row.rows.is_empty() {
+                LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "init invariant violation: commit '{commit_id}' is missing from canonical lix_commit facts"
+                    ),
+                }
+            } else {
+                LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "init invariant violation: expected exactly one canonical lix_commit fact for '{commit_id}', got {}",
+                        commit_row.rows.len()
+                    ),
+                }
+            });
+        };
+        let Some(Value::Text(raw_snapshot)) = row.first() else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "init invariant violation: commit '{commit_id}' canonical snapshot must be text"
+                ),
+            });
+        };
+        let commit_snapshot: crate::schema::LixCommit =
+            serde_json::from_str(raw_snapshot).map_err(|error| LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "init invariant violation: commit '{commit_id}' canonical snapshot is invalid JSON: {error}"
+                ),
+            })?;
+        let Some(change_set_id) = commit_snapshot
+            .change_set_id
+            .filter(|change_set_id| !change_set_id.is_empty())
+        else {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "init invariant violation: commit '{commit_id}' has empty change_set_id"
+                ),
+            });
+        };
+
+        let existing = self
+            .execute_backend(
+                "SELECT 1 \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_change_set' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(change_set_id.clone())],
+            )
+            .await?;
+        if existing.rows.is_empty() {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "init invariant violation: commit '{commit_id}' references missing change_set '{change_set_id}'"
+                ),
+            });
+        }
+
+        Ok(())
+    }
+
+    async fn seed_local_version_head(
+        &mut self,
+        version_id: &str,
+        commit_id: &str,
+    ) -> Result<(), LixError> {
+        let timestamp = self.generate_runtime_timestamp().await?;
+        let row = LiveRow {
+            entity_id: version_id.to_string(),
+            schema_key: crate::contracts::version_ref_schema_key().to_string(),
+            schema_version: crate::contracts::version_ref_schema_version().to_string(),
+            file_id: crate::contracts::version_ref_file_id().to_string(),
+            version_id: crate::contracts::version_ref_storage_version_id().to_string(),
+            plugin_key: crate::contracts::version_ref_plugin_key().to_string(),
+            metadata: None,
+            change_id: None,
+            writer_key: None,
+            global: true,
+            untracked: true,
+            created_at: Some(timestamp.clone()),
+            updated_at: Some(timestamp),
+            snapshot_content: Some(crate::contracts::version_ref_snapshot_content(
+                version_id, commit_id,
+            )),
+        };
+        write_live_rows(self.backend_transaction_mut()?, &[row]).await
+    }
+
+    pub(crate) async fn seed_commit_graph_nodes(&mut self) -> Result<(), LixError> {
+        let graph_count_result = self
+            .execute_backend(
+                &format!(
+                    "SELECT COUNT(*) FROM {}",
+                    crate::canonical::COMMIT_GRAPH_NODE_TABLE
+                ),
+                &[],
+            )
+            .await?;
+        let graph_count =
+            read_scalar_count(&graph_count_result, "lix_internal_commit_graph_node count")?;
+        if graph_count > 0 {
+            return Ok(());
+        }
+
+        let commit_count_result = self
+            .execute_backend(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL",
+                &[],
+            )
+            .await?;
+        let commit_count = read_scalar_count(&commit_count_result, "lix_commit count")?;
+        if commit_count == 0 {
+            return Ok(());
+        }
+
+        let dialect = self.backend_transaction_mut()?.dialect();
+        self.execute_backend(
+            &crate::canonical::build_commit_generation_seed_sql(dialect),
+            &[],
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn seed_canonical_version_descriptor(
+        &mut self,
+        initial_commit_id: &str,
+        entity_id: &str,
+        name: &str,
+    ) -> Result<String, LixError> {
+        let snapshot_content = crate::contracts::version_descriptor_snapshot_content(
+            entity_id,
+            name,
+            entity_id == GLOBAL_VERSION_ID,
+        );
+        let change_id = self.generate_runtime_uuid().await?;
+        let timestamp = self.generate_runtime_timestamp().await?;
+        self.insert_change_row_for_snapshot(
+            entity_id,
+            crate::contracts::version_descriptor_schema_key(),
+            crate::contracts::version_descriptor_schema_version(),
+            crate::contracts::version_descriptor_file_id(),
+            crate::contracts::version_descriptor_plugin_key(),
+            &snapshot_content,
+            &change_id,
+            &timestamp,
+        )
+        .await?;
+        self.add_change_id_to_commit(initial_commit_id, &change_id)
+            .await?;
+        Ok(change_id)
+    }
+
+    pub(crate) async fn seed_initial_commit(
+        &mut self,
+        commit_id: &str,
+        change_set_id: &str,
+    ) -> Result<(), LixError> {
+        let existing = self
+            .execute_backend(
+                "SELECT 1 \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_commit' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(commit_id.to_string())],
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = serde_json::json!({
+            "id": commit_id,
+            "change_set_id": change_set_id,
+            "parent_commit_ids": [],
+            "change_ids": [],
+        })
+        .to_string();
+        let change_id = self.generate_runtime_uuid().await?;
+        let timestamp = self.generate_runtime_timestamp().await?;
+        self.insert_change_row_for_snapshot(
+            commit_id,
+            "lix_commit",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
+            &timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn seed_initial_change_set(
+        &mut self,
+        change_set_id: &str,
+    ) -> Result<(), LixError> {
+        let existing = self
+            .execute_backend(
+                "SELECT 1 \
+                 FROM lix_internal_change c \
+                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
+                 WHERE c.schema_key = 'lix_change_set' \
+                   AND c.entity_id = $1 \
+                   AND c.file_id = 'lix' \
+                   AND s.content IS NOT NULL \
+                 LIMIT 1",
+                &[Value::Text(change_set_id.to_string())],
+            )
+            .await?;
+        if !existing.rows.is_empty() {
+            return Ok(());
+        }
+
+        let snapshot_content = serde_json::json!({ "id": change_set_id }).to_string();
+        let change_id = self.generate_runtime_uuid().await?;
+        let timestamp = self.generate_runtime_timestamp().await?;
+        self.insert_change_row_for_snapshot(
+            change_set_id,
+            "lix_change_set",
+            "1",
+            "lix",
+            "lix",
+            &snapshot_content,
+            &change_id,
+            &timestamp,
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn seed_checkpoint_labels_bootstrap(
+        &mut self,
+        version_heads: &[crate::canonical::CheckpointVersionHeadFact],
+    ) -> Result<(), LixError> {
+        self.seed_default_checkpoint_label().await?;
+        self.rebuild_internal_last_checkpoint_from_heads(version_heads)
+            .await
+    }
+
+    pub(crate) async fn seed_default_checkpoint_label(&mut self) -> Result<(), LixError> {
+        let bootstrap_commit_id = self.load_global_version_commit_id().await?;
+        let existing = self
+            .execute_internal(
+                "SELECT snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = $2 \
+                   AND entity_id = $1 \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY updated_at DESC, created_at DESC, change_id DESC \
+                 LIMIT 1",
+                &[
+                    Value::Text(crate::canonical::CHECKPOINT_LABEL_ID.to_string()),
+                    Value::Text(crate::canonical::CHECKPOINT_LABEL_SCHEMA_KEY.to_string()),
+                ],
+            )
+            .await?;
+        let [statement] = existing.statements.as_slice() else {
+            return Err(crate::common::unexpected_statement_count_error(
+                "default checkpoint label query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if let Some(row) = statement.rows.first() {
+            let Some(Value::Text(snapshot_content)) = row.first() else {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "checkpoint label snapshot_content must be text",
+                ));
+            };
+            let parsed: serde_json::Value = serde_json::from_str(snapshot_content.as_str())
+                .map_err(|error| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!("checkpoint label snapshot invalid JSON: {error}"),
+                })?;
+            let id = parsed.get("id").and_then(serde_json::Value::as_str);
+            let name = parsed.get("name").and_then(serde_json::Value::as_str);
+            if id != Some(crate::canonical::CHECKPOINT_LABEL_ID)
+                || name != Some(crate::canonical::CHECKPOINT_LABEL_NAME)
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "checkpoint label canonical row is present but invalid",
+                ));
+            }
+            self.ensure_checkpoint_label_on_bootstrap_commit(
+                &bootstrap_commit_id,
+                crate::canonical::CHECKPOINT_LABEL_ID,
+            )
+            .await?;
+            return Ok(());
+        }
+
+        let snapshot_content = crate::canonical::checkpoint_label_snapshot();
+        self.insert_bootstrap_tracked_row(
+            Some(&bootstrap_commit_id),
+            crate::canonical::CHECKPOINT_LABEL_ID,
+            crate::canonical::CHECKPOINT_LABEL_SCHEMA_KEY,
+            "1",
+            "lix",
+            "global",
+            "lix",
+            &snapshot_content,
+        )
+        .await?;
+
+        self.ensure_checkpoint_label_on_bootstrap_commit(
+            &bootstrap_commit_id,
+            crate::canonical::CHECKPOINT_LABEL_ID,
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn ensure_checkpoint_label_on_bootstrap_commit(
+        &mut self,
+        bootstrap_commit_id: &str,
+        label_id: &str,
+    ) -> Result<(), LixError> {
+        let entity_label_id =
+            crate::canonical::checkpoint_commit_label_entity_id(bootstrap_commit_id);
+        let existing = self
+            .execute_internal(
+                "SELECT 1 \
+                 FROM lix_state_by_version \
+                 WHERE entity_id = $1 \
+                   AND schema_key = $2 \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND snapshot_content IS NOT NULL \
+                 LIMIT 1",
+                &[
+                    Value::Text(entity_label_id.clone()),
+                    Value::Text(crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string()),
+                ],
+            )
+            .await?;
+        let [statement] = existing.statements.as_slice() else {
+            return Err(crate::common::unexpected_statement_count_error(
+                "checkpoint label bootstrap link existence query",
+                1,
+                existing.statements.len(),
+            ));
+        };
+        if !statement.rows.is_empty() {
+            return Ok(());
+        }
+
+        if label_id != crate::canonical::CHECKPOINT_LABEL_ID {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("unexpected checkpoint label id '{label_id}'"),
+            ));
+        }
+        let snapshot_content =
+            crate::canonical::checkpoint_commit_label_snapshot(bootstrap_commit_id);
+        self.insert_bootstrap_tracked_row(
+            Some(bootstrap_commit_id),
+            &entity_label_id,
+            crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
+            "1",
+            "lix",
+            "global",
+            "lix",
+            &snapshot_content,
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    pub(crate) async fn insert_last_checkpoint_for_version(
+        &mut self,
+        version_id: &str,
+        checkpoint_commit_id: &str,
+    ) -> Result<(), LixError> {
+        self.execute_backend(
+            "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
+             VALUES ($1, $2)",
+            &[
+                Value::Text(version_id.to_string()),
+                Value::Text(checkpoint_commit_id.to_string()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn rebuild_internal_last_checkpoint_from_heads(
+        &mut self,
+        version_heads: &[crate::canonical::CheckpointVersionHeadFact],
+    ) -> Result<(), LixError> {
+        self.execute_backend("DELETE FROM lix_internal_last_checkpoint", &[])
+            .await?;
+
+        for version_head in version_heads {
+            let version_id = version_head.version_id.as_str();
+            let commit_id = version_head.head_commit_id.as_str();
+            let checkpoint_commit_id = self
+                .resolve_last_checkpoint_commit_id_for_tip(commit_id)
+                .await?
+                .unwrap_or_else(|| commit_id.to_string());
+            self.insert_last_checkpoint_for_version(version_id, &checkpoint_commit_id)
+                .await?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn insert_bootstrap_key_value(
         &mut self,
         key: &str,
@@ -546,7 +1103,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 }
 
-pub(crate) fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, LixError> {
+pub(super) fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, LixError> {
     let value = result
         .rows
         .first()
@@ -568,7 +1125,7 @@ pub(crate) fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Res
     }
 }
 
-pub(crate) fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
+pub(super) fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
     match value {
         Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
         Some(Value::Text(_)) => Err(LixError {
@@ -587,7 +1144,7 @@ pub(crate) fn text_value(value: Option<&Value>, label: &str) -> Result<String, L
     }
 }
 
-pub(crate) fn system_directory_name(path: &str) -> String {
+pub(super) fn system_directory_name(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
     trimmed
         .rsplit('/')
@@ -595,4 +1152,23 @@ pub(crate) fn system_directory_name(path: &str) -> String {
         .filter(|segment| !segment.is_empty())
         .unwrap_or(".lix")
         .to_string()
+}
+
+fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
+    let schema_key = schema
+        .get("x-lix-key")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "builtin schema must define string x-lix-key".to_string(),
+        })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "builtin schema must define string x-lix-version".to_string(),
+        })?;
+
+    Ok(format!("{schema_key}~{schema_version}"))
 }

@@ -59,12 +59,12 @@ pub(crate) use api::{
 #[allow(unused_imports)]
 pub(crate) use checkpoint_labels::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, checkpoint_label_snapshot,
-    resolve_last_checkpoint_commit_id_for_tip_with_executor,
-    seed_bootstrap as seed_checkpoint_labels_bootstrap, CheckpointVersionHeadFact,
+    resolve_last_checkpoint_commit_id_for_tip_with_executor, CheckpointVersionHeadFact,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY, CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME,
     CHECKPOINT_LABEL_SCHEMA_KEY,
 };
-pub(crate) use init::{init, seed_bootstrap};
+pub(crate) use graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
+pub(crate) use init::init;
 #[allow(unused_imports)]
 pub(crate) use read::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,

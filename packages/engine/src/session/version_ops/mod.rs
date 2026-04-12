@@ -12,7 +12,7 @@ mod merge;
 mod state_history;
 pub(crate) mod undo_redo;
 
-pub(crate) use bootstrap::{init, seed_bootstrap};
+pub(crate) use bootstrap::init;
 pub(crate) use committed_state::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions,

@@ -1,7 +1,7 @@
-use crate::init::seed::{system_directory_name, text_value};
-use crate::init::InitExecutor;
 use crate::LixError;
 use crate::Value;
+
+use super::seed::{system_directory_name, text_value, InitExecutor};
 
 pub(crate) async fn seed_bootstrap(executor: &mut InitExecutor<'_, '_>) -> Result<(), LixError> {
     executor.seed_global_system_directories().await
