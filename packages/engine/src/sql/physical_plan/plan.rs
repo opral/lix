@@ -1,11 +1,10 @@
-use crate::catalog::SurfaceBinding;
 use crate::contracts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionRead};
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
-use crate::sql::logical_plan::public_ir::{FilesystemKind, PlannedStateRow, VersionScope};
+use crate::sql::logical_plan::public_ir::PlannedStateRow;
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::contracts::effects::PlanEffects;
 use crate::sql::prepare::contracts::planned_statement::SchemaLiveTableRequirement;
@@ -339,76 +338,4 @@ pub(crate) struct UntrackedWriteExecution {
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FilesystemPublicSurface {
-    File,
-    FileByVersion,
-    Directory,
-    DirectoryByVersion,
-}
-
-impl FilesystemPublicSurface {
-    pub(crate) fn from_public_name(public_name: &str) -> Option<Self> {
-        match public_name.to_ascii_lowercase().as_str() {
-            "lix_file" => Some(Self::File),
-            "lix_file_by_version" => Some(Self::FileByVersion),
-            "lix_directory" => Some(Self::Directory),
-            "lix_directory_by_version" => Some(Self::DirectoryByVersion),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn from_surface_binding(binding: &SurfaceBinding) -> Option<Self> {
-        Self::from_public_name(&binding.descriptor.public_name)
-    }
-
-    pub(crate) fn from_filesystem_read(
-        binding: &SurfaceBinding,
-        kind: FilesystemKind,
-        version_scope: VersionScope,
-    ) -> Option<Self> {
-        let surface = Self::from_surface_binding(binding)?;
-        match (surface, kind, version_scope) {
-            (Self::File, FilesystemKind::File, VersionScope::ActiveVersion)
-            | (Self::FileByVersion, FilesystemKind::File, VersionScope::ExplicitVersion)
-            | (Self::Directory, FilesystemKind::Directory, VersionScope::ActiveVersion)
-            | (
-                Self::DirectoryByVersion,
-                FilesystemKind::Directory,
-                VersionScope::ExplicitVersion,
-            ) => Some(surface),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn kind(self) -> FilesystemKind {
-        match self {
-            Self::File | Self::FileByVersion => FilesystemKind::File,
-            Self::Directory | Self::DirectoryByVersion => FilesystemKind::Directory,
-        }
-    }
-
-    pub(crate) fn needs_active_version_id(self) -> bool {
-        matches!(self, Self::File | Self::Directory)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::FilesystemPublicSurface;
-
-    #[test]
-    fn filesystem_surface_names_map_to_typed_variants() {
-        assert_eq!(
-            FilesystemPublicSurface::from_public_name("lix_file"),
-            Some(FilesystemPublicSurface::File)
-        );
-        assert_eq!(
-            FilesystemPublicSurface::from_public_name("lix_directory_by_version"),
-            Some(FilesystemPublicSurface::DirectoryByVersion)
-        );
-        assert_eq!(FilesystemPublicSurface::from_public_name("message"), None);
-    }
 }

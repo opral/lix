@@ -1,3 +1,7 @@
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
+    FilesystemRelationKind, SurfaceBinding,
+};
 use crate::contracts::should_invalidate_deterministic_settings_cache;
 use crate::contracts::{
     PlannedFilesystemState, PreparedPublicWriteExecutionPartition, PreparedWriteStep,
@@ -223,13 +227,21 @@ fn public_write_filesystem_payload_changes_already_committed(prepared: &Prepared
     let Some(public_write) = prepared.public_write() else {
         return false;
     };
-    matches!(
-        public_write.contract.target.descriptor.public_name.as_str(),
-        "lix_file" | "lix_file_by_version"
-    ) && public_write.materialization().is_some_and(|execution| {
-        execution
-            .partitions
-            .iter()
-            .any(|partition| matches!(partition, PreparedPublicWriteExecutionPartition::Tracked(_)))
-    })
+    is_catalog_filesystem_file_surface(&public_write.contract.target)
+        && public_write.materialization().is_some_and(|execution| {
+            execution.partitions.iter().any(|partition| {
+                matches!(partition, PreparedPublicWriteExecutionPartition::Tracked(_))
+            })
+        })
+}
+
+fn is_catalog_filesystem_file_surface(target: &SurfaceBinding) -> bool {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics(target)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| {
+            semantics.target_kind == CatalogWriteTargetKind::Filesystem
+                && semantics.filesystem_kind == Some(FilesystemRelationKind::File)
+        })
 }

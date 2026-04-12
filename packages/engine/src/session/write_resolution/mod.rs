@@ -2,6 +2,9 @@ pub(crate) mod effective_state;
 pub(crate) mod prepared_artifacts;
 
 use crate::catalog::SurfaceFamily;
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
+};
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
@@ -268,8 +271,8 @@ async fn resolve_admin_write(
     planned_write: &PlannedWrite,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    match planned_write.command.target.descriptor.public_name.as_str() {
-        "lix_version" => match planned_write.command.operation_kind {
+    match admin_write_behavior(&planned_write.command.target)? {
+        CatalogAdminWriteBehavior::Version => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
                 resolve_version_insert_write_plan(hydrator, planned_write).await
             }
@@ -277,13 +280,30 @@ async fn resolve_admin_write(
                 resolve_existing_version_write(hydrator, planned_write, selector_resolver).await
             }
         },
-        other => Err(WriteResolveError {
+    }
+}
+
+fn admin_write_behavior(
+    target: &crate::catalog::SurfaceBinding,
+) -> Result<CatalogAdminWriteBehavior, WriteResolveError> {
+    let Some(semantics) = builtin_catalog_compiler_facade()
+        .write_surface_semantics(target)
+        .map_err(write_resolve_backend_error)?
+    else {
+        return Err(WriteResolveError {
             message: format!(
                 "public write resolver does not yet support '{}' writes",
-                other
+                target.descriptor.public_name
             ),
-        }),
-    }
+        });
+    };
+
+    semantics.admin_behavior.ok_or_else(|| WriteResolveError {
+        message: format!(
+            "public write resolver does not yet support '{}' writes",
+            target.descriptor.public_name
+        ),
+    })
 }
 
 async fn resolve_version_insert_write_plan(

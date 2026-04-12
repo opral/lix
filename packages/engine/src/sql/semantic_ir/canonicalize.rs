@@ -1,4 +1,7 @@
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
+    CatalogWriteVersionSemantics, SurfaceBinding, SurfaceFamily, SurfaceRegistry,
+};
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
@@ -620,7 +623,7 @@ fn bind_table_with_joins_surface(
 
 fn validate_semantic_write_surface(
     surface_binding: &SurfaceBinding,
-    surface_rule: impl Fn(&SurfaceBinding) -> bool,
+    surface_rule: impl Fn(&SurfaceBinding) -> Result<bool, CanonicalizeError>,
 ) -> Result<(), CanonicalizeError> {
     if !surface_binding.resolution_capabilities.semantic_write {
         return Err(CanonicalizeError::unsupported(format!(
@@ -639,7 +642,7 @@ fn validate_semantic_write_surface(
             "public write canonicalizer only supports migrated state, entity, admin, and filesystem surfaces",
         ));
     }
-    if !surface_rule(surface_binding) {
+    if !surface_rule(surface_binding)? {
         return Err(CanonicalizeError::unsupported(format!(
             "public day-1 write canonicalizer does not yet support '{}' for this operation",
             surface_binding.descriptor.public_name
@@ -664,36 +667,16 @@ fn reject_filesystem_history_write(
     Ok(())
 }
 
-fn insert_write_surface_supported(surface_binding: &SurfaceBinding) -> bool {
-    matches!(
-        surface_binding.descriptor.surface_family,
-        SurfaceFamily::Entity
-    ) || matches!(
-        surface_binding.descriptor.public_name.as_str(),
-        "lix_state"
-            | "lix_state_by_version"
-            | "lix_version"
-            | "lix_file"
-            | "lix_file_by_version"
-            | "lix_directory"
-            | "lix_directory_by_version"
-    )
+fn insert_write_surface_supported(
+    surface_binding: &SurfaceBinding,
+) -> Result<bool, CanonicalizeError> {
+    Ok(write_target_kind(surface_binding)?.is_some())
 }
 
-fn update_delete_surface_supported(surface_binding: &SurfaceBinding) -> bool {
-    matches!(
-        surface_binding.descriptor.surface_family,
-        SurfaceFamily::Entity
-    ) || matches!(
-        surface_binding.descriptor.public_name.as_str(),
-        "lix_state"
-            | "lix_state_by_version"
-            | "lix_version"
-            | "lix_file"
-            | "lix_file_by_version"
-            | "lix_directory"
-            | "lix_directory_by_version"
-    )
+fn update_delete_surface_supported(
+    surface_binding: &SurfaceBinding,
+) -> Result<bool, CanonicalizeError> {
+    Ok(write_target_kind(surface_binding)?.is_some())
 }
 
 fn insert_payloads(
@@ -1167,7 +1150,8 @@ fn reject_forbidden_default_state_write_column(
         "version_id" | "lixcol_version_id"
     ) {
         return Err(CanonicalizeError::unsupported(format!(
-            "lix_state {operation} cannot set version_id; active version is resolved automatically"
+            "{} {operation} cannot set version_id; active version is resolved automatically",
+            surface_binding.descriptor.public_name
         )));
     }
 
@@ -1181,19 +1165,53 @@ fn reject_forbidden_default_state_selector(
     if default_state_surface_rejects_version_id(surface_binding)
         && contains_version_id_reference(expr)
     {
-        return Err(CanonicalizeError::unsupported(
-            "lix_state does not expose version_id; use lix_state_by_version for explicit version filters",
-        ));
+        let counterpart = builtin_catalog_compiler_facade()
+            .explicit_version_counterpart_surface_name(surface_binding, &["version_id".to_string()])
+            .unwrap_or_else(|| "an explicit-version surface".to_string());
+        return Err(CanonicalizeError::unsupported(format!(
+            "{} does not expose version_id; use {} for explicit version filters",
+            surface_binding.descriptor.public_name, counterpart
+        )));
     }
 
     Ok(())
 }
 
 fn default_state_surface_rejects_version_id(surface_binding: &SurfaceBinding) -> bool {
-    surface_binding
-        .descriptor
-        .public_name
-        .eq_ignore_ascii_case("lix_state")
+    write_version_semantics(surface_binding)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| {
+            semantics == CatalogWriteVersionSemantics::ActiveVersionDefaultRejectedVersionId
+        })
+}
+
+fn write_target_kind(
+    surface_binding: &SurfaceBinding,
+) -> Result<Option<CatalogWriteTargetKind>, CanonicalizeError> {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics(surface_binding)
+        .map(|semantics| semantics.map(|semantics| semantics.target_kind))
+        .map_err(|error| {
+            CanonicalizeError::unsupported(format!(
+                "catalog write-surface semantics lookup failed for '{}': {}",
+                surface_binding.descriptor.public_name, error.description
+            ))
+        })
+}
+
+fn write_version_semantics(
+    surface_binding: &SurfaceBinding,
+) -> Result<Option<CatalogWriteVersionSemantics>, CanonicalizeError> {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics(surface_binding)
+        .map(|semantics| semantics.map(|semantics| semantics.version_semantics))
+        .map_err(|error| {
+            CanonicalizeError::unsupported(format!(
+                "catalog write-surface semantics lookup failed for '{}': {}",
+                surface_binding.descriptor.public_name, error.description
+            ))
+        })
 }
 
 fn contains_version_id_reference(expr: &Expr) -> bool {
@@ -1250,30 +1268,9 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
                 | "untracked"
                 | "writer_key"
         ),
-        SurfaceFamily::Entity => surface_binding
-            .exposed_columns
-            .iter()
-            .chain(surface_binding.descriptor.hidden_columns.iter())
-            .any(|candidate| {
-                canonical_write_column_key(surface_binding, candidate)
-                    .map(|candidate| candidate == column)
-                    .unwrap_or(false)
-            }),
-        SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
-            "lix_version" => column == "id",
-            _ => false,
-        },
-        SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
-            "lix_file" | "lix_file_by_version" => matches!(
-                column,
-                "id" | "path" | "hidden" | "metadata" | "data" | "version_id" | "untracked"
-            ),
-            "lix_directory" | "lix_directory_by_version" => matches!(
-                column,
-                "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
-            ),
-            _ => false,
-        },
+        SurfaceFamily::Entity | SurfaceFamily::Admin | SurfaceFamily::Filesystem => {
+            write_surface_supports_column(surface_binding, column, column)
+        }
         SurfaceFamily::Change => false,
     }
 }
@@ -1286,7 +1283,10 @@ fn canonical_write_column_key(
     let canonical = candidate_column_key(&column);
 
     match surface_binding.descriptor.surface_family {
-        SurfaceFamily::State => {
+        SurfaceFamily::State
+        | SurfaceFamily::Entity
+        | SurfaceFamily::Admin
+        | SurfaceFamily::Filesystem => {
             let supported = write_surface_supports_column(surface_binding, raw_column, &canonical);
             if supported {
                 Ok(canonical)
@@ -1294,44 +1294,6 @@ fn canonical_write_column_key(
                 Err(unknown_write_column_error(surface_binding, raw_column))
             }
         }
-        SurfaceFamily::Entity => {
-            let supported = write_surface_supports_column(surface_binding, raw_column, &canonical);
-            if supported {
-                Ok(canonical)
-            } else {
-                Err(unknown_write_column_error(surface_binding, raw_column))
-            }
-        }
-        SurfaceFamily::Admin => match surface_binding.descriptor.public_name.as_str() {
-            "lix_version" => match canonical.as_str() {
-                "id" | "name" | "hidden" | "commit_id" => Ok(canonical.clone()),
-                _ => Err(CanonicalizeError::unsupported(format!(
-                    "public write canonicalizer does not support column '{raw_column}' on '{}'",
-                    surface_binding.descriptor.public_name
-                ))),
-            },
-            _ => Err(CanonicalizeError::unsupported(format!(
-                "public write canonicalizer does not yet support '{}' writes",
-                surface_binding.descriptor.public_name
-            ))),
-        },
-        SurfaceFamily::Filesystem => match surface_binding.descriptor.public_name.as_str() {
-            "lix_file" | "lix_file_by_version" => match canonical.as_str() {
-                "id" | "path" | "hidden" | "version_id" | "untracked" | "metadata" | "data" => {
-                    Ok(canonical.clone())
-                }
-                _ => Err(unknown_write_column_error(surface_binding, raw_column)),
-            },
-            "lix_directory" | "lix_directory_by_version" => match canonical.as_str() {
-                "id" | "path" | "parent_id" | "name" | "hidden" | "version_id" | "untracked"
-                | "metadata" => Ok(canonical.clone()),
-                _ => Err(unknown_write_column_error(surface_binding, raw_column)),
-            },
-            _ => Err(CanonicalizeError::unsupported(format!(
-                "public write canonicalizer does not yet support '{}' writes",
-                surface_binding.descriptor.public_name
-            ))),
-        },
         SurfaceFamily::Change => Err(CanonicalizeError::unsupported(format!(
             "public day-1 write canonicalizer does not support '{}' writes",
             surface_binding.descriptor.public_name

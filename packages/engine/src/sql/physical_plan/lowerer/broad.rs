@@ -2609,7 +2609,8 @@ fn build_supported_public_read_surface_sql(
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
-    let Some(surface_binding) = registry.bind_relation_name(surface_name) else {
+    let facade = crate::catalog::catalog_compiler_facade_for_registry(registry);
+    let Some(surface_binding) = facade.resolve_surface(surface_name) else {
         return Ok(None);
     };
 
@@ -2688,7 +2689,7 @@ fn build_public_admin_surface_sql(
     let Some(admin_scan) = CanonicalAdminScan::from_surface_binding(surface_binding.clone()) else {
         return Ok(None);
     };
-    build_admin_source_sql(admin_scan.kind, dialect).map(Some)
+    build_admin_source_sql(&admin_scan, dialect).map(Some)
 }
 
 fn build_public_change_surface_sql(
