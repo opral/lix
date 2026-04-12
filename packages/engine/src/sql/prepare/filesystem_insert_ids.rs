@@ -1,9 +1,11 @@
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
+    FilesystemRelationKind,
+};
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::binder::insert_values_rows_mut;
 use crate::LixError;
-use sqlparser::ast::{
-    Expr, ObjectName, ObjectNamePart, Statement, TableObject, Value as AstValue, ValueWithSpan,
-};
+use sqlparser::ast::{Expr, Statement, TableObject, Value as AstValue, ValueWithSpan};
 
 pub(crate) fn ensure_generated_filesystem_insert_ids<P: LixFunctionProvider>(
     statements: &mut [Statement],
@@ -41,7 +43,7 @@ fn statement_requires_generated_filesystem_insert_id(statement: &Statement) -> b
     let Statement::Insert(insert) = statement else {
         return false;
     };
-    if file_write_target_from_insert(&insert.table).is_none() {
+    if !statement_targets_generated_file_surface(&insert.table) {
         return false;
     }
     let data_index = insert
@@ -59,33 +61,82 @@ fn statement_requires_generated_filesystem_insert_id(statement: &Statement) -> b
     data_index.is_some() && path_index.is_some() && id_index.is_none()
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FileWriteTarget {
-    ActiveVersion,
-    ExplicitVersion,
-}
-
-fn file_write_target_from_insert(table: &TableObject) -> Option<FileWriteTarget> {
+fn statement_targets_generated_file_surface(table: &TableObject) -> bool {
     let TableObject::TableName(name) = table else {
-        return None;
+        return false;
     };
-    let table_name = object_name_terminal(name)?;
-    if table_name.eq_ignore_ascii_case("lix_file") {
-        Some(FileWriteTarget::ActiveVersion)
-    } else if table_name.eq_ignore_ascii_case("lix_file_by_version") {
-        Some(FileWriteTarget::ExplicitVersion)
-    } else {
-        None
-    }
-}
-
-fn object_name_terminal(name: &ObjectName) -> Option<String> {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.clone())
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics_for_object_name(name)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| {
+            semantics.target_kind == CatalogWriteTargetKind::Filesystem
+                && semantics.filesystem_kind == Some(FilesystemRelationKind::File)
+        })
 }
 
 fn string_literal_expr(value: String) -> Expr {
     Expr::Value(ValueWithSpan::from(AstValue::SingleQuotedString(value)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_generated_filesystem_insert_ids;
+    use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::sql::parse_sql;
+    use sqlparser::ast::Statement;
+
+    struct FixedUuidProvider;
+
+    impl LixFunctionProvider for FixedUuidProvider {
+        fn uuid_v7(&mut self) -> String {
+            "uuid-1".to_string()
+        }
+
+        fn timestamp(&mut self) -> String {
+            "2026-01-01T00:00:00Z".to_string()
+        }
+    }
+
+    fn parse_one(sql: &str) -> Statement {
+        let mut statements = parse_sql(sql).expect("sql should parse");
+        assert_eq!(statements.len(), 1);
+        statements.remove(0)
+    }
+
+    #[test]
+    fn generated_insert_ids_use_catalog_write_surface_metadata_for_file_surfaces() {
+        let mut statements = vec![parse_one(
+            "INSERT INTO lix_file (path, data) VALUES ('a', X'01')",
+        )];
+        let functions = SharedFunctionProvider::new(FixedUuidProvider);
+
+        ensure_generated_filesystem_insert_ids(&mut statements, &functions)
+            .expect("generated ids should succeed");
+
+        let Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert");
+        };
+        assert!(insert
+            .columns
+            .iter()
+            .any(|column| column.value.eq_ignore_ascii_case("id")));
+    }
+
+    #[test]
+    fn generated_insert_ids_do_not_apply_to_directory_surfaces() {
+        let mut statements = vec![parse_one("INSERT INTO lix_directory (path) VALUES ('a')")];
+        let functions = SharedFunctionProvider::new(FixedUuidProvider);
+
+        ensure_generated_filesystem_insert_ids(&mut statements, &functions)
+            .expect("filesystem insert preprocessing should succeed");
+
+        let Statement::Insert(insert) = &statements[0] else {
+            panic!("expected insert");
+        };
+        assert!(!insert
+            .columns
+            .iter()
+            .any(|column| column.value.eq_ignore_ascii_case("id")));
+    }
 }

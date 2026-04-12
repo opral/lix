@@ -1614,6 +1614,7 @@ fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
         "diagnostics",
         "live_state",
         "schema",
+        "sql",
     ]
     .into_iter()
     .collect()
@@ -2143,6 +2144,74 @@ fn plan84_non_sql_code_uses_sql_root_not_stage_modules() {
     assert!(
         offenders.is_empty(),
         "Plan 84 regression: non-sql production code should use root sql APIs, not sql stage modules:\n{}",
+        offenders.join("\n"),
+    );
+}
+
+#[test]
+fn plan84_session_uses_root_sql_catalog_and_live_state_apis() {
+    let offenders: Vec<String> = production_source_files()
+        .into_iter()
+        .filter(|(relative_path, _)| relative_path.starts_with("session/"))
+        .filter_map(|(relative_path, source)| {
+            let sanitized = mask_rust_source(&source);
+            (sanitized.contains("crate::sql::parser::")
+                || sanitized.contains("crate::sql::support::")
+                || sanitized.contains("crate::sql::binder::")
+                || sanitized.contains("crate::sql::prepare::")
+                || sanitized.contains("crate::sql::semantic_ir::")
+                || sanitized.contains("crate::sql::logical_plan::")
+                || sanitized.contains("crate::sql::physical_plan::")
+                || sanitized.contains("crate::sql::explain::")
+                || sanitized.contains("crate::catalog::api::")
+                || sanitized.contains("crate::catalog::binding::")
+                || sanitized.contains("crate::catalog::declaration::")
+                || sanitized.contains("crate::catalog::registry::")
+                || sanitized.contains("crate::catalog::state::")
+                || sanitized.contains("crate::catalog::version::")
+                || sanitized.contains("crate::catalog::file::")
+                || sanitized.contains("crate::catalog::directory::")
+                || sanitized.contains("crate::live_state::projection::")
+                || sanitized.contains("crate::live_state::pending_reads::")
+                || sanitized.contains("crate::live_state::storage::")
+                || sanitized.contains("crate::live_state::raw::")
+                || sanitized.contains("crate::live_state::schema_access::")
+                || sanitized.contains("crate::live_state::shared::")
+                || sanitized.contains("crate::live_state::tracked::")
+                || sanitized.contains("crate::live_state::untracked::")
+                || sanitized.contains("crate::live_state::testing::")
+                || sanitized.contains("use crate::sql::parser::")
+                || sanitized.contains("use crate::sql::support::")
+                || sanitized.contains("use crate::sql::binder::")
+                || sanitized.contains("use crate::sql::prepare::")
+                || sanitized.contains("use crate::sql::semantic_ir::")
+                || sanitized.contains("use crate::sql::logical_plan::")
+                || sanitized.contains("use crate::sql::physical_plan::")
+                || sanitized.contains("use crate::sql::explain::")
+                || sanitized.contains("use crate::catalog::api::")
+                || sanitized.contains("use crate::catalog::binding::")
+                || sanitized.contains("use crate::catalog::declaration::")
+                || sanitized.contains("use crate::catalog::registry::")
+                || sanitized.contains("use crate::catalog::state::")
+                || sanitized.contains("use crate::catalog::version::")
+                || sanitized.contains("use crate::catalog::file::")
+                || sanitized.contains("use crate::catalog::directory::")
+                || sanitized.contains("use crate::live_state::projection::")
+                || sanitized.contains("use crate::live_state::pending_reads::")
+                || sanitized.contains("use crate::live_state::storage::")
+                || sanitized.contains("use crate::live_state::raw::")
+                || sanitized.contains("use crate::live_state::schema_access::")
+                || sanitized.contains("use crate::live_state::shared::")
+                || sanitized.contains("use crate::live_state::tracked::")
+                || sanitized.contains("use crate::live_state::untracked::")
+                || sanitized.contains("use crate::live_state::testing::"))
+            .then_some(relative_path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "Plan 84 regression: session/* should orchestrate through root sql/catalog/live_state APIs, not owner child modules:\n{}",
         offenders.join("\n"),
     );
 }

@@ -1,11 +1,17 @@
 mod api;
 mod binding;
 mod declaration;
+mod dependency;
+mod direct_read;
 mod directory;
 mod file;
+mod read_surface;
 mod registry;
+mod scan;
 mod state;
+mod transaction_write;
 mod version;
+mod write_surface;
 
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
@@ -19,12 +25,18 @@ use crate::schema::{
 use crate::LixError;
 
 #[allow(unused_imports)]
-pub(crate) use api::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogCompilerFacade};
+pub(crate) use api::{
+    builtin_catalog_compiler_facade, catalog_compiler_facade_for_registry, CatalogCompilerApi,
+    CatalogCompilerFacade,
+};
 
 #[allow(unused_imports)]
 pub(crate) use registry::*;
 #[allow(unused_imports)]
-pub(crate) use state::state_by_version_relation_name;
+pub(crate) use state::{
+    state_by_version_relation_name, state_surface_effective_foreign_key_target_schema_key,
+    state_surface_validation_schema,
+};
 
 #[allow(unused_imports)]
 pub(crate) use binding::{
@@ -43,6 +55,13 @@ pub(crate) use declaration::{
     CatalogProjectionStorageKind, CatalogProjectionSurfaceSpec, RegisteredCatalogProjection,
 };
 #[allow(unused_imports)]
+pub(crate) use dependency::{
+    dependency_metadata_for_surface_binding, dependency_metadata_for_surface_name,
+    CatalogSurfaceDependencyMetadata,
+};
+#[allow(unused_imports)]
+pub(crate) use direct_read::{direct_read_semantics, CatalogDirectReadSemantics};
+#[allow(unused_imports)]
 pub(crate) use directory::LixDirectoryProjection;
 #[allow(unused_imports)]
 pub(crate) use directory::{
@@ -57,7 +76,26 @@ pub(crate) use file::{
     LixFileByVersionProjection,
 };
 #[allow(unused_imports)]
+pub(crate) use read_surface::{
+    explicit_version_counterpart_surface_name, read_preparation_semantics,
+    CatalogReadPreparationSemantics,
+};
+#[allow(unused_imports)]
+pub(crate) use scan::{
+    admin_scan_kind, filesystem_scan_semantics, is_working_changes_surface, CatalogAdminScanKind,
+    CatalogFilesystemScanSemantics, CatalogScanVersionScope,
+};
+#[allow(unused_imports)]
+pub(crate) use transaction_write::{
+    transaction_insert_semantics, CatalogTransactionInsertSemantics,
+};
+#[allow(unused_imports)]
 pub(crate) use version::{builtin_lix_version_catalog_registration, LixVersionProjection};
+#[allow(unused_imports)]
+pub(crate) use write_surface::{
+    write_surface_semantics, CatalogAdminWriteBehavior, CatalogWriteSurfaceSemantics,
+    CatalogWriteTargetKind, CatalogWriteVersionSemantics,
+};
 
 pub(crate) fn build_builtin_surface_registry() -> SurfaceRegistry {
     let mut registry = SurfaceRegistry::new();

@@ -1,11 +1,10 @@
-use crate::sql::analysis::state_resolution::canonical::{
-    statement_targets_table_name, CanonicalStateResolution,
-};
+use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind};
+use crate::sql::analysis::state_resolution::canonical::CanonicalStateResolution;
 use crate::sql::optimizer::registry::{
     run_infallible_pass, OptimizerPassMetadata, OptimizerPassOutcome, OptimizerPassRegistry,
     OptimizerPassSettings, OptimizerPassTrace,
 };
-use sqlparser::ast::Statement;
+use sqlparser::ast::{FromTable, ObjectName, Statement, TableObject, TableWithJoins};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct OptimizedStateResolution {
@@ -59,7 +58,7 @@ fn optimize_state_resolution_with_settings(
             diagnostics.push("read-only query; file-cache refresh not required".to_string());
         } else if should_refresh_file_cache {
             diagnostics.push(
-                "writes target lix_state/lix_state_by_version; file cache refresh required"
+                "writes target catalog-owned state write surfaces; file cache refresh required"
                     .to_string(),
             );
         } else {
@@ -93,8 +92,43 @@ fn should_refresh_file_cache_for_statements(statements: &[Statement]) -> bool {
 }
 
 fn statement_targets_file_cache_refresh_table(statement: &Statement) -> bool {
-    statement_targets_table_name(statement, "lix_state")
-        || statement_targets_table_name(statement, "lix_state_by_version")
+    match statement {
+        Statement::Insert(insert) => table_object_targets_file_cache_refresh_surface(&insert.table),
+        Statement::Update(update) => {
+            table_with_joins_targets_file_cache_refresh_surface(&update.table)
+        }
+        Statement::Delete(delete) => {
+            let tables = match &delete.from {
+                FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
+            };
+            tables
+                .iter()
+                .any(table_with_joins_targets_file_cache_refresh_surface)
+        }
+        _ => false,
+    }
+}
+
+fn table_object_targets_file_cache_refresh_surface(table: &TableObject) -> bool {
+    let TableObject::TableName(name) = table else {
+        return false;
+    };
+    object_name_targets_file_cache_refresh_surface(name)
+}
+
+fn table_with_joins_targets_file_cache_refresh_surface(table: &TableWithJoins) -> bool {
+    let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation else {
+        return false;
+    };
+    object_name_targets_file_cache_refresh_surface(name)
+}
+
+fn object_name_targets_file_cache_refresh_surface(name: &ObjectName) -> bool {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics_for_object_name(name)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| semantics.target_kind == CatalogWriteTargetKind::State)
 }
 
 #[cfg(test)]

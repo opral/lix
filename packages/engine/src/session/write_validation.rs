@@ -16,7 +16,7 @@ use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
 use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
-use crate::catalog::SurfaceFamily;
+use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceFamily};
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
 use crate::contracts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
@@ -30,9 +30,8 @@ use crate::live_state::{
     LiveRowQuery, LiveRowSemantics, RowReadMode,
 };
 use crate::schema::{
-    builtin_schema_definition, builtin_schema_keys, lix_state_surface_schema_definition,
-    schema_from_registered_snapshot, schema_key_from_definition, validate_lix_schema_definition,
-    SchemaKey,
+    builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
+    schema_key_from_definition, validate_lix_schema_definition, SchemaKey,
 };
 use crate::{LixBackend, LixError, Value};
 
@@ -279,7 +278,11 @@ impl<'a> WriteValidationSchemaLookup<'a> {
 
         let mut entries_by_key = HashMap::<SchemaKey, JsonValue>::new();
 
-        if let Some(schema) = whitelisted_internal_schema("lix_state") {
+        for surface_name in builtin_catalog_compiler_facade().public_surface_names() {
+            let Some(schema) = builtin_catalog_compiler_facade().validation_schema(&surface_name)
+            else {
+                continue;
+            };
             let key = schema_key_from_definition(&schema)?;
             entries_by_key.insert(key, schema);
         }
@@ -1917,27 +1920,18 @@ fn effective_foreign_key_target_schema_key(
     index: usize,
     source_schema_key: &str,
 ) -> Result<String, LixError> {
-    if referenced_schema_key != "lix_state" {
-        return Ok(referenced_schema_key.to_string());
+    if let Some(schema_key) = builtin_catalog_compiler_facade()
+        .effective_foreign_key_target_schema_key(
+            referenced_schema_key,
+            referenced_properties,
+            local_values,
+            source_schema_key,
+            index,
+        )?
+    {
+        return Ok(schema_key);
     }
-
-    let Some(schema_key_position) = referenced_properties
-        .iter()
-        .position(|pointer| pointer == "/schema_key")
-    else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "foreign key at index {index} in schema '{}' references lix_state and must include '/schema_key' in references.properties",
-                source_schema_key
-            ),
-        ));
-    };
-
-    json_value_to_string(
-        &local_values[schema_key_position],
-        "foreign key target schema_key",
-    )
+    Ok(referenced_schema_key.to_string())
 }
 
 fn effective_foreign_key_target_file_id(
@@ -2057,11 +2051,7 @@ fn builtin_schema_for_key(key: &SchemaKey) -> Option<JsonValue> {
 }
 
 fn whitelisted_internal_schema(schema_key: &str) -> Option<JsonValue> {
-    if schema_key != "lix_state" {
-        return None;
-    }
-
-    Some(lix_state_surface_schema_definition().clone())
+    builtin_catalog_compiler_facade().validation_schema(schema_key)
 }
 
 fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String, LixError> {

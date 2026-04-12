@@ -753,7 +753,7 @@ fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
     let Ok(statements) = crate::sql::parse_sql(sql) else {
         return false;
     };
-    crate::sql::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements(&statements)
+    crate::sql::should_invalidate_installed_plugins_cache_for_statements(&statements)
 }
 
 #[cfg(test)]
@@ -761,12 +761,11 @@ mod tests {
     use super::should_invalidate_installed_plugins_cache_for_sql;
     use super::*;
     use crate::runtime::wasm::NoopWasmRuntime;
-    use crate::sql::analysis::state_resolution::canonical::is_query_only_statements;
-    use crate::sql::binder::{advance_placeholder_state_for_statement_ast, bind_sql_with_state};
-    use crate::sql::optimizer::optimize_state_resolution;
-    use crate::sql::parser::parse_sql_statements;
-    use crate::sql::parser::placeholders::PlaceholderState;
-    use crate::sql::prepare::script::extract_explicit_transaction_script_from_statements;
+    use crate::sql::{
+        advance_placeholder_state_for_statement_ast, bind_sql_with_state,
+        extract_explicit_transaction_script, is_query_only_statements, optimize_state_resolution,
+        parse_sql_statements, PlaceholderState,
+    };
     use crate::TransactionMode;
     use crate::{
         ExecuteOptions, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
@@ -1092,7 +1091,7 @@ mod tests {
 
     #[test]
     fn extract_explicit_transaction_script_parses_begin_commit_wrapper() {
-        let parsed = extract_explicit_transaction_script(
+        let parsed = parse_explicit_transaction_script(
             "BEGIN; INSERT INTO lix_file (id, path, data) VALUES ('f1', '/a', x'01'); COMMIT;",
             &[],
         )
@@ -1114,9 +1113,7 @@ mod tests {
             .map(|statements| {
                 optimize_state_resolution(
                     &statements,
-                    crate::sql::analysis::state_resolution::canonical::canonicalize_state_resolution(
-                        &statements,
-                    ),
+                    crate::sql::canonicalize_state_resolution(&statements),
                 )
                 .optimized
                 .should_refresh_file_cache
@@ -1124,12 +1121,12 @@ mod tests {
             .unwrap_or(false)
     }
 
-    fn extract_explicit_transaction_script(
+    fn parse_explicit_transaction_script(
         sql: &str,
         params: &[Value],
     ) -> Result<Option<Vec<Statement>>, LixError> {
         let statements = parse_sql_statements(sql)?;
-        extract_explicit_transaction_script_from_statements(&statements, params)
+        extract_explicit_transaction_script(&statements, params)
     }
 
     #[test]

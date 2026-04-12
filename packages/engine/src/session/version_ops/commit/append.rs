@@ -229,9 +229,7 @@ mod tests {
                         ),
                         Value::Null,
                         Value::Null,
-                        Value::Text(
-                            crate::live_state::testing::LIVE_STATE_SCHEMA_EPOCH.to_string(),
-                        ),
+                        Value::Text(crate::live_state::LIVE_STATE_SCHEMA_EPOCH.to_string()),
                     ]],
                     columns: vec![
                         "mode".to_string(),

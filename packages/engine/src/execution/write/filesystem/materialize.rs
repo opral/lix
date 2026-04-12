@@ -1,7 +1,6 @@
-use crate::binary_cas::read::load_binary_blob_data_by_hash;
 use crate::catalog::FilesystemProjectionScope;
-use crate::contracts::FilesystemPluginMaterializer;
 use crate::contracts::{select_best_glob_match, InstalledPlugin, PluginContentType};
+use crate::contracts::{BlobDataReader, FilesystemPluginMaterializer};
 use crate::execution::write::filesystem::query::load_file_row_by_id;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::{LixBackend, LixError};
@@ -148,7 +147,8 @@ pub(crate) async fn materialize_file_data_with_plugins(
         if plugin.is_none() {
             let blob_ref = builtin_binary_blob_ref_from_changes(&changes, &descriptor.file_id)?;
             if let Some(blob_ref) = blob_ref {
-                let blob_data = load_binary_blob_data_by_hash(backend, &blob_ref.blob_hash)
+                let blob_data = backend
+                    .load_blob_data_by_hash(&blob_ref.blob_hash)
                     .await?
                     .ok_or_else(|| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),

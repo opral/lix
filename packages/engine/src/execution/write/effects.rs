@@ -82,7 +82,7 @@ fn function_args_empty(function: &Function) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{derive_execution_runtime_effects, ExecutionRuntimeEffects};
-    use crate::sql::parser::parse_sql;
+    use crate::sql::parse_sql;
 
     #[test]
     fn deterministic_runtime_effects_detect_uuid_and_timestamp_usage() {

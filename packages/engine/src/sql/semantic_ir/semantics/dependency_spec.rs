@@ -1,71 +1,49 @@
-use crate::catalog::{SurfaceBinding, SurfaceFamily};
-use crate::contracts::SessionDependency;
-use crate::sql::logical_plan::public_ir::{
-    CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan,
-    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogSurfaceDependencyMetadata,
+    SurfaceBinding, SurfaceFamily,
 };
+use crate::contracts::SessionDependency;
+use crate::sql::logical_plan::public_ir::{ReadPlan, StructuredPublicRead};
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
     BinaryOperator, Expr, OrderByKind, SelectItem, UnaryOperator, Value as SqlValue, Visit, Visitor,
 };
-use std::collections::BTreeSet;
 use std::ops::ControlFlow;
 
 pub(crate) fn derive_dependency_spec_from_structured_public_read(
     structured_read: &StructuredPublicRead,
 ) -> Option<DependencySpec> {
     if let Some(change_scan) = canonical_change_scan(&structured_read.read_command.root) {
+        let mut spec = dependency_spec_from_catalog_metadata(&change_scan.binding);
+        spec.precision = DependencyPrecision::Conservative;
+        return Some(with_public_surface_registry_dependency(spec));
+    }
+    if let Some(scan) = canonical_working_changes_scan(&structured_read.read_command.root) {
+        let mut spec = dependency_spec_from_catalog_metadata(&scan.binding);
+        spec.precision = DependencyPrecision::Conservative;
+        return Some(with_public_surface_registry_dependency(spec));
+    }
+    if canonical_filesystem_scan(&structured_read.read_command.root).is_some() {
         return Some(with_public_surface_registry_dependency(
-            dependency_spec_for_change_scan(&change_scan.binding),
+            dependency_spec_for_filesystem_scan(&structured_read.surface_binding),
         ));
     }
-    if canonical_working_changes_scan(&structured_read.read_command.root).is_some() {
+    if let Some(scan) = canonical_admin_scan(&structured_read.read_command.root) {
         return Some(with_public_surface_registry_dependency(
-            dependency_spec_for_working_changes_scan(),
+            dependency_spec_from_catalog_metadata(&scan.binding),
         ));
     }
-    if let Some(filesystem_scan) = canonical_filesystem_scan(&structured_read.read_command.root) {
-        return Some(with_public_surface_registry_dependency(
-            dependency_spec_for_filesystem_scan(
-                filesystem_scan.kind,
-                &structured_read.surface_binding,
-            ),
-        ));
-    }
-    if let Some(admin_scan) = canonical_admin_scan(&structured_read.read_command.root) {
-        return Some(with_public_surface_registry_dependency(
-            dependency_spec_for_admin_scan(admin_scan.kind),
-        ));
-    }
-    let Some(scan) = canonical_state_scan(&structured_read.read_command.root) else {
+    let Some(_scan) = canonical_state_scan(&structured_read.read_command.root) else {
         return None;
     };
     if query_contains_expression_subqueries(&structured_read.query) {
         return None;
     }
 
-    let relation_name = structured_read
-        .surface_binding
-        .descriptor
-        .public_name
-        .to_ascii_lowercase();
-    let mut pinned_schema_keys = BTreeSet::new();
-    if let Some(schema_key) = structured_read
-        .surface_binding
-        .implicit_overrides
-        .fixed_schema_key
-        .clone()
-    {
-        pinned_schema_keys.insert(schema_key);
-    }
-
-    let mut spec = DependencySpec {
-        relations: [relation_name].into_iter().collect(),
-        schema_keys: pinned_schema_keys.clone(),
-        ..DependencySpec::default()
-    };
+    let mut spec = dependency_spec_from_catalog_metadata(&structured_read.surface_binding);
+    let pinned_schema_keys = spec.schema_keys.clone();
     let mut placeholder_state = PlaceholderState::new();
     for predicate in &structured_read.query.selection_predicates {
         if expr_is_non_representable_for_commit_filter(predicate) {
@@ -84,10 +62,7 @@ pub(crate) fn derive_dependency_spec_from_structured_public_read(
         );
     }
 
-    if state_like_surface_depends_on_active_version(&scan.binding, scan.version_scope) {
-        spec.depends_on_active_version = true;
-        spec.session_dependencies
-            .insert(SessionDependency::ActiveVersion);
+    if spec.depends_on_active_version {
         spec.entity_ids.clear();
         spec.file_ids.clear();
         spec.version_ids.clear();
@@ -178,138 +153,53 @@ fn with_public_surface_registry_dependency(mut spec: DependencySpec) -> Dependen
     spec
 }
 
-fn dependency_spec_for_admin_scan(kind: CanonicalAdminKind) -> DependencySpec {
-    let mut spec = DependencySpec::default();
-    match kind {
-        CanonicalAdminKind::Version => {
-            spec.relations.insert("lix_version".to_string());
-            spec.schema_keys
-                .insert("lix_version_descriptor".to_string());
-            spec.schema_keys.insert("lix_version_ref".to_string());
-        }
-    }
-    spec
-}
-
 fn dependency_spec_for_bound_surface(binding: &SurfaceBinding) -> DependencySpec {
-    if let Some(admin_scan) = CanonicalAdminScan::from_surface_binding(binding.clone()) {
-        return dependency_spec_for_admin_scan(admin_scan.kind);
-    }
-    if let Some(filesystem_scan) = CanonicalFilesystemScan::from_surface_binding(binding.clone()) {
-        return dependency_spec_for_filesystem_scan(filesystem_scan.kind, binding);
-    }
-    if CanonicalWorkingChangesScan::from_surface_binding(binding.clone()).is_some() {
-        return dependency_spec_for_working_changes_scan();
-    }
-    if CanonicalChangeScan::from_surface_binding(binding.clone()).is_some() {
-        return dependency_spec_for_change_scan(binding);
-    }
-
-    dependency_spec_for_state_like_surface(binding)
-}
-
-fn dependency_spec_for_working_changes_scan() -> DependencySpec {
-    DependencySpec {
-        relations: ["lix_working_changes".to_string()].into_iter().collect(),
-        precision: DependencyPrecision::Conservative,
-        ..DependencySpec::default()
-    }
-}
-
-fn dependency_spec_for_filesystem_scan(
-    kind: FilesystemKind,
-    binding: &crate::catalog::SurfaceBinding,
-) -> DependencySpec {
-    let mut spec = DependencySpec {
-        relations: [binding.descriptor.public_name.clone()]
-            .into_iter()
-            .collect(),
-        ..DependencySpec::default()
-    };
-
-    match kind {
-        FilesystemKind::File => {
-            spec.schema_keys.insert("lix_file_descriptor".to_string());
-            spec.schema_keys.insert("lix_binary_blob_ref".to_string());
-            spec.schema_keys
-                .insert("lix_directory_descriptor".to_string());
-        }
-        FilesystemKind::Directory => {
-            spec.schema_keys
-                .insert("lix_directory_descriptor".to_string());
-        }
-    }
-
-    if matches!(
-        binding.descriptor.public_name.as_str(),
-        "lix_file" | "lix_directory" | "lix_file_history" | "lix_directory_history"
-    ) {
-        spec.depends_on_active_version = true;
-        spec.session_dependencies
-            .insert(SessionDependency::ActiveVersion);
-    }
-
-    spec.precision = DependencyPrecision::Conservative;
-    spec
-}
-
-fn dependency_spec_for_change_scan(binding: &SurfaceBinding) -> DependencySpec {
-    DependencySpec {
-        relations: [binding.descriptor.public_name.clone()]
-            .into_iter()
-            .collect(),
-        precision: DependencyPrecision::Conservative,
-        ..DependencySpec::default()
-    }
-}
-
-fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> DependencySpec {
-    let mut spec = DependencySpec {
-        relations: [binding.descriptor.public_name.clone()]
-            .into_iter()
-            .collect(),
-        ..DependencySpec::default()
-    };
     if matches!(
         binding.descriptor.surface_family,
         SurfaceFamily::State | SurfaceFamily::Entity
     ) {
-        if let Some(schema_key) = binding.implicit_overrides.fixed_schema_key.clone() {
-            spec.schema_keys.insert(schema_key);
-        }
-        let version_scope = match binding.default_scope {
-            crate::catalog::DefaultScopeSemantics::ActiveVersion => {
-                Some(VersionScope::ActiveVersion)
-            }
-            crate::catalog::DefaultScopeSemantics::ExplicitVersion => {
-                Some(VersionScope::ExplicitVersion)
-            }
-            crate::catalog::DefaultScopeSemantics::History => Some(VersionScope::History),
-            crate::catalog::DefaultScopeSemantics::GlobalAdmin
-            | crate::catalog::DefaultScopeSemantics::WorkingChanges => None,
-        };
-        if version_scope
-            .is_some_and(|scope| state_like_surface_depends_on_active_version(binding, scope))
-        {
-            spec.depends_on_active_version = true;
-            spec.session_dependencies
-                .insert(SessionDependency::ActiveVersion);
-        }
-        spec.precision = DependencyPrecision::Conservative;
+        return dependency_spec_for_state_like_surface(binding);
     }
+
+    let mut spec = dependency_spec_from_catalog_metadata(binding);
+    spec.precision = DependencyPrecision::Conservative;
     spec
 }
 
-fn state_like_surface_depends_on_active_version(
-    binding: &SurfaceBinding,
-    version_scope: VersionScope,
-) -> bool {
-    version_scope == VersionScope::ActiveVersion
-        || (version_scope == VersionScope::History
-            && !binding
-                .descriptor
-                .public_name
-                .ends_with("_history_by_version"))
+fn dependency_spec_for_filesystem_scan(binding: &crate::catalog::SurfaceBinding) -> DependencySpec {
+    let mut spec = dependency_spec_from_catalog_metadata(binding);
+    spec.precision = DependencyPrecision::Conservative;
+    spec
+}
+
+fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> DependencySpec {
+    let mut spec = dependency_spec_from_catalog_metadata(binding);
+    spec.precision = DependencyPrecision::Conservative;
+    spec
+}
+
+fn dependency_spec_from_catalog_metadata(binding: &SurfaceBinding) -> DependencySpec {
+    match builtin_catalog_compiler_facade().dependency_metadata_for_binding(binding) {
+        Ok(Some(metadata)) => dependency_spec_from_catalog_surface_metadata(metadata),
+        Ok(None) | Err(_) => DependencySpec {
+            relations: [binding.descriptor.public_name.clone()]
+                .into_iter()
+                .collect(),
+            ..DependencySpec::default()
+        },
+    }
+}
+
+fn dependency_spec_from_catalog_surface_metadata(
+    metadata: CatalogSurfaceDependencyMetadata,
+) -> DependencySpec {
+    DependencySpec {
+        relations: metadata.relation_names,
+        schema_keys: metadata.compiled_schema_keys,
+        session_dependencies: metadata.session_dependencies,
+        depends_on_active_version: metadata.depends_on_active_version,
+        ..DependencySpec::default()
+    }
 }
 
 fn merge_dependency_specs(mut left: DependencySpec, right: DependencySpec) -> DependencySpec {
@@ -589,6 +479,7 @@ mod tests {
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::ExecutionContext;
     use crate::{SqlDialect, Value};
+    use std::collections::BTreeSet;
 
     fn structured_read(
         registry: &SurfaceRegistry,
@@ -678,5 +569,84 @@ mod tests {
             .contains(&SessionDependency::ActiveVersion));
         assert!(spec.schema_keys.is_empty());
         assert!(spec.entity_ids.is_empty());
+    }
+
+    #[test]
+    fn filesystem_history_by_version_dependencies_come_from_catalog_metadata() {
+        let registry = crate::catalog::build_builtin_surface_registry();
+        let structured_read = structured_read(
+            &registry,
+            "SELECT id, path FROM lix_file_history_by_version WHERE version_id = 'v-1'",
+            Vec::new(),
+        );
+
+        let spec = derive_dependency_spec_from_structured_public_read(&structured_read)
+            .expect("filesystem history-by-version read should derive dependency spec");
+
+        assert_eq!(spec.precision, DependencyPrecision::Conservative);
+        assert!(!spec.depends_on_active_version);
+        assert!(!spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
+        assert_eq!(
+            spec.schema_keys,
+            BTreeSet::from([
+                "lix_binary_blob_ref".to_string(),
+                "lix_directory_descriptor".to_string(),
+                "lix_file_descriptor".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn admin_surface_dependencies_come_from_catalog_metadata() {
+        let registry = crate::catalog::build_builtin_surface_registry();
+        let structured_read = structured_read(
+            &registry,
+            "SELECT id, commit_id FROM lix_version WHERE name = 'main'",
+            Vec::new(),
+        );
+
+        let spec = derive_dependency_spec_from_structured_public_read(&structured_read)
+            .expect("admin read should derive dependency spec");
+
+        assert_eq!(spec.precision, DependencyPrecision::Precise);
+        assert_eq!(spec.relations, BTreeSet::from(["lix_version".to_string()]));
+        assert_eq!(
+            spec.schema_keys,
+            BTreeSet::from([
+                "lix_version_descriptor".to_string(),
+                "lix_version_ref".to_string(),
+            ])
+        );
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+    }
+
+    #[test]
+    fn working_changes_dependencies_come_from_catalog_metadata() {
+        let registry = crate::catalog::build_builtin_surface_registry();
+        let structured_read = structured_read(
+            &registry,
+            "SELECT entity_id FROM lix_working_changes WHERE schema_key = 'lix_key_value'",
+            Vec::new(),
+        );
+
+        let spec = derive_dependency_spec_from_structured_public_read(&structured_read)
+            .expect("working changes read should derive dependency spec");
+
+        assert_eq!(spec.precision, DependencyPrecision::Conservative);
+        assert_eq!(
+            spec.relations,
+            BTreeSet::from(["lix_working_changes".to_string()])
+        );
+        assert!(spec.depends_on_active_version);
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
+        assert!(spec
+            .session_dependencies
+            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
     }
 }
