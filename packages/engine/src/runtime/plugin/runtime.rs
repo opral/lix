@@ -1,11 +1,11 @@
-use crate::binary_cas::read::load_binary_blob_data_by_hash;
-use crate::binary_cas::schema::INTERNAL_BINARY_FILE_VERSION_REF;
+use crate::binary_cas::load_blob_data_by_hash;
 use crate::contracts::{parse_plugin_manifest_json, plugin_key_from_archive_path, InstalledPlugin};
+use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
 #[cfg(test)]
 use crate::runtime::wasm::WasmRuntime;
 use crate::runtime::wasm::{WasmComponentInstance, WasmLimits};
 use crate::runtime::Runtime;
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError};
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
@@ -150,54 +150,34 @@ async fn call_apply_changes(
 async fn load_installed_plugins_from_backend(
     backend: &dyn LixBackend,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
-    let rows = backend
-        .execute(
-            &format!(
-                "SELECT binary_ref.file_id, path_cache.path, binary_ref.blob_hash \
-                 FROM {binary_file_version_ref} AS binary_ref \
-                 INNER JOIN lix_internal_file_path_cache AS path_cache \
-                     ON path_cache.file_id = binary_ref.file_id \
-                    AND path_cache.version_id = binary_ref.version_id \
-                 WHERE binary_ref.version_id = 'global' \
-                   AND path_cache.path LIKE '/.lix/plugins/%.lixplugin' \
-                   AND path_cache.path NOT LIKE '/.lix/plugins/%/%' \
-                 ORDER BY path_cache.path",
-                binary_file_version_ref = INTERNAL_BINARY_FILE_VERSION_REF,
-            ),
-            &[],
-        )
-        .await?;
-
-    let mut plugins = Vec::with_capacity(rows.rows.len());
-    for row in rows.rows {
-        plugins.push(load_installed_plugin_from_blob_ref_row(backend, &row).await?);
+    let archive_refs = list_installed_plugin_archive_refs(backend).await?;
+    let mut plugins = Vec::with_capacity(archive_refs.len());
+    for archive_ref in archive_refs {
+        plugins.push(load_installed_plugin_from_archive_ref(backend, &archive_ref).await?);
     }
     Ok(plugins)
 }
 
-async fn load_installed_plugin_from_blob_ref_row(
+async fn load_installed_plugin_from_archive_ref(
     backend: &dyn LixBackend,
-    row: &[Value],
+    archive_ref: &PluginArchiveRef,
 ) -> Result<InstalledPlugin, LixError> {
-    let file_id = text_required(row, 0, "file_id")?;
-    let archive_path = text_required(row, 1, "path")?;
-    let blob_hash = text_required(row, 2, "blob_hash")?;
-    let Some(plugin_key) = plugin_key_from_archive_path(&archive_path) else {
+    let Some(plugin_key) = plugin_key_from_archive_path(&archive_ref.path) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "plugin materialization: unsupported plugin archive path '{}'",
-                archive_path
+                archive_ref.path
             ),
         });
     };
-    let archive_bytes = load_binary_blob_data_by_hash(backend, &blob_hash)
+    let archive_bytes = load_blob_data_by_hash(backend, &archive_ref.blob_hash)
         .await?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
-                blob_hash, archive_path, file_id
+                archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
             ),
         })?;
     if archive_bytes.is_empty() {
@@ -205,11 +185,11 @@ async fn load_installed_plugin_from_blob_ref_row(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "plugin materialization: archive '{}' is empty",
-                archive_path
+                archive_ref.path
             ),
         });
     }
-    parse_installed_plugin_from_archive_bytes(&plugin_key, &archive_path, &archive_bytes)
+    parse_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
 }
 
 fn parse_installed_plugin_from_archive_bytes(
@@ -418,24 +398,6 @@ fn ensure_valid_plugin_wasm(wasm_bytes: &[u8]) -> Result<(), LixError> {
         });
     }
     Ok(())
-}
-
-fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, LixError> {
-    let Some(value) = row.get(index) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: row missing column '{column}' at index {index}"
-            ),
-        });
-    };
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        other => Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
-                "plugin materialization: expected text column '{column}' at index {index}, got {other:?}"
-            ),
-        }),
-    }
 }
 
 #[cfg(test)]

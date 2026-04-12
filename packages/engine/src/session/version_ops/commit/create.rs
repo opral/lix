@@ -1,7 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
-use crate::binary_cas::support::build_binary_blob_fastcdc_write_program;
 use crate::canonical::{append_changes, CanonicalChangeWrite, CanonicalStateIdentity};
 use crate::contracts::version_ref_snapshot_content;
 use crate::contracts::LixFunctionProvider;
@@ -430,20 +429,22 @@ pub(crate) async fn create_commit(
     // transactions (including merged commits) always end with a consistent
     // watermark pointing to the latest canonical change.
 
-    let payloads = compiled_filesystem_state
+    let blob_writes = compiled_filesystem_state
         .binary_blob_writes
         .iter()
         .map(BinaryBlobWrite::as_input)
-        .map(|payload| crate::binary_cas::support::BinaryBlobWriteInput {
+        .map(|payload| crate::binary_cas::BinaryBlobWrite {
             file_id: payload.file_id,
             version_id: payload.version_id,
             data: payload.data,
         })
         .collect::<Vec<_>>();
-    write_program.extend(
-        build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)
-            .map_err(backend_error)?,
-    );
+    crate::binary_cas::append_blob_writes_to_program(
+        &mut write_program,
+        transaction.dialect(),
+        &blob_writes,
+    )
+    .map_err(backend_error)?;
     execute_write_program_with_transaction(transaction, write_program)
         .await
         .map_err(backend_error)?;

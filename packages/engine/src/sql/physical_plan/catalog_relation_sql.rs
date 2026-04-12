@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::binary_cas::INTERNAL_BINARY_BLOB_STORE;
+use crate::binary_cas::binary_blob_store_relation_name;
 use crate::catalog::{
     FilesystemProjectionScope, FilesystemRelationBinding, FilesystemRelationKind,
     StoredVersionHeadSourceBinding, VersionHeadSourceBinding, VersionRelationBinding,
@@ -463,7 +463,7 @@ fn build_filesystem_file_projection_sql(
             &binding.binary_blob_ref_schema_key,
             &binding.global_version_id,
         ),
-        binary_blob_store = INTERNAL_BINARY_BLOB_STORE,
+        binary_blob_store = binary_blob_store_relation_name(),
         commit_id_projection = commit_id_projection,
     ))
 }

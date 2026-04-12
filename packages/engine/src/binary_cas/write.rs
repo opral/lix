@@ -5,6 +5,7 @@ use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE,
 };
+use crate::binary_cas::BinaryBlobWrite;
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 use std::collections::BTreeMap;
 
@@ -16,24 +17,6 @@ pub(crate) struct BinaryBlobWriteInput<'a> {
     pub(crate) file_id: &'a str,
     pub(crate) version_id: &'a str,
     pub(crate) data: &'a [u8],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ResolvedBinaryBlobWrite {
-    pub(crate) file_id: String,
-    pub(crate) version_id: String,
-    pub(crate) untracked: bool,
-    pub(crate) data: Vec<u8>,
-}
-
-impl ResolvedBinaryBlobWrite {
-    pub(crate) fn as_input(&self) -> BinaryBlobWriteInput<'_> {
-        BinaryBlobWriteInput {
-            file_id: self.file_id.as_str(),
-            version_id: self.version_id.as_str(),
-            data: &self.data,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -78,9 +61,25 @@ pub(crate) struct BinaryCasWriteBatch {
     pub(crate) manifest_chunk_rows: Vec<BinaryBlobManifestChunkRow>,
 }
 
-pub(crate) async fn persist_resolved_binary_blob_writes_in_transaction(
+pub(crate) async fn persist_blob_writes_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    writes: &[ResolvedBinaryBlobWrite],
+    writes: &[BinaryBlobWrite<'_>],
+) -> Result<(), LixError> {
+    if writes.is_empty() {
+        return Ok(());
+    }
+
+    let mut program = WriteProgram::new();
+    append_blob_writes_to_program(&mut program, transaction.dialect(), writes)?;
+    execute_write_program_with_transaction(transaction, program).await?;
+
+    Ok(())
+}
+
+pub(crate) fn append_blob_writes_to_program(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
     if writes.is_empty() {
         return Ok(());
@@ -88,11 +87,14 @@ pub(crate) async fn persist_resolved_binary_blob_writes_in_transaction(
 
     let payloads = writes
         .iter()
-        .map(ResolvedBinaryBlobWrite::as_input)
+        .map(|write| BinaryBlobWriteInput {
+            file_id: write.file_id,
+            version_id: write.version_id,
+            data: write.data,
+        })
         .collect::<Vec<_>>();
-    let program = build_binary_blob_fastcdc_write_program(transaction.dialect(), &payloads)?;
-    execute_write_program_with_transaction(transaction, program).await?;
-
+    let appended = build_binary_blob_fastcdc_write_program(dialect, &payloads)?;
+    program.extend(appended);
     Ok(())
 }
 

@@ -1,14 +1,65 @@
-pub(crate) mod chunking;
-pub(crate) mod codec;
-pub(crate) mod gc;
-pub(crate) mod init;
-pub(crate) mod read;
+mod chunking;
+mod codec;
+mod gc;
+mod init;
+mod read;
 pub(crate) mod schema;
-pub(crate) mod support;
-pub(crate) mod write;
+mod write;
+
+use crate::backend::WriteProgram;
+use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BinaryBlobWrite<'a> {
+    pub file_id: &'a str,
+    pub version_id: &'a str,
+    pub data: &'a [u8],
+}
 
 pub(crate) use init::init;
-pub(crate) use schema::INTERNAL_BINARY_BLOB_STORE;
+
+pub(crate) async fn load_blob_data_by_hash(
+    backend: &dyn LixBackend,
+    blob_hash: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    read::load_binary_blob_data_by_hash(backend, blob_hash).await
+}
+
+pub(crate) async fn blob_exists(
+    backend: &dyn LixBackend,
+    blob_hash: &str,
+) -> Result<bool, LixError> {
+    read::blob_exists(backend, blob_hash).await
+}
+
+pub(crate) async fn persist_blob_writes_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    writes: &[BinaryBlobWrite<'_>],
+) -> Result<(), LixError> {
+    write::persist_blob_writes_in_transaction(transaction, writes).await
+}
+
+pub(crate) fn append_blob_writes_to_program(
+    program: &mut WriteProgram,
+    dialect: SqlDialect,
+    writes: &[BinaryBlobWrite<'_>],
+) -> Result<(), LixError> {
+    write::append_blob_writes_to_program(program, dialect, writes)
+}
+
+pub(crate) async fn garbage_collect_unreachable_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    gc::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
+}
+
+pub(crate) fn binary_blob_store_relation_name() -> &'static str {
+    schema::INTERNAL_BINARY_BLOB_STORE
+}
+
+pub(crate) fn binary_file_version_ref_relation_name() -> &'static str {
+    schema::INTERNAL_BINARY_FILE_VERSION_REF
+}
 
 pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
     &[
