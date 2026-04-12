@@ -1018,7 +1018,7 @@ async fn validate_filesystem_snapshot_integrity(
         .is_some_and(|planned_binary_blob_hashes| planned_binary_blob_hashes.contains(blob_hash));
     if require_binary_blob_ref_cas
         && !is_planned_blob
-        && !crate::binary_cas::support::blob_exists(backend, blob_hash).await?
+        && !crate::binary_cas::blob_exists(backend, blob_hash).await?
     {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

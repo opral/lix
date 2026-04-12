@@ -180,30 +180,22 @@ pub(crate) async fn persist_binary_blob_writes(
     transaction: &mut dyn LixBackendTransaction,
     writes: &[BinaryBlobWrite],
 ) -> Result<(), LixError> {
-    let resolved = resolve_binary_blob_writes_in_transaction(transaction, writes)
-        .await?
-        .into_iter()
-        .map(
-            |write| crate::binary_cas::support::ResolvedBinaryBlobWrite {
-                file_id: write.file_id,
-                version_id: write.version_id,
-                untracked: write.untracked,
-                data: write.data,
-            },
-        )
+    let resolved = resolve_binary_blob_writes_in_transaction(transaction, writes).await?;
+    let cas_writes = resolved
+        .iter()
+        .map(|write| crate::binary_cas::BinaryBlobWrite {
+            file_id: write.file_id.as_str(),
+            version_id: write.version_id.as_str(),
+            data: write.data.as_slice(),
+        })
         .collect::<Vec<_>>();
-    crate::binary_cas::support::persist_resolved_binary_blob_writes_in_transaction(
-        transaction,
-        &resolved,
-    )
-    .await
+    crate::binary_cas::persist_blob_writes_in_transaction(transaction, &cas_writes).await
 }
 
 pub(crate) async fn garbage_collect_unreachable_binary_cas(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
-    crate::binary_cas::support::garbage_collect_unreachable_binary_cas_in_transaction(transaction)
-        .await
+    crate::binary_cas::garbage_collect_unreachable_in_transaction(transaction).await
 }
 
 pub(crate) async fn persist_runtime_sequence(
