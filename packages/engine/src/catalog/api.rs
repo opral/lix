@@ -1,11 +1,21 @@
 use sqlparser::ast::ObjectName;
 
 use crate::catalog::{
-    bind_named_relation, bind_surface_relation, builtin_catalog_projection_registry,
-    CatalogProjectionDefinition, CatalogProjectionRegistry, RegisteredCatalogProjection,
-    RelationBindContext, RelationBinding, SurfaceBinding, SurfaceDescriptor, SurfaceRegistry,
+    admin_scan_kind, bind_filesystem_relation, bind_named_relation, bind_surface_relation,
+    builtin_catalog_projection_registry, dependency_metadata_for_surface_binding,
+    dependency_metadata_for_surface_name, direct_read_semantics,
+    explicit_version_counterpart_surface_name, filesystem_scan_semantics,
+    is_working_changes_surface, read_preparation_semantics,
+    state_surface_effective_foreign_key_target_schema_key, state_surface_validation_schema,
+    transaction_insert_semantics, write_surface_semantics, CatalogAdminScanKind,
+    CatalogDirectReadSemantics, CatalogFilesystemScanSemantics, CatalogProjectionDefinition,
+    CatalogProjectionRegistry, CatalogReadPreparationSemantics, CatalogSurfaceDependencyMetadata,
+    CatalogTransactionInsertSemantics, CatalogWriteSurfaceSemantics, FilesystemProjectionScope,
+    FilesystemRelationKind, RegisteredCatalogProjection, RelationBindContext, RelationBinding,
+    SurfaceBinding, SurfaceDescriptor, SurfaceRegistry,
 };
 use crate::LixError;
+use serde_json::Value as JsonValue;
 
 /// Compiler-facing semantic catalog contract.
 ///
@@ -35,10 +45,91 @@ pub(crate) trait CatalogCompilerApi {
         context: RelationBindContext<'_>,
     ) -> Result<Option<RelationBinding>, LixError>;
 
+    fn bind_filesystem_runtime_relation(
+        &self,
+        kind: FilesystemRelationKind,
+        scope: FilesystemProjectionScope,
+        active_version_id: Option<&str>,
+    ) -> Result<RelationBinding, LixError>;
+
     fn derived_surface_registration(
         &self,
         public_name: &str,
     ) -> Option<&RegisteredCatalogProjection>;
+
+    fn dependency_metadata(
+        &self,
+        public_name: &str,
+    ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError>;
+
+    fn dependency_metadata_for_binding(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError>;
+
+    fn direct_read_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Option<CatalogDirectReadSemantics>;
+
+    fn explicit_version_counterpart_surface_name(
+        &self,
+        surface_binding: &SurfaceBinding,
+        missing_columns: &[String],
+    ) -> Option<String>;
+
+    fn read_preparation_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> CatalogReadPreparationSemantics;
+
+    fn validation_schema(&self, schema_key: &str) -> Option<JsonValue>;
+
+    fn effective_foreign_key_target_schema_key(
+        &self,
+        referenced_schema_key: &str,
+        referenced_properties: &[String],
+        local_values: &[JsonValue],
+        source_schema_key: &str,
+        index: usize,
+    ) -> Result<Option<String>, LixError>;
+
+    fn filesystem_scan_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Result<Option<CatalogFilesystemScanSemantics>, LixError>;
+
+    fn is_working_changes_surface(&self, surface_binding: &SurfaceBinding) -> bool;
+
+    fn admin_scan_kind(&self, surface_binding: &SurfaceBinding) -> Option<CatalogAdminScanKind>;
+
+    fn transaction_insert_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Option<CatalogTransactionInsertSemantics>;
+
+    fn write_surface_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError>;
+
+    fn transaction_insert_semantics_for_object_name(
+        &self,
+        name: &ObjectName,
+    ) -> Option<CatalogTransactionInsertSemantics> {
+        self.resolve_object_name(name)
+            .and_then(|binding| self.transaction_insert_semantics(&binding))
+    }
+
+    fn write_surface_semantics_for_object_name(
+        &self,
+        name: &ObjectName,
+    ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError> {
+        let Some(binding) = self.resolve_object_name(name) else {
+            return Ok(None);
+        };
+        self.write_surface_semantics(&binding)
+    }
 
     fn derived_surface_definition(
         &self,
@@ -106,11 +197,106 @@ impl CatalogCompilerApi for CatalogCompilerFacade<'_> {
         bind_surface_relation(surface_binding, context)
     }
 
+    fn bind_filesystem_runtime_relation(
+        &self,
+        kind: FilesystemRelationKind,
+        scope: FilesystemProjectionScope,
+        active_version_id: Option<&str>,
+    ) -> Result<RelationBinding, LixError> {
+        bind_filesystem_relation(kind, scope, active_version_id)
+    }
+
     fn derived_surface_registration(
         &self,
         public_name: &str,
     ) -> Option<&RegisteredCatalogProjection> {
         self.declarations.registration_for_surface(public_name)
+    }
+
+    fn dependency_metadata(
+        &self,
+        public_name: &str,
+    ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError> {
+        dependency_metadata_for_surface_name(self.surfaces, self.declarations, public_name)
+    }
+
+    fn dependency_metadata_for_binding(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError> {
+        dependency_metadata_for_surface_binding(self.declarations, surface_binding)
+    }
+
+    fn direct_read_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Option<CatalogDirectReadSemantics> {
+        direct_read_semantics(surface_binding)
+    }
+
+    fn explicit_version_counterpart_surface_name(
+        &self,
+        surface_binding: &SurfaceBinding,
+        missing_columns: &[String],
+    ) -> Option<String> {
+        explicit_version_counterpart_surface_name(surface_binding, missing_columns)
+    }
+
+    fn read_preparation_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> CatalogReadPreparationSemantics {
+        read_preparation_semantics(surface_binding)
+    }
+
+    fn validation_schema(&self, schema_key: &str) -> Option<JsonValue> {
+        state_surface_validation_schema(schema_key)
+    }
+
+    fn effective_foreign_key_target_schema_key(
+        &self,
+        referenced_schema_key: &str,
+        referenced_properties: &[String],
+        local_values: &[JsonValue],
+        source_schema_key: &str,
+        index: usize,
+    ) -> Result<Option<String>, LixError> {
+        state_surface_effective_foreign_key_target_schema_key(
+            referenced_schema_key,
+            referenced_properties,
+            local_values,
+            source_schema_key,
+            index,
+        )
+    }
+
+    fn filesystem_scan_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Result<Option<CatalogFilesystemScanSemantics>, LixError> {
+        filesystem_scan_semantics(surface_binding)
+    }
+
+    fn is_working_changes_surface(&self, surface_binding: &SurfaceBinding) -> bool {
+        is_working_changes_surface(surface_binding)
+    }
+
+    fn admin_scan_kind(&self, surface_binding: &SurfaceBinding) -> Option<CatalogAdminScanKind> {
+        admin_scan_kind(surface_binding)
+    }
+
+    fn transaction_insert_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Option<CatalogTransactionInsertSemantics> {
+        transaction_insert_semantics(surface_binding)
+    }
+
+    fn write_surface_semantics(
+        &self,
+        surface_binding: &SurfaceBinding,
+    ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError> {
+        write_surface_semantics(surface_binding)
     }
 }
 
@@ -121,12 +307,25 @@ pub(crate) fn builtin_catalog_compiler_facade() -> CatalogCompilerFacade<'static
     )
 }
 
+pub(crate) fn catalog_compiler_facade_for_registry(
+    surfaces: &SurfaceRegistry,
+) -> CatalogCompilerFacade<'_> {
+    CatalogCompilerFacade::new(surfaces, builtin_catalog_projection_registry())
+}
+
 #[cfg(test)]
 mod tests {
     use sqlparser::ast::{Ident, ObjectName, ObjectNamePart};
 
     use super::{builtin_catalog_compiler_facade, CatalogCompilerApi};
-    use crate::catalog::{RelationBindContext, RelationBinding, SurfaceFamily};
+    use crate::catalog::{
+        CatalogAdminScanKind, CatalogAdminWriteBehavior, CatalogDirectReadSemantics,
+        CatalogFilesystemScanSemantics, CatalogScanVersionScope, CatalogTransactionInsertSemantics,
+        CatalogWriteSurfaceSemantics, CatalogWriteTargetKind, CatalogWriteVersionSemantics,
+        FilesystemProjectionScope, FilesystemRelationKind, RelationBindContext, RelationBinding,
+        SurfaceFamily,
+    };
+    use crate::contracts::SessionDependency;
 
     #[test]
     fn builtin_facade_resolves_surface_descriptors_and_columns() {
@@ -175,5 +374,147 @@ mod tests {
         let surfaces = definition.surfaces();
         assert_eq!(surfaces.len(), 1);
         assert_eq!(surfaces[0].public_name, "lix_version");
+    }
+
+    #[test]
+    fn builtin_facade_exposes_catalog_owned_dependency_metadata() {
+        let facade = builtin_catalog_compiler_facade();
+
+        let version = facade
+            .dependency_metadata("lix_version")
+            .expect("dependency metadata lookup should succeed")
+            .expect("lix_version dependency metadata should resolve");
+        assert!(version.relation_names.contains("lix_version"));
+        assert!(version
+            .compiled_schema_keys
+            .contains("lix_version_descriptor"));
+        assert!(version.compiled_schema_keys.contains("lix_version_ref"));
+        assert!(version
+            .session_dependencies
+            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+
+        let state = facade
+            .dependency_metadata("lix_state")
+            .expect("dependency metadata lookup should succeed")
+            .expect("lix_state dependency metadata should resolve");
+        assert!(state.relation_names.contains("lix_state"));
+        assert!(state.uses_dynamic_state_relations);
+        assert!(state
+            .session_dependencies
+            .contains(&SessionDependency::ActiveVersion));
+
+        let working_changes = facade
+            .dependency_metadata("lix_working_changes")
+            .expect("dependency metadata lookup should succeed")
+            .expect("lix_working_changes dependency metadata should resolve");
+        assert!(working_changes
+            .relation_names
+            .contains("lix_working_changes"));
+        assert!(working_changes.uses_dynamic_state_relations);
+    }
+
+    #[test]
+    fn builtin_facade_exposes_catalog_owned_direct_read_semantics() {
+        let facade = builtin_catalog_compiler_facade();
+        let binding = facade
+            .resolve_surface("lix_file_history")
+            .expect("lix_file_history should resolve");
+
+        assert_eq!(
+            facade.direct_read_semantics(&binding),
+            Some(CatalogDirectReadSemantics::FileHistory {
+                active_version_lineage: true,
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_facade_exposes_catalog_owned_transaction_insert_semantics() {
+        let facade = builtin_catalog_compiler_facade();
+        let binding = facade
+            .resolve_surface("lix_file")
+            .expect("lix_file should resolve");
+
+        assert_eq!(
+            facade.transaction_insert_semantics(&binding),
+            Some(CatalogTransactionInsertSemantics {
+                coalescable: true,
+                transaction_sensitive_columns: std::collections::BTreeSet::from([
+                    "global".to_string(),
+                    "untracked".to_string(),
+                    "version_id".to_string(),
+                ]),
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_facade_exposes_catalog_owned_write_surface_semantics() {
+        let facade = builtin_catalog_compiler_facade();
+
+        let file = facade
+            .resolve_surface("lix_file")
+            .expect("lix_file should resolve");
+        assert_eq!(
+            facade
+                .write_surface_semantics(&file)
+                .expect("write semantics lookup should succeed"),
+            Some(CatalogWriteSurfaceSemantics {
+                target_kind: CatalogWriteTargetKind::Filesystem,
+                version_semantics: CatalogWriteVersionSemantics::ActiveVersionDefault,
+                filesystem_kind: Some(FilesystemRelationKind::File),
+                filesystem_scope: Some(FilesystemProjectionScope::ActiveVersion),
+                supports_untracked_writes: true,
+                admin_behavior: None,
+            })
+        );
+
+        let version = facade
+            .resolve_surface("lix_version")
+            .expect("lix_version should resolve");
+        assert_eq!(
+            facade
+                .write_surface_semantics(&version)
+                .expect("write semantics lookup should succeed"),
+            Some(CatalogWriteSurfaceSemantics {
+                target_kind: CatalogWriteTargetKind::Admin,
+                version_semantics: CatalogWriteVersionSemantics::GlobalAdmin,
+                filesystem_kind: None,
+                filesystem_scope: None,
+                supports_untracked_writes: true,
+                admin_behavior: Some(CatalogAdminWriteBehavior::Version),
+            })
+        );
+    }
+
+    #[test]
+    fn builtin_facade_exposes_catalog_owned_scan_semantics() {
+        let facade = builtin_catalog_compiler_facade();
+
+        let file_history = facade
+            .resolve_surface("lix_file_history")
+            .expect("lix_file_history should resolve");
+        assert_eq!(
+            facade
+                .filesystem_scan_semantics(&file_history)
+                .expect("filesystem scan semantics lookup should succeed"),
+            Some(CatalogFilesystemScanSemantics {
+                kind: FilesystemRelationKind::File,
+                version_scope: CatalogScanVersionScope::History,
+            })
+        );
+
+        let working_changes = facade
+            .resolve_surface("lix_working_changes")
+            .expect("lix_working_changes should resolve");
+        assert!(facade.is_working_changes_surface(&working_changes));
+
+        let version = facade
+            .resolve_surface("lix_version")
+            .expect("lix_version should resolve");
+        assert_eq!(
+            facade.admin_scan_kind(&version),
+            Some(CatalogAdminScanKind::Version)
+        );
     }
 }

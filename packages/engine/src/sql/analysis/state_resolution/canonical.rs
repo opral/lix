@@ -1,5 +1,6 @@
+use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationKind};
 use sqlparser::ast::Statement;
-use sqlparser::ast::{FromTable, ObjectName, ObjectNamePart, TableObject, TableWithJoins};
+use sqlparser::ast::{FromTable, ObjectName, TableObject, TableWithJoins};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct CanonicalStateResolution {
@@ -30,56 +31,58 @@ fn statement_is_query_only(statement: &Statement) -> bool {
 pub(crate) fn should_invalidate_installed_plugins_cache_for_statements(
     statements: &[Statement],
 ) -> bool {
-    statements.iter().any(|statement| {
-        statement_targets_table_name(statement, "lix_file")
-            || statement_targets_table_name(statement, "lix_file_by_version")
-    })
+    statements
+        .iter()
+        .any(statement_targets_plugin_cache_invalidating_surface)
 }
 
-pub(crate) fn statement_targets_table_name(statement: &Statement, table_name: &str) -> bool {
+fn statement_targets_plugin_cache_invalidating_surface(statement: &Statement) -> bool {
     match statement {
-        Statement::Insert(insert) => table_object_targets_table_name(&insert.table, table_name),
-        Statement::Update(update) => table_with_joins_targets_table_name(&update.table, table_name),
+        Statement::Insert(insert) => {
+            table_object_targets_plugin_cache_invalidating_surface(&insert.table)
+        }
+        Statement::Update(update) => {
+            table_with_joins_targets_plugin_cache_invalidating_surface(&update.table)
+        }
         Statement::Delete(delete) => {
             let tables = match &delete.from {
                 FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
             };
             tables
                 .iter()
-                .any(|table| table_with_joins_targets_table_name(table, table_name))
+                .any(table_with_joins_targets_plugin_cache_invalidating_surface)
         }
         _ => false,
     }
 }
 
-pub(crate) fn table_object_targets_table_name(table: &TableObject, table_name: &str) -> bool {
+fn table_object_targets_plugin_cache_invalidating_surface(table: &TableObject) -> bool {
     let TableObject::TableName(name) = table else {
         return false;
     };
-    object_name_targets_table_name(name, table_name)
+    object_name_targets_plugin_cache_invalidating_surface(name)
 }
 
-pub(crate) fn table_with_joins_targets_table_name(
-    table: &TableWithJoins,
-    table_name: &str,
-) -> bool {
+fn table_with_joins_targets_plugin_cache_invalidating_surface(table: &TableWithJoins) -> bool {
     let sqlparser::ast::TableFactor::Table { name, .. } = &table.relation else {
         return false;
     };
-    object_name_targets_table_name(name, table_name)
+    object_name_targets_plugin_cache_invalidating_surface(name)
 }
 
-fn object_name_targets_table_name(name: &ObjectName, table_name: &str) -> bool {
-    name.0
-        .last()
-        .and_then(ObjectNamePart::as_ident)
-        .map(|ident| ident.value.eq_ignore_ascii_case(table_name))
-        .unwrap_or(false)
+fn object_name_targets_plugin_cache_invalidating_surface(name: &ObjectName) -> bool {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics_for_object_name(name)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| semantics.filesystem_kind == Some(FilesystemRelationKind::File))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::is_query_only_statements;
+    use super::{
+        is_query_only_statements, should_invalidate_installed_plugins_cache_for_statements,
+    };
 
     fn parse_one(sql: &str) -> sqlparser::ast::Statement {
         crate::sql::parser::parse_sql_script(sql)
@@ -99,5 +102,25 @@ mod tests {
         let statement =
             parse_one("EXPLAIN INSERT INTO lix_active_version (version_id) VALUES ('main')");
         assert!(!is_query_only_statements(&[statement]));
+    }
+
+    #[test]
+    fn file_surface_writes_invalidate_installed_plugins_cache_via_catalog_metadata() {
+        let statements = vec![parse_one(
+            "UPDATE lix_file SET data = X'01' WHERE id = 'file-1'",
+        )];
+        assert!(should_invalidate_installed_plugins_cache_for_statements(
+            &statements
+        ));
+    }
+
+    #[test]
+    fn non_file_surface_writes_do_not_invalidate_installed_plugins_cache() {
+        let statements = vec![parse_one(
+            "UPDATE lix_directory SET metadata = '{}' WHERE id = 'dir-1'",
+        )];
+        assert!(!should_invalidate_installed_plugins_cache_for_statements(
+            &statements
+        ));
     }
 }

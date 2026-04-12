@@ -1,5 +1,8 @@
 use super::*;
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogDirectReadSemantics,
+    SurfaceBinding, SurfaceFamily, SurfaceRegistry,
+};
 use crate::contracts::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
     FileHistoryRootScope, FileHistoryVersionScope, PendingViewReadQuery, PendingViewReadStorage,
@@ -208,8 +211,12 @@ fn public_output_columns_from_select(select: &Select) -> Option<Vec<String>> {
 
 fn build_direct_state_history_plan(
     structured_read: &StructuredPublicRead,
+    direct_read_semantics: CatalogDirectReadSemantics,
 ) -> Result<Option<StateHistoryDirectReadPlan>, LixError> {
-    if structured_read.surface_binding.descriptor.public_name != "lix_state_history" {
+    if !matches!(
+        direct_read_semantics,
+        CatalogDirectReadSemantics::StateHistoryActiveVersion
+    ) {
         return Ok(None);
     }
     if structured_read.query.uses_wildcard_projection()
@@ -261,10 +268,12 @@ fn build_direct_state_history_plan(
 
 fn build_direct_entity_history_plan(
     structured_read: &StructuredPublicRead,
+    direct_read_semantics: CatalogDirectReadSemantics,
 ) -> Result<Option<EntityHistoryDirectReadPlan>, LixError> {
-    if structured_read.surface_binding.descriptor.surface_family != SurfaceFamily::Entity
-        || structured_read.surface_binding.descriptor.surface_variant != SurfaceVariant::History
-    {
+    if !matches!(
+        direct_read_semantics,
+        CatalogDirectReadSemantics::EntityHistoryActiveVersion
+    ) {
         return Ok(None);
     }
     if structured_read.query.uses_wildcard_projection()
@@ -687,15 +696,14 @@ fn direct_entity_history_result_columns(
 
 fn build_direct_file_history_plan(
     structured_read: &StructuredPublicRead,
+    direct_read_semantics: CatalogDirectReadSemantics,
 ) -> Result<Option<FileHistoryDirectReadPlan>, LixError> {
-    let public_name = structured_read
-        .surface_binding
-        .descriptor
-        .public_name
-        .as_str();
-    if public_name != "lix_file_history" && public_name != "lix_file_history_by_version" {
+    let CatalogDirectReadSemantics::FileHistory {
+        active_version_lineage,
+    } = direct_read_semantics
+    else {
         return Ok(None);
-    }
+    };
     if structured_read.query.uses_wildcard_projection()
         && structured_read.query.projection.len() != 1
     {
@@ -703,12 +711,12 @@ fn build_direct_file_history_plan(
     }
 
     let mut request = FileHistoryRequest {
-        lineage_scope: if public_name == "lix_file_history" {
+        lineage_scope: if active_version_lineage {
             FileHistoryLineageScope::ActiveVersion
         } else {
             FileHistoryLineageScope::Standard
         },
-        active_version_id: (public_name == "lix_file_history")
+        active_version_id: active_version_lineage
             .then(|| required_requested_version_id(structured_read).map(str::to_string))
             .transpose()?,
         ..FileHistoryRequest::default()
@@ -756,13 +764,12 @@ fn build_direct_file_history_plan(
 
 fn build_direct_directory_history_plan(
     structured_read: &StructuredPublicRead,
+    direct_read_semantics: CatalogDirectReadSemantics,
 ) -> Result<Option<DirectoryHistoryDirectReadPlan>, LixError> {
-    let public_name = structured_read
-        .surface_binding
-        .descriptor
-        .public_name
-        .as_str();
-    if public_name != "lix_directory_history" {
+    if !matches!(
+        direct_read_semantics,
+        CatalogDirectReadSemantics::DirectoryHistoryActiveVersion
+    ) {
         return Ok(None);
     }
     if structured_read.query.uses_wildcard_projection()
@@ -3110,8 +3117,9 @@ async fn try_prepare_public_read_via_specialized_optimization(
     stage_timings.record(ExplainStage::Routing, routing_started.elapsed());
     let routing_passes = strategy_decision.pass_traces;
     let empty_current_version_heads = BTreeMap::new();
-    let current_version_heads = if surface_binding.descriptor.surface_family == SurfaceFamily::Admin
-        && surface_binding.descriptor.public_name == "lix_version"
+    let current_version_heads = if builtin_catalog_compiler_facade()
+        .read_preparation_semantics(&surface_binding)
+        .requires_current_version_heads
     {
         compiler_metadata
             .current_version_heads
@@ -3124,16 +3132,14 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let physical_started = Instant::now();
     let (execution, pushdown_decision) = match strategy_decision.strategy {
         PublicReadExecutionStrategy::DirectHistory => {
-            match (
-                structured_read.surface_binding.descriptor.surface_family,
-                structured_read
-                    .surface_binding
-                    .descriptor
-                    .public_name
-                    .as_str(),
-            ) {
-                (SurfaceFamily::State, "lix_state_history") => {
-                    match build_direct_state_history_plan(&structured_read) {
+            match builtin_catalog_compiler_facade()
+                .direct_read_semantics(&structured_read.surface_binding)
+            {
+                Some(CatalogDirectReadSemantics::StateHistoryActiveVersion) => {
+                    match build_direct_state_history_plan(
+                        &structured_read,
+                        CatalogDirectReadSemantics::StateHistoryActiveVersion,
+                    ) {
                         Ok(Some(plan)) => {
                             let pushdown_decision = direct_state_history_pushdown_decision(&plan);
                             (
@@ -3163,8 +3169,11 @@ async fn try_prepare_public_read_via_specialized_optimization(
                         }
                     }
                 }
-                (SurfaceFamily::Entity, _) => {
-                    match build_direct_entity_history_plan(&structured_read) {
+                Some(CatalogDirectReadSemantics::EntityHistoryActiveVersion) => {
+                    match build_direct_entity_history_plan(
+                        &structured_read,
+                        CatalogDirectReadSemantics::EntityHistoryActiveVersion,
+                    ) {
                         Ok(Some(plan)) => {
                             let pushdown_decision = direct_entity_history_pushdown_decision(&plan);
                             (
@@ -3194,8 +3203,8 @@ async fn try_prepare_public_read_via_specialized_optimization(
                         }
                     }
                 }
-                (SurfaceFamily::Filesystem, "lix_directory_history") => {
-                    match build_direct_directory_history_plan(&structured_read) {
+                Some(semantics @ CatalogDirectReadSemantics::DirectoryHistoryActiveVersion) => {
+                    match build_direct_directory_history_plan(&structured_read, semantics) {
                         Ok(Some(plan)) => {
                             let pushdown_decision =
                                 direct_directory_history_pushdown_decision(&plan);
@@ -3226,8 +3235,8 @@ async fn try_prepare_public_read_via_specialized_optimization(
                         }
                     }
                 }
-                (SurfaceFamily::Filesystem, _) => {
-                    match build_direct_file_history_plan(&structured_read) {
+                Some(semantics @ CatalogDirectReadSemantics::FileHistory { .. }) => {
+                    match build_direct_file_history_plan(&structured_read, semantics) {
                         Ok(Some(plan)) => {
                             let pushdown_decision = direct_file_history_pushdown_decision(&plan);
                             (
@@ -3954,11 +3963,9 @@ fn bound_summary_contains_direct_only_history_surface(
 }
 
 fn is_direct_only_history_surface(binding: &SurfaceBinding) -> bool {
-    binding.descriptor.surface_variant == SurfaceVariant::History
-        && matches!(
-            binding.descriptor.surface_family,
-            SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-        )
+    builtin_catalog_compiler_facade()
+        .direct_read_semantics(binding)
+        .is_some()
 }
 
 #[cfg(test)]

@@ -1,4 +1,7 @@
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceBinding, SurfaceFamily,
+    SurfaceRegistry, SurfaceVariant,
+};
 use crate::contracts::ReadTimeProjectionRead;
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
@@ -2261,11 +2264,9 @@ fn collect_relation_names_in_sql_function_arg_expr<F>(
 }
 
 fn is_direct_only_history_surface(binding: &SurfaceBinding) -> bool {
-    binding.descriptor.surface_variant == SurfaceVariant::History
-        && matches!(
-            binding.descriptor.surface_family,
-            SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-        )
+    builtin_catalog_compiler_facade()
+        .direct_read_semantics(binding)
+        .is_some()
 }
 
 #[cfg(test)]

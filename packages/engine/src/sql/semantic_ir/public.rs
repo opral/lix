@@ -4,6 +4,7 @@ use super::canonicalize::{
 use super::internal::NormalizedInternalStatements;
 use super::statement::BoundStatement;
 use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogDirectReadSemantics,
     SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::diagnostics::schema_not_registered_error;
@@ -133,14 +134,15 @@ fn bind_active_history_root_commit_id(
     mut structured_read: StructuredPublicRead,
     active_history_root_commit_id: Option<&str>,
 ) -> Option<StructuredPublicRead> {
-    let descriptor = &structured_read.surface_binding.descriptor;
-    let public_name = descriptor.public_name.as_str();
-    let uses_active_history_root = descriptor.surface_variant == SurfaceVariant::History
-        && matches!(
-            descriptor.surface_family,
-            SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-        )
-        && !public_name.ends_with("_history_by_version");
+    let uses_active_history_root = matches!(
+        builtin_catalog_compiler_facade().direct_read_semantics(&structured_read.surface_binding),
+        Some(CatalogDirectReadSemantics::StateHistoryActiveVersion)
+            | Some(CatalogDirectReadSemantics::EntityHistoryActiveVersion)
+            | Some(CatalogDirectReadSemantics::DirectoryHistoryActiveVersion)
+            | Some(CatalogDirectReadSemantics::FileHistory {
+                active_version_lineage: true
+            })
+    );
     if !uses_active_history_root || structured_read_has_root_commit_predicate(&structured_read) {
         return Some(structured_read);
     }
@@ -336,7 +338,10 @@ fn try_build_direct_state_history_structured_read(
     let Some(surface_binding) = registry.bind_object_name(name) else {
         return Ok(None);
     };
-    if surface_binding.descriptor.public_name != "lix_state_history" {
+    if !matches!(
+        builtin_catalog_compiler_facade().direct_read_semantics(&surface_binding),
+        Some(CatalogDirectReadSemantics::StateHistoryActiveVersion)
+    ) {
         return Ok(None);
     }
 

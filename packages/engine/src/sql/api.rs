@@ -14,7 +14,11 @@ use crate::contracts::{
 };
 use crate::{LixError, SqlDialect, Value};
 
+#[cfg(test)]
+pub(crate) use super::analysis::state_resolution::canonical::is_query_only_statements;
 pub(crate) use super::analysis::state_resolution::canonical::should_invalidate_installed_plugins_cache_for_statements;
+#[cfg(test)]
+pub(crate) use super::binder::advance_placeholder_state_for_statement_ast;
 pub(crate) use super::binder::RuntimeBindingValues;
 pub(crate) use super::explain::{
     prepare_analyzed_explain_template, prepare_plain_explain_template,
@@ -25,6 +29,8 @@ pub(crate) use super::logical_plan::public_ir::{
     SchemaProof, ScopeProof, TargetSetProof, WriteModeRequest, WriteOperationKind,
 };
 pub(crate) use super::logical_plan::DependencySpec;
+#[cfg(test)]
+pub(crate) use super::optimizer::optimize_state_resolution;
 pub(crate) use super::parser::{parse_sql, parse_sql_statements, parse_sql_with_timing};
 pub(crate) use super::physical_plan::{
     PreparedPublicWriteExecution, PublicWriteExecutionPartition,
@@ -63,7 +69,7 @@ pub(crate) use super::semantic_ir::semantics::surface_semantics::{
     OverlayLane,
 };
 pub(crate) use super::support::{
-    bind_sql, parse_sql_script_with_timing, parse_sql_statements_with_timing,
+    bind_sql, bind_sql_with_state, parse_sql_script_with_timing, parse_sql_statements_with_timing,
     reject_internal_table_writes, reject_public_create_table, resolve_placeholder_index, BoundSql,
     ParsedSql, PlaceholderState,
 };
@@ -182,6 +188,15 @@ pub(crate) fn dependency_spec_to_state_commit_stream_filter(
     spec: &DependencySpec,
 ) -> StateCommitStreamFilter {
     super::prepare::dependency_spec::dependency_spec_to_state_commit_stream_filter(spec)
+}
+
+/// Canonicalize state-resolution requirements for a parsed SQL script without
+/// exposing analysis-stage internals to outside owners.
+#[cfg(test)]
+pub(crate) fn canonicalize_state_resolution(
+    statements: &[Statement],
+) -> super::analysis::state_resolution::canonical::CanonicalStateResolution {
+    super::analysis::state_resolution::canonical::canonicalize_state_resolution(statements)
 }
 
 #[derive(Debug, Clone, PartialEq)]
