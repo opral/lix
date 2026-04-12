@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
 use crate::backend::execute_ddl_batch;
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
+};
 use crate::common::escape_sql_string;
 use crate::contracts::{ChangeBatch, PreparedPublicWriteArtifact, PreparedWriteOperationKind};
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
@@ -23,7 +26,12 @@ pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
     public_write: &PreparedPublicWriteArtifact,
     batch: &ChangeBatch,
 ) -> Result<(), LixError> {
-    if public_write.contract.target.descriptor.public_name != "lix_version" {
+    let Some(semantics) =
+        builtin_catalog_compiler_facade().write_surface_semantics(&public_write.contract.target)?
+    else {
+        return Ok(());
+    };
+    if semantics.admin_behavior != Some(CatalogAdminWriteBehavior::Version) {
         return Ok(());
     }
 

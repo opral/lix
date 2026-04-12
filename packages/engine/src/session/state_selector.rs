@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 
+use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind};
 use crate::contracts::{LiveStateQueryBackend, PendingSemanticStorage, PendingView};
 use crate::contracts::{PendingViewFilter, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, RowReadMode};
@@ -73,10 +74,12 @@ pub(crate) async fn try_resolve_state_selector_rows_with_backend(
     pending_view: Option<&dyn PendingView>,
     planned_write: &PlannedWrite,
 ) -> Result<Option<Vec<CanonicalStateRowKey>>, LixError> {
-    if !matches!(
-        planned_write.command.target.descriptor.public_name.as_str(),
-        "lix_state" | "lix_state_by_version"
-    ) {
+    let Some(semantics) =
+        builtin_catalog_compiler_facade().write_surface_semantics(&planned_write.command.target)?
+    else {
+        return Ok(None);
+    };
+    if semantics.target_kind != CatalogWriteTargetKind::State {
         return Ok(None);
     }
 

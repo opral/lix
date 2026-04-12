@@ -1,6 +1,6 @@
 use sqlparser::ast::{Expr, Insert, SetExpr, Statement, TableObject, Value as SqlAstValue};
 
-use crate::sql::ast::walk::object_name_matches;
+use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
 use crate::{LixError, Value};
 
 pub(crate) fn extract_explicit_transaction_script_from_statements(
@@ -163,25 +163,27 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
 
 fn insert_targets_coalescable_table(insert: &Insert) -> bool {
     match &insert.table {
-        TableObject::TableName(name) => {
-            object_name_matches(name, "lix_state_by_version")
-                || object_name_matches(name, "lix_file")
-        }
+        TableObject::TableName(name) => builtin_catalog_compiler_facade()
+            .transaction_insert_semantics_for_object_name(name)
+            .is_some_and(|semantics| semantics.coalescable),
         _ => false,
     }
 }
 
 fn insert_has_transaction_sensitive_public_filesystem_columns(insert: &Insert) -> bool {
-    if !matches!(&insert.table, TableObject::TableName(name) if object_name_matches(name, "lix_file"))
-    {
+    let TableObject::TableName(name) = &insert.table else {
         return false;
-    }
+    };
+    let Some(semantics) =
+        builtin_catalog_compiler_facade().transaction_insert_semantics_for_object_name(name)
+    else {
+        return false;
+    };
 
     insert.columns.iter().any(|column| {
-        matches!(
-            column.value.to_ascii_lowercase().as_str(),
-            "untracked" | "version_id" | "global"
-        )
+        semantics
+            .transaction_sensitive_columns
+            .contains(&column.value.to_ascii_lowercase())
     })
 }
 

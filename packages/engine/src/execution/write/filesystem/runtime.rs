@@ -1,4 +1,4 @@
-use crate::catalog::FilesystemProjectionScope;
+use crate::catalog::{state_by_version_relation_name, FilesystemProjectionScope};
 use crate::common::stable_content_fingerprint_hex;
 use crate::contracts::{FilesystemPayloadChange, MutationRow, OptionalTextPatch};
 use crate::contracts::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
@@ -17,8 +17,6 @@ pub(crate) const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const GLOBAL_VERSION_ID: &str = "global";
-const STATE_BY_VERSION_TABLE: &str = "lix_state_by_version";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BinaryBlobWriteInput<'a> {
     pub(crate) file_id: &'a str,
@@ -716,12 +714,13 @@ fn values_row_placeholders_sql(row_index: usize, values_per_row: usize) -> Strin
 }
 
 fn insert_filesystem_payload_changes_sql(row_values: &str, untracked: bool) -> String {
+    let state_by_version_table = state_by_version_relation_name();
     if untracked {
         return format!(
             "INSERT INTO {} (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
              ) VALUES {row_values}",
-            STATE_BY_VERSION_TABLE,
+            state_by_version_table,
         );
     }
 
@@ -729,6 +728,6 @@ fn insert_filesystem_payload_changes_sql(row_values: &str, untracked: bool) -> S
         "INSERT INTO {} (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
          ) VALUES {row_values}",
-        STATE_BY_VERSION_TABLE,
+        state_by_version_table,
     )
 }

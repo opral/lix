@@ -5,7 +5,10 @@ use self::insert_planning::{
     plan_file_insert_batch,
 };
 use super::*;
-use crate::catalog::{bind_named_relation, FilesystemProjectionScope, RelationBindContext};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteSurfaceSemantics,
+    FilesystemProjectionScope, FilesystemRelationKind,
+};
 use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
@@ -52,8 +55,8 @@ pub(super) async fn resolve_filesystem_write(
     planned_write: &PlannedWrite,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    match planned_write.command.target.descriptor.public_name.as_str() {
-        "lix_file" | "lix_file_by_version" => match planned_write.command.operation_kind {
+    match filesystem_write_kind(planned_write)? {
+        FilesystemRelationKind::File => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
                 resolve_file_insert_write_plan(hydrator, planned_write).await
             }
@@ -69,50 +72,46 @@ pub(super) async fn resolve_filesystem_write(
                 .await
             }
         },
-        "lix_directory" | "lix_directory_by_version" => {
-            match planned_write.command.operation_kind {
-                WriteOperationKind::Insert => {
-                    resolve_directory_insert_write_plan(hydrator, planned_write).await
-                }
-                WriteOperationKind::Update | WriteOperationKind::Delete => {
-                    resolve_existing_directory_write(
-                        hydrator.backend(),
-                        planned_write,
-                        hydrator
-                            .pending_state_overlay()
-                            .map(|overlay| overlay.as_pending_view()),
-                        selector_resolver,
-                    )
-                    .await
-                }
+        FilesystemRelationKind::Directory => match planned_write.command.operation_kind {
+            WriteOperationKind::Insert => {
+                resolve_directory_insert_write_plan(hydrator, planned_write).await
             }
-        }
-        other => Err(WriteResolveError {
-            message: format!(
-                "public filesystem live slice does not yet support '{}' writes",
-                other
-            ),
-        }),
+            WriteOperationKind::Update | WriteOperationKind::Delete => {
+                resolve_existing_directory_write(
+                    hydrator.backend(),
+                    planned_write,
+                    hydrator
+                        .pending_state_overlay()
+                        .map(|overlay| overlay.as_pending_view()),
+                    selector_resolver,
+                )
+                .await
+            }
+        },
     }
 }
 
-fn filesystem_write_lookup_scope(planned_write: &PlannedWrite) -> FilesystemProjectionScope {
-    match planned_write.command.target.descriptor.public_name.as_str() {
-        "lix_file" | "lix_directory" => FilesystemProjectionScope::ActiveVersion,
-        "lix_file_by_version" | "lix_directory_by_version" => {
-            FilesystemProjectionScope::ExplicitVersion
-        }
-        _ => FilesystemProjectionScope::ExplicitVersion,
-    }
+fn filesystem_write_lookup_scope(
+    planned_write: &PlannedWrite,
+) -> Result<FilesystemProjectionScope, WriteResolveError> {
+    filesystem_write_semantics(planned_write).and_then(|semantics| {
+        semantics.filesystem_scope.ok_or_else(|| WriteResolveError {
+            message: format!(
+                "public filesystem write '{}' is missing catalog-owned filesystem scope",
+                planned_write.command.target.descriptor.public_name
+            ),
+        })
+    })
 }
 
 fn filesystem_projection_sql(
     backend: &dyn LixBackend,
-    relation_name: &str,
+    kind: FilesystemRelationKind,
+    scope: FilesystemProjectionScope,
 ) -> Result<String, WriteResolveError> {
-    let binding = bind_named_relation(relation_name, RelationBindContext::default())
-        .map_err(write_resolve_backend_error)?
-        .expect("filesystem public relation must bind to a catalog relation");
+    let binding = builtin_catalog_compiler_facade()
+        .bind_filesystem_runtime_relation(kind, scope, None)
+        .map_err(write_resolve_backend_error)?;
     lower_catalog_relation_binding_to_source_sql(backend.dialect(), &binding)
         .map_err(write_resolve_backend_error)
 }
@@ -189,7 +188,7 @@ async fn resolve_directory_insert_write_plan(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     let payloads = payload_maps(planned_write)?;
     let assignments_rows = directory_insert_assignments_batch(planned_write)?;
     if payloads.len() != assignments_rows.len() {
@@ -280,7 +279,7 @@ async fn resolve_existing_directory_write(
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
-    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     let current_rows = load_target_directory_rows_for_selector(
         backend,
         planned_write,
@@ -377,9 +376,16 @@ async fn resolve_existing_directory_write(
         WriteOperationKind::Delete => {
             let mut descendant_directories = BTreeMap::new();
             let mut descendant_files = BTreeMap::new();
-            let directory_projection_sql =
-                filesystem_projection_sql(backend, "lix_directory_by_version")?;
-            let file_projection_sql = filesystem_projection_sql(backend, "lix_file_by_version")?;
+            let directory_projection_sql = filesystem_projection_sql(
+                backend,
+                FilesystemRelationKind::Directory,
+                FilesystemProjectionScope::ExplicitVersion,
+            )?;
+            let file_projection_sql = filesystem_projection_sql(
+                backend,
+                FilesystemRelationKind::File,
+                FilesystemProjectionScope::ExplicitVersion,
+            )?;
             for current_row in current_rows {
                 for row in load_directory_rows_under_path(
                     backend,
@@ -515,7 +521,7 @@ async fn resolve_file_insert_write_plan(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     let payloads = payload_maps(planned_write)?;
     let assignments_rows = file_insert_assignments_batch(planned_write)?;
     if payloads.len() != assignments_rows.len() {
@@ -649,7 +655,7 @@ async fn resolve_existing_file_write(
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
-    let lookup_scope = filesystem_write_lookup_scope(planned_write);
+    let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
             let assignments = file_update_assignments(planned_write)?;
@@ -880,6 +886,33 @@ async fn resolve_existing_file_write(
             message: "public filesystem existing-row resolver does not handle inserts".to_string(),
         }),
     }
+}
+
+fn filesystem_write_semantics(
+    planned_write: &PlannedWrite,
+) -> Result<CatalogWriteSurfaceSemantics, WriteResolveError> {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics(&planned_write.command.target)
+        .map_err(write_resolve_backend_error)?
+        .ok_or_else(|| WriteResolveError {
+            message: format!(
+                "public filesystem live slice does not have catalog-owned write semantics for '{}'",
+                planned_write.command.target.descriptor.public_name
+            ),
+        })
+}
+
+fn filesystem_write_kind(
+    planned_write: &PlannedWrite,
+) -> Result<FilesystemRelationKind, WriteResolveError> {
+    filesystem_write_semantics(planned_write).and_then(|semantics| {
+        semantics.filesystem_kind.ok_or_else(|| WriteResolveError {
+            message: format!(
+                "public filesystem write '{}' is missing catalog-owned filesystem kind",
+                planned_write.command.target.descriptor.public_name
+            ),
+        })
+    })
 }
 
 async fn resolve_parent_directory_target(

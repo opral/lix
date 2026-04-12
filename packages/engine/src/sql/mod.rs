@@ -40,11 +40,18 @@ mod relation_policy;
 pub(crate) mod semantic_ir;
 pub(crate) mod support;
 
+#[cfg(test)]
+#[allow(unused_imports)]
+pub(crate) use api::{
+    advance_placeholder_state_for_statement_ast, canonicalize_state_resolution,
+    is_query_only_statements, optimize_state_resolution, StatementTemplate,
+    StatementTemplateCacheKey,
+};
 #[allow(unused_imports)]
 pub(crate) use api::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload, bind_sql,
-    build_change_batches, build_entity_insert_rows_with_functions, build_public_write_execution,
-    build_public_write_invariant_trace, build_state_insert_row,
+    bind_sql_with_state, build_change_batches, build_entity_insert_rows_with_functions,
+    build_public_write_execution, build_public_write_invariant_trace, build_state_insert_row,
     compile_execution_from_template_instance_with_context, compiled_explain_diagnostics,
     dependency_spec_to_state_commit_stream_filter, derive_commit_preconditions,
     derive_dependency_spec, ensure_identity_columns_preserved, extract_explicit_transaction_script,
@@ -72,9 +79,6 @@ pub(crate) use api::{
     SqlPreparationSeed, StateAssignmentsError, TargetSetProof, UpdateValidationPlan,
     WriteModeRequest, WriteOperationKind,
 };
-#[cfg(test)]
-#[allow(unused_imports)]
-pub(crate) use api::{StatementTemplate, StatementTemplateCacheKey};
 
 // Existing root helpers used outside the compiler stages.
 pub(crate) use physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;

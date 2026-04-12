@@ -1,5 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
+    FilesystemRelationKind, SurfaceBinding,
+};
 use crate::contracts::{
     coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
     IdempotencyKey, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
@@ -798,16 +802,7 @@ fn collect_filesystem_overlay_from_tracked_plan(
     overlay: &mut PendingFilesystemOverlay,
     saw_entry: &mut bool,
 ) -> bool {
-    if !matches!(
-        tracked
-            .public_write
-            .contract
-            .target
-            .descriptor
-            .public_name
-            .as_str(),
-        "lix_file" | "lix_file_by_version"
-    ) {
+    if !is_catalog_filesystem_file_surface(&tracked.public_write.contract.target) {
         return false;
     }
 
@@ -911,10 +906,8 @@ fn collect_semantic_overlay_from_public_write(
     let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
         return Ok(false);
     };
-    let skip_file_descriptor_rows = matches!(
-        public_write.contract.target.descriptor.public_name.as_str(),
-        "lix_file" | "lix_file_by_version"
-    );
+    let skip_file_descriptor_rows =
+        is_catalog_filesystem_file_surface(&public_write.contract.target);
     let mut saw_row = false;
     for partition in &resolved.partitions {
         let storage = match partition.execution_mode {
@@ -1098,15 +1091,18 @@ fn filesystem_tracked_plans_are_buffer_compatible(
 }
 
 fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
-    matches!(
-        plan.public_write
-            .contract
-            .target
-            .descriptor
-            .public_name
-            .as_str(),
-        "lix_file" | "lix_file_by_version"
-    )
+    is_catalog_filesystem_file_surface(&plan.public_write.contract.target)
+}
+
+fn is_catalog_filesystem_file_surface(target: &SurfaceBinding) -> bool {
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics(target)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| {
+            semantics.target_kind == CatalogWriteTargetKind::Filesystem
+                && semantics.filesystem_kind == Some(FilesystemRelationKind::File)
+        })
 }
 
 fn create_commit_expected_head_compatible(left: &ExpectedHead, right: &ExpectedHead) -> bool {

@@ -3,7 +3,9 @@
 pub(crate) mod routing;
 
 use crate::catalog::{
-    SurfaceCapability, SurfaceFamily, SurfaceReadFreshness, SurfaceRegistry, SurfaceVariant,
+    builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
+    CatalogWriteVersionSemantics, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness,
+    SurfaceRegistry, SurfaceVariant,
 };
 #[cfg(test)]
 use crate::contracts::SqlPreparationMetadataReader;
@@ -25,7 +27,6 @@ use crate::diagnostics::{
     sql_unknown_table_error,
 };
 use crate::schema::builtin_schema_definition;
-use crate::sql::analysis::state_resolution::canonical::statement_targets_table_name;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::explain::{
@@ -340,29 +341,49 @@ fn public_read_preflight_error(
     let Statement::Query(query) = statement else {
         return None;
     };
-    let referenced_surfaces = collect_public_query_relation_names(query);
-    if !referenced_surfaces.contains("lix_state")
-        || !query_references_any_column(query, &["version_id", "lixcol_version_id"])
-    {
+    if !query_references_any_column(query, &["version_id", "lixcol_version_id"]) {
         return None;
     }
-    let other_version_exposing_surface_present = referenced_surfaces.iter().any(|surface_name| {
-        !surface_name.eq_ignore_ascii_case("lix_state")
-            && registry
+    let referenced_surfaces = collect_public_query_relation_names(query);
+    let counterpart_candidates = referenced_surfaces
+        .iter()
+        .filter_map(|surface_name| {
+            registry
                 .bind_relation_name(surface_name)
-                .is_some_and(|binding| {
-                    binding
+                .and_then(|binding| {
+                    builtin_catalog_compiler_facade()
+                        .explicit_version_counterpart_surface_name(
+                            &binding,
+                            &["version_id".to_string()],
+                        )
+                        .map(|counterpart| (binding.descriptor.public_name, counterpart))
+                })
+        })
+        .collect::<Vec<_>>();
+    if counterpart_candidates.len() != 1 {
+        return None;
+    }
+    let (source_surface_name, counterpart_surface_name) = counterpart_candidates[0].clone();
+    let other_version_exposing_surface_present = referenced_surfaces.iter().any(|surface_name| {
+        registry
+            .bind_relation_name(surface_name)
+            .is_some_and(|binding| {
+                binding.descriptor.public_name != source_surface_name
+                    && binding
                         .exposed_columns
                         .iter()
                         .any(|column| matches!(column.as_str(), "version_id" | "lixcol_version_id"))
-                })
+            })
     });
     if other_version_exposing_surface_present {
         return None;
     }
     Some(LixError::new(
         "LIX_ERROR_UNKNOWN",
-        "lix_state does not expose version_id; use lix_state_by_version for explicit version filters",
+        format!(
+            "{} does not expose version_id; use {} for explicit version filters",
+            source_surface_name, counterpart_surface_name
+        ),
     ))
 }
 
@@ -1124,8 +1145,6 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     );
     let mut stage_timings = ExplainTimingCollector::new(parse_duration);
     stage_timings.record(ExplainStage::Bind, bind_started.elapsed());
-    let filesystem_target_name =
-        top_level_filesystem_write_target_name(&bound_statement.statement).map(str::to_string);
     let semantic_started = Instant::now();
     let semantics = match PublicWriteSemantics::prepare(bound_statement.clone(), &registry) {
         Ok(semantics) => semantics,
@@ -1144,13 +1163,14 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
                         return Err(error);
                     }
                 }
-            }
-            match filesystem_target_name.as_deref() {
-                Some(target_name) => {
-                    return Err(public_filesystem_write_error(target_name, &error.message));
+                if binding.descriptor.surface_family == SurfaceFamily::Filesystem {
+                    return Err(public_filesystem_write_error(
+                        &binding.descriptor.public_name,
+                        &error.message,
+                    ));
                 }
-                None => return Ok(None),
             }
+            return Ok(None);
         }
     };
     stage_timings.record(ExplainStage::SemanticAnalysis, semantic_started.elapsed());
@@ -1359,24 +1379,24 @@ fn tracked_public_write_operation_supported(
 }
 
 fn public_untracked_operation_supported(planned_write: &PlannedWrite) -> bool {
-    matches!(
-        planned_write.command.target.descriptor.surface_family,
-        SurfaceFamily::State | SurfaceFamily::Entity | SurfaceFamily::Filesystem
-    ) || planned_write.command.target.descriptor.public_name == "lix_version"
+    builtin_catalog_compiler_facade()
+        .write_surface_semantics(&planned_write.command.target)
+        .ok()
+        .flatten()
+        .is_some_and(|semantics| semantics.supports_untracked_writes)
 }
 
 fn public_write_persists_filesystem_payloads(
     planned_write: &PlannedWrite,
     partition: &crate::sql::logical_plan::public_ir::ResolvedWritePartition,
 ) -> bool {
-    matches!(
-        planned_write.command.target.descriptor.public_name.as_str(),
-        "lix_file" | "lix_file_by_version"
-    ) && matches!(
-        partition.execution_mode,
-        crate::sql::logical_plan::public_ir::WriteMode::Tracked
-            | crate::sql::logical_plan::public_ir::WriteMode::Untracked
-    )
+    filesystem_surface_kind(&planned_write.command.target)
+        == Some(crate::catalog::FilesystemRelationKind::File)
+        && matches!(
+            partition.execution_mode,
+            crate::sql::logical_plan::public_ir::WriteMode::Tracked
+                | crate::sql::logical_plan::public_ir::WriteMode::Untracked
+        )
 }
 
 pub(crate) fn state_commit_stream_operation(
@@ -1409,10 +1429,9 @@ fn semantic_plan_effects_from_untracked_public_write(
         )?,
         ..PlanEffects::default()
     };
-    if matches!(
-        planned_write.command.target.descriptor.public_name.as_str(),
-        "lix_file" | "lix_file_by_version"
-    ) {
+    if filesystem_surface_kind(&planned_write.command.target)
+        == Some(crate::catalog::FilesystemRelationKind::File)
+    {
         let pending_file_delete_targets =
             delete_targets_from_planned_filesystem_state(filesystem_state);
         effects.file_cache_refresh_targets =
@@ -1537,7 +1556,13 @@ fn public_write_preparation_error_for_surface(
     }
     if (message.contains("write analysis requires version_id")
         || message.contains("requires a concrete version_id"))
-        && public_name.ends_with("_by_version")
+        && builtin_catalog_compiler_facade()
+            .write_surface_semantics(surface_binding)
+            .ok()
+            .flatten()
+            .is_some_and(|semantics| {
+                semantics.version_semantics == CatalogWriteVersionSemantics::ExplicitVersionRequired
+            })
     {
         let action = match operation_kind {
             WriteOperationKind::Insert => "insert requires version_id",
@@ -1557,18 +1582,24 @@ fn public_write_preparation_error_for_surface(
         }
         SurfaceFamily::Admin => Some(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            normalize_admin_public_write_message(public_name, message),
+            normalize_admin_public_write_message(surface_binding, message),
         )),
         _ => None,
     }
 }
 
 fn normalize_admin_public_write_message<'a>(
-    public_name: &str,
+    surface_binding: &crate::catalog::SurfaceBinding,
     message: &'a str,
 ) -> std::borrow::Cow<'a, str> {
-    match public_name {
-        "lix_version" => message
+    let public_name = surface_binding.descriptor.public_name.as_str();
+    match builtin_catalog_compiler_facade()
+        .write_surface_semantics(surface_binding)
+        .ok()
+        .flatten()
+        .and_then(|semantics| semantics.admin_behavior)
+    {
+        Some(CatalogAdminWriteBehavior::Version) => message
             .strip_prefix("version ")
             .map(|suffix| std::borrow::Cow::Owned(format!("{public_name} {suffix}")))
             .or_else(|| {
@@ -1577,7 +1608,7 @@ fn normalize_admin_public_write_message<'a>(
                     .map(|suffix| std::borrow::Cow::Owned(format!("{public_name} {suffix}")))
             })
             .unwrap_or_else(|| std::borrow::Cow::Borrowed(message)),
-        _ => std::borrow::Cow::Borrowed(message),
+        None => std::borrow::Cow::Borrowed(message),
     }
 }
 
@@ -1602,20 +1633,6 @@ fn public_write_target_name(
     Some(binding.descriptor.public_name)
 }
 
-fn top_level_filesystem_write_target_name(statement: &Statement) -> Option<&'static str> {
-    [
-        "lix_file",
-        "lix_file_by_version",
-        "lix_directory",
-        "lix_directory_by_version",
-        "lix_file_history",
-        "lix_file_history_by_version",
-        "lix_directory_history",
-    ]
-    .into_iter()
-    .find(|target_name| statement_targets_table_name(statement, target_name))
-}
-
 fn top_level_write_target_name(statement: &Statement) -> Option<String> {
     match statement {
         Statement::Explain { statement, .. } => top_level_write_target_name(statement.as_ref()),
@@ -1637,6 +1654,22 @@ fn top_level_write_target_name(statement: &Statement) -> Option<String> {
                 _ => None,
             }
         }
+        _ => None,
+    }
+}
+
+fn filesystem_surface_kind(
+    surface_binding: &crate::catalog::SurfaceBinding,
+) -> Option<crate::catalog::FilesystemRelationKind> {
+    let binding = crate::catalog::builtin_catalog_compiler_facade()
+        .bind_surface_runtime_relation(
+            surface_binding,
+            crate::catalog::RelationBindContext::default(),
+        )
+        .ok()
+        .flatten()?;
+    match binding {
+        crate::catalog::RelationBinding::FilesystemRelation(binding) => Some(binding.kind),
         _ => None,
     }
 }

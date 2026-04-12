@@ -86,6 +86,8 @@ pub(crate) use storage_metadata::{
     builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,
     key_value_schema_version, BuiltinSchemaStorageLane, BuiltinSchemaStorageMetadata,
 };
+#[cfg(test)]
+pub(crate) use testing::LIVE_STATE_SCHEMA_EPOCH;
 pub(crate) use tracked::{
     load_exact_row_with_backend as load_exact_tracked_row_with_backend,
     scan_rows_with_backend as scan_tracked_rows_with_backend, TrackedRow, TrackedTombstoneMarker,

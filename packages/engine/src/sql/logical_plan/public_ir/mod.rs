@@ -1,4 +1,7 @@
-use crate::catalog::{DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogAdminScanKind, CatalogCompilerApi,
+    CatalogScanVersionScope, DefaultScopeSemantics, SurfaceBinding, SurfaceFamily, SurfaceVariant,
+};
 use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
 use crate::sql::semantic_ir::ExecutionContext;
 use crate::Value;
@@ -106,34 +109,22 @@ pub(crate) struct CanonicalFilesystemScan {
 
 impl CanonicalFilesystemScan {
     pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
-        if binding.descriptor.surface_family != SurfaceFamily::Filesystem {
-            return None;
-        }
-
-        let version_scope = match binding.descriptor.public_name.as_str() {
-            "lix_file" | "lix_directory" => VersionScope::ActiveVersion,
-            "lix_file_by_version" | "lix_directory_by_version" => VersionScope::ExplicitVersion,
-            "lix_file_history" | "lix_file_history_by_version" | "lix_directory_history" => {
-                VersionScope::History
-            }
-            _ => return None,
-        };
-
-        let kind = match binding.descriptor.public_name.as_str() {
-            "lix_file"
-            | "lix_file_by_version"
-            | "lix_file_history"
-            | "lix_file_history_by_version" => FilesystemKind::File,
-            "lix_directory" | "lix_directory_by_version" | "lix_directory_history" => {
-                FilesystemKind::Directory
-            }
-            _ => return None,
-        };
+        let semantics = builtin_catalog_compiler_facade()
+            .filesystem_scan_semantics(&binding)
+            .ok()
+            .flatten()?;
 
         Some(Self {
             binding,
-            kind,
-            version_scope,
+            kind: match semantics.kind {
+                crate::catalog::FilesystemRelationKind::File => FilesystemKind::File,
+                crate::catalog::FilesystemRelationKind::Directory => FilesystemKind::Directory,
+            },
+            version_scope: match semantics.version_scope {
+                CatalogScanVersionScope::ActiveVersion => VersionScope::ActiveVersion,
+                CatalogScanVersionScope::ExplicitVersion => VersionScope::ExplicitVersion,
+                CatalogScanVersionScope::History => VersionScope::History,
+            },
         })
     }
 }
@@ -145,7 +136,7 @@ pub(crate) struct CanonicalWorkingChangesScan {
 
 impl CanonicalWorkingChangesScan {
     pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
-        if binding.descriptor.public_name != "lix_working_changes" {
+        if !builtin_catalog_compiler_facade().is_working_changes_surface(&binding) {
             return None;
         }
 
@@ -166,13 +157,8 @@ pub(crate) struct CanonicalAdminScan {
 
 impl CanonicalAdminScan {
     pub(crate) fn from_surface_binding(binding: SurfaceBinding) -> Option<Self> {
-        if binding.descriptor.surface_family != SurfaceFamily::Admin {
-            return None;
-        }
-
-        let kind = match binding.descriptor.public_name.as_str() {
-            "lix_version" => CanonicalAdminKind::Version,
-            _ => return None,
+        let kind = match builtin_catalog_compiler_facade().admin_scan_kind(&binding)? {
+            CatalogAdminScanKind::Version => CanonicalAdminKind::Version,
         };
 
         Some(Self { binding, kind })

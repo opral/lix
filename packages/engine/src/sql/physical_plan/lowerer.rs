@@ -1,20 +1,20 @@
 use crate::catalog::{
-    builtin_catalog_compiler_facade, CatalogCompilerApi, RelationBindContext, SurfaceBinding,
-    SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate, SurfaceOverrideValue,
-    SurfaceRegistry, SurfaceVariant,
+    builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemProjectionScope,
+    FilesystemRelationBinding, FilesystemRelationKind, RelationBindContext, RelationBinding,
+    SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
+    SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::EffectiveStateRequest;
 use crate::diagnostics::sql_unknown_column_error;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
-    BroadPublicReadStatement, CanonicalAdminKind, CanonicalAdminScan, CanonicalChangeScan,
-    CanonicalStateScan, CanonicalWorkingChangesScan, FilesystemKind, ReadPlan,
-    StructuredPublicRead, VersionScope,
+    BroadPublicReadStatement, CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan,
+    CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,
 };
 use crate::sql::physical_plan::plan::{
     compile_final_read_statement, compile_lowered_read_statement,
-    compile_terminal_read_statement_from_template, FilesystemPublicSurface, LoweredReadProgram,
-    LoweredResultColumn, LoweredResultColumns, TerminalRelationRenderNode,
+    compile_terminal_read_statement_from_template, LoweredReadProgram, LoweredResultColumn,
+    LoweredResultColumns, TerminalRelationRenderNode,
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_has_live_payload_collisions, entity_surface_payload_alias,
@@ -440,16 +440,15 @@ fn state_read_exposed_column_error(
     if missing.is_empty() {
         return None;
     }
-    if surface_binding.descriptor.public_name == "lix_state"
-        && missing
-            .iter()
-            .any(|column| matches!(column.as_str(), "version_id" | "lixcol_version_id"))
+    if let Some(explicit_version_surface) = builtin_catalog_compiler_facade()
+        .explicit_version_counterpart_surface_name(surface_binding, &missing)
     {
         return Some(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "lix_state does not expose version_id; use lix_state_by_version for explicit version filters"
-                    .to_string(),
+            description: format!(
+                "{} does not expose version_id; use {} for explicit version filters",
+                surface_binding.descriptor.public_name, explicit_version_surface
+            ),
         });
     }
     let column = missing[0].clone();
@@ -882,13 +881,12 @@ fn build_nested_filesystem_surface_sql(
     active_version_id: Option<&str>,
     surface_name: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(surface) = FilesystemPublicSurface::from_public_name(surface_name) else {
+    let Some(binding) = bind_filesystem_surface_relation(surface_name, active_version_id)? else {
         return Ok(None);
     };
-    Ok(Some(build_filesystem_surface_sql(
+    Ok(Some(lower_catalog_relation_binding_to_source_sql(
         dialect,
-        active_version_id,
-        surface,
+        &RelationBinding::FilesystemRelation(binding),
     )?))
 }
 
@@ -900,7 +898,9 @@ fn table_name_terminal(name: &sqlparser::ast::ObjectName) -> Option<&str> {
 }
 
 fn is_rewriteable_filesystem_public_surface_name(name: &str) -> bool {
-    FilesystemPublicSurface::from_public_name(name).is_some()
+    builtin_catalog_compiler_facade()
+        .resolve_surface_descriptor(name)
+        .is_some_and(|descriptor| descriptor.surface_family == SurfaceFamily::Filesystem)
 }
 
 fn lower_admin_read_for_execution(
@@ -915,7 +915,7 @@ fn lower_admin_read_for_execution(
     build_lowered_read_program(
         dialect,
         canonicalized,
-        build_admin_source_sql_with_current_heads(admin_scan.kind, dialect, current_version_heads)?,
+        build_admin_source_sql_with_current_heads(&admin_scan, dialect, current_version_heads)?,
         canonicalized.query.selection.clone(),
     )
     .map(Some)
@@ -929,44 +929,94 @@ fn lower_filesystem_read_for_execution(
         return Ok(None);
     };
     let active_version_id = canonicalized.requested_version_id.as_deref();
-    let Some(surface) = FilesystemPublicSurface::from_filesystem_read(
-        &canonicalized.surface_binding,
-        filesystem_scan.kind,
-        filesystem_scan.version_scope,
-    ) else {
+    let Some(binding) =
+        bind_filesystem_surface_binding(&canonicalized.surface_binding, active_version_id)?
+    else {
         return Ok(None);
     };
+    if !filesystem_binding_matches_read(
+        &binding,
+        filesystem_scan.kind,
+        filesystem_scan.version_scope,
+    ) {
+        return Ok(None);
+    }
 
     build_lowered_read_program(
         dialect,
         canonicalized,
-        build_filesystem_surface_sql(dialect, active_version_id, surface)?,
+        lower_catalog_relation_binding_to_source_sql(
+            dialect,
+            &RelationBinding::FilesystemRelation(binding),
+        )?,
         canonicalized.query.selection.clone(),
     )
     .map(Some)
 }
 
-fn build_filesystem_surface_sql(
-    dialect: SqlDialect,
+fn bind_filesystem_surface_relation(
+    relation_name: &str,
     active_version_id: Option<&str>,
-    surface: FilesystemPublicSurface,
-) -> Result<String, LixError> {
-    let relation_name = match (surface.kind(), surface.needs_active_version_id()) {
-        (FilesystemKind::File, true) => "lix_file",
-        (FilesystemKind::File, false) => "lix_file_by_version",
-        (FilesystemKind::Directory, true) => "lix_directory",
-        (FilesystemKind::Directory, false) => "lix_directory_by_version",
+) -> Result<Option<FilesystemRelationBinding>, LixError> {
+    let Some(binding) = builtin_catalog_compiler_facade().bind_relation(
+        relation_name,
+        RelationBindContext {
+            active_version_id,
+            current_heads: None,
+        },
+    )?
+    else {
+        return Ok(None);
     };
-    let binding = builtin_catalog_compiler_facade()
-        .bind_relation(
-            relation_name,
-            RelationBindContext {
-                active_version_id,
-                current_heads: None,
-            },
-        )?
-        .expect("filesystem relation must bind to a catalog relation");
-    lower_catalog_relation_binding_to_source_sql(dialect, &binding)
+
+    match binding {
+        RelationBinding::FilesystemRelation(binding) => Ok(Some(binding)),
+        _ => Ok(None),
+    }
+}
+
+fn bind_filesystem_surface_binding(
+    surface_binding: &SurfaceBinding,
+    active_version_id: Option<&str>,
+) -> Result<Option<FilesystemRelationBinding>, LixError> {
+    let Some(binding) = builtin_catalog_compiler_facade().bind_surface_runtime_relation(
+        surface_binding,
+        RelationBindContext {
+            active_version_id,
+            current_heads: None,
+        },
+    )?
+    else {
+        return Ok(None);
+    };
+
+    match binding {
+        RelationBinding::FilesystemRelation(binding) => Ok(Some(binding)),
+        _ => Ok(None),
+    }
+}
+
+fn filesystem_binding_matches_read(
+    binding: &FilesystemRelationBinding,
+    kind: FilesystemKind,
+    version_scope: VersionScope,
+) -> bool {
+    let kind_matches = matches!(
+        (binding.kind, kind),
+        (FilesystemRelationKind::File, FilesystemKind::File)
+            | (FilesystemRelationKind::Directory, FilesystemKind::Directory)
+    );
+    let scope_matches = matches!(
+        (binding.scope, version_scope),
+        (
+            FilesystemProjectionScope::ActiveVersion,
+            VersionScope::ActiveVersion
+        ) | (
+            FilesystemProjectionScope::ExplicitVersion,
+            VersionScope::ExplicitVersion
+        )
+    );
+    kind_matches && scope_matches
 }
 
 fn build_state_source_sql(
@@ -993,38 +1043,30 @@ fn build_state_source_sql(
 }
 
 fn build_admin_source_sql(
-    kind: CanonicalAdminKind,
+    admin_scan: &CanonicalAdminScan,
     dialect: SqlDialect,
 ) -> Result<String, LixError> {
-    Ok(match kind {
-        CanonicalAdminKind::Version => {
-            let binding = builtin_catalog_compiler_facade()
-                .bind_relation("lix_version", RelationBindContext::default())?
-                .expect("lix_version must bind to a catalog relation");
-            lower_catalog_relation_binding_to_source_sql(dialect, &binding)?
-        }
-    })
+    let binding = builtin_catalog_compiler_facade()
+        .bind_surface_runtime_relation(&admin_scan.binding, RelationBindContext::default())?
+        .expect("admin scan must bind to a catalog runtime relation");
+    lower_catalog_relation_binding_to_source_sql(dialect, &binding)
 }
 
 fn build_admin_source_sql_with_current_heads(
-    kind: CanonicalAdminKind,
+    admin_scan: &CanonicalAdminScan,
     dialect: SqlDialect,
     current_version_heads: &BTreeMap<String, String>,
 ) -> Result<String, LixError> {
-    Ok(match kind {
-        CanonicalAdminKind::Version => {
-            let binding = builtin_catalog_compiler_facade()
-                .bind_relation(
-                    "lix_version",
-                    RelationBindContext {
-                        active_version_id: None,
-                        current_heads: Some(current_version_heads),
-                    },
-                )?
-                .expect("lix_version must bind to a catalog relation");
-            lower_catalog_relation_binding_to_source_sql(dialect, &binding)?
-        }
-    })
+    let binding = builtin_catalog_compiler_facade()
+        .bind_surface_runtime_relation(
+            &admin_scan.binding,
+            RelationBindContext {
+                active_version_id: None,
+                current_heads: Some(current_version_heads),
+            },
+        )?
+        .expect("admin scan must bind to a catalog runtime relation");
+    lower_catalog_relation_binding_to_source_sql(dialect, &binding)
 }
 
 fn build_entity_source_sql(

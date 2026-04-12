@@ -1,4 +1,8 @@
-use crate::catalog::SurfaceOverrideValue;
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationBinding,
+    FilesystemRelationKind, RelationBindContext, RelationBinding, SurfaceBinding,
+    SurfaceOverrideValue,
+};
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
@@ -67,17 +71,14 @@ pub(crate) fn analyze_write(
 fn analyze_filesystem_write_intent(
     canonicalized: &CanonicalizedWrite,
 ) -> Result<Option<FilesystemWriteIntent>, WriteAnalysisError> {
+    let filesystem_kind = filesystem_surface_kind(&canonicalized.surface_binding)?;
     match (
-        canonicalized
-            .surface_binding
-            .descriptor
-            .public_name
-            .as_str(),
+        filesystem_kind,
         canonicalized.write_command.operation_kind,
         &canonicalized.write_command.payload,
     ) {
         (
-            "lix_directory" | "lix_directory_by_version",
+            Some(FilesystemRelationKind::Directory),
             WriteOperationKind::Insert,
             MutationPayload::InsertRows(rows),
         ) => rows
@@ -90,7 +91,7 @@ fn analyze_filesystem_write_intent(
             .map(FilesystemWriteIntent::DirectoryInsert)
             .map(Some),
         (
-            "lix_directory" | "lix_directory_by_version",
+            Some(FilesystemRelationKind::Directory),
             WriteOperationKind::Update,
             MutationPayload::UpdatePatch(payload),
         ) => parse_directory_update_assignments(payload)
@@ -98,12 +99,12 @@ fn analyze_filesystem_write_intent(
             .map(Some)
             .map_err(write_analysis_filesystem_assignments_error),
         (
-            "lix_directory" | "lix_directory_by_version",
+            Some(FilesystemRelationKind::Directory),
             WriteOperationKind::Delete,
             MutationPayload::Tombstone,
         ) => Ok(Some(FilesystemWriteIntent::DirectoryDelete)),
         (
-            "lix_file" | "lix_file_by_version",
+            Some(FilesystemRelationKind::File),
             WriteOperationKind::Insert,
             MutationPayload::InsertRows(rows),
         ) => rows
@@ -116,7 +117,7 @@ fn analyze_filesystem_write_intent(
             .map(FilesystemWriteIntent::FileInsert)
             .map(Some),
         (
-            "lix_file" | "lix_file_by_version",
+            Some(FilesystemRelationKind::File),
             WriteOperationKind::Update,
             MutationPayload::UpdatePatch(payload),
         ) => parse_file_update_assignments(payload)
@@ -124,7 +125,7 @@ fn analyze_filesystem_write_intent(
             .map(Some)
             .map_err(write_analysis_filesystem_assignments_error),
         (
-            "lix_file" | "lix_file_by_version",
+            Some(FilesystemRelationKind::File),
             WriteOperationKind::Delete,
             MutationPayload::Tombstone,
         ) => Ok(Some(FilesystemWriteIntent::FileDelete)),
@@ -512,17 +513,8 @@ fn derive_write_schema_facts(canonicalized: &CanonicalizedWrite) -> SchemaProof 
 }
 
 fn derive_write_target_facts(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
-    let target_key = match canonicalized
-        .surface_binding
-        .descriptor
-        .public_name
-        .as_str()
-    {
-        "lix_version"
-        | "lix_file"
-        | "lix_file_by_version"
-        | "lix_directory"
-        | "lix_directory_by_version" => "id",
+    let target_key = match canonicalized.surface_binding.descriptor.surface_family {
+        crate::catalog::SurfaceFamily::Filesystem | crate::catalog::SurfaceFamily::Admin => "id",
         _ => "entity_id",
     };
     write_text_value(canonicalized, target_key)
@@ -530,17 +522,38 @@ fn derive_write_target_facts(canonicalized: &CanonicalizedWrite) -> Option<Targe
         .or(Some(TargetSetProof::Unknown))
 }
 
-fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<&'static str> {
-    match canonicalized
-        .surface_binding
-        .descriptor
-        .public_name
-        .as_str()
-    {
-        "lix_file" | "lix_file_by_version" => Some("lix_file_descriptor"),
-        "lix_directory" | "lix_directory_by_version" => Some("lix_directory_descriptor"),
-        _ => None,
+fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<String> {
+    let binding = filesystem_surface_binding(&canonicalized.surface_binding)
+        .ok()
+        .flatten()?;
+    Some(match binding.kind {
+        FilesystemRelationKind::File => binding.file_descriptor_schema_key,
+        FilesystemRelationKind::Directory => binding.directory_descriptor_schema_key,
+    })
+}
+
+fn filesystem_surface_binding(
+    surface_binding: &SurfaceBinding,
+) -> Result<Option<FilesystemRelationBinding>, WriteAnalysisError> {
+    let Some(binding) = builtin_catalog_compiler_facade()
+        .bind_surface_runtime_relation(surface_binding, RelationBindContext::default())
+        .map_err(|error| WriteAnalysisError {
+            message: error.description,
+        })?
+    else {
+        return Ok(None);
+    };
+
+    match binding {
+        RelationBinding::FilesystemRelation(binding) => Ok(Some(binding)),
+        _ => Ok(None),
     }
+}
+
+fn filesystem_surface_kind(
+    surface_binding: &SurfaceBinding,
+) -> Result<Option<FilesystemRelationKind>, WriteAnalysisError> {
+    Ok(filesystem_surface_binding(surface_binding)?.map(|binding| binding.kind))
 }
 
 fn write_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {
