@@ -136,6 +136,8 @@ enum UseToken {
     Ident(String),
 }
 
+const SEALED_OWNER_SNAPSHOT_PATH: &str = "tests/sealed_owner_violations.txt";
+
 fn engine_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
@@ -1664,6 +1666,30 @@ fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -
     }
 
     rendered
+}
+
+fn write_sealed_owner_violations_snapshot(rendered: &str) {
+    let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent).expect("sealed-owner snapshot directory should exist");
+    }
+    fs::write(&snapshot_path, rendered).expect("sealed-owner snapshot should be writable");
+}
+
+#[test]
+fn sealed_owner_import_rule_writes_current_violations_snapshot() {
+    let actual_violations = current_sealed_owner_violations();
+    let actual = render_grouped_sealed_owner_violations(&actual_violations);
+    write_sealed_owner_violations_snapshot(&actual);
+
+    let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
+    let written = fs::read_to_string(&snapshot_path)
+        .expect("sealed-owner snapshot should be readable after writing");
+
+    assert_eq!(
+        written, actual,
+        "sealed-owner snapshot should match the current violations after regeneration",
+    );
 }
 
 #[test]
