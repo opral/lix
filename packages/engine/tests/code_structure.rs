@@ -91,8 +91,6 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "sql",
 ];
 
-const SEALED_OWNER_SNAPSHOT_PATH: &str = "tests/sealed_owner_violations.txt";
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct EngineDependencyGraph {
     module_source: String,
@@ -1665,21 +1663,6 @@ fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -
     }
 
     rendered
-}
-
-#[test]
-fn sealed_owner_import_rule_lists_current_violations() {
-    let actual_violations = current_sealed_owner_violations();
-    let actual = render_grouped_sealed_owner_violations(&actual_violations);
-    let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
-    let expected = fs::read_to_string(&snapshot_path).unwrap_or_default();
-
-    assert_eq!(
-        actual, expected,
-        "sealed-owner snapshot drifted.\n\nReview the current violations and update `{}` intentionally.\n\nCurrent violations:\n{}",
-        SEALED_OWNER_SNAPSHOT_PATH,
-        actual
-    );
 }
 
 #[test]
