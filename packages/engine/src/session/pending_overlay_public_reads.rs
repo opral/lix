@@ -1,3 +1,9 @@
+//! Pending-overlay public-read adapters.
+//!
+//! This module owns the session-side bridge that merges overlay-visible
+//! registered schema rows, rebuilds the public-read surface registry, and
+//! executes pending-overlay public reads.
+
 use std::collections::BTreeMap;
 
 use crate::contracts::{
@@ -20,13 +26,13 @@ const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
 
-struct TransactionReadModel<'a> {
+struct PendingOverlayReadModel<'a> {
     base: &'a dyn LixBackend,
     pending_overlay: Option<&'a dyn PendingOverlay>,
     functions: Option<&'a DynFunctionProvider>,
 }
 
-impl<'a> TransactionReadModel<'a> {
+impl<'a> PendingOverlayReadModel<'a> {
     fn new(
         base: &'a dyn LixBackend,
         pending_overlay: Option<&'a dyn PendingOverlay>,
@@ -44,7 +50,7 @@ impl<'a> TransactionReadModel<'a> {
             .is_some_and(PendingOverlay::has_overlays)
     }
 
-    async fn build_public_surface_registry(
+    async fn build_public_read_surface_registry(
         &self,
     ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
         let functions = self
@@ -76,7 +82,7 @@ impl<'a> TransactionReadModel<'a> {
         Ok(registry)
     }
 
-    async fn execute_prepared_public_read(
+    async fn execute_pending_overlay_public_read(
         &self,
         public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError> {
@@ -378,27 +384,27 @@ impl<'a> TransactionReadModel<'a> {
     }
 }
 
-pub(crate) async fn build_surface_registry(
+pub(crate) async fn build_public_read_surface_registry_with_pending_overlay(
     base: &dyn LixBackend,
-    pending_write_overlay: Option<&dyn PendingOverlay>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     functions: &DynFunctionProvider,
 ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
-    TransactionReadModel::new(base, pending_write_overlay, Some(functions))
-        .build_public_surface_registry()
+    PendingOverlayReadModel::new(base, pending_overlay, Some(functions))
+        .build_public_read_surface_registry()
         .await
 }
 
-pub(crate) async fn execute_prepared_public_read_with_pending_overlay(
+pub(crate) async fn execute_pending_overlay_public_read(
     base: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    TransactionReadModel::new(base, pending_overlay, None)
-        .execute_prepared_public_read(public_read)
+    PendingOverlayReadModel::new(base, pending_overlay, None)
+        .execute_pending_overlay_public_read(public_read)
         .await
 }
 
-pub(crate) async fn execute_prepared_public_read_with_pending_overlay_in_transaction(
+pub(crate) async fn execute_pending_overlay_public_read_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     pending_overlay: Option<&dyn PendingOverlay>,
     public_read: &PreparedPublicRead,
@@ -406,8 +412,8 @@ pub(crate) async fn execute_prepared_public_read_with_pending_overlay_in_transac
     match public_read.contract.source() {
         PublicReadSource::PendingOverlay => {
             let backend = crate::backend::transaction_backend_view(transaction);
-            TransactionReadModel::new(&backend, pending_overlay, None)
-                .execute_prepared_public_read(public_read)
+            PendingOverlayReadModel::new(&backend, pending_overlay, None)
+                .execute_pending_overlay_public_read(public_read)
                 .await
         }
         PublicReadSource::Committed(_) => Err(LixError::new(

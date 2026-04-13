@@ -1,3 +1,9 @@
+//! Transaction overlay read-context helpers.
+//!
+//! This module wraps `live_state::LiveReadContext` with pending overlay views so
+//! transaction-side materialization and write-state tests can resolve
+//! overlay-aware effective rows.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
@@ -18,11 +24,11 @@ type BatchUntrackedRowRequest = BatchRowRequest;
 type TrackedScanRequest = ScanRequest;
 type UntrackedScanRequest = ScanRequest;
 
-pub struct ReadContext<'a> {
+pub struct OverlayReadContext<'a> {
     base: LiveReadContext<'a>,
 }
 
-impl<'a> ReadContext<'a> {
+impl<'a> OverlayReadContext<'a> {
     #[cfg(test)]
     pub(crate) fn new(
         tracked: &'a dyn TrackedReadView,
@@ -46,8 +52,8 @@ impl<'a> ReadContext<'a> {
     pub(crate) fn with_pending<'b>(
         &'b self,
         pending: &'b PendingRowOverlay,
-    ) -> PendingReadContext<'b> {
-        PendingReadContext {
+    ) -> PendingOverlayReadContext<'b> {
+        PendingOverlayReadContext {
             tracked: PendingTrackedReadView {
                 base: self.base.tracked,
                 pending,
@@ -68,14 +74,14 @@ impl<'a> ReadContext<'a> {
     }
 }
 
-pub(crate) struct PendingReadContext<'a> {
+pub(crate) struct PendingOverlayReadContext<'a> {
     tracked: PendingTrackedReadView<'a>,
     untracked: PendingUntrackedReadView<'a>,
     tracked_tombstones: PendingTrackedTombstoneView<'a>,
     writer_keys: PendingWriterKeyReadView<'a>,
 }
 
-impl<'a> PendingReadContext<'a> {
+impl<'a> PendingOverlayReadContext<'a> {
     pub(crate) fn effective_state_context(&'a self) -> LiveReadContext<'a> {
         let context = LiveReadContext::new(&self.tracked, &self.untracked, &self.writer_keys);
         if self.tracked_tombstones.has_source() {

@@ -29,8 +29,8 @@ use crate::contracts::{
 };
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
+use crate::session::compiler_state::SessionCompilerState;
 use crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
-use crate::session::execution_state::SessionExecutionState;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::bind_sql;
 use crate::sql::{
@@ -60,7 +60,7 @@ pub(crate) struct WritePreparationStamp {
 }
 
 impl WritePreparationStamp {
-    pub(crate) fn capture(context: &SessionExecutionState) -> Self {
+    pub(crate) fn capture(context: &SessionCompilerState) -> Self {
         Self {
             public_surface_registry_generation: context.public_surface_registry_generation(),
         }
@@ -138,7 +138,7 @@ impl ValidatedWriteCommand {
 pub(crate) async fn build_write_preparation_context(
     mut transaction: &mut dyn LixBackendTransaction,
     pending_write_overlay: Option<&PendingWriteOverlay>,
-    context: &SessionExecutionState,
+    context: &SessionCompilerState,
 ) -> Result<WritePreparationContext, LixError> {
     let active_history_root_commit_id = transaction
         .load_active_history_root_commit_id_for_preparation(context.active_version_id.as_str())
@@ -166,7 +166,7 @@ pub(crate) async fn build_write_preparation_context(
 pub(crate) async fn ensure_function_bindings_for_write_scope(
     execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
-    context: &mut SessionExecutionState,
+    context: &mut SessionCompilerState,
 ) -> Result<(), LixError> {
     if context.function_bindings().is_some() {
         return Ok(());
@@ -194,7 +194,7 @@ pub(crate) async fn prepare_buffered_write_execution_step(
     bound_statement: &BoundStatementInstance,
     prepared_context: &WritePreparationContext,
     allow_internal_relations: bool,
-    context: &SessionExecutionState,
+    context: &SessionCompilerState,
     skip_side_effect_collection: bool,
 ) -> Result<WriteCommand, LixError> {
     let compiled = compile_write_command(
@@ -257,7 +257,7 @@ async fn compile_write_command(
     bound_statement: &BoundStatementInstance,
     prepared_context: &WritePreparationContext,
     allow_internal_relations: bool,
-    context: &SessionExecutionState,
+    context: &SessionCompilerState,
     skip_side_effect_collection: bool,
 ) -> Result<CompiledWriteCommand, LixError> {
     let statement_kind = PreparedWriteStatementKind::for_statement(bound_statement.statement());

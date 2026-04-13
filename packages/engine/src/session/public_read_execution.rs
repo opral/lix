@@ -74,7 +74,7 @@ impl ReadExecutionHost for SessionExecutionContext<'_> {
 
 #[async_trait(?Send)]
 impl PendingPublicReadHost for dyn LixBackend + '_ {
-    async fn execute_prepared_public_read_with_pending_overlay(
+    async fn execute_pending_overlay_public_read(
         &self,
         host: &dyn ReadExecutionHost,
         pending_overlay: Option<&dyn PendingOverlay>,
@@ -82,7 +82,7 @@ impl PendingPublicReadHost for dyn LixBackend + '_ {
     ) -> Result<QueryResult, LixError> {
         match public_read.contract.source() {
             crate::contracts::PublicReadSource::PendingOverlay => {
-                crate::session::pending_reads::execute_prepared_public_read_with_pending_overlay(
+                crate::session::pending_overlay_public_reads::execute_pending_overlay_public_read(
                     self,
                     pending_overlay,
                     public_read,

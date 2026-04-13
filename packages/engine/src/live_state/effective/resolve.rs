@@ -14,7 +14,7 @@ use crate::live_state::tracked::{
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 use crate::live_state::EffectiveRowsResolver;
-use crate::live_state::LiveReadContext as ReadContext;
+use crate::live_state::LiveReadContext;
 use crate::live_state::WriterKeyReadView;
 use crate::{LixError, Value};
 
@@ -46,7 +46,7 @@ pub fn overlay_lanes_for_version(
 #[cfg(test)]
 pub(crate) async fn resolve_effective_row(
     request: &EffectiveRowRequest,
-    context: &ReadContext<'_>,
+    context: &LiveReadContext<'_>,
 ) -> Result<Option<EffectiveRow>, LixError> {
     let lanes = overlay_lanes_for_version(
         &request.version_id,
@@ -130,7 +130,7 @@ pub(crate) async fn resolve_effective_row(
 
 pub(crate) async fn resolve_effective_rows(
     request: &EffectiveRowsRequest,
-    context: &ReadContext<'_>,
+    context: &LiveReadContext<'_>,
 ) -> Result<EffectiveRowSet, LixError> {
     let lanes = overlay_lanes_for_version(
         &request.version_id,
@@ -189,7 +189,7 @@ pub(crate) async fn resolve_effective_rows(
 }
 
 #[async_trait(?Send)]
-impl EffectiveRowsResolver for ReadContext<'_> {
+impl EffectiveRowsResolver for LiveReadContext<'_> {
     async fn resolve_effective_rows(
         &self,
         request: &EffectiveRowsRequest,
@@ -200,7 +200,7 @@ impl EffectiveRowsResolver for ReadContext<'_> {
 
 async fn scan_tracked_lane(
     request: &EffectiveRowsRequest,
-    context: &ReadContext<'_>,
+    context: &LiveReadContext<'_>,
     lane: OverlayLane,
 ) -> Result<BTreeMap<EffectiveRowIdentity, LaneResult<EffectiveRow>>, LixError> {
     let storage_version_id = storage_version_id(&request.version_id, lane);
@@ -246,7 +246,7 @@ async fn scan_tracked_lane(
 
 async fn scan_untracked_lane(
     request: &EffectiveRowsRequest,
-    context: &ReadContext<'_>,
+    context: &LiveReadContext<'_>,
     lane: OverlayLane,
 ) -> Result<BTreeMap<EffectiveRowIdentity, LaneResult<EffectiveRow>>, LixError> {
     let storage_version_id = storage_version_id(&request.version_id, lane);
@@ -405,7 +405,7 @@ fn projected_version_id(
 #[allow(dead_code)]
 async fn load_effective_rows_exact_batch(
     request: &EffectiveRowsRequest,
-    context: &ReadContext<'_>,
+    context: &LiveReadContext<'_>,
     lane: OverlayLane,
     identities: &[EffectiveRowIdentity],
 ) -> Result<BTreeMap<EffectiveRowIdentity, EffectiveRow>, LixError> {

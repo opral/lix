@@ -1,3 +1,8 @@
+//! Session compiler-state helpers.
+//!
+//! This module owns session-local compiler/runtime state used during planning,
+//! public-read preparation, and buffered write preparation.
+
 #[cfg(test)]
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,7 +70,7 @@ impl SessionCompilerCache {
     }
 }
 
-pub(crate) struct SessionExecutionState {
+pub(crate) struct SessionCompilerState {
     pub(crate) options: ExecuteOptions,
     pub(crate) public_surface_registry: SurfaceRegistry,
     compiler_cache: SessionCompilerCacheHandle,
@@ -74,7 +79,7 @@ pub(crate) struct SessionExecutionState {
     function_bindings: Option<FunctionBindings>,
 }
 
-impl SessionExecutionState {
+impl SessionCompilerState {
     pub(crate) fn new(
         options: ExecuteOptions,
         public_surface_registry: SurfaceRegistry,

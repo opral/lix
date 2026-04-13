@@ -32,7 +32,7 @@ pub(crate) async fn build_read_preparation_context(
     functions: &DynFunctionProvider,
 ) -> Result<ReadPreparationContext, LixError> {
     let registry =
-        crate::session::pending_reads::build_surface_registry(backend, pending_overlay, functions)
+        crate::session::pending_overlay_public_reads::build_public_read_surface_registry_with_pending_overlay(backend, pending_overlay, functions)
             .await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
     Ok(ReadPreparationContext {

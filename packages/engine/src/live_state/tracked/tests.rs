@@ -10,7 +10,7 @@ use crate::live_state::tracked::{
 };
 use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRowSource};
 use crate::session::workspace::init as init_workspace;
-use crate::transaction::{LiveStateWriteTransaction, ReadContext, TransactionDelta};
+use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
     Value,
@@ -202,7 +202,7 @@ async fn commit_tracked_rows(
     backend: &SqliteBackend,
     rows: Vec<TrackedWriteRow>,
 ) -> Result<(), LixError> {
-    let read_context = ReadContext::new(backend, backend, backend);
+    let read_context = OverlayReadContext::new(backend, backend, backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await?;

@@ -2,8 +2,8 @@ use async_trait::async_trait;
 
 use crate::catalog::FilesystemProjectionScope;
 use crate::common::NormalizedDirectoryPath;
-use crate::session::semantic_write::{
-    install_plugin_archive_with_writer, PluginInstallWriteExecutor, SemanticWriteContext,
+use crate::session::plugin_install_writes::{
+    install_plugin_archive_with_writer, PluginInstallWriteContext, PluginInstallWriteExecutor,
 };
 use crate::transaction::{
     ensure_function_bindings_for_write_scope, lookup_directory_id_by_path_in_transaction,
@@ -16,13 +16,13 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 struct SessionPluginInstallWriter<'a, 'tx> {
     transaction: &'a mut BufferedWriteTransaction<'tx>,
-    semantic_context: SemanticWriteContext,
+    plugin_install_context: PluginInstallWriteContext,
 }
 
 #[async_trait(?Send)]
 impl<'a, 'tx> PluginInstallWriteExecutor for SessionPluginInstallWriter<'a, 'tx> {
-    fn semantic_write_context(&self) -> SemanticWriteContext {
-        self.semantic_context.clone()
+    fn plugin_install_write_context(&self) -> PluginInstallWriteContext {
+        self.plugin_install_context.clone()
     }
 
     fn stage_prepared_write_statement(&mut self, statement: WriteCommand) -> Result<(), LixError> {
@@ -49,7 +49,7 @@ pub(crate) async fn install_plugin_in_session(
 ) -> Result<(), LixError> {
     let transaction = session.session_host().begin_write_unit().await?;
     let mut write_transaction = BufferedWriteTransaction::new(transaction);
-    let mut context = session.new_execution_state(ExecuteOptions::default());
+    let mut context = session.new_compiler_state(ExecuteOptions::default());
     let execution_context = session.execution_context();
     ensure_function_bindings_for_write_scope(
         &execution_context,
@@ -57,7 +57,7 @@ pub(crate) async fn install_plugin_in_session(
         &mut context,
     )
     .await?;
-    let semantic_context = SemanticWriteContext::new(
+    let plugin_install_context = PluginInstallWriteContext::new(
         prepared_write_function_bindings_for_execution(
             context
                 .function_bindings()
@@ -71,7 +71,7 @@ pub(crate) async fn install_plugin_in_session(
     let install_result = {
         let mut writer = SessionPluginInstallWriter {
             transaction: &mut write_transaction,
-            semantic_context,
+            plugin_install_context,
         };
         install_plugin_archive_with_writer(archive_bytes, &mut writer).await
     };
@@ -79,13 +79,13 @@ pub(crate) async fn install_plugin_in_session(
     match install_result {
         Ok(()) => {
             let outcome = write_transaction
-                .commit_buffered_write(&execution_context, context.buffered_write_execution_input())
+                .commit(&execution_context, context.buffered_write_execution_input())
                 .await?;
             session.apply_transaction_commit_outcome(outcome).await?;
             Ok(())
         }
         Err(error) => {
-            let _ = write_transaction.rollback_buffered_write().await;
+            let _ = write_transaction.rollback().await;
             Err(error)
         }
     }

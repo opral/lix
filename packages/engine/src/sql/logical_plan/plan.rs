@@ -1,4 +1,4 @@
-use crate::catalog::ResolvedSurface;
+use crate::catalog::ResolvedRelation;
 use crate::contracts::EffectiveStateRequest;
 use crate::sql::logical_plan::dependency_spec::DependencySpec;
 use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
@@ -46,7 +46,7 @@ pub(crate) enum PublicReadLogicalPlan {
     },
     Broad {
         broad_statement: Box<BroadPublicReadStatement>,
-        surface_bindings: Vec<ResolvedSurface>,
+        resolved_relations: Vec<ResolvedRelation>,
         dependency_spec: Option<DependencySpec>,
     },
 }

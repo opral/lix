@@ -5,7 +5,7 @@ use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     write_live_rows, LiveRow,
 };
-use crate::session::execution_state::{SessionCompilerCache, SessionExecutionState};
+use crate::session::compiler_state::{SessionCompilerCache, SessionCompilerState};
 use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::sql::parse_sql;
 use crate::transaction::{
@@ -19,7 +19,7 @@ pub(crate) const LIX_ID_KEY: &str = "lix_id";
 pub(crate) struct InitExecutor<'engine, 'tx> {
     lix: &'engine Lix,
     write_transaction: BorrowedBufferedWriteTransaction<'tx>,
-    context: SessionExecutionState,
+    context: SessionCompilerState,
 }
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
@@ -30,7 +30,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(Self {
             lix,
             write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
-            context: SessionExecutionState::new(
+            context: SessionCompilerState::new(
                 ExecuteOptions::default(),
                 lix.public_surface_registry(),
                 SessionCompilerCache::new(),
@@ -62,7 +62,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         let mut execution_input = self.context.buffered_write_execution_input();
         self.write_transaction
-            .flush_buffered_write_journal(self.lix, &mut execution_input)
+            .flush_journal(self.lix, &mut execution_input)
             .await?;
         self.context
             .apply_buffered_write_execution_input(&execution_input);

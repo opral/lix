@@ -1,6 +1,7 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminScanKind, CatalogCompilerApi,
-    CatalogScanVersionScope, DefaultScopeSemantics, ResolvedSurface, SurfaceFamily, SurfaceVariant,
+    CatalogScanVersionScope, DefaultScopeSemantics, ResolvedRelation, SurfaceFamily,
+    SurfaceVariant,
 };
 use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
 use crate::sql::semantic_ir::StatementContext;
@@ -33,7 +34,7 @@ pub(crate) struct EntityProjectionSpec {
 }
 
 impl EntityProjectionSpec {
-    pub(crate) fn from_resolved_surface(binding: &ResolvedSurface) -> Option<Self> {
+    pub(crate) fn from_resolved_relation(binding: &ResolvedRelation) -> Option<Self> {
         if binding.descriptor.surface_family != SurfaceFamily::Entity {
             return None;
         }
@@ -48,7 +49,7 @@ impl EntityProjectionSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalStateScan {
-    pub(crate) binding: ResolvedSurface,
+    pub(crate) binding: ResolvedRelation,
     pub(crate) version_scope: VersionScope,
     pub(crate) expose_version_id: bool,
     pub(crate) include_tombstones: bool,
@@ -56,7 +57,7 @@ pub(crate) struct CanonicalStateScan {
 }
 
 impl CanonicalStateScan {
-    pub(crate) fn from_resolved_surface(binding: ResolvedSurface) -> Option<Self> {
+    pub(crate) fn from_resolved_relation(binding: ResolvedRelation) -> Option<Self> {
         let version_scope = match binding.default_scope {
             DefaultScopeSemantics::ActiveVersion => VersionScope::ActiveVersion,
             DefaultScopeSemantics::ExplicitVersion => VersionScope::ExplicitVersion,
@@ -70,7 +71,7 @@ impl CanonicalStateScan {
             SurfaceFamily::State | SurfaceFamily::Entity => Some(Self {
                 include_tombstones: binding.descriptor.surface_variant == SurfaceVariant::History,
                 expose_version_id: binding.implicit_overrides.expose_version_id,
-                entity_projection: EntityProjectionSpec::from_resolved_surface(&binding),
+                entity_projection: EntityProjectionSpec::from_resolved_relation(&binding),
                 binding,
                 version_scope,
             }),
@@ -81,11 +82,11 @@ impl CanonicalStateScan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalChangeScan {
-    pub(crate) binding: ResolvedSurface,
+    pub(crate) binding: ResolvedRelation,
 }
 
 impl CanonicalChangeScan {
-    pub(crate) fn from_resolved_surface(binding: ResolvedSurface) -> Option<Self> {
+    pub(crate) fn from_resolved_relation(binding: ResolvedRelation) -> Option<Self> {
         if binding.descriptor.surface_family != SurfaceFamily::Change {
             return None;
         }
@@ -102,13 +103,13 @@ pub(crate) enum FilesystemKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalFilesystemScan {
-    pub(crate) binding: ResolvedSurface,
+    pub(crate) binding: ResolvedRelation,
     pub(crate) kind: FilesystemKind,
     pub(crate) version_scope: VersionScope,
 }
 
 impl CanonicalFilesystemScan {
-    pub(crate) fn from_resolved_surface(binding: ResolvedSurface) -> Option<Self> {
+    pub(crate) fn from_resolved_relation(binding: ResolvedRelation) -> Option<Self> {
         let semantics = builtin_catalog_compiler_facade()
             .filesystem_scan_semantics(&binding)
             .ok()
@@ -131,11 +132,11 @@ impl CanonicalFilesystemScan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalWorkingChangesScan {
-    pub(crate) binding: ResolvedSurface,
+    pub(crate) binding: ResolvedRelation,
 }
 
 impl CanonicalWorkingChangesScan {
-    pub(crate) fn from_resolved_surface(binding: ResolvedSurface) -> Option<Self> {
+    pub(crate) fn from_resolved_relation(binding: ResolvedRelation) -> Option<Self> {
         if !builtin_catalog_compiler_facade().is_working_changes_surface(&binding) {
             return None;
         }
@@ -151,12 +152,12 @@ pub(crate) enum CanonicalAdminKind {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalAdminScan {
-    pub(crate) binding: ResolvedSurface,
+    pub(crate) binding: ResolvedRelation,
     pub(crate) kind: CanonicalAdminKind,
 }
 
 impl CanonicalAdminScan {
-    pub(crate) fn from_resolved_surface(binding: ResolvedSurface) -> Option<Self> {
+    pub(crate) fn from_resolved_relation(binding: ResolvedRelation) -> Option<Self> {
         let kind = match builtin_catalog_compiler_facade().admin_scan_kind(&binding)? {
             CatalogAdminScanKind::Version => CanonicalAdminKind::Version,
         };
@@ -269,7 +270,7 @@ impl NormalizedPublicReadQuery {
 pub(crate) struct StructuredPublicRead {
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) requested_version_id: Option<String>,
-    pub(crate) surface_binding: ResolvedSurface,
+    pub(crate) resolved_relation: ResolvedRelation,
     pub(crate) read_command: ReadCommand,
     pub(crate) query: NormalizedPublicReadQuery,
 }
@@ -703,8 +704,8 @@ pub(crate) struct BroadPublicReadAlias {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BroadPublicReadRelation {
-    Public(ResolvedSurface),
-    LoweredPublic(ResolvedSurface),
+    Public(ResolvedRelation),
+    LoweredPublic(ResolvedRelation),
     Internal(String),
     External(String),
     Cte(String),
@@ -781,7 +782,7 @@ pub(crate) struct CanonicalStateAssignments {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WriteCommand {
     pub(crate) operation_kind: WriteOperationKind,
-    pub(crate) target: ResolvedSurface,
+    pub(crate) target: ResolvedRelation,
     pub(crate) selector: WriteSelector,
     pub(crate) payload: MutationPayload,
     pub(crate) on_conflict: Option<InsertOnConflict>,
@@ -906,7 +907,7 @@ mod tests {
     #[test]
     fn canonical_state_scan_tracks_explicit_version_visibility() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let scan = CanonicalStateScan::from_resolved_surface(
+        let scan = CanonicalStateScan::from_resolved_relation(
             registry
                 .bind_relation_name("lix_state_by_version")
                 .expect("surface should bind"),
@@ -935,9 +936,9 @@ mod tests {
             .bind_relation_name("lix_key_value")
             .expect("dynamic surface should bind");
         let projection =
-            EntityProjectionSpec::from_resolved_surface(&binding).expect("entity projection");
-        let scan =
-            CanonicalStateScan::from_resolved_surface(binding).expect("entity surface should scan");
+            EntityProjectionSpec::from_resolved_relation(&binding).expect("entity projection");
+        let scan = CanonicalStateScan::from_resolved_relation(binding)
+            .expect("entity surface should scan");
 
         assert_eq!(projection.schema_key, "lix_key_value");
         assert_eq!(scan.version_scope, VersionScope::ActiveVersion);

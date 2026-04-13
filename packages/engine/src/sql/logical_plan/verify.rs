@@ -40,7 +40,7 @@ pub(crate) fn verify_public_read_logical_plan(
     match plan {
         PublicReadLogicalPlan::Structured { plan } => {
             let read = plan.structured_read();
-            if read.surface_binding.descriptor.public_name.is_empty() {
+            if read.resolved_relation.descriptor.public_name.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "structured public read must target a named surface",
                 ));
@@ -51,7 +51,7 @@ pub(crate) fn verify_public_read_logical_plan(
             history_read_plan,
         } => {
             let read = plan.structured_read();
-            if read.surface_binding.descriptor.public_name.is_empty() {
+            if read.resolved_relation.descriptor.public_name.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "direct history read must target a named surface",
                 ));
@@ -60,10 +60,10 @@ pub(crate) fn verify_public_read_logical_plan(
         }
         PublicReadLogicalPlan::Broad {
             broad_statement,
-            surface_bindings,
+            resolved_relations,
             ..
         } => {
-            if surface_bindings.is_empty() {
+            if resolved_relations.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "broad public read logical plan must record at least one bound surface",
                 ));
@@ -483,7 +483,7 @@ fn verify_direct_public_read_plan(
     match plan {
         HistoryReadPlan::StateHistory(plan) => verify_state_history_read_plan(plan),
         HistoryReadPlan::EntityHistory(plan) => {
-            if plan.surface_binding.descriptor.public_name.is_empty() {
+            if plan.resolved_relation.descriptor.public_name.is_empty() {
                 Err(LogicalPlanVerificationError::new(
                     "entity history direct read must target a named surface",
                 ))

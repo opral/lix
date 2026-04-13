@@ -10,8 +10,7 @@ use crate::live_state::tracked::{
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 use crate::live_state::{
-    LiveReadContext as ReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
-    WriterKeyReadView,
+    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
 };
 use crate::{LixError, Value};
 use async_trait::async_trait;
@@ -242,7 +241,7 @@ async fn effective_state_exact_prefers_local_untracked_first() {
             include_global: true,
             include_untracked: true,
         },
-        &ReadContext::new(&tracked, &untracked, &writer_keys),
+        &LiveReadContext::new(&tracked, &untracked, &writer_keys),
     )
     .await
     .expect("effective exact lookup should succeed")
@@ -277,7 +276,8 @@ async fn effective_state_exact_tombstone_hides_global_fallback() {
             include_global: true,
             include_untracked: true,
         },
-        &ReadContext::new(&tracked, &untracked, &writer_keys).with_tracked_tombstones(&tombstones),
+        &LiveReadContext::new(&tracked, &untracked, &writer_keys)
+            .with_tracked_tombstones(&tombstones),
     )
     .await
     .expect("effective exact lookup should succeed");
@@ -323,7 +323,7 @@ async fn effective_state_scan_merges_lanes_and_projects_global_versions() {
             include_untracked: true,
             include_tombstones: false,
         },
-        &ReadContext::new(&tracked, &untracked, &writer_keys),
+        &LiveReadContext::new(&tracked, &untracked, &writer_keys),
     )
     .await
     .expect("effective scan should succeed");
@@ -363,7 +363,8 @@ async fn effective_state_scan_can_return_tombstones_when_requested() {
             include_untracked: true,
             include_tombstones: true,
         },
-        &ReadContext::new(&tracked, &untracked, &writer_keys).with_tracked_tombstones(&tombstones),
+        &LiveReadContext::new(&tracked, &untracked, &writer_keys)
+            .with_tracked_tombstones(&tombstones),
     )
     .await
     .expect("effective scan with tombstones should succeed");
@@ -406,7 +407,7 @@ async fn effective_state_exact_overlays_writer_key_annotation() {
             include_global: false,
             include_untracked: false,
         },
-        &ReadContext::new(&tracked, &untracked, &writer_keys),
+        &LiveReadContext::new(&tracked, &untracked, &writer_keys),
     )
     .await
     .expect("effective exact lookup should succeed")

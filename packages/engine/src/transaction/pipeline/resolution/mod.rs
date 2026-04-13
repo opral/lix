@@ -277,7 +277,7 @@ async fn resolve_admin_write(
 }
 
 fn admin_write_behavior(
-    target: &crate::catalog::ResolvedSurface,
+    target: &crate::catalog::ResolvedRelation,
 ) -> Result<CatalogAdminWriteBehavior, WriteResolveError> {
     let Some(semantics) = builtin_catalog_compiler_facade()
         .write_surface_semantics(target)

@@ -5,7 +5,7 @@
 
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationKind,
-    RelationBindContext, RelationBinding, ResolvedSurface, SurfaceCapability, SurfaceFamily,
+    RelationBindContext, RelationBinding, ResolvedRelation, SurfaceCapability, SurfaceFamily,
     SurfaceReadFreshness, SurfaceReadSemantics, SurfaceVariant,
 };
 use crate::contracts::{
@@ -419,7 +419,7 @@ pub(crate) struct BoundPublicLeafSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ResolvedSurfaceSnapshot {
+pub(crate) struct ResolvedRelationSnapshot {
     pub(crate) public_name: String,
     pub(crate) surface_family: ExplainSurfaceFamily,
     pub(crate) surface_variant: ExplainSurfaceVariant,
@@ -590,7 +590,7 @@ pub(crate) struct SortKeySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalStateScanSnapshot {
-    pub(crate) binding: ResolvedSurfaceSnapshot,
+    pub(crate) binding: ResolvedRelationSnapshot,
     pub(crate) version_scope: ExplainVersionScope,
     pub(crate) expose_version_id: bool,
     pub(crate) include_tombstones: bool,
@@ -606,25 +606,25 @@ pub(crate) struct EntityProjectionSpecSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalFilesystemScanSnapshot {
-    pub(crate) binding: ResolvedSurfaceSnapshot,
+    pub(crate) binding: ResolvedRelationSnapshot,
     pub(crate) kind: ExplainFilesystemKind,
     pub(crate) version_scope: ExplainVersionScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalAdminScanSnapshot {
-    pub(crate) binding: ResolvedSurfaceSnapshot,
+    pub(crate) binding: ResolvedRelationSnapshot,
     pub(crate) kind: ExplainCanonicalAdminKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalChangeScanSnapshot {
-    pub(crate) binding: ResolvedSurfaceSnapshot,
+    pub(crate) binding: ResolvedRelationSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalWorkingChangesScanSnapshot {
-    pub(crate) binding: ResolvedSurfaceSnapshot,
+    pub(crate) binding: ResolvedRelationSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -677,7 +677,7 @@ pub(crate) struct NormalizedPublicReadQuerySnapshot {
 pub(crate) struct StructuredPublicReadSnapshot {
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) requested_version_id: Option<String>,
-    pub(crate) surface_binding: ResolvedSurfaceSnapshot,
+    pub(crate) resolved_relation: ResolvedRelationSnapshot,
     pub(crate) read_command: Box<ReadCommandSnapshot>,
     pub(crate) query: NormalizedPublicReadQuerySnapshot,
 }
@@ -706,7 +706,7 @@ pub(crate) struct InsertOnConflictSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct WriteCommandSnapshot {
     pub(crate) operation_kind: ExplainWriteOperationKind,
-    pub(crate) target: ResolvedSurfaceSnapshot,
+    pub(crate) target: ResolvedRelationSnapshot,
     pub(crate) selector: WriteSelectorSnapshot,
     pub(crate) payload: MutationPayloadSnapshot,
     pub(crate) on_conflict: Option<InsertOnConflictSnapshot>,
@@ -1154,7 +1154,7 @@ pub(crate) struct EntityHistoryReadPlanSnapshot {
     pub(crate) wildcard_projection: bool,
     pub(crate) wildcard_columns: Vec<String>,
     pub(crate) result_columns: LoweredResultColumnsSnapshot,
-    pub(crate) surface_binding: ResolvedSurfaceSnapshot,
+    pub(crate) resolved_relation: ResolvedRelationSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1705,8 +1705,8 @@ pub(crate) enum ExplainBroadSqlFunctionArgExprSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainBroadPublicReadRelationSnapshot {
-    Public(ResolvedSurfaceSnapshot),
-    LoweredPublic(ResolvedSurfaceSnapshot),
+    Public(ResolvedRelationSnapshot),
+    LoweredPublic(ResolvedRelationSnapshot),
     Internal { relation_name: String },
     External { relation_name: String },
     Cte { relation_name: String },
@@ -1732,7 +1732,7 @@ pub(crate) struct ExplainSurfaceReadPlanSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) strategy: ExplainPublicReadPlanKind,
-    pub(crate) surface_bindings: Vec<ResolvedSurfaceSnapshot>,
+    pub(crate) resolved_relations: Vec<ResolvedRelationSnapshot>,
     pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
@@ -1768,7 +1768,7 @@ pub(crate) enum ExplainSemanticStatement {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadSemantics {
-    pub(crate) surface_bindings: Vec<ResolvedSurfaceSnapshot>,
+    pub(crate) resolved_relations: Vec<ResolvedRelationSnapshot>,
     pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
@@ -1781,7 +1781,7 @@ pub(crate) struct ExplainPublicReadSemantics {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicWriteSemantics {
-    pub(crate) surface_binding: ResolvedSurfaceSnapshot,
+    pub(crate) resolved_relation: ResolvedRelationSnapshot,
     pub(crate) write_command: Box<WriteCommandSnapshot>,
 }
 
@@ -1995,7 +1995,7 @@ fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> Strin
     match statement {
         ExplainSemanticStatement::PublicRead(details) => format!(
             "kind: public_read\nsurfaces: {}\nbroad_statement: {}\nstructured_read: {}\neffective_state_request: {}\neffective_state_plan: {}",
-            join_public_names(&details.surface_bindings),
+            join_public_names(&details.resolved_relations),
             yes_no(details.broad_statement.is_some()),
             yes_no(details.structured_read.is_some()),
             yes_no(details.effective_state_request.is_some()),
@@ -2003,7 +2003,7 @@ fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> Strin
         ),
         ExplainSemanticStatement::PublicWrite(details) => format!(
             "kind: public_write\ntarget: {}\noperation: {}",
-            details.surface_binding.public_name,
+            details.resolved_relation.public_name,
             explain_write_operation_kind_label(details.write_command.operation_kind),
         ),
         ExplainSemanticStatement::Direct(statements) => format!(
@@ -2024,7 +2024,10 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
                     "strategy: {}",
                     explain_public_read_plan_kind_label(details.strategy)
                 ),
-                format!("surfaces: {}", join_public_names(&details.surface_bindings)),
+                format!(
+                    "surfaces: {}",
+                    join_public_names(&details.resolved_relations)
+                ),
                 format!(
                     "broad_statement: {}",
                     yes_no(details.broad_statement.is_some())
@@ -2650,9 +2653,9 @@ fn compiled_artifacts_for_public_read(
 ) -> CompiledExplainArtifacts {
     CompiledExplainArtifacts {
         bound_public_leaves: semantics
-            .surface_bindings
+            .resolved_relations
             .iter()
-            .map(BoundPublicLeaf::from_resolved_surface)
+            .map(BoundPublicLeaf::from_resolved_relation)
             .map(|leaf| bound_public_leaf_snapshot(&leaf))
             .collect(),
         dependency_spec: optimized_logical_plan
@@ -2695,7 +2698,7 @@ fn compiled_artifacts_for_public_write(
     let target = &planned_write.command.target;
 
     CompiledExplainArtifacts {
-        bound_public_leaves: vec![BoundPublicLeaf::from_resolved_surface(target)]
+        bound_public_leaves: vec![BoundPublicLeaf::from_resolved_relation(target)]
             .iter()
             .map(bound_public_leaf_snapshot)
             .collect(),
@@ -2828,12 +2831,12 @@ fn semantic_statement_snapshot(statement: &SemanticStatement) -> ExplainSemantic
 
 fn public_read_semantics_snapshot(semantics: &PublicReadSemantics) -> ExplainPublicReadSemantics {
     ExplainPublicReadSemantics {
-        surface_bindings: semantics
-            .surface_bindings
+        resolved_relations: semantics
+            .resolved_relations
             .iter()
-            .map(resolved_surface_snapshot)
+            .map(resolved_relation_snapshot)
             .collect(),
-        relation_bindings: surface_relation_binding_snapshots(&semantics.surface_bindings),
+        relation_bindings: surface_relation_binding_snapshots(&semantics.resolved_relations),
         broad_statement: semantics
             .broad_statement
             .as_deref()
@@ -2892,7 +2895,7 @@ fn public_write_semantics_snapshot(
     semantics: &PublicWriteSemantics,
 ) -> ExplainPublicWriteSemantics {
     ExplainPublicWriteSemantics {
-        surface_binding: resolved_surface_snapshot(&semantics.canonicalized.surface_binding),
+        resolved_relation: resolved_relation_snapshot(&semantics.canonicalized.resolved_relation),
         write_command: Box::new(write_command_snapshot(
             &semantics.canonicalized.write_command,
         )),
@@ -3694,10 +3697,10 @@ fn broad_public_read_relation_snapshot(
 ) -> ExplainBroadPublicReadRelationSnapshot {
     match relation {
         BroadPublicReadRelation::Public(binding) => {
-            ExplainBroadPublicReadRelationSnapshot::Public(resolved_surface_snapshot(binding))
+            ExplainBroadPublicReadRelationSnapshot::Public(resolved_relation_snapshot(binding))
         }
         BroadPublicReadRelation::LoweredPublic(binding) => {
-            ExplainBroadPublicReadRelationSnapshot::LoweredPublic(resolved_surface_snapshot(
+            ExplainBroadPublicReadRelationSnapshot::LoweredPublic(resolved_relation_snapshot(
                 binding,
             ))
         }
@@ -4645,9 +4648,11 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
             ExplainLogicalPlanSnapshot::PublicRead(Box::new(match plan {
                 PublicReadLogicalPlan::Structured { plan } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadPlanKind::Structured,
-                    surface_bindings: vec![resolved_surface_snapshot(&plan.read.surface_binding)],
+                    resolved_relations: vec![resolved_relation_snapshot(
+                        &plan.read.resolved_relation,
+                    )],
                     relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
-                        &plan.read.surface_binding,
+                        &plan.read.resolved_relation,
                     )),
                     broad_statement: None,
                     broad_relation_summary: None,
@@ -4672,9 +4677,11 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                     history_read_plan,
                 } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadPlanKind::HistoryRead,
-                    surface_bindings: vec![resolved_surface_snapshot(&plan.read.surface_binding)],
+                    resolved_relations: vec![resolved_relation_snapshot(
+                        &plan.read.resolved_relation,
+                    )],
                     relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
-                        &plan.read.surface_binding,
+                        &plan.read.resolved_relation,
                     )),
                     broad_statement: None,
                     broad_relation_summary: None,
@@ -4698,15 +4705,15 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 },
                 PublicReadLogicalPlan::Broad {
                     broad_statement,
-                    surface_bindings,
+                    resolved_relations,
                     dependency_spec,
                 } => ExplainPublicReadLogicalPlan {
                     strategy: ExplainPublicReadPlanKind::Broad,
-                    surface_bindings: surface_bindings
+                    resolved_relations: resolved_relations
                         .iter()
-                        .map(resolved_surface_snapshot)
+                        .map(resolved_relation_snapshot)
                         .collect(),
-                    relation_bindings: surface_relation_binding_snapshots(surface_bindings),
+                    relation_bindings: surface_relation_binding_snapshots(resolved_relations),
                     broad_statement: Some(Box::new(broad_public_read_statement_snapshot(
                         broad_statement,
                     ))),
@@ -4854,7 +4861,7 @@ fn structured_public_read_snapshot(read: &StructuredPublicRead) -> StructuredPub
     StructuredPublicReadSnapshot {
         bound_parameters: read.bound_parameters.clone(),
         requested_version_id: read.requested_version_id.clone(),
-        surface_binding: resolved_surface_snapshot(&read.surface_binding),
+        resolved_relation: resolved_relation_snapshot(&read.resolved_relation),
         read_command: Box::new(read_command_snapshot(&read.read_command)),
         query: normalized_public_read_query_snapshot(&read.query),
     }
@@ -4923,7 +4930,7 @@ fn read_plan_snapshot(plan: &ReadPlan) -> ExplainReadPlan {
 
 fn canonical_state_scan_snapshot(scan: &CanonicalStateScan) -> CanonicalStateScanSnapshot {
     CanonicalStateScanSnapshot {
-        binding: resolved_surface_snapshot(&scan.binding),
+        binding: resolved_relation_snapshot(&scan.binding),
         version_scope: version_scope_snapshot(scan.version_scope),
         expose_version_id: scan.expose_version_id,
         include_tombstones: scan.include_tombstones,
@@ -4941,7 +4948,7 @@ fn canonical_filesystem_scan_snapshot(
     scan: &CanonicalFilesystemScan,
 ) -> CanonicalFilesystemScanSnapshot {
     CanonicalFilesystemScanSnapshot {
-        binding: resolved_surface_snapshot(&scan.binding),
+        binding: resolved_relation_snapshot(&scan.binding),
         kind: filesystem_kind_snapshot(scan.kind),
         version_scope: version_scope_snapshot(scan.version_scope),
     }
@@ -4949,14 +4956,14 @@ fn canonical_filesystem_scan_snapshot(
 
 fn canonical_admin_scan_snapshot(scan: &CanonicalAdminScan) -> CanonicalAdminScanSnapshot {
     CanonicalAdminScanSnapshot {
-        binding: resolved_surface_snapshot(&scan.binding),
+        binding: resolved_relation_snapshot(&scan.binding),
         kind: canonical_admin_kind_snapshot(scan.kind),
     }
 }
 
 fn canonical_change_scan_snapshot(scan: &CanonicalChangeScan) -> CanonicalChangeScanSnapshot {
     CanonicalChangeScanSnapshot {
-        binding: resolved_surface_snapshot(&scan.binding),
+        binding: resolved_relation_snapshot(&scan.binding),
     }
 }
 
@@ -4964,7 +4971,7 @@ fn canonical_working_changes_scan_snapshot(
     scan: &CanonicalWorkingChangesScan,
 ) -> CanonicalWorkingChangesScanSnapshot {
     CanonicalWorkingChangesScanSnapshot {
-        binding: resolved_surface_snapshot(&scan.binding),
+        binding: resolved_relation_snapshot(&scan.binding),
     }
 }
 
@@ -5014,7 +5021,7 @@ fn planned_write_snapshot(plan: &PlannedWrite) -> PlannedWriteSnapshot {
 fn write_command_snapshot(command: &WriteCommand) -> WriteCommandSnapshot {
     WriteCommandSnapshot {
         operation_kind: write_operation_kind_snapshot(command.operation_kind),
-        target: resolved_surface_snapshot(&command.target),
+        target: resolved_relation_snapshot(&command.target),
         selector: write_selector_snapshot(&command.selector),
         payload: mutation_payload_snapshot(&command.payload),
         on_conflict: command
@@ -5471,7 +5478,7 @@ fn entity_history_read_plan_snapshot(
         wildcard_projection: plan.wildcard_projection,
         wildcard_columns: plan.wildcard_columns.clone(),
         result_columns: lowered_result_columns_snapshot(&plan.result_columns),
-        surface_binding: resolved_surface_snapshot(&plan.surface_binding),
+        resolved_relation: resolved_relation_snapshot(&plan.resolved_relation),
     }
 }
 
@@ -5582,8 +5589,8 @@ fn directory_history_request_snapshot(
     }
 }
 
-fn resolved_surface_snapshot(binding: &ResolvedSurface) -> ResolvedSurfaceSnapshot {
-    ResolvedSurfaceSnapshot {
+fn resolved_relation_snapshot(binding: &ResolvedRelation) -> ResolvedRelationSnapshot {
+    ResolvedRelationSnapshot {
         public_name: binding.descriptor.public_name.clone(),
         surface_family: surface_family_snapshot(binding.descriptor.surface_family),
         surface_variant: surface_variant_snapshot(binding.descriptor.surface_variant),
@@ -5600,7 +5607,7 @@ fn resolved_surface_snapshot(binding: &ResolvedSurface) -> ResolvedSurfaceSnapsh
 }
 
 fn surface_relation_binding_snapshots(
-    bindings: &[ResolvedSurface],
+    bindings: &[ResolvedRelation],
 ) -> Vec<ExplainRelationBindingSnapshot> {
     bindings
         .iter()
@@ -6659,7 +6666,7 @@ fn explain_history_read_plan_label(plan: &ExplainHistoryReadPlan) -> &'static st
     }
 }
 
-fn join_public_names(bindings: &[ResolvedSurfaceSnapshot]) -> String {
+fn join_public_names(bindings: &[ResolvedRelationSnapshot]) -> String {
     if bindings.is_empty() {
         return "(none)".to_string();
     }

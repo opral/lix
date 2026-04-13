@@ -1,3 +1,8 @@
+//! Plugin install write helpers.
+//!
+//! This module owns plugin archive parsing, registered-schema staging, and the
+//! prepared write construction needed to install a plugin into the engine.
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
@@ -6,7 +11,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 use zip::read::ZipArchive;
 
-use crate::catalog::{ResolvedSurface, SurfaceRegistry};
+use crate::catalog::{ResolvedRelation, SurfaceRegistry};
 use crate::common::stable_content_fingerprint_hex;
 use crate::common::{NormalizedDirectoryPath, ParsedFilePath};
 use crate::contracts::{
@@ -56,14 +61,14 @@ struct ParsedSchema {
 }
 
 #[derive(Clone)]
-pub(crate) struct SemanticWriteContext {
+pub(crate) struct PluginInstallWriteContext {
     function_bindings: PreparedWriteFunctionBindings,
     public_surface_registry: SurfaceRegistry,
     active_account_ids: Vec<String>,
     writer_key: Option<String>,
 }
 
-impl SemanticWriteContext {
+impl PluginInstallWriteContext {
     pub(crate) fn new(
         function_bindings: PreparedWriteFunctionBindings,
         public_surface_registry: SurfaceRegistry,
@@ -81,7 +86,7 @@ impl SemanticWriteContext {
 
 #[async_trait(?Send)]
 pub(crate) trait PluginInstallWriteExecutor {
-    fn semantic_write_context(&self) -> SemanticWriteContext;
+    fn plugin_install_write_context(&self) -> PluginInstallWriteContext;
 
     fn stage_prepared_write_statement(&mut self, statement: WriteCommand) -> Result<(), LixError>;
 
@@ -102,7 +107,7 @@ pub(crate) async fn install_plugin_archive_with_writer(
 
 pub(crate) fn prepare_registered_schema_write_statement(
     schema: &JsonValue,
-    context: &SemanticWriteContext,
+    context: &PluginInstallWriteContext,
 ) -> Result<WriteCommand, LixError> {
     let parsed_schema = parsed_schema_from_json(schema)?;
     prepare_registered_schema_write_statement_from_schemas(&[parsed_schema], context)
@@ -113,13 +118,13 @@ async fn install_plugin_with_writer(
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
 ) -> Result<(), LixError> {
-    let semantic_context = executor.semantic_write_context();
+    let plugin_install_context = executor.plugin_install_write_context();
 
     if !parsed.schemas.is_empty() {
         executor.stage_prepared_write_statement(
             prepare_registered_schema_write_statement_from_schemas(
                 &parsed.schemas,
-                &semantic_context,
+                &plugin_install_context,
             )?,
         )?;
     }
@@ -142,7 +147,7 @@ async fn install_plugin_with_writer(
         parsed,
         archive_bytes,
         &plugin_directory_id,
-        &semantic_context,
+        &plugin_install_context,
     )?)?;
 
     Ok(())
@@ -158,7 +163,7 @@ struct RegisteredSchemaRowSpec {
 
 fn prepare_registered_schema_write_statement_from_schemas(
     schemas: &[ParsedSchema],
-    context: &SemanticWriteContext,
+    context: &PluginInstallWriteContext,
 ) -> Result<WriteCommand, LixError> {
     let target = require_resolved_surface(
         &context.public_surface_registry,
@@ -220,7 +225,7 @@ fn prepare_plugin_archive_write_statement(
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
     plugin_directory_id: &str,
-    context: &SemanticWriteContext,
+    context: &PluginInstallWriteContext,
 ) -> Result<WriteCommand, LixError> {
     let target = require_resolved_surface(&context.public_surface_registry, "lix_file_by_version")?;
     let archive_id = plugin_storage_archive_file_id(parsed.manifest.key.as_str());
@@ -429,8 +434,8 @@ fn plugin_archive_binary_blob_ref_row(
 }
 
 fn prepare_public_tracked_write_statement(
-    context: &SemanticWriteContext,
-    target: ResolvedSurface,
+    context: &PluginInstallWriteContext,
+    target: ResolvedRelation,
     relation_name: &str,
     intended_post_state: Vec<PlannedStateRow>,
     filesystem_state: PlannedFilesystemState,
@@ -652,7 +657,7 @@ fn summarize_planned_row(row: &PlannedStateRow) -> JsonValue {
 fn require_resolved_surface(
     public_surface_registry: &SurfaceRegistry,
     relation_name: &str,
-) -> Result<ResolvedSurface, LixError> {
+) -> Result<ResolvedRelation, LixError> {
     public_surface_registry
         .bind_relation_name(relation_name)
         .ok_or_else(|| {

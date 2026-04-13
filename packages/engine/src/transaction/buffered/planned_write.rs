@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
-    FilesystemRelationKind, ResolvedSurface,
+    FilesystemRelationKind, ResolvedRelation,
 };
 use crate::contracts::{
     coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
@@ -1090,7 +1090,7 @@ fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
     is_catalog_filesystem_file_surface(&plan.public_write.contract.target)
 }
 
-fn is_catalog_filesystem_file_surface(target: &ResolvedSurface) -> bool {
+fn is_catalog_filesystem_file_surface(target: &ResolvedRelation) -> bool {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(target)
         .ok()

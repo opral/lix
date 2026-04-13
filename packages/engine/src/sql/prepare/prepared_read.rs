@@ -293,7 +293,7 @@ pub(crate) fn prepare_public_read_artifact(
     Ok(PreparedPublicRead {
         contract,
         freshness_contract: public_read.freshness_contract,
-        surface_bindings: public_read.surface_bindings.clone(),
+        resolved_relations: public_read.resolved_relations.clone(),
         public_output_columns: public_read.public_output_columns.clone(),
         execution,
     })
@@ -428,7 +428,7 @@ fn prepared_entity_history_read_plan(
     plan: &EntityHistoryReadPlan,
 ) -> PreparedEntityHistoryReadPlan {
     PreparedEntityHistoryReadPlan {
-        surface_binding: plan.surface_binding.clone(),
+        resolved_relation: plan.resolved_relation.clone(),
         request: plan.request.clone(),
         predicates: plan
             .predicates

@@ -5,7 +5,7 @@ use super::direct::NormalizedDirectStatements;
 use super::statement::BoundStatement;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
-    ResolvedSurface, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
+    ResolvedRelation, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::diagnostics::schema_not_registered_error;
 use crate::sql::logical_plan::public_ir::{
@@ -24,7 +24,7 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadSemantics {
-    pub(crate) surface_bindings: Vec<ResolvedSurface>,
+    pub(crate) resolved_relations: Vec<ResolvedRelation>,
     pub(crate) broad_statement: Option<Box<BroadPublicReadStatement>>,
     pub(crate) surface_read_plan: Option<SurfaceReadPlan>,
 }
@@ -78,7 +78,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
                 .statement_context
                 .requested_version_id
                 .clone(),
-            surface_binding: parts.surface_binding,
+            resolved_relation: parts.resolved_relation,
             read_command: parts.read_command,
             query: parts.query,
         },
@@ -103,7 +103,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
         &structured_read,
         derive_dependency_spec_from_structured_public_read(&structured_read),
     );
-    if structured_read.surface_binding.descriptor.surface_family == SurfaceFamily::State {
+    if structured_read.resolved_relation.descriptor.surface_family == SurfaceFamily::State {
         if let Some(error) = unknown_public_state_schema_error(registry, dependency_spec.as_ref()) {
             return Err(error);
         }
@@ -120,7 +120,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
         StructuredPublicReadAnalysis {
             bound_statement,
             semantics: PublicReadSemantics {
-                surface_bindings: vec![structured_read.surface_binding.clone()],
+                resolved_relations: vec![structured_read.resolved_relation.clone()],
                 broad_statement: None,
                 surface_read_plan: Some(surface_read_plan),
             },
@@ -134,7 +134,8 @@ fn bind_active_history_root_commit_id(
     active_history_root_commit_id: Option<&str>,
 ) -> Option<StructuredPublicRead> {
     let uses_active_history_root = matches!(
-        builtin_catalog_compiler_facade().history_read_semantics(&structured_read.surface_binding),
+        builtin_catalog_compiler_facade()
+            .history_read_semantics(&structured_read.resolved_relation),
         Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
             | Some(CatalogHistoryReadSemantics::EntityHistoryActiveVersion)
             | Some(CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion)
@@ -259,7 +260,7 @@ pub(crate) struct BoundPublicLeaf {
 }
 
 impl BoundPublicLeaf {
-    pub(crate) fn from_resolved_surface(binding: &ResolvedSurface) -> Self {
+    pub(crate) fn from_resolved_relation(binding: &ResolvedRelation) -> Self {
         Self {
             public_name: binding.descriptor.public_name.clone(),
             surface_family: binding.descriptor.surface_family,
@@ -334,18 +335,18 @@ fn try_build_direct_state_history_structured_read(
     let having = select.having.clone();
     let order_by = query.order_by.clone();
     let limit_clause = query.limit_clause.clone();
-    let Some(surface_binding) = registry.bind_object_name(name) else {
+    let Some(resolved_relation) = registry.bind_object_name(name) else {
         return Ok(None);
     };
     if !matches!(
-        builtin_catalog_compiler_facade().history_read_semantics(&surface_binding),
+        builtin_catalog_compiler_facade().history_read_semantics(&resolved_relation),
         Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
     ) {
         return Ok(None);
     }
 
     let scan =
-        CanonicalStateScan::from_resolved_surface(surface_binding.clone()).ok_or_else(|| {
+        CanonicalStateScan::from_resolved_relation(resolved_relation.clone()).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "state-history direct preparation could not derive a canonical state scan",
@@ -358,7 +359,7 @@ fn try_build_direct_state_history_structured_read(
             .statement_context
             .requested_version_id
             .clone(),
-        surface_binding,
+        resolved_relation,
         read_command: ReadCommand {
             root: ReadPlan::scan(scan),
             contract: ReadVisibility::CommittedAtStart,
@@ -445,7 +446,7 @@ pub(crate) fn augment_dependency_spec_for_public_read(
     augment_dependency_spec_for_broad_public_read(registry, Some(dependency_spec)).map(
         |mut dependency_spec| {
             let has_state_schema_keys = !dependency_spec.schema_keys.is_empty();
-            if structured_read.surface_binding.descriptor.surface_family == SurfaceFamily::State
+            if structured_read.resolved_relation.descriptor.surface_family == SurfaceFamily::State
                 && !has_state_schema_keys
             {
                 dependency_spec.schema_keys = registry

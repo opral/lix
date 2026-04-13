@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedRelation, SurfaceFamily, SurfaceVariant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CatalogTransactionInsertSemantics {
@@ -9,12 +9,12 @@ pub(crate) struct CatalogTransactionInsertSemantics {
 }
 
 pub(crate) fn transaction_insert_semantics(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Option<CatalogTransactionInsertSemantics> {
     match (
-        surface_binding.descriptor.surface_family,
-        surface_binding.descriptor.surface_variant,
-        surface_binding.descriptor.public_name.as_str(),
+        resolved_relation.descriptor.surface_family,
+        resolved_relation.descriptor.surface_variant,
+        resolved_relation.descriptor.public_name.as_str(),
     ) {
         (SurfaceFamily::State, SurfaceVariant::ByVersion, "lix_state_by_version") => {
             Some(CatalogTransactionInsertSemantics {

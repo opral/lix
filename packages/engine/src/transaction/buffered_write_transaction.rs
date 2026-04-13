@@ -1,3 +1,8 @@
+//! Buffered write transaction helpers.
+//!
+//! This module owns buffered write commit orchestration, rollback, and staged
+//! journal flushing over a single backend transaction.
+
 use crate::contracts::should_invalidate_deterministic_settings_cache;
 use crate::contracts::{CanonicalCommitReceipt, PendingCommitState, StateCommitStreamChange};
 use crate::execution::step::{BufferedWriteExecutionInput, WriteExecutionOutcome};
@@ -34,7 +39,7 @@ impl<'a> BufferedWriteTransaction<'a> {
         }
     }
 
-    pub(crate) async fn commit_buffered_write(
+    pub(crate) async fn commit(
         mut self,
         execution_context: &dyn WriteExecutionContext,
         mut execution_input: BufferedWriteExecutionInput,
@@ -57,7 +62,7 @@ impl<'a> BufferedWriteTransaction<'a> {
         Ok(outcome)
     }
 
-    pub(crate) async fn rollback_buffered_write(mut self) -> Result<(), LixError> {
+    pub(crate) async fn rollback(mut self) -> Result<(), LixError> {
         self.coordinator.rollback().await
     }
 
@@ -103,7 +108,7 @@ impl<'a> BufferedWriteTransaction<'a> {
         self.buffered_write_state.commit_outcome_mut()
     }
 
-    pub(crate) async fn flush_buffered_write_journal(
+    pub(crate) async fn flush_journal(
         &mut self,
         execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,
@@ -135,7 +140,7 @@ impl<'a> BufferedWriteTransaction<'a> {
         execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
-        self.flush_buffered_write_journal(execution_context, execution_input)
+        self.flush_journal(execution_context, execution_input)
             .await?;
         if !self.buffered_write_state.observe_tick_emitted()
             && !self
@@ -243,7 +248,7 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         &mut self.pending_commit_state
     }
 
-    pub(crate) async fn flush_buffered_write_journal(
+    pub(crate) async fn flush_journal(
         &mut self,
         execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,

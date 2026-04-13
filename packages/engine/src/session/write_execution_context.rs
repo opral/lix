@@ -123,7 +123,7 @@ impl WriteExecutionContext for SessionExecutionContext<'_> {
         prepare_function_bindings_with_host(self.session_host(), backend).await
     }
 
-    async fn execute_prepared_public_read_with_pending_overlay(
+    async fn execute_pending_overlay_public_read(
         &self,
         transaction: &mut dyn LixBackendTransaction,
         pending_overlay: Option<&dyn PendingOverlay>,
@@ -179,7 +179,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.source() {
         crate::contracts::PublicReadSource::PendingOverlay => {
-            crate::session::pending_reads::execute_prepared_public_read_with_pending_overlay_in_transaction(
+            crate::session::pending_overlay_public_reads::execute_pending_overlay_public_read_in_transaction(
                 transaction,
                 pending_overlay,
                 public_read,

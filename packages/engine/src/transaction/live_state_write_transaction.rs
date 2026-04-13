@@ -2,7 +2,7 @@ use crate::contracts::SchemaRegistration;
 use crate::transaction::buffered::{LiveStateWriteState, TransactionCoordinator};
 use crate::{LixBackendTransaction, LixError};
 
-use super::{CommitOutcome, ReadContext, TransactionDelta, TransactionJournal};
+use super::{CommitOutcome, OverlayReadContext, TransactionDelta, TransactionJournal};
 
 pub struct LiveStateWriteTransaction<'a> {
     coordinator: TransactionCoordinator<'a>,
@@ -12,7 +12,7 @@ pub struct LiveStateWriteTransaction<'a> {
 impl<'a> LiveStateWriteTransaction<'a> {
     pub fn new(
         backend_txn: Box<dyn LixBackendTransaction + 'a>,
-        read_context: ReadContext<'a>,
+        read_context: OverlayReadContext<'a>,
     ) -> Self {
         Self {
             coordinator: TransactionCoordinator::new(backend_txn),
@@ -193,7 +193,7 @@ mod tests {
         let untracked = CountingUntrackedView::default();
         let tombstones = EmptyTombstones;
         let writer_keys = EmptyWriterKeys;
-        let read_context = ReadContext::new(&tracked, &untracked, &writer_keys)
+        let read_context = OverlayReadContext::new(&tracked, &untracked, &writer_keys)
             .with_tracked_tombstones(&tombstones);
         let mut journal = TransactionJournal::default();
         journal

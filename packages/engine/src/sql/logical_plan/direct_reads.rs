@@ -1,4 +1,4 @@
-use crate::catalog::ResolvedSurface;
+use crate::catalog::ResolvedRelation;
 use crate::contracts::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
@@ -122,7 +122,7 @@ pub(crate) enum EntityHistoryPredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EntityHistoryReadPlan {
-    pub(crate) surface_binding: ResolvedSurface,
+    pub(crate) resolved_relation: ResolvedRelation,
     pub(crate) request: StateHistoryRequest,
     pub(crate) predicates: Vec<EntityHistoryPredicate>,
     pub(crate) projections: Vec<EntityHistoryProjection>,

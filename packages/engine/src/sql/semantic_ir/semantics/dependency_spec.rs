@@ -1,6 +1,6 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogSurfaceDependencyMetadata,
-    ResolvedSurface, SurfaceFamily,
+    ResolvedRelation, SurfaceFamily,
 };
 use crate::contracts::SessionDependency;
 use crate::sql::logical_plan::public_ir::{ReadPlan, StructuredPublicRead};
@@ -27,7 +27,7 @@ pub(crate) fn derive_dependency_spec_from_structured_public_read(
     }
     if canonical_filesystem_scan(&structured_read.read_command.root).is_some() {
         return Some(with_public_surface_registry_dependency(
-            dependency_spec_for_filesystem_scan(&structured_read.surface_binding),
+            dependency_spec_for_filesystem_scan(&structured_read.resolved_relation),
         ));
     }
     if let Some(scan) = canonical_admin_scan(&structured_read.read_command.root) {
@@ -42,7 +42,7 @@ pub(crate) fn derive_dependency_spec_from_structured_public_read(
         return None;
     }
 
-    let mut spec = dependency_spec_from_catalog_metadata(&structured_read.surface_binding);
+    let mut spec = dependency_spec_from_catalog_metadata(&structured_read.resolved_relation);
     let pinned_schema_keys = spec.schema_keys.clone();
     let mut placeholder_state = PlaceholderState::new();
     for predicate in &structured_read.query.selection_predicates {
@@ -132,7 +132,7 @@ fn expr_contains_expression_subquery(expr: &Expr) -> bool {
 }
 
 pub(crate) fn derive_dependency_spec_from_bound_public_surface_bindings(
-    bindings: &[ResolvedSurface],
+    bindings: &[ResolvedRelation],
 ) -> Option<DependencySpec> {
     let mut iter = bindings.iter();
     let first = iter.next()?;
@@ -153,7 +153,7 @@ fn with_public_surface_registry_dependency(mut spec: DependencySpec) -> Dependen
     spec
 }
 
-fn dependency_spec_for_bound_surface(binding: &ResolvedSurface) -> DependencySpec {
+fn dependency_spec_for_bound_surface(binding: &ResolvedRelation) -> DependencySpec {
     if matches!(
         binding.descriptor.surface_family,
         SurfaceFamily::State | SurfaceFamily::Entity
@@ -167,20 +167,20 @@ fn dependency_spec_for_bound_surface(binding: &ResolvedSurface) -> DependencySpe
 }
 
 fn dependency_spec_for_filesystem_scan(
-    binding: &crate::catalog::ResolvedSurface,
+    binding: &crate::catalog::ResolvedRelation,
 ) -> DependencySpec {
     let mut spec = dependency_spec_from_catalog_metadata(binding);
     spec.precision = DependencyPrecision::Conservative;
     spec
 }
 
-fn dependency_spec_for_state_like_surface(binding: &ResolvedSurface) -> DependencySpec {
+fn dependency_spec_for_state_like_surface(binding: &ResolvedRelation) -> DependencySpec {
     let mut spec = dependency_spec_from_catalog_metadata(binding);
     spec.precision = DependencyPrecision::Conservative;
     spec
 }
 
-fn dependency_spec_from_catalog_metadata(binding: &ResolvedSurface) -> DependencySpec {
+fn dependency_spec_from_catalog_metadata(binding: &ResolvedRelation) -> DependencySpec {
     match builtin_catalog_compiler_facade().dependency_metadata_for_binding(binding) {
         Ok(Some(metadata)) => dependency_spec_from_catalog_surface_metadata(metadata),
         Ok(None) | Err(_) => DependencySpec {

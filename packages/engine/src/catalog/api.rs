@@ -11,7 +11,7 @@ use crate::catalog::{
     CatalogProjectionDefinition, CatalogProjectionRegistry, CatalogReadPreparationSemantics,
     CatalogSurfaceDependencyMetadata, CatalogTransactionInsertSemantics,
     CatalogWriteSurfaceSemantics, FilesystemProjectionScope, FilesystemRelationKind,
-    RegisteredCatalogProjection, RelationBindContext, RelationBinding, ResolvedSurface,
+    RegisteredCatalogProjection, RelationBindContext, RelationBinding, ResolvedRelation,
     SurfaceDescriptor, SurfaceRegistry,
 };
 use crate::LixError;
@@ -23,11 +23,11 @@ use serde_json::Value as JsonValue;
 /// implementation files directly.
 #[allow(dead_code)]
 pub(crate) trait CatalogCompilerApi {
-    fn resolve_surface(&self, relation_name: &str) -> Option<ResolvedSurface>;
+    fn resolve_surface(&self, relation_name: &str) -> Option<ResolvedRelation>;
 
     fn resolve_surface_descriptor(&self, relation_name: &str) -> Option<SurfaceDescriptor>;
 
-    fn resolve_object_name(&self, name: &ObjectName) -> Option<ResolvedSurface>;
+    fn resolve_object_name(&self, name: &ObjectName) -> Option<ResolvedRelation>;
 
     fn visible_columns(&self, relation_name: &str) -> Option<Vec<String>>;
 
@@ -41,7 +41,7 @@ pub(crate) trait CatalogCompilerApi {
 
     fn bind_surface_runtime_relation(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
         context: RelationBindContext<'_>,
     ) -> Result<Option<RelationBinding>, LixError>;
 
@@ -64,23 +64,23 @@ pub(crate) trait CatalogCompilerApi {
 
     fn dependency_metadata_for_binding(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError>;
 
     fn history_read_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Option<CatalogHistoryReadSemantics>;
 
     fn explicit_version_counterpart_surface_name(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
         missing_columns: &[String],
     ) -> Option<String>;
 
     fn read_preparation_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> CatalogReadPreparationSemantics;
 
     fn validation_schema(&self, schema_key: &str) -> Option<JsonValue>;
@@ -96,21 +96,22 @@ pub(crate) trait CatalogCompilerApi {
 
     fn filesystem_scan_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Result<Option<CatalogFilesystemScanSemantics>, LixError>;
 
-    fn is_working_changes_surface(&self, surface_binding: &ResolvedSurface) -> bool;
+    fn is_working_changes_surface(&self, resolved_relation: &ResolvedRelation) -> bool;
 
-    fn admin_scan_kind(&self, surface_binding: &ResolvedSurface) -> Option<CatalogAdminScanKind>;
+    fn admin_scan_kind(&self, resolved_relation: &ResolvedRelation)
+        -> Option<CatalogAdminScanKind>;
 
     fn transaction_insert_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Option<CatalogTransactionInsertSemantics>;
 
     fn write_surface_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError>;
 
     fn transaction_insert_semantics_for_object_name(
@@ -160,7 +161,7 @@ impl<'a> CatalogCompilerFacade<'a> {
 }
 
 impl CatalogCompilerApi for CatalogCompilerFacade<'_> {
-    fn resolve_surface(&self, relation_name: &str) -> Option<ResolvedSurface> {
+    fn resolve_surface(&self, relation_name: &str) -> Option<ResolvedRelation> {
         self.surfaces.bind_relation_name(relation_name)
     }
 
@@ -169,7 +170,7 @@ impl CatalogCompilerApi for CatalogCompilerFacade<'_> {
             .map(|binding| binding.descriptor)
     }
 
-    fn resolve_object_name(&self, name: &ObjectName) -> Option<ResolvedSurface> {
+    fn resolve_object_name(&self, name: &ObjectName) -> Option<ResolvedRelation> {
         self.surfaces.bind_object_name(name)
     }
 
@@ -191,10 +192,10 @@ impl CatalogCompilerApi for CatalogCompilerFacade<'_> {
 
     fn bind_surface_runtime_relation(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
         context: RelationBindContext<'_>,
     ) -> Result<Option<RelationBinding>, LixError> {
-        bind_surface_relation(surface_binding, context)
+        bind_surface_relation(resolved_relation, context)
     }
 
     fn bind_filesystem_runtime_relation(
@@ -222,31 +223,31 @@ impl CatalogCompilerApi for CatalogCompilerFacade<'_> {
 
     fn dependency_metadata_for_binding(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError> {
-        dependency_metadata_for_surface_binding(self.declarations, surface_binding)
+        dependency_metadata_for_surface_binding(self.declarations, resolved_relation)
     }
 
     fn history_read_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Option<CatalogHistoryReadSemantics> {
-        history_read_semantics(surface_binding)
+        history_read_semantics(resolved_relation)
     }
 
     fn explicit_version_counterpart_surface_name(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
         missing_columns: &[String],
     ) -> Option<String> {
-        explicit_version_counterpart_surface_name(surface_binding, missing_columns)
+        explicit_version_counterpart_surface_name(resolved_relation, missing_columns)
     }
 
     fn read_preparation_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> CatalogReadPreparationSemantics {
-        read_preparation_semantics(surface_binding)
+        read_preparation_semantics(resolved_relation)
     }
 
     fn validation_schema(&self, schema_key: &str) -> Option<JsonValue> {
@@ -272,31 +273,34 @@ impl CatalogCompilerApi for CatalogCompilerFacade<'_> {
 
     fn filesystem_scan_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Result<Option<CatalogFilesystemScanSemantics>, LixError> {
-        filesystem_scan_semantics(surface_binding)
+        filesystem_scan_semantics(resolved_relation)
     }
 
-    fn is_working_changes_surface(&self, surface_binding: &ResolvedSurface) -> bool {
-        is_working_changes_surface(surface_binding)
+    fn is_working_changes_surface(&self, resolved_relation: &ResolvedRelation) -> bool {
+        is_working_changes_surface(resolved_relation)
     }
 
-    fn admin_scan_kind(&self, surface_binding: &ResolvedSurface) -> Option<CatalogAdminScanKind> {
-        admin_scan_kind(surface_binding)
+    fn admin_scan_kind(
+        &self,
+        resolved_relation: &ResolvedRelation,
+    ) -> Option<CatalogAdminScanKind> {
+        admin_scan_kind(resolved_relation)
     }
 
     fn transaction_insert_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Option<CatalogTransactionInsertSemantics> {
-        transaction_insert_semantics(surface_binding)
+        transaction_insert_semantics(resolved_relation)
     }
 
     fn write_surface_semantics(
         &self,
-        surface_binding: &ResolvedSurface,
+        resolved_relation: &ResolvedRelation,
     ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError> {
-        write_surface_semantics(surface_binding)
+        write_surface_semantics(resolved_relation)
     }
 }
 

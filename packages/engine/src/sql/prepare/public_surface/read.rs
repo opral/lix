@@ -1,7 +1,7 @@
 use super::*;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
-    ResolvedSurface, SurfaceFamily, SurfaceRegistry,
+    ResolvedRelation, SurfaceFamily, SurfaceRegistry,
 };
 use crate::contracts::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
@@ -81,13 +81,13 @@ fn pending_overlay_query_from_prepared_public_read(
     let surface_read_plan = public_read.logical_plan.surface_read_plan()?;
     let structured_read = surface_read_plan.structured_read();
     if !matches!(
-        structured_read.surface_binding.descriptor.surface_family,
+        structured_read.resolved_relation.descriptor.surface_family,
         SurfaceFamily::State | SurfaceFamily::Entity
     ) {
         return None;
     }
     if matches!(
-        structured_read.surface_binding.descriptor.surface_variant,
+        structured_read.resolved_relation.descriptor.surface_variant,
         SurfaceVariant::History | SurfaceVariant::WorkingChanges
     ) {
         return None;
@@ -98,7 +98,7 @@ fn pending_overlay_query_from_prepared_public_read(
     Some(PendingOverlayQuery {
         lane: PendingOverlayLane::Tracked,
         schema_key: structured_read
-            .surface_binding
+            .resolved_relation
             .implicit_overrides
             .fixed_schema_key
             .clone()
@@ -246,7 +246,7 @@ fn build_state_history_read_plan(
         &structured_read.bound_parameters,
     )?;
     let result_columns = state_history_result_columns(
-        &structured_read.surface_binding,
+        &structured_read.resolved_relation,
         &projections,
         wildcard_projection,
     );
@@ -283,7 +283,7 @@ fn build_entity_history_read_plan(
     }
 
     let schema_key = structured_read
-        .surface_binding
+        .resolved_relation
         .implicit_overrides
         .fixed_schema_key
         .clone()
@@ -310,13 +310,13 @@ fn build_entity_history_read_plan(
         &structured_read.bound_parameters,
     )?;
     let result_columns = entity_history_result_columns(
-        &structured_read.surface_binding,
+        &structured_read.resolved_relation,
         &projections,
         wildcard_projection,
     );
 
     Ok(Some(EntityHistoryReadPlan {
-        surface_binding: structured_read.surface_binding.clone(),
+        resolved_relation: structured_read.resolved_relation.clone(),
         request,
         predicates,
         projections,
@@ -343,7 +343,7 @@ fn build_state_history_group_by_fields(
             expressions
                 .iter()
                 .map(|expr| {
-                    state_history_field_from_expr(&structured_read.surface_binding, expr)?
+                    state_history_field_from_expr(&structured_read.resolved_relation, expr)?
                         .ok_or_else(|| {
                             LixError::new(
                                 "LIX_ERROR_UNKNOWN",
@@ -389,7 +389,7 @@ fn required_requested_version_id(structured_read: &StructuredPublicRead) -> Resu
                 "LIX_ERROR_UNKNOWN",
                 format!(
                     "public read '{}' requires a session-requested active version id",
-                    structured_read.surface_binding.descriptor.public_name
+                    structured_read.resolved_relation.descriptor.public_name
                 ),
             )
         })
@@ -412,7 +412,7 @@ fn build_entity_history_predicates_and_request(
     for predicate_expr in &structured_read.query.selection_predicates {
         let predicate = parse_entity_history_predicate(
             predicate_expr,
-            &structured_read.surface_binding,
+            &structured_read.resolved_relation,
             &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
@@ -597,7 +597,7 @@ fn build_entity_history_projection_plan(
         return Ok((
             Vec::new(),
             true,
-            structured_read.surface_binding.exposed_columns.clone(),
+            structured_read.resolved_relation.exposed_columns.clone(),
             BTreeMap::new(),
         ));
     }
@@ -605,7 +605,8 @@ fn build_entity_history_projection_plan(
     let mut projections = Vec::new();
     let mut aliases = BTreeMap::new();
     for item in &structured_read.query.projection {
-        let field = entity_history_field_from_select_item(&structured_read.surface_binding, item)?;
+        let field =
+            entity_history_field_from_select_item(&structured_read.resolved_relation, item)?;
         let output_name = entity_history_output_name(item);
         aliases.insert(output_name.to_ascii_lowercase(), field.clone());
         projections.push(EntityHistoryProjection { output_name, field });
@@ -636,7 +637,7 @@ fn build_entity_history_sort_keys(
             ));
         }
         let output_name = direct_expr_output_name(&expr.expr);
-        let field = entity_history_field_from_expr(&structured_read.surface_binding, &expr.expr)?
+        let field = entity_history_field_from_expr(&structured_read.resolved_relation, &expr.expr)?
             .or_else(|| {
                 projection_aliases
                     .get(&output_name.to_ascii_lowercase())
@@ -658,13 +659,13 @@ fn build_entity_history_sort_keys(
 }
 
 fn entity_history_result_columns(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     projections: &[EntityHistoryProjection],
     wildcard_projection: bool,
 ) -> LoweredResultColumns {
     if wildcard_projection {
         return LoweredResultColumns::ByColumnName(
-            surface_binding
+            resolved_relation
                 .column_types
                 .iter()
                 .map(|(name, column_type)| {
@@ -682,7 +683,7 @@ fn entity_history_result_columns(
             .iter()
             .map(|projection| {
                 direct_surface_column_type(
-                    surface_binding,
+                    resolved_relation,
                     entity_history_field_name(&projection.field),
                 )
                 .map(direct_lowered_result_column_from_surface_type)
@@ -739,7 +740,7 @@ fn build_file_history_read_plan(
         &structured_read.bound_parameters,
     )?;
     let result_columns = file_history_result_columns(
-        &structured_read.surface_binding,
+        &structured_read.resolved_relation,
         &projections,
         wildcard_projection,
         aggregate.as_ref(),
@@ -798,7 +799,7 @@ fn build_directory_history_read_plan(
         &structured_read.bound_parameters,
     )?;
     let result_columns = directory_history_result_columns(
-        &structured_read.surface_binding,
+        &structured_read.resolved_relation,
         &projections,
         wildcard_projection,
         aggregate.as_ref(),
@@ -879,7 +880,7 @@ fn build_directory_history_predicates_and_request(
     for predicate_expr in &structured_read.query.selection_predicates {
         let predicate = parse_directory_history_predicate(
             predicate_expr,
-            &structured_read.surface_binding,
+            &structured_read.resolved_relation,
             &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
@@ -999,7 +1000,7 @@ fn build_directory_history_projection_plan(
         return Ok((
             Vec::new(),
             true,
-            structured_read.surface_binding.exposed_columns.clone(),
+            structured_read.resolved_relation.exposed_columns.clone(),
             BTreeMap::new(),
         ));
     }
@@ -1008,7 +1009,7 @@ fn build_directory_history_projection_plan(
     let mut aliases = BTreeMap::new();
     for item in &structured_read.query.projection {
         let field =
-            directory_history_field_from_select_item(&structured_read.surface_binding, item)?;
+            directory_history_field_from_select_item(&structured_read.resolved_relation, item)?;
         let output_name = directory_history_output_name(item);
         aliases.insert(output_name.to_ascii_lowercase(), field.clone());
         projections.push(DirectoryHistoryProjection { output_name, field });
@@ -1041,7 +1042,7 @@ fn build_directory_history_sort_keys(
 
         let output_name = direct_expr_output_name(&expr.expr);
         let field =
-            directory_history_field_from_expr(&structured_read.surface_binding, &expr.expr)?
+            directory_history_field_from_expr(&structured_read.resolved_relation, &expr.expr)?
                 .or_else(|| {
                     projection_aliases
                         .get(&output_name.to_ascii_lowercase())
@@ -1063,7 +1064,7 @@ fn build_directory_history_sort_keys(
 }
 
 fn directory_history_result_columns(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     projections: &[DirectoryHistoryProjection],
     wildcard_projection: bool,
     aggregate: Option<&DirectoryHistoryAggregate>,
@@ -1073,7 +1074,7 @@ fn directory_history_result_columns(
     }
     if wildcard_projection {
         return LoweredResultColumns::ByColumnName(
-            surface_binding
+            resolved_relation
                 .column_types
                 .iter()
                 .map(|(name, column_type)| {
@@ -1091,7 +1092,7 @@ fn directory_history_result_columns(
             .iter()
             .map(|projection| {
                 direct_surface_column_type(
-                    surface_binding,
+                    resolved_relation,
                     directory_history_field_name(&projection.field),
                 )
                 .map(direct_lowered_result_column_from_surface_type)
@@ -1102,7 +1103,7 @@ fn directory_history_result_columns(
 }
 
 fn directory_history_field_from_select_item(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     item: &SelectItem,
 ) -> Result<DirectDirectoryHistoryField, LixError> {
     let expr = match item {
@@ -1114,7 +1115,7 @@ fn directory_history_field_from_select_item(
             ));
         }
     };
-    directory_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
+    directory_history_field_from_expr(resolved_relation, expr)?.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "directory-history read execution does not support this projection expression",
@@ -1131,26 +1132,26 @@ fn directory_history_output_name(item: &SelectItem) -> String {
 }
 
 fn directory_history_field_from_expr(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     expr: &Expr,
 ) -> Result<Option<DirectDirectoryHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
-            directory_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            directory_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
         Expr::CompoundIdentifier(parts) => {
             let Some(ident) = parts.last() else {
                 return Ok(None);
             };
-            directory_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            directory_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
-        Expr::Nested(inner) => directory_history_field_from_expr(surface_binding, inner),
+        Expr::Nested(inner) => directory_history_field_from_expr(resolved_relation, inner),
         _ => Ok(None),
     }
 }
 
 fn directory_history_field_from_column_name(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Result<DirectDirectoryHistoryField, LixError> {
     match column.to_ascii_lowercase().as_str() {
@@ -1177,8 +1178,8 @@ fn directory_history_field_from_column_name(
         "depth" | "lixcol_depth" => Ok(DirectDirectoryHistoryField::Depth),
         _ => Err(crate::diagnostics::sql_unknown_column_error(
             column,
-            Some(&surface_binding.descriptor.public_name),
-            &surface_binding
+            Some(&resolved_relation.descriptor.public_name),
+            &resolved_relation
                 .exposed_columns
                 .iter()
                 .map(String::as_str)
@@ -1190,21 +1191,21 @@ fn directory_history_field_from_column_name(
 
 fn parse_directory_history_predicate(
     expr: &Expr,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Option<DirectoryHistoryPredicate>, LixError> {
     match expr {
         Expr::Nested(inner) => {
-            parse_directory_history_predicate(inner, surface_binding, params, placeholder_state)
+            parse_directory_history_predicate(inner, resolved_relation, params, placeholder_state)
         }
         Expr::BinaryOp { left, op, right } => {
-            if let Some(field) = directory_history_field_from_expr(surface_binding, left)? {
+            if let Some(field) = directory_history_field_from_expr(resolved_relation, left)? {
                 if let Some(value) = direct_value_from_expr(right, params, placeholder_state)? {
                     return Ok(directory_history_predicate_from_operator(field, op, value));
                 }
             }
-            if let Some(field) = directory_history_field_from_expr(surface_binding, right)? {
+            if let Some(field) = directory_history_field_from_expr(resolved_relation, right)? {
                 if let Some(value) = direct_value_from_expr(left, params, placeholder_state)? {
                     return Ok(directory_history_predicate_from_reversed_operator(
                         field, op, value,
@@ -1221,7 +1222,7 @@ fn parse_directory_history_predicate(
             if *negated {
                 return Ok(None);
             }
-            let Some(field) = directory_history_field_from_expr(surface_binding, expr)? else {
+            let Some(field) = directory_history_field_from_expr(resolved_relation, expr)? else {
                 return Ok(None);
             };
             let mut values = Vec::new();
@@ -1233,7 +1234,7 @@ fn parse_directory_history_predicate(
             }
             Ok(Some(DirectoryHistoryPredicate::In(field, values)))
         }
-        Expr::IsNull(expr) => directory_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNull(expr) => directory_history_field_from_expr(resolved_relation, expr)?
             .map(DirectoryHistoryPredicate::IsNull)
             .map(Some)
             .ok_or_else(|| {
@@ -1242,7 +1243,7 @@ fn parse_directory_history_predicate(
                     "directory-history read execution does not support this predicate shape",
                 )
             }),
-        Expr::IsNotNull(expr) => directory_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNotNull(expr) => directory_history_field_from_expr(resolved_relation, expr)?
             .map(DirectoryHistoryPredicate::IsNotNull)
             .map(Some)
             .ok_or_else(|| {
@@ -1352,7 +1353,7 @@ fn build_file_history_predicates_and_request(
     for predicate_expr in &structured_read.query.selection_predicates {
         let predicate = parse_file_history_predicate(
             predicate_expr,
-            &structured_read.surface_binding,
+            &structured_read.resolved_relation,
             &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
@@ -1446,7 +1447,7 @@ fn file_history_query_needs_data(
 
     for projection in &structured_read.query.projection {
         if matches!(
-            file_history_field_from_select_item(&structured_read.surface_binding, projection)?,
+            file_history_field_from_select_item(&structured_read.resolved_relation, projection)?,
             DirectFileHistoryField::Data
         ) {
             return Ok(true);
@@ -1466,7 +1467,7 @@ fn file_history_query_needs_data(
                 return Ok(true);
             }
             let Some(field) =
-                file_history_field_from_expr(&structured_read.surface_binding, &sort.expr)?
+                file_history_field_from_expr(&structured_read.resolved_relation, &sort.expr)?
             else {
                 continue;
             };
@@ -1493,7 +1494,7 @@ fn build_file_history_projection_plan(
         return Ok((
             Vec::new(),
             true,
-            structured_read.surface_binding.exposed_columns.clone(),
+            structured_read.resolved_relation.exposed_columns.clone(),
             BTreeMap::new(),
         ));
     }
@@ -1501,7 +1502,7 @@ fn build_file_history_projection_plan(
     let mut projections = Vec::new();
     let mut aliases = BTreeMap::new();
     for item in &structured_read.query.projection {
-        let field = file_history_field_from_select_item(&structured_read.surface_binding, item)?;
+        let field = file_history_field_from_select_item(&structured_read.resolved_relation, item)?;
         let output_name = file_history_output_name(item);
         aliases.insert(output_name.to_ascii_lowercase(), field.clone());
         projections.push(FileHistoryProjection { output_name, field });
@@ -1533,7 +1534,7 @@ fn build_file_history_sort_keys(
         }
 
         let output_name = direct_expr_output_name(&expr.expr);
-        let field = file_history_field_from_expr(&structured_read.surface_binding, &expr.expr)?
+        let field = file_history_field_from_expr(&structured_read.resolved_relation, &expr.expr)?
             .or_else(|| {
                 projection_aliases
                     .get(&output_name.to_ascii_lowercase())
@@ -1555,7 +1556,7 @@ fn build_file_history_sort_keys(
 }
 
 fn file_history_result_columns(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     projections: &[FileHistoryProjection],
     wildcard_projection: bool,
     aggregate: Option<&FileHistoryAggregate>,
@@ -1565,7 +1566,7 @@ fn file_history_result_columns(
     }
     if wildcard_projection {
         return LoweredResultColumns::ByColumnName(
-            surface_binding
+            resolved_relation
                 .column_types
                 .iter()
                 .map(|(name, column_type)| {
@@ -1583,7 +1584,7 @@ fn file_history_result_columns(
             .iter()
             .map(|projection| {
                 direct_surface_column_type(
-                    surface_binding,
+                    resolved_relation,
                     file_history_field_name(&projection.field),
                 )
                 .map(direct_lowered_result_column_from_surface_type)
@@ -1594,7 +1595,7 @@ fn file_history_result_columns(
 }
 
 fn file_history_field_from_select_item(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     item: &SelectItem,
 ) -> Result<DirectFileHistoryField, LixError> {
     let expr = match item {
@@ -1606,7 +1607,7 @@ fn file_history_field_from_select_item(
             ));
         }
     };
-    file_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
+    file_history_field_from_expr(resolved_relation, expr)?.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "file-history read execution does not support this projection expression",
@@ -1623,26 +1624,26 @@ fn file_history_output_name(item: &SelectItem) -> String {
 }
 
 fn file_history_field_from_expr(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     expr: &Expr,
 ) -> Result<Option<DirectFileHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
-            file_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            file_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
         Expr::CompoundIdentifier(parts) => {
             let Some(ident) = parts.last() else {
                 return Ok(None);
             };
-            file_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            file_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
-        Expr::Nested(inner) => file_history_field_from_expr(surface_binding, inner),
+        Expr::Nested(inner) => file_history_field_from_expr(resolved_relation, inner),
         _ => Ok(None),
     }
 }
 
 fn file_history_field_from_column_name(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Result<DirectFileHistoryField, LixError> {
     match column.to_ascii_lowercase().as_str() {
@@ -1667,8 +1668,8 @@ fn file_history_field_from_column_name(
         "depth" | "lixcol_depth" => Ok(DirectFileHistoryField::Depth),
         _ => Err(crate::diagnostics::sql_unknown_column_error(
             column,
-            Some(&surface_binding.descriptor.public_name),
-            &surface_binding
+            Some(&resolved_relation.descriptor.public_name),
+            &resolved_relation
                 .exposed_columns
                 .iter()
                 .map(String::as_str)
@@ -1680,21 +1681,21 @@ fn file_history_field_from_column_name(
 
 fn parse_file_history_predicate(
     expr: &Expr,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Option<FileHistoryPredicate>, LixError> {
     match expr {
         Expr::Nested(inner) => {
-            parse_file_history_predicate(inner, surface_binding, params, placeholder_state)
+            parse_file_history_predicate(inner, resolved_relation, params, placeholder_state)
         }
         Expr::BinaryOp { left, op, right } => {
-            if let Some(field) = file_history_field_from_expr(surface_binding, left)? {
+            if let Some(field) = file_history_field_from_expr(resolved_relation, left)? {
                 if let Some(value) = direct_value_from_expr(right, params, placeholder_state)? {
                     return Ok(file_history_predicate_from_operator(field, op, value));
                 }
             }
-            if let Some(field) = file_history_field_from_expr(surface_binding, right)? {
+            if let Some(field) = file_history_field_from_expr(resolved_relation, right)? {
                 if let Some(value) = direct_value_from_expr(left, params, placeholder_state)? {
                     return Ok(file_history_predicate_from_reversed_operator(
                         field, op, value,
@@ -1711,7 +1712,7 @@ fn parse_file_history_predicate(
             if *negated {
                 return Ok(None);
             }
-            let Some(field) = file_history_field_from_expr(surface_binding, expr)? else {
+            let Some(field) = file_history_field_from_expr(resolved_relation, expr)? else {
                 return Ok(None);
             };
             let mut values = Vec::new();
@@ -1723,7 +1724,7 @@ fn parse_file_history_predicate(
             }
             Ok(Some(FileHistoryPredicate::In(field, values)))
         }
-        Expr::IsNull(expr) => file_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNull(expr) => file_history_field_from_expr(resolved_relation, expr)?
             .map(FileHistoryPredicate::IsNull)
             .map(Some)
             .ok_or_else(|| {
@@ -1732,7 +1733,7 @@ fn parse_file_history_predicate(
                     "file-history read execution does not support this predicate shape",
                 )
             }),
-        Expr::IsNotNull(expr) => file_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNotNull(expr) => file_history_field_from_expr(resolved_relation, expr)?
             .map(FileHistoryPredicate::IsNotNull)
             .map(Some)
             .ok_or_else(|| {
@@ -1795,7 +1796,7 @@ fn build_state_history_predicates_and_request(
     for predicate_expr in &structured_read.query.selection_predicates {
         let predicate = parse_state_history_predicate(
             predicate_expr,
-            &structured_read.surface_binding,
+            &structured_read.resolved_relation,
             &structured_read.bound_parameters,
             &mut placeholder_state,
         )?
@@ -1978,7 +1979,7 @@ fn state_history_query_needs_snapshot_content(
 
     for projection in &structured_read.query.projection {
         let value =
-            state_history_projection_value(&structured_read.surface_binding, projection, &[])?;
+            state_history_projection_value(&structured_read.resolved_relation, projection, &[])?;
         if let StateHistoryProjectionValue::Field(DirectStateHistoryField::SnapshotContent) = value
         {
             return Ok(true);
@@ -1998,7 +1999,7 @@ fn state_history_query_needs_snapshot_content(
                 return Ok(true);
             }
             let Some(field) =
-                state_history_field_from_expr(&structured_read.surface_binding, &sort.expr)?
+                state_history_field_from_expr(&structured_read.resolved_relation, &sort.expr)?
             else {
                 continue;
             };
@@ -2032,7 +2033,7 @@ fn build_state_history_projection_plan(
         return Ok((
             Vec::new(),
             true,
-            structured_read.surface_binding.exposed_columns.clone(),
+            structured_read.resolved_relation.exposed_columns.clone(),
             BTreeMap::new(),
         ));
     }
@@ -2041,7 +2042,7 @@ fn build_state_history_projection_plan(
     let mut aliases = BTreeMap::new();
     for item in &structured_read.query.projection {
         let value = state_history_projection_value(
-            &structured_read.surface_binding,
+            &structured_read.resolved_relation,
             item,
             group_by_fields,
         )?;
@@ -2077,7 +2078,7 @@ fn build_state_history_sort_keys(
 
         let output_name = direct_expr_output_name(&expr.expr);
         let value =
-            state_history_sort_value_from_expr(&structured_read.surface_binding, &expr.expr)?
+            state_history_sort_value_from_expr(&structured_read.resolved_relation, &expr.expr)?
                 .or_else(|| {
                     projection_aliases
                         .get(&output_name.to_ascii_lowercase())
@@ -2100,13 +2101,13 @@ fn build_state_history_sort_keys(
 }
 
 fn state_history_result_columns(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     projections: &[StateHistoryProjection],
     wildcard_projection: bool,
 ) -> LoweredResultColumns {
     if wildcard_projection {
         return LoweredResultColumns::ByColumnName(
-            surface_binding
+            resolved_relation
                 .column_types
                 .iter()
                 .map(
@@ -2126,7 +2127,7 @@ fn state_history_result_columns(
             .iter()
             .map(|projection| match &projection.value {
                 StateHistoryProjectionValue::Field(field) => {
-                    direct_surface_column_type(surface_binding, state_history_field_name(field))
+                    direct_surface_column_type(resolved_relation, state_history_field_name(field))
                         .map(direct_lowered_result_column_from_surface_type)
                         .unwrap_or(LoweredResultColumn::Untyped)
                 }
@@ -2151,10 +2152,10 @@ fn direct_lowered_result_column_from_surface_type(
 }
 
 fn direct_surface_column_type(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Option<crate::catalog::SurfaceColumnType> {
-    surface_binding.column_types.iter().find_map(
+    resolved_relation.column_types.iter().find_map(
         |(candidate, kind): (&String, &crate::catalog::SurfaceColumnType)| {
             candidate.eq_ignore_ascii_case(column).then_some(*kind)
         },
@@ -2162,7 +2163,7 @@ fn direct_surface_column_type(
 }
 
 fn entity_history_field_from_select_item(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     item: &SelectItem,
 ) -> Result<DirectEntityHistoryField, LixError> {
     let expr = match item {
@@ -2174,7 +2175,7 @@ fn entity_history_field_from_select_item(
             ));
         }
     };
-    entity_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
+    entity_history_field_from_expr(resolved_relation, expr)?.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "entity-history read execution does not support this projection expression",
@@ -2183,7 +2184,7 @@ fn entity_history_field_from_select_item(
 }
 
 fn state_history_projection_value(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     item: &SelectItem,
     group_by_fields: &[DirectStateHistoryField],
 ) -> Result<StateHistoryProjectionValue, LixError> {
@@ -2199,7 +2200,7 @@ fn state_history_projection_value(
     if let Some(aggregate) = state_history_aggregate_from_expr(expr)? {
         return Ok(StateHistoryProjectionValue::Aggregate(aggregate));
     }
-    let field = state_history_field_from_expr(surface_binding, expr)?.ok_or_else(|| {
+    let field = state_history_field_from_expr(resolved_relation, expr)?.ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             "state-history read execution does not support this projection expression",
@@ -2271,48 +2272,48 @@ fn direct_expr_output_name(expr: &Expr) -> String {
 }
 
 fn state_history_field_from_expr(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     expr: &Expr,
 ) -> Result<Option<DirectStateHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
-            state_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            state_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
         Expr::CompoundIdentifier(parts) => {
             let Some(ident) = parts.last() else {
                 return Ok(None);
             };
-            state_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            state_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
-        Expr::Nested(inner) => state_history_field_from_expr(surface_binding, inner),
+        Expr::Nested(inner) => state_history_field_from_expr(resolved_relation, inner),
         _ => Ok(None),
     }
 }
 
 fn entity_history_field_from_expr(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     expr: &Expr,
 ) -> Result<Option<DirectEntityHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
-            entity_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            entity_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
         Expr::CompoundIdentifier(parts) => {
             let Some(ident) = parts.last() else {
                 return Ok(None);
             };
-            entity_history_field_from_column_name(surface_binding, &ident.value).map(Some)
+            entity_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
         }
-        Expr::Nested(inner) => entity_history_field_from_expr(surface_binding, inner),
+        Expr::Nested(inner) => entity_history_field_from_expr(resolved_relation, inner),
         _ => Ok(None),
     }
 }
 
 fn state_history_sort_value_from_expr(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     expr: &Expr,
 ) -> Result<Option<StateHistorySortValue>, LixError> {
-    if let Some(field) = state_history_field_from_expr(surface_binding, expr)? {
+    if let Some(field) = state_history_field_from_expr(resolved_relation, expr)? {
         return Ok(Some(StateHistorySortValue::Field(field)));
     }
     Ok(state_history_aggregate_from_expr(expr)?.map(StateHistorySortValue::Aggregate))
@@ -2330,7 +2331,7 @@ fn state_history_sort_value_from_projection_value(
 }
 
 fn state_history_field_from_column_name(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Result<DirectStateHistoryField, LixError> {
     match column.to_ascii_lowercase().as_str() {
@@ -2349,8 +2350,8 @@ fn state_history_field_from_column_name(
         "version_id" | "lixcol_version_id" => Ok(DirectStateHistoryField::VersionId),
         _ => Err(crate::diagnostics::sql_unknown_column_error(
             column,
-            Some(&surface_binding.descriptor.public_name),
-            &surface_binding
+            Some(&resolved_relation.descriptor.public_name),
+            &resolved_relation
                 .exposed_columns
                 .iter()
                 .map(String::as_str)
@@ -2361,14 +2362,14 @@ fn state_history_field_from_column_name(
 }
 
 fn entity_history_field_from_column_name(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Result<DirectEntityHistoryField, LixError> {
     let lowercase = column.to_ascii_lowercase();
-    if let Ok(field) = state_history_field_from_column_name(surface_binding, column) {
+    if let Ok(field) = state_history_field_from_column_name(resolved_relation, column) {
         return Ok(DirectEntityHistoryField::State(field));
     }
-    if surface_binding
+    if resolved_relation
         .descriptor
         .visible_columns
         .iter()
@@ -2378,12 +2379,12 @@ fn entity_history_field_from_column_name(
     }
     Err(crate::diagnostics::sql_unknown_column_error(
         column,
-        Some(&surface_binding.descriptor.public_name),
-        &surface_binding
+        Some(&resolved_relation.descriptor.public_name),
+        &resolved_relation
             .descriptor
             .visible_columns
             .iter()
-            .chain(surface_binding.descriptor.hidden_columns.iter())
+            .chain(resolved_relation.descriptor.hidden_columns.iter())
             .map(String::as_str)
             .collect::<Vec<_>>(),
         None,
@@ -2392,16 +2393,16 @@ fn entity_history_field_from_column_name(
 
 fn parse_state_history_predicate(
     expr: &Expr,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Option<StateHistoryPredicate>, LixError> {
     match expr {
         Expr::Nested(inner) => {
-            parse_state_history_predicate(inner, surface_binding, params, placeholder_state)
+            parse_state_history_predicate(inner, resolved_relation, params, placeholder_state)
         }
         Expr::BinaryOp { left, op, right } => {
-            if let Some(field) = state_history_field_from_expr(surface_binding, left)? {
+            if let Some(field) = state_history_field_from_expr(resolved_relation, left)? {
                 if let Some(value) = direct_value_from_expr(right, params, placeholder_state)? {
                     return Ok(state_history_predicate_from_operator(field, op, value));
                 }
@@ -2409,7 +2410,7 @@ fn parse_state_history_predicate(
                     return Ok(None);
                 }
             }
-            if let Some(field) = state_history_field_from_expr(surface_binding, right)? {
+            if let Some(field) = state_history_field_from_expr(resolved_relation, right)? {
                 if let Some(value) = direct_value_from_expr(left, params, placeholder_state)? {
                     return Ok(state_history_predicate_from_reversed_operator(
                         field, op, value,
@@ -2426,7 +2427,7 @@ fn parse_state_history_predicate(
             if *negated {
                 return Ok(None);
             }
-            let Some(field) = state_history_field_from_expr(surface_binding, expr)? else {
+            let Some(field) = state_history_field_from_expr(resolved_relation, expr)? else {
                 return Ok(None);
             };
             let mut values = Vec::new();
@@ -2438,7 +2439,7 @@ fn parse_state_history_predicate(
             }
             Ok(Some(StateHistoryPredicate::In(field, values)))
         }
-        Expr::IsNull(expr) => state_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNull(expr) => state_history_field_from_expr(resolved_relation, expr)?
             .map(StateHistoryPredicate::IsNull)
             .map(Some)
             .ok_or_else(|| {
@@ -2447,7 +2448,7 @@ fn parse_state_history_predicate(
                     "state-history read execution does not support this predicate shape",
                 )
             }),
-        Expr::IsNotNull(expr) => state_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNotNull(expr) => state_history_field_from_expr(resolved_relation, expr)?
             .map(StateHistoryPredicate::IsNotNull)
             .map(Some)
             .ok_or_else(|| {
@@ -2462,21 +2463,21 @@ fn parse_state_history_predicate(
 
 fn parse_entity_history_predicate(
     expr: &Expr,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Option<EntityHistoryPredicate>, LixError> {
     match expr {
         Expr::Nested(inner) => {
-            parse_entity_history_predicate(inner, surface_binding, params, placeholder_state)
+            parse_entity_history_predicate(inner, resolved_relation, params, placeholder_state)
         }
         Expr::BinaryOp { left, op, right } => {
-            if let Some(field) = entity_history_field_from_expr(surface_binding, left)? {
+            if let Some(field) = entity_history_field_from_expr(resolved_relation, left)? {
                 if let Some(value) = direct_value_from_expr(right, params, placeholder_state)? {
                     return Ok(entity_history_predicate_from_operator(field, op, value));
                 }
             }
-            if let Some(field) = entity_history_field_from_expr(surface_binding, right)? {
+            if let Some(field) = entity_history_field_from_expr(resolved_relation, right)? {
                 if let Some(value) = direct_value_from_expr(left, params, placeholder_state)? {
                     return Ok(entity_history_predicate_from_reversed_operator(
                         field, op, value,
@@ -2493,7 +2494,7 @@ fn parse_entity_history_predicate(
             if *negated {
                 return Ok(None);
             }
-            let Some(field) = entity_history_field_from_expr(surface_binding, expr)? else {
+            let Some(field) = entity_history_field_from_expr(resolved_relation, expr)? else {
                 return Ok(None);
             };
             let mut values = Vec::with_capacity(list.len());
@@ -2505,7 +2506,7 @@ fn parse_entity_history_predicate(
             }
             Ok(Some(EntityHistoryPredicate::In(field, values)))
         }
-        Expr::IsNull(expr) => entity_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNull(expr) => entity_history_field_from_expr(resolved_relation, expr)?
             .map(EntityHistoryPredicate::IsNull)
             .map(Some)
             .ok_or_else(|| {
@@ -2514,7 +2515,7 @@ fn parse_entity_history_predicate(
                     "entity-history read execution does not support IS NULL on this expression",
                 )
             }),
-        Expr::IsNotNull(expr) => entity_history_field_from_expr(surface_binding, expr)?
+        Expr::IsNotNull(expr) => entity_history_field_from_expr(resolved_relation, expr)?
             .map(EntityHistoryPredicate::IsNotNull)
             .map(Some)
             .ok_or_else(|| {
@@ -3023,7 +3024,7 @@ fn parse_public_read_unknown_column_name(message: &str) -> Option<String> {
     (!column.is_empty()).then(|| column.to_string())
 }
 
-fn public_read_preparation_error(bindings: &[ResolvedSurface], message: &str) -> Option<LixError> {
+fn public_read_preparation_error(bindings: &[ResolvedRelation], message: &str) -> Option<LixError> {
     let missing_column = parse_public_read_unknown_column_name(message)?;
     let binding = if bindings.len() == 1 {
         bindings.first()
@@ -3092,8 +3093,8 @@ async fn try_prepare_public_read_via_specialized_optimization(
     stage_timings.record(ExplainStage::SemanticAnalysis, semantic_started.elapsed());
     let surface_read_plan = analysis.surface_read_plan().clone();
     let structured_read = surface_read_plan.structured_read().clone();
-    let surface_binding = structured_read.surface_binding.clone();
-    let freshness_contract = surface_binding.read_freshness;
+    let resolved_relation = structured_read.resolved_relation.clone();
+    let freshness_contract = resolved_relation.read_freshness;
     let logical_started = Instant::now();
     let logical_plan = analysis.logical_plan();
     stage_timings.record(ExplainStage::LogicalPlanning, logical_started.elapsed());
@@ -3103,7 +3104,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let routing_passes = plan_choice.pass_traces;
     let empty_current_version_heads = BTreeMap::new();
     let current_version_heads = if builtin_catalog_compiler_facade()
-        .read_preparation_semantics(&surface_binding)
+        .read_preparation_semantics(&resolved_relation)
         .requires_current_version_heads
     {
         compiler_metadata
@@ -3118,7 +3119,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     let (execution, pushdown_decision) = match plan_choice.kind {
         PublicReadPlanKind::HistoryRead => {
             match builtin_catalog_compiler_facade()
-                .history_read_semantics(&structured_read.surface_binding)
+                .history_read_semantics(&structured_read.resolved_relation)
             {
                 Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion) => {
                     match build_state_history_read_plan(
@@ -3138,7 +3139,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             return Ok(SpecializedPublicReadPreparation::Declined {
                                 reason: format!(
                                     "specialized read optimization declined '{}'",
-                                    structured_read.surface_binding.descriptor.public_name
+                                    structured_read.resolved_relation.descriptor.public_name
                                 ),
                                 bound_statement: analysis.bound_statement,
                             });
@@ -3172,7 +3173,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             return Ok(SpecializedPublicReadPreparation::Declined {
                                 reason: format!(
                                     "specialized read optimization declined '{}'",
-                                    structured_read.surface_binding.descriptor.public_name
+                                    structured_read.resolved_relation.descriptor.public_name
                                 ),
                                 bound_statement: analysis.bound_statement,
                             });
@@ -3203,7 +3204,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             return Ok(SpecializedPublicReadPreparation::Declined {
                                 reason: format!(
                                     "specialized read optimization declined '{}'",
-                                    structured_read.surface_binding.descriptor.public_name
+                                    structured_read.resolved_relation.descriptor.public_name
                                 ),
                                 bound_statement: analysis.bound_statement,
                             });
@@ -3234,7 +3235,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                             return Ok(SpecializedPublicReadPreparation::Declined {
                                 reason: format!(
                                     "specialized read optimization declined '{}'",
-                                    structured_read.surface_binding.descriptor.public_name
+                                    structured_read.resolved_relation.descriptor.public_name
                                 ),
                                 bound_statement: analysis.bound_statement,
                             });
@@ -3254,7 +3255,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: format!(
                             "specialized read optimization declined '{}'",
-                            structured_read.surface_binding.descriptor.public_name
+                            structured_read.resolved_relation.descriptor.public_name
                         ),
                         bound_statement: analysis.bound_statement,
                     });
@@ -3284,7 +3285,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
                     return Ok(SpecializedPublicReadPreparation::Declined {
                         reason: format!(
                             "specialized read optimization declined '{}'",
-                            structured_read.surface_binding.descriptor.public_name
+                            structured_read.resolved_relation.descriptor.public_name
                         ),
                         bound_statement: analysis.bound_statement,
                     });
@@ -3356,9 +3357,9 @@ async fn try_prepare_public_read_via_specialized_optimization(
 
     Ok(SpecializedPublicReadPreparation::Prepared(PublicReadPlan {
         freshness_contract,
-        surface_bindings: analysis
+        resolved_relations: analysis
             .semantics
-            .surface_bindings
+            .resolved_relations
             .iter()
             .map(|binding| binding.descriptor.public_name.clone())
             .collect(),
@@ -3810,7 +3811,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
 
     let logical_plan = PublicReadLogicalPlan::Broad {
         broad_statement: Box::new(broad_statement.clone()),
-        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        resolved_relations: read_summary.bound_surface_bindings.clone(),
         dependency_spec: dependency_spec.clone(),
     };
     verify_logical_plan(&LogicalPlan::PublicRead(logical_plan.clone())).map_err(|error| {
@@ -3855,7 +3856,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     };
     let optimized_logical_plan = PublicReadLogicalPlan::Broad {
         broad_statement: Box::new(routed_broad_read.broad_statement.clone()),
-        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        resolved_relations: read_summary.bound_surface_bindings.clone(),
         dependency_spec: dependency_spec.clone(),
     };
     verify_logical_plan(&LogicalPlan::PublicRead(optimized_logical_plan.clone())).map_err(
@@ -3889,7 +3890,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
             .expect("broad public read should bind at least one surface");
 
     let semantic_read = PublicReadSemantics {
-        surface_bindings: read_summary.bound_surface_bindings.clone(),
+        resolved_relations: read_summary.bound_surface_bindings.clone(),
         broad_statement: Some(Box::new(broad_statement)),
         surface_read_plan: None,
     };
@@ -3905,8 +3906,8 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         ExplainStage::ArtifactPreparation,
         artifact_started.elapsed(),
     );
-    let surface_bindings = semantic_read
-        .surface_bindings
+    let resolved_relations = semantic_read
+        .resolved_relations
         .iter()
         .map(|binding| binding.descriptor.public_name.clone())
         .collect();
@@ -3926,7 +3927,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
 
     Ok(Some(PublicReadPlan {
         freshness_contract,
-        surface_bindings,
+        resolved_relations,
         logical_plan,
         bound_parameters: bound_statement.bound_parameters.clone(),
         runtime_bindings: runtime_binding_values_from_statement_context(
@@ -3947,7 +3948,7 @@ fn bound_summary_contains_direct_only_history_surface(
         .any(is_direct_only_history_surface)
 }
 
-fn is_direct_only_history_surface(binding: &ResolvedSurface) -> bool {
+fn is_direct_only_history_surface(binding: &ResolvedRelation) -> bool {
     builtin_catalog_compiler_facade()
         .history_read_semantics(binding)
         .is_some()

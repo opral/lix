@@ -60,7 +60,7 @@ pub(crate) fn build_effective_state(
     };
     let all_predicates = structured_read.query.selection_predicates.clone();
     let pushdown_safe_predicates =
-        effective_state_pushdown_predicates(&structured_read.surface_binding, &all_predicates);
+        effective_state_pushdown_predicates(&structured_read.resolved_relation, &all_predicates);
     let plan = EffectiveStatePlan {
         state_source: StateSourceAuthority::AuthoritativeCommitted,
         overlay_lanes: overlay_lanes(
@@ -108,7 +108,7 @@ fn schema_set_for_read(
 ) -> BTreeSet<String> {
     let mut schema_set = BTreeSet::new();
     if let Some(schema_key) = structured_read
-        .surface_binding
+        .resolved_relation
         .implicit_overrides
         .fixed_schema_key
         .clone()

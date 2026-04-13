@@ -65,7 +65,7 @@ fn read_time_projection_pushdown_decision(
     structured_read: &StructuredPublicRead,
 ) -> PushdownDecision {
     let residual_predicates = structured_read.query.selection_predicates.clone();
-    let reason = match structured_read.surface_binding.descriptor.surface_family {
+    let reason = match structured_read.resolved_relation.descriptor.surface_family {
         SurfaceFamily::Filesystem => {
             "read-time filesystem execution keeps predicates above the derived source"
         }

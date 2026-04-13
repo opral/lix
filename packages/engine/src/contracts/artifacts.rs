@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::catalog::{ResolvedSurface, SurfaceReadFreshness};
+use crate::catalog::{ResolvedRelation, SurfaceReadFreshness};
 use crate::common::{LixError, Value};
 use crate::contracts::ReplayCursor;
 use crate::contracts::TransactionBeginMode;
@@ -467,7 +467,7 @@ pub enum PreparedEntityHistoryPredicate {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct PreparedEntityHistoryReadPlan {
-    pub surface_binding: ResolvedSurface,
+    pub resolved_relation: ResolvedRelation,
     pub request: StateHistoryRequest,
     pub predicates: Vec<PreparedEntityHistoryPredicate>,
     pub projections: Vec<PreparedEntityHistoryProjection>,
@@ -682,7 +682,7 @@ pub(crate) enum PreparedPublicReadPlanArtifact {
 pub struct PreparedPublicRead {
     pub contract: PreparedPublicReadContract,
     pub freshness_contract: SurfaceReadFreshness,
-    pub surface_bindings: Vec<String>,
+    pub resolved_relations: Vec<String>,
     pub public_output_columns: Option<Vec<String>>,
     pub execution: PreparedPublicReadPlanArtifact,
 }
@@ -905,7 +905,7 @@ impl PreparedResolvedWritePlan {
 #[allow(dead_code)]
 pub struct PreparedPublicWriteContract {
     pub operation_kind: PreparedWriteOperationKind,
-    pub target: ResolvedSurface,
+    pub target: ResolvedRelation,
     pub on_conflict_action: Option<PreparedInsertOnConflictAction>,
     pub requested_version_id: Option<String>,
     pub active_account_ids: Vec<String>,
@@ -2224,7 +2224,7 @@ mod tests {
                 result_columns: None,
             },
             freshness_contract: SurfaceReadFreshness::AllowsStaleProjection,
-            surface_bindings: vec!["lix_version".into()],
+            resolved_relations: vec!["lix_version".into()],
             public_output_columns: None,
             execution: PreparedPublicReadPlanArtifact::ReadTimeProjection(
                 PreparedReadTimeProjectionArtifact {
@@ -2312,7 +2312,7 @@ mod tests {
                     result_columns: None,
                 },
                 freshness_contract: SurfaceReadFreshness::RequiresFreshProjection,
-                surface_bindings: vec!["lix_file".into()],
+                resolved_relations: vec!["lix_file".into()],
                 public_output_columns: None,
                 execution: PreparedPublicReadPlanArtifact::HistoryRead(
                     PreparedHistoryReadArtifact {
@@ -2379,7 +2379,7 @@ mod tests {
                 PreparedPublicReadPlanArtifact::HistoryRead(PreparedHistoryReadArtifact {
                     plan: PreparedHistoryReadPlan::FileHistory(_),
                 }) => {
-                    assert_eq!(public.surface_bindings, vec!["lix_file".to_string()]);
+                    assert_eq!(public.resolved_relations, vec!["lix_file".to_string()]);
                 }
                 _ => panic!("expected history read artifact"),
             },

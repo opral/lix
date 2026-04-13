@@ -1,4 +1,4 @@
-use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedRelation, SurfaceFamily, SurfaceVariant};
 use crate::contracts::GLOBAL_VERSION_ID;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 
@@ -127,50 +127,53 @@ pub(crate) fn overlay_lanes_for_version(
 }
 
 pub(crate) fn effective_state_pushdown_predicates(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     predicates: &[Expr],
 ) -> Vec<Expr> {
-    if !surface_supports_effective_state_pushdown(surface_binding) {
+    if !surface_supports_effective_state_pushdown(resolved_relation) {
         return Vec::new();
     }
 
     predicates
         .iter()
-        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, surface_binding))
+        .filter(|predicate| state_predicate_is_pushdown_safe(predicate, resolved_relation))
         .cloned()
         .collect()
 }
 
-fn surface_supports_effective_state_pushdown(surface_binding: &ResolvedSurface) -> bool {
-    let family = surface_binding.descriptor.surface_family;
-    let variant = surface_binding.descriptor.surface_variant;
+fn surface_supports_effective_state_pushdown(resolved_relation: &ResolvedRelation) -> bool {
+    let family = resolved_relation.descriptor.surface_family;
+    let variant = resolved_relation.descriptor.surface_variant;
     family == SurfaceFamily::State
         || (family == SurfaceFamily::Entity && variant == SurfaceVariant::History)
 }
 
-fn state_predicate_is_pushdown_safe(expr: &Expr, surface_binding: &ResolvedSurface) -> bool {
+fn state_predicate_is_pushdown_safe(expr: &Expr, resolved_relation: &ResolvedRelation) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::Eq,
             right,
-        } => state_pushdown_column(left, surface_binding).is_some() && constant_like_expr(right),
+        } => state_pushdown_column(left, resolved_relation).is_some() && constant_like_expr(right),
         Expr::InList {
             expr,
             list,
             negated: false,
         } => {
-            state_pushdown_column(expr, surface_binding).is_some()
+            state_pushdown_column(expr, resolved_relation).is_some()
                 && list.iter().all(constant_like_expr)
         }
-        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner, surface_binding),
+        Expr::Nested(inner) => state_predicate_is_pushdown_safe(inner, resolved_relation),
         _ => false,
     }
 }
 
-fn state_pushdown_column<'a>(expr: &'a Expr, surface_binding: &ResolvedSurface) -> Option<&'a str> {
+fn state_pushdown_column<'a>(
+    expr: &'a Expr,
+    resolved_relation: &ResolvedRelation,
+) -> Option<&'a str> {
     let column = identifier_column_name(expr)?;
-    match surface_binding.descriptor.surface_variant {
+    match resolved_relation.descriptor.surface_variant {
         SurfaceVariant::Default => match column.to_ascii_lowercase().as_str() {
             "schema_key" | "entity_id" | "file_id" | "plugin_key" | "schema_version" => {
                 Some(column)

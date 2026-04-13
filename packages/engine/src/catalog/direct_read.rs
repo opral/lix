@@ -1,4 +1,4 @@
-use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedRelation, SurfaceFamily, SurfaceVariant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CatalogHistoryReadSemantics {
@@ -9,12 +9,12 @@ pub(crate) enum CatalogHistoryReadSemantics {
 }
 
 pub(crate) fn history_read_semantics(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Option<CatalogHistoryReadSemantics> {
     match (
-        surface_binding.descriptor.surface_family,
-        surface_binding.descriptor.surface_variant,
-        surface_binding.descriptor.public_name.as_str(),
+        resolved_relation.descriptor.surface_family,
+        resolved_relation.descriptor.surface_variant,
+        resolved_relation.descriptor.public_name.as_str(),
     ) {
         (SurfaceFamily::State, SurfaceVariant::History, "lix_state_history") => {
             Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
