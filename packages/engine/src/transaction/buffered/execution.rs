@@ -1,13 +1,14 @@
 use crate::contracts::{PendingCommitState, PlanEffects};
-use crate::execution::step::{
-    empty_public_write_execution_outcome, execute_direct_transaction_write_unit_with_transaction,
-    execute_public_tracked_transaction_write_unit_with_transaction,
-    execute_public_untracked_transaction_write_unit_with_transaction, WriteExecutionOutcome,
-};
 use crate::transaction::WriteExecutionContext;
 use crate::{LixBackendTransaction, LixError};
 
-use super::{TransactionWriteDelta, TransactionWriteUnit};
+use super::{
+    direct_apply::execute_direct_transaction_write_unit_with_transaction,
+    tracked_apply::execute_public_tracked_transaction_write_unit_with_transaction,
+    untracked_apply::execute_public_untracked_transaction_write_unit_with_transaction,
+    TransactionWriteDelta, TransactionWriteUnit,
+};
+use crate::transaction::pipeline::{empty_public_write_execution_outcome, WriteExecutionOutcome};
 
 impl TransactionWriteDelta {
     pub(crate) async fn execute(

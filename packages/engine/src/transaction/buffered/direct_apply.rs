@@ -1,4 +1,7 @@
 use crate::contracts::FilesystemPayloadChange;
+use crate::transaction::pipeline::{
+    execute_direct_execution_with_transaction, WriteExecutionOutcome,
+};
 use crate::transaction::{
     build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,
@@ -6,9 +9,9 @@ use crate::transaction::{
 };
 use crate::{LixBackendTransaction, LixError};
 
-use super::runtime::{execute_direct_execution_with_transaction, WriteExecutionOutcome};
+use super::registered_schema_mirror::mirror_registered_schema_mutations_in_transaction;
 
-pub(crate) async fn run_direct_write_txn_with_transaction(
+pub(crate) async fn execute_direct_transaction_write_unit_with_transaction(
     execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedDirectWriteUnit,
@@ -22,6 +25,8 @@ pub(crate) async fn run_direct_write_txn_with_transaction(
     )
     .await
     .map_err(LixError::from)?;
+    mirror_registered_schema_mutations_in_transaction(transaction, &plan.execution.mutations)
+        .await?;
 
     let filesystem_state =
         filesystem_transaction_state_from_planned(&plan.execution.filesystem_state);

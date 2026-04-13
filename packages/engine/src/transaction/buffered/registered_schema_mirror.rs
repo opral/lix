@@ -7,7 +7,7 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const GLOBAL_VERSION_ID: &str = "global";
 const PENDING_BOOTSTRAP_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
-pub(super) async fn mirror_registered_schema_planned_rows_in_transaction(
+pub(crate) async fn mirror_registered_schema_planned_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[PlannedStateRow],
     untracked: bool,
@@ -27,9 +27,9 @@ pub(super) async fn mirror_registered_schema_planned_rows_in_transaction(
             planned_row_optional_json_text_value(row, "snapshot_content")?
         };
 
-        upsert_registered_schema_bootstrap_row_in_transaction(
+        upsert_registered_schema_mirror_row_in_transaction(
             transaction,
-            RegisteredSchemaBootstrapRow {
+            RegisteredSchemaMirrorRow {
                 entity_id: row.entity_id.as_str(),
                 schema_version: schema_version.as_str(),
                 file_id: file_id.as_str(),
@@ -46,7 +46,7 @@ pub(super) async fn mirror_registered_schema_planned_rows_in_transaction(
     Ok(())
 }
 
-pub(super) async fn mirror_registered_schema_mutations_in_transaction(
+pub(crate) async fn mirror_registered_schema_mutations_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[MutationRow],
 ) -> Result<(), LixError> {
@@ -67,9 +67,9 @@ pub(super) async fn mirror_registered_schema_mutations_in_transaction(
                 )
             })?;
 
-        upsert_registered_schema_bootstrap_row_in_transaction(
+        upsert_registered_schema_mirror_row_in_transaction(
             transaction,
-            RegisteredSchemaBootstrapRow {
+            RegisteredSchemaMirrorRow {
                 entity_id: row.entity_id.as_str(),
                 schema_version: row.schema_version.as_str(),
                 file_id: row.file_id.as_str(),
@@ -86,7 +86,7 @@ pub(super) async fn mirror_registered_schema_mutations_in_transaction(
     Ok(())
 }
 
-struct RegisteredSchemaBootstrapRow<'a> {
+struct RegisteredSchemaMirrorRow<'a> {
     entity_id: &'a str,
     schema_version: &'a str,
     file_id: &'a str,
@@ -97,9 +97,9 @@ struct RegisteredSchemaBootstrapRow<'a> {
     untracked: bool,
 }
 
-async fn upsert_registered_schema_bootstrap_row_in_transaction(
+async fn upsert_registered_schema_mirror_row_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    row: RegisteredSchemaBootstrapRow<'_>,
+    row: RegisteredSchemaMirrorRow<'_>,
 ) -> Result<(), LixError> {
     let snapshot_sql = row
         .snapshot_content

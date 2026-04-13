@@ -1,7 +1,8 @@
 pub(crate) mod read;
 mod statement_batch;
 mod statement_batch_runner;
-pub(crate) mod step;
+#[cfg(test)]
+mod transaction_tests;
 mod write;
 
 pub(crate) use statement_batch::WriteBatch;

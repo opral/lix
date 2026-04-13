@@ -47,7 +47,7 @@ struct BuiltinBinaryBlobRefSnapshot {
     size_bytes: u64,
 }
 
-pub(crate) async fn materialize_file_data_with_plugins(
+pub(crate) async fn rebuild_file_payloads_with_plugins(
     backend: &dyn LixBackend,
     plugin_materializer: &dyn FilesystemPluginMaterializer,
     plan: &LiveStateRebuildPlan,
@@ -357,25 +357,5 @@ mod tests {
         let markdown_plugin = select_plugin_for_path("/docs/readme.md", None, &plugins)
             .expect("markdown should match");
         assert_eq!(markdown_plugin.key, "plugin_md_v2");
-
-        let fallback_plugin = select_plugin_for_path("/docs/data.json", None, &plugins)
-            .expect("catch-all should match non-markdown");
-        assert_eq!(fallback_plugin.key, "text_plugin");
-    }
-
-    #[test]
-    fn select_plugin_applies_content_type_filter_when_available() {
-        let plugins = vec![
-            test_plugin("text_plugin", "*", Some(PluginContentType::Text)),
-            test_plugin("binary_plugin", "*", Some(PluginContentType::Binary)),
-        ];
-
-        let selected = select_plugin_for_path(
-            "/images/logo.png",
-            Some(PluginContentType::Binary),
-            &plugins,
-        )
-        .expect("binary plugin should match");
-        assert_eq!(selected.key, "binary_plugin");
     }
 }

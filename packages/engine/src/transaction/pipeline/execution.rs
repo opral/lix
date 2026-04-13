@@ -6,10 +6,6 @@ use crate::contracts::{
     render_analyzed_explain_result, render_plain_explain_result, PendingCommitState,
     PreparedPublicWriteExecutionPartition, PreparedWriteStatement, SessionStateDelta,
 };
-use crate::execution::step::{
-    command_metadata, complete_sql_command_execution, empty_public_write_execution_outcome,
-    execute_direct_execution_with_transaction,
-};
 use crate::session::compiler_state::SessionCompilerState;
 #[cfg(test)]
 use crate::sql::parse_sql_with_timing;
@@ -20,8 +16,8 @@ use crate::sql::{BoundStatementInstance, StatementBatch};
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::{
-    build_write_preparation_context, ensure_function_bindings_for_write_scope,
-    prepare_buffered_write_execution_step,
+    command_metadata, complete_sql_command_execution, empty_public_write_execution_outcome,
+    execute_direct_execution_with_transaction,
 };
 use crate::transaction::{
     apply_schema_registrations_in_transaction,
@@ -31,6 +27,11 @@ use crate::transaction::{
     WriteCommand, WriteExecutionContext, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
+
+use super::{
+    build_write_preparation_context, ensure_function_bindings_for_write_scope,
+    prepare_buffered_write_execution_step,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedWriteContextInvalidation {

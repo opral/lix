@@ -3,10 +3,10 @@ use crate::contracts::{
     PreparedWriteFunctionBindings, PreparedWriteStatement, PreparedWriteStatementKind,
     SchemaRegistration, SchemaRegistrationSet, WriteDiagnosticContext,
 };
-use crate::execution::step::WriteExecutionOutcome;
 use crate::{LixError, QueryResult};
 
 use super::buffered::{build_transaction_write_delta, TransactionWriteDelta};
+use super::pipeline::WriteExecutionOutcome;
 
 pub(crate) struct WriteCommand {
     prepared: PreparedWriteStatement,

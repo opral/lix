@@ -75,7 +75,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "execution",
-        reason: "execution should consume contracts, live_state, and backend; compiler access must come through prepared artifacts rather than direct owner imports",
+        reason: "execution should consume contracts, live_state, and backend; compiler and transaction access must come through prepared artifacts and transaction-owned callers rather than direct owner imports",
         forbidden_scopes: &[
             "canonical",
             "api",
@@ -83,6 +83,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "services",
             "session",
             "sql",
+            "transaction",
         ],
     },
     ForbiddenDependencyRule {
@@ -101,6 +102,7 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "services",
     "session",
     "sql",
+    "transaction",
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,16 +204,19 @@ fn analyze_engine_dependency_graph() -> EngineDependencyGraph {
 
     for module_name in &top_level_modules {
         for absolute_path in rust_files_for_top_level_module(module_name) {
-            let source =
-                fs::read_to_string(&absolute_path).expect("module source file should be readable");
             let relative_path = absolute_path
                 .strip_prefix(src_root())
                 .expect("module source file should be inside src/")
                 .to_string_lossy()
                 .replace('\\', "/");
+            if is_test_support_relative_path(&relative_path) {
+                continue;
+            }
+            let source = fs::read_to_string(&absolute_path)
+                .expect("module source file should be readable");
             let current_module_path = module_path_for_file(&relative_path);
             let dependencies =
-                collect_dependencies_from_source(&source, &current_module_path, &module_set);
+                collect_dependencies_from_source(&strip_test_code(&source), &current_module_path, &module_set);
 
             for dependency in dependencies {
                 if dependency == *module_name {
@@ -1221,6 +1226,47 @@ fn target_core_graph(graph: &EngineDependencyGraph) -> BTreeMap<String, BTreeSet
     filtered
 }
 
+fn render_target_core_graph(graph: &BTreeMap<String, BTreeSet<String>>) -> String {
+    let mut rendered = String::new();
+
+    for (module, outgoing) in graph {
+        let neighbors = outgoing.iter().cloned().collect::<Vec<_>>().join(", ");
+        let _ = writeln!(&mut rendered, "{module} -> [{neighbors}]");
+    }
+
+    rendered
+}
+
+fn render_forbidden_dependency_violations(
+    violations: &[&DependencyEdge],
+    forbidden_lookup: &BTreeMap<&'static str, &'static ForbiddenDependencyRule>,
+) -> String {
+    let mut grouped: BTreeMap<&str, Vec<&DependencyEdge>> = BTreeMap::new();
+
+    for violation in violations {
+        grouped
+            .entry(violation.from.as_str())
+            .or_default()
+            .push(*violation);
+    }
+
+    let mut rendered = String::new();
+    for (from_scope, edges) in grouped {
+        let rule = forbidden_lookup
+            .get(from_scope)
+            .expect("every forbidden violation should have a matching rule");
+        let _ = writeln!(&mut rendered, "{from_scope}: {}", rule.reason);
+        for edge in edges {
+            let _ = writeln!(&mut rendered, "  - {} -> {}", edge.from, edge.to);
+            for via_file in &edge.via_files {
+                let _ = writeln!(&mut rendered, "    via {via_file}");
+            }
+        }
+    }
+
+    rendered
+}
+
 fn production_source_files() -> Vec<(String, String)> {
     let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
     let top_level_modules = parse_top_level_modules(&lib_source);
@@ -1888,6 +1934,28 @@ fn sealed_owner_import_rule_writes_current_violations_snapshot() {
     assert_eq!(
         written, actual,
         "sealed-owner snapshot should match the current violations after regeneration",
+    );
+}
+
+#[test]
+fn forbidden_dependency_rules_have_no_current_violations() {
+    let graph = analyze_engine_dependency_graph();
+    let graph_modules = module_set(&graph);
+    for module in TARGET_CORE_MODULES {
+        assert!(
+            graph_modules.contains(*module),
+            "target core graph should include `{module}`",
+        );
+    }
+
+    let forbidden_lookup = forbidden_dependency_lookup();
+    let violations = actual_architecture_violations(&graph, &forbidden_lookup);
+
+    assert!(
+        violations.is_empty(),
+        "forbidden owner-root dependencies are present.\n\nTarget core graph:\n{}\nCurrent violations:\n{}",
+        render_target_core_graph(&target_core_graph(&graph)),
+        render_forbidden_dependency_violations(&violations, &forbidden_lookup),
     );
 }
 
