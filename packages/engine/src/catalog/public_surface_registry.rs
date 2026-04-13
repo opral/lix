@@ -7,7 +7,9 @@ use crate::catalog::{
     register_dynamic_entity_surface_spec, SurfaceRegistry,
 };
 use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
-use crate::live_state::{decode_registered_schema_row, scan_live_rows, LiveRowQuery, RowReadMode};
+use crate::live_state::{
+    decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
+};
 use crate::schema::SchemaKey;
 use crate::{LixBackend, LixError};
 
@@ -32,7 +34,7 @@ async fn load_latest_registered_schemas(
         &LiveRowQuery {
             schema_key: "lix_registered_schema".to_string(),
             version_id: "global".to_string(),
-            mode: RowReadMode::Tracked,
+            source: LiveRowSource::Tracked,
             constraints: Vec::new(),
             include_tombstones: false,
         },

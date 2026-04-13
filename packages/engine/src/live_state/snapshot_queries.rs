@@ -5,20 +5,58 @@ use serde_json::Value as JsonValue;
 
 use crate::contracts::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
+    LiveStateProjectionStatus,
 };
-use crate::contracts::{LiveRowShapeContract, LiveStateQueryBackend};
 use crate::{LixBackend, LixError, Value};
 
 use super::schema_access::LiveRowShape;
 use super::visible_rows::{scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane};
 use super::{schema_access, ScanConstraint, ScanField, ScanOperator};
 
+pub(crate) trait LiveRowShapeContract {
+    fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String;
+
+    fn snapshot_from_projected_row(
+        &self,
+        schema_key: &str,
+        row: &[Value],
+        snapshot_index: usize,
+        normalized_start_index: usize,
+    ) -> Result<Option<JsonValue>, LixError>;
+}
+
+#[async_trait(?Send)]
+pub(crate) trait LiveStateQueryBackend {
+    async fn load_live_read_shape_for_table_name(
+        &self,
+        table_name: &str,
+    ) -> Result<Option<Box<dyn LiveRowShapeContract>>, LixError>;
+
+    async fn load_live_snapshot_rows(
+        &self,
+        storage: LiveSnapshotStorage,
+        schema_key: &str,
+        version_id: &str,
+        filters: &[LiveFilter],
+    ) -> Result<Vec<LiveSnapshotRow>, LixError>;
+
+    async fn normalize_live_snapshot_values(
+        &self,
+        schema_key: &str,
+        snapshot_content: Option<&str>,
+    ) -> Result<BTreeMap<String, Value>, LixError>;
+
+    async fn load_live_state_projection_status(
+        &self,
+    ) -> Result<LiveStateProjectionStatus, LixError>;
+}
+
 #[derive(Debug, Clone)]
-pub(crate) struct LiveRowShapeView {
+pub(crate) struct LiveRowShapeAdapter {
     contract: LiveRowShape,
 }
 
-impl LiveRowShapeView {
+impl LiveRowShapeAdapter {
     pub(crate) fn property_names(&self) -> Vec<String> {
         self.contract
             .columns()
@@ -55,9 +93,9 @@ impl LiveRowShapeView {
     }
 }
 
-impl LiveRowShapeContract for LiveRowShapeView {
+impl LiveRowShapeContract for LiveRowShapeAdapter {
     fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String {
-        LiveRowShapeView::normalized_projection_sql(self, table_alias)
+        LiveRowShapeAdapter::normalized_projection_sql(self, table_alias)
     }
 
     fn snapshot_from_projected_row(
@@ -67,7 +105,7 @@ impl LiveRowShapeContract for LiveRowShapeView {
         snapshot_index: usize,
         normalized_start_index: usize,
     ) -> Result<Option<JsonValue>, LixError> {
-        LiveRowShapeView::snapshot_from_projected_row(
+        LiveRowShapeAdapter::snapshot_from_projected_row(
             self,
             schema_key,
             row,
@@ -80,19 +118,19 @@ impl LiveRowShapeContract for LiveRowShapeView {
 pub(crate) async fn load_live_read_shape_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
-) -> Result<LiveRowShapeView, LixError> {
+) -> Result<LiveRowShapeAdapter, LixError> {
     schema_access::load_live_row_shape_with_backend(backend, schema_key)
         .await
-        .map(|shape| LiveRowShapeView { contract: shape })
+        .map(|shape| LiveRowShapeAdapter { contract: shape })
 }
 
 pub(crate) async fn load_live_read_shape_for_table_name(
     backend: &dyn LixBackend,
     table_name: &str,
-) -> Result<Option<LiveRowShapeView>, LixError> {
+) -> Result<Option<LiveRowShapeAdapter>, LixError> {
     schema_access::load_live_row_shape_for_table_name(backend, table_name)
         .await
-        .map(|shape| shape.map(|shape| LiveRowShapeView { contract: shape }))
+        .map(|shape| shape.map(|shape| LiveRowShapeAdapter { contract: shape }))
 }
 
 pub(crate) async fn normalize_live_snapshot_values_with_backend(
@@ -160,7 +198,7 @@ fn scan_constraint_from_filter(filter: &LiveFilter) -> ScanConstraint {
 }
 
 fn snapshot_row_from_live_row(
-    shape: &LiveRowShapeView,
+    shape: &LiveRowShapeAdapter,
     row: LiveReadRow,
 ) -> Result<LiveSnapshotRow, LixError> {
     Ok(LiveSnapshotRow {
@@ -207,7 +245,7 @@ impl LiveStateQueryBackend for dyn LixBackend + '_ {
 
     async fn load_live_state_projection_status(
         &self,
-    ) -> Result<crate::contracts::LiveStateProjectionStatus, LixError> {
+    ) -> Result<LiveStateProjectionStatus, LixError> {
         super::projection::status::load_live_state_projection_status_with_backend(self).await
     }
 }

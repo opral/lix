@@ -11,13 +11,13 @@ use crate::live_state::untracked::UntrackedRow;
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub(crate) enum RawRow {
+pub(crate) enum StoredRow {
     Tracked(TrackedRow),
     Untracked(UntrackedRow),
 }
 
 #[cfg(test)]
-impl RawRow {
+impl StoredRow {
     #[cfg(test)]
     pub(crate) fn schema_key(&self) -> &str {
         match self {
@@ -36,7 +36,10 @@ impl RawRow {
 }
 
 #[cfg(test)]
-pub(crate) fn snapshot_json(access: &LiveRowAccess, row: &RawRow) -> Result<JsonValue, LixError> {
+pub(crate) fn snapshot_json(
+    access: &LiveRowAccess,
+    row: &StoredRow,
+) -> Result<JsonValue, LixError> {
     snapshot_json_from_values(access, row.schema_key(), row.values())
 }
 
@@ -71,7 +74,7 @@ pub(crate) fn snapshot_json_from_values(
 
 #[cfg(test)]
 mod tests {
-    use super::{snapshot_json, RawRow};
+    use super::{snapshot_json, StoredRow};
     use crate::live_state::storage::{
         LiveColumnKind, LiveColumnSpec, LiveRowAccess, LiveTableLayout,
     };
@@ -94,8 +97,8 @@ mod tests {
     }
 
     #[test]
-    fn raw_row_preserves_lane_identity() {
-        let tracked = RawRow::Tracked(TrackedRow {
+    fn stored_row_preserves_lane_identity() {
+        let tracked = StoredRow::Tracked(TrackedRow {
             entity_id: "row-1".to_string(),
             schema_key: "profile".to_string(),
             schema_version: "1".to_string(),
@@ -110,7 +113,7 @@ mod tests {
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             values: BTreeMap::from([("name".to_string(), Value::Text("Ada".to_string()))]),
         });
-        let untracked = RawRow::Untracked(UntrackedRow {
+        let untracked = StoredRow::Untracked(UntrackedRow {
             entity_id: "row-2".to_string(),
             schema_key: "profile".to_string(),
             schema_version: "1".to_string(),
@@ -126,19 +129,19 @@ mod tests {
         });
 
         match tracked {
-            RawRow::Tracked(row) => {
+            StoredRow::Tracked(row) => {
                 assert_eq!(row.change_id.as_deref(), Some("chg-1"));
                 assert!(row.writer_key.is_none());
             }
-            RawRow::Untracked(_) => panic!("expected tracked row"),
+            StoredRow::Untracked(_) => panic!("expected tracked row"),
         }
-        assert!(matches!(untracked, RawRow::Untracked(_)));
+        assert!(matches!(untracked, StoredRow::Untracked(_)));
     }
 
     #[test]
     fn snapshot_json_uses_row_values_without_lane_specific_logic() {
         let access = test_access();
-        let row = RawRow::Tracked(TrackedRow {
+        let row = StoredRow::Tracked(TrackedRow {
             entity_id: "row-1".to_string(),
             schema_key: "profile".to_string(),
             schema_version: "1".to_string(),

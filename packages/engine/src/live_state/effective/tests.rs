@@ -1,9 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::contracts::WriterKeyReadView;
-use crate::contracts::{
-    LiveReadContext as ReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
-};
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::effective::{
     EffectiveRowRequest, EffectiveRowState, EffectiveRowsRequest, OverlayLane,
@@ -13,6 +9,10 @@ use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
+use crate::live_state::{
+    LiveReadContext as ReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
+    WriterKeyReadView,
+};
 use crate::{LixError, Value};
 use async_trait::async_trait;
 

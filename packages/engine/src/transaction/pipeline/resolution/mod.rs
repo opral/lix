@@ -14,7 +14,7 @@ use crate::contracts::{
     version_ref_snapshot_content,
 };
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::{PendingOverlayView, PendingStateOverlay, PendingStateOverlayRef};
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
     OverlayLane, PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
@@ -213,27 +213,20 @@ impl ResolvedWritePlanBuilder {
 pub(crate) async fn resolve_write_plan_with_functions<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let pending_state_overlay =
-        pending_write_overlay_view.map(|view| PendingStateOverlayRef::new(view));
-    let mut hydrator = PublicWriteHydrator::new(
-        backend,
-        pending_state_overlay
-            .as_ref()
-            .map(|overlay| overlay as &dyn PendingStateOverlay),
-    );
+    let mut hydrator = PublicWriteHydrator::new(backend, pending_write_overlay);
     let resolved = match planned_write.command.target.descriptor.surface_family {
         SurfaceFamily::State => {
             resolve_state_write(
                 &mut hydrator,
                 planned_write,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 functions.clone(),
                 selector_resolver,
             )
@@ -243,7 +236,7 @@ where
             resolve_entity_write(
                 &mut hydrator,
                 planned_write,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 functions.clone(),
                 selector_resolver,
             )

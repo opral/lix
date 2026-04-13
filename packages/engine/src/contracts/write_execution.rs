@@ -38,35 +38,32 @@ pub struct TrackedCommitExecutionOutcome {
 }
 
 #[derive(Clone)]
-pub struct PreparedWriteRuntimeState {
-    deterministic_mode_enabled: bool,
-    functions: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+pub struct PreparedWriteFunctionBindings {
+    deterministic_enabled: bool,
+    provider: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
 }
 
-impl std::fmt::Debug for PreparedWriteRuntimeState {
+impl std::fmt::Debug for PreparedWriteFunctionBindings {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PreparedWriteRuntimeState")
-            .field(
-                "deterministic_mode_enabled",
-                &self.deterministic_mode_enabled,
-            )
+        f.debug_struct("PreparedWriteFunctionBindings")
+            .field("deterministic_enabled", &self.deterministic_enabled)
             .finish_non_exhaustive()
     }
 }
 
-impl PreparedWriteRuntimeState {
+impl PreparedWriteFunctionBindings {
     pub fn new(
-        deterministic_mode_enabled: bool,
-        functions: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+        deterministic_enabled: bool,
+        provider: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
     ) -> Self {
         Self {
-            deterministic_mode_enabled,
-            functions,
+            deterministic_enabled,
+            provider,
         }
     }
 
-    pub fn functions(&self) -> &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>> {
-        &self.functions
+    pub fn provider(&self) -> &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>> {
+        &self.provider
     }
 }
 

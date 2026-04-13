@@ -4,7 +4,7 @@ use crate::execution::step::{
     execute_public_tracked_transaction_write_unit_with_transaction,
     execute_public_untracked_transaction_write_unit_with_transaction, WriteExecutionOutcome,
 };
-use crate::transaction::WriteExecutionHost;
+use crate::transaction::WriteExecutionContext;
 use crate::{LixBackendTransaction, LixError};
 
 use super::{TransactionWriteDelta, TransactionWriteUnit};
@@ -12,7 +12,7 @@ use super::{TransactionWriteDelta, TransactionWriteUnit};
 impl TransactionWriteDelta {
     pub(crate) async fn execute(
         &self,
-        host: &dyn WriteExecutionHost,
+        execution_context: &dyn WriteExecutionContext,
         transaction: &mut dyn LixBackendTransaction,
         mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
     ) -> Result<WriteExecutionOutcome, LixError> {
@@ -22,7 +22,7 @@ impl TransactionWriteDelta {
             let write_outcome = match unit {
                 TransactionWriteUnit::PublicTracked(tracked) => {
                     execute_public_tracked_transaction_write_unit_with_transaction(
-                        host,
+                        execution_context,
                         transaction,
                         tracked,
                         pending_commit_state.as_deref_mut(),
@@ -31,7 +31,7 @@ impl TransactionWriteDelta {
                 }
                 TransactionWriteUnit::PublicUntracked(untracked) => {
                     execute_public_untracked_transaction_write_unit_with_transaction(
-                        host,
+                        execution_context,
                         transaction,
                         untracked,
                     )
@@ -39,7 +39,7 @@ impl TransactionWriteDelta {
                 }
                 TransactionWriteUnit::Direct(direct) => {
                     execute_direct_transaction_write_unit_with_transaction(
-                        host,
+                        execution_context,
                         transaction,
                         direct,
                     )

@@ -30,7 +30,7 @@ use crate::contracts::{
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::{LixError, Value};
 
-use crate::contracts::PreparedWriteRuntimeState;
+use crate::contracts::PreparedWriteFunctionBindings;
 use crate::transaction::WriteCommand;
 
 const GLOBAL_VERSION_ID: &str = "global";
@@ -57,7 +57,7 @@ struct ParsedSchema {
 
 #[derive(Clone)]
 pub(crate) struct SemanticWriteContext {
-    runtime_state: PreparedWriteRuntimeState,
+    function_bindings: PreparedWriteFunctionBindings,
     public_surface_registry: SurfaceRegistry,
     active_account_ids: Vec<String>,
     writer_key: Option<String>,
@@ -65,13 +65,13 @@ pub(crate) struct SemanticWriteContext {
 
 impl SemanticWriteContext {
     pub(crate) fn new(
-        runtime_state: PreparedWriteRuntimeState,
+        function_bindings: PreparedWriteFunctionBindings,
         public_surface_registry: SurfaceRegistry,
         active_account_ids: Vec<String>,
         writer_key: Option<String>,
     ) -> Self {
         Self {
-            runtime_state,
+            function_bindings,
             public_surface_registry,
             active_account_ids,
             writer_key,
@@ -498,7 +498,7 @@ fn prepare_public_tracked_write_statement(
             diagnostic_context: WriteDiagnosticContext::new(vec![relation_name.to_string()]),
             public_surface_registry_effect,
         },
-        &context.runtime_state,
+        &context.function_bindings,
     )
 }
 

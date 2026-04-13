@@ -6,8 +6,8 @@ use crate::session::semantic_write::{
     install_plugin_archive_with_writer, PluginInstallWriteExecutor, SemanticWriteContext,
 };
 use crate::transaction::{
-    ensure_function_runtime_state_for_write_scope, lookup_directory_id_by_path_in_transaction,
-    prepared_write_runtime_state_for_execution, stage_prepared_write_statement,
+    ensure_function_bindings_for_write_scope, lookup_directory_id_by_path_in_transaction,
+    prepared_write_function_bindings_for_execution, stage_prepared_write_statement,
     BufferedWriteTransaction, WriteCommand,
 };
 use crate::{ExecuteOptions, LixError, Session};
@@ -47,20 +47,21 @@ pub(crate) async fn install_plugin_in_session(
     session: &Session,
     archive_bytes: &[u8],
 ) -> Result<(), LixError> {
-    let transaction = session.session_runtime().begin_write_unit().await?;
+    let transaction = session.session_host().begin_write_unit().await?;
     let mut write_transaction = BufferedWriteTransaction::new(transaction);
     let mut context = session.new_execution_state(ExecuteOptions::default());
-    ensure_function_runtime_state_for_write_scope(
-        session.session_runtime(),
+    let execution_context = session.execution_context();
+    ensure_function_bindings_for_write_scope(
+        &execution_context,
         write_transaction.backend_transaction_mut()?,
         &mut context,
     )
     .await?;
     let semantic_context = SemanticWriteContext::new(
-        prepared_write_runtime_state_for_execution(
+        prepared_write_function_bindings_for_execution(
             context
-                .function_runtime_state()
-                .expect("plugin install should prepare write runtime state"),
+                .function_bindings()
+                .expect("plugin install should prepare function bindings"),
         ),
         context.public_surface_registry.clone(),
         context.active_account_ids.clone(),
@@ -78,10 +79,7 @@ pub(crate) async fn install_plugin_in_session(
     match install_result {
         Ok(()) => {
             let outcome = write_transaction
-                .commit_buffered_write(
-                    session.session_runtime.as_ref(),
-                    context.buffered_write_execution_input(),
-                )
+                .commit_buffered_write(&execution_context, context.buffered_write_execution_input())
                 .await?;
             session.apply_transaction_commit_outcome(outcome).await?;
             Ok(())

@@ -4,15 +4,13 @@ use sqlparser::ast::Statement;
 
 use crate::contracts::{
     render_analyzed_explain_result, render_plain_explain_result, PendingCommitState,
-    PendingOverlayView, PreparedPublicWriteExecutionPartition, PreparedWriteStatement,
-    SessionStateDelta,
+    PreparedPublicWriteExecutionPartition, PreparedWriteStatement, SessionStateDelta,
 };
 use crate::execution::step::{
     command_metadata, complete_sql_command_execution, empty_public_write_execution_outcome,
     execute_direct_execution_with_transaction,
 };
 use crate::session::execution_state::SessionExecutionState;
-use crate::session::host::WriteExecutionServices;
 #[cfg(test)]
 use crate::sql::parse_sql_with_timing;
 #[cfg(test)]
@@ -20,16 +18,17 @@ use crate::sql::PlaceholderState;
 use crate::sql::{BoundStatementInstance, StatementBatch};
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::{
-    bootstrap_prepared_write_preparation_context, ensure_function_runtime_state_for_write_scope,
+    build_write_preparation_context, ensure_function_bindings_for_write_scope,
     prepare_buffered_write_execution_step,
 };
 use crate::transaction::{
     apply_schema_registrations_in_transaction,
     normalize_sql_error_with_transaction_and_relation_names, BorrowedBufferedWriteTransaction,
     BufferedWriteCommandMetadata, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    BufferedWriteTransaction, DeferredCommitEffects, PendingWriteOverlayView,
-    TransactionWriteDelta, WriteCommand, WriteExecutionHost, WritePath, WriteResult,
+    BufferedWriteTransaction, DeferredCommitEffects, PendingWriteOverlay, TransactionWriteDelta,
+    WriteCommand, WriteExecutionContext, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -47,7 +46,7 @@ impl PreparedWriteContextInvalidation {
 }
 
 pub(crate) async fn execute_parsed_statements_in_write_transaction(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut BufferedWriteTransaction<'_>,
     parsed_statements: Vec<Statement>,
     params: &[Value],
@@ -64,15 +63,15 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
         &runtime_bindings,
         parse_duration,
     )?;
-    ensure_function_runtime_state_for_write_scope(
-        services,
+    ensure_function_bindings_for_write_scope(
+        execution_context,
         write_transaction.backend_transaction_mut()?,
         context,
     )
     .await?;
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
     execute_statement_batch_with_buffered_write_scope(
-        services,
+        execution_context,
         &mut scope,
         &statement_batch,
         allow_internal_relations,
@@ -82,7 +81,7 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
 }
 
 pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut BorrowedBufferedWriteTransaction<'_>,
     parsed_statements: Vec<Statement>,
     params: &[Value],
@@ -99,15 +98,15 @@ pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
         &runtime_bindings,
         parse_duration,
     )?;
-    ensure_function_runtime_state_for_write_scope(
-        services,
+    ensure_function_bindings_for_write_scope(
+        execution_context,
         write_transaction.backend_transaction_mut(),
         context,
     )
     .await?;
     let mut scope = SqlBufferedWriteScope::Borrowed(write_transaction);
     execute_statement_batch_with_buffered_write_scope(
-        services,
+        execution_context,
         &mut scope,
         &statement_batch,
         allow_internal_relations,
@@ -117,7 +116,7 @@ pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
 }
 
 pub(crate) async fn execute_statement_batch_with_write_transaction(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut BufferedWriteTransaction<'_>,
     statement_batch: &StatementBatch,
     allow_internal_relations: bool,
@@ -125,7 +124,7 @@ pub(crate) async fn execute_statement_batch_with_write_transaction(
 ) -> Result<ExecuteResult, LixError> {
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
     execute_statement_batch_with_buffered_write_scope(
-        services,
+        execution_context,
         &mut scope,
         statement_batch,
         allow_internal_relations,
@@ -135,7 +134,7 @@ pub(crate) async fn execute_statement_batch_with_write_transaction(
 }
 
 async fn execute_statement_batch_with_buffered_write_scope(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut SqlBufferedWriteScope<'_, '_>,
     statement_batch: &StatementBatch,
     allow_internal_relations: bool,
@@ -145,7 +144,7 @@ async fn execute_statement_batch_with_buffered_write_scope(
 
     for step in statement_batch.steps() {
         let result = execute_bound_statement_in_buffered_write_scope(
-            services,
+            execution_context,
             write_transaction,
             step,
             allow_internal_relations,
@@ -169,7 +168,7 @@ async fn execute_statement_batch_with_buffered_write_scope(
 }
 
 async fn execute_bound_statement_in_buffered_write_scope(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut SqlBufferedWriteScope<'_, '_>,
     bound_statement: &BoundStatementInstance,
     allow_internal_relations: bool,
@@ -178,23 +177,18 @@ async fn execute_bound_statement_in_buffered_write_scope(
     skip_side_effect_collection: bool,
 ) -> Result<QueryResult, LixError> {
     loop {
-        let pending_write_overlay_view =
-            write_transaction.buffered_write_pending_write_overlay_view()?;
+        let pending_write_overlay = write_transaction.buffered_write_pending_write_overlay()?;
         let prepared_context = {
             let transaction = write_transaction.backend_transaction_mut()?;
-            bootstrap_prepared_write_preparation_context(
-                transaction,
-                pending_write_overlay_view.as_ref(),
-                context,
-            )
-            .await?
+            build_write_preparation_context(transaction, pending_write_overlay.as_ref(), context)
+                .await?
         };
         let command = {
             let transaction = write_transaction.backend_transaction_mut()?;
             prepare_buffered_write_execution_step(
-                services,
+                execution_context,
                 transaction,
-                pending_write_overlay_view.as_ref(),
+                pending_write_overlay.as_ref(),
                 bound_statement,
                 &prepared_context,
                 allow_internal_relations,
@@ -207,7 +201,7 @@ async fn execute_bound_statement_in_buffered_write_scope(
             Ok(command) => command,
             Err(error) if !write_transaction.buffered_write_journal_is_empty() => {
                 write_transaction
-                    .flush_buffered_write_journal(services, context)
+                    .flush_buffered_write_journal(execution_context, context)
                     .await?;
                 let _ = error;
                 continue;
@@ -221,7 +215,7 @@ async fn execute_bound_statement_in_buffered_write_scope(
                 write_transaction.can_stage_transaction_write_delta(&statement_delta)?;
             if !write_transaction.buffered_write_journal_is_empty() && !continuation_safe {
                 write_transaction
-                    .flush_buffered_write_journal(services, context)
+                    .flush_buffered_write_journal(execution_context, context)
                     .await?;
                 continue;
             }
@@ -233,12 +227,12 @@ async fn execute_bound_statement_in_buffered_write_scope(
             let invalidation = prepared_write_context_invalidation_for_metadata(&metadata);
             if !invalidation.is_none() {
                 write_transaction.mark_public_surface_registry_refresh_pending();
-                let pending_write_overlay_view =
-                    write_transaction.buffered_write_pending_write_overlay_view()?;
+                let pending_write_overlay =
+                    write_transaction.buffered_write_pending_write_overlay()?;
                 let transaction = write_transaction.backend_transaction_mut()?;
                 apply_prepared_write_context_invalidation(
                     transaction,
-                    pending_write_overlay_view.as_ref(),
+                    pending_write_overlay.as_ref(),
                     context,
                     invalidation,
                 )
@@ -252,7 +246,7 @@ async fn execute_bound_statement_in_buffered_write_scope(
 
         if should_flush_before_command(&metadata, write_transaction) {
             write_transaction
-                .flush_buffered_write_journal(services, context)
+                .flush_buffered_write_journal(execution_context, context)
                 .await?;
             continue;
         }
@@ -261,10 +255,10 @@ async fn execute_bound_statement_in_buffered_write_scope(
         let write_result = {
             let transaction = write_transaction.backend_transaction_mut()?;
             execute_write_command_with_transaction(
-                services,
+                execution_context,
                 transaction,
                 &command,
-                pending_write_overlay_view.as_ref(),
+                pending_write_overlay.as_ref(),
                 Some(&mut pending_commit_state),
             )
             .await?
@@ -278,7 +272,7 @@ async fn execute_bound_statement_in_buffered_write_scope(
                 let buffered_write_outcome = {
                     let transaction = write_transaction.backend_transaction_mut()?;
                     complete_sql_command_execution(
-                        services,
+                        execution_context,
                         transaction,
                         &command,
                         write_outcome,
@@ -318,27 +312,27 @@ async fn execute_bound_statement_in_buffered_write_scope(
 }
 
 async fn execute_write_command_with_transaction(
-    host: &dyn WriteExecutionHost,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     command: &WriteCommand,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     pending_commit_state: Option<&mut Option<PendingCommitState>>,
 ) -> Result<WriteResult, LixError> {
     match command.path() {
         WritePath::ExplainOnly => execute_explain_write_command(command),
         WritePath::PendingRead(public_read) | WritePath::CommittedRead(public_read) => {
             execute_read_query_write_command(
-                host,
+                execution_context,
                 transaction,
                 command,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 public_read,
             )
             .await
         }
         WritePath::BufferedDelta(delta) => {
             let write_outcome = delta
-                .execute(host, transaction, pending_commit_state)
+                .execute(execution_context, transaction, pending_commit_state)
                 .await?;
             Ok(WriteResult::Outcome(write_outcome))
         }
@@ -366,17 +360,17 @@ fn execute_explain_write_command(command: &WriteCommand) -> Result<WriteResult, 
 }
 
 async fn execute_read_query_write_command(
-    host: &dyn WriteExecutionHost,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     command: &WriteCommand,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     public_read: &crate::contracts::PreparedPublicRead,
 ) -> Result<WriteResult, LixError> {
     let execution_started = std::time::Instant::now();
-    let public_result = match host
-        .execute_prepared_public_read_with_pending_overlay_view(
+    let public_result = match execution_context
+        .execute_prepared_public_read_with_pending_overlay(
             transaction,
-            pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+            pending_write_overlay.map(|view| view as &dyn PendingOverlay),
             public_read,
         )
         .await
@@ -417,7 +411,7 @@ async fn execute_direct_write_command(
         transaction,
         direct,
         command.prepared().result_contract,
-        command.runtime_state().functions(),
+        command.function_bindings().provider(),
         direct.writer_key.as_deref(),
     )
     .await
@@ -485,33 +479,33 @@ fn prepared_write_context_invalidation_for_session_effects(
 
 async fn apply_prepared_write_context_invalidation(
     transaction: &mut dyn LixBackendTransaction,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     context: &mut SessionExecutionState,
     invalidation: PreparedWriteContextInvalidation,
 ) -> Result<(), LixError> {
     let registry = match invalidation {
         PreparedWriteContextInvalidation::None => return Ok(()),
         PreparedWriteContextInvalidation::RegenerateFromPendingOverlay => {
-            let runtime_state = context.function_runtime_state().expect(
-                "prepared write context invalidation requires an initialized execution runtime state",
+            let function_bindings = context.function_bindings().expect(
+                "prepared write context invalidation requires initialized function bindings",
             );
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::session::pending_reads::build_surface_registry(
                 &backend,
-                pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
-                runtime_state.provider(),
+                pending_write_overlay.map(|view| view as &dyn PendingOverlay),
+                function_bindings.provider(),
             )
             .await?
         }
         PreparedWriteContextInvalidation::RegenerateFromCommittedState => {
-            let runtime_state = context.function_runtime_state().expect(
-                "prepared write context invalidation requires an initialized execution runtime state",
+            let function_bindings = context.function_bindings().expect(
+                "prepared write context invalidation requires initialized function bindings",
             );
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::session::pending_reads::build_surface_registry(
                 &backend,
                 None,
-                runtime_state.provider(),
+                function_bindings.provider(),
             )
             .await?
         }
@@ -638,15 +632,15 @@ impl SqlBufferedWriteScope<'_, '_> {
         }
     }
 
-    fn buffered_write_pending_write_overlay_view(
+    fn buffered_write_pending_write_overlay(
         &self,
-    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
+    ) -> Result<Option<PendingWriteOverlay>, LixError> {
         match self {
             Self::Owned(write_transaction) => {
-                write_transaction.buffered_write_pending_write_overlay_view()
+                write_transaction.buffered_write_pending_write_overlay()
             }
             Self::Borrowed(write_transaction) => {
-                write_transaction.buffered_write_pending_write_overlay_view()
+                write_transaction.buffered_write_pending_write_overlay()
             }
         }
     }
@@ -732,19 +726,19 @@ impl SqlBufferedWriteScope<'_, '_> {
 
     async fn flush_buffered_write_journal(
         &mut self,
-        host: &dyn WriteExecutionHost,
+        execution_context: &dyn WriteExecutionContext,
         context: &mut SessionExecutionState,
     ) -> Result<(), LixError> {
         let mut execution_input = context.buffered_write_execution_input();
         match self {
             Self::Owned(write_transaction) => {
                 write_transaction
-                    .flush_buffered_write_journal(host, &mut execution_input)
+                    .flush_buffered_write_journal(execution_context, &mut execution_input)
                     .await
             }
             Self::Borrowed(write_transaction) => {
                 write_transaction
-                    .flush_buffered_write_journal(host, &mut execution_input)
+                    .flush_buffered_write_journal(execution_context, &mut execution_input)
                     .await
             }
         }?;
@@ -846,11 +840,7 @@ mod tests {
     }
 
     fn test_session(lix: &Arc<Lix>) -> Session {
-        Session::new_for_test(
-            crate::session::runtime::SessionRuntime::new(lix.session_host()),
-            "version-test".to_string(),
-            Vec::new(),
-        )
+        Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new())
     }
 
     #[test]

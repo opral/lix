@@ -12,14 +12,10 @@ use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::PreparedWriteRuntimeState;
+use crate::contracts::CompiledSchemaCache;
 use crate::contracts::{
-    clone_boxed_function_provider, FunctionRuntimeState, LixFunctionProvider,
-    SharedFunctionProvider,
-};
-use crate::contracts::{
-    CompiledSchemaCache, LiveRowShapeContract, LiveStateQueryBackend, PendingOverlayView,
-    SqlPreparationMetadataReader,
+    clone_boxed_function_provider, FunctionBindings, LixFunctionProvider,
+    PreparedWriteFunctionBindings, SharedFunctionProvider,
 };
 use crate::contracts::{
     PreparedBatch, PreparedDirectWriteArtifact, PreparedExplainMode,
@@ -32,37 +28,38 @@ use crate::contracts::{
     UpdateValidationInput, UpdateValidationInputRow, WriteDiagnosticContext,
 };
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
+use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
 use crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
 use crate::session::execution_state::SessionExecutionState;
-use crate::session::host::WriteExecutionServices;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::bind_sql;
 use crate::sql::{
     build_change_batches, build_public_write_execution,
     compile_execution_from_bound_statement_with_context, compiled_explain_diagnostics,
     derive_commit_preconditions, finalize_public_write_execution,
-    load_sql_compiler_metadata_with_reader_and_pending_overlay_view, prepare_public_read_artifact,
+    load_sql_compiler_metadata_with_reader_and_pending_overlay, prepare_public_read_artifact,
     public_authoritative_write_error, public_write_preparation_error,
     refresh_materialized_public_write_explain, BoundStatementInstance, CompilePolicy,
     CompiledExecution, InsertOnConflictAction, PublicWriteExecutionPartition,
     PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan, SqlCompilerMetadata,
-    UpdateValidationPlan, WriteOperationKind,
+    SqlPreparationMetadataReader, UpdateValidationPlan, WriteOperationKind,
 };
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::resolve_write_plan_with_functions;
 use crate::transaction::pipeline::validation::{
     validate_batch_local_write, validate_inserts, validate_update_inputs,
 };
-use crate::transaction::{PendingWriteOverlayView, WriteCommand};
+use crate::transaction::{PendingWriteOverlay, WriteCommand, WriteExecutionContext};
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PreparedWriteContextStamp {
+pub(crate) struct WritePreparationStamp {
     public_surface_registry_generation: u64,
 }
 
-impl PreparedWriteContextStamp {
+impl WritePreparationStamp {
     pub(crate) fn capture(context: &SessionExecutionState) -> Self {
         Self {
             public_surface_registry_generation: context.public_surface_registry_generation(),
@@ -71,8 +68,8 @@ impl PreparedWriteContextStamp {
 }
 
 #[derive(Clone)]
-pub(crate) struct PreparedWritePreparationContext {
-    stamp: PreparedWriteContextStamp,
+pub(crate) struct WritePreparationContext {
+    stamp: WritePreparationStamp,
     public_surface_registry: SurfaceRegistry,
     compiler_metadata: SqlCompilerMetadata,
     active_history_root_commit_id: Option<String>,
@@ -81,8 +78,8 @@ pub(crate) struct PreparedWritePreparationContext {
     writer_key: Option<String>,
 }
 
-impl PreparedWritePreparationContext {
-    pub(crate) fn stamp(&self) -> PreparedWriteContextStamp {
+impl WritePreparationContext {
+    pub(crate) fn stamp(&self) -> WritePreparationStamp {
         self.stamp
     }
 
@@ -117,7 +114,7 @@ struct WriteCommandSeed {
     diagnostic_context: WriteDiagnosticContext,
     writer_key: Option<String>,
     compiled_execution: CompiledExecution,
-    prepared_runtime_state: PreparedWriteRuntimeState,
+    function_bindings: PreparedWriteFunctionBindings,
 }
 
 pub(crate) struct CompiledWriteCommand {
@@ -138,25 +135,25 @@ impl ValidatedWriteCommand {
     }
 }
 
-pub(crate) async fn bootstrap_prepared_write_preparation_context(
+pub(crate) async fn build_write_preparation_context(
     mut transaction: &mut dyn LixBackendTransaction,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     context: &SessionExecutionState,
-) -> Result<PreparedWritePreparationContext, LixError> {
+) -> Result<WritePreparationContext, LixError> {
     let active_history_root_commit_id = transaction
         .load_active_history_root_commit_id_for_preparation(context.active_version_id.as_str())
         .await?;
     let compiler_metadata = {
         let metadata_reader = &mut transaction;
-        load_sql_compiler_metadata_with_reader_and_pending_overlay_view(
+        load_sql_compiler_metadata_with_reader_and_pending_overlay(
             metadata_reader,
             &context.public_surface_registry,
-            pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+            pending_write_overlay.map(|view| view as &dyn PendingOverlay),
         )
         .await?
     };
-    Ok(PreparedWritePreparationContext {
-        stamp: PreparedWriteContextStamp::capture(context),
+    Ok(WritePreparationContext {
+        stamp: WritePreparationStamp::capture(context),
         public_surface_registry: context.public_surface_registry.clone(),
         compiler_metadata,
         active_history_root_commit_id,
@@ -166,40 +163,42 @@ pub(crate) async fn bootstrap_prepared_write_preparation_context(
     })
 }
 
-pub(crate) async fn ensure_function_runtime_state_for_write_scope(
-    services: &dyn WriteExecutionServices,
+pub(crate) async fn ensure_function_bindings_for_write_scope(
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     context: &mut SessionExecutionState,
 ) -> Result<(), LixError> {
-    if context.function_runtime_state().is_some() {
+    if context.function_bindings().is_some() {
         return Ok(());
     }
 
     let backend = crate::backend::transaction_backend_view(transaction);
-    let runtime_state = services.prepare_function_runtime_state(&backend).await?;
-    context.set_function_runtime_state(runtime_state);
+    let function_bindings = execution_context
+        .prepare_function_bindings(&backend)
+        .await?;
+    context.set_function_bindings(function_bindings);
     Ok(())
 }
 
-pub(crate) fn prepared_write_runtime_state_for_execution(
-    runtime_state: &FunctionRuntimeState,
-) -> PreparedWriteRuntimeState {
-    let functions = clone_boxed_function_provider(runtime_state.provider());
-    PreparedWriteRuntimeState::new(runtime_state.deterministic_enabled(), functions)
+pub(crate) fn prepared_write_function_bindings_for_execution(
+    function_bindings: &FunctionBindings,
+) -> PreparedWriteFunctionBindings {
+    let provider = clone_boxed_function_provider(function_bindings.provider());
+    PreparedWriteFunctionBindings::new(function_bindings.deterministic_enabled(), provider)
 }
 
 pub(crate) async fn prepare_buffered_write_execution_step(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     bound_statement: &BoundStatementInstance,
-    prepared_context: &PreparedWritePreparationContext,
+    prepared_context: &WritePreparationContext,
     allow_internal_relations: bool,
     context: &SessionExecutionState,
     skip_side_effect_collection: bool,
 ) -> Result<WriteCommand, LixError> {
     let compiled = compile_write_command(
-        services,
+        execution_context,
         transaction,
         bound_statement,
         prepared_context,
@@ -211,17 +210,17 @@ pub(crate) async fn prepare_buffered_write_execution_step(
     let backend = crate::backend::transaction_backend_view(transaction);
     let validated = validate_compiled_write_command(
         &backend,
-        services.compiled_schema_cache(),
+        execution_context.compiled_schema_cache(),
         bound_statement.params(),
-        pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+        pending_write_overlay.map(|view| view as &dyn PendingOverlay),
         compiled,
     )
     .await?;
     let relation_names = validated.relation_names().to_vec();
     let materialized = match materialize_validated_write_command(
         &backend,
-        services.catalog_projection_registry(),
-        pending_write_overlay_view,
+        execution_context.catalog_projection_registry(),
+        pending_write_overlay,
         validated,
     )
     .await
@@ -239,13 +238,13 @@ pub(crate) async fn prepare_buffered_write_execution_step(
     let command = assemble_write_command(materialized)?;
     debug_assert_eq!(
         prepared_context.stamp(),
-        PreparedWriteContextStamp::capture(context),
+        WritePreparationStamp::capture(context),
         "prepared write command should use the current prepared-context stamp",
     );
     validate_write_command(
         &backend,
-        services.compiled_schema_cache(),
-        pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+        execution_context.compiled_schema_cache(),
+        pending_write_overlay.map(|view| view as &dyn PendingOverlay),
         &command,
     )
     .await?;
@@ -253,10 +252,10 @@ pub(crate) async fn prepare_buffered_write_execution_step(
 }
 
 async fn compile_write_command(
-    services: &dyn WriteExecutionServices,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     bound_statement: &BoundStatementInstance,
-    prepared_context: &PreparedWritePreparationContext,
+    prepared_context: &WritePreparationContext,
     allow_internal_relations: bool,
     context: &SessionExecutionState,
     skip_side_effect_collection: bool,
@@ -266,21 +265,21 @@ async fn compile_write_command(
         bound_statement.statement(),
     ));
     let writer_key = prepared_context.writer_key.clone();
-    let runtime_state = context
-        .function_runtime_state()
-        .expect("write execution should install an execution runtime state before preparation");
+    let function_bindings = context
+        .function_bindings()
+        .expect("write execution should install function bindings before preparation");
 
-    if runtime_state.deterministic_enabled() {
-        let mut runtime_functions = runtime_state.provider().clone();
+    if function_bindings.deterministic_enabled() {
+        let mut runtime_functions = function_bindings.provider().clone();
         ensure_runtime_sequence_initialized_in_transaction(transaction, &mut runtime_functions)
             .await?;
     }
 
     let dialect = transaction.dialect();
     let backend = crate::backend::transaction_backend_view(transaction);
-    let compiler_context = services
+    let compiler_context = execution_context
         .sql_compiler_seed(
-            runtime_state.provider(),
+            function_bindings.provider(),
             prepared_context.public_surface_registry(),
         )
         .with_compiler_metadata(
@@ -319,7 +318,7 @@ async fn compile_write_command(
             diagnostic_context,
             writer_key,
             compiled_execution,
-            prepared_runtime_state: prepared_write_runtime_state_for_execution(runtime_state),
+            function_bindings: prepared_write_function_bindings_for_execution(function_bindings),
         },
     })
 }
@@ -328,12 +327,12 @@ async fn validate_compiled_write_command(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     params: &[Value],
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     compiled: CompiledWriteCommand,
 ) -> Result<ValidatedWriteCommand, LixError> {
     if let Some(internal) = compiled.payload.compiled_execution.direct_execution() {
         if !internal.mutations.is_empty() {
-            validate_inserts(backend, cache, &internal.mutations, pending_overlay_view)
+            validate_inserts(backend, cache, &internal.mutations, pending_overlay)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -349,7 +348,7 @@ async fn validate_compiled_write_command(
                 cache,
                 &internal.update_validations,
                 params,
-                pending_overlay_view,
+                pending_overlay,
             )
             .await
             .map_err(|error| LixError {
@@ -370,16 +369,16 @@ async fn validate_compiled_write_command(
 async fn materialize_validated_write_command(
     backend: &dyn crate::LixBackend,
     projection_registry: &CatalogProjectionRegistry,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     mut validated: ValidatedWriteCommand,
 ) -> Result<MaterializedWriteCommand, LixError> {
     if let Some(public_write) = validated.payload.compiled_execution.public_write().cloned() {
         let public_write = materialize_prepared_public_write(
             backend,
             projection_registry,
-            pending_write_overlay_view,
+            pending_write_overlay,
             &public_write,
-            validated.payload.prepared_runtime_state.functions().clone(),
+            validated.payload.function_bindings.provider().clone(),
         )
         .await?;
         validated.payload.compiled_execution.explain = public_write
@@ -408,7 +407,7 @@ fn assemble_write_command(
         diagnostic_context,
         writer_key,
         compiled_execution,
-        prepared_runtime_state,
+        function_bindings,
     } = materialized.payload;
     let prepared_statement = prepared_write_statement_from_compiled_execution(
         dialect,
@@ -417,17 +416,17 @@ fn assemble_write_command(
         diagnostic_context,
         writer_key,
     )?;
-    WriteCommand::build(prepared_statement, &prepared_runtime_state)
+    WriteCommand::build(prepared_statement, &function_bindings)
 }
 
 async fn validate_write_command(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     command: &WriteCommand,
 ) -> Result<(), LixError> {
     if let Some(public_write) = command.prepared().public_write() {
-        validate_batch_local_write(backend, cache, public_write, pending_overlay_view)
+        validate_batch_local_write(backend, cache, public_write, pending_overlay)
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -466,13 +465,13 @@ async fn validate_update_plans(
     cache: &dyn CompiledSchemaCache,
     plans: &[UpdateValidationPlan],
     params: &[Value],
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<(), LixError> {
     let mut inputs = Vec::with_capacity(plans.len());
     for plan in plans {
         inputs.push(load_update_validation_input(backend, plan, params).await?);
     }
-    validate_update_inputs(backend, cache, &inputs, pending_overlay_view).await
+    validate_update_inputs(backend, cache, &inputs, pending_overlay).await
 }
 
 async fn load_update_validation_input(
@@ -865,7 +864,7 @@ fn planned_row_optional_json_text_value<'a>(
 async fn materialize_prepared_public_write<P>(
     backend: &dyn crate::LixBackend,
     projection_registry: &CatalogProjectionRegistry,
-    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_write_overlay: Option<&PendingWriteOverlay>,
     public_write: &PublicWritePlan,
     functions: SharedFunctionProvider<P>,
 ) -> Result<PublicWritePlan, LixError>
@@ -878,14 +877,14 @@ where
     let selector_resolver = SessionWriteSelectorResolver::new(
         backend,
         projection_registry,
-        pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+        pending_write_overlay.map(|view| view as &dyn PendingOverlay),
         &selector_functions,
     )
     .await?;
     let resolved_write_plan = resolve_write_plan_with_functions(
         backend,
         &public_write.planned_write,
-        pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+        pending_write_overlay.map(|view| view as &dyn PendingOverlay),
         functions,
         &selector_resolver,
     )

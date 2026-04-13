@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::contracts::{RowIdentity, TrackedWriteRow, UntrackedWriteRow};
-use crate::transaction::overlay::PendingWriteOverlay;
+use crate::transaction::overlay::PendingRowOverlay;
 use crate::transaction::TransactionDelta;
 use crate::LixError;
 
@@ -68,18 +68,18 @@ impl WritePlan {
 pub(crate) struct WriteDelta {
     public_delta: TransactionDelta,
     materialization_plan: WritePlan,
-    pending_write_overlay: PendingWriteOverlay,
+    pending_row_overlay: PendingRowOverlay,
 }
 
 impl WriteDelta {
     pub(crate) fn from_public_delta(delta: TransactionDelta) -> Result<Self, LixError> {
         let public_delta = coalesce_public_delta(delta);
-        let pending_write_overlay = PendingWriteOverlay::from_delta(&public_delta)?;
+        let pending_row_overlay = PendingRowOverlay::from_delta(&public_delta)?;
         let materialization_plan = WritePlan::from_public_delta(&public_delta);
         Ok(Self {
             public_delta,
             materialization_plan,
-            pending_write_overlay,
+            pending_row_overlay,
         })
     }
 
@@ -87,8 +87,8 @@ impl WriteDelta {
         &self.materialization_plan
     }
 
-    pub(crate) fn pending_write_overlay(&self) -> &PendingWriteOverlay {
-        &self.pending_write_overlay
+    pub(crate) fn pending_row_overlay(&self) -> &PendingRowOverlay {
+        &self.pending_row_overlay
     }
 
     pub(crate) fn extend(&mut self, incoming: WriteDelta) {
@@ -98,8 +98,7 @@ impl WriteDelta {
         ));
         self.materialization_plan
             .extend(incoming.materialization_plan);
-        self.pending_write_overlay
-            .merge(incoming.pending_write_overlay);
+        self.pending_row_overlay.merge(incoming.pending_row_overlay);
     }
 }
 
@@ -153,21 +152,21 @@ impl WriteJournal {
             .map(WriteDelta::materialization_plan)
     }
 
-    pub(crate) fn pending_write_overlay(&self) -> Option<&PendingWriteOverlay> {
+    pub(crate) fn pending_row_overlay(&self) -> Option<&PendingRowOverlay> {
         self.staged_delta
             .as_ref()
-            .map(WriteDelta::pending_write_overlay)
+            .map(WriteDelta::pending_row_overlay)
     }
 
     fn can_stage_delta(&self, incoming: &WriteDelta) -> bool {
-        let Some(current) = self.pending_write_overlay() else {
+        let Some(current) = self.pending_row_overlay() else {
             return true;
         };
 
         let current_tracked = current.tracked_identities();
         let current_untracked = current.untracked_identities();
-        let incoming_tracked = incoming.pending_write_overlay().tracked_identities();
-        let incoming_untracked = incoming.pending_write_overlay().untracked_identities();
+        let incoming_tracked = incoming.pending_row_overlay().tracked_identities();
+        let incoming_untracked = incoming.pending_row_overlay().untracked_identities();
 
         current_tracked.is_disjoint(&incoming_untracked)
             && current_untracked.is_disjoint(&incoming_tracked)

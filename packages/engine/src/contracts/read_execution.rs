@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use crate::contracts::PendingOverlayView;
 use crate::contracts::{PreparedPublicRead, ReadTimeProjectionPlan, RowIdentity};
+use crate::transaction::PendingOverlay;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -24,10 +24,15 @@ pub trait ReadExecutionHost {
 
 #[async_trait(?Send)]
 pub trait PendingPublicReadHost {
-    async fn execute_prepared_public_read_with_pending_overlay_view(
+    async fn execute_prepared_public_read_with_pending_overlay(
         &self,
         host: &dyn ReadExecutionHost,
-        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        pending_overlay: Option<&dyn PendingOverlay>,
         public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError>;
+}
+
+#[async_trait(?Send)]
+pub trait PendingPublicReadTransaction {
+    async fn require_live_state_ready(&mut self) -> Result<(), LixError>;
 }

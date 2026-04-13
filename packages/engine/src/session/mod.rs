@@ -13,16 +13,15 @@ mod init;
 pub(crate) mod observe;
 pub(crate) mod pending_reads;
 pub(crate) mod plugin;
+pub(crate) mod public_read_execution;
+pub(crate) mod public_read_preparation;
 mod public_surface_registry;
-pub(crate) mod read_execution_host;
-pub(crate) mod read_preparation;
-pub(crate) mod runtime;
 mod selector_reads;
 pub(crate) mod semantic_write;
 pub(crate) mod state_selector;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
-pub(crate) mod write_execution_host;
+pub(crate) mod write_execution_context;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -37,7 +36,7 @@ use crate::catalog::SurfaceRegistry;
 use crate::contracts::ExecuteOptions;
 use crate::contracts::TransactionCommitOutcome;
 use crate::contracts::{
-    FunctionRuntimeState, SessionDependency, SessionExecutionMode, SessionStateSnapshot,
+    FunctionBindings, SessionDependency, SessionExecutionMode, SessionStateSnapshot,
 };
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::read::execute_prepared_read_batch_in_committed_read_transaction;
@@ -45,8 +44,11 @@ use crate::image::ImageChunkWriter;
 use crate::session::execution_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionExecutionState,
 };
+use crate::session::host::{
+    prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
+    SessionHost,
+};
 pub(crate) use crate::session::public_surface_registry::apply_registered_schema_snapshot_to_surface_registry;
-use crate::session::runtime::SessionRuntime;
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::semantic_write::{
     prepare_registered_schema_write_statement, SemanticWriteContext,
@@ -63,8 +65,8 @@ use crate::sql::{
     reject_internal_table_writes, reject_public_create_table, CommittedReadContext, StatementBatch,
 };
 use crate::transaction::{
-    ensure_function_runtime_state_for_write_scope, execute_parsed_statements_in_write_transaction,
-    execute_statement_batch_with_write_transaction, prepared_write_runtime_state_for_execution,
+    ensure_function_bindings_for_write_scope, execute_parsed_statements_in_write_transaction,
+    execute_statement_batch_with_write_transaction, prepared_write_function_bindings_for_execution,
 };
 use crate::transaction::{stage_prepared_write_statement, BufferedWriteTransaction};
 use crate::{ExecuteResult, LixError, Value};
@@ -96,7 +98,7 @@ enum Persistence {
 /// type internally, and additional sessions can be opened explicitly when a
 /// caller needs a different scoped view over the same repository.
 pub struct Session {
-    session_runtime: Arc<SessionRuntime>,
+    session_host: Arc<dyn SessionHost>,
     // Session-local runtime state. Workspace sessions persist these selectors
     // through `crate::session::workspace`; extra sessions keep them ephemeral.
     active_version_id: RwLock<String>,
@@ -113,7 +115,7 @@ pub struct Session {
 }
 
 pub struct SessionTransaction<'a> {
-    session_runtime: &'a SessionRuntime,
+    session_host: &'a dyn SessionHost,
     session: &'a Session,
     pub(crate) write_transaction: Option<BufferedWriteTransaction<'a>>,
     pub(crate) context: SessionExecutionState,
@@ -121,18 +123,17 @@ pub struct SessionTransaction<'a> {
 
 impl Session {
     pub(crate) async fn open_workspace(
-        session_runtime: Arc<SessionRuntime>,
+        session_host: Arc<dyn SessionHost>,
     ) -> Result<Self, LixError> {
-        session_runtime.ensure_initialized().await?;
+        session_host.ensure_initialized().await?;
         let active_version_id =
-            require_workspace_active_version_id(session_runtime.backend().as_ref()).await?;
-        let active_account_ids =
-            load_workspace_active_account_ids(session_runtime.backend().as_ref())
-                .await?
-                .unwrap_or_default();
-        let registry = session_runtime.public_surface_registry();
+            require_workspace_active_version_id(session_host.backend().as_ref()).await?;
+        let active_account_ids = load_workspace_active_account_ids(session_host.backend().as_ref())
+            .await?
+            .unwrap_or_default();
+        let registry = session_host.public_surface_registry();
         Ok(Self {
-            session_runtime,
+            session_host,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             public_surface_registry: RwLock::new(registry),
@@ -161,7 +162,7 @@ impl Session {
             .active_account_ids
             .unwrap_or_else(|| self.active_account_ids());
         Ok(Self {
-            session_runtime: Arc::clone(&self.session_runtime),
+            session_host: Arc::clone(&self.session_host),
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             public_surface_registry: RwLock::new(self.public_surface_registry()),
@@ -176,13 +177,13 @@ impl Session {
 
     #[cfg(test)]
     pub(crate) fn new_for_test(
-        session_runtime: Arc<SessionRuntime>,
+        session_host: Arc<dyn SessionHost>,
         active_version_id: String,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
-            public_surface_registry: RwLock::new(session_runtime.public_surface_registry()),
-            session_runtime,
+            public_surface_registry: RwLock::new(session_host.public_surface_registry()),
+            session_host,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
             compiler_cache: SessionCompilerCache::new(),
@@ -194,8 +195,12 @@ impl Session {
         }
     }
 
-    pub(crate) fn session_runtime(&self) -> &SessionRuntime {
-        self.session_runtime.as_ref()
+    pub(crate) fn session_host(&self) -> &dyn SessionHost {
+        self.session_host.as_ref()
+    }
+
+    pub(crate) fn execution_context(&self) -> SessionExecutionContext<'_> {
+        SessionExecutionContext::new(self.session_host())
     }
 
     pub fn active_version_id(&self) -> String {
@@ -279,9 +284,7 @@ impl Session {
         &self,
         options: crate::CreateVersionOptions,
     ) -> Result<crate::CreateVersionResult, LixError> {
-        self.session_runtime
-            .create_version_in_session(self, options)
-            .await
+        crate::session::version_ops::create_version_in_session(self, options).await
     }
 
     /// Creates a canonical checkpoint label on committed history for the
@@ -302,9 +305,7 @@ impl Session {
         &self,
         options: crate::MergeVersionOptions,
     ) -> Result<crate::MergeVersionResult, LixError> {
-        self.session_runtime
-            .merge_version_in_session(self, options)
-            .await
+        crate::session::version_ops::merge_version_in_session(self, options).await
     }
 
     pub async fn undo(&self) -> Result<crate::UndoResult, LixError> {
@@ -316,8 +317,7 @@ impl Session {
         options: crate::UndoOptions,
     ) -> Result<crate::UndoResult, LixError> {
         Box::pin(
-            self.session_runtime
-                .undo_with_options_in_session(self, options),
+            crate::session::version_ops::undo_redo::undo_with_options_in_session(self, options),
         )
         .await
     }
@@ -331,8 +331,7 @@ impl Session {
         options: crate::RedoOptions,
     ) -> Result<crate::RedoResult, LixError> {
         Box::pin(
-            self.session_runtime
-                .redo_with_options_in_session(self, options),
+            crate::session::version_ops::undo_redo::redo_with_options_in_session(self, options),
         )
         .await
     }
@@ -350,7 +349,7 @@ impl Session {
     }
 
     pub async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        self.session_runtime.export_image(writer).await
+        self.session_host.export_image(writer).await
     }
 
     pub(crate) fn new_execution_state(&self, options: ExecuteOptions) -> SessionExecutionState {
@@ -366,8 +365,7 @@ impl Session {
     pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
         self.replace_local_public_surface_registry(registry.clone());
         if self.should_persist_workspace_selectors() {
-            self.session_runtime
-                .install_public_surface_registry(registry);
+            self.session_host.install_public_surface_registry(registry);
         }
     }
 
@@ -382,7 +380,7 @@ impl Session {
     }
 
     pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        let registry = self.session_runtime.load_public_surface_registry().await?;
+        let registry = self.session_host.load_public_surface_registry().await?;
         self.install_public_surface_registry(registry);
         Ok(())
     }
@@ -393,9 +391,9 @@ impl Session {
         }
 
         let active_version_id =
-            require_workspace_active_version_id(self.session_runtime.backend().as_ref()).await?;
+            require_workspace_active_version_id(self.session_host.backend().as_ref()).await?;
         let active_account_ids =
-            load_workspace_active_account_ids(self.session_runtime.backend().as_ref())
+            load_workspace_active_account_ids(self.session_host.backend().as_ref())
                 .await?
                 .unwrap_or_default();
 
@@ -426,8 +424,7 @@ impl Session {
         options: ExecuteOptions,
         allow_internal_relations: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let allow_internal_sql =
-            allow_internal_relations || self.session_runtime.access_to_internal();
+        let allow_internal_sql = allow_internal_relations || self.session_host.access_to_internal();
 
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
@@ -449,103 +446,105 @@ impl Session {
         let statement_batch = StatementBatch::compile(
             parsed_statements,
             params,
-            self.session_runtime.backend().dialect(),
+            self.session_host.backend().dialect(),
             &runtime_bindings,
             Some(parsed.parse_duration),
         )?;
         let execution_mode =
             classify_session_execution_mode(&statement_batch, explicit_transaction_script);
-        let runtime_state = self
-            .session_runtime
-            .prepare_function_runtime_state(self.session_runtime.backend().as_ref())
-            .await?;
-        context.set_function_runtime_state(runtime_state.clone());
+        let function_bindings = prepare_function_bindings_with_host(
+            self.session_host.as_ref(),
+            self.session_host.backend().as_ref(),
+        )
+        .await?;
+        context.set_function_bindings(function_bindings.clone());
+        let execution_context = self.execution_context();
 
         let result = match execution_mode {
             SessionExecutionMode::CommittedRead => {
                 let committed_read_context = committed_read_context(
                     &context,
-                    self.session_runtime.as_ref(),
-                    &runtime_state,
+                    self.session_host.as_ref(),
+                    &function_bindings,
                     execution_mode,
                 );
                 let prepared_read_batch = prepare_committed_read_batch_with_backend(
-                    self.session_runtime.backend().as_ref(),
+                    self.session_host.backend().as_ref(),
                     &statement_batch,
                     allow_internal_sql,
                     &committed_read_context,
                 )
                 .await?;
                 let mut transaction = self
-                    .session_runtime
+                    .session_host
                     .begin_read_unit(prepared_read_batch.transaction_mode)
                     .await?;
                 let result = execute_prepared_read_batch_in_committed_read_transaction(
                     transaction.as_mut(),
-                    self.session_runtime.as_ref(),
+                    &execution_context,
                     &prepared_read_batch,
                 )
                 .await;
                 match result {
                     Ok(result) => {
                         transaction.commit().await?;
-                        context.clear_function_runtime_state();
+                        context.clear_function_bindings();
                         Ok(result)
                     }
                     Err(error) => {
                         let _ = transaction.rollback().await;
-                        context.clear_function_runtime_state();
+                        context.clear_function_bindings();
                         Err(error)
                     }
                 }
             }
             SessionExecutionMode::CommittedRuntimeMutation => {
-                let runtime_state = context.function_runtime_state().expect(
-                    "committed execution should retain an execution runtime state during execution",
-                );
+                let function_bindings = context
+                    .function_bindings()
+                    .expect("committed execution should retain function bindings during execution");
 
-                if !runtime_state.deterministic_enabled() {
+                if !function_bindings.deterministic_enabled() {
                     let committed_read_context = committed_read_context(
                         &context,
-                        self.session_runtime.as_ref(),
-                        runtime_state,
+                        self.session_host.as_ref(),
+                        function_bindings,
                         execution_mode,
                     );
                     let prepared_read_batch = prepare_committed_read_batch_with_backend(
-                        self.session_runtime.backend().as_ref(),
+                        self.session_host.backend().as_ref(),
                         &statement_batch,
                         allow_internal_sql,
                         &committed_read_context,
                     )
                     .await?;
                     let mut transaction = self
-                        .session_runtime
+                        .session_host
                         .begin_read_unit(prepared_read_batch.transaction_mode)
                         .await?;
                     let result = execute_prepared_read_batch_in_committed_read_transaction(
                         transaction.as_mut(),
-                        self.session_runtime.as_ref(),
+                        &execution_context,
                         &prepared_read_batch,
                     )
                     .await;
                     match result {
                         Ok(result) => {
                             transaction.commit().await?;
-                            context.clear_function_runtime_state();
+                            context.clear_function_bindings();
                             Ok(result)
                         }
                         Err(error) => {
                             let _ = transaction.rollback().await;
-                            context.clear_function_runtime_state();
+                            context.clear_function_bindings();
                             Err(error)
                         }
                     }
                 } else {
                     let mut transaction = self
-                        .session_runtime
+                        .session_host
                         .begin_read_unit(crate::TransactionBeginMode::Write)
                         .await?;
-                    let mut runtime_functions = runtime_state.provider().clone();
+                    let mut runtime_functions = function_bindings.provider().clone();
                     crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
                         transaction.as_mut(),
                         &mut runtime_functions,
@@ -553,8 +552,8 @@ impl Session {
                     .await?;
                     let committed_read_context = committed_read_context(
                         &context,
-                        self.session_runtime.as_ref(),
-                        runtime_state,
+                        self.session_host.as_ref(),
+                        function_bindings,
                         execution_mode,
                     );
                     let prepared_read_batch = {
@@ -568,7 +567,7 @@ impl Session {
                     };
                     let result = execute_prepared_read_batch_in_committed_read_transaction(
                         transaction.as_mut(),
-                        self.session_runtime.as_ref(),
+                        &execution_context,
                         &prepared_read_batch,
                     )
                     .await;
@@ -576,27 +575,27 @@ impl Session {
                         Ok(result) => {
                             crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
                                 transaction.as_mut(),
-                                runtime_state.provider(),
+                                function_bindings.provider(),
                             )
                             .await?;
                             transaction.commit().await?;
-                            context.clear_function_runtime_state();
+                            context.clear_function_bindings();
                             Ok(result)
                         }
                         Err(error) => {
                             let _ = transaction.rollback().await;
-                            context.clear_function_runtime_state();
+                            context.clear_function_bindings();
                             Err(error)
                         }
                     }
                 }
             }
             SessionExecutionMode::WriteTransaction => {
-                let transaction = self.session_runtime.begin_write_unit().await?;
+                let transaction = self.session_host.begin_write_unit().await?;
                 let mut write_transaction = BufferedWriteTransaction::new(transaction);
 
                 let result = execute_statement_batch_with_write_transaction(
-                    self.session_runtime.as_ref(),
+                    &execution_context,
                     &mut write_transaction,
                     &statement_batch,
                     allow_internal_sql,
@@ -606,10 +605,10 @@ impl Session {
 
                 match result {
                     Ok(result) => {
-                        context.clear_function_runtime_state();
+                        context.clear_function_bindings();
                         let outcome = write_transaction
                             .commit_buffered_write(
-                                self.session_runtime.as_ref(),
+                                &execution_context,
                                 context.buffered_write_execution_input(),
                             )
                             .await?;
@@ -618,7 +617,7 @@ impl Session {
                     }
                     Err(error) => {
                         let _ = write_transaction.rollback_buffered_write().await;
-                        context.clear_function_runtime_state();
+                        context.clear_function_bindings();
                         Err(error)
                     }
                 }
@@ -631,9 +630,9 @@ impl Session {
         &self,
         options: ExecuteOptions,
     ) -> Result<SessionTransaction<'_>, LixError> {
-        let transaction = self.session_runtime.begin_write_unit().await?;
+        let transaction = self.session_host.begin_write_unit().await?;
         Ok(SessionTransaction {
-            session_runtime: self.session_runtime.as_ref(),
+            session_host: self.session_host.as_ref(),
             session: self,
             write_transaction: Some(BufferedWriteTransaction::new(transaction)),
             context: self.new_execution_state(options),
@@ -747,7 +746,7 @@ impl Session {
         }
         if persist_workspace {
             persist_workspace_selectors(
-                self.session_runtime.backend().as_ref(),
+                self.session_host.backend().as_ref(),
                 next_active_version_id.as_deref(),
                 next_active_account_ids.as_deref(),
             )
@@ -769,16 +768,15 @@ impl Session {
         )
         .await?;
         if outcome.invalidate_deterministic_settings_cache {
-            self.session_runtime
-                .invalidate_deterministic_settings_cache();
+            self.session_host.invalidate_deterministic_settings_cache();
         }
         if outcome.invalidate_installed_plugins_cache {
-            self.session_runtime.invalidate_installed_plugins_cache()?;
+            self.session_host.invalidate_installed_plugins_cache()?;
         }
         if outcome.refresh_public_surface_registry {
             self.refresh_public_surface_registry().await?;
         }
-        self.session_runtime
+        self.session_host
             .emit_state_commit_stream_changes(std::mem::take(
                 &mut outcome.state_commit_stream_changes,
             ));
@@ -788,12 +786,12 @@ impl Session {
 
 fn baseline_committed_read_transaction_mode(
     execution_mode: SessionExecutionMode,
-    runtime_state: &FunctionRuntimeState,
+    function_bindings: &FunctionBindings,
 ) -> crate::TransactionBeginMode {
     match execution_mode {
         SessionExecutionMode::CommittedRead => crate::TransactionBeginMode::Read,
         SessionExecutionMode::CommittedRuntimeMutation => {
-            if runtime_state.deterministic_enabled() {
+            if function_bindings.deterministic_enabled() {
                 crate::TransactionBeginMode::Write
             } else {
                 crate::TransactionBeginMode::Read
@@ -805,19 +803,22 @@ fn baseline_committed_read_transaction_mode(
 
 fn committed_read_context<'a>(
     context: &'a SessionExecutionState,
-    session_runtime: &'a SessionRuntime,
-    runtime_state: &'a FunctionRuntimeState,
+    session_host: &'a dyn SessionHost,
+    function_bindings: &'a FunctionBindings,
     execution_mode: SessionExecutionMode,
 ) -> CommittedReadContext<'a> {
     CommittedReadContext {
         active_version_id: context.active_version_id.as_str(),
         active_account_ids: &context.active_account_ids,
         writer_key: context.options.writer_key.as_deref(),
-        compiler_seed: session_runtime
-            .sql_compiler_seed(runtime_state.provider(), &context.public_surface_registry),
+        compiler_seed: sql_compiler_seed_from_host(
+            session_host,
+            function_bindings.provider(),
+            &context.public_surface_registry,
+        ),
         base_transaction_mode: baseline_committed_read_transaction_mode(
             execution_mode,
-            runtime_state,
+            function_bindings,
         ),
     }
 }
@@ -828,7 +829,7 @@ fn classify_session_execution_mode(
 ) -> SessionExecutionMode {
     if !explicit_transaction_script && statement_batch.is_plain_committed_read() {
         if statement_batch
-            .runtime_effects()
+            .statement_effects()
             .requires_deterministic_sequence_persistence
         {
             SessionExecutionMode::CommittedRuntimeMutation
@@ -841,8 +842,12 @@ fn classify_session_execution_mode(
 }
 
 impl<'a> SessionTransaction<'a> {
-    pub(crate) fn session_runtime(&self) -> &'a SessionRuntime {
-        self.session_runtime
+    pub(crate) fn session_host(&self) -> &'a dyn SessionHost {
+        self.session_host
+    }
+
+    pub(crate) fn execution_context(&self) -> SessionExecutionContext<'a> {
+        SessionExecutionContext::new(self.session_host())
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -879,21 +884,23 @@ impl<'a> SessionTransaction<'a> {
     }
 
     pub async fn register_schema(&mut self, schema: &serde_json::Value) -> Result<(), LixError> {
+        let session_host = self.session_host;
+        let execution_context = SessionExecutionContext::new(session_host);
         let write_transaction = self
             .write_transaction
             .as_mut()
             .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
-        ensure_function_runtime_state_for_write_scope(
-            self.session_runtime,
+        ensure_function_bindings_for_write_scope(
+            &execution_context,
             write_transaction.backend_transaction_mut()?,
             &mut self.context,
         )
         .await?;
         let semantic_context = SemanticWriteContext::new(
-            prepared_write_runtime_state_for_execution(
+            prepared_write_function_bindings_for_execution(
                 self.context
-                    .function_runtime_state()
-                    .expect("register_schema should prepare write runtime state"),
+                    .function_bindings()
+                    .expect("register_schema should prepare function bindings"),
             ),
             self.context.public_surface_registry.clone(),
             self.context.active_account_ids.clone(),
@@ -915,20 +922,21 @@ impl<'a> SessionTransaction<'a> {
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
-        if !self.session_runtime.access_to_internal() {
+        if !self.session_host.access_to_internal() {
             reject_public_create_table(&parsed_statements)?;
             reject_internal_table_writes(&parsed_statements)?;
         }
+        let execution_context = self.execution_context();
         let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
         execute_parsed_statements_in_write_transaction(
-            self.session_runtime,
+            &execution_context,
             write_transaction,
             parsed_statements,
             params,
-            self.session_runtime.access_to_internal(),
+            self.session_host.access_to_internal(),
             &mut self.context,
             Some(parsed.parse_duration),
         )
@@ -943,12 +951,13 @@ impl<'a> SessionTransaction<'a> {
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
+        let execution_context = self.execution_context();
         let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
         execute_parsed_statements_in_write_transaction(
-            self.session_runtime,
+            &execution_context,
             write_transaction,
             parsed_statements,
             params,
@@ -964,9 +973,10 @@ impl<'a> SessionTransaction<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
+        let execution_context = self.execution_context();
         let outcome = write_transaction
             .commit_buffered_write(
-                self.session.session_runtime.as_ref(),
+                &execution_context,
                 self.context.buffered_write_execution_input(),
             )
             .await?;
@@ -1008,10 +1018,11 @@ impl Drop for SessionTransaction<'_> {
 }
 
 async fn ensure_version_exists(session: &Session, version_id: &str) -> Result<(), LixError> {
-    session
-        .session_runtime
-        .ensure_version_exists(version_id)
-        .await
+    crate::session::version_ops::context::ensure_version_exists_with_backend(
+        session.session_host.backend().as_ref(),
+        version_id,
+    )
+    .await
 }
 
 fn contains_transaction_control_statement(statements: &[Statement]) -> bool {
@@ -1264,11 +1275,8 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let result = session
                 .execute("SELECT 1", &[])
@@ -1284,11 +1292,8 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
             let parsed_statements =
                 parse_sql("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
             let runtime_bindings = session
@@ -1316,11 +1321,8 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let _ = session.execute("BEGIN; SELECT 1; COMMIT;", &[]).await;
             assert_eq!(backend.modes(), vec![crate::TransactionBeginMode::Write]);
@@ -1405,11 +1407,8 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let error = session
                 .execute(
@@ -1436,11 +1435,8 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let error = session
                 .execute("CREATE TABLE user_data (id TEXT)", &[])

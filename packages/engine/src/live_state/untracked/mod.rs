@@ -6,6 +6,8 @@ mod write;
 
 #[cfg(test)]
 pub(crate) use contracts::BatchUntrackedRowRequest;
+#[cfg(test)]
+pub(crate) use contracts::UntrackedReadView;
 pub(crate) use contracts::{
     ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
     UntrackedWriteRow,

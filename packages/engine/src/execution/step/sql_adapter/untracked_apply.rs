@@ -5,7 +5,7 @@ use crate::contracts::PlannedStateRow;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::transaction::{
     compile_filesystem_finalization_from_state_in_transaction, PlannedPublicUntrackedWriteUnit,
-    WriteExecutionHost,
+    WriteExecutionContext,
 };
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -15,11 +15,11 @@ use super::runtime::WriteExecutionOutcome;
 const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) async fn run_public_untracked_write_txn_with_transaction(
-    host: &dyn WriteExecutionHost,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedPublicUntrackedWriteUnit,
 ) -> Result<Option<WriteExecutionOutcome>, LixError> {
-    let mut runtime_functions = plan.runtime_state.functions().clone();
+    let mut runtime_functions = plan.function_bindings.provider().clone();
     let timestamp = runtime_functions.timestamp();
 
     if plan.execution.persist_filesystem_payloads_before_write {
@@ -50,25 +50,28 @@ pub(crate) async fn run_public_untracked_write_txn_with_transaction(
     if plan.execution.persist_filesystem_payloads_before_write
         && !filesystem_finalization.binary_blob_writes.is_empty()
     {
-        host.persist_binary_blob_writes_in_transaction(
-            transaction,
-            &filesystem_finalization.binary_blob_writes,
-        )
-        .await
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "public untracked filesystem payload persistence failed inside write txn: {}",
-                error.description
-            ),
-        })?;
+        execution_context
+            .persist_binary_blob_writes_in_transaction(
+                transaction,
+                &filesystem_finalization.binary_blob_writes,
+            )
+            .await
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "public untracked filesystem payload persistence failed inside write txn: {}",
+                    error.description
+                ),
+            })?;
     }
     if filesystem_finalization.should_run_gc {
-        host.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+        execution_context
+            .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
             .await?;
     }
 
-    host.persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.functions())
+    execution_context
+        .persist_runtime_sequence_in_transaction(transaction, plan.function_bindings.provider())
         .await
         .map_err(|error| LixError {
             code: error.code,

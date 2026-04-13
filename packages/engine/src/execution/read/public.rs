@@ -1,11 +1,12 @@
 use crate::catalog::SurfaceReadFreshness;
+use crate::contracts::PendingPublicReadTransaction;
 use crate::contracts::ReadExecutionHost;
-use crate::contracts::{LiveStateQueryBackend, PendingPublicReadTransaction};
 use crate::contracts::{
     PreparedPublicRead, PreparedPublicReadPlanArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
 use crate::diagnostics::sanitize_lowered_public_sql_error_description;
+use crate::live_state::LiveStateQueryBackend;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 

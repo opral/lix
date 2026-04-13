@@ -112,7 +112,7 @@ enum PollWork {
         query: ObserveQuery,
         session_dependency_generations: BTreeMap<SessionDependency, u64>,
     },
-    SessionRuntime {
+    SessionState {
         query: ObserveQuery,
         session_dependency_generations: BTreeMap<SessionDependency, u64>,
     },
@@ -400,7 +400,7 @@ impl ObserveState {
                 }
             } else if source.session_dependency_generations_changed(&session_dependency_generations)
             {
-                PollWork::SessionRuntime {
+                PollWork::SessionState {
                     query: source.query.clone(),
                     session_dependency_generations,
                 }
@@ -426,7 +426,7 @@ impl ObserveState {
                 session_dependency_generations,
             } => {
                 let latest_tick_seq =
-                    latest_observe_tick_seq(session.session_runtime().backend().as_ref()).await?;
+                    latest_observe_tick_seq(session.session_host().backend().as_ref()).await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
@@ -437,7 +437,7 @@ impl ObserveState {
                     mark_initialized: true,
                 }
             }
-            PollWork::SessionRuntime {
+            PollWork::SessionState {
                 query,
                 session_dependency_generations,
             } => {
@@ -474,7 +474,7 @@ impl ObserveState {
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
                 let observed_ticks = observe_ticks_since(
-                    session.session_runtime().backend().as_ref(),
+                    session.session_host().backend().as_ref(),
                     last_seen_tick_seq,
                 )
                 .await?;
@@ -769,7 +769,7 @@ fn build_shared_observe_source(
         include: filter.writer_keys.iter().cloned().collect(),
         exclude: filter.exclude_writer_keys.iter().cloned().collect(),
     };
-    let state_commits = session.session_runtime().state_commit_stream(filter);
+    let state_commits = session.session_host().state_commit_stream(filter);
 
     Ok(SharedObserveSource::new(
         query,
@@ -1089,11 +1089,8 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1130,11 +1127,8 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1236,11 +1230,8 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let mut state = build_observe_state(
                 &session,
@@ -1283,11 +1274,8 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session = Session::new_for_test(
-                crate::session::runtime::SessionRuntime::new(lix.session_host()),
-                "version-test".to_string(),
-                Vec::new(),
-            );
+            let session =
+                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
             let mut state = build_observe_state(
                 &session,

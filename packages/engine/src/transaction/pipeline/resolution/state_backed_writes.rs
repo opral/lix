@@ -2,12 +2,14 @@ use super::*;
 use crate::contracts::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
-use crate::contracts::{PendingOverlayView, PendingSemanticStorage};
-use crate::live_state::{decode_registered_schema_row, scan_live_rows, LiveRowQuery, RowReadMode};
+use crate::live_state::{
+    decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
+};
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
     collect_state_column_overrides_with_shared_runtime, schema_from_registered_snapshot, SchemaKey,
 };
+use crate::transaction::overlay::{PendingOverlay, PendingSemanticStorage};
 use crate::transaction::pipeline::resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
@@ -30,7 +32,7 @@ const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
 
 async fn load_latest_registered_schema(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     schema_key: &str,
 ) -> Result<Option<JsonValue>, crate::LixError> {
     let mut latest = None::<(SchemaKey, JsonValue)>;
@@ -40,7 +42,7 @@ async fn load_latest_registered_schema(
         &LiveRowQuery {
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
             version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
-            mode: RowReadMode::Tracked,
+            source: LiveRowSource::Tracked,
             constraints: Vec::new(),
             include_tombstones: false,
         },
@@ -59,8 +61,8 @@ async fn load_latest_registered_schema(
         }
     }
 
-    if let Some(pending_overlay_view) = pending_overlay_view {
-        for (_, snapshot_content) in pending_overlay_view.visible_registered_schema_entries() {
+    if let Some(pending_overlay) = pending_overlay {
+        for (_, snapshot_content) in pending_overlay.visible_registered_schema_entries() {
             let Some(snapshot_content) = snapshot_content else {
                 continue;
             };
@@ -75,7 +77,7 @@ async fn load_latest_registered_schema(
             PendingSemanticStorage::Tracked,
             PendingSemanticStorage::Untracked,
         ] {
-            for row in pending_overlay_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+            for row in pending_overlay.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
                 let Some(snapshot_content) = row.snapshot_content else {
                     continue;
                 };
@@ -232,7 +234,7 @@ fn authoritative_pre_state_row_for_effective_row(
 pub(super) async fn resolve_state_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -241,7 +243,7 @@ where
 {
     let state_schema = load_optional_annotation_schema(
         hydrator.backend(),
-        pending_overlay_view,
+        pending_overlay,
         planned_write,
         functions.clone(),
     )
@@ -260,7 +262,7 @@ where
 pub(super) async fn resolve_entity_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -269,7 +271,7 @@ where
 {
     let entity_schema = load_entity_schema(
         hydrator.backend(),
-        pending_overlay_view,
+        pending_overlay,
         planned_write,
         functions.clone(),
     )
@@ -1048,7 +1050,7 @@ fn selector_row_version_id(
 
 async fn load_optional_annotation_schema<P>(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<LoadedAnnotationSchema>, crate::LixError>
@@ -1059,7 +1061,7 @@ where
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        match load_latest_registered_schema(backend, pending_overlay_view, &schema_key).await? {
+        match load_latest_registered_schema(backend, pending_overlay, &schema_key).await? {
             Some(schema) => schema,
             None => {
                 return Ok(None);
@@ -1071,7 +1073,7 @@ where
 
 async fn load_entity_schema<P>(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
 ) -> Result<EntityWriteSchema, crate::LixError>
@@ -1082,7 +1084,7 @@ where
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        load_latest_registered_schema(backend, pending_overlay_view, &schema_key)
+        load_latest_registered_schema(backend, pending_overlay, &schema_key)
             .await?
             .ok_or_else(|| {
                 crate::LixError::new(

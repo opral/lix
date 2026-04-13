@@ -35,14 +35,7 @@ use crate::contracts::{
 use crate::schema::{schema_key_from_definition, SchemaKey};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum RowReadMode {
-    Tracked,
-    Untracked,
-    Effective,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum LiveRowSemantics {
+pub enum LiveRowSource {
     Tracked,
     Untracked,
     Effective,
@@ -52,7 +45,8 @@ pub enum LiveRowSemantics {
 pub struct LiveRowQuery {
     pub schema_key: String,
     pub version_id: String,
-    pub mode: RowReadMode,
+    #[serde(alias = "mode")]
+    pub source: LiveRowSource,
     #[serde(default)]
     pub constraints: Vec<ScanConstraint>,
     #[serde(default)]
@@ -61,7 +55,8 @@ pub struct LiveRowQuery {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExactLiveRowQuery {
-    pub semantics: LiveRowSemantics,
+    #[serde(alias = "semantics")]
+    pub source: LiveRowSource,
     pub schema_key: String,
     pub version_id: String,
     pub entity_id: String,
@@ -140,10 +135,10 @@ pub async fn scan_live_rows(
     backend: &dyn LixBackend,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
-    match request.mode {
-        RowReadMode::Tracked => scan_tracked_rows(backend, request).await,
-        RowReadMode::Untracked => scan_untracked_rows(backend, request).await,
-        RowReadMode::Effective => scan_effective_rows(backend, request).await,
+    match request.source {
+        LiveRowSource::Tracked => scan_tracked_rows(backend, request).await,
+        LiveRowSource::Untracked => scan_untracked_rows(backend, request).await,
+        LiveRowSource::Effective => scan_effective_rows(backend, request).await,
     }
 }
 
@@ -151,10 +146,10 @@ pub async fn load_exact_live_row(
     backend: &dyn LixBackend,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
-    match request.semantics {
-        LiveRowSemantics::Tracked => load_exact_tracked_row(backend, request).await,
-        LiveRowSemantics::Untracked => load_exact_untracked_row(backend, request).await,
-        LiveRowSemantics::Effective => load_exact_effective_row(backend, request).await,
+    match request.source {
+        LiveRowSource::Tracked => load_exact_tracked_row(backend, request).await,
+        LiveRowSource::Untracked => load_exact_untracked_row(backend, request).await,
+        LiveRowSource::Effective => load_exact_effective_row(backend, request).await,
     }
 }
 
@@ -403,7 +398,7 @@ async fn load_exact_effective_row(
     let mut query = LiveRowQuery {
         schema_key: request.schema_key.clone(),
         version_id: request.version_id.clone(),
-        mode: RowReadMode::Effective,
+        source: LiveRowSource::Effective,
         constraints: vec![ScanConstraint {
             field: super::ScanField::EntityId,
             operator: super::ScanOperator::Eq(Value::Text(request.entity_id.clone())),
@@ -976,7 +971,7 @@ mod tests {
     use super::{
         decode_registered_schema_row, exact_live_row_matches_query, load_exact_live_row,
         partition_live_rows_for_write, tracked_write_from_live_row, untracked_write_from_live_row,
-        ExactLiveRowQuery, LiveRow, LiveRowSemantics,
+        ExactLiveRowQuery, LiveRow, LiveRowSource,
     };
     use crate::live_state::tracked::TrackedWriteOperation;
     use crate::live_state::untracked::UntrackedWriteOperation;
@@ -1029,7 +1024,7 @@ mod tests {
 
     fn exact_live_row_query() -> ExactLiveRowQuery {
         ExactLiveRowQuery {
-            semantics: LiveRowSemantics::Tracked,
+            source: LiveRowSource::Tracked,
             schema_key: "lix_key_value".to_string(),
             version_id: "main".to_string(),
             entity_id: "settings".to_string(),
@@ -1233,7 +1228,7 @@ mod tests {
         let row = load_exact_live_row(
             &backend,
             &ExactLiveRowQuery {
-                semantics: LiveRowSemantics::Effective,
+                source: LiveRowSource::Effective,
                 schema_key: "lix_key_value".to_string(),
                 version_id: "main".to_string(),
                 entity_id: "settings".to_string(),

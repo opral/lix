@@ -6,8 +6,8 @@ use crate::transaction::buffered::{
     TransactionWriteDelta,
 };
 use crate::transaction::{
-    append_observe_tick_in_transaction, PendingWriteOverlayView, PreparedWriteStatementStager,
-    TransactionCommitOutcome, WriteExecutionHost,
+    append_observe_tick_in_transaction, PendingWriteOverlay, PreparedWriteStatementStager,
+    TransactionCommitOutcome, WriteExecutionContext,
 };
 use crate::{LixBackendTransaction, LixError};
 
@@ -36,12 +36,12 @@ impl<'a> BufferedWriteTransaction<'a> {
 
     pub(crate) async fn commit_buffered_write(
         mut self,
-        host: &dyn WriteExecutionHost,
+        execution_context: &dyn WriteExecutionContext,
         mut execution_input: BufferedWriteExecutionInput,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let initial_active_version_id = execution_input.active_version_id().to_string();
         let initial_active_account_ids = execution_input.active_account_ids().to_vec();
-        self.prepare_buffered_write_commit(host, &mut execution_input)
+        self.prepare_buffered_write_commit(execution_context, &mut execution_input)
             .await?;
         let mut outcome = self.buffered_write_state.commit_outcome();
         if execution_input.active_version_id() != initial_active_version_id {
@@ -71,10 +71,10 @@ impl<'a> BufferedWriteTransaction<'a> {
         self.buffered_write_state.journal_is_empty()
     }
 
-    pub(crate) fn buffered_write_pending_write_overlay_view(
+    pub(crate) fn buffered_write_pending_write_overlay(
         &self,
-    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
-        self.buffered_write_state.pending_write_overlay_view()
+    ) -> Result<Option<PendingWriteOverlay>, LixError> {
+        self.buffered_write_state.pending_write_overlay()
     }
 
     pub(crate) fn can_stage_transaction_write_delta(
@@ -105,7 +105,7 @@ impl<'a> BufferedWriteTransaction<'a> {
 
     pub(crate) async fn flush_buffered_write_journal(
         &mut self,
-        host: &dyn WriteExecutionHost,
+        execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         let Some(delta) = self.buffered_write_state.take_staged_delta() else {
@@ -115,7 +115,11 @@ impl<'a> BufferedWriteTransaction<'a> {
         apply_schema_registrations_in_transaction(transaction, delta.schema_registrations())
             .await?;
         let write_outcome = delta
-            .execute(host, transaction, Some(&mut self.pending_commit_state))
+            .execute(
+                execution_context,
+                transaction,
+                Some(&mut self.pending_commit_state),
+            )
             .await?;
         apply_buffered_write_execution_outcome(
             &mut self.buffered_write_state,
@@ -128,10 +132,10 @@ impl<'a> BufferedWriteTransaction<'a> {
 
     pub(crate) async fn prepare_buffered_write_commit(
         &mut self,
-        host: &dyn WriteExecutionHost,
+        execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
-        self.flush_buffered_write_journal(host, execution_input)
+        self.flush_buffered_write_journal(execution_context, execution_input)
             .await?;
         if !self.buffered_write_state.observe_tick_emitted()
             && !self
@@ -211,10 +215,10 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         self.buffered_write_state.journal_is_empty()
     }
 
-    pub(crate) fn buffered_write_pending_write_overlay_view(
+    pub(crate) fn buffered_write_pending_write_overlay(
         &self,
-    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
-        self.buffered_write_state.pending_write_overlay_view()
+    ) -> Result<Option<PendingWriteOverlay>, LixError> {
+        self.buffered_write_state.pending_write_overlay()
     }
 
     pub(crate) fn can_stage_transaction_write_delta(
@@ -241,7 +245,7 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
 
     pub(crate) async fn flush_buffered_write_journal(
         &mut self,
-        host: &dyn WriteExecutionHost,
+        execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         let Some(delta) = self.buffered_write_state.take_staged_delta() else {
@@ -251,7 +255,11 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         apply_schema_registrations_in_transaction(self.backend_txn, delta.schema_registrations())
             .await?;
         let write_outcome = delta
-            .execute(host, self.backend_txn, Some(&mut self.pending_commit_state))
+            .execute(
+                execution_context,
+                self.backend_txn,
+                Some(&mut self.pending_commit_state),
+            )
             .await?;
         apply_buffered_write_execution_outcome(
             &mut self.buffered_write_state,

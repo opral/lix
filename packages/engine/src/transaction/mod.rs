@@ -34,7 +34,7 @@ pub(crate) use buffered::{
 };
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
-pub(crate) use contracts::{DeferredCommitEffects, WriteExecutionHost};
+pub(crate) use contracts::{DeferredCommitEffects, WriteExecutionContext};
 #[cfg(test)]
 pub(crate) use filesystem::runtime::FilesystemTransactionFileState;
 pub(crate) use filesystem::runtime::{
@@ -51,15 +51,18 @@ pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
 #[cfg(test)]
 pub(crate) use live_state_write_transaction::LiveStateWriteTransaction;
 pub(crate) use observe_tick::append_observe_tick_in_transaction;
-pub(crate) use overlay::PendingWriteOverlayView;
+pub(crate) use overlay::{
+    PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
+    PendingWriteOverlay,
+};
 pub(crate) use pipeline::resolution::prepared_artifacts::SchemaProof;
 #[cfg(test)]
 pub(crate) use pipeline::resolution::resolve_write_plan_with_functions;
 pub(crate) use pipeline::{
-    ensure_function_runtime_state_for_write_scope,
+    ensure_function_bindings_for_write_scope,
     execute_parsed_statements_in_borrowed_write_transaction,
     execute_parsed_statements_in_write_transaction, execute_statement_batch_with_write_transaction,
-    prepared_write_runtime_state_for_execution, validate_commit_time_write, WriteResolveError,
+    prepared_write_function_bindings_for_execution, validate_commit_time_write, WriteResolveError,
     WriteSelectorResolver,
 };
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};

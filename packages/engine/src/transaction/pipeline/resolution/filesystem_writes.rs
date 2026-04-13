@@ -8,21 +8,21 @@ use super::*;
 use crate::catalog::{
     builtin_catalog_compiler_facade, ensure_no_directory_at_file_path,
     ensure_no_file_at_directory_path, load_directory_row_by_id,
-    load_directory_row_by_id_with_pending_write_overlay_view, load_directory_rows_under_path,
-    load_file_row_by_id_with_pending_write_overlay_view,
-    load_file_row_by_id_without_path_with_pending_write_overlay_view,
-    load_file_row_by_path_with_pending_write_overlay_view, load_file_rows_under_path,
-    lookup_directory_id_by_path, lookup_directory_id_by_path_with_pending_write_overlay_view,
-    lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_write_overlay_view,
-    CatalogCompilerApi, CatalogWriteSurfaceSemantics, DirectoryFilesystemRow, FileFilesystemRow,
+    load_directory_row_by_id_with_pending_overlay, load_directory_rows_under_path,
+    load_file_row_by_id_with_pending_overlay,
+    load_file_row_by_id_without_path_with_pending_overlay,
+    load_file_row_by_path_with_pending_overlay, load_file_rows_under_path,
+    lookup_directory_id_by_path, lookup_directory_id_by_path_with_pending_overlay,
+    lookup_directory_path_by_id, lookup_file_id_by_path_with_pending_overlay, CatalogCompilerApi,
+    CatalogWriteSurfaceSemantics, DirectoryFilesystemRow, FileFilesystemRow,
     FilesystemProjectionScope, FilesystemRelationKind,
 };
 use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::contracts::PendingOverlayView;
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     resolve_placeholder_index, DirectoryInsertAssignments, DirectoryUpdateAssignments,
     FileInsertAssignments, FileUpdateAssignments, FilesystemWriteIntent, PlaceholderState,
@@ -62,9 +62,7 @@ pub(super) async fn resolve_filesystem_write(
                 resolve_existing_file_write(
                     hydrator.backend(),
                     planned_write,
-                    hydrator
-                        .pending_state_overlay()
-                        .map(|overlay| overlay.as_pending_overlay_view()),
+                    hydrator.pending_overlay(),
                     selector_resolver,
                 )
                 .await
@@ -78,9 +76,7 @@ pub(super) async fn resolve_filesystem_write(
                 resolve_existing_directory_write(
                     hydrator.backend(),
                     planned_write,
-                    hydrator
-                        .pending_state_overlay()
-                        .map(|overlay| overlay.as_pending_overlay_view()),
+                    hydrator.pending_overlay(),
                     selector_resolver,
                 )
                 .await
@@ -233,9 +229,7 @@ async fn resolve_directory_insert_write_plan(
     for (execution_mode, version_id, assignments_batch) in grouped_batches {
         let snapshot = build_directory_insert_snapshot(
             hydrator.backend(),
-            hydrator
-                .pending_state_overlay()
-                .map(|overlay| overlay.as_pending_overlay_view()),
+            hydrator.pending_overlay(),
             &assignments_batch,
             &version_id,
             lookup_scope,
@@ -273,7 +267,7 @@ async fn resolve_directory_insert_write_plan(
 async fn resolve_existing_directory_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
@@ -281,7 +275,7 @@ async fn resolve_existing_directory_write(
     let current_rows = load_target_directory_rows_for_selector(
         backend,
         planned_write,
-        pending_write_overlay_view,
+        pending_write_overlay,
         &version_id,
         lookup_scope,
         selector_resolver,
@@ -565,9 +559,7 @@ async fn resolve_file_insert_write_plan(
     for (execution_mode, version_id, assignments_batch) in grouped_batches {
         let snapshot = build_file_insert_snapshot(
             hydrator.backend(),
-            hydrator
-                .pending_state_overlay()
-                .map(|overlay| overlay.as_pending_overlay_view()),
+            hydrator.pending_overlay(),
             &assignments_batch,
             &version_id,
             lookup_scope,
@@ -649,7 +641,7 @@ async fn resolve_file_insert_write_plan(
 async fn resolve_existing_file_write(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
@@ -660,7 +652,7 @@ async fn resolve_existing_file_write(
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 &version_id,
                 lookup_scope,
                 assignments.path.is_some(),
@@ -722,7 +714,7 @@ async fn resolve_existing_file_write(
 
                 let (next_row, ancestor_rows) = resolve_file_update_target(
                     backend,
-                    pending_write_overlay_view,
+                    pending_write_overlay,
                     &current_row,
                     &assignments,
                     &version_id,
@@ -807,7 +799,7 @@ async fn resolve_existing_file_write(
             let current_rows = load_target_file_rows_for_selector(
                 backend,
                 planned_write,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 &version_id,
                 lookup_scope,
                 true,
@@ -915,7 +907,7 @@ fn filesystem_write_kind(
 
 async fn resolve_parent_directory_target(
     backend: &dyn LixBackend,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,
     directory_path: Option<&str>,
     untracked: bool,
@@ -926,7 +918,7 @@ async fn resolve_parent_directory_target(
     };
     let missing_rows = resolve_missing_directory_rows(
         backend,
-        pending_write_overlay_view,
+        pending_write_overlay,
         version_id,
         directory_path,
         untracked,
@@ -936,9 +928,9 @@ async fn resolve_parent_directory_target(
     let directory_id = if let Some(last_row) = missing_rows.last() {
         Some(last_row.id.clone())
     } else {
-        lookup_directory_id_by_path_with_pending_write_overlay_view(
+        lookup_directory_id_by_path_with_pending_overlay(
             backend,
-            pending_write_overlay_view,
+            pending_write_overlay,
             version_id,
             &NormalizedDirectoryPath::from_normalized(directory_path.to_string()),
             lookup_scope,
@@ -1027,7 +1019,7 @@ fn set_filesystem_deleted_state(
 
 async fn resolve_missing_directory_rows(
     backend: &dyn LixBackend,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,
     directory_path: &str,
     untracked: bool,
@@ -1039,9 +1031,9 @@ async fn resolve_missing_directory_rows(
     paths.push(directory_path.to_string());
 
     for candidate_path in paths {
-        if let Some(existing_id) = lookup_directory_id_by_path_with_pending_write_overlay_view(
+        if let Some(existing_id) = lookup_directory_id_by_path_with_pending_overlay(
             backend,
-            pending_write_overlay_view,
+            pending_write_overlay,
             version_id,
             &NormalizedDirectoryPath::from_normalized(candidate_path.clone()),
             lookup_scope,
@@ -1063,9 +1055,9 @@ async fn resolve_missing_directory_rows(
                 if let Some(parent_id) = known_ids.get(&parent_path).cloned() {
                     Some(parent_id)
                 } else if let Some(existing_parent_id) =
-                    lookup_directory_id_by_path_with_pending_write_overlay_view(
+                    lookup_directory_id_by_path_with_pending_overlay(
                         backend,
-                        pending_write_overlay_view,
+                        pending_write_overlay,
                         version_id,
                         &NormalizedDirectoryPath::from_normalized(parent_path.clone()),
                         lookup_scope,
@@ -1099,7 +1091,7 @@ async fn resolve_missing_directory_rows(
 
 async fn resolve_file_update_target(
     backend: &dyn LixBackend,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     current_row: &FileFilesystemRow,
     assignments: &FileUpdateAssignments,
     version_id: &str,
@@ -1114,7 +1106,7 @@ async fn resolve_file_update_target(
             ensure_no_directory_at_file_path(backend, version_id, parsed, lookup_scope).await?;
             let (directory_id, missing_ancestors) = resolve_parent_directory_target(
                 backend,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 version_id,
                 parsed.directory_path.as_deref(),
                 current_row.untracked,
@@ -1138,9 +1130,9 @@ async fn resolve_file_update_target(
         };
 
     if let Some(next_path) = next_path.as_ref() {
-        if let Some(existing_id) = lookup_file_id_by_path_with_pending_write_overlay_view(
+        if let Some(existing_id) = lookup_file_id_by_path_with_pending_overlay(
             backend,
-            pending_write_overlay_view,
+            pending_write_overlay,
             version_id,
             &ParsedFilePath::from_normalized_path(next_path.clone())
                 .map_err(write_resolve_backend_error)?,
@@ -1504,15 +1496,15 @@ fn resolve_proposed_directory_path(
 async fn load_target_directory_rows_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
     if let Some(directory_id) = exact_id_selector_value(planned_write) {
-        return Ok(load_directory_row_by_id_with_pending_write_overlay_view(
+        return Ok(load_directory_row_by_id_with_pending_overlay(
             backend,
-            pending_write_overlay_view,
+            pending_write_overlay,
             version_id,
             &directory_id,
             lookup_scope,
@@ -1542,7 +1534,7 @@ async fn load_target_directory_rows_for_selector(
 async fn load_target_file_rows_for_selector(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
     require_paths: bool,
@@ -1550,18 +1542,18 @@ async fn load_target_file_rows_for_selector(
 ) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
     if let Some(file_id) = exact_id_selector_value(planned_write) {
         let row = if require_paths {
-            load_file_row_by_id_with_pending_write_overlay_view(
+            load_file_row_by_id_with_pending_overlay(
                 backend,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 version_id,
                 &file_id,
                 lookup_scope,
             )
             .await?
         } else {
-            load_file_row_by_id_without_path_with_pending_write_overlay_view(
+            load_file_row_by_id_without_path_with_pending_overlay(
                 backend,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 version_id,
                 &file_id,
                 lookup_scope,
@@ -1575,9 +1567,9 @@ async fn load_target_file_rows_for_selector(
         for path in paths {
             let parsed =
                 ParsedFilePath::from_normalized_path(path).map_err(write_resolve_backend_error)?;
-            let row = load_file_row_by_path_with_pending_write_overlay_view(
+            let row = load_file_row_by_path_with_pending_overlay(
                 backend,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 version_id,
                 &parsed,
                 lookup_scope,
@@ -1599,18 +1591,18 @@ async fn load_target_file_rows_for_selector(
     let mut rows = Vec::new();
     for file_id in file_ids {
         let row = if require_paths {
-            load_file_row_by_id_with_pending_write_overlay_view(
+            load_file_row_by_id_with_pending_overlay(
                 backend,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 version_id,
                 &file_id,
                 lookup_scope,
             )
             .await?
         } else {
-            load_file_row_by_id_without_path_with_pending_write_overlay_view(
+            load_file_row_by_id_without_path_with_pending_overlay(
                 backend,
-                pending_write_overlay_view,
+                pending_write_overlay,
                 version_id,
                 &file_id,
                 lookup_scope,

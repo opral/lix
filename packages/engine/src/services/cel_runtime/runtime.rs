@@ -181,8 +181,8 @@ mod tests {
     fn production_consumers_use_shared_runtime() {
         for (path, source) in [
             (
-                "packages/engine/src/services/plugin_runtime.rs",
-                include_str!("../plugin_runtime.rs"),
+                "packages/engine/src/services/plugin_archive.rs",
+                include_str!("../plugin_archive.rs"),
             ),
             (
                 "packages/engine/src/catalog/registry.rs",

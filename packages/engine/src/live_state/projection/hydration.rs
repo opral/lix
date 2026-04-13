@@ -483,7 +483,7 @@ mod tests {
         .to_string()
     }
 
-    fn bootstrap_tracked_live_row(
+    fn tracked_live_row(
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
@@ -512,7 +512,7 @@ mod tests {
         }
     }
 
-    fn bootstrap_untracked_live_row(
+    fn untracked_live_row(
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
@@ -558,7 +558,7 @@ mod tests {
             .expect("write transaction should begin");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_tracked_live_row(
+            &[tracked_live_row(
                 crate::contracts::GLOBAL_VERSION_ID,
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
@@ -578,7 +578,7 @@ mod tests {
         .expect("global descriptor should seed");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_tracked_live_row(
+            &[tracked_live_row(
                 "version-main",
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
@@ -598,7 +598,7 @@ mod tests {
         .expect("main descriptor should seed");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_untracked_live_row(
+            &[untracked_live_row(
                 crate::contracts::GLOBAL_VERSION_ID,
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
@@ -613,7 +613,7 @@ mod tests {
         .expect("global ref should seed");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_untracked_live_row(
+            &[untracked_live_row(
                 "version-main",
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
@@ -713,7 +713,7 @@ mod tests {
             .expect("write transaction should begin");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_untracked_live_row(
+            &[untracked_live_row(
                 "version-main",
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
@@ -728,7 +728,7 @@ mod tests {
         .expect("main ref should seed");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_untracked_live_row(
+            &[untracked_live_row(
                 "version-dev",
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
@@ -743,7 +743,7 @@ mod tests {
         .expect("dev ref should seed");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_tracked_live_row(
+            &[tracked_live_row(
                 "theme",
                 &key_value_schema_key(),
                 &key_value_schema_version(),
@@ -759,7 +759,7 @@ mod tests {
         .expect("main key value row should seed");
         live_state::write_live_rows(
             transaction.as_mut(),
-            &[bootstrap_tracked_live_row(
+            &[tracked_live_row(
                 "theme",
                 &key_value_schema_key(),
                 &key_value_schema_version(),

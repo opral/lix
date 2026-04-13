@@ -4,22 +4,21 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedSurface,
 };
-use crate::contracts::PreparedWriteRuntimeState;
 use crate::contracts::{
     coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
     IdempotencyKey, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
     PreparedDirectWriteArtifact, PreparedPublicWrite, PreparedPublicWriteExecutionPartition,
     PreparedPublicWritePlanArtifact, PreparedTrackedWriteExecution,
-    PreparedUntrackedWriteExecution, PreparedWriteStatement, ResultContract, RowIdentity,
-    SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
+    PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings, PreparedWriteStatement,
+    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
 };
-use crate::contracts::{PendingSemanticRow, PendingSemanticStorage};
 use crate::transaction::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
 use crate::transaction::filesystem::state::filesystem_transaction_state_from_planned;
-use crate::transaction::PendingWriteOverlayView;
+use crate::transaction::overlay::{PendingSemanticRow, PendingSemanticStorage};
+use crate::transaction::PendingWriteOverlay;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -31,7 +30,7 @@ pub(crate) struct TrackedTxnUnit {
     pub(crate) public_write: PreparedPublicWrite,
     pub(crate) execution: PreparedTrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) runtime_state: PreparedWriteRuntimeState,
+    pub(crate) function_bindings: PreparedWriteFunctionBindings,
     pub(crate) writer_key: Option<String>,
 }
 
@@ -58,14 +57,14 @@ fn build_tracked_txn_unit(
     public_write: &PreparedPublicWrite,
     execution: &PreparedTrackedWriteExecution,
     filesystem_state: &FilesystemTransactionState,
-    runtime_state: &PreparedWriteRuntimeState,
+    function_bindings: &PreparedWriteFunctionBindings,
 ) -> TrackedTxnUnit {
     TrackedTxnUnit {
         public_writes: vec![public_write.clone()],
         public_write: public_write.clone(),
         execution: execution.clone(),
         filesystem_state: filesystem_state.clone(),
-        runtime_state: runtime_state.clone(),
+        function_bindings: function_bindings.clone(),
         writer_key: public_write.contract.writer_key.clone(),
     }
 }
@@ -74,7 +73,7 @@ fn build_tracked_txn_unit(
 pub(crate) struct PlannedPublicUntrackedWriteUnit {
     pub(crate) execution: PreparedUntrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) runtime_state: PreparedWriteRuntimeState,
+    pub(crate) function_bindings: PreparedWriteFunctionBindings,
     pub(crate) writer_key: Option<String>,
 }
 
@@ -82,7 +81,7 @@ pub(crate) struct PlannedPublicUntrackedWriteUnit {
 pub(crate) struct PlannedDirectWriteUnit {
     pub(crate) execution: PreparedDirectWriteArtifact,
     pub(crate) result_contract: ResultContract,
-    pub(crate) runtime_state: PreparedWriteRuntimeState,
+    pub(crate) function_bindings: PreparedWriteFunctionBindings,
 }
 
 #[derive(Clone)]
@@ -183,8 +182,8 @@ impl TransactionWriteDelta {
         self.writer_key_overlay.clone()
     }
 
-    pub(crate) fn pending_write_overlay_view(&self) -> Option<PendingWriteOverlayView> {
-        PendingWriteOverlayView::new(
+    pub(crate) fn pending_write_overlay(&self) -> Option<PendingWriteOverlay> {
+        PendingWriteOverlay::new(
             self.registered_schema_overlay(),
             self.semantic_overlay(),
             self.filesystem_overlay(),
@@ -292,13 +291,11 @@ impl BufferedWriteJournal {
         Some(delta)
     }
 
-    pub(crate) fn pending_write_overlay_view(
-        &self,
-    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
+    pub(crate) fn pending_write_overlay(&self) -> Result<Option<PendingWriteOverlay>, LixError> {
         Ok(self
             .staged_delta
             .as_ref()
-            .and_then(TransactionWriteDelta::pending_write_overlay_view))
+            .and_then(TransactionWriteDelta::pending_write_overlay))
     }
 
     fn current_materialization_plan(&self) -> Option<&PlannedWritePlan> {
@@ -420,7 +417,7 @@ impl PendingSemanticOverlay {
 
 pub(crate) fn build_planned_write_plan(
     prepared: &PreparedWriteStatement,
-    runtime_state: &PreparedWriteRuntimeState,
+    function_bindings: &PreparedWriteFunctionBindings,
 ) -> Option<PlannedWritePlan> {
     let mut units = Vec::new();
 
@@ -443,7 +440,7 @@ pub(crate) fn build_planned_write_plan(
                             public_write,
                             tracked,
                             &filesystem_state,
-                            runtime_state,
+                            function_bindings,
                         );
                         units.push(TransactionWriteUnit::PublicTracked(tracked_plan));
                     }
@@ -452,7 +449,7 @@ pub(crate) fn build_planned_write_plan(
                             PlannedPublicUntrackedWriteUnit {
                                 execution: untracked.clone(),
                                 filesystem_state: filesystem_state.clone(),
-                                runtime_state: runtime_state.clone(),
+                                function_bindings: function_bindings.clone(),
                                 writer_key: public_write.contract.writer_key.clone(),
                             },
                         ));
@@ -477,7 +474,7 @@ pub(crate) fn build_planned_write_plan(
                         semantic_effects: PlanEffects::default(),
                     },
                     &filesystem_state,
-                    runtime_state,
+                    function_bindings,
                 )));
             }
         }
@@ -488,7 +485,7 @@ pub(crate) fn build_planned_write_plan(
         units.push(TransactionWriteUnit::Direct(PlannedDirectWriteUnit {
             execution: direct_execution.clone(),
             result_contract: prepared.result_contract,
-            runtime_state: runtime_state.clone(),
+            function_bindings: function_bindings.clone(),
         }));
     }
 
@@ -503,9 +500,9 @@ pub(crate) fn build_planned_write_plan(
 
 pub(crate) fn build_transaction_write_delta(
     prepared: &PreparedWriteStatement,
-    runtime_state: &PreparedWriteRuntimeState,
+    function_bindings: &PreparedWriteFunctionBindings,
 ) -> Result<Option<TransactionWriteDelta>, LixError> {
-    build_planned_write_plan(prepared, runtime_state)
+    build_planned_write_plan(prepared, function_bindings)
         .map(TransactionWriteDelta::from_materialization_plan)
         .transpose()
 }

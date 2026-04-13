@@ -5,13 +5,13 @@ use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::PendingOverlayView;
 use crate::contracts::SharedFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::services::functions::SystemFunctionProvider;
 use crate::services::wasm_runtime::NoopWasmRuntime;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
@@ -274,7 +274,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     backend: &dyn LixBackend,
     projection_registry: &CatalogProjectionRegistry,
     planned_write: &PlannedWrite,
-    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let selector_functions = crate::contracts::clone_boxed_function_provider(
         &SharedFunctionProvider::new(SystemFunctionProvider),
@@ -282,7 +282,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     let selector_resolver = SessionWriteSelectorResolver::new(
         backend,
         projection_registry,
-        pending_write_overlay_view,
+        pending_write_overlay,
         &selector_functions,
     )
     .await
@@ -292,7 +292,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     resolve_write_plan_with_functions(
         backend,
         planned_write,
-        pending_write_overlay_view,
+        pending_write_overlay,
         SharedFunctionProvider::new(SystemFunctionProvider),
         &selector_resolver,
     )

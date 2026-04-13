@@ -3,22 +3,22 @@ use super::{
 };
 
 #[derive(Clone)]
-pub(crate) struct FunctionRuntimeState {
+pub(crate) struct FunctionBindings {
     deterministic_enabled: bool,
-    functions: DynFunctionProvider,
+    provider: DynFunctionProvider,
 }
 
-impl FunctionRuntimeState {
+impl FunctionBindings {
     pub(crate) fn from_prepared_parts<P>(
         deterministic_enabled: bool,
-        functions: &SharedFunctionProvider<P>,
+        provider: &SharedFunctionProvider<P>,
     ) -> Self
     where
         P: LixFunctionProvider + Send + 'static,
     {
         Self {
             deterministic_enabled,
-            functions: clone_boxed_function_provider(functions),
+            provider: clone_boxed_function_provider(provider),
         }
     }
 
@@ -27,6 +27,6 @@ impl FunctionRuntimeState {
     }
 
     pub(crate) fn provider(&self) -> &DynFunctionProvider {
-        &self.functions
+        &self.provider
     }
 }

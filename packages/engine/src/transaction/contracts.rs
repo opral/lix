@@ -1,15 +1,20 @@
 use async_trait::async_trait;
 
-use crate::contracts::PendingOverlayView;
+use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
+use crate::contracts::CompiledSchemaCache;
 use crate::contracts::TrackedCommitExecutionOutcome;
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::contracts::{
+    DynFunctionProvider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
+};
 use crate::contracts::{PendingCommitState, PreparedPublicRead};
 #[cfg(test)]
 use crate::contracts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::sql::SqlCompilerSeed;
+use crate::transaction::overlay::PendingOverlay;
 use crate::LixError;
-use crate::{LixBackendTransaction, QueryResult};
+use crate::{LixBackend, LixBackendTransaction, QueryResult};
 
 #[cfg(not(test))]
 use crate::transaction::buffered::TrackedTxnUnit;
@@ -112,11 +117,26 @@ impl CommitOutcome {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait WriteExecutionHost {
-    async fn execute_prepared_public_read_with_pending_overlay_view(
+pub(crate) trait WriteExecutionContext {
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
+
+    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
+
+    fn sql_compiler_seed<'a>(
+        &'a self,
+        functions: &'a DynFunctionProvider,
+        surface_registry: &'a SurfaceRegistry,
+    ) -> SqlCompilerSeed<'a>;
+
+    async fn prepare_function_bindings(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<FunctionBindings, LixError>;
+
+    async fn execute_prepared_public_read_with_pending_overlay(
         &self,
         transaction: &mut dyn LixBackendTransaction,
-        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        pending_overlay: Option<&dyn PendingOverlay>,
         public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError>;
 

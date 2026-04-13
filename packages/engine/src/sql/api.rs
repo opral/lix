@@ -39,7 +39,7 @@ pub(crate) use super::prepare::{
     build_public_write_execution, build_public_write_invariant_trace,
     compile_execution_from_bound_statement_with_context, finalize_public_write_execution,
     load_sql_compiler_metadata, load_sql_compiler_metadata_with_reader,
-    load_sql_compiler_metadata_with_reader_and_pending_overlay_view,
+    load_sql_compiler_metadata_with_reader_and_pending_overlay,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
     prepare_public_read_artifact, public_authoritative_write_error, public_write_preparation_error,
     BoundStatementInstance, CommittedReadContext, CompilePolicy, CompiledExecution, PublicPlan,

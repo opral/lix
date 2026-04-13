@@ -18,7 +18,17 @@ use crate::backend::QueryExecutor;
 use crate::contracts::RowIdentity;
 use crate::contracts::TrackedChangeView;
 #[cfg(test)]
-pub(crate) use crate::contracts::WriterKeyReadView;
+#[async_trait(?Send)]
+pub trait WriterKeyReadView {
+    #[allow(dead_code)]
+    async fn load_annotation(&self, row_identity: &RowIdentity)
+        -> Result<Option<String>, LixError>;
+
+    async fn load_annotations(
+        &self,
+        row_identities: &BTreeSet<RowIdentity>,
+    ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError>;
+}
 use crate::live_state::LiveRow;
 use crate::{LixBackend, LixError, Value};
 

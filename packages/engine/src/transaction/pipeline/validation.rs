@@ -18,21 +18,23 @@ use serde_json::Value as JsonValue;
 use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceFamily};
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
+use crate::contracts::CompiledSchemaCache;
 use crate::contracts::{
     is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
     LiveSnapshotStorage, MutationOperation, MutationRow, PlannedStateRow,
     PreparedInsertOnConflictAction, PreparedPublicWrite, PreparedResolvedWritePlan,
     PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
 };
-use crate::contracts::{CompiledSchemaCache, LiveStateQueryBackend, PendingOverlayView};
+use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,
-    LiveRowQuery, LiveRowSemantics, RowReadMode,
+    LiveRowQuery, LiveRowSource,
 };
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
     schema_key_from_definition, validate_lix_schema_definition, SchemaKey,
 };
+use crate::transaction::overlay::PendingOverlay;
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -142,13 +144,13 @@ impl<'a> WriteValidationSchemaLookup<'a> {
 
     fn remember_pending_registered_schemas_from_view(
         &mut self,
-        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        pending_overlay: Option<&dyn PendingOverlay>,
     ) -> Result<(), LixError> {
-        let Some(pending_overlay_view) = pending_overlay_view else {
+        let Some(pending_overlay) = pending_overlay else {
             return Ok(());
         };
 
-        for (_, snapshot_content) in pending_overlay_view.visible_registered_schema_entries() {
+        for (_, snapshot_content) in pending_overlay.visible_registered_schema_entries() {
             let Some(snapshot_content) = snapshot_content else {
                 continue;
             };
@@ -163,10 +165,10 @@ impl<'a> WriteValidationSchemaLookup<'a> {
         }
 
         for storage in [
-            crate::contracts::PendingSemanticStorage::Tracked,
-            crate::contracts::PendingSemanticStorage::Untracked,
+            crate::transaction::overlay::PendingSemanticStorage::Tracked,
+            crate::transaction::overlay::PendingSemanticStorage::Untracked,
         ] {
-            for row in pending_overlay_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+            for row in pending_overlay.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
                 let Some(snapshot_content) = row.snapshot_content else {
                     continue;
                 };
@@ -196,7 +198,7 @@ impl<'a> WriteValidationSchemaLookup<'a> {
         let row = load_exact_live_row(
             self.backend,
             &ExactLiveRowQuery {
-                semantics: LiveRowSemantics::Tracked,
+                source: LiveRowSource::Tracked,
                 schema_key: REGISTERED_SCHEMA_KEY.to_string(),
                 version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
                 entity_id: key.entity_id(),
@@ -300,7 +302,7 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             &LiveRowQuery {
                 schema_key: REGISTERED_SCHEMA_KEY.to_string(),
                 version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
-                mode: RowReadMode::Tracked,
+                source: LiveRowSource::Tracked,
                 constraints: Vec::new(),
                 include_tombstones: false,
             },
@@ -328,10 +330,10 @@ pub async fn validate_inserts(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     mutations: &[MutationRow],
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<(), LixError> {
     let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
-    schema_provider.remember_pending_registered_schemas_from_view(pending_overlay_view)?;
+    schema_provider.remember_pending_registered_schemas_from_view(pending_overlay)?;
 
     for row in mutations {
         if row.operation == MutationOperation::Insert && row.schema_key == REGISTERED_SCHEMA_KEY {
@@ -384,10 +386,10 @@ pub(crate) async fn validate_update_inputs(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     inputs: &[UpdateValidationInput],
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<(), LixError> {
     let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
-    schema_provider.remember_pending_registered_schemas_from_view(pending_overlay_view)?;
+    schema_provider.remember_pending_registered_schemas_from_view(pending_overlay)?;
     let mut pending_rows = Vec::new();
     let mut deleted_rows = Vec::new();
 
@@ -502,9 +504,9 @@ pub(crate) async fn validate_batch_local_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     public_write: &PreparedPublicWrite,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<(), LixError> {
-    validate_prepared_public_write(backend, cache, public_write, pending_overlay_view, false).await
+    validate_prepared_public_write(backend, cache, public_write, pending_overlay, false).await
 }
 
 pub(crate) async fn validate_commit_time_write(
@@ -519,7 +521,7 @@ async fn validate_prepared_public_write(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
     public_write: &PreparedPublicWrite,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     require_binary_blob_ref_cas: bool,
 ) -> Result<(), LixError> {
     let resolved = public_write
@@ -531,7 +533,7 @@ async fn validate_prepared_public_write(
             description: "planned write validation requires a resolved write plan".to_string(),
         })?;
     let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
-    schema_provider.remember_pending_registered_schemas_from_view(pending_overlay_view)?;
+    schema_provider.remember_pending_registered_schemas_from_view(pending_overlay)?;
     remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
         collect_planned_binary_blob_hashes(resolved, require_binary_blob_ref_cas)?;
@@ -1249,12 +1251,12 @@ async fn validate_constraint_group_conflict(
             && pending.identity.file_id == row.identity.file_id
             && pending_row_is_visible(context, pending)
     }) {
-        let pending_overlay_view = ConstraintRowView {
+        let pending_overlay = ConstraintRowView {
             identity: &pending.identity,
             schema_version: &pending.schema_version,
             snapshot: &pending.snapshot,
         };
-        let Some(other_tuple) = extract_pointer_tuple(&pending_overlay_view, pointers)? else {
+        let Some(other_tuple) = extract_pointer_tuple(&pending_overlay, pointers)? else {
             continue;
         };
         if other_tuple == candidate_tuple {
@@ -1609,13 +1611,13 @@ async fn delete_has_referencing_row(
             && pending.schema_version == source_key.schema_version
             && pending_row_is_visible(context, pending)
     }) {
-        let pending_overlay_view = ConstraintRowView {
+        let pending_overlay = ConstraintRowView {
             identity: &pending.identity,
             schema_version: &pending.schema_version,
             snapshot: &pending.snapshot,
         };
         if row_references_deleted_target(
-            &pending_overlay_view,
+            &pending_overlay,
             deleted_row,
             source_schema_key,
             referenced_schema_key,
@@ -1743,13 +1745,12 @@ async fn foreign_key_target_exists_in_storage(
             && pending.identity.file_id == target_scope.file_id
             && pending_row_is_visible(context, pending)
     }) {
-        let pending_overlay_view = ConstraintRowView {
+        let pending_overlay = ConstraintRowView {
             identity: &pending.identity,
             schema_version: &pending.schema_version,
             snapshot: &pending.snapshot,
         };
-        let Some(target_values) =
-            extract_pointer_tuple(&pending_overlay_view, referenced_properties)?
+        let Some(target_values) = extract_pointer_tuple(&pending_overlay, referenced_properties)?
         else {
             continue;
         };
