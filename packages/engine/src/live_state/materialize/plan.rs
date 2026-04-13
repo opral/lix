@@ -511,8 +511,7 @@ async fn load_version_heads_from_canonical(
     stats: &mut Vec<StageStat>,
 ) -> Result<VersionHeadMap, LixError> {
     let root_version_refs =
-        crate::session::version_ops::load_all_version_head_commit_ids_with_executor(executor)
-            .await?;
+        crate::live_state::load_all_version_head_commit_ids_with_executor(executor).await?;
     let heads = build_version_head_map_local(&root_version_refs);
 
     stats.push(StageStat {

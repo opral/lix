@@ -80,7 +80,9 @@ pub(crate) use file::{
 #[allow(unused_imports)]
 pub(crate) use filesystem_query::*;
 #[allow(unused_imports)]
-pub(crate) use public_surface_registry::load_public_surface_registry_with_backend;
+pub(crate) use public_surface_registry::{
+    apply_registered_schema_snapshot_to_surface_registry, load_public_surface_registry_with_backend,
+};
 #[allow(unused_imports)]
 pub(crate) use read_surface::{
     explicit_version_counterpart_surface_name, read_preparation_semantics,

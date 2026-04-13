@@ -330,7 +330,7 @@ async fn append_undo_redo_commit_in_transaction(
 ) -> Result<AppliedUndoRedoCommit, LixError> {
     let function_bindings = checkpoint_function_bindings(tx).await?;
     let mut functions = function_bindings.provider().clone();
-    crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+    crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut functions,
     )

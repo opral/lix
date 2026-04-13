@@ -6,13 +6,13 @@ use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::SharedFunctionProvider;
+use crate::functions::SystemFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
-use crate::services::functions::SystemFunctionProvider;
-use crate::services::wasm_runtime::NoopWasmRuntime;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::{resolve_write_plan_with_functions, WriteResolveError};
+use crate::wasm::NoopWasmRuntime;
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionBeginMode, Value,
@@ -663,11 +663,9 @@ mod tests {
         .expect("live-state status seed should succeed");
 
         let frontier =
-            crate::session::version_ops::load_current_committed_version_frontier_with_backend(
-                &backend,
-            )
-            .await
-            .expect("frontier load should succeed");
+            crate::live_state::load_current_committed_version_frontier_with_backend(&backend)
+                .await
+                .expect("frontier load should succeed");
         assert_eq!(
             frontier.version_heads.get("main").map(String::as_str),
             Some("commit-1")

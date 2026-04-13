@@ -3,19 +3,21 @@ mod backend;
 mod binary_cas;
 pub(crate) mod canonical;
 pub(crate) mod catalog;
+pub(crate) mod cel;
 mod common;
 pub(crate) mod contracts;
 mod diagnostics;
 pub(crate) mod execution;
+pub(crate) mod functions;
 mod init;
 pub mod live_state;
 mod schema;
-mod services;
 pub mod session;
 pub(crate) mod sql;
 #[cfg(test)]
 mod test_support;
 pub(crate) mod transaction;
+pub mod wasm;
 
 pub mod image {
     pub use crate::backend::{ImageChunkReader, ImageChunkWriter};
@@ -26,11 +28,6 @@ pub mod streams {
         StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange,
         StateCommitStreamFilter, StateCommitStreamOperation,
     };
-}
-
-pub mod wasm {
-    pub use crate::contracts::{WasmComponentInstance, WasmLimits, WasmRuntime};
-    pub use crate::services::wasm_runtime::NoopWasmRuntime;
 }
 
 pub use schema::{

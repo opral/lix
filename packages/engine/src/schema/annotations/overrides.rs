@@ -101,12 +101,7 @@ pub(crate) fn collect_state_column_overrides_with_shared_runtime(
     schema_key: &str,
     functions: &DynFunctionProvider,
 ) -> Result<BTreeMap<String, Value>, LixError> {
-    collect_state_column_overrides(
-        schema,
-        schema_key,
-        crate::services::cel_runtime::shared_runtime(),
-        functions,
-    )
+    collect_state_column_overrides(schema, schema_key, crate::cel::shared_runtime(), functions)
 }
 
 fn raw_lixcol_override_expression<'a>(schema: &'a JsonValue, key: &str) -> Option<&'a str> {
@@ -231,9 +226,9 @@ mod tests {
     use super::{
         collect_dynamic_entity_surface_overrides, DynamicEntitySurfaceOverride, LixcolOverrideValue,
     };
+    use crate::cel::shared_runtime;
     use crate::contracts::{clone_boxed_function_provider, SharedFunctionProvider};
-    use crate::services::cel_runtime::shared_runtime;
-    use crate::services::functions::SystemFunctionProvider;
+    use crate::functions::SystemFunctionProvider;
     use serde_json::json;
 
     fn system_functions() -> crate::contracts::DynFunctionProvider {

@@ -11,11 +11,11 @@ use crate::contracts::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,
 };
-use crate::session::version_ops::{
-    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
-};
+use crate::live_state::load_version_head_commit_map_with_executor;
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
 use crate::{LixBackend, LixError, Value};
+
+use super::load_version_head_commit_id_with_executor;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct VersionDescriptorRow {
@@ -97,18 +97,6 @@ pub(crate) async fn load_all_version_descriptors_with_executor(
     }
     descriptors.sort_by(|left, right| left.version_id.cmp(&right.version_id));
     Ok(descriptors)
-}
-
-pub(crate) async fn find_version_id_by_name_with_executor(
-    executor: &mut dyn QueryExecutor,
-    name: &str,
-) -> Result<Option<String>, LixError> {
-    for descriptor in load_all_version_descriptors_with_executor(executor).await? {
-        if descriptor.name == name {
-            return Ok(Some(descriptor.version_id));
-        }
-    }
-    Ok(None)
 }
 
 pub(crate) async fn load_checkpoint_version_heads_with_executor(

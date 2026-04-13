@@ -5,10 +5,9 @@ use std::sync::Arc;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
 use crate::contracts::{
-    clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, SharedFunctionProvider,
+    clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
 };
 use crate::image::ImageChunkWriter;
-use crate::session::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::sql::SqlCompilerSeed;
 use crate::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode};
@@ -43,13 +42,7 @@ pub(crate) trait SessionHost: Send + Sync {
     async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    >;
+    ) -> Result<DynFunctionProvider, LixError>;
 
     fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream;
 
@@ -91,9 +84,9 @@ pub(crate) async fn prepare_function_bindings_with_host(
     host: &dyn SessionHost,
     backend: &dyn LixBackend,
 ) -> Result<FunctionBindings, LixError> {
-    let (settings, functions) = host.prepare_runtime_functions_with_backend(backend).await?;
+    let functions = host.prepare_runtime_functions_with_backend(backend).await?;
     Ok(FunctionBindings::from_prepared_parts(
-        settings.enabled,
+        functions.deterministic_sequence_enabled(),
         &functions,
     ))
 }

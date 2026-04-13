@@ -4,11 +4,10 @@
 //! committed heads selected by session-owned version-head helpers.
 
 use crate::backend::QueryExecutor;
+use crate::live_state::load_version_head_commit_map_with_executor;
 use crate::{LixBackend, LixError};
 
-use super::{
-    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
-};
+use super::load_version_head_commit_id_with_executor;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedRootCommit {

@@ -4,12 +4,14 @@ use serde_json::Value as JsonValue;
 
 use crate::catalog::{
     build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
-    register_dynamic_entity_surface_spec, SurfaceRegistry,
+    register_dynamic_entity_surface_spec, remove_dynamic_entity_surfaces_for_schema_key,
+    SurfaceRegistry,
 };
 use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
 use crate::live_state::{
     decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
 };
+use crate::schema::schema_from_registered_snapshot;
 use crate::schema::SchemaKey;
 use crate::{LixBackend, LixError};
 
@@ -24,6 +26,19 @@ pub(crate) async fn load_public_surface_registry_with_backend(
         register_dynamic_entity_surface_spec(&mut registry, spec);
     }
     Ok(registry)
+}
+
+pub(crate) fn apply_registered_schema_snapshot_to_surface_registry(
+    registry: &mut SurfaceRegistry,
+    snapshot: &JsonValue,
+    evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
+) -> Result<(), LixError> {
+    let (key, schema) = schema_from_registered_snapshot(snapshot)?;
+    remove_dynamic_entity_surfaces_for_schema_key(registry, &key.schema_key);
+    let spec = dynamic_entity_surface_spec_from_schema(&schema, evaluator, functions)?;
+    register_dynamic_entity_surface_spec(registry, spec);
+    Ok(())
 }
 
 async fn load_latest_registered_schemas(
@@ -72,9 +87,9 @@ mod tests {
     use crate::catalog::{
         dynamic_entity_surface_spec_from_schema, SurfaceFamily, SurfaceOverrideValue,
     };
+    use crate::cel::shared_runtime;
     use crate::contracts::{clone_boxed_function_provider, SharedFunctionProvider};
-    use crate::services::cel_runtime::shared_runtime;
-    use crate::services::functions::SystemFunctionProvider;
+    use crate::functions::SystemFunctionProvider;
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;

@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::{PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionRow};
 use crate::contracts::{PreparedPublicRead, ReadTimeProjectionPlan};
-use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
+use crate::execution::execute_prepared_public_read_artifact_with_backend;
 use crate::session::host::SessionExecutionContext;
 use crate::transaction::PendingOverlay;
 use crate::{LixBackend, LixError, QueryResult};
@@ -82,7 +82,7 @@ impl PendingPublicReadHost for dyn LixBackend + '_ {
     ) -> Result<QueryResult, LixError> {
         match public_read.contract.source() {
             crate::contracts::PublicReadSource::PendingOverlay => {
-                crate::session::pending_overlay_public_reads::execute_pending_overlay_public_read(
+                crate::transaction::execute_pending_overlay_public_read(
                     self,
                     pending_overlay,
                     public_read,

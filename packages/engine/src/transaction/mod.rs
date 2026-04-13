@@ -8,7 +8,9 @@
 mod backend;
 pub(crate) mod buffered;
 mod buffered_write_transaction;
+mod compiler_state;
 mod contracts;
+mod deterministic_sequence;
 pub(crate) mod filesystem;
 #[cfg(test)]
 mod live_state_write_transaction;
@@ -16,6 +18,7 @@ mod observe_tick;
 pub(crate) mod overlay;
 #[cfg(test)]
 mod overlay_read_context;
+mod pending_overlay_public_reads;
 pub(crate) mod pipeline;
 mod prepared_step;
 mod prepared_write;
@@ -35,9 +38,17 @@ pub(crate) use buffered::{
 pub(crate) use buffered_write_transaction::{
     BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
 };
+pub(crate) use compiler_state::{
+    SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
+};
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 pub(crate) use contracts::{DeferredCommitEffects, WriteExecutionContext};
+pub(crate) use deterministic_sequence::{
+    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
+    deterministic_sequence_key, ensure_runtime_sequence_initialized_in_transaction,
+    persist_runtime_sequence_in_transaction,
+};
 #[cfg(test)]
 pub(crate) use filesystem::runtime::FilesystemTransactionFileState;
 pub(crate) use filesystem::runtime::{
@@ -60,6 +71,10 @@ pub(crate) use overlay::{
 };
 #[cfg(test)]
 pub(crate) use overlay_read_context::OverlayReadContext;
+pub(crate) use pending_overlay_public_reads::{
+    build_public_read_surface_registry_with_pending_overlay, execute_pending_overlay_public_read,
+    execute_pending_overlay_public_read_in_transaction,
+};
 pub(crate) use pipeline::resolution::prepared_artifacts::SchemaProof;
 #[cfg(test)]
 pub(crate) use pipeline::resolution::resolve_write_plan_with_functions;

@@ -6,17 +6,13 @@
 //! from canonical version refs and committed graph state.
 
 pub(crate) mod checkpoint_ops;
-pub(crate) mod compiler_state;
-pub(crate) mod deterministic_mode;
 pub(crate) mod host;
 mod init;
 pub(crate) mod observe;
-pub(crate) mod pending_overlay_public_reads;
 pub(crate) mod plugin;
 pub(crate) mod plugin_install_writes;
 pub(crate) mod public_read_execution;
 pub(crate) mod public_read_preparation;
-mod public_surface_registry;
 mod selector_reads;
 pub(crate) mod state_write_target_resolver;
 pub(crate) mod version_ops;
@@ -39,19 +35,11 @@ use crate::contracts::{
     FunctionBindings, SessionDependency, SessionExecutionMode, SessionStateSnapshot,
 };
 use crate::diagnostics::transaction_control_statement_denied_error;
-use crate::execution::read::execute_prepared_read_batch_in_committed_read_transaction;
+use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
 use crate::image::ImageChunkWriter;
-use crate::session::compiler_state::{
-    SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
-};
-use crate::session::host::{
-    prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
-    SessionHost,
-};
 use crate::session::plugin_install_writes::{
     prepare_registered_schema_write_statement, PluginInstallWriteContext,
 };
-pub(crate) use crate::session::public_surface_registry::apply_registered_schema_snapshot_to_surface_registry;
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
@@ -69,9 +57,60 @@ use crate::transaction::{
     execute_statement_batch_with_write_transaction, prepared_write_function_bindings_for_execution,
 };
 use crate::transaction::{stage_prepared_write_statement, BufferedWriteTransaction};
+use crate::transaction::{SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState};
 use crate::{ExecuteResult, LixError, Value};
+pub(crate) use host::{
+    prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
+    SessionHost,
+};
 
 pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
+
+pub(crate) async fn execute_prepared_public_read_with_registry(
+    projection_registry: &crate::catalog::CatalogProjectionRegistry,
+    transaction: &mut dyn crate::LixBackendTransaction,
+    pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,
+    public_read: &crate::contracts::PreparedPublicRead,
+) -> Result<crate::QueryResult, LixError> {
+    write_execution_context::execute_prepared_public_read_with_registry(
+        projection_registry,
+        transaction,
+        pending_overlay,
+        public_read,
+    )
+    .await
+}
+
+pub(crate) async fn persist_binary_blob_writes_in_transaction(
+    transaction: &mut dyn crate::LixBackendTransaction,
+    writes: &[crate::transaction::BinaryBlobWrite],
+) -> Result<(), LixError> {
+    write_execution_context::persist_binary_blob_writes(transaction, writes).await
+}
+
+pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
+    transaction: &mut dyn crate::LixBackendTransaction,
+) -> Result<(), LixError> {
+    write_execution_context::garbage_collect_unreachable_binary_cas(transaction).await
+}
+
+pub(crate) async fn persist_runtime_sequence_in_transaction(
+    transaction: &mut dyn crate::LixBackendTransaction,
+    functions: &crate::contracts::SharedFunctionProvider<
+        Box<dyn crate::contracts::LixFunctionProvider + Send>,
+    >,
+) -> Result<(), LixError> {
+    write_execution_context::persist_runtime_sequence(transaction, functions).await
+}
+
+pub(crate) async fn execute_public_tracked_append_txn_with_transaction(
+    transaction: &mut dyn crate::LixBackendTransaction,
+    unit: &crate::transaction::TrackedTxnUnit,
+    pending_commit_state: Option<&mut Option<crate::contracts::PendingCommitState>>,
+) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
+    write_execution_context::execute_public_tracked_append(transaction, unit, pending_commit_state)
+        .await
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
 pub struct AdditionalSessionOptions {
@@ -545,7 +584,7 @@ impl Session {
                         .begin_read_unit(crate::TransactionBeginMode::Write)
                         .await?;
                     let mut runtime_functions = function_bindings.provider().clone();
-                    crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+                    crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
                         transaction.as_mut(),
                         &mut runtime_functions,
                     )
@@ -573,7 +612,7 @@ impl Session {
                     .await;
                     match result {
                         Ok(result) => {
-                            crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
+                            crate::transaction::persist_runtime_sequence_in_transaction(
                                 transaction.as_mut(),
                                 function_bindings.provider(),
                             )
@@ -1196,7 +1235,7 @@ mod tests {
     fn test_lix(backend: RecordingBackend) -> Arc<crate::Lix> {
         Arc::new(crate::Lix::boot(crate::LixConfig::new(
             Box::new(backend),
-            Arc::new(crate::services::wasm_runtime::NoopWasmRuntime),
+            Arc::new(crate::wasm::NoopWasmRuntime),
         )))
     }
 

@@ -12,8 +12,8 @@ use sqlparser::ast::Statement;
 use crate::backend::QueryExecutor;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::{DynFunctionProvider, PreparedPublicRead};
+use crate::live_state::load_version_head_commit_map_with_executor;
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
-use crate::session::version_ops::load_version_head_commit_map_with_executor;
 use crate::sql::{
     load_sql_compiler_metadata, prepare_public_read, prepare_public_read_artifact,
     SqlCompilerMetadata, SqlPreparationMetadataReader,
@@ -31,9 +31,12 @@ pub(crate) async fn build_read_preparation_context(
     pending_overlay: Option<&dyn PendingOverlay>,
     functions: &DynFunctionProvider,
 ) -> Result<ReadPreparationContext, LixError> {
-    let registry =
-        crate::session::pending_overlay_public_reads::build_public_read_surface_registry_with_pending_overlay(backend, pending_overlay, functions)
-            .await?;
+    let registry = crate::transaction::build_public_read_surface_registry_with_pending_overlay(
+        backend,
+        pending_overlay,
+        functions,
+    )
+    .await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
     Ok(ReadPreparationContext {
         registry,

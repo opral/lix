@@ -1,16 +1,59 @@
-use std::collections::BTreeMap;
-
 use crate::backend::QueryExecutor;
-use crate::contracts::version_ref_storage_version_id;
-use crate::contracts::CommittedVersionFrontier;
+use crate::contracts::{
+    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id,
+    CommittedVersionFrontier,
+};
 use crate::diagnostics::is_missing_relation_error;
-use crate::live_state::{builtin_schema_storage_metadata, tracked_relation_name};
 use crate::{LixBackend, LixError, Value};
+
+use super::naming::tracked_relation_name;
+use super::storage_metadata::builtin_schema_storage_metadata;
+use super::untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
+use super::ExactUntrackedRowRequest;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VersionHeadRef {
     version_id: String,
     commit_id: String,
+}
+
+pub(crate) async fn load_version_head_commit_id_with_backend(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<Option<String>, LixError> {
+    let mut executor = backend;
+    load_version_head_commit_id_with_executor(&mut executor, version_id).await
+}
+
+pub(crate) async fn load_version_head_commit_id_with_executor(
+    executor: &mut dyn QueryExecutor,
+    version_id: &str,
+) -> Result<Option<String>, LixError> {
+    let Some(row) = load_exact_untracked_row_with_executor(
+        executor,
+        &ExactUntrackedRowRequest {
+            schema_key: version_ref_schema_key().to_string(),
+            version_id: version_ref_storage_version_id().to_string(),
+            entity_id: version_id.to_string(),
+            file_id: Some(version_ref_file_id().to_string()),
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
+    };
+
+    let Some(commit_id) = row
+        .property_text("commit_id")
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("local version head for '{version_id}' has empty commit_id"),
+        ));
+    };
+
+    Ok(Some(commit_id))
 }
 
 pub(crate) async fn load_all_version_head_commit_ids_with_executor(
@@ -26,7 +69,7 @@ pub(crate) async fn load_all_version_head_commit_ids_with_executor(
 
 pub(crate) async fn load_version_head_commit_map_with_executor(
     executor: &mut dyn QueryExecutor,
-) -> Result<Option<BTreeMap<String, String>>, LixError> {
+) -> Result<Option<std::collections::BTreeMap<String, String>>, LixError> {
     Ok(load_all_version_head_refs_with_executor(executor)
         .await?
         .map(|rows| {
@@ -112,7 +155,7 @@ async fn load_all_version_head_refs_with_executor(
     Ok(Some(rows))
 }
 
-fn version_ref_storage_metadata() -> crate::live_state::BuiltinSchemaStorageMetadata {
+fn version_ref_storage_metadata() -> super::BuiltinSchemaStorageMetadata {
     builtin_schema_storage_metadata("lix_version_ref")
         .expect("lix_version_ref builtin storage metadata should exist")
 }

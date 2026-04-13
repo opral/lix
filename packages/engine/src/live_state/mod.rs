@@ -29,6 +29,7 @@
 
 pub(crate) mod constraints;
 pub(crate) mod effective;
+mod frontier;
 mod init;
 pub(crate) mod lifecycle;
 pub(crate) mod materialize;
@@ -68,6 +69,13 @@ pub(crate) use effective::EffectiveRowsResolver;
 pub use effective::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane,
+};
+pub(crate) use frontier::{
+    load_all_version_head_commit_ids_with_executor,
+    load_current_committed_version_frontier_with_backend,
+    load_current_committed_version_frontier_with_executor,
+    load_version_head_commit_id_with_backend, load_version_head_commit_id_with_executor,
+    load_version_head_commit_map_with_executor,
 };
 pub use init::init;
 pub use lifecycle::LiveStateReadiness;

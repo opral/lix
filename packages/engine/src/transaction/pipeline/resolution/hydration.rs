@@ -1,4 +1,5 @@
 use super::effective_state::resolve_exact_effective_state_row_with_pending_overlay;
+use super::version_admin::load_version_admin_state_with_backend;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
@@ -63,28 +64,18 @@ impl<'a> PublicWriteHydrator<'a> {
         &self,
         version_id: &str,
     ) -> Result<Option<HydratedVersionAdminRow>, LixError> {
-        let Some(descriptor_row) =
-            crate::session::version_ops::descriptors::load_version_descriptor_with_backend(
-                self.backend,
-                version_id,
-            )
-            .await?
+        let Some(admin_state) =
+            load_version_admin_state_with_backend(self.backend, version_id).await?
         else {
             return Ok(None);
         };
-        let mut executor = self.backend;
-        let commit_id = crate::session::version_ops::load_version_head_commit_id_with_executor(
-            &mut executor,
-            version_id,
-        )
-        .await?;
-        let has_local_head = commit_id.is_some();
+        let has_local_head = admin_state.head_commit_id.is_some();
         Ok(Some(HydratedVersionAdminRow {
-            id: version_id.to_string(),
-            name: descriptor_row.name,
-            hidden: descriptor_row.hidden,
-            commit_id: commit_id.unwrap_or_default(),
-            descriptor_change_id: descriptor_row.change_id,
+            id: admin_state.version_id,
+            name: admin_state.name,
+            hidden: admin_state.hidden,
+            commit_id: admin_state.head_commit_id.unwrap_or_default(),
+            descriptor_change_id: admin_state.descriptor_change_id,
             has_local_head,
         }))
     }

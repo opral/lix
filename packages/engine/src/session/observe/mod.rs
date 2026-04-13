@@ -655,14 +655,14 @@ impl Session {
             state,
         })
     }
-}
 
-pub(crate) fn observe_owned_session(
-    session: Arc<Session>,
-    query: ObserveQuery,
-) -> Result<ObserveEventsOwned, LixError> {
-    let state = build_observe_state(session.as_ref(), query)?;
-    Ok(ObserveEventsOwned { session, state })
+    pub(crate) fn observe_owned(
+        session: Arc<Self>,
+        query: ObserveQuery,
+    ) -> Result<ObserveEventsOwned, LixError> {
+        let state = build_observe_state(session.as_ref(), query)?;
+        Ok(ObserveEventsOwned { session, state })
+    }
 }
 
 fn build_observe_state(session: &Session, query: ObserveQuery) -> Result<ObserveState, LixError> {
@@ -949,7 +949,7 @@ mod tests {
         build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery,
         OBSERVE_TICK_POLL_INTERVAL,
     };
-    use crate::services::wasm_runtime::NoopWasmRuntime;
+    use crate::wasm::NoopWasmRuntime;
     use crate::{
         ExecuteOptions, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
         Session, SqlDialect, Value,

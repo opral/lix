@@ -11,18 +11,16 @@ use super::engine::Engine;
 use super::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::SharedFunctionProvider;
-use crate::contracts::{CompiledSchemaCache, FunctionBindings, WasmRuntime};
+use crate::contracts::{
+    CompiledSchemaCache, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
+    SharedFunctionProvider,
+};
 use crate::live_state::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
     ProjectionStatus,
 };
-use crate::session::deterministic_mode::{
-    global_deterministic_settings_storage_scope, parse_deterministic_settings_value,
-    DeterministicSettings, RuntimeFunctionProvider,
-};
-use crate::session::observe::observe_owned_session;
 use crate::streams::StateCommitStream as PublicStateCommitStream;
+use crate::wasm::WasmRuntime;
 use crate::{
     AdditionalSessionOptions, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
     ExecuteOptions, ExecuteResult, LixBackend, LixBackendTransaction, LixError,
@@ -30,7 +28,9 @@ use crate::{
     RedoResult, Session, SessionTransaction, TransactionBeginMode, UndoOptions, UndoResult, Value,
 };
 
-const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
+use super::deterministic_settings::{
+    parse_deterministic_settings_value, DeterministicSettings, DETERMINISTIC_MODE_KEY,
+};
 
 #[derive(Debug, Clone)]
 pub struct BootKeyValue {
@@ -209,20 +209,13 @@ impl Lix {
     pub(crate) async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    > {
-        let storage_scope = global_deterministic_settings_storage_scope();
+    ) -> Result<DynFunctionProvider, LixError> {
         self.engine
-            .prepare_runtime_functions_with_backend(backend, &storage_scope)
+            .prepare_runtime_functions_with_backend(backend)
             .await
     }
 
-    pub(crate) fn session_host(&self) -> Arc<dyn crate::session::host::SessionHost> {
+    pub(crate) fn session_host(&self) -> Arc<dyn crate::session::SessionHost> {
         Arc::new(LixEngineSessionHost::new(Arc::clone(&self.engine)))
     }
 
@@ -311,7 +304,7 @@ impl Lix {
     }
 
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEventsOwned, LixError> {
-        observe_owned_session(Arc::clone(self.workspace_session()?), query)
+        Session::observe_owned(Arc::clone(self.workspace_session()?), query)
     }
 
     /// Opens an additional scoped [`Session`].
@@ -544,9 +537,9 @@ impl crate::transaction::WriteExecutionContext for Lix {
         &self,
         backend: &dyn LixBackend,
     ) -> Result<FunctionBindings, LixError> {
-        let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
+        let functions = self.prepare_runtime_functions_with_backend(backend).await?;
         Ok(FunctionBindings::from_prepared_parts(
-            settings.enabled,
+            functions.deterministic_sequence_enabled(),
             &functions,
         ))
     }
@@ -556,7 +549,7 @@ impl crate::transaction::WriteExecutionContext for Lix {
         pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,
         public_read: &crate::contracts::PreparedPublicRead,
     ) -> Result<crate::QueryResult, LixError> {
-        crate::session::write_execution_context::execute_prepared_public_read_with_registry(
+        crate::session::execute_prepared_public_read_with_registry(
             self.catalog_projection_registry().as_ref(),
             transaction,
             pending_overlay,
@@ -570,16 +563,14 @@ impl crate::transaction::WriteExecutionContext for Lix {
         transaction: &mut dyn crate::LixBackendTransaction,
         writes: &[crate::transaction::BinaryBlobWrite],
     ) -> Result<(), LixError> {
-        crate::session::write_execution_context::persist_binary_blob_writes(transaction, writes)
-            .await
+        crate::session::persist_binary_blob_writes_in_transaction(transaction, writes).await
     }
 
     async fn garbage_collect_unreachable_binary_cas_in_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_context::garbage_collect_unreachable_binary_cas(transaction)
-            .await
+        crate::session::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
     }
 
     async fn persist_runtime_sequence_in_transaction(
@@ -587,8 +578,7 @@ impl crate::transaction::WriteExecutionContext for Lix {
         transaction: &mut dyn crate::LixBackendTransaction,
         functions: &SharedFunctionProvider<Box<dyn crate::contracts::LixFunctionProvider + Send>>,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_context::persist_runtime_sequence(transaction, functions)
-            .await
+        crate::session::persist_runtime_sequence_in_transaction(transaction, functions).await
     }
 
     async fn execute_public_tracked_append_txn_with_transaction(
@@ -597,7 +587,7 @@ impl crate::transaction::WriteExecutionContext for Lix {
         unit: &crate::transaction::TrackedTxnUnit,
         pending_commit_state: Option<&mut Option<crate::contracts::PendingCommitState>>,
     ) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
-        crate::session::write_execution_context::execute_public_tracked_append(
+        crate::session::execute_public_tracked_append_txn_with_transaction(
             transaction,
             unit,
             pending_commit_state,
@@ -617,7 +607,7 @@ impl LixEngineSessionHost {
 }
 
 #[async_trait(?Send)]
-impl crate::session::host::SessionHost for LixEngineSessionHost {
+impl crate::session::SessionHost for LixEngineSessionHost {
     async fn ensure_initialized(&self) -> Result<(), LixError> {
         if crate::live_state::load_mode_with_backend(self.engine.backend().as_ref()).await?
             == crate::live_state::LiveStateMode::Uninitialized
@@ -675,16 +665,9 @@ impl crate::session::host::SessionHost for LixEngineSessionHost {
     async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    > {
-        let storage_scope = global_deterministic_settings_storage_scope();
+    ) -> Result<DynFunctionProvider, LixError> {
         self.engine
-            .prepare_runtime_functions_with_backend(backend, &storage_scope)
+            .prepare_runtime_functions_with_backend(backend)
             .await
     }
 
@@ -730,12 +713,12 @@ fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
 mod tests {
     use super::should_invalidate_installed_plugins_cache_for_sql;
     use super::*;
-    use crate::services::wasm_runtime::NoopWasmRuntime;
     use crate::sql::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state,
         extract_explicit_transaction_script, is_query_only_statements, optimize_state_resolution,
         parse_sql_statements, PlaceholderState,
     };
+    use crate::wasm::NoopWasmRuntime;
     use crate::TransactionBeginMode;
     use crate::{
         ExecuteOptions, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,

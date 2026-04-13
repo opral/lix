@@ -1,15 +1,26 @@
+use std::collections::BTreeMap;
+
+use crate::backend::QueryExecutor;
+use crate::canonical::{
+    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
+};
 use crate::contracts::ExecuteOptions;
 use crate::contracts::FunctionBindings;
+use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::contracts::{
+    parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
+    version_descriptor_schema_key, version_descriptor_schema_version,
+};
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
+    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
     write_live_rows, LiveRow,
 };
-use crate::session::compiler_state::{SessionCompilerCache, SessionCompilerState};
-use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::sql::parse_sql;
 use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedBufferedWriteTransaction,
+    SessionCompilerCache, SessionCompilerState,
 };
 use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -89,7 +100,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let function_bindings = self.ensure_function_bindings().await?;
         let mut runtime_functions = function_bindings.provider().clone();
-        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
@@ -100,7 +111,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
         let function_bindings = self.ensure_function_bindings().await?;
         let mut runtime_functions = function_bindings.provider().clone();
-        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
@@ -112,7 +123,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let Some(function_bindings) = self.context.function_bindings().cloned() else {
             return Ok(());
         };
-        crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
+        crate::transaction::persist_runtime_sequence_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             function_bindings.provider(),
         )
@@ -126,11 +137,14 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let backend = crate::backend::transaction_backend_view(
             self.write_transaction.backend_transaction_mut(),
         );
-        let (settings, functions) = self
+        let functions = self
             .lix
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
-        let function_bindings = FunctionBindings::from_prepared_parts(settings.enabled, &functions);
+        let function_bindings = FunctionBindings::from_prepared_parts(
+            functions.deterministic_sequence_enabled(),
+            &functions,
+        );
         self.context
             .set_function_bindings(function_bindings.clone());
         Ok(function_bindings)
@@ -305,11 +319,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<Option<String>, LixError> {
         let mut executor =
             crate::backend::transaction_backend_view(self.backend_transaction_mut()?);
-        crate::session::version_ops::descriptors::find_version_id_by_name_with_executor(
-            &mut executor,
-            name,
-        )
-        .await
+        find_version_id_by_name_with_executor(&mut executor, name).await
     }
 
     pub(crate) async fn assert_commit_change_set_integrity(
@@ -1102,6 +1112,59 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         Ok(())
     }
+}
+
+async fn find_version_id_by_name_with_executor(
+    executor: &mut dyn QueryExecutor,
+    name: &str,
+) -> Result<Option<String>, LixError> {
+    let Some(global_head_commit_id) =
+        load_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
+    else {
+        return Ok(None);
+    };
+    let Some(version_heads) = load_version_head_commit_map_with_executor(executor).await? else {
+        return Ok(None);
+    };
+
+    for version_id in version_heads.keys() {
+        let Some(row) = load_exact_committed_change_from_commit_with_executor(
+            executor,
+            &global_head_commit_id,
+            &ExactCommittedStateRowRequest {
+                entity_id: version_id.to_string(),
+                schema_key: version_descriptor_schema_key().to_string(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                exact_filters: BTreeMap::from([
+                    (
+                        "file_id".to_string(),
+                        Value::Text(version_descriptor_file_id().to_string()),
+                    ),
+                    (
+                        "plugin_key".to_string(),
+                        Value::Text(version_descriptor_plugin_key().to_string()),
+                    ),
+                    (
+                        "schema_version".to_string(),
+                        Value::Text(version_descriptor_schema_version().to_string()),
+                    ),
+                ]),
+            },
+        )
+        .await?
+        else {
+            continue;
+        };
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let descriptor = parse_version_descriptor_snapshot(snapshot_content)?;
+        if descriptor.name.as_deref() == Some(name) {
+            return Ok(Some(descriptor.id));
+        }
+    }
+
+    Ok(None)
 }
 
 pub(super) fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Result<i64, LixError> {
