@@ -5,7 +5,7 @@ use crate::binary_cas::schema::{
     INTERNAL_BINARY_CHUNK_STORE,
 };
 use crate::binary_cas::BinaryBlobWrite;
-use crate::services::functions::timestamp;
+use crate::functions::current_timestamp;
 use crate::transaction::{execute_write_batch_with_transaction, WriteBatch};
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 use std::collections::BTreeMap;
@@ -117,7 +117,7 @@ pub(crate) fn build_binary_blob_fastcdc_write_batch(
 fn build_binary_cas_write_batch(
     payloads: &[BinaryBlobWriteInput<'_>],
 ) -> Result<BinaryCasWriteBatch, LixError> {
-    let now = timestamp::timestamp();
+    let now = current_timestamp();
     let mut manifest_rows = BTreeMap::<String, BinaryBlobManifestRow>::new();
     let mut blob_store_rows = BTreeMap::<String, BinaryBlobStoreRow>::new();
     let mut chunk_store_rows = BTreeMap::<String, BinaryChunkStoreRow>::new();

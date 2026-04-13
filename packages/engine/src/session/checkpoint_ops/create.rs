@@ -213,7 +213,7 @@ async fn checkpoint_function_bindings(
     let function_bindings =
         crate::session::host::prepare_function_bindings_with_host(session_host, &backend).await?;
     let mut runtime_functions = function_bindings.provider().clone();
-    crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+    crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut runtime_functions,
     )

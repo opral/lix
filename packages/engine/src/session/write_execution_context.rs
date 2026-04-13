@@ -179,7 +179,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.source() {
         crate::contracts::PublicReadSource::PendingOverlay => {
-            crate::session::pending_overlay_public_reads::execute_pending_overlay_public_read_in_transaction(
+            crate::transaction::execute_pending_overlay_public_read_in_transaction(
                 transaction,
                 pending_overlay,
                 public_read,
@@ -188,7 +188,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
         }
         crate::contracts::PublicReadSource::Committed(_) => {
             let host = ProjectionReadExecutionHost::new(projection_registry);
-            crate::execution::read::execute_prepared_public_read_artifact_in_transaction(
+            crate::execution::execute_prepared_public_read_artifact_in_transaction(
                 transaction,
                 &host,
                 public_read,
@@ -224,11 +224,7 @@ pub(crate) async fn persist_runtime_sequence(
     transaction: &mut dyn LixBackendTransaction,
     functions: &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
 ) -> Result<(), LixError> {
-    crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
-        transaction,
-        functions,
-    )
-    .await
+    crate::transaction::persist_runtime_sequence_in_transaction(transaction, functions).await
 }
 
 pub(crate) async fn execute_public_tracked_append(
@@ -268,7 +264,7 @@ pub(crate) async fn execute_public_tracked_append(
         .is_some_and(|slot| slot.as_ref().is_some())
         && !unit.has_compiler_only_filesystem_changes()
     {
-        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
             transaction,
             &mut create_commit_functions,
         )
@@ -319,7 +315,7 @@ pub(crate) async fn execute_public_tracked_append(
             .deterministic_sequence_persist_highest_seen()
             .is_some()
     {
-        crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
+        crate::transaction::persist_runtime_sequence_in_transaction(
             transaction,
             &create_commit_functions,
         )

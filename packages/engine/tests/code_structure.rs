@@ -99,7 +99,6 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "contracts",
     "execution",
     "live_state",
-    "services",
     "session",
     "sql",
     "transaction",
@@ -156,7 +155,6 @@ enum UseToken {
     Ident(String),
 }
 
-const SEALED_OWNER_SNAPSHOT_PATH: &str = "tests/sealed_owner_violations.txt";
 const ALLOWED_SERVICE_FOUNDATION_ROOTS: &[&str] = &["common", "contracts"];
 
 fn engine_root() -> PathBuf {
@@ -212,11 +210,14 @@ fn analyze_engine_dependency_graph() -> EngineDependencyGraph {
             if is_test_support_relative_path(&relative_path) {
                 continue;
             }
-            let source = fs::read_to_string(&absolute_path)
-                .expect("module source file should be readable");
+            let source =
+                fs::read_to_string(&absolute_path).expect("module source file should be readable");
             let current_module_path = module_path_for_file(&relative_path);
-            let dependencies =
-                collect_dependencies_from_source(&strip_test_code(&source), &current_module_path, &module_set);
+            let dependencies = collect_dependencies_from_source(
+                &strip_test_code(&source),
+                &current_module_path,
+                &module_set,
+            );
 
             for dependency in dependencies {
                 if dependency == *module_name {
@@ -1787,7 +1788,7 @@ fn top_level_module_set() -> HashSet<String> {
 
 fn services_child_modules() -> BTreeSet<String> {
     let Some(relative_path) = root_module_entry_relative_path("services") else {
-        panic!("expected a top-level `services` root when validating services structure rules");
+        return BTreeSet::new();
     };
     let source = read_engine_source(&relative_path);
     parse_declared_modules(&strip_test_code(&source))
@@ -1913,27 +1914,14 @@ fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> 
     violations.into_iter().collect()
 }
 
-fn write_sealed_owner_violations_snapshot(rendered: &str) {
-    let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
-    if let Some(parent) = snapshot_path.parent() {
-        fs::create_dir_all(parent).expect("sealed-owner snapshot directory should exist");
-    }
-    fs::write(&snapshot_path, rendered).expect("sealed-owner snapshot should be writable");
-}
-
 #[test]
-fn sealed_owner_import_rule_writes_current_violations_snapshot() {
-    let actual_violations = current_sealed_owner_violations();
-    let actual = render_grouped_sealed_owner_violations(&actual_violations);
-    write_sealed_owner_violations_snapshot(&actual);
+fn sealed_owner_violations_are_empty() {
+    let violations = current_sealed_owner_violations();
 
-    let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
-    let written = fs::read_to_string(&snapshot_path)
-        .expect("sealed-owner snapshot should be readable after writing");
-
-    assert_eq!(
-        written, actual,
-        "sealed-owner snapshot should match the current violations after regeneration",
+    assert!(
+        violations.is_empty(),
+        "sealed-owner violations are present.\n\nCurrent violations:\n{}",
+        render_grouped_sealed_owner_violations(&violations),
     );
 }
 
@@ -1977,6 +1965,9 @@ fn sealed_owner_whitelist_has_no_current_violations() {
 // depend on `services::child::*`, but not on deeper implementation paths.
 #[test]
 fn services_imports_are_limited_to_direct_child_namespaces() {
+    if !top_level_module_set().contains("services") {
+        return;
+    }
     let violations = current_services_direct_child_import_violations();
 
     assert!(
@@ -1991,6 +1982,9 @@ fn services_imports_are_limited_to_direct_child_namespaces() {
 // composition, semantic owners, or other top-level roots.
 #[test]
 fn services_has_no_external_root_dependencies() {
+    if !top_level_module_set().contains("services") {
+        return;
+    }
     let violations = current_services_external_dependency_violations();
 
     assert!(
@@ -2005,6 +1999,9 @@ fn services_has_no_external_root_dependencies() {
 // ground or the capabilities should be merged.
 #[test]
 fn services_direct_children_do_not_import_sibling_services() {
+    if !top_level_module_set().contains("services") {
+        return;
+    }
     let violations = current_services_sibling_dependency_violations();
 
     assert!(

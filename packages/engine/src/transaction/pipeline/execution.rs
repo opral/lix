@@ -6,7 +6,6 @@ use crate::contracts::{
     render_analyzed_explain_result, render_plain_explain_result, PendingCommitState,
     PreparedPublicWriteExecutionPartition, PreparedWriteStatement, SessionStateDelta,
 };
-use crate::session::compiler_state::SessionCompilerState;
 #[cfg(test)]
 use crate::sql::parse_sql_with_timing;
 #[cfg(test)]
@@ -23,8 +22,8 @@ use crate::transaction::{
     apply_schema_registrations_in_transaction,
     normalize_sql_error_with_transaction_and_relation_names, BorrowedBufferedWriteTransaction,
     BufferedWriteCommandMetadata, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    BufferedWriteTransaction, DeferredCommitEffects, PendingWriteOverlay, TransactionWriteDelta,
-    WriteCommand, WriteExecutionContext, WritePath, WriteResult,
+    BufferedWriteTransaction, DeferredCommitEffects, PendingWriteOverlay, SessionCompilerState,
+    TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -491,7 +490,7 @@ async fn apply_prepared_write_context_invalidation(
                 "prepared write context invalidation requires initialized function bindings",
             );
             let backend = crate::backend::transaction_backend_view(transaction);
-            crate::session::pending_overlay_public_reads::build_public_read_surface_registry_with_pending_overlay(
+            crate::transaction::build_public_read_surface_registry_with_pending_overlay(
                 &backend,
                 pending_write_overlay.map(|view| view as &dyn PendingOverlay),
                 function_bindings.provider(),
@@ -503,7 +502,7 @@ async fn apply_prepared_write_context_invalidation(
                 "prepared write context invalidation requires initialized function bindings",
             );
             let backend = crate::backend::transaction_backend_view(transaction);
-            crate::session::pending_overlay_public_reads::build_public_read_surface_registry_with_pending_overlay(
+            crate::transaction::build_public_read_surface_registry_with_pending_overlay(
                 &backend,
                 None,
                 function_bindings.provider(),
@@ -762,7 +761,7 @@ impl SqlBufferedWriteScope<'_, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::wasm_runtime::NoopWasmRuntime;
+    use crate::wasm::NoopWasmRuntime;
     use crate::{ExecuteOptions, Lix, LixConfig, QueryResult, Session, SqlDialect};
     use async_trait::async_trait;
     use std::sync::Arc;

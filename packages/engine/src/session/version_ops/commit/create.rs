@@ -6,15 +6,15 @@ use crate::contracts::version_ref_snapshot_content;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{MutationRow, OptionalTextPatch};
-use crate::session::deterministic_mode::{
-    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
-};
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
     VersionSnapshot,
 };
 use crate::transaction::execute_write_batch_with_transaction;
+use crate::transaction::{
+    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
+};
 use crate::transaction::{
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,

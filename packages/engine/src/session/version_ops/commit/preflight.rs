@@ -3,10 +3,9 @@ use crate::canonical::CanonicalStateIdentity;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::key_value_schema_key;
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
-use crate::session::deterministic_mode::deterministic_sequence_key;
 use crate::transaction::{
-    ExactFilesystemDescriptorState, FilesystemDescriptorState, FILESYSTEM_DESCRIPTOR_FILE_ID,
-    FILESYSTEM_FILE_SCHEMA_KEY,
+    deterministic_sequence_key, ExactFilesystemDescriptorState, FilesystemDescriptorState,
+    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::{LixError, Value};
 

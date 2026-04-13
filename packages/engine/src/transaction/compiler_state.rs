@@ -1,7 +1,8 @@
-//! Session compiler-state helpers.
+//! Transaction-owned compiler-state helpers.
 //!
-//! This module owns session-local compiler/runtime state used during planning,
-//! public-read preparation, and buffered write preparation.
+//! `session/*` remains the workflow caller, but the mutable compiler/runtime
+//! state used by transaction-time planning and buffered write execution lives
+//! under the transaction owner.
 
 #[cfg(test)]
 use std::collections::BTreeMap;

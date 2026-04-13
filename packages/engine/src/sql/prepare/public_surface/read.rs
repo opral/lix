@@ -3565,13 +3565,11 @@ pub(super) async fn try_prepare_public_read(
     writer_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     let functions = crate::contracts::clone_boxed_function_provider(
-        &crate::contracts::SharedFunctionProvider::new(
-            crate::services::functions::SystemFunctionProvider,
-        ),
+        &crate::contracts::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
     );
     let registry = crate::catalog::load_public_surface_registry_with_backend(
         backend,
-        crate::services::cel_runtime::shared_runtime(),
+        crate::cel::shared_runtime(),
         &functions,
     )
     .await

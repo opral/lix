@@ -13,7 +13,7 @@ fn build_error(code: &str, description: impl Into<String>) -> LixError {
 
 fn system_functions() -> crate::contracts::DynFunctionProvider {
     crate::contracts::clone_boxed_function_provider(&crate::contracts::SharedFunctionProvider::new(
-        crate::services::functions::SystemFunctionProvider,
+        crate::functions::SystemFunctionProvider,
     ))
 }
 
@@ -355,7 +355,7 @@ async fn resolve_available_columns(
 
     let registry = match crate::catalog::load_public_surface_registry_with_backend(
         backend,
-        crate::services::cel_runtime::shared_runtime(),
+        crate::cel::shared_runtime(),
         &system_functions(),
     )
     .await
@@ -371,7 +371,7 @@ async fn resolve_available_columns(
 async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
     match crate::catalog::load_public_surface_registry_with_backend(
         backend,
-        crate::services::cel_runtime::shared_runtime(),
+        crate::cel::shared_runtime(),
         &system_functions(),
     )
     .await
@@ -388,7 +388,7 @@ async fn public_surfaces_in_relation_names_with_backend(
 ) -> Vec<String> {
     let registry = match crate::catalog::load_public_surface_registry_with_backend(
         backend,
-        crate::services::cel_runtime::shared_runtime(),
+        crate::cel::shared_runtime(),
         &system_functions(),
     )
     .await

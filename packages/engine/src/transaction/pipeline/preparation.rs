@@ -29,8 +29,6 @@ use crate::contracts::{
 };
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
-use crate::session::compiler_state::SessionCompilerState;
-use crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::bind_sql;
 use crate::sql::{
@@ -44,12 +42,15 @@ use crate::sql::{
     PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan, SqlCompilerMetadata,
     SqlPreparationMetadataReader, UpdateValidationPlan, WriteOperationKind,
 };
+use crate::transaction::ensure_runtime_sequence_initialized_in_transaction;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::resolve_write_plan_with_functions;
 use crate::transaction::pipeline::validation::{
     validate_batch_local_write, validate_inserts, validate_update_inputs,
 };
-use crate::transaction::{PendingWriteOverlay, WriteCommand, WriteExecutionContext};
+use crate::transaction::{
+    PendingWriteOverlay, SessionCompilerState, WriteCommand, WriteExecutionContext,
+};
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";

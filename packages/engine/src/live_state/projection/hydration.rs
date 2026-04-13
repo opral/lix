@@ -4,6 +4,7 @@ use crate::catalog::{
     CatalogProjectionSourceRow, CatalogProjectionStorageKind,
 };
 use crate::common::escape_sql_string;
+use crate::live_state::load_current_committed_version_frontier_with_backend;
 use crate::live_state::tracked::{
     scan_rows_with_backend as scan_tracked_rows_with_backend,
     scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,
@@ -13,14 +14,13 @@ use crate::live_state::untracked::{
 };
 use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-use crate::session::version_ops::load_current_committed_version_frontier_with_backend;
 use crate::{LixBackend, LixError, Value};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
 ///
-/// Projection definitions stay storage-free. `session::version_ops` owns the
-/// committed frontier lookups and resolves per-input scope such as global-only
-/// or current committed local-version rows.
+/// Projection definitions stay storage-free. `live_state` owns the committed
+/// frontier lookups that resolve per-input scope such as global-only or current
+/// committed local-version rows.
 pub(crate) async fn hydrate_projection_input_with_backend(
     backend: &dyn LixBackend,
     projection: &dyn CatalogProjectionDefinition,

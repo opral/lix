@@ -286,13 +286,11 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     allow_internal_relations: bool,
 ) -> Result<Option<PublicPlan>, LixError> {
     let functions = crate::contracts::clone_boxed_function_provider(
-        &crate::contracts::SharedFunctionProvider::new(
-            crate::services::functions::SystemFunctionProvider,
-        ),
+        &crate::contracts::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
     );
     let registry = crate::catalog::load_public_surface_registry_with_backend(
         backend,
-        crate::services::cel_runtime::shared_runtime(),
+        crate::cel::shared_runtime(),
         &functions,
     )
     .await
@@ -1790,7 +1788,7 @@ mod tests {
     use crate::contracts::{
         FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
     };
-    use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
+    use crate::execution::execute_prepared_public_read_artifact_with_backend;
     use crate::live_state::{self, mark_mode_with_backend};
     use crate::schema::LixCommit;
     use crate::sql::prepare::prepare_public_read_artifact;

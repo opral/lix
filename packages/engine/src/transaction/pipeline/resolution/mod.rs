@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod filesystem_writes;
 mod hydration;
 mod state_backed_writes;
+mod version_admin;
 
 use filesystem_writes::resolve_filesystem_write;
 use hydration::{HydratedVersionAdminRow as VersionAdminRow, PublicWriteHydrator};

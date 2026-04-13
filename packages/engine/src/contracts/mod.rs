@@ -17,7 +17,6 @@ pub(crate) mod state_history_reader;
 pub(crate) mod statement_effects;
 pub(crate) mod transaction_mode;
 pub(crate) mod version_artifacts;
-pub(crate) mod wasm;
 pub(crate) mod write_execution;
 
 pub use artifacts::*;
@@ -39,5 +38,4 @@ pub use state_history_reader::*;
 pub use statement_effects::*;
 pub use transaction_mode::*;
 pub use version_artifacts::*;
-pub use wasm::*;
 pub use write_execution::*;

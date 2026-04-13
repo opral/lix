@@ -1,7 +1,10 @@
-pub mod timestamp;
+mod runtime_provider;
+mod timestamp;
 pub mod uuid_v7;
 
 use crate::contracts::LixFunctionProvider;
+pub(crate) use runtime_provider::RuntimeFunctionProvider;
+pub(crate) use timestamp::timestamp as current_timestamp;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemFunctionProvider;
@@ -12,6 +15,6 @@ impl LixFunctionProvider for SystemFunctionProvider {
     }
 
     fn timestamp(&mut self) -> String {
-        timestamp::timestamp()
+        current_timestamp()
     }
 }

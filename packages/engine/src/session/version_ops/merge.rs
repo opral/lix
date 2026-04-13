@@ -304,11 +304,11 @@ async fn merge_version_in_transaction(
     let (target_head_after_commit_id, created_merge_commit_id, receipt) = {
         let transaction = tx.backend_transaction_mut()?;
         let backend = crate::backend::transaction_backend_view(transaction);
-        let (_settings, functions) = session_host
+        let functions = session_host
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
         let mut functions = functions;
-        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
             transaction,
             &mut functions,
         )

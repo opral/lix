@@ -181,20 +181,16 @@ mod tests {
     fn production_consumers_use_shared_runtime() {
         for (path, source) in [
             (
-                "packages/engine/src/services/plugin_archive.rs",
-                include_str!("../plugin_archive.rs"),
-            ),
-            (
                 "packages/engine/src/catalog/registry.rs",
-                include_str!("../../catalog/registry.rs"),
+                include_str!("../catalog/registry.rs"),
             ),
             (
                 "packages/engine/src/sql/semantic_ir/semantics/state_assignments.rs",
-                include_str!("../../sql/semantic_ir/semantics/state_assignments.rs"),
+                include_str!("../sql/semantic_ir/semantics/state_assignments.rs"),
             ),
             (
                 "packages/engine/src/transaction/pipeline/resolution/state_backed_writes.rs",
-                include_str!("../../transaction/pipeline/resolution/state_backed_writes.rs"),
+                include_str!("../transaction/pipeline/resolution/state_backed_writes.rs"),
             ),
         ] {
             assert!(

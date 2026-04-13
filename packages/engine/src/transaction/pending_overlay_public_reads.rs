@@ -1,8 +1,7 @@
 //! Pending-overlay public-read adapters.
 //!
-//! This module owns the session-side bridge that merges overlay-visible
-//! registered schema rows, rebuilds the public-read surface registry, and
-//! executes pending-overlay public reads.
+//! `transaction/*` owns overlay-visible public-read semantics, including the
+//! registry rebuild path that must reflect pending registered-schema rows.
 
 use std::collections::BTreeMap;
 
@@ -59,7 +58,7 @@ impl<'a> PendingOverlayReadModel<'a> {
         if !self.has_pending_visibility() {
             return crate::catalog::load_public_surface_registry_with_backend(
                 self.base,
-                crate::services::cel_runtime::shared_runtime(),
+                crate::cel::shared_runtime(),
                 functions,
             )
             .await;
@@ -73,9 +72,10 @@ impl<'a> PendingOverlayReadModel<'a> {
                     format!("registered schema snapshot_content invalid JSON: {error}"),
                 )
             })?;
-            crate::session::apply_registered_schema_snapshot_to_surface_registry(
+            crate::catalog::apply_registered_schema_snapshot_to_surface_registry(
                 &mut registry,
                 &snapshot,
+                crate::cel::shared_runtime(),
                 functions,
             )?;
         }

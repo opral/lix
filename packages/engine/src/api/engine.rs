@@ -1,4 +1,6 @@
 use std::collections::{BTreeMap, HashMap};
+use std::io::{Cursor, Read};
+use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -10,21 +12,18 @@ use super::streams::{
 };
 use crate::binary_cas::load_blob_data_by_hash;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::SharedFunctionProvider;
 use crate::contracts::{
-    clone_boxed_function_provider, CompiledSchemaCache, FilesystemPluginMaterializer,
-    InstalledPlugin, WasmComponentInstance, WasmRuntime,
+    clone_boxed_function_provider, parse_plugin_manifest_json, CompiledSchemaCache,
+    DynFunctionProvider, FilesystemPluginMaterializer, InstalledPlugin,
 };
+use crate::functions::RuntimeFunctionProvider;
 use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
 use crate::schema::SchemaKey;
-use crate::services::plugin_archive::{
-    invoke_apply_changes_export, load_installed_plugin_from_archive_bytes,
-};
-use crate::session::deterministic_mode::{
-    global_deterministic_settings_storage_scope, load_runtime_settings, DeterministicSettings,
-    PersistedKeyValueStorageScope, RuntimeFunctionProvider,
-};
+use crate::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
 use crate::{LixBackend, LixError, TransactionBeginMode};
+use zip::read::ZipArchive;
+
+use super::deterministic_settings::{load_global_runtime_settings, DeterministicSettings};
 
 const INIT_STATE_NOT_STARTED: u8 = 0;
 const INIT_STATE_IN_PROGRESS: u8 = 1;
@@ -122,14 +121,13 @@ impl Engine {
     pub(crate) async fn load_public_surface_registry_from_backend(
         &self,
     ) -> Result<SurfaceRegistry, LixError> {
-        let storage_scope = global_deterministic_settings_storage_scope();
-        let (_, functions) = self
-            .prepare_runtime_functions_with_backend(self.backend().as_ref(), &storage_scope)
+        let functions = self
+            .prepare_runtime_functions_with_backend(self.backend().as_ref())
             .await?;
         let functions = clone_boxed_function_provider(&functions);
         crate::catalog::load_public_surface_registry_with_backend(
             self.backend().as_ref(),
-            crate::services::cel_runtime::shared_runtime(),
+            crate::cel::shared_runtime(),
             &functions,
         )
         .await
@@ -180,27 +178,27 @@ impl Engine {
     pub(crate) async fn prepare_runtime_functions_with_backend(
         &self,
         backend: &dyn LixBackend,
-        storage_scope: &PersistedKeyValueStorageScope,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    > {
+    ) -> Result<DynFunctionProvider, LixError> {
         let settings = if self.deterministic_boot_pending() {
             self.boot_deterministic_settings()
                 .unwrap_or_else(DeterministicSettings::disabled)
         } else if let Some(settings) = self.cached_deterministic_settings() {
             settings
         } else {
-            let settings = load_runtime_settings(backend, storage_scope).await?;
+            let settings = load_global_runtime_settings(backend).await?;
             self.cache_deterministic_settings(settings);
             settings
         };
 
-        let functions = SharedFunctionProvider::new(RuntimeFunctionProvider::new(settings, None));
-        Ok((settings, functions))
+        Ok(crate::contracts::SharedFunctionProvider::new(Box::new(
+            RuntimeFunctionProvider::new(
+                settings.enabled,
+                settings.uuid_v7_enabled,
+                settings.timestamp_enabled,
+                settings.timestamp_shuffle_enabled,
+                None,
+            ),
+        )))
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
@@ -263,7 +261,7 @@ impl Engine {
 
         let initialized = self
             .wasm_runtime
-            .init_component(plugin.wasm.clone(), crate::contracts::WasmLimits::default())
+            .init_component(plugin.wasm.clone(), WasmLimits::default())
             .await?;
         let mut guard = self.plugin_component_cache.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -438,11 +436,194 @@ impl CompiledSchemaCache for SchemaCache {
     }
 }
 
+const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
+
+async fn invoke_apply_changes_export(
+    instance: &dyn WasmComponentInstance,
+    payload: &[u8],
+) -> Result<Vec<u8>, LixError> {
+    let mut errors = Vec::new();
+    for export in APPLY_CHANGES_EXPORTS {
+        match instance.call(export, payload).await {
+            Ok(output) => return Ok(output),
+            Err(error) => errors.push(format!("{export}: {}", error.description)),
+        }
+    }
+
+    Err(LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "plugin materialization: failed to call apply-changes export ({})",
+            errors.join("; ")
+        ),
+    })
+}
+
+fn load_installed_plugin_from_archive_bytes(
+    plugin_key: &str,
+    archive_path: &str,
+    archive_bytes: &[u8],
+) -> Result<InstalledPlugin, LixError> {
+    let files = read_plugin_archive_files(archive_path, archive_bytes)?;
+    let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "plugin materialization: archive '{}' is missing manifest.json",
+            archive_path
+        ),
+    })?;
+    let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "plugin materialization: archive '{}' manifest.json must be UTF-8: {error}",
+            archive_path
+        ),
+    })?;
+    let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
+    if validated_manifest.manifest.key != plugin_key {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "plugin materialization: archive '{}' key mismatch: path key '{}' vs manifest key '{}'",
+                archive_path, plugin_key, validated_manifest.manifest.key
+            ),
+        });
+    }
+
+    let entry_path = normalize_plugin_archive_path(&validated_manifest.manifest.entry)?;
+    let wasm = files.get(&entry_path).ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "plugin materialization: archive '{}' is missing entry file '{}'",
+            archive_path, validated_manifest.manifest.entry
+        ),
+    })?;
+    ensure_valid_plugin_wasm(wasm)?;
+
+    let manifest = validated_manifest.manifest;
+    let content_type = manifest.file_match.content_type;
+
+    Ok(InstalledPlugin {
+        key: manifest.key,
+        runtime: manifest.runtime,
+        api_version: manifest.api_version,
+        path_glob: manifest.file_match.path_glob,
+        content_type,
+        entry: manifest.entry,
+        manifest_json: validated_manifest.normalized_json,
+        wasm: wasm.clone(),
+    })
+}
+
+fn read_plugin_archive_files(
+    archive_path: &str,
+    archive_bytes: &[u8],
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>, LixError> {
+    if archive_bytes.is_empty() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "plugin materialization: archive '{}' is empty",
+                archive_path
+            ),
+        });
+    }
+
+    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "plugin materialization: archive '{}' is not a valid zip file: {error}",
+            archive_path
+        ),
+    })?;
+    let mut files = std::collections::BTreeMap::<String, Vec<u8>>::new();
+
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "plugin materialization: failed to read archive '{}' entry index {}: {error}",
+                archive_path, index
+            ),
+        })?;
+
+        let entry_name = entry.name().to_string();
+        let normalized_path = normalize_plugin_archive_path(&entry_name)?;
+        if normalized_path.ends_with('/') {
+            continue;
+        }
+
+        let mut bytes = Vec::new();
+        entry.read_to_end(&mut bytes).map_err(|error| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "plugin materialization: failed to read archive '{}' entry '{}': {error}",
+                archive_path, entry_name
+            ),
+        })?;
+        files.insert(normalized_path, bytes);
+    }
+
+    Ok(files)
+}
+
+fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
+    let raw_path = Path::new(path);
+    if raw_path.is_absolute() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "plugin materialization: archive path '{}' must be relative",
+                path
+            ),
+        });
+    }
+
+    let mut normalized = Vec::new();
+    for component in raw_path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part.to_string_lossy().to_string()),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
+                        "plugin materialization: archive path '{}' must not escape the archive root",
+                        path
+                    ),
+                });
+            }
+        }
+    }
+
+    if normalized.is_empty() {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "plugin materialization: archive path must not be empty".to_string(),
+        });
+    }
+
+    Ok(normalized.join("/"))
+}
+
+fn ensure_valid_plugin_wasm(bytes: &[u8]) -> Result<(), LixError> {
+    const WASM_MAGIC: &[u8; 4] = b"\0asm";
+    if bytes.len() < WASM_MAGIC.len() || &bytes[..WASM_MAGIC.len()] != WASM_MAGIC {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "plugin materialization: entry file must be a valid WebAssembly module"
+                .to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{InstalledPlugin, PluginRuntime, WasmLimits};
-    use crate::services::wasm_runtime::NoopWasmRuntime;
+    use crate::contracts::{InstalledPlugin, LixFunctionProvider, PluginRuntime};
+    use crate::wasm::{NoopWasmRuntime, WasmLimits};
     use crate::{Lix, LixConfig, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use std::sync::{
@@ -497,18 +678,18 @@ mod tests {
         };
         let lix = Lix::boot(LixConfig::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
-        let (settings, _) = lix
+        let functions = lix
             .prepare_runtime_functions_with_backend(lix.backend().as_ref())
             .await
             .expect("first runtime preparation should succeed");
-        assert!(!settings.enabled);
+        assert!(!functions.deterministic_sequence_enabled());
         assert_eq!(
             execute_calls.load(Ordering::SeqCst),
             1,
             "first call should read deterministic settings from the backend"
         );
 
-        let (_settings, _) = lix
+        let _functions = lix
             .prepare_runtime_functions_with_backend(lix.backend().as_ref())
             .await
             .expect("second runtime preparation should succeed");
@@ -520,7 +701,7 @@ mod tests {
 
         lix.engine().invalidate_deterministic_settings_cache();
 
-        let (_settings, _) = lix
+        let _functions = lix
             .prepare_runtime_functions_with_backend(lix.backend().as_ref())
             .await
             .expect("runtime preparation after invalidation should succeed");
