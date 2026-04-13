@@ -3,7 +3,7 @@ use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
-use crate::contracts::{FunctionRuntimeState, GLOBAL_VERSION_ID};
+use crate::contracts::{FunctionBindings, GLOBAL_VERSION_ID};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::super::version_ops::context::require_target_version_context_in_transaction;
@@ -201,37 +201,36 @@ async fn insert_canonical_checkpoint_label_change(
     Ok(())
 }
 
-async fn checkpoint_runtime_state(
+async fn checkpoint_function_bindings(
     tx: &mut SessionTransaction<'_>,
-) -> Result<FunctionRuntimeState, LixError> {
-    if let Some(runtime_state) = tx.context.function_runtime_state().cloned() {
-        return Ok(runtime_state);
+) -> Result<FunctionBindings, LixError> {
+    if let Some(function_bindings) = tx.context.function_bindings().cloned() {
+        return Ok(function_bindings);
     }
 
-    let session_runtime = tx.session_runtime();
+    let session_host = tx.session_host();
     let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
-    let runtime_state = session_runtime
-        .prepare_function_runtime_state(&backend)
-        .await?;
-    let mut runtime_functions = runtime_state.provider().clone();
+    let function_bindings =
+        crate::session::host::prepare_function_bindings_with_host(session_host, &backend).await?;
+    let mut runtime_functions = function_bindings.provider().clone();
     crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut runtime_functions,
     )
     .await?;
-    tx.context.set_function_runtime_state(runtime_state.clone());
-    Ok(runtime_state)
+    tx.context.set_function_bindings(function_bindings.clone());
+    Ok(function_bindings)
 }
 
 async fn generate_runtime_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
-    Ok(checkpoint_runtime_state(tx)
+    Ok(checkpoint_function_bindings(tx)
         .await?
         .provider()
         .call_uuid_v7())
 }
 
 async fn generate_runtime_timestamp(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
-    Ok(checkpoint_runtime_state(tx)
+    Ok(checkpoint_function_bindings(tx)
         .await?
         .provider()
         .call_timestamp())

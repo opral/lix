@@ -4,9 +4,26 @@ use async_trait::async_trait;
 #[cfg(test)]
 pub use crate::contracts::BatchRowRequest as BatchTrackedRowRequest;
 #[cfg(test)]
-pub(crate) use crate::contracts::TrackedReadView;
+#[async_trait(?Send)]
+pub trait TrackedReadView {
+    async fn load_exact_rows(
+        &self,
+        request: &BatchTrackedRowRequest,
+    ) -> Result<Vec<TrackedRow>, crate::LixError>;
+
+    async fn scan_rows(
+        &self,
+        request: &TrackedScanRequest,
+    ) -> Result<Vec<TrackedRow>, crate::LixError>;
+}
 #[cfg(test)]
-pub(crate) use crate::contracts::TrackedTombstoneView;
+#[async_trait(?Send)]
+pub trait TrackedTombstoneView {
+    async fn scan_tombstones(
+        &self,
+        request: &TrackedScanRequest,
+    ) -> Result<Vec<TrackedTombstoneMarker>, crate::LixError>;
+}
 pub use crate::contracts::{
     ExactRowRequest as ExactTrackedRowRequest, ScanRequest as TrackedScanRequest, TrackedRow,
     TrackedTombstoneMarker, TrackedWriteOperation, TrackedWriteRow,

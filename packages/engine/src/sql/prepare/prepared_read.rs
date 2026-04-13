@@ -1,4 +1,3 @@
-use crate::contracts::SqlPreparationMetadataReader;
 use crate::contracts::{
     PreparedBatch, PreparedBatchReadArtifact, PreparedDirectReadArtifact,
     PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryField,
@@ -34,6 +33,7 @@ use crate::sql::logical_plan::direct_reads::{
 use crate::sql::physical_plan::{
     LoweredResultColumn, LoweredResultColumns, PublicReadPhysicalPlan,
 };
+use crate::sql::prepare::SqlPreparationMetadataReader;
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode, Value};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use std::ops::ControlFlow;

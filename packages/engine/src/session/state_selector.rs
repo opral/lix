@@ -3,12 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind};
-use crate::contracts::{LiveStateQueryBackend, PendingOverlayView, PendingSemanticStorage};
 use crate::contracts::{PendingOverlayFilter, ScanConstraint, ScanField, ScanOperator};
-use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, RowReadMode};
+use crate::live_state::LiveStateQueryBackend;
+use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, LiveRowSource};
 use crate::sql::{
     resolve_placeholder_index, CanonicalStateRowKey, PlaceholderState, PlannedWrite, ScopeProof,
 };
+use crate::transaction::{PendingOverlay, PendingSemanticStorage};
 use crate::{LixBackend, LixError, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";
@@ -71,7 +72,7 @@ enum LaneSelectorResult {
 
 pub(crate) async fn try_resolve_state_selector_rows_with_backend(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     planned_write: &PlannedWrite,
 ) -> Result<Option<Vec<CanonicalStateRowKey>>, LixError> {
     let Some(semantics) =
@@ -99,7 +100,7 @@ pub(crate) async fn try_resolve_state_selector_rows_with_backend(
         selector_rows.extend(
             resolve_rows_for_version(
                 backend,
-                pending_overlay_view,
+                pending_overlay,
                 &schema_key,
                 &version_id,
                 &constraints,
@@ -136,7 +137,7 @@ pub(crate) async fn try_resolve_state_selector_rows_with_backend(
 
 async fn resolve_rows_for_version(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     schema_key: &str,
     requested_version_id: &str,
     constraints: &[ScanConstraint],
@@ -148,7 +149,7 @@ async fn resolve_rows_for_version(
     for lane in selector_overlay_lanes_for_version(requested_version_id) {
         let lane_rows = scan_selector_lane(
             backend,
-            pending_overlay_view,
+            pending_overlay,
             schema_key,
             requested_version_id,
             lane,
@@ -185,7 +186,7 @@ async fn resolve_rows_for_version(
 
 async fn scan_selector_lane(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     schema_key: &str,
     requested_version_id: &str,
     lane: SelectorOverlayLane,
@@ -195,10 +196,10 @@ async fn scan_selector_lane(
     let request = LiveRowQuery {
         schema_key: schema_key.to_string(),
         version_id: storage_version_id.clone(),
-        mode: if lane.is_untracked() {
-            RowReadMode::Untracked
+        source: if lane.is_untracked() {
+            LiveRowSource::Untracked
         } else {
-            RowReadMode::Tracked
+            LiveRowSource::Tracked
         },
         constraints: constraints.to_vec(),
         include_tombstones: !lane.is_untracked(),
@@ -222,7 +223,7 @@ async fn scan_selector_lane(
         lane_rows.insert(row.identity(), LaneSelectorResult::Visible(row));
     }
 
-    let Some(pending_overlay_view) = pending_overlay_view else {
+    let Some(pending_overlay) = pending_overlay else {
         return Ok(lane_rows);
     };
 
@@ -232,7 +233,7 @@ async fn scan_selector_lane(
         PendingSemanticStorage::Tracked
     };
 
-    for pending in pending_overlay_view.visible_semantic_rows(pending_storage, schema_key) {
+    for pending in pending_overlay.visible_semantic_rows(pending_storage, schema_key) {
         if pending.version_id != storage_version_id
             || !crate::contracts::matches_constraints(
                 &pending.entity_id,
@@ -259,7 +260,7 @@ async fn scan_selector_lane(
             continue;
         }
 
-        let writer_key = pending_overlay_view.writer_key_annotation_for_state_row(
+        let writer_key = pending_overlay.writer_key_annotation_for_state_row(
             &pending.version_id,
             &pending.schema_key,
             &pending.entity_id,

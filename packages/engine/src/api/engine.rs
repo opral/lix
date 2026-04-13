@@ -17,8 +17,8 @@ use crate::contracts::{
 };
 use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
 use crate::schema::SchemaKey;
-use crate::services::plugin_runtime::{
-    call_apply_changes, parse_installed_plugin_from_archive_bytes,
+use crate::services::plugin_archive::{
+    invoke_apply_changes_export, load_installed_plugin_from_archive_bytes,
 };
 use crate::session::deterministic_mode::{
     global_deterministic_settings_storage_scope, load_runtime_settings, DeterministicSettings,
@@ -290,7 +290,7 @@ impl Engine {
         payload: &[u8],
     ) -> Result<Vec<u8>, LixError> {
         let instance = self.load_or_init_plugin_component(plugin).await?;
-        call_apply_changes(instance.as_ref(), payload).await
+        invoke_apply_changes_export(instance.as_ref(), payload).await
     }
 
     async fn load_installed_plugins_with_runtime_cache(
@@ -361,7 +361,7 @@ impl Engine {
                 ),
             });
         }
-        parse_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
+        load_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
     }
 
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {

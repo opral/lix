@@ -53,7 +53,7 @@ impl LiveRowShape {
         schema_key: &str,
         values: &std::collections::BTreeMap<String, Value>,
     ) -> Result<JsonValue, LixError> {
-        super::raw::snapshot_json_from_values(&self.access, schema_key, values)
+        super::stored_rows::snapshot_json_from_values(&self.access, schema_key, values)
     }
 
     pub(crate) fn snapshot_text_from_values(

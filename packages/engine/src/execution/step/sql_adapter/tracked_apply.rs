@@ -5,18 +5,18 @@ use crate::contracts::{
     state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
 };
 use crate::contracts::{PendingCommitState, PlanEffects, SessionStateDelta};
-use crate::transaction::{TrackedTxnUnit, WriteExecutionHost};
+use crate::transaction::{TrackedTxnUnit, WriteExecutionContext};
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 use super::runtime::WriteExecutionOutcome;
 
 pub(crate) async fn run_public_tracked_append_txn_with_transaction(
-    host: &dyn WriteExecutionHost,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     unit: &TrackedTxnUnit,
     pending_commit_state: Option<&mut Option<PendingCommitState>>,
 ) -> Result<Option<WriteExecutionOutcome>, LixError> {
-    let tracked_write_outcome = host
+    let tracked_write_outcome = execution_context
         .execute_public_tracked_append_txn_with_transaction(transaction, unit, pending_commit_state)
         .await?;
 

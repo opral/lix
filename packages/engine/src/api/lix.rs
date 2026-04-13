@@ -12,7 +12,7 @@ use super::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStre
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::SharedFunctionProvider;
-use crate::contracts::{CompiledSchemaCache, FunctionRuntimeState, WasmRuntime};
+use crate::contracts::{CompiledSchemaCache, FunctionBindings, WasmRuntime};
 use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
@@ -227,10 +227,7 @@ impl Lix {
     }
 
     pub(crate) async fn open_workspace_session(&self) -> Result<Session, LixError> {
-        Session::open_workspace(crate::session::runtime::SessionRuntime::new(
-            self.session_host(),
-        ))
-        .await
+        Session::open_workspace(self.session_host()).await
     }
 
     pub(crate) async fn opened_workspace_session(&self) -> Result<Arc<Session>, LixError> {
@@ -537,7 +534,7 @@ impl Lix {
 }
 
 #[async_trait(?Send)]
-impl crate::session::host::WriteExecutionServices for Lix {
+impl crate::transaction::WriteExecutionContext for Lix {
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
         self.catalog_projection_registry().as_ref()
     }
@@ -558,30 +555,26 @@ impl crate::session::host::WriteExecutionServices for Lix {
         }
     }
 
-    async fn prepare_function_runtime_state(
+    async fn prepare_function_bindings(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<FunctionRuntimeState, LixError> {
+    ) -> Result<FunctionBindings, LixError> {
         let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(FunctionRuntimeState::from_prepared_parts(
+        Ok(FunctionBindings::from_prepared_parts(
             settings.enabled,
             &functions,
         ))
     }
-}
-
-#[async_trait(?Send)]
-impl crate::transaction::WriteExecutionHost for Lix {
-    async fn execute_prepared_public_read_with_pending_overlay_view(
+    async fn execute_prepared_public_read_with_pending_overlay(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        pending_overlay_view: Option<&dyn crate::contracts::PendingOverlayView>,
+        pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,
         public_read: &crate::contracts::PreparedPublicRead,
     ) -> Result<crate::QueryResult, LixError> {
-        crate::session::write_execution_host::execute_prepared_public_read_with_registry(
+        crate::session::write_execution_context::execute_prepared_public_read_with_registry(
             self.catalog_projection_registry().as_ref(),
             transaction,
-            pending_overlay_view,
+            pending_overlay,
             public_read,
         )
         .await
@@ -592,14 +585,15 @@ impl crate::transaction::WriteExecutionHost for Lix {
         transaction: &mut dyn crate::LixBackendTransaction,
         writes: &[crate::transaction::BinaryBlobWrite],
     ) -> Result<(), LixError> {
-        crate::session::write_execution_host::persist_binary_blob_writes(transaction, writes).await
+        crate::session::write_execution_context::persist_binary_blob_writes(transaction, writes)
+            .await
     }
 
     async fn garbage_collect_unreachable_binary_cas_in_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_host::garbage_collect_unreachable_binary_cas(transaction)
+        crate::session::write_execution_context::garbage_collect_unreachable_binary_cas(transaction)
             .await
     }
 
@@ -608,7 +602,8 @@ impl crate::transaction::WriteExecutionHost for Lix {
         transaction: &mut dyn crate::LixBackendTransaction,
         functions: &SharedFunctionProvider<Box<dyn crate::contracts::LixFunctionProvider + Send>>,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_host::persist_runtime_sequence(transaction, functions).await
+        crate::session::write_execution_context::persist_runtime_sequence(transaction, functions)
+            .await
     }
 
     async fn execute_public_tracked_append_txn_with_transaction(
@@ -617,7 +612,7 @@ impl crate::transaction::WriteExecutionHost for Lix {
         unit: &crate::transaction::TrackedTxnUnit,
         pending_commit_state: Option<&mut Option<crate::contracts::PendingCommitState>>,
     ) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
-        crate::session::write_execution_host::execute_public_tracked_append(
+        crate::session::write_execution_context::execute_public_tracked_append(
             transaction,
             unit,
             pending_commit_state,
@@ -914,7 +909,7 @@ mod tests {
                         Arc::new(NoopWasmRuntime),
                     )));
                     let session = Session::new_for_test(
-                        crate::session::runtime::SessionRuntime::new(lix.session_host()),
+                        lix.session_host(),
                         "version-test".to_string(),
                         Vec::new(),
                     );
@@ -959,11 +954,8 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session = Session::new_for_test(
-            crate::session::runtime::SessionRuntime::new(lix.session_host()),
-            "version-test".to_string(),
-            Vec::new(),
-        );
+        let session =
+            Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
         {
             let mut cache = lix
@@ -1014,11 +1006,8 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session = Session::new_for_test(
-            crate::session::runtime::SessionRuntime::new(lix.session_host()),
-            "version-test".to_string(),
-            Vec::new(),
-        );
+        let session =
+            Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
 
         {
             let mut cache = lix

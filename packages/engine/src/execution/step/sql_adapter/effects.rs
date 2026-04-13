@@ -13,7 +13,8 @@ use crate::transaction::{
     filesystem_transaction_state_from_planned, merge_filesystem_transaction_state,
     persist_filesystem_payload_changes_in_transaction, BufferedWriteCommandMetadata,
     BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    DeferredCommitEffects, TransactionCommitOutcome, WriteCommand, WriteExecutionHost, WritePath,
+    DeferredCommitEffects, TransactionCommitOutcome, WriteCommand, WriteExecutionContext,
+    WritePath,
 };
 use crate::{LixBackendTransaction, LixError};
 
@@ -43,7 +44,7 @@ pub(crate) fn command_metadata(
 }
 
 pub(crate) async fn complete_sql_command_execution(
-    host: &dyn WriteExecutionHost,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     step: &WriteCommand,
     write_outcome: WriteExecutionOutcome,
@@ -105,7 +106,8 @@ pub(crate) async fn complete_sql_command_execution(
             filesystem_transaction_state_from_planned(&prepared_filesystem_state(step.prepared()));
         let binary_blob_writes = binary_blob_writes_from_filesystem_state(&filesystem_state);
         if !filesystem_payload_changes_already_committed {
-            host.persist_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
+            execution_context
+                .persist_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -156,7 +158,8 @@ pub(crate) async fn complete_sql_command_execution(
             .as_ref()
             .is_some_and(|compiled| compiled.should_run_gc)
         {
-            host.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+            execution_context
+                .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -169,7 +172,11 @@ pub(crate) async fn complete_sql_command_execution(
     }
 
     if !write_handled_by_planned_write {
-        host.persist_runtime_sequence_in_transaction(transaction, step.runtime_state().functions())
+        execution_context
+            .persist_runtime_sequence_in_transaction(
+                transaction,
+                step.function_bindings().provider(),
+            )
             .await
             .map_err(|error| LixError {
                 code: error.code,

@@ -7,17 +7,19 @@ use jsonschema::JSONSchema;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::common::escape_sql_string;
 use crate::contracts::parse_active_version_snapshot;
+use crate::contracts::CompiledSchemaCache;
 use crate::contracts::TrackedChangeView;
 use crate::contracts::TrackedCommitExecutionOutcome;
 use crate::contracts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PendingCommitState, PreparedPublicRead,
     PreparedPublicWrite, PublicChange, SchemaKey, WriteLane,
 };
-use crate::contracts::{CompiledSchemaCache, PendingOverlayView};
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
-use crate::session::read_execution_host::CatalogProjectionRegistryReadExecutionHost;
-use crate::session::runtime::SessionRuntime;
+use crate::session::host::{
+    prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
+};
+use crate::session::public_read_execution::ProjectionReadExecutionHost;
 use crate::session::version_ops::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
     CreateCommitAppliedOutput, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
@@ -26,7 +28,7 @@ use crate::session::version_ops::commit::{
 };
 use crate::transaction::{
     resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
-    TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionHost,
+    PendingOverlay, TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionContext,
 };
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
@@ -97,17 +99,40 @@ impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
 }
 
 #[async_trait(?Send)]
-impl WriteExecutionHost for SessionRuntime {
-    async fn execute_prepared_public_read_with_pending_overlay_view(
+impl WriteExecutionContext for SessionExecutionContext<'_> {
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        self.session_host().catalog_projection_registry()
+    }
+
+    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
+        self.session_host().compiled_schema_cache()
+    }
+
+    fn sql_compiler_seed<'a>(
+        &'a self,
+        functions: &'a crate::contracts::DynFunctionProvider,
+        surface_registry: &'a crate::catalog::SurfaceRegistry,
+    ) -> crate::sql::SqlCompilerSeed<'a> {
+        sql_compiler_seed_from_host(self.session_host(), functions, surface_registry)
+    }
+
+    async fn prepare_function_bindings(
+        &self,
+        backend: &dyn crate::LixBackend,
+    ) -> Result<crate::contracts::FunctionBindings, LixError> {
+        prepare_function_bindings_with_host(self.session_host(), backend).await
+    }
+
+    async fn execute_prepared_public_read_with_pending_overlay(
         &self,
         transaction: &mut dyn LixBackendTransaction,
-        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        pending_overlay: Option<&dyn PendingOverlay>,
         public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError> {
         execute_prepared_public_read_with_registry(
-            self.catalog_projection_registry(),
+            self.session_host().catalog_projection_registry(),
             transaction,
-            pending_overlay_view,
+            pending_overlay,
             public_read,
         )
         .await
@@ -149,20 +174,20 @@ impl WriteExecutionHost for SessionRuntime {
 pub(crate) async fn execute_prepared_public_read_with_registry(
     projection_registry: &CatalogProjectionRegistry,
     transaction: &mut dyn LixBackendTransaction,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.source() {
         crate::contracts::PublicReadSource::PendingOverlay => {
-            crate::session::pending_reads::execute_prepared_public_read_with_pending_overlay_view_in_transaction(
+            crate::session::pending_reads::execute_prepared_public_read_with_pending_overlay_in_transaction(
                 transaction,
-                pending_overlay_view,
+                pending_overlay,
                 public_read,
             )
             .await
         }
         crate::contracts::PublicReadSource::Committed(_) => {
-            let host = CatalogProjectionRegistryReadExecutionHost::new(projection_registry);
+            let host = ProjectionReadExecutionHost::new(projection_registry);
             crate::execution::read::execute_prepared_public_read_artifact_in_transaction(
                 transaction,
                 &host,
@@ -235,7 +260,7 @@ pub(crate) async fn execute_public_tracked_append(
         return Ok(TrackedCommitExecutionOutcome::default());
     }
 
-    let mut create_commit_functions = unit.runtime_state.functions().clone();
+    let mut create_commit_functions = unit.function_bindings.provider().clone();
     let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
 
     if pending_commit_state
@@ -503,7 +528,7 @@ async fn tracked_live_rows_for_writer_key_updates(
         let row = crate::live_state::load_exact_live_row(
             &backend,
             &crate::live_state::ExactLiveRowQuery {
-                semantics: crate::live_state::LiveRowSemantics::Tracked,
+                source: crate::live_state::LiveRowSource::Tracked,
                 schema_key: row_identity.schema_key.clone(),
                 version_id: row_identity.version_id.clone(),
                 entity_id: row_identity.entity_id.clone(),

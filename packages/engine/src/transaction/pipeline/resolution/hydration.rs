@@ -1,6 +1,6 @@
 use super::effective_state::resolve_exact_effective_state_row_with_pending_overlay;
-use crate::contracts::PendingStateOverlay;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
 };
@@ -19,7 +19,7 @@ pub(crate) struct HydratedVersionAdminRow {
 
 pub(crate) struct PublicWriteHydrator<'a> {
     backend: &'a dyn LixBackend,
-    pending_state_overlay: Option<&'a dyn PendingStateOverlay>,
+    pending_overlay: Option<&'a dyn PendingOverlay>,
     version_admin_rows: BTreeMap<String, Option<HydratedVersionAdminRow>>,
     validated_version_targets: BTreeSet<String>,
 }
@@ -27,11 +27,11 @@ pub(crate) struct PublicWriteHydrator<'a> {
 impl<'a> PublicWriteHydrator<'a> {
     pub(crate) fn new(
         backend: &'a dyn LixBackend,
-        pending_state_overlay: Option<&'a dyn PendingStateOverlay>,
+        pending_overlay: Option<&'a dyn PendingOverlay>,
     ) -> Self {
         Self {
             backend,
-            pending_state_overlay,
+            pending_overlay,
             version_admin_rows: BTreeMap::new(),
             validated_version_targets: BTreeSet::new(),
         }
@@ -41,8 +41,8 @@ impl<'a> PublicWriteHydrator<'a> {
         self.backend
     }
 
-    pub(crate) fn pending_state_overlay(&self) -> Option<&'a dyn PendingStateOverlay> {
-        self.pending_state_overlay
+    pub(crate) fn pending_overlay(&self) -> Option<&'a dyn PendingOverlay> {
+        self.pending_overlay
     }
 
     pub(crate) async fn load_version_admin_row(
@@ -126,7 +126,7 @@ impl<'a> PublicWriteHydrator<'a> {
         resolve_exact_effective_state_row_with_pending_overlay(
             self.backend,
             request,
-            self.pending_state_overlay,
+            self.pending_overlay,
         )
         .await
     }

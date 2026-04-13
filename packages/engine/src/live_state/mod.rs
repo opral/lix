@@ -8,7 +8,7 @@
 //! - lifecycle initialization and readiness checks for live-state serving
 //! - projection replay/catch-up orchestration for live-state derived rows
 //! - schema-scoped storage initialization
-//! - raw, tracked, untracked, and effective row access
+//! - stored, tracked, untracked, and effective row access
 //! - rebuild planning and apply for visible-row materialization
 //! - read-only passthrough query surfaces for canonical-owned facts when
 //!   SQL/public reads need them
@@ -36,13 +36,15 @@ pub(crate) mod naming;
 mod plugin_archives;
 #[allow(dead_code)]
 pub(crate) mod projection;
-mod query_contracts;
-pub(crate) mod raw;
-mod row_api;
+#[cfg(test)]
+mod read_context;
+mod row_queries;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
+mod snapshot_queries;
 pub(crate) mod storage;
 mod storage_metadata;
+pub(crate) mod stored_rows;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tracked;
@@ -61,6 +63,8 @@ pub(crate) use crate::contracts::{
 };
 pub use crate::contracts::{LiveStateMode, SchemaRegistration};
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
+#[cfg(test)]
+pub(crate) use effective::EffectiveRowsResolver;
 pub use effective::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane,
@@ -78,12 +82,15 @@ pub(crate) use plugin_archives::PluginArchiveRef;
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
-pub use row_api::{
+#[cfg(test)]
+pub(crate) use read_context::LiveReadContext;
+pub use row_queries::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, write_live_rows,
-    ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSemantics, RowReadMode,
+    ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSource,
 };
 pub(crate) use schema_access::LiveRowShape;
 pub use shared::identity::RowIdentity;
+pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
 pub(crate) use storage_metadata::{
     builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,
     key_value_schema_version, BuiltinSchemaStorageLane, BuiltinSchemaStorageMetadata,
@@ -98,11 +105,17 @@ pub(crate) use tracked::{
     load_exact_tombstone_with_executor as load_exact_tracked_tombstone_with_executor,
     scan_tombstones_with_executor as scan_tracked_tombstones_with_executor,
 };
+#[cfg(test)]
+pub(crate) use tracked::{TrackedReadView, TrackedTombstoneView};
 pub(crate) use untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
+#[cfg(test)]
+pub(crate) use untracked::UntrackedReadView;
 pub(crate) use untracked::{ExactUntrackedRowRequest, UntrackedRow};
 pub(crate) use visible_rows::{
     scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
 };
+#[cfg(test)]
+pub(crate) use writer_key::WriterKeyReadView;
 pub(crate) use writer_key::WRITER_KEY_TABLE;
 
 pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;

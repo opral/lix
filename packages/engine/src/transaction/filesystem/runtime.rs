@@ -4,7 +4,7 @@ use crate::catalog::{
 };
 use crate::common::stable_content_fingerprint_hex;
 use crate::contracts::{FilesystemPayloadChange, MutationRow, OptionalTextPatch};
-use crate::contracts::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
+use crate::transaction::overlay::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::transaction::TransactionExecutionBackend;
 use crate::{LixBackendTransaction, LixError, Value};
 use std::collections::{BTreeMap, BTreeSet};

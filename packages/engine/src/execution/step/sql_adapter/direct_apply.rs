@@ -2,14 +2,14 @@ use crate::contracts::FilesystemPayloadChange;
 use crate::transaction::{
     build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,
-    filesystem_transaction_state_from_planned, PlannedDirectWriteUnit, WriteExecutionHost,
+    filesystem_transaction_state_from_planned, PlannedDirectWriteUnit, WriteExecutionContext,
 };
 use crate::{LixBackendTransaction, LixError};
 
 use super::runtime::{execute_direct_execution_with_transaction, WriteExecutionOutcome};
 
 pub(crate) async fn run_direct_write_txn_with_transaction(
-    host: &dyn WriteExecutionHost,
+    execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedDirectWriteUnit,
 ) -> Result<Option<WriteExecutionOutcome>, LixError> {
@@ -17,7 +17,7 @@ pub(crate) async fn run_direct_write_txn_with_transaction(
         transaction,
         &plan.execution,
         plan.result_contract,
-        plan.runtime_state.functions(),
+        plan.function_bindings.provider(),
         plan.execution.writer_key.as_deref(),
     )
     .await
@@ -33,11 +33,12 @@ pub(crate) async fn run_direct_write_txn_with_transaction(
     )
     .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
-        host.persist_binary_blob_writes_in_transaction(
-            transaction,
-            &filesystem_finalization.binary_blob_writes,
-        )
-        .await?;
+        execution_context
+            .persist_binary_blob_writes_in_transaction(
+                transaction,
+                &filesystem_finalization.binary_blob_writes,
+            )
+            .await?;
     }
     persist_filesystem_payload_changes_direct(
         transaction,
@@ -45,11 +46,13 @@ pub(crate) async fn run_direct_write_txn_with_transaction(
     )
     .await?;
     if filesystem_finalization.should_run_gc {
-        host.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+        execution_context
+            .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
             .await?;
     }
 
-    host.persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.functions())
+    execution_context
+        .persist_runtime_sequence_in_transaction(transaction, plan.function_bindings.provider())
         .await
         .map_err(|error| LixError {
             code: error.code,

@@ -7,8 +7,6 @@ use crate::catalog::{
     CatalogWriteVersionSemantics, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness,
     SurfaceRegistry, SurfaceVariant,
 };
-#[cfg(test)]
-use crate::contracts::SqlPreparationMetadataReader;
 use crate::contracts::TrackedChangeView;
 use crate::contracts::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
@@ -49,6 +47,8 @@ use crate::sql::prepare::intent::{
     authoritative_binary_blob_write_targets_from_planned_state,
     delete_targets_from_planned_filesystem_state,
 };
+#[cfg(test)]
+use crate::sql::prepare::SqlPreparationMetadataReader;
 use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::sql::semantic_ir::{

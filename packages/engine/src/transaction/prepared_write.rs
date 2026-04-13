@@ -1,8 +1,7 @@
-use crate::contracts::PreparedWriteRuntimeState;
 use crate::contracts::{
     coalesce_live_table_requirements, PreparedDirectWriteArtifact, PreparedPublicRead,
-    PreparedWriteStatement, PreparedWriteStatementKind, SchemaRegistration, SchemaRegistrationSet,
-    WriteDiagnosticContext,
+    PreparedWriteFunctionBindings, PreparedWriteStatement, PreparedWriteStatementKind,
+    SchemaRegistration, SchemaRegistrationSet, WriteDiagnosticContext,
 };
 use crate::execution::step::WriteExecutionOutcome;
 use crate::{LixError, QueryResult};
@@ -11,7 +10,7 @@ use super::buffered::{build_transaction_write_delta, TransactionWriteDelta};
 
 pub(crate) struct WriteCommand {
     prepared: PreparedWriteStatement,
-    runtime_state: PreparedWriteRuntimeState,
+    function_bindings: PreparedWriteFunctionBindings,
     transaction_write_delta: Option<TransactionWriteDelta>,
     schema_registrations: SchemaRegistrationSet,
 }
@@ -33,17 +32,17 @@ pub(crate) enum WriteResult {
 impl WriteCommand {
     pub(crate) fn build(
         prepared: PreparedWriteStatement,
-        runtime_state: &PreparedWriteRuntimeState,
+        function_bindings: &PreparedWriteFunctionBindings,
     ) -> Result<Self, LixError> {
         let schema_registrations = schema_registrations_for_prepared_write_statement(&prepared);
         let transaction_write_delta = if prepared.diagnostic_context.explain_mode.is_some() {
             None
         } else {
-            build_transaction_write_delta(&prepared, runtime_state)?
+            build_transaction_write_delta(&prepared, function_bindings)?
         };
         Ok(Self {
             prepared,
-            runtime_state: runtime_state.clone(),
+            function_bindings: function_bindings.clone(),
             transaction_write_delta,
             schema_registrations,
         })
@@ -65,8 +64,8 @@ impl WriteCommand {
         self.transaction_write_delta.as_ref()
     }
 
-    pub(crate) fn runtime_state(&self) -> &PreparedWriteRuntimeState {
-        &self.runtime_state
+    pub(crate) fn function_bindings(&self) -> &PreparedWriteFunctionBindings {
+        &self.function_bindings
     }
 
     pub(crate) fn schema_registrations(&self) -> &SchemaRegistrationSet {

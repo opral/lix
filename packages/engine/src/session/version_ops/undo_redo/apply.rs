@@ -6,7 +6,7 @@ use crate::canonical::{
     CanonicalStateRow,
 };
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::{FunctionRuntimeState, StateCommitStreamChange, StateCommitStreamOperation};
+use crate::contracts::{FunctionBindings, StateCommitStreamChange, StateCommitStreamOperation};
 use crate::session::version_ops::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };
@@ -328,8 +328,8 @@ async fn append_undo_redo_commit_in_transaction(
     active_account_ids: Vec<String>,
     operation_kind: UndoRedoOperationKind,
 ) -> Result<AppliedUndoRedoCommit, LixError> {
-    let runtime_state = checkpoint_runtime_state(tx).await?;
-    let mut functions = runtime_state.provider().clone();
+    let function_bindings = checkpoint_function_bindings(tx).await?;
+    let mut functions = function_bindings.provider().clone();
     crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut functions,
@@ -388,20 +388,19 @@ async fn append_undo_redo_commit_in_transaction(
     })
 }
 
-async fn checkpoint_runtime_state(
+async fn checkpoint_function_bindings(
     tx: &mut SessionTransaction<'_>,
-) -> Result<FunctionRuntimeState, LixError> {
-    if let Some(runtime_state) = tx.context.function_runtime_state().cloned() {
-        return Ok(runtime_state);
+) -> Result<FunctionBindings, LixError> {
+    if let Some(function_bindings) = tx.context.function_bindings().cloned() {
+        return Ok(function_bindings);
     }
 
-    let session_runtime = tx.session_runtime();
+    let session_host = tx.session_host();
     let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
-    let runtime_state = session_runtime
-        .prepare_function_runtime_state(&backend)
-        .await?;
-    tx.context.set_function_runtime_state(runtime_state.clone());
-    Ok(runtime_state)
+    let function_bindings =
+        crate::session::host::prepare_function_bindings_with_host(session_host, &backend).await?;
+    tx.context.set_function_bindings(function_bindings.clone());
+    Ok(function_bindings)
 }
 
 async fn resolve_target_version_id_in_session(

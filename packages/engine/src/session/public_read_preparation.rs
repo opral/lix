@@ -1,7 +1,8 @@
-//! Neutral read preparation pipeline.
+//! Public-read preparation helpers.
 //!
-//! `session/*` owns selector orchestration, but selector-read preparation and
-//! active-history lookup should not live under the session owner.
+//! `session/*` owns selector orchestration, but public-read preparation and
+//! active-history lookup should stay scoped to the public-read preparation
+//! behavior they support.
 
 use std::collections::BTreeMap;
 
@@ -10,34 +11,31 @@ use sqlparser::ast::Statement;
 
 use crate::backend::QueryExecutor;
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::SqlPreparationMetadataReader;
-use crate::contracts::{DynFunctionProvider, PendingOverlayView, PreparedPublicRead};
+use crate::contracts::{DynFunctionProvider, PreparedPublicRead};
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
 use crate::session::version_ops::load_version_head_commit_map_with_executor;
 use crate::sql::{
     load_sql_compiler_metadata, prepare_public_read, prepare_public_read_artifact,
-    SqlCompilerMetadata,
+    SqlCompilerMetadata, SqlPreparationMetadataReader,
 };
+use crate::transaction::PendingOverlay;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
-pub(crate) struct PreparedPublicReadCollaborators {
+pub(crate) struct ReadPreparationContext {
     registry: SurfaceRegistry,
     compiler_metadata: SqlCompilerMetadata,
 }
 
-pub(crate) async fn bootstrap_prepared_public_read_collaborators(
+pub(crate) async fn build_read_preparation_context(
     backend: &dyn LixBackend,
-    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     functions: &DynFunctionProvider,
-) -> Result<PreparedPublicReadCollaborators, LixError> {
-    let registry = crate::session::pending_reads::build_surface_registry(
-        backend,
-        pending_overlay_view,
-        functions,
-    )
-    .await?;
+) -> Result<ReadPreparationContext, LixError> {
+    let registry =
+        crate::session::pending_reads::build_surface_registry(backend, pending_overlay, functions)
+            .await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
-    Ok(PreparedPublicReadCollaborators {
+    Ok(ReadPreparationContext {
         registry,
         compiler_metadata,
     })
@@ -45,7 +43,7 @@ pub(crate) async fn bootstrap_prepared_public_read_collaborators(
 
 pub(crate) async fn prepare_required_active_public_read_artifact_with_backend(
     backend: &dyn LixBackend,
-    collaborators: &PreparedPublicReadCollaborators,
+    preparation_context: &ReadPreparationContext,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -55,7 +53,7 @@ pub(crate) async fn prepare_required_active_public_read_artifact_with_backend(
     prepare_required_active_public_read_artifact_with_reader(
         &mut metadata_reader,
         backend.dialect(),
-        collaborators,
+        preparation_context,
         parsed_statements,
         params,
         active_version_id,
@@ -67,7 +65,7 @@ pub(crate) async fn prepare_required_active_public_read_artifact_with_backend(
 async fn prepare_required_active_public_read_artifact_with_reader(
     metadata_reader: &mut dyn SqlPreparationMetadataReader,
     dialect: crate::SqlDialect,
-    collaborators: &PreparedPublicReadCollaborators,
+    preparation_context: &ReadPreparationContext,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
@@ -78,8 +76,8 @@ async fn prepare_required_active_public_read_artifact_with_reader(
         .await?;
     let prepared = prepare_public_read(
         dialect,
-        &collaborators.registry,
-        &collaborators.compiler_metadata,
+        &preparation_context.registry,
+        &preparation_context.compiler_metadata,
         parsed_statements,
         params,
         active_version_id,

@@ -1,7 +1,7 @@
 use super::BufferedWriteJournal;
 use super::TransactionWriteDelta;
 use crate::contracts::StateCommitStreamChange;
-use crate::transaction::overlay::PendingWriteOverlayView;
+use crate::transaction::overlay::PendingWriteOverlay;
 use crate::transaction::TransactionCommitOutcome;
 use crate::LixError;
 
@@ -17,10 +17,8 @@ impl BufferedWriteState {
         self.journal.is_empty()
     }
 
-    pub(crate) fn pending_write_overlay_view(
-        &self,
-    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
-        self.journal.pending_write_overlay_view()
+    pub(crate) fn pending_write_overlay(&self) -> Result<Option<PendingWriteOverlay>, LixError> {
+        self.journal.pending_write_overlay()
     }
 
     pub(crate) fn can_stage_delta(&self, delta: &TransactionWriteDelta) -> Result<bool, LixError> {

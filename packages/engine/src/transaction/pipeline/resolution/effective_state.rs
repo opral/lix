@@ -1,8 +1,7 @@
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{
-    LiveStateQueryBackend, PendingSemanticRow, PendingSemanticStorage, PendingStateOverlay,
-};
-use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRow, LiveRowSemantics};
+use crate::live_state::LiveStateQueryBackend;
+use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRow, LiveRowSource};
+use crate::transaction::overlay::{PendingOverlay, PendingSemanticRow, PendingSemanticStorage};
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,
     ExactEffectiveStateRowRequest, OverlayLane,
@@ -12,7 +11,7 @@ use crate::{LixBackend, LixError, Value};
 pub(crate) async fn resolve_exact_effective_state_row_with_pending_overlay(
     backend: &dyn LixBackend,
     request: &ExactEffectiveStateRowRequest,
-    pending_state_overlay: Option<&dyn PendingStateOverlay>,
+    pending_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<Option<ExactEffectiveStateRow>, LixError> {
     let requested_untracked = request.row_key.untracked;
     let mut requested_global = request.row_key.global;
@@ -25,7 +24,7 @@ pub(crate) async fn resolve_exact_effective_state_row_with_pending_overlay(
 
     if let Some(row) = load_exact_pending_effective_row(
         backend,
-        pending_state_overlay,
+        pending_overlay,
         request,
         requested_global,
         requested_untracked,
@@ -38,7 +37,7 @@ pub(crate) async fn resolve_exact_effective_state_row_with_pending_overlay(
     let Some(row) = load_exact_live_row(
         backend,
         &ExactLiveRowQuery {
-            semantics: LiveRowSemantics::Effective,
+            source: LiveRowSource::Effective,
             schema_key: request.schema_key.clone(),
             version_id: request.version_id.clone(),
             entity_id: request.row_key.entity_id.clone(),
@@ -101,7 +100,7 @@ fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Op
 
 async fn load_exact_pending_effective_row(
     backend: &dyn LixBackend,
-    pending_state_overlay: Option<&dyn PendingStateOverlay>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     request: &ExactEffectiveStateRowRequest,
     requested_global: Option<bool>,
     requested_untracked: Option<bool>,
@@ -136,7 +135,7 @@ async fn load_exact_pending_effective_row(
                 PendingSemanticStorage::Untracked
             }
         };
-        let Some(pending) = pending_state_overlay.and_then(|view| {
+        let Some(pending) = pending_overlay.and_then(|view| {
             view.visible_semantic_rows(storage, &request.schema_key)
                 .into_iter()
                 .find(|row| pending_row_matches_exact_request(row, request, &internal_version_id))
@@ -150,7 +149,7 @@ async fn load_exact_pending_effective_row(
 
         let row = exact_effective_state_row_from_pending(
             backend,
-            pending_state_overlay,
+            pending_overlay,
             &pending,
             &request.version_id,
             overlay_lane,
@@ -182,7 +181,7 @@ fn pending_row_matches_exact_request(
 
 async fn exact_effective_state_row_from_pending(
     backend: &dyn LixBackend,
-    pending_state_overlay: Option<&dyn PendingStateOverlay>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     row: &PendingSemanticRow,
     requested_version_id: &str,
     overlay_lane: OverlayLane,
@@ -229,7 +228,7 @@ async fn exact_effective_state_row_from_pending(
         row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
     );
     let writer_key = pending_writer_key_annotation(
-        pending_state_overlay,
+        pending_overlay,
         &row.version_id,
         &row.schema_key,
         &row.entity_id,
@@ -265,13 +264,13 @@ fn pending_effective_row_matches_row_key(
 }
 
 fn pending_writer_key_annotation(
-    pending_state_overlay: Option<&dyn PendingStateOverlay>,
+    pending_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,
     schema_key: &str,
     entity_id: &str,
     file_id: &str,
 ) -> Option<Option<String>> {
-    pending_state_overlay.and_then(|view| {
+    pending_overlay.and_then(|view| {
         view.writer_key_annotation_for_state_row(version_id, schema_key, entity_id, file_id)
     })
 }

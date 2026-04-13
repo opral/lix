@@ -4,7 +4,18 @@ use async_trait::async_trait;
 #[cfg(test)]
 pub use crate::contracts::BatchRowRequest as BatchUntrackedRowRequest;
 #[cfg(test)]
-pub(crate) use crate::contracts::UntrackedReadView;
+#[async_trait(?Send)]
+pub trait UntrackedReadView {
+    async fn load_exact_rows(
+        &self,
+        request: &BatchUntrackedRowRequest,
+    ) -> Result<Vec<UntrackedRow>, crate::LixError>;
+
+    async fn scan_rows(
+        &self,
+        request: &UntrackedScanRequest,
+    ) -> Result<Vec<UntrackedRow>, crate::LixError>;
+}
 pub use crate::contracts::{
     ExactRowRequest as ExactUntrackedRowRequest, ScanRequest as UntrackedScanRequest, UntrackedRow,
     UntrackedWriteOperation, UntrackedWriteRow,

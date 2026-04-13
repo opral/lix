@@ -1,4 +1,4 @@
-use crate::contracts::derive_compiler_cache_effects;
+use crate::contracts::derive_statement_effects;
 use crate::sql::optimizer::optimize_state_resolution;
 use crate::sql::prepare::contracts::requirements::PlanRequirements;
 use sqlparser::ast::Statement;
@@ -14,6 +14,6 @@ pub(crate) fn derive_requirements_from_state_resolution(
     PlanRequirements {
         read_only_query: optimized.read_only_query,
         should_refresh_file_cache: optimized.should_refresh_file_cache,
-        runtime_effects: derive_compiler_cache_effects(statements),
+        statement_effects: derive_statement_effects(statements),
     }
 }

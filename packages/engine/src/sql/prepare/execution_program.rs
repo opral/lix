@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::contracts::ExecutionRuntimeEffects;
+use crate::contracts::StatementEffects;
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
@@ -189,16 +189,15 @@ impl StatementBatch {
         })
     }
 
-    pub(crate) fn runtime_effects(&self) -> ExecutionRuntimeEffects {
-        self.steps.iter().fold(
-            ExecutionRuntimeEffects::default(),
-            |effects, step| match step {
+    pub(crate) fn statement_effects(&self) -> StatementEffects {
+        self.steps
+            .iter()
+            .fold(StatementEffects::default(), |effects, step| match step {
                 StatementBatchStep::TransactionControl => effects,
                 StatementBatchStep::Statement(step) => {
-                    effects.merge(step.bound_statement.plan_requirements().runtime_effects)
+                    effects.merge(step.bound_statement.plan_requirements().statement_effects)
                 }
-            },
-        )
+            })
     }
 
     pub(crate) fn steps(&self) -> impl Iterator<Item = &BoundStatementInstance> {

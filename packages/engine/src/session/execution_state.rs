@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::BufferedWriteExecutionInput;
-use crate::contracts::{ExecuteOptions, FunctionRuntimeState, SessionStateDelta};
+use crate::contracts::{ExecuteOptions, FunctionBindings, SessionStateDelta};
 use crate::sql::RuntimeBindingValues;
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
@@ -71,7 +71,7 @@ pub(crate) struct SessionExecutionState {
     compiler_cache: SessionCompilerCacheHandle,
     pub(crate) active_version_id: String,
     pub(crate) active_account_ids: Vec<String>,
-    function_runtime_state: Option<FunctionRuntimeState>,
+    function_bindings: Option<FunctionBindings>,
 }
 
 impl SessionExecutionState {
@@ -88,7 +88,7 @@ impl SessionExecutionState {
             compiler_cache,
             active_version_id,
             active_account_ids,
-            function_runtime_state: None,
+            function_bindings: None,
         }
     }
 
@@ -123,16 +123,16 @@ impl SessionExecutionState {
         self.compiler_cache.cache_statement_template(key, template);
     }
 
-    pub(crate) fn function_runtime_state(&self) -> Option<&FunctionRuntimeState> {
-        self.function_runtime_state.as_ref()
+    pub(crate) fn function_bindings(&self) -> Option<&FunctionBindings> {
+        self.function_bindings.as_ref()
     }
 
-    pub(crate) fn set_function_runtime_state(&mut self, runtime_state: FunctionRuntimeState) {
-        self.function_runtime_state = Some(runtime_state);
+    pub(crate) fn set_function_bindings(&mut self, function_bindings: FunctionBindings) {
+        self.function_bindings = Some(function_bindings);
     }
 
-    pub(crate) fn clear_function_runtime_state(&mut self) {
-        self.function_runtime_state = None;
+    pub(crate) fn clear_function_bindings(&mut self) {
+        self.function_bindings = None;
     }
 
     pub(crate) fn runtime_binding_values(&self) -> Result<RuntimeBindingValues, LixError> {

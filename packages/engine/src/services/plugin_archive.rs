@@ -1,3 +1,5 @@
+//! Plugin archive loading and apply-changes export dispatch.
+
 use std::io::{Cursor, Read};
 use std::path::{Component, Path};
 
@@ -7,7 +9,7 @@ use zip::read::ZipArchive;
 
 const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
 
-pub(crate) async fn call_apply_changes(
+pub(crate) async fn invoke_apply_changes_export(
     instance: &dyn WasmComponentInstance,
     payload: &[u8],
 ) -> Result<Vec<u8>, LixError> {
@@ -28,7 +30,7 @@ pub(crate) async fn call_apply_changes(
     })
 }
 
-pub(crate) fn parse_installed_plugin_from_archive_bytes(
+pub(crate) fn load_installed_plugin_from_archive_bytes(
     plugin_key: &str,
     archive_path: &str,
     archive_bytes: &[u8],

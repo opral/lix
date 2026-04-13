@@ -8,19 +8,18 @@ use sqlparser::ast::{
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::{
-    DynFunctionProvider, PendingOverlayView, PendingPublicReadHost, ReadExecutionHost,
-    ReadTimeProjectionRow,
+    DynFunctionProvider, PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionRow,
 };
-use crate::session::read_preparation::{
-    bootstrap_prepared_public_read_collaborators,
-    prepare_required_active_public_read_artifact_with_backend, PreparedPublicReadCollaborators,
+use crate::session::public_read_preparation::{
+    build_read_preparation_context, prepare_required_active_public_read_artifact_with_backend,
+    ReadPreparationContext,
 };
 use crate::session::state_selector::try_resolve_state_selector_rows_with_backend;
 use crate::sql::{
     public_selector_column_name, public_selector_version_column, CanonicalStateRowKey,
     PlannedWrite, ScopeProof,
 };
-use crate::transaction::{WriteResolveError, WriteSelectorResolver};
+use crate::transaction::{PendingOverlay, WriteResolveError, WriteSelectorResolver};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";
@@ -28,25 +27,24 @@ const GLOBAL_VERSION_ID: &str = "global";
 pub(crate) struct SessionWriteSelectorResolver<'a> {
     backend: &'a dyn LixBackend,
     projection_registry: &'a CatalogProjectionRegistry,
-    pending_overlay_view: Option<&'a dyn PendingOverlayView>,
-    prepared_read_collaborators: PreparedPublicReadCollaborators,
+    pending_overlay: Option<&'a dyn PendingOverlay>,
+    preparation_context: ReadPreparationContext,
 }
 
 impl<'a> SessionWriteSelectorResolver<'a> {
     pub(crate) async fn new(
         backend: &'a dyn LixBackend,
         projection_registry: &'a CatalogProjectionRegistry,
-        pending_overlay_view: Option<&'a dyn PendingOverlayView>,
+        pending_overlay: Option<&'a dyn PendingOverlay>,
         functions: &DynFunctionProvider,
     ) -> Result<Self, LixError> {
-        let prepared_read_collaborators =
-            bootstrap_prepared_public_read_collaborators(backend, pending_overlay_view, functions)
-                .await?;
+        let preparation_context =
+            build_read_preparation_context(backend, pending_overlay, functions).await?;
         Ok(Self {
             backend,
             projection_registry,
-            pending_overlay_view,
-            prepared_read_collaborators,
+            pending_overlay,
+            preparation_context,
         })
     }
 
@@ -62,7 +60,7 @@ impl<'a> SessionWriteSelectorResolver<'a> {
         let active_version_id = selector_read_preparation_version_id(planned_write);
         let artifact = prepare_required_active_public_read_artifact_with_backend(
             self.backend,
-            &self.prepared_read_collaborators,
+            &self.preparation_context,
             &[statement],
             &planned_write.command.bound_parameters,
             active_version_id,
@@ -74,9 +72,9 @@ impl<'a> SessionWriteSelectorResolver<'a> {
         )
         .await?;
         self.backend
-            .execute_prepared_public_read_with_pending_overlay_view(
+            .execute_prepared_public_read_with_pending_overlay(
                 self,
-                self.pending_overlay_view,
+                self.pending_overlay,
                 &artifact,
             )
             .await
@@ -90,7 +88,7 @@ impl ReadExecutionHost for SessionWriteSelectorResolver<'_> {
         backend: &dyn LixBackend,
         artifact: &crate::contracts::ReadTimeProjectionPlan,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        crate::session::read_execution_host::derive_read_time_projection_rows_with_registry(
+        crate::session::public_read_execution::derive_read_time_projection_rows_with_registry(
             self.projection_registry,
             backend,
             artifact,
@@ -191,7 +189,7 @@ impl WriteSelectorResolver for SessionWriteSelectorResolver<'_> {
     ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
         if let Some(rows) = try_resolve_state_selector_rows_with_backend(
             self.backend,
-            self.pending_overlay_view,
+            self.pending_overlay,
             planned_write,
         )
         .await

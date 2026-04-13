@@ -57,7 +57,7 @@ pub(crate) use api::{
     derive_dependency_spec, ensure_identity_columns_preserved, extract_explicit_transaction_script,
     finalize_public_write_execution, load_sql_compiler_metadata,
     load_sql_compiler_metadata_with_reader,
-    load_sql_compiler_metadata_with_reader_and_pending_overlay_view, overlay_lanes_for_version,
+    load_sql_compiler_metadata_with_reader_and_pending_overlay, overlay_lanes_for_version,
     parse_sql, parse_sql_script_with_timing, parse_sql_statements,
     parse_sql_statements_with_timing, parse_sql_with_timing, prepare_analyzed_explain_template,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
@@ -78,6 +78,7 @@ pub(crate) use api::{
     ScopeProof, SqlCompilerMetadata, SqlCompilerSeed, StateAssignmentsError, StatementBatch,
     TargetSetProof, UpdateValidationPlan, WriteModeRequest, WriteOperationKind,
 };
+pub(crate) use prepare::SqlPreparationMetadataReader;
 
 // Existing root helpers used outside the compiler stages.
 pub(crate) use physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;

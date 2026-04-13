@@ -3,12 +3,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
-use crate::live_state::row_api::{load_exact_live_row, ExactLiveRowQuery, LiveRowSemantics};
 use crate::live_state::tracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
     BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest, TrackedWriteOperation,
     TrackedWriteRow,
 };
+use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRowSource};
 use crate::session::workspace::init as init_workspace;
 use crate::transaction::{LiveStateWriteTransaction, ReadContext, TransactionDelta};
 use crate::{
@@ -245,7 +245,7 @@ async fn live_tracked_state_roundtrips_rows() {
     let exact = load_exact_live_row(
         &backend,
         &ExactLiveRowQuery {
-            semantics: LiveRowSemantics::Tracked,
+            source: LiveRowSource::Tracked,
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),

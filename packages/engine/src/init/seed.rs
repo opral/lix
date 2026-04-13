@@ -1,5 +1,5 @@
 use crate::contracts::ExecuteOptions;
-use crate::contracts::FunctionRuntimeState;
+use crate::contracts::FunctionBindings;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
@@ -87,41 +87,41 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
-        let runtime_state = self.ensure_runtime_state().await?;
-        let mut runtime_functions = runtime_state.provider().clone();
+        let function_bindings = self.ensure_function_bindings().await?;
+        let mut runtime_functions = function_bindings.provider().clone();
         crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
         .await?;
-        Ok(runtime_state.provider().call_uuid_v7())
+        Ok(function_bindings.provider().call_uuid_v7())
     }
 
     pub(crate) async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
-        let runtime_state = self.ensure_runtime_state().await?;
-        let mut runtime_functions = runtime_state.provider().clone();
+        let function_bindings = self.ensure_function_bindings().await?;
+        let mut runtime_functions = function_bindings.provider().clone();
         crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
         .await?;
-        Ok(runtime_state.provider().call_timestamp())
+        Ok(function_bindings.provider().call_timestamp())
     }
 
     pub(crate) async fn persist_runtime_state(&mut self) -> Result<(), LixError> {
-        let Some(runtime_state) = self.context.function_runtime_state().cloned() else {
+        let Some(function_bindings) = self.context.function_bindings().cloned() else {
             return Ok(());
         };
         crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
             self.write_transaction.backend_transaction_mut(),
-            runtime_state.provider(),
+            function_bindings.provider(),
         )
         .await
     }
 
-    async fn ensure_runtime_state(&mut self) -> Result<FunctionRuntimeState, LixError> {
-        if let Some(runtime_state) = self.context.function_runtime_state().cloned() {
-            return Ok(runtime_state);
+    async fn ensure_function_bindings(&mut self) -> Result<FunctionBindings, LixError> {
+        if let Some(function_bindings) = self.context.function_bindings().cloned() {
+            return Ok(function_bindings);
         }
         let backend = crate::backend::transaction_backend_view(
             self.write_transaction.backend_transaction_mut(),
@@ -130,10 +130,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .lix
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
-        let runtime_state = FunctionRuntimeState::from_prepared_parts(settings.enabled, &functions);
+        let function_bindings = FunctionBindings::from_prepared_parts(settings.enabled, &functions);
         self.context
-            .set_function_runtime_state(runtime_state.clone());
-        Ok(runtime_state)
+            .set_function_bindings(function_bindings.clone());
+        Ok(function_bindings)
     }
 
     pub(crate) async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {

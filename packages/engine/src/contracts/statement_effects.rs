@@ -5,11 +5,11 @@ use sqlparser::ast::{
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct ExecutionRuntimeEffects {
+pub struct StatementEffects {
     pub requires_deterministic_sequence_persistence: bool,
 }
 
-impl ExecutionRuntimeEffects {
+impl StatementEffects {
     pub fn merge(self, other: Self) -> Self {
         Self {
             requires_deterministic_sequence_persistence: self
@@ -19,11 +19,11 @@ impl ExecutionRuntimeEffects {
     }
 }
 
-pub fn derive_compiler_cache_effects(statements: &[Statement]) -> ExecutionRuntimeEffects {
+pub fn derive_statement_effects(statements: &[Statement]) -> StatementEffects {
     statements
         .iter()
-        .fold(ExecutionRuntimeEffects::default(), |effects, statement| {
-            effects.merge(ExecutionRuntimeEffects {
+        .fold(StatementEffects::default(), |effects, statement| {
+            effects.merge(StatementEffects {
                 requires_deterministic_sequence_persistence:
                     statement_requires_deterministic_sequence_persistence(statement),
             })
@@ -79,27 +79,27 @@ fn function_args_empty(function: &Function) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_compiler_cache_effects, ExecutionRuntimeEffects};
+    use super::{derive_statement_effects, StatementEffects};
     use crate::sql::parse_sql;
 
     #[test]
-    fn deterministic_runtime_effects_detect_uuid_and_timestamp_usage() {
+    fn statement_effects_detect_uuid_and_timestamp_usage() {
         let statements = parse_sql("SELECT lix_uuid_v7(), lix_timestamp(), 1")
             .expect("parse SQL should succeed");
         assert_eq!(
-            derive_compiler_cache_effects(&statements),
-            ExecutionRuntimeEffects {
+            derive_statement_effects(&statements),
+            StatementEffects {
                 requires_deterministic_sequence_persistence: true,
             }
         );
     }
 
     #[test]
-    fn deterministic_runtime_effects_ignore_plain_reads() {
+    fn statement_effects_ignore_plain_reads() {
         let statements = parse_sql("SELECT 1, 2, 3").expect("parse SQL should succeed");
         assert_eq!(
-            derive_compiler_cache_effects(&statements),
-            ExecutionRuntimeEffects::default()
+            derive_statement_effects(&statements),
+            StatementEffects::default()
         );
     }
 }

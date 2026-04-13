@@ -6,12 +6,12 @@ use crate::contracts::{
     matches_constraints, BatchRowRequest, RowIdentity, ScanRequest, TrackedRow,
     TrackedTombstoneMarker, UntrackedRow,
 };
-use crate::contracts::{
+use crate::live_state::{
     LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
 };
 use crate::LixError;
 
-use crate::transaction::overlay::PendingWriteOverlay;
+use crate::transaction::overlay::PendingRowOverlay;
 
 type BatchTrackedRowRequest = BatchRowRequest;
 type BatchUntrackedRowRequest = BatchRowRequest;
@@ -45,7 +45,7 @@ impl<'a> ReadContext<'a> {
 
     pub(crate) fn with_pending<'b>(
         &'b self,
-        pending: &'b PendingWriteOverlay,
+        pending: &'b PendingRowOverlay,
     ) -> PendingReadContext<'b> {
         PendingReadContext {
             tracked: PendingTrackedReadView {
@@ -88,22 +88,22 @@ impl<'a> PendingReadContext<'a> {
 
 struct PendingTrackedReadView<'a> {
     base: &'a dyn TrackedReadView,
-    pending: &'a PendingWriteOverlay,
+    pending: &'a PendingRowOverlay,
 }
 
 struct PendingUntrackedReadView<'a> {
     base: &'a dyn UntrackedReadView,
-    pending: &'a PendingWriteOverlay,
+    pending: &'a PendingRowOverlay,
 }
 
 struct PendingTrackedTombstoneView<'a> {
     base: Option<&'a dyn TrackedTombstoneView>,
-    pending: &'a PendingWriteOverlay,
+    pending: &'a PendingRowOverlay,
 }
 
 struct PendingWriterKeyReadView<'a> {
     base: &'a dyn WriterKeyReadView,
-    pending: &'a PendingWriteOverlay,
+    pending: &'a PendingRowOverlay,
 }
 
 impl PendingTrackedTombstoneView<'_> {
@@ -361,7 +361,7 @@ fn sort_untracked_rows(rows: &mut [UntrackedRow]) {
 }
 
 fn pending_writer_key_annotation(
-    pending: &PendingWriteOverlay,
+    pending: &PendingRowOverlay,
     row_identity: &RowIdentity,
 ) -> Option<Option<String>> {
     if let Some(row) = pending.tracked_rows().get(row_identity) {

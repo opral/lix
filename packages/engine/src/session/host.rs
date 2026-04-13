@@ -1,10 +1,12 @@
-use std::sync::Arc;
-
 use async_trait::async_trait;
+
+use std::sync::Arc;
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::{DynFunctionProvider, FunctionRuntimeState, SharedFunctionProvider};
+use crate::contracts::{
+    clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, SharedFunctionProvider,
+};
 use crate::image::ImageChunkWriter;
 use crate::session::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::sql::SqlCompilerSeed;
@@ -58,20 +60,40 @@ pub(crate) trait SessionHost: Send + Sync {
     fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError>;
 }
 
-#[async_trait(?Send)]
-pub(crate) trait WriteExecutionServices: crate::transaction::WriteExecutionHost {
-    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
+#[derive(Clone, Copy)]
+pub(crate) struct SessionExecutionContext<'a> {
+    host: &'a dyn SessionHost,
+}
 
-    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
+impl<'a> SessionExecutionContext<'a> {
+    pub(crate) fn new(host: &'a dyn SessionHost) -> Self {
+        Self { host }
+    }
 
-    fn sql_compiler_seed<'a>(
-        &'a self,
-        functions: &'a DynFunctionProvider,
-        surface_registry: &'a SurfaceRegistry,
-    ) -> SqlCompilerSeed<'a>;
+    pub(crate) fn session_host(&self) -> &'a dyn SessionHost {
+        self.host
+    }
+}
 
-    async fn prepare_function_runtime_state(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<FunctionRuntimeState, LixError>;
+pub(crate) fn sql_compiler_seed_from_host<'a>(
+    host: &'a dyn SessionHost,
+    functions: &'a DynFunctionProvider,
+    surface_registry: &'a SurfaceRegistry,
+) -> SqlCompilerSeed<'a> {
+    SqlCompilerSeed {
+        dialect: host.backend().dialect(),
+        functions: clone_boxed_function_provider(functions),
+        surface_registry,
+    }
+}
+
+pub(crate) async fn prepare_function_bindings_with_host(
+    host: &dyn SessionHost,
+    backend: &dyn LixBackend,
+) -> Result<FunctionBindings, LixError> {
+    let (settings, functions) = host.prepare_runtime_functions_with_backend(backend).await?;
+    Ok(FunctionBindings::from_prepared_parts(
+        settings.enabled,
+        &functions,
+    ))
 }
