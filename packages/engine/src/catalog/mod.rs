@@ -62,7 +62,7 @@ pub(crate) use dependency::{
     CatalogSurfaceDependencyMetadata,
 };
 #[allow(unused_imports)]
-pub(crate) use direct_read::{direct_read_semantics, CatalogDirectReadSemantics};
+pub(crate) use direct_read::{history_read_semantics, CatalogHistoryReadSemantics};
 #[allow(unused_imports)]
 pub(crate) use directory::LixDirectoryProjection;
 #[allow(unused_imports)]

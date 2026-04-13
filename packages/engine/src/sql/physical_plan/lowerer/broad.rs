@@ -85,7 +85,7 @@ pub(crate) fn lower_broad_public_read_for_execution(
     params_len: usize,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     ensure_broad_public_read_statement_is_fully_typed(statement)?;
 
     if broad_public_read_statement_contains_public_relations(statement)
@@ -116,7 +116,7 @@ pub(crate) fn lower_broad_public_read_for_execution(
         )?
     };
 
-    Ok(Some(LoweredReadProgram {
+    Ok(Some(LoweredReadBatch {
         statements: vec![compiled_statement],
         pushdown_decision: PushdownDecision::default(),
         result_columns: LoweredResultColumns::Static(Vec::new()),
@@ -124,7 +124,7 @@ pub(crate) fn lower_broad_public_read_for_execution(
 }
 
 pub(crate) fn broad_public_relation_supports_terminal_render(
-    binding: &SurfaceBinding,
+    binding: &ResolvedSurface,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
@@ -2641,13 +2641,14 @@ fn build_supported_public_read_surface_sql(
 }
 
 fn build_public_state_surface_sql(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
-    let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
+    let Some(state_scan) = CanonicalStateScan::from_resolved_surface(surface_binding.clone())
+    else {
         return Ok(None);
     };
     let schema_set: BTreeSet<String> = registry
@@ -2684,9 +2685,10 @@ fn build_public_state_surface_sql(
 
 fn build_public_admin_surface_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<String>, LixError> {
-    let Some(admin_scan) = CanonicalAdminScan::from_surface_binding(surface_binding.clone()) else {
+    let Some(admin_scan) = CanonicalAdminScan::from_resolved_surface(surface_binding.clone())
+    else {
         return Ok(None);
     };
     build_admin_source_sql(&admin_scan, dialect).map(Some)
@@ -2694,10 +2696,10 @@ fn build_public_admin_surface_sql(
 
 fn build_public_change_surface_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     active_version_id: Option<&str>,
 ) -> Result<Option<String>, LixError> {
-    if CanonicalWorkingChangesScan::from_surface_binding(surface_binding.clone()).is_some() {
+    if CanonicalWorkingChangesScan::from_resolved_surface(surface_binding.clone()).is_some() {
         let Some(active_version_id) = active_version_id else {
             return Ok(None);
         };
@@ -2706,7 +2708,7 @@ fn build_public_change_surface_sql(
             active_version_id,
         )));
     }
-    if CanonicalChangeScan::from_surface_binding(surface_binding.clone()).is_some() {
+    if CanonicalChangeScan::from_resolved_surface(surface_binding.clone()).is_some() {
         return Ok(Some(build_change_source_sql()));
     }
     Ok(None)
@@ -2714,7 +2716,7 @@ fn build_public_change_surface_sql(
 
 fn build_entity_surface_sql_for_broad_lowering(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
@@ -2732,7 +2734,8 @@ fn build_entity_surface_sql_for_broad_lowering(
     {
         return Ok(None);
     }
-    let Some(state_scan) = CanonicalStateScan::from_surface_binding(surface_binding.clone()) else {
+    let Some(state_scan) = CanonicalStateScan::from_resolved_surface(surface_binding.clone())
+    else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(

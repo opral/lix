@@ -139,7 +139,7 @@ pub(crate) struct SurfaceDescriptor {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SurfaceBinding {
+pub(crate) struct ResolvedSurface {
     pub(crate) descriptor: SurfaceDescriptor,
     pub(crate) catalog_epoch: Option<CatalogEpoch>,
     pub(crate) exposed_columns: Vec<String>,
@@ -215,10 +215,10 @@ impl SurfaceRegistry {
         self.epoch
     }
 
-    pub(crate) fn bind_relation_name(&self, relation_name: &str) -> Option<SurfaceBinding> {
+    pub(crate) fn bind_relation_name(&self, relation_name: &str) -> Option<ResolvedSurface> {
         let key = normalize_surface_name(relation_name);
         let descriptor = self.descriptors.get(&key)?.clone();
-        Some(SurfaceBinding {
+        Some(ResolvedSurface {
             catalog_epoch: match descriptor.catalog_source {
                 CatalogSource::Builtin => None,
                 CatalogSource::Dynamic => Some(self.epoch),
@@ -235,7 +235,7 @@ impl SurfaceRegistry {
         })
     }
 
-    pub(crate) fn bind_object_name(&self, name: &ObjectName) -> Option<SurfaceBinding> {
+    pub(crate) fn bind_object_name(&self, name: &ObjectName) -> Option<ResolvedSurface> {
         let relation_name = object_name_to_relation_name(name)?;
         self.bind_relation_name(&relation_name)
     }

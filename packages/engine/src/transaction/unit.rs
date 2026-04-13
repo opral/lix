@@ -1,29 +1,27 @@
 use crate::contracts::should_invalidate_deterministic_settings_cache;
-use crate::contracts::{
-    CanonicalCommitReceipt, PendingPublicCommitSession, StateCommitStreamChange,
-};
-use crate::execution::step::{BufferedWriteExecutionInput, SqlExecutionOutcome};
+use crate::contracts::{CanonicalCommitReceipt, PendingCommitState, StateCommitStreamChange};
+use crate::execution::step::{BufferedWriteExecutionInput, WriteExecutionOutcome};
 use crate::transaction::buffered::{
     apply_schema_registrations_in_transaction, BufferedWriteState, TransactionCoordinator,
     TransactionWriteDelta,
 };
 use crate::transaction::{
-    append_observe_tick_in_transaction, PendingWriteView, PreparedWriteStepStager,
-    TransactionCommitOutcome, WriteExecutionBindings,
+    append_observe_tick_in_transaction, PendingWriteOverlayView, PreparedWriteStatementStager,
+    TransactionCommitOutcome, WriteExecutionHost,
 };
 use crate::{LixBackendTransaction, LixError};
 
 pub(crate) struct BufferedWriteTransaction<'a> {
     coordinator: TransactionCoordinator<'a>,
     buffered_write_state: BufferedWriteState,
-    pending_public_commit_session: Option<PendingPublicCommitSession>,
+    pending_commit_state: Option<PendingCommitState>,
     latest_canonical_commit_receipt: Option<CanonicalCommitReceipt>,
 }
 
 pub(crate) struct BorrowedBufferedWriteTransaction<'tx> {
     backend_txn: &'tx mut dyn LixBackendTransaction,
     buffered_write_state: BufferedWriteState,
-    pending_public_commit_session: Option<PendingPublicCommitSession>,
+    pending_commit_state: Option<PendingCommitState>,
 }
 
 impl<'a> BufferedWriteTransaction<'a> {
@@ -31,19 +29,19 @@ impl<'a> BufferedWriteTransaction<'a> {
         Self {
             coordinator: TransactionCoordinator::new(backend_txn),
             buffered_write_state: BufferedWriteState::default(),
-            pending_public_commit_session: None,
+            pending_commit_state: None,
             latest_canonical_commit_receipt: None,
         }
     }
 
     pub(crate) async fn commit_buffered_write(
         mut self,
-        bindings: &dyn WriteExecutionBindings,
+        host: &dyn WriteExecutionHost,
         mut execution_input: BufferedWriteExecutionInput,
     ) -> Result<TransactionCommitOutcome, LixError> {
         let initial_active_version_id = execution_input.active_version_id().to_string();
         let initial_active_account_ids = execution_input.active_account_ids().to_vec();
-        self.prepare_buffered_write_commit(bindings, &mut execution_input)
+        self.prepare_buffered_write_commit(host, &mut execution_input)
             .await?;
         let mut outcome = self.buffered_write_state.commit_outcome();
         if execution_input.active_version_id() != initial_active_version_id {
@@ -73,10 +71,10 @@ impl<'a> BufferedWriteTransaction<'a> {
         self.buffered_write_state.journal_is_empty()
     }
 
-    pub(crate) fn buffered_write_pending_write_view(
+    pub(crate) fn buffered_write_pending_write_overlay_view(
         &self,
-    ) -> Result<Option<PendingWriteView>, LixError> {
-        self.buffered_write_state.pending_write_view()
+    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
+        self.buffered_write_state.pending_write_overlay_view()
     }
 
     pub(crate) fn can_stage_transaction_write_delta(
@@ -93,14 +91,12 @@ impl<'a> BufferedWriteTransaction<'a> {
         self.buffered_write_state.stage_delta(delta)
     }
 
-    pub(crate) fn clear_pending_public_commit_session(&mut self) {
-        self.pending_public_commit_session = None;
+    pub(crate) fn clear_pending_commit_state(&mut self) {
+        self.pending_commit_state = None;
     }
 
-    pub(crate) fn pending_public_commit_session_mut(
-        &mut self,
-    ) -> &mut Option<PendingPublicCommitSession> {
-        &mut self.pending_public_commit_session
+    pub(crate) fn pending_commit_state_mut(&mut self) -> &mut Option<PendingCommitState> {
+        &mut self.pending_commit_state
     }
 
     pub(crate) fn buffered_write_commit_outcome_mut(&mut self) -> &mut TransactionCommitOutcome {
@@ -109,7 +105,7 @@ impl<'a> BufferedWriteTransaction<'a> {
 
     pub(crate) async fn flush_buffered_write_journal(
         &mut self,
-        bindings: &dyn WriteExecutionBindings,
+        host: &dyn WriteExecutionHost,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         let Some(delta) = self.buffered_write_state.take_staged_delta() else {
@@ -118,28 +114,24 @@ impl<'a> BufferedWriteTransaction<'a> {
         let transaction = self.coordinator.backend_transaction_mut()?;
         apply_schema_registrations_in_transaction(transaction, delta.schema_registrations())
             .await?;
-        let execution = delta
-            .execute(
-                bindings,
-                transaction,
-                Some(&mut self.pending_public_commit_session),
-            )
+        let write_outcome = delta
+            .execute(host, transaction, Some(&mut self.pending_commit_state))
             .await?;
         apply_buffered_write_execution_outcome(
             &mut self.buffered_write_state,
             &mut self.latest_canonical_commit_receipt,
             execution_input,
-            execution,
+            write_outcome,
         );
         Ok(())
     }
 
     pub(crate) async fn prepare_buffered_write_commit(
         &mut self,
-        bindings: &dyn WriteExecutionBindings,
+        host: &dyn WriteExecutionHost,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
-        self.flush_buffered_write_journal(bindings, execution_input)
+        self.flush_buffered_write_journal(host, execution_input)
             .await?;
         if !self.buffered_write_state.observe_tick_emitted()
             && !self
@@ -189,7 +181,7 @@ impl<'a> BufferedWriteTransaction<'a> {
     }
 }
 
-impl PreparedWriteStepStager for BufferedWriteTransaction<'_> {
+impl PreparedWriteStatementStager for BufferedWriteTransaction<'_> {
     fn mark_public_surface_registry_refresh_pending(&mut self) {
         Self::mark_public_surface_registry_refresh_pending(self);
     }
@@ -207,7 +199,7 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         Self {
             backend_txn,
             buffered_write_state: BufferedWriteState::default(),
-            pending_public_commit_session: None,
+            pending_commit_state: None,
         }
     }
 
@@ -219,10 +211,10 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         self.buffered_write_state.journal_is_empty()
     }
 
-    pub(crate) fn buffered_write_pending_write_view(
+    pub(crate) fn buffered_write_pending_write_overlay_view(
         &self,
-    ) -> Result<Option<PendingWriteView>, LixError> {
-        self.buffered_write_state.pending_write_view()
+    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
+        self.buffered_write_state.pending_write_overlay_view()
     }
 
     pub(crate) fn can_stage_transaction_write_delta(
@@ -239,19 +231,17 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         self.buffered_write_state.stage_delta(delta)
     }
 
-    pub(crate) fn clear_pending_public_commit_session(&mut self) {
-        self.pending_public_commit_session = None;
+    pub(crate) fn clear_pending_commit_state(&mut self) {
+        self.pending_commit_state = None;
     }
 
-    pub(crate) fn pending_public_commit_session_mut(
-        &mut self,
-    ) -> &mut Option<PendingPublicCommitSession> {
-        &mut self.pending_public_commit_session
+    pub(crate) fn pending_commit_state_mut(&mut self) -> &mut Option<PendingCommitState> {
+        &mut self.pending_commit_state
     }
 
     pub(crate) async fn flush_buffered_write_journal(
         &mut self,
-        bindings: &dyn WriteExecutionBindings,
+        host: &dyn WriteExecutionHost,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
         let Some(delta) = self.buffered_write_state.take_staged_delta() else {
@@ -260,18 +250,14 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
         let mut latest_canonical_commit_receipt = None;
         apply_schema_registrations_in_transaction(self.backend_txn, delta.schema_registrations())
             .await?;
-        let execution = delta
-            .execute(
-                bindings,
-                self.backend_txn,
-                Some(&mut self.pending_public_commit_session),
-            )
+        let write_outcome = delta
+            .execute(host, self.backend_txn, Some(&mut self.pending_commit_state))
             .await?;
         apply_buffered_write_execution_outcome(
             &mut self.buffered_write_state,
             &mut latest_canonical_commit_receipt,
             execution_input,
-            execution,
+            write_outcome,
         );
         Ok(())
     }
@@ -291,7 +277,7 @@ impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
     }
 }
 
-impl PreparedWriteStepStager for BorrowedBufferedWriteTransaction<'_> {
+impl PreparedWriteStatementStager for BorrowedBufferedWriteTransaction<'_> {
     fn mark_public_surface_registry_refresh_pending(&mut self) {
         self.buffered_write_state
             .mark_public_surface_registry_refresh_pending();
@@ -321,28 +307,28 @@ fn apply_buffered_write_execution_outcome(
     state: &mut BufferedWriteState,
     latest_canonical_commit_receipt: &mut Option<CanonicalCommitReceipt>,
     execution_input: &mut BufferedWriteExecutionInput,
-    execution: SqlExecutionOutcome,
+    write_outcome: WriteExecutionOutcome,
 ) {
-    let active_effects = execution
+    let active_effects = write_outcome
         .plan_effects_override
         .as_ref()
         .cloned()
         .unwrap_or_default();
     execution_input.apply_session_delta(&active_effects.session_delta);
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
-    state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
+    state_commit_stream_changes.extend(write_outcome.state_commit_stream_changes.clone());
     state.commit_outcome_mut().merge(TransactionCommitOutcome {
         session_delta: active_effects.session_delta.clone(),
         invalidate_deterministic_settings_cache: should_invalidate_deterministic_settings_cache(
             &[],
             &state_commit_stream_changes,
         ),
-        invalidate_installed_plugins_cache: execution.plugin_changes_committed,
+        invalidate_installed_plugins_cache: write_outcome.plugin_changes_committed,
         state_commit_stream_changes,
         ..TransactionCommitOutcome::default()
     });
-    if let Some(receipt) = execution.canonical_commit_receipt {
+    if let Some(receipt) = write_outcome.canonical_commit_receipt {
         record_latest_canonical_commit_receipt(latest_canonical_commit_receipt, receipt);
     }
-    state.absorb_observe_tick_emitted(execution.observe_tick_emitted);
+    state.absorb_observe_tick_emitted(write_outcome.observe_tick_emitted);
 }

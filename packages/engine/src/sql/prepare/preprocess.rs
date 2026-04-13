@@ -2,9 +2,9 @@ use super::statement_references_public_surface;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::{
-    result_contract_for_statements, verify_logical_plan, InternalLogicalPlan, LogicalPlan,
+    result_contract_for_statements, verify_direct_logical_plan, DirectLogicalPlan,
 };
-use crate::sql::semantic_ir::prepare_internal_statements_to_plan;
+use crate::sql::semantic_ir::prepare_direct_statements_to_plan;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
@@ -15,24 +15,24 @@ pub(crate) async fn preprocess_with_surfaces_to_logical_plan<P: LixFunctionProvi
     params: &[Value],
     functions: SharedFunctionProvider<P>,
     writer_key: Option<&str>,
-) -> Result<InternalLogicalPlan, LixError>
+) -> Result<DirectLogicalPlan, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
     reject_public_surface_statements(registry, &statements)?;
     let result_contract = result_contract_for_statements(&statements);
     let normalized_statements =
-        prepare_internal_statements_to_plan(dialect, statements, params, functions, writer_key)
+        prepare_direct_statements_to_plan(dialect, statements, params, functions, writer_key)
             .await?;
-    let logical_plan = InternalLogicalPlan {
+    let logical_plan = DirectLogicalPlan {
         normalized_statements,
         result_contract,
     };
-    verify_logical_plan(&LogicalPlan::Internal(logical_plan.clone())).map_err(|error| {
+    verify_direct_logical_plan(&logical_plan).map_err(|error| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "internal logical plan verification failed during preprocess: {}",
+                "direct logical plan verification failed during preprocess: {}",
                 error.message
             ),
         )

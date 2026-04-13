@@ -3,7 +3,7 @@ use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
-use crate::contracts::{ExecutionRuntimeState, GLOBAL_VERSION_ID};
+use crate::contracts::{FunctionRuntimeState, GLOBAL_VERSION_ID};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::super::version_ops::context::require_target_version_context_in_transaction;
@@ -203,15 +203,15 @@ async fn insert_canonical_checkpoint_label_change(
 
 async fn checkpoint_runtime_state(
     tx: &mut SessionTransaction<'_>,
-) -> Result<ExecutionRuntimeState, LixError> {
-    if let Some(runtime_state) = tx.context.execution_runtime_state().cloned() {
+) -> Result<FunctionRuntimeState, LixError> {
+    if let Some(runtime_state) = tx.context.function_runtime_state().cloned() {
         return Ok(runtime_state);
     }
 
-    let collaborators = tx.collaborators();
+    let session_runtime = tx.session_runtime();
     let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
-    let runtime_state = collaborators
-        .prepare_execution_runtime_state(&backend)
+    let runtime_state = session_runtime
+        .prepare_function_runtime_state(&backend)
         .await?;
     let mut runtime_functions = runtime_state.provider().clone();
     crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
@@ -219,8 +219,7 @@ async fn checkpoint_runtime_state(
         &mut runtime_functions,
     )
     .await?;
-    tx.context
-        .set_execution_runtime_state(runtime_state.clone());
+    tx.context.set_function_runtime_state(runtime_state.clone());
     Ok(runtime_state)
 }
 

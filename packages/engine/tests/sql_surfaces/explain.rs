@@ -279,8 +279,8 @@ fn assert_no_rust_debug_leaks(explain_json: &JsonValue) {
         "SurfaceFamily",
         "SurfaceVariant",
         "SurfaceCapability",
-        "PreparedPublicReadExecution",
-        "InternalLogicalPlan",
+        "PublicReadPhysicalPlan",
+        "DirectLogicalPlan",
     ] {
         assert!(
             !serialized.contains(forbidden),
@@ -1241,18 +1241,18 @@ fn assert_broad_public_read_physical_execution_contract(
         physical_details.get("kind").and_then(JsonValue::as_str),
         Some("lowered_sql")
     );
-    let lowered_program = physical_details
+    let lowered_batch = physical_details
         .get("details")
         .map(|value| json_object(value, "physical_plan.details.details"))
         .expect("physical_plan.details should include lowered_sql details");
     assert_object_keys(
-        lowered_program,
+        lowered_batch,
         &["pushdown_decision", "result_columns", "statements"],
         "physical_plan.details.details",
     );
 
     let statements = json_array(
-        lowered_program
+        lowered_batch
             .get("statements")
             .expect("physical_plan.details.details should include statements"),
         "physical_plan.details.details.statements",
@@ -1624,24 +1624,29 @@ fn assert_public_read_logical_strategy(
     );
 }
 
-fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
+fn assert_entity_history_read_plan_contract(explain_json: &JsonValue) {
     let optimized_plan = json_object_at(explain_json, "optimized_logical_plan", "explain_json");
     let optimized_details = optimized_plan
         .get("details")
         .map(|value| json_object(value, "optimized_logical_plan.details"))
         .expect("optimized_logical_plan should include details");
-    let direct_plan = optimized_details
-        .get("direct_plan")
-        .map(|value| json_object(value, "optimized_logical_plan.details.direct_plan"))
-        .expect("optimized_logical_plan should include a direct_plan");
+    let history_read_plan = optimized_details
+        .get("history_read_plan")
+        .map(|value| json_object(value, "optimized_logical_plan.details.history_read_plan"))
+        .expect("optimized_logical_plan should include a history_read_plan");
     assert_eq!(
-        direct_plan.get("kind").and_then(JsonValue::as_str),
+        history_read_plan.get("kind").and_then(JsonValue::as_str),
         Some("entity_history")
     );
-    let direct_details = direct_plan
+    let direct_details = history_read_plan
         .get("details")
-        .map(|value| json_object(value, "optimized_logical_plan.details.direct_plan.details"))
-        .expect("direct_plan should include details");
+        .map(|value| {
+            json_object(
+                value,
+                "optimized_logical_plan.details.history_read_plan.details",
+            )
+        })
+        .expect("history_read_plan should include details");
     assert_object_keys(
         direct_details,
         &[
@@ -1656,29 +1661,29 @@ fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
             "wildcard_columns",
             "wildcard_projection",
         ],
-        "entity_history_direct_plan",
+        "entity_history_read_plan",
     );
 
     let predicates = json_array(
         direct_details
             .get("predicates")
-            .expect("entity_history_direct_plan should include predicates"),
-        "entity_history_direct_plan.predicates",
+            .expect("entity_history_read_plan should include predicates"),
+        "entity_history_read_plan.predicates",
     );
     let predicate = predicates
         .iter()
         .find_map(|predicate| {
-            let predicate = json_object(predicate, "entity_history_direct_plan.predicate");
+            let predicate = json_object(predicate, "entity_history_read_plan.predicate");
             let field = predicate
                 .get("field")
-                .map(|value| json_object(value, "entity_history_direct_plan.predicate.field"))?;
+                .map(|value| json_object(value, "entity_history_read_plan.predicate.field"))?;
             (field.get("kind").and_then(JsonValue::as_str) == Some("property")).then_some(predicate)
         })
-        .expect("entity_history_direct_plan should include a property predicate");
+        .expect("entity_history_read_plan should include a property predicate");
     assert_object_keys(
         predicate,
         &["field", "operator", "value", "values"],
-        "entity_history_direct_plan.predicate",
+        "entity_history_read_plan.predicate",
     );
     assert_eq!(
         predicate.get("operator").and_then(JsonValue::as_str),
@@ -1686,12 +1691,12 @@ fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
     );
     let predicate_field = predicate
         .get("field")
-        .map(|value| json_object(value, "entity_history_direct_plan.predicate.field"))
+        .map(|value| json_object(value, "entity_history_read_plan.predicate.field"))
         .expect("predicate should include field");
     assert_object_keys(
         predicate_field,
         &["details", "kind"],
-        "entity_history_direct_plan.predicate.field",
+        "entity_history_read_plan.predicate.field",
     );
     assert_eq!(
         predicate_field.get("kind").and_then(JsonValue::as_str),
@@ -1705,29 +1710,29 @@ fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
     let projections = json_array(
         direct_details
             .get("projections")
-            .expect("entity_history_direct_plan should include projections"),
-        "entity_history_direct_plan.projections",
+            .expect("entity_history_read_plan should include projections"),
+        "entity_history_read_plan.projections",
     );
     let projection = projections
         .iter()
         .find_map(|projection| {
-            let projection = json_object(projection, "entity_history_direct_plan.projection");
+            let projection = json_object(projection, "entity_history_read_plan.projection");
             let field = projection
                 .get("field")
-                .map(|value| json_object(value, "entity_history_direct_plan.projection.field"))?;
+                .map(|value| json_object(value, "entity_history_read_plan.projection.field"))?;
             (field.get("kind").and_then(JsonValue::as_str) == Some("property")
                 && field.get("details").and_then(JsonValue::as_str) == Some("key"))
             .then_some(projection)
         })
-        .expect("entity_history_direct_plan should include a property projection for key");
+        .expect("entity_history_read_plan should include a property projection for key");
     assert_object_keys(
         projection,
         &["field", "output_name"],
-        "entity_history_direct_plan.projection",
+        "entity_history_read_plan.projection",
     );
     let projection_field = projection
         .get("field")
-        .map(|value| json_object(value, "entity_history_direct_plan.projection.field"))
+        .map(|value| json_object(value, "entity_history_read_plan.projection.field"))
         .expect("projection should include field");
     assert_eq!(
         projection_field.get("kind").and_then(JsonValue::as_str),
@@ -1741,25 +1746,25 @@ fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
     let sort_keys = json_array(
         direct_details
             .get("sort_keys")
-            .expect("entity_history_direct_plan should include sort_keys"),
-        "entity_history_direct_plan.sort_keys",
+            .expect("entity_history_read_plan should include sort_keys"),
+        "entity_history_read_plan.sort_keys",
     );
     let sort_key = sort_keys
         .iter()
         .find_map(|sort_key| {
-            let sort_key = json_object(sort_key, "entity_history_direct_plan.sort_key");
+            let sort_key = json_object(sort_key, "entity_history_read_plan.sort_key");
             let field = sort_key
                 .get("field")
-                .map(|value| json_object(value, "entity_history_direct_plan.sort_key.field"))?;
+                .map(|value| json_object(value, "entity_history_read_plan.sort_key.field"))?;
             (field.get("kind").and_then(JsonValue::as_str) == Some("state")
                 && field.get("details").and_then(JsonValue::as_str) == Some("depth"))
             .then_some(sort_key)
         })
-        .expect("entity_history_direct_plan should include a state sort key for depth");
+        .expect("entity_history_read_plan should include a state sort key for depth");
     assert_object_keys(
         sort_key,
         &["descending", "field", "output_name"],
-        "entity_history_direct_plan.sort_key",
+        "entity_history_read_plan.sort_key",
     );
     assert_eq!(
         sort_key.get("descending").and_then(JsonValue::as_bool),
@@ -1767,7 +1772,7 @@ fn assert_entity_history_direct_plan_contract(explain_json: &JsonValue) {
     );
     let sort_field = sort_key
         .get("field")
-        .map(|value| json_object(value, "entity_history_direct_plan.sort_key.field"))
+        .map(|value| json_object(value, "entity_history_read_plan.sort_key.field"))
         .expect("sort_key should include field");
     assert_eq!(
         sort_field.get("kind").and_then(JsonValue::as_str),
@@ -2104,7 +2109,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    explain_direct_history_public_read_omits_artifact_preparation,
+    explain_history_read_public_read_omits_artifact_preparation,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -2123,12 +2128,8 @@ simulation_test!(
 
         let explain_json = explain_json_payload(&result);
         assert_public_read_logical_strategy(explain_json, "logical_plan", "structured");
-        assert_public_read_logical_strategy(
-            explain_json,
-            "optimized_logical_plan",
-            "direct_history",
-        );
-        assert_public_read_physical_kind(explain_json, "direct");
+        assert_public_read_logical_strategy(explain_json, "optimized_logical_plan", "history_read");
+        assert_public_read_physical_kind(explain_json, "history_read");
         assert_lowered_sql_presence(explain_json, false);
         assert_stage_timings_contract(
             explain_json,
@@ -2149,7 +2150,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    explain_direct_history_public_read_exposes_typed_nested_plan_artifacts,
+    explain_history_read_public_read_exposes_typed_nested_plan_artifacts,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -2171,12 +2172,8 @@ simulation_test!(
             .unwrap();
 
         let explain_json = explain_json_payload(&result);
-        assert_public_read_logical_strategy(
-            explain_json,
-            "optimized_logical_plan",
-            "direct_history",
-        );
-        assert_entity_history_direct_plan_contract(explain_json);
+        assert_public_read_logical_strategy(explain_json, "optimized_logical_plan", "history_read");
+        assert_entity_history_read_plan_contract(explain_json);
     }
 );
 
@@ -2474,7 +2471,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    internal_explain_omits_unmeasured_stages,
+    direct_explain_omits_unmeasured_stages,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -2711,7 +2708,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    explain_analyze_internal_read_only_query_reports_runtime_metrics,
+    explain_analyze_direct_read_only_query_reports_runtime_metrics,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -2732,25 +2729,25 @@ simulation_test!(
                 .get("semantic_statement")
                 .and_then(|value| value.get("kind"))
                 .and_then(JsonValue::as_str),
-            Some("internal")
+            Some("direct")
         );
         assert_eq!(
             explain_json
                 .get("logical_plan")
                 .and_then(|value| value.get("kind"))
                 .and_then(JsonValue::as_str),
-            Some("internal")
+            Some("direct")
         );
         assert_eq!(
             explain_json
                 .get("optimized_logical_plan")
                 .and_then(|value| value.get("kind"))
                 .and_then(JsonValue::as_str),
-            Some("internal")
+            Some("direct")
         );
         assert!(
             explain_json.get("physical_plan").is_none(),
-            "internal analyzed explain should not invent a physical_plan section"
+            "direct analyzed explain should not invent a physical_plan section"
         );
         assert_stage_timings_contract(explain_json, &["parse", "logical_planning"]);
         assert_missing_stage_names(

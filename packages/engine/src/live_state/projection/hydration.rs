@@ -325,7 +325,7 @@ mod tests {
     use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
     use crate::schema::{LixVersionDescriptor, LixVersionRef};
     use crate::test_support::{init_test_backend_core, TestSqliteBackend};
-    use crate::{LixBackend, TransactionMode};
+    use crate::{LixBackend, TransactionBeginMode};
 
     #[derive(Debug, Clone, Copy)]
     struct TestLixVersionProjection;
@@ -553,7 +553,7 @@ mod tests {
             .await
             .expect("version ref schema should register");
         let mut transaction = backend
-            .begin_transaction(TransactionMode::Write)
+            .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("write transaction should begin");
         live_state::write_live_rows(
@@ -708,7 +708,7 @@ mod tests {
             .await
             .expect("key value schema should register");
         let mut transaction = backend
-            .begin_transaction(TransactionMode::Write)
+            .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("write transaction should begin");
         live_state::write_live_rows(

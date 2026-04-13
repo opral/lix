@@ -11,13 +11,12 @@ mod rowset_query;
 pub(crate) mod source_sql;
 
 pub(crate) use plan::{
-    LoweredReadProgram, LoweredResultColumn, LoweredResultColumns, PhysicalPlan,
-    PreparedPublicReadExecution, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
-    PublicWriteMaterialization, TerminalRelationRenderNode, TrackedWriteExecution,
-    UntrackedWriteExecution,
+    LoweredReadBatch, LoweredResultColumn, LoweredResultColumns, PhysicalPlan,
+    PublicReadPhysicalPlan, PublicWriteExecutionPartition, PublicWriteMaterialization,
+    PublicWritePhysicalPlan, TerminalRelationRenderNode, TrackedWritePlan, UntrackedWritePlan,
 };
 pub(crate) use public_read_artifacts::{
-    compile_derived_rowset_execution, compile_general_public_read_execution,
+    compile_prepared_batch_public_read_execution, compile_read_time_projection_execution,
     CompilerOwnedPublicReadExecutionSelection,
 };
 pub(crate) use rowset_query::{compile_public_rowset_query, try_compile_read_time_projection_read};

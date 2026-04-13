@@ -24,7 +24,7 @@ use crate::session::deterministic_mode::{
     global_deterministic_settings_storage_scope, load_runtime_settings, DeterministicSettings,
     PersistedKeyValueStorageScope, RuntimeFunctionProvider,
 };
-use crate::{LixBackend, LixError, TransactionMode};
+use crate::{LixBackend, LixError, TransactionBeginMode};
 
 const INIT_STATE_NOT_STARTED: u8 = 0;
 const INIT_STATE_IN_PROGRESS: u8 = 1;
@@ -232,13 +232,15 @@ impl Engine {
             let id = self.savepoint_counter.fetch_add(1, Ordering::SeqCst);
             self.backend.begin_savepoint(&format!("sp_{id}")).await
         } else {
-            self.backend.begin_transaction(TransactionMode::Write).await
+            self.backend
+                .begin_transaction(TransactionBeginMode::Write)
+                .await
         }
     }
 
     pub(crate) async fn begin_read_unit(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
         self.backend.begin_transaction(mode).await
     }
@@ -468,7 +470,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionMode,
+            _mode: crate::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",

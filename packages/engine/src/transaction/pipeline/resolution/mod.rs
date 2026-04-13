@@ -14,7 +14,7 @@ use crate::contracts::{
     version_ref_snapshot_content,
 };
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::{PendingStateOverlay, PendingStateOverlayRef, PendingView};
+use crate::contracts::{PendingOverlayView, PendingStateOverlay, PendingStateOverlayRef};
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
     OverlayLane, PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
@@ -213,14 +213,15 @@ impl ResolvedWritePlanBuilder {
 pub(crate) async fn resolve_write_plan_with_functions<P>(
     backend: &dyn LixBackend,
     planned_write: &PlannedWrite,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let pending_state_overlay = pending_write_view.map(|view| PendingStateOverlayRef::new(view));
+    let pending_state_overlay =
+        pending_write_overlay_view.map(|view| PendingStateOverlayRef::new(view));
     let mut hydrator = PublicWriteHydrator::new(
         backend,
         pending_state_overlay
@@ -232,7 +233,7 @@ where
             resolve_state_write(
                 &mut hydrator,
                 planned_write,
-                pending_write_view,
+                pending_write_overlay_view,
                 functions.clone(),
                 selector_resolver,
             )
@@ -242,7 +243,7 @@ where
             resolve_entity_write(
                 &mut hydrator,
                 planned_write,
-                pending_write_view,
+                pending_write_overlay_view,
                 functions.clone(),
                 selector_resolver,
             )
@@ -283,7 +284,7 @@ async fn resolve_admin_write(
 }
 
 fn admin_write_behavior(
-    target: &crate::catalog::SurfaceBinding,
+    target: &crate::catalog::ResolvedSurface,
 ) -> Result<CatalogAdminWriteBehavior, WriteResolveError> {
     let Some(semantics) = builtin_catalog_compiler_facade()
         .write_surface_semantics(target)
@@ -864,7 +865,7 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => planned_write
             .command
-            .execution_context
+            .statement_context
             .requested_version_id
             .clone()
             .map(Some)
@@ -896,7 +897,7 @@ fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, Wri
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => planned_write
             .command
-            .execution_context
+            .statement_context
             .requested_version_id
             .clone()
             .map(|version_id| vec![version_id])
@@ -956,7 +957,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
     match planned_write.command.target.default_scope {
         crate::catalog::DefaultScopeSemantics::ActiveVersion => planned_write
             .command
-            .execution_context
+            .statement_context
             .requested_version_id
             .clone()
             .map(Some)

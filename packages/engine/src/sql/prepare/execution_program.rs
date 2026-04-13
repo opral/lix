@@ -12,18 +12,18 @@ use sqlparser::ast::Statement;
 
 use super::contracts::requirements::PlanRequirements;
 
-pub(crate) struct ExecutionProgram {
+pub(crate) struct StatementBatch {
     source_statements: Vec<Statement>,
-    steps: Vec<ExecutionProgramStep>,
+    steps: Vec<StatementBatchStep>,
 }
 
-enum ExecutionProgramStep {
+enum StatementBatchStep {
     TransactionControl,
-    Statement(ExecutionProgramStatement),
+    Statement(PreparedStatementStep),
 }
 
-struct ExecutionProgramStatement {
-    bound_template: BoundStatementTemplateInstance,
+struct PreparedStatementStep {
+    bound_statement: BoundStatementInstance,
 }
 
 #[derive(Clone)]
@@ -72,10 +72,10 @@ impl StatementTemplate {
         params: &[Value],
         runtime_bindings: &RuntimeBindingValues,
         parse_duration: Option<Duration>,
-    ) -> Result<BoundStatementTemplateInstance, LixError> {
+    ) -> Result<BoundStatementInstance, LixError> {
         let bound =
             bind_statement_binding_template(&self.binding_template, params, runtime_bindings)?;
-        Ok(BoundStatementTemplateInstance {
+        Ok(BoundStatementInstance {
             statement: bound.statement,
             params: bound.params,
             parse_duration,
@@ -85,14 +85,14 @@ impl StatementTemplate {
 }
 
 #[derive(Clone)]
-pub(crate) struct BoundStatementTemplateInstance {
+pub(crate) struct BoundStatementInstance {
     statement: Statement,
     params: Vec<Value>,
     parse_duration: Option<Duration>,
     plan_requirements: PlanRequirements,
 }
 
-impl BoundStatementTemplateInstance {
+impl BoundStatementInstance {
     pub(crate) fn statement(&self) -> &Statement {
         &self.statement
     }
@@ -115,7 +115,7 @@ impl BoundStatementTemplateInstance {
 pub(crate) struct StatementTemplateCacheKey {
     sql: String,
     dialect: u8,
-    allow_internal_tables: bool,
+    allow_internal_relations: bool,
     public_surface_registry_generation: u64,
 }
 
@@ -124,7 +124,7 @@ impl StatementTemplateCacheKey {
     pub(crate) fn new(
         sql: &str,
         dialect: SqlDialect,
-        allow_internal_tables: bool,
+        allow_internal_relations: bool,
         public_surface_registry_generation: u64,
     ) -> Self {
         Self {
@@ -133,13 +133,13 @@ impl StatementTemplateCacheKey {
                 SqlDialect::Sqlite => 1,
                 SqlDialect::Postgres => 2,
             },
-            allow_internal_tables,
+            allow_internal_relations,
             public_surface_registry_generation,
         }
     }
 }
 
-impl ExecutionProgram {
+impl StatementBatch {
     pub(crate) fn compile(
         original_statements: Vec<Statement>,
         params: &[Value],
@@ -156,17 +156,17 @@ impl ExecutionProgram {
         let mut placeholder_state = PlaceholderState::new();
         for statement in source_statements.iter().cloned() {
             if is_transaction_control(&statement) {
-                steps.push(ExecutionProgramStep::TransactionControl);
+                steps.push(StatementBatchStep::TransactionControl);
                 continue;
             }
 
             let (template, next_placeholder_state) =
                 StatementTemplate::compile(statement, dialect, params.len(), placeholder_state)?;
-            let bound_template =
+            let bound_statement =
                 template.bind(params, runtime_bindings, single_statement_parse_duration)?;
             placeholder_state = next_placeholder_state;
-            steps.push(ExecutionProgramStep::Statement(ExecutionProgramStatement {
-                bound_template,
+            steps.push(StatementBatchStep::Statement(PreparedStatementStep {
+                bound_statement,
             }));
         }
 
@@ -182,9 +182,9 @@ impl ExecutionProgram {
 
     pub(crate) fn is_plain_committed_read(&self) -> bool {
         self.steps.iter().all(|step| match step {
-            ExecutionProgramStep::TransactionControl => true,
-            ExecutionProgramStep::Statement(step) => {
-                step.bound_template.plan_requirements().read_only_query
+            StatementBatchStep::TransactionControl => true,
+            StatementBatchStep::Statement(step) => {
+                step.bound_statement.plan_requirements().read_only_query
             }
         })
     }
@@ -193,18 +193,18 @@ impl ExecutionProgram {
         self.steps.iter().fold(
             ExecutionRuntimeEffects::default(),
             |effects, step| match step {
-                ExecutionProgramStep::TransactionControl => effects,
-                ExecutionProgramStep::Statement(step) => {
-                    effects.merge(step.bound_template.plan_requirements().runtime_effects)
+                StatementBatchStep::TransactionControl => effects,
+                StatementBatchStep::Statement(step) => {
+                    effects.merge(step.bound_statement.plan_requirements().runtime_effects)
                 }
             },
         )
     }
 
-    pub(crate) fn steps(&self) -> impl Iterator<Item = &BoundStatementTemplateInstance> {
+    pub(crate) fn steps(&self) -> impl Iterator<Item = &BoundStatementInstance> {
         self.steps.iter().filter_map(|step| match step {
-            ExecutionProgramStep::TransactionControl => None,
-            ExecutionProgramStep::Statement(step) => Some(&step.bound_template),
+            StatementBatchStep::TransactionControl => None,
+            StatementBatchStep::Statement(step) => Some(&step.bound_statement),
         })
     }
 }

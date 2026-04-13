@@ -1,7 +1,7 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemProjectionScope,
     FilesystemRelationBinding, FilesystemRelationKind, RelationBindContext, RelationBinding,
-    SurfaceBinding, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
+    ResolvedSurface, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::EffectiveStateRequest;
@@ -13,7 +13,7 @@ use crate::sql::logical_plan::public_ir::{
 };
 use crate::sql::physical_plan::plan::{
     compile_final_read_statement, compile_lowered_read_statement,
-    compile_terminal_read_statement_from_template, LoweredReadProgram, LoweredResultColumn,
+    compile_terminal_read_statement_from_template, LoweredReadBatch, LoweredResultColumn,
     LoweredResultColumns, TerminalRelationRenderNode,
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
@@ -90,7 +90,7 @@ impl RenderRelationSubstitutionCollector {
 mod broad;
 
 pub(crate) fn broad_public_relation_supports_terminal_render(
-    binding: &SurfaceBinding,
+    binding: &ResolvedSurface,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
@@ -112,7 +112,7 @@ pub(crate) fn lower_broad_public_read_for_execution_with_layouts(
     params_len: usize,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     broad::lower_broad_public_read_for_execution(
         statement,
         registry,
@@ -130,7 +130,7 @@ pub(crate) fn lower_read_for_execution_with_layouts(
     effective_state_plan: Option<&EffectiveStatePlan>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
     current_version_heads: &BTreeMap<String, String>,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     let result_columns = lowered_result_columns(structured_read);
     match structured_read.surface_binding.descriptor.surface_family {
         SurfaceFamily::State => {
@@ -221,7 +221,7 @@ fn lower_state_read_for_execution(
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     if let Some(error) =
         state_read_exposed_column_error(&canonicalized.surface_binding, effective_state_request)
     {
@@ -248,15 +248,15 @@ fn lower_state_read_for_execution(
     else {
         return Ok(None);
     };
-    build_lowered_read_program(dialect, canonicalized, source_sql, residual_selection).map(Some)
+    build_lowered_read_batch(dialect, canonicalized, source_sql, residual_selection).map(Some)
 }
 
-fn build_lowered_read_program(
+fn build_lowered_read_batch(
     dialect: SqlDialect,
     structured_read: &StructuredPublicRead,
     source_sql: String,
     selection: Option<Expr>,
-) -> Result<LoweredReadProgram, LixError> {
+) -> Result<LoweredReadBatch, LixError> {
     let mut projection = structured_read.query.projection.clone();
     let active_version_id = structured_read.requested_version_id.as_deref();
     let mut substitutions = RenderRelationSubstitutionCollector::default();
@@ -337,7 +337,7 @@ fn build_lowered_read_program(
         format_clause: None,
         pipe_operators: Vec::new(),
     }));
-    Ok(LoweredReadProgram {
+    Ok(LoweredReadBatch {
         statements: vec![compile_lowered_read_statement(
             dialect,
             structured_read.bound_parameters.len(),
@@ -379,7 +379,7 @@ fn lowered_result_columns(structured_read: &StructuredPublicRead) -> LoweredResu
 
 fn lowered_result_column_for_projection_item(
     item: &SelectItem,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> LoweredResultColumn {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -413,7 +413,7 @@ fn lowered_result_column_from_surface_type(column_type: SurfaceColumnType) -> Lo
 }
 
 fn surface_column_type(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     column: &str,
 ) -> Option<SurfaceColumnType> {
     surface_binding
@@ -423,7 +423,7 @@ fn surface_column_type(
 }
 
 fn state_read_exposed_column_error(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     effective_state_request: &EffectiveStateRequest,
 ) -> Option<LixError> {
     let exposed = surface_binding
@@ -471,7 +471,7 @@ fn lower_entity_read_for_execution(
     effective_state_request: &EffectiveStateRequest,
     effective_state_plan: &EffectiveStatePlan,
     known_live_layouts: &BTreeMap<String, JsonValue>,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     if canonicalized.query.uses_wildcard_projection() {
         return Ok(None);
     }
@@ -491,18 +491,18 @@ fn lower_entity_read_for_execution(
     else {
         return Ok(None);
     };
-    build_lowered_read_program(dialect, canonicalized, source_sql, residual_selection).map(Some)
+    build_lowered_read_batch(dialect, canonicalized, source_sql, residual_selection).map(Some)
 }
 
 fn lower_change_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     if canonical_working_changes_scan(&canonicalized.read_command.root).is_some() {
         return lower_working_changes_read_for_execution(dialect, canonicalized);
     }
 
-    build_lowered_read_program(
+    build_lowered_read_batch(
         dialect,
         canonicalized,
         build_change_source_sql(),
@@ -514,7 +514,7 @@ fn lower_change_read_for_execution(
 fn lower_working_changes_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     let active_version_id = canonicalized
         .requested_version_id
         .as_deref()
@@ -527,7 +527,7 @@ fn lower_working_changes_read_for_execution(
                 ),
             )
         })?;
-    build_lowered_read_program(
+    build_lowered_read_batch(
         dialect,
         canonicalized,
         build_working_changes_public_read_source_sql(dialect, active_version_id),
@@ -907,12 +907,12 @@ fn lower_admin_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
     current_version_heads: &BTreeMap<String, String>,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     let Some(admin_scan) = canonical_admin_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
 
-    build_lowered_read_program(
+    build_lowered_read_batch(
         dialect,
         canonicalized,
         build_admin_source_sql_with_current_heads(&admin_scan, dialect, current_version_heads)?,
@@ -924,7 +924,7 @@ fn lower_admin_read_for_execution(
 fn lower_filesystem_read_for_execution(
     dialect: SqlDialect,
     canonicalized: &StructuredPublicRead,
-) -> Result<Option<LoweredReadProgram>, LixError> {
+) -> Result<Option<LoweredReadBatch>, LixError> {
     let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
@@ -942,7 +942,7 @@ fn lower_filesystem_read_for_execution(
         return Ok(None);
     }
 
-    build_lowered_read_program(
+    build_lowered_read_batch(
         dialect,
         canonicalized,
         lower_catalog_relation_binding_to_source_sql(
@@ -976,7 +976,7 @@ fn bind_filesystem_surface_relation(
 }
 
 fn bind_filesystem_surface_binding(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     active_version_id: Option<&str>,
 ) -> Result<Option<FilesystemRelationBinding>, LixError> {
     let Some(binding) = builtin_catalog_compiler_facade().bind_surface_runtime_relation(
@@ -1022,7 +1022,7 @@ fn filesystem_binding_matches_read(
 fn build_state_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
@@ -1072,7 +1072,7 @@ fn build_admin_source_sql_with_current_heads(
 fn build_entity_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
@@ -1121,7 +1121,7 @@ fn build_effective_state_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     effective_state_request: &EffectiveStateRequest,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<String, LixError> {
@@ -1209,7 +1209,7 @@ fn canonical_filesystem_scan(
 }
 
 fn entity_projection_sql(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     effective_state_request: &EffectiveStateRequest,
 ) -> Vec<String> {
     let mut projections = Vec::new();
@@ -1225,7 +1225,7 @@ fn entity_projection_sql(
 }
 
 fn entity_projection_sql_for_column(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     column: &str,
 ) -> Option<String> {
     if let Some(source_column) =
@@ -1466,7 +1466,7 @@ fn read_predicates_from_query(canonicalized: &StructuredPublicRead) -> Vec<Expr>
 mod tests {
     use super::{
         lower_broad_public_read_for_execution_with_layouts, lower_read_for_execution_with_layouts,
-        LoweredReadProgram,
+        LoweredReadBatch,
     };
     use crate::catalog::SurfaceRegistry;
     use crate::sql::binder::{
@@ -1488,25 +1488,25 @@ mod tests {
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
     use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
-    use crate::sql::semantic_ir::ExecutionContext;
+    use crate::sql::semantic_ir::StatementContext;
     use crate::{SqlDialect, Value};
     use serde_json::{json, Value as JsonValue};
     use std::collections::BTreeMap;
 
-    fn lowered_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
-        lowered_program_with_layouts(registry, sql, &BTreeMap::new())
+    fn lowered_batch(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadBatch> {
+        lowered_batch_with_layouts(registry, sql, &BTreeMap::new())
     }
 
-    fn lowered_program_with_layouts(
+    fn lowered_batch_with_layouts(
         registry: &SurfaceRegistry,
         sql: &str,
         known_live_layouts: &BTreeMap<String, JsonValue>,
-    ) -> Option<LoweredReadProgram> {
+    ) -> Option<LoweredReadBatch> {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        let mut execution_context = ExecutionContext::with_dialect(SqlDialect::Sqlite);
-        execution_context.requested_version_id = Some("main".to_string());
-        let bound = bind_statement(statement, Vec::<Value>::new(), execution_context);
+        let mut statement_context = StatementContext::with_dialect(SqlDialect::Sqlite);
+        statement_context.requested_version_id = Some("main".to_string());
+        let bound = bind_statement(statement, Vec::<Value>::new(), statement_context);
         let structured_read = canonicalize_read(bound, registry)
             .expect("query should canonicalize")
             .structured_read();
@@ -1531,15 +1531,15 @@ mod tests {
             .expect("query should bind as broad public read")
     }
 
-    fn lowered_broad_program(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadProgram> {
-        lowered_broad_program_with_layouts(registry, sql, &BTreeMap::new())
+    fn lowered_broad_batch(registry: &SurfaceRegistry, sql: &str) -> Option<LoweredReadBatch> {
+        lowered_broad_batch_with_layouts(registry, sql, &BTreeMap::new())
     }
 
-    fn lowered_broad_program_with_layouts(
+    fn lowered_broad_batch_with_layouts(
         registry: &SurfaceRegistry,
         sql: &str,
         known_live_layouts: &BTreeMap<String, JsonValue>,
-    ) -> Option<LoweredReadProgram> {
+    ) -> Option<LoweredReadBatch> {
         let broad_statement = bound_broad_statement(registry, sql);
         let optimized = route_broad_public_read_statement_with_known_live_layouts(
             &broad_statement,
@@ -1918,7 +1918,7 @@ mod tests {
     #[test]
     fn lowers_builtin_entity_reads_through_state_surfaces() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT key, value FROM lix_key_value WHERE key = 'hello'",
         )
@@ -1974,7 +1974,7 @@ mod tests {
 
     #[test]
     fn lowers_optimized_cte_and_joined_state_surfaces_to_internal_queries() {
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &crate::catalog::build_builtin_surface_registry(),
             "WITH keyed AS ( \
                SELECT entity_id, schema_key \
@@ -2003,7 +2003,7 @@ mod tests {
 
     #[test]
     fn cte_names_that_shadow_public_surfaces_do_not_lower_through_broad_physical_planning() {
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &crate::catalog::build_builtin_surface_registry(),
             "WITH lix_state AS (SELECT 'shadow' AS entity_id) \
              SELECT entity_id FROM lix_state",
@@ -2058,7 +2058,7 @@ mod tests {
             }),
         );
 
-        let lowered = lowered_program_with_layouts(
+        let lowered = lowered_batch_with_layouts(
             &registry,
             "SELECT body, lixcol_global FROM message WHERE id = 'm1'",
             &known_live_layouts,
@@ -2078,7 +2078,7 @@ mod tests {
     fn rejects_entity_wildcard_reads_for_live_lowering() {
         let registry = crate::catalog::build_builtin_surface_registry();
         assert_eq!(
-            lowered_program(&registry, "SELECT * FROM lix_key_value"),
+            lowered_batch(&registry, "SELECT * FROM lix_key_value"),
             None
         );
     }
@@ -2086,7 +2086,7 @@ mod tests {
     #[test]
     fn lowers_state_reads_through_explicit_source_boundary() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
         )
@@ -2118,7 +2118,7 @@ mod tests {
     #[test]
     fn lowers_change_reads_through_internal_change_sources() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT id, schema_key, snapshot_content FROM lix_change WHERE entity_id = 'entity-1'",
         )
@@ -2139,7 +2139,7 @@ mod tests {
     #[test]
     fn projects_entity_string_payloads_without_json_wrappers() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT change_id FROM lix_change_set_element \
              WHERE entity_id = 'entity-1' AND schema_key = 'lix_file_descriptor'",
@@ -2175,7 +2175,7 @@ mod tests {
     #[test]
     fn lowers_change_set_element_by_version_reads_through_version_heads() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT change_id, version_id FROM lix_change_set_element_by_version \
              WHERE version_id = 'main' AND schema_key = 'lix_file_descriptor'",
@@ -2216,7 +2216,7 @@ mod tests {
     fn commit_family_entity_views_lower_as_state_projections() {
         let registry = crate::catalog::build_builtin_surface_registry();
 
-        let commit = lowered_program(
+        let commit = lowered_batch(
             &registry,
             "SELECT change_set_id FROM lix_commit WHERE id = 'commit-1'",
         )
@@ -2242,7 +2242,7 @@ mod tests {
             "commit entity view should not depend on live commit mirrors: {commit_sql}"
         );
 
-        let author = lowered_program(
+        let author = lowered_batch(
             &registry,
             "SELECT account_id FROM lix_change_author_by_version WHERE version_id = 'version-a'",
         )
@@ -2274,7 +2274,7 @@ mod tests {
     #[test]
     fn lowers_working_changes_reads_through_canonical_commit_sources() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT status, before_change_id, after_change_id \
              FROM lix_working_changes \
@@ -2309,7 +2309,7 @@ mod tests {
     #[test]
     fn lowers_working_changes_reads_with_nested_filesystem_subqueries() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT COUNT(*) \
              FROM lix_working_changes wc \
@@ -2331,7 +2331,7 @@ mod tests {
     #[test]
     fn lowers_broad_working_changes_reads_with_nested_filesystem_subqueries() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &registry,
             "SELECT COUNT(*) \
              FROM lix_working_changes wc \
@@ -2355,7 +2355,7 @@ mod tests {
     #[test]
     fn lowers_broad_scalar_subqueries_without_top_level_surface_relations() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &registry,
             "SELECT \
                 (SELECT lixcol_change_id FROM lix_directory WHERE id = 'dir-stable-parent'), \
@@ -2515,7 +2515,7 @@ mod tests {
     #[test]
     fn broad_physical_lowering_emits_final_terminal_statement_artifacts() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &registry,
             "SELECT COUNT(*) \
              FROM lix_working_changes wc \
@@ -2567,7 +2567,7 @@ mod tests {
     fn lowers_filesystem_current_and_versioned_reads_through_internal_sources() {
         let registry = crate::catalog::build_builtin_surface_registry();
 
-        let current = lowered_program(
+        let current = lowered_batch(
             &registry,
             "SELECT id, path, data FROM lix_file WHERE id = 'file-1'",
         )
@@ -2590,7 +2590,7 @@ mod tests {
             vec!["id = 'file-1'".to_string()]
         );
 
-        let by_version = lowered_program(
+        let by_version = lowered_batch(
             &registry,
             "SELECT id, path FROM lix_directory_by_version \
              WHERE id = 'dir-1' AND lixcol_version_id = 'version-a'",
@@ -2621,7 +2621,7 @@ mod tests {
     fn lowers_commit_family_state_reads_through_lazy_state_derivation() {
         let registry = crate::catalog::build_builtin_surface_registry();
 
-        let current = lowered_program(
+        let current = lowered_batch(
             &registry,
             "SELECT entity_id, schema_key, snapshot_content \
              FROM lix_state \
@@ -2646,7 +2646,7 @@ mod tests {
             "state lowering should not recurse through public commit-edge surfaces: {current_sql}"
         );
 
-        let by_version = lowered_program(
+        let by_version = lowered_batch(
             &registry,
             "SELECT entity_id, schema_key, snapshot_content, version_id \
              FROM lix_state_by_version \
@@ -2733,7 +2733,7 @@ mod tests {
 
         for (label, sql) in cases {
             let lowered =
-                lowered_program(&registry, sql).unwrap_or_else(|| panic!("{label} should lower"));
+                lowered_batch(&registry, sql).unwrap_or_else(|| panic!("{label} should lower"));
             let lowered_sql = lowered.statements[0]
                 .render_sql(SqlDialect::Sqlite)
                 .unwrap_or_else(|_| panic!("{label} should render"));
@@ -2772,7 +2772,7 @@ mod tests {
     #[test]
     fn lowers_version_reads_through_canonical_descriptor_and_pointer_sources() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT id, name, hidden, commit_id FROM lix_version WHERE name = 'main'",
         )
@@ -2808,7 +2808,7 @@ mod tests {
     #[test]
     fn broad_lowering_keeps_version_commit_join_on_internal_sources() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &registry,
             "SELECT c.change_set_id \
              FROM lix_version v \
@@ -2851,12 +2851,12 @@ mod tests {
         )
         .expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        let mut execution_context = ExecutionContext::with_dialect(SqlDialect::Postgres);
-        execution_context.requested_version_id = Some("main".to_string());
+        let mut statement_context = StatementContext::with_dialect(SqlDialect::Postgres);
+        statement_context.requested_version_id = Some("main".to_string());
         let bound = bind_statement(
             statement,
             vec![Value::Text("main".to_string())],
-            execution_context,
+            statement_context,
         );
         let structured_read = canonicalize_read(bound, &registry)
             .expect("query should canonicalize")
@@ -2894,7 +2894,7 @@ mod tests {
     #[test]
     fn lowers_registered_schema_reads_through_entity_surface() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_program(
+        let lowered = lowered_batch(
             &registry,
             "SELECT value, lixcol_entity_id FROM lix_registered_schema WHERE lixcol_entity_id = 'x~1'",
         )
@@ -2917,7 +2917,7 @@ mod tests {
     #[test]
     fn broad_lowering_preserves_select_distinct() {
         let registry = crate::catalog::build_builtin_surface_registry();
-        let lowered = lowered_broad_program(
+        let lowered = lowered_broad_batch(
             &registry,
             "SELECT DISTINCT schema_key \
              FROM lix_state_by_version \

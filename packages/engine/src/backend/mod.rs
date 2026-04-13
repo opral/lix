@@ -1,26 +1,18 @@
 mod ddl;
 mod image;
 mod prepared;
-mod program;
-mod program_runner;
 mod transaction_adapter;
 
 use async_trait::async_trait;
 
 use crate::common::SqlDialect;
-pub use crate::contracts::TransactionMode;
+pub use crate::contracts::TransactionBeginMode;
 use crate::{LixError, QueryResult, Value};
 #[allow(unused_imports)]
 pub(crate) use ddl::{add_column_if_missing, execute_ddl_batch};
 pub use image::{ImageChunkReader, ImageChunkWriter};
 #[allow(unused_imports)]
 pub use prepared::{PreparedBatch, PreparedStatement};
-#[allow(unused_imports)]
-pub(crate) use program::WriteProgram;
-#[allow(unused_imports)]
-pub(crate) use program_runner::{
-    execute_write_program_with_backend, execute_write_program_with_transaction,
-};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
 
 #[async_trait(?Send)]
@@ -40,7 +32,7 @@ pub trait LixBackend: Send + Sync {
     /// All SQL must go through the handle until commit/rollback.
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
 
     /// Begin a named savepoint within an active transaction.
@@ -142,7 +134,7 @@ where
 #[async_trait(?Send)]
 pub trait LixBackendTransaction {
     fn dialect(&self) -> SqlDialect;
-    fn mode(&self) -> TransactionMode;
+    fn mode(&self) -> TransactionBeginMode;
 
     /// Executes one SQL statement inside the current transaction.
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;

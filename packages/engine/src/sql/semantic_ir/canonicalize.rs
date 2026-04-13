@@ -1,15 +1,15 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
-    CatalogWriteVersionSemantics, SurfaceBinding, SurfaceFamily, SurfaceRegistry,
+    CatalogWriteVersionSemantics, ResolvedSurface, SurfaceFamily, SurfaceRegistry,
 };
 use crate::sql::logical_plan::public_ir::{
     CanonicalAdminScan, CanonicalChangeScan, CanonicalFilesystemScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, InsertOnConflict, InsertOnConflictAction, MutationPayload,
-    NormalizedPublicReadQuery, PredicateSpec, ProjectionExpr, ReadCommand, ReadContract, ReadPlan,
-    SortKey, WriteCommand, WriteModeRequest, WriteOperationKind, WriteSelector,
+    NormalizedPublicReadQuery, PredicateSpec, ProjectionExpr, ReadCommand, ReadPlan,
+    ReadVisibility, SortKey, WriteCommand, WriteModeRequest, WriteOperationKind, WriteSelector,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
-use crate::sql::semantic_ir::{BoundStatement, ExecutionContext, StatementKind};
+use crate::sql::semantic_ir::{BoundStatement, StatementContext, StatementKind};
 use crate::Value;
 use sqlparser::ast::{
     AssignmentTarget, BinaryOperator, ConflictTarget, Delete, Expr, FromTable, FunctionArg,
@@ -36,14 +36,14 @@ impl CanonicalizeError {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalizedRead {
     pub(crate) bound_statement: BoundStatement,
-    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) surface_binding: ResolvedSurface,
     pub(crate) read_command: ReadCommand,
     pub(crate) query: NormalizedPublicReadQuery,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalizedReadParts {
-    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) surface_binding: ResolvedSurface,
     pub(crate) read_command: ReadCommand,
     pub(crate) query: NormalizedPublicReadQuery,
 }
@@ -57,7 +57,7 @@ impl CanonicalizedRead {
             bound_parameters: self.bound_statement.bound_parameters.clone(),
             requested_version_id: self
                 .bound_statement
-                .execution_context
+                .statement_context
                 .requested_version_id
                 .clone(),
             surface_binding: self.surface_binding.clone(),
@@ -70,7 +70,7 @@ impl CanonicalizedRead {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CanonicalizedWrite {
     pub(crate) bound_statement: BoundStatement,
-    pub(crate) surface_binding: SurfaceBinding,
+    pub(crate) surface_binding: ResolvedSurface,
     pub(crate) write_command: WriteCommand,
 }
 
@@ -108,67 +108,67 @@ pub(crate) fn canonicalize_read_parts(
     let select = extract_supported_select(query)?;
     let surface_binding = bind_single_surface(select, registry)?;
     let query_model = normalized_public_read_query(query, select)?;
-    let mut root = if surface_binding.resolution_capabilities.canonical_state_scan {
-        let scan =
-            CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
-                CanonicalizeError::unsupported(format!(
-                    "surface '{}' did not produce a canonical state scan",
-                    surface_binding.descriptor.public_name
-                ))
-            })?;
-        ReadPlan::scan(scan)
-    } else if surface_binding
-        .resolution_capabilities
-        .canonical_change_scan
-    {
-        let scan = CanonicalChangeScan::from_surface_binding(surface_binding.clone()).ok_or_else(
-            || {
-                CanonicalizeError::unsupported(format!(
-                    "surface '{}' did not produce a canonical change scan",
-                    surface_binding.descriptor.public_name
-                ))
-            },
-        )?;
-        ReadPlan::change_scan(scan)
-    } else if surface_binding
-        .resolution_capabilities
-        .canonical_working_changes_scan
-    {
-        let scan = CanonicalWorkingChangesScan::from_surface_binding(surface_binding.clone())
-            .ok_or_else(|| {
-                CanonicalizeError::unsupported(format!(
-                    "surface '{}' did not produce a canonical working-changes scan",
-                    surface_binding.descriptor.public_name
-                ))
-            })?;
-        ReadPlan::working_changes_scan(scan)
-    } else if surface_binding
-        .resolution_capabilities
-        .canonical_filesystem_scan
-    {
-        let scan = CanonicalFilesystemScan::from_surface_binding(surface_binding.clone())
-            .ok_or_else(|| {
-                CanonicalizeError::unsupported(format!(
-                    "surface '{}' did not produce a canonical filesystem scan",
-                    surface_binding.descriptor.public_name
-                ))
-            })?;
-        ReadPlan::filesystem_scan(scan)
-    } else if surface_binding.resolution_capabilities.canonical_admin_scan {
-        let scan =
-            CanonicalAdminScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
-                CanonicalizeError::unsupported(format!(
-                    "surface '{}' did not produce a canonical admin scan",
-                    surface_binding.descriptor.public_name
-                ))
-            })?;
-        ReadPlan::admin_scan(scan)
-    } else {
-        return Err(CanonicalizeError::unsupported(format!(
-            "surface '{}' does not yet canonicalize through public read planning",
-            surface_binding.descriptor.public_name
-        )));
-    };
+    let mut root =
+        if surface_binding.resolution_capabilities.canonical_state_scan {
+            let scan = CanonicalStateScan::from_resolved_surface(surface_binding.clone())
+                .ok_or_else(|| {
+                    CanonicalizeError::unsupported(format!(
+                        "surface '{}' did not produce a canonical state scan",
+                        surface_binding.descriptor.public_name
+                    ))
+                })?;
+            ReadPlan::scan(scan)
+        } else if surface_binding
+            .resolution_capabilities
+            .canonical_change_scan
+        {
+            let scan = CanonicalChangeScan::from_resolved_surface(surface_binding.clone())
+                .ok_or_else(|| {
+                    CanonicalizeError::unsupported(format!(
+                        "surface '{}' did not produce a canonical change scan",
+                        surface_binding.descriptor.public_name
+                    ))
+                })?;
+            ReadPlan::change_scan(scan)
+        } else if surface_binding
+            .resolution_capabilities
+            .canonical_working_changes_scan
+        {
+            let scan = CanonicalWorkingChangesScan::from_resolved_surface(surface_binding.clone())
+                .ok_or_else(|| {
+                    CanonicalizeError::unsupported(format!(
+                        "surface '{}' did not produce a canonical working-changes scan",
+                        surface_binding.descriptor.public_name
+                    ))
+                })?;
+            ReadPlan::working_changes_scan(scan)
+        } else if surface_binding
+            .resolution_capabilities
+            .canonical_filesystem_scan
+        {
+            let scan = CanonicalFilesystemScan::from_resolved_surface(surface_binding.clone())
+                .ok_or_else(|| {
+                    CanonicalizeError::unsupported(format!(
+                        "surface '{}' did not produce a canonical filesystem scan",
+                        surface_binding.descriptor.public_name
+                    ))
+                })?;
+            ReadPlan::filesystem_scan(scan)
+        } else if surface_binding.resolution_capabilities.canonical_admin_scan {
+            let scan = CanonicalAdminScan::from_resolved_surface(surface_binding.clone())
+                .ok_or_else(|| {
+                    CanonicalizeError::unsupported(format!(
+                        "surface '{}' did not produce a canonical admin scan",
+                        surface_binding.descriptor.public_name
+                    ))
+                })?;
+            ReadPlan::admin_scan(scan)
+        } else {
+            return Err(CanonicalizeError::unsupported(format!(
+                "surface '{}' does not yet canonicalize through public read planning",
+                surface_binding.descriptor.public_name
+            )));
+        };
 
     if let Some(predicate) = select.selection.as_ref() {
         root = ReadPlan::Filter {
@@ -205,7 +205,7 @@ pub(crate) fn canonicalize_read_parts(
         surface_binding,
         read_command: ReadCommand {
             root,
-            contract: ReadContract::CommittedAtStart,
+            contract: ReadVisibility::CommittedAtStart,
             requested_commit_mapping: None,
         },
         query: query_model,
@@ -245,14 +245,14 @@ fn canonicalize_insert_write(
         &surface_binding,
         insert,
         &bound_statement.bound_parameters,
-        &bound_statement.execution_context,
+        &bound_statement.statement_context,
     )?;
     let on_conflict = match payloads.as_slice() {
         [payload] => insert_on_conflict(
             &surface_binding,
             insert,
             &bound_statement.bound_parameters,
-            &bound_statement.execution_context,
+            &bound_statement.statement_context,
             payload,
         )?,
         _ if insert.on.is_some() => {
@@ -276,7 +276,7 @@ fn canonicalize_insert_write(
             on_conflict,
             requested_mode,
             bound_parameters: bound_statement.bound_parameters.clone(),
-            execution_context: bound_statement.execution_context,
+            statement_context: bound_statement.statement_context,
         },
     })
 }
@@ -303,7 +303,7 @@ fn canonicalize_update_write(
         &surface_binding,
         &update.assignments,
         &bound_statement.bound_parameters,
-        &bound_statement.execution_context,
+        &bound_statement.statement_context,
         &mut placeholder_state,
     )?;
     let selector = match update.selection.as_ref() {
@@ -311,7 +311,7 @@ fn canonicalize_update_write(
             &surface_binding,
             selection,
             &bound_statement.bound_parameters,
-            &bound_statement.execution_context,
+            &bound_statement.statement_context,
             &mut placeholder_state,
         )?,
         None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
@@ -338,7 +338,7 @@ fn canonicalize_update_write(
             on_conflict: None,
             requested_mode,
             bound_parameters: bound_statement.bound_parameters.clone(),
-            execution_context: bound_statement.execution_context,
+            statement_context: bound_statement.statement_context,
         },
     })
 }
@@ -367,7 +367,7 @@ fn canonicalize_delete_write(
             &surface_binding,
             selection,
             &bound_statement.bound_parameters,
-            &bound_statement.execution_context,
+            &bound_statement.statement_context,
             &mut placeholder_state,
         )?,
         None if supports_implicit_admin_selector(&surface_binding) => WriteSelector {
@@ -396,16 +396,16 @@ fn canonicalize_delete_write(
                 Some(&selector),
             ),
             bound_parameters: bound_statement.bound_parameters.clone(),
-            execution_context: bound_statement.execution_context,
+            statement_context: bound_statement.statement_context,
         },
     })
 }
 
 fn insert_on_conflict(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     insert: &Insert,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     insert_payload: &BTreeMap<String, Value>,
 ) -> Result<Option<InsertOnConflict>, CanonicalizeError> {
     let Some(on_insert) = &insert.on else {
@@ -451,7 +451,7 @@ fn insert_on_conflict(
                 surface_binding,
                 &update.assignments,
                 params,
-                execution_context,
+                statement_context,
                 &mut placeholder_state,
             )?;
             for (key, value) in update_payload {
@@ -528,7 +528,7 @@ fn extract_supported_select(query: &Query) -> Result<&Select, CanonicalizeError>
 fn bind_single_surface(
     select: &Select,
     registry: &SurfaceRegistry,
-) -> Result<SurfaceBinding, CanonicalizeError> {
+) -> Result<ResolvedSurface, CanonicalizeError> {
     let relation = &select.from[0].relation;
     let TableFactor::Table { name, .. } = relation else {
         return Err(CanonicalizeError::unsupported(
@@ -552,7 +552,7 @@ fn bind_single_surface(
 fn bind_insert_surface(
     insert: &Insert,
     registry: &SurfaceRegistry,
-) -> Result<SurfaceBinding, CanonicalizeError> {
+) -> Result<ResolvedSurface, CanonicalizeError> {
     let sqlparser::ast::TableObject::TableName(name) = &insert.table else {
         return Err(CanonicalizeError::unsupported(
             "public day-1 write canonicalizer only supports direct table targets",
@@ -575,14 +575,14 @@ fn bind_insert_surface(
 fn bind_update_surface(
     update: &Update,
     registry: &SurfaceRegistry,
-) -> Result<SurfaceBinding, CanonicalizeError> {
+) -> Result<ResolvedSurface, CanonicalizeError> {
     bind_table_with_joins_surface(&update.table, registry)
 }
 
 fn bind_delete_surface(
     delete: &Delete,
     registry: &SurfaceRegistry,
-) -> Result<SurfaceBinding, CanonicalizeError> {
+) -> Result<ResolvedSurface, CanonicalizeError> {
     let tables = match &delete.from {
         FromTable::WithFromKeyword(tables) | FromTable::WithoutKeyword(tables) => tables,
     };
@@ -597,7 +597,7 @@ fn bind_delete_surface(
 fn bind_table_with_joins_surface(
     table: &TableWithJoins,
     registry: &SurfaceRegistry,
-) -> Result<SurfaceBinding, CanonicalizeError> {
+) -> Result<ResolvedSurface, CanonicalizeError> {
     if !table.joins.is_empty() {
         return Err(CanonicalizeError::unsupported(
             "public day-1 write canonicalizer does not support JOIN targets",
@@ -622,8 +622,8 @@ fn bind_table_with_joins_surface(
 }
 
 fn validate_semantic_write_surface(
-    surface_binding: &SurfaceBinding,
-    surface_rule: impl Fn(&SurfaceBinding) -> Result<bool, CanonicalizeError>,
+    surface_binding: &ResolvedSurface,
+    surface_rule: impl Fn(&ResolvedSurface) -> Result<bool, CanonicalizeError>,
 ) -> Result<(), CanonicalizeError> {
     if !surface_binding.resolution_capabilities.semantic_write {
         return Err(CanonicalizeError::unsupported(format!(
@@ -652,7 +652,7 @@ fn validate_semantic_write_surface(
 }
 
 fn reject_filesystem_history_write(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     operation: &str,
 ) -> Result<(), CanonicalizeError> {
     if surface_binding.descriptor.surface_family == SurfaceFamily::Filesystem
@@ -668,22 +668,22 @@ fn reject_filesystem_history_write(
 }
 
 fn insert_write_surface_supported(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<bool, CanonicalizeError> {
     Ok(write_target_kind(surface_binding)?.is_some())
 }
 
 fn update_delete_surface_supported(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<bool, CanonicalizeError> {
     Ok(write_target_kind(surface_binding)?.is_some())
 }
 
 fn insert_payloads(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     insert: &Insert,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
 ) -> Result<Vec<BTreeMap<String, Value>>, CanonicalizeError> {
     let Some(source) = &insert.source else {
         if insert.columns.is_empty() {
@@ -700,17 +700,17 @@ fn insert_payloads(
         insert.columns.as_slice(),
         source,
         params,
-        execution_context,
+        statement_context,
         &mut placeholder_state,
     )
 }
 
 fn insert_source_payloads(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     insert_columns: &[Ident],
     source: &Query,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Vec<BTreeMap<String, Value>>, CanonicalizeError> {
     reject_unsupported_insert_source_query_clauses(source)?;
@@ -730,7 +730,7 @@ fn insert_source_payloads(
                     insert_columns,
                     row.iter(),
                     params,
-                    execution_context,
+                    statement_context,
                     placeholder_state,
                 )?);
             }
@@ -741,7 +741,7 @@ fn insert_source_payloads(
             insert_columns,
             select,
             params,
-            execution_context,
+            statement_context,
             placeholder_state,
         )?]),
         SetExpr::Query(query) => insert_source_payloads(
@@ -749,7 +749,7 @@ fn insert_source_payloads(
             insert_columns,
             query,
             params,
-            execution_context,
+            statement_context,
             placeholder_state,
         ),
         SetExpr::SetOperation { .. } => Err(CanonicalizeError::unsupported(
@@ -787,11 +787,11 @@ fn reject_unsupported_insert_source_query_clauses(source: &Query) -> Result<(), 
 }
 
 fn insert_payload_from_select(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     insert_columns: &[Ident],
     select: &Select,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     if !select.from.is_empty() {
@@ -848,17 +848,17 @@ fn insert_payload_from_select(
         insert_columns,
         projection_exprs,
         params,
-        execution_context,
+        statement_context,
         placeholder_state,
     )
 }
 
 fn insert_payload_from_row_exprs<'a>(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     insert_columns: &[Ident],
     exprs: impl IntoIterator<Item = &'a Expr>,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     let exprs = exprs.into_iter().collect::<Vec<_>>();
@@ -872,7 +872,7 @@ fn insert_payload_from_row_exprs<'a>(
     for (column, expr) in insert_columns.iter().zip(exprs) {
         reject_forbidden_default_state_write_column(surface_binding, &column.value, "insert")?;
         let key = canonical_write_column_key(surface_binding, &column.value)?;
-        let value = match expr_to_value(expr, params, execution_context, placeholder_state) {
+        let value = match expr_to_value(expr, params, statement_context, placeholder_state) {
             Ok(value) => value,
             Err(error) if key == "data" => return Err(filesystem_file_data_error(error)),
             Err(error) => return Err(error),
@@ -884,7 +884,7 @@ fn insert_payload_from_row_exprs<'a>(
 }
 
 fn write_mode_request_for_insert_payloads(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     payloads: &[BTreeMap<String, Value>],
 ) -> Result<WriteModeRequest, CanonicalizeError> {
     let Some(first) = payloads.first() else {
@@ -903,10 +903,10 @@ fn write_mode_request_for_insert_payloads(
 }
 
 fn assignment_payload(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     assignments: &[sqlparser::ast::Assignment],
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<BTreeMap<String, Value>, CanonicalizeError> {
     if assignments.is_empty() {
@@ -937,7 +937,7 @@ fn assignment_payload(
         let value = match expr_to_value(
             &assignment.value,
             params,
-            execution_context,
+            statement_context,
             placeholder_state,
         ) {
             Ok(value) => value,
@@ -950,10 +950,10 @@ fn assignment_payload(
 }
 
 fn write_selector(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     expr: &Expr,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<WriteSelector, CanonicalizeError> {
     reject_forbidden_default_state_selector(surface_binding, expr)?;
@@ -963,7 +963,7 @@ fn write_selector(
         surface_binding,
         expr,
         params,
-        execution_context,
+        statement_context,
         placeholder_state,
         &mut exact_filters,
     );
@@ -976,10 +976,10 @@ fn write_selector(
 }
 
 fn collect_exact_selector_filters(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     expr: &Expr,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
     exact_filters: &mut BTreeMap<String, Value>,
 ) -> bool {
@@ -993,14 +993,14 @@ fn collect_exact_selector_filters(
                 surface_binding,
                 left,
                 params,
-                execution_context,
+                statement_context,
                 placeholder_state,
                 exact_filters,
             ) && collect_exact_selector_filters(
                 surface_binding,
                 right,
                 params,
-                execution_context,
+                statement_context,
                 placeholder_state,
                 exact_filters,
             )
@@ -1026,7 +1026,7 @@ fn collect_exact_selector_filters(
             } else {
                 left
             };
-            let Ok(value) = expr_to_value(value_expr, params, execution_context, placeholder_state)
+            let Ok(value) = expr_to_value(value_expr, params, statement_context, placeholder_state)
             else {
                 return false;
             };
@@ -1056,7 +1056,7 @@ fn collect_exact_selector_filters(
             if !selector_column_is_supported(surface_binding, &column) {
                 return false;
             }
-            let Ok(value) = expr_to_value(&list[0], params, execution_context, placeholder_state)
+            let Ok(value) = expr_to_value(&list[0], params, statement_context, placeholder_state)
             else {
                 return false;
             };
@@ -1073,7 +1073,7 @@ fn collect_exact_selector_filters(
             surface_binding,
             inner,
             params,
-            execution_context,
+            statement_context,
             placeholder_state,
             exact_filters,
         ),
@@ -1093,7 +1093,7 @@ fn selector_column_name(expr: &Expr) -> Option<String> {
 }
 
 fn reject_unknown_selector_columns(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     expr: &Expr,
 ) -> Result<(), CanonicalizeError> {
     if let Some(raw_column) = selector_column_name(expr) {
@@ -1137,7 +1137,7 @@ fn reject_unknown_selector_columns(
 }
 
 fn reject_forbidden_default_state_write_column(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     raw_column: &str,
     operation: &str,
 ) -> Result<(), CanonicalizeError> {
@@ -1159,7 +1159,7 @@ fn reject_forbidden_default_state_write_column(
 }
 
 fn reject_forbidden_default_state_selector(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     expr: &Expr,
 ) -> Result<(), CanonicalizeError> {
     if default_state_surface_rejects_version_id(surface_binding)
@@ -1177,7 +1177,7 @@ fn reject_forbidden_default_state_selector(
     Ok(())
 }
 
-fn default_state_surface_rejects_version_id(surface_binding: &SurfaceBinding) -> bool {
+fn default_state_surface_rejects_version_id(surface_binding: &ResolvedSurface) -> bool {
     write_version_semantics(surface_binding)
         .ok()
         .flatten()
@@ -1187,7 +1187,7 @@ fn default_state_surface_rejects_version_id(surface_binding: &SurfaceBinding) ->
 }
 
 fn write_target_kind(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<CatalogWriteTargetKind>, CanonicalizeError> {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(surface_binding)
@@ -1201,7 +1201,7 @@ fn write_target_kind(
 }
 
 fn write_version_semantics(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<CatalogWriteVersionSemantics>, CanonicalizeError> {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(surface_binding)
@@ -1254,7 +1254,7 @@ fn contains_column_reference(expr: &Expr, column: &str) -> bool {
     }
 }
 
-fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) -> bool {
+fn selector_column_is_supported(surface_binding: &ResolvedSurface, column: &str) -> bool {
     match surface_binding.descriptor.surface_family {
         SurfaceFamily::State => matches!(
             column,
@@ -1276,7 +1276,7 @@ fn selector_column_is_supported(surface_binding: &SurfaceBinding, column: &str) 
 }
 
 fn canonical_write_column_key(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     raw_column: &str,
 ) -> Result<String, CanonicalizeError> {
     let column = raw_column.to_ascii_lowercase();
@@ -1302,7 +1302,7 @@ fn canonical_write_column_key(
 }
 
 fn write_surface_supports_column(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     raw_column: &str,
     canonical_column: &str,
 ) -> bool {
@@ -1334,7 +1334,7 @@ fn candidate_column_key(candidate: &str) -> String {
 }
 
 fn unknown_write_column_error(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     raw_column: &str,
 ) -> CanonicalizeError {
     CanonicalizeError::unsupported(format!(
@@ -1350,16 +1350,16 @@ fn filesystem_file_data_error(_error: CanonicalizeError) -> CanonicalizeError {
 pub(crate) fn evaluate_public_write_expr_to_value(
     expr: &Expr,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
 ) -> Result<Value, CanonicalizeError> {
     let mut placeholder_state = PlaceholderState::new();
-    expr_to_value(expr, params, execution_context, &mut placeholder_state)
+    expr_to_value(expr, params, statement_context, &mut placeholder_state)
 }
 
 fn expr_to_value(
     expr: &Expr,
     params: &[Value],
-    execution_context: &ExecutionContext,
+    statement_context: &StatementContext,
     placeholder_state: &mut PlaceholderState,
 ) -> Result<Value, CanonicalizeError> {
     match expr {
@@ -1369,7 +1369,7 @@ fn expr_to_value(
                 .is_some_and(|name| name.eq_ignore_ascii_case("lix_text_encode")) =>
         {
             let encoded = single_function_arg_expr(function, "lix_text_encode")?;
-            match expr_to_value(encoded, params, execution_context, placeholder_state)? {
+            match expr_to_value(encoded, params, statement_context, placeholder_state)? {
                 Value::Text(text) => Ok(Value::Blob(text.into_bytes())),
                 Value::Blob(bytes) => Ok(Value::Blob(bytes)),
                 Value::Null => Ok(Value::Null),
@@ -1383,7 +1383,7 @@ fn expr_to_value(
                 .is_some_and(|name| name.eq_ignore_ascii_case("lix_json")) =>
         {
             let json_expr = single_function_arg_expr(function, "lix_json")?;
-            let value = expr_to_value(json_expr, params, execution_context, placeholder_state)?;
+            let value = expr_to_value(json_expr, params, statement_context, placeholder_state)?;
             value_to_json_value(value)
         }
         Expr::Function(function)
@@ -1391,7 +1391,7 @@ fn expr_to_value(
                 .is_some_and(|name| name.eq_ignore_ascii_case("lix_active_version_id")) =>
         {
             ensure_no_function_args(function, "lix_active_version_id")?;
-            execution_context
+            statement_context
                 .requested_version_id
                 .clone()
                 .map(Value::Text)
@@ -1407,7 +1407,7 @@ fn expr_to_value(
         {
             ensure_no_function_args(function, "lix_active_account_ids")?;
             Ok(Value::Json(serde_json::Value::Array(
-                execution_context
+                statement_context
                     .active_account_ids
                     .iter()
                     .cloned()
@@ -1415,9 +1415,9 @@ fn expr_to_value(
                     .collect(),
             )))
         }
-        Expr::Nested(inner) => expr_to_value(inner, params, execution_context, placeholder_state),
+        Expr::Nested(inner) => expr_to_value(inner, params, statement_context, placeholder_state),
         Expr::UnaryOp { op, expr } if op.to_string() == "-" => {
-            match expr_to_value(expr, params, execution_context, placeholder_state)? {
+            match expr_to_value(expr, params, statement_context, placeholder_state)? {
                 Value::Integer(value) => Ok(Value::Integer(-value)),
                 Value::Real(value) => Ok(Value::Real(-value)),
                 _ => Err(CanonicalizeError::unsupported(
@@ -1598,13 +1598,13 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn supports_implicit_admin_selector(surface_binding: &SurfaceBinding) -> bool {
+fn supports_implicit_admin_selector(surface_binding: &ResolvedSurface) -> bool {
     let _ = surface_binding;
     false
 }
 
 fn write_mode_request_for_surface(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     payload: &BTreeMap<String, Value>,
 ) -> WriteModeRequest {
     let _ = surface_binding;
@@ -1612,7 +1612,7 @@ fn write_mode_request_for_surface(
 }
 
 fn write_mode_request_for_surface_and_selector(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     payload: &BTreeMap<String, Value>,
     selector: Option<&WriteSelector>,
 ) -> WriteModeRequest {
@@ -1839,9 +1839,10 @@ mod tests {
     use crate::catalog::DynamicEntitySurfaceSpec;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::{
-        MutationPayload, ReadContract, ReadPlan, VersionScope, WriteModeRequest, WriteOperationKind,
+        MutationPayload, ReadPlan, ReadVisibility, VersionScope, WriteModeRequest,
+        WriteOperationKind,
     };
-    use crate::sql::semantic_ir::{BoundStatement, ExecutionContext};
+    use crate::sql::semantic_ir::{BoundStatement, StatementContext};
     use crate::Value;
     use serde_json::json;
     use std::collections::BTreeMap;
@@ -1849,22 +1850,22 @@ mod tests {
     fn bound_statement(sql: &str) -> BoundStatement {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        bind_statement(statement, Vec::new(), ExecutionContext::default())
+        bind_statement(statement, Vec::new(), StatementContext::default())
     }
 
     fn bound_statement_with_params(sql: &str, params: Vec<Value>) -> BoundStatement {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        bind_statement(statement, params, ExecutionContext::default())
+        bind_statement(statement, params, StatementContext::default())
     }
 
     fn bound_statement_with_context(
         sql: &str,
-        execution_context: ExecutionContext,
+        statement_context: StatementContext,
     ) -> BoundStatement {
         let mut statements = crate::sql::parser::parse_sql_script(sql).expect("SQL should parse");
         let statement = statements.pop().expect("single statement");
-        bind_statement(statement, Vec::new(), execution_context)
+        bind_statement(statement, Vec::new(), statement_context)
     }
 
     #[test]
@@ -1888,7 +1889,7 @@ mod tests {
         );
         assert_eq!(
             canonicalized.read_command.contract,
-            ReadContract::CommittedAtStart
+            ReadVisibility::CommittedAtStart
         );
         assert!(canonicalized.query.source_alias.is_none());
         assert_eq!(canonicalized.query.projection.len(), 2);
@@ -2082,9 +2083,9 @@ mod tests {
                  ) VALUES (\
                  'entity-1', 'lix_key_value', 'lix', lix_active_version_id(), 'lix', '{\"key\":\"hello\"}', '1'\
                  )",
-                ExecutionContext {
+                StatementContext {
                     requested_version_id: Some("version-active".to_string()),
-                    ..ExecutionContext::default()
+                    ..StatementContext::default()
                 },
             ),
             &registry,

@@ -1,4 +1,4 @@
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
 use crate::contracts::GLOBAL_VERSION_ID;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 
@@ -127,7 +127,7 @@ pub(crate) fn overlay_lanes_for_version(
 }
 
 pub(crate) fn effective_state_pushdown_predicates(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     predicates: &[Expr],
 ) -> Vec<Expr> {
     if !surface_supports_effective_state_pushdown(surface_binding) {
@@ -141,14 +141,14 @@ pub(crate) fn effective_state_pushdown_predicates(
         .collect()
 }
 
-fn surface_supports_effective_state_pushdown(surface_binding: &SurfaceBinding) -> bool {
+fn surface_supports_effective_state_pushdown(surface_binding: &ResolvedSurface) -> bool {
     let family = surface_binding.descriptor.surface_family;
     let variant = surface_binding.descriptor.surface_variant;
     family == SurfaceFamily::State
         || (family == SurfaceFamily::Entity && variant == SurfaceVariant::History)
 }
 
-fn state_predicate_is_pushdown_safe(expr: &Expr, surface_binding: &SurfaceBinding) -> bool {
+fn state_predicate_is_pushdown_safe(expr: &Expr, surface_binding: &ResolvedSurface) -> bool {
     match expr {
         Expr::BinaryOp {
             left,
@@ -168,7 +168,7 @@ fn state_predicate_is_pushdown_safe(expr: &Expr, surface_binding: &SurfaceBindin
     }
 }
 
-fn state_pushdown_column<'a>(expr: &'a Expr, surface_binding: &SurfaceBinding) -> Option<&'a str> {
+fn state_pushdown_column<'a>(expr: &'a Expr, surface_binding: &ResolvedSurface) -> Option<&'a str> {
     let column = identifier_column_name(expr)?;
     match surface_binding.descriptor.surface_variant {
         SurfaceVariant::Default => match column.to_ascii_lowercase().as_str() {

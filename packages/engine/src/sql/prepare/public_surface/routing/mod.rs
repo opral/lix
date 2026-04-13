@@ -8,9 +8,9 @@ mod registry;
 
 #[cfg(test)]
 pub(crate) use public_reads::forbid_broad_routing_for_test;
-pub use public_reads::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
 pub(crate) use public_reads::{
-    route_broad_public_read_statement_with_known_live_layouts,
-    route_public_read_execution_strategy, PublicReadExecutionStrategy,
+    classify_public_read_plan_kind, route_broad_public_read_statement_with_known_live_layouts,
+    PublicReadPlanKind,
 };
+pub use public_reads::{delay_broad_routing_for_test, BroadRoutingDelayForTestGuard};
 pub(crate) use registry::RoutingPassTrace;

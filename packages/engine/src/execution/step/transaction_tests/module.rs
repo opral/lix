@@ -11,7 +11,8 @@ use crate::live_state::untracked::{
 use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::transaction::{LiveStateWriteTransaction, ReadContext, TransactionDelta};
 use crate::{
-    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
+    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
+    Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
@@ -25,7 +26,7 @@ struct SqliteBackend {
 
 struct SqliteTransaction {
     connection: Arc<Mutex<rusqlite::Connection>>,
-    mode: TransactionMode,
+    mode: TransactionBeginMode,
 }
 
 impl SqliteBackend {
@@ -53,14 +54,14 @@ impl LixBackend for SqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
             connection
                 .execute_batch(match mode {
-                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
-                    TransactionMode::Write => "BEGIN IMMEDIATE",
+                    TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN",
+                    TransactionBeginMode::Write => "BEGIN IMMEDIATE",
                 })
                 .map_err(sqlite_error)?;
         }
@@ -74,7 +75,7 @@ impl LixBackend for SqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction(TransactionMode::Write).await
+        self.begin_transaction(TransactionBeginMode::Write).await
     }
 }
 
@@ -84,7 +85,7 @@ impl LixBackendTransaction for SqliteTransaction {
         SqlDialect::Sqlite
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
 
@@ -257,7 +258,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
         .expect("workspace init should succeed");
     let read_context = ReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
-        .begin_transaction(TransactionMode::Write)
+        .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("begin transaction should succeed");
 
@@ -329,7 +330,7 @@ async fn isolated_transaction_rejects_staging_after_execute() {
         .expect("workspace init should succeed");
     let read_context = ReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
-        .begin_transaction(TransactionMode::Write)
+        .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("begin transaction should succeed");
 
@@ -366,7 +367,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
         .expect("workspace init should succeed");
     let read_context = ReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
-        .begin_transaction(TransactionMode::Write)
+        .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("begin transaction should succeed");
 

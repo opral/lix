@@ -2,18 +2,18 @@ use crate::contracts::FilesystemPayloadChange;
 use crate::transaction::{
     build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,
-    filesystem_transaction_state_from_planned, PlannedInternalWriteUnit, WriteExecutionBindings,
+    filesystem_transaction_state_from_planned, PlannedDirectWriteUnit, WriteExecutionHost,
 };
 use crate::{LixBackendTransaction, LixError};
 
-use super::runtime::{execute_internal_execution_with_transaction, SqlExecutionOutcome};
+use super::runtime::{execute_direct_execution_with_transaction, WriteExecutionOutcome};
 
-pub(crate) async fn run_internal_write_txn_with_transaction(
-    bindings: &dyn WriteExecutionBindings,
+pub(crate) async fn run_direct_write_txn_with_transaction(
+    host: &dyn WriteExecutionHost,
     transaction: &mut dyn LixBackendTransaction,
-    plan: &PlannedInternalWriteUnit,
-) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let mut execution = execute_internal_execution_with_transaction(
+    plan: &PlannedDirectWriteUnit,
+) -> Result<Option<WriteExecutionOutcome>, LixError> {
+    let mut write_outcome = execute_direct_execution_with_transaction(
         transaction,
         &plan.execution,
         plan.result_contract,
@@ -33,12 +33,11 @@ pub(crate) async fn run_internal_write_txn_with_transaction(
     )
     .await?;
     if !filesystem_finalization.binary_blob_writes.is_empty() {
-        bindings
-            .persist_binary_blob_writes_in_transaction(
-                transaction,
-                &filesystem_finalization.binary_blob_writes,
-            )
-            .await?;
+        host.persist_binary_blob_writes_in_transaction(
+            transaction,
+            &filesystem_finalization.binary_blob_writes,
+        )
+        .await?;
     }
     persist_filesystem_payload_changes_direct(
         transaction,
@@ -46,27 +45,25 @@ pub(crate) async fn run_internal_write_txn_with_transaction(
     )
     .await?;
     if filesystem_finalization.should_run_gc {
-        bindings
-            .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+        host.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
             .await?;
     }
 
-    bindings
-        .persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.functions())
+    host.persist_runtime_sequence_in_transaction(transaction, plan.runtime_state.functions())
         .await
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "internal write runtime-sequence persistence failed inside write txn: {}",
+                "direct write runtime-sequence persistence failed inside write txn: {}",
                 error.description
             ),
         })?;
 
-    if execution.plan_effects_override.is_none() {
-        execution.plan_effects_override = Some(plan.execution.effects.clone());
+    if write_outcome.plan_effects_override.is_none() {
+        write_outcome.plan_effects_override = Some(plan.execution.effects.clone());
     }
 
-    Ok(Some(execution))
+    Ok(Some(write_outcome))
 }
 
 async fn persist_filesystem_payload_changes_direct(

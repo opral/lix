@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::{
-    DefaultScopeSemantics, SurfaceBinding, SurfaceColumnType, SurfaceFamily,
+    DefaultScopeSemantics, ResolvedSurface, SurfaceColumnType, SurfaceFamily,
     SurfaceOverridePredicate, SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
@@ -99,7 +99,7 @@ pub(crate) struct RelationBindContext<'a> {
     pub(crate) current_heads: Option<&'a BTreeMap<String, String>>,
 }
 
-pub(crate) fn bind_schema_relation(surface_binding: &SurfaceBinding) -> Option<RelationBinding> {
+pub(crate) fn bind_schema_relation(surface_binding: &ResolvedSurface) -> Option<RelationBinding> {
     let schema_key = surface_binding
         .implicit_overrides
         .fixed_schema_key
@@ -200,7 +200,7 @@ pub(crate) fn bind_named_relation(
 }
 
 pub(crate) fn bind_surface_relation(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     context: RelationBindContext<'_>,
 ) -> Result<Option<RelationBinding>, LixError> {
     if let Some(binding) = bind_named_relation(

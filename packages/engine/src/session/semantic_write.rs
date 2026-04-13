@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value as JsonValue};
 use zip::read::ZipArchive;
 
-use crate::catalog::{SurfaceBinding, SurfaceRegistry};
+use crate::catalog::{ResolvedSurface, SurfaceRegistry};
 use crate::common::stable_content_fingerprint_hex;
 use crate::common::{NormalizedDirectoryPath, ParsedFilePath};
 use crate::contracts::{
@@ -20,18 +20,18 @@ use crate::contracts::{
     ChangeBatch, CommitPreconditions, IdempotencyKey, OptionalTextPatch, PlanEffects,
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
     PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
-    PreparedPublicWriteArtifact, PreparedPublicWriteContract, PreparedPublicWriteExecutionArtifact,
-    PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
+    PreparedPublicWrite, PreparedPublicWriteContract, PreparedPublicWriteExecutionPartition,
+    PreparedPublicWriteMaterialization, PreparedPublicWritePlanArtifact,
     PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
-    PreparedWriteArtifact, PreparedWriteDiagnosticContext, PreparedWriteOperationKind,
-    PreparedWriteStatementKind, PreparedWriteStep, PublicChange, ResultContract,
-    SchemaLiveTableRequirement, SemanticEffect, StateCommitStreamOperation, WriteLane, WriteMode,
+    PreparedWriteArtifact, PreparedWriteOperationKind, PreparedWriteStatement,
+    PreparedWriteStatementKind, PublicChange, ResultContract, SchemaLiveTableRequirement,
+    SemanticEffect, StateCommitStreamOperation, WriteDiagnosticContext, WriteLane, WriteMode,
 };
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
 use crate::{LixError, Value};
 
 use crate::contracts::PreparedWriteRuntimeState;
-use crate::execution::step::PreparedWriteExecutionStep;
+use crate::transaction::WriteCommand;
 
 const GLOBAL_VERSION_ID: &str = "global";
 const REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -83,10 +83,7 @@ impl SemanticWriteContext {
 pub(crate) trait PluginInstallWriteExecutor {
     fn semantic_write_context(&self) -> SemanticWriteContext;
 
-    fn stage_prepared_write_step(
-        &mut self,
-        step: PreparedWriteExecutionStep,
-    ) -> Result<(), LixError>;
+    fn stage_prepared_write_statement(&mut self, statement: WriteCommand) -> Result<(), LixError>;
 
     async fn resolve_directory_id(
         &mut self,
@@ -103,12 +100,12 @@ pub(crate) async fn install_plugin_archive_with_writer(
     install_plugin_with_writer(executor, &parsed, archive_bytes).await
 }
 
-pub(crate) fn prepare_registered_schema_write_step(
+pub(crate) fn prepare_registered_schema_write_statement(
     schema: &JsonValue,
     context: &SemanticWriteContext,
-) -> Result<PreparedWriteExecutionStep, LixError> {
+) -> Result<WriteCommand, LixError> {
     let parsed_schema = parsed_schema_from_json(schema)?;
-    prepare_registered_schema_write_step_from_schemas(&[parsed_schema], context)
+    prepare_registered_schema_write_statement_from_schemas(&[parsed_schema], context)
 }
 
 async fn install_plugin_with_writer(
@@ -119,10 +116,12 @@ async fn install_plugin_with_writer(
     let semantic_context = executor.semantic_write_context();
 
     if !parsed.schemas.is_empty() {
-        executor.stage_prepared_write_step(prepare_registered_schema_write_step_from_schemas(
-            &parsed.schemas,
-            &semantic_context,
-        )?)?;
+        executor.stage_prepared_write_statement(
+            prepare_registered_schema_write_statement_from_schemas(
+                &parsed.schemas,
+                &semantic_context,
+            )?,
+        )?;
     }
 
     let plugin_root =
@@ -139,7 +138,7 @@ async fn install_plugin_with_writer(
                 ),
             )
         })?;
-    executor.stage_prepared_write_step(prepare_plugin_archive_write_step(
+    executor.stage_prepared_write_statement(prepare_plugin_archive_write_statement(
         parsed,
         archive_bytes,
         &plugin_directory_id,
@@ -157,11 +156,11 @@ struct RegisteredSchemaRowSpec {
     schema_json: JsonValue,
 }
 
-fn prepare_registered_schema_write_step_from_schemas(
+fn prepare_registered_schema_write_statement_from_schemas(
     schemas: &[ParsedSchema],
     context: &SemanticWriteContext,
-) -> Result<PreparedWriteExecutionStep, LixError> {
-    let target = require_surface_binding(
+) -> Result<WriteCommand, LixError> {
+    let target = require_resolved_surface(
         &context.public_surface_registry,
         "lix_registered_schema_by_version",
     )?;
@@ -195,7 +194,7 @@ fn prepare_registered_schema_write_step_from_schemas(
         })
         .collect::<Vec<_>>();
 
-    prepare_public_tracked_write_step(
+    prepare_public_tracked_write_statement(
         context,
         target,
         "lix_registered_schema_by_version",
@@ -217,13 +216,13 @@ fn prepare_registered_schema_write_step_from_schemas(
     )
 }
 
-fn prepare_plugin_archive_write_step(
+fn prepare_plugin_archive_write_statement(
     parsed: &ParsedPluginArchive,
     archive_bytes: &[u8],
     plugin_directory_id: &str,
     context: &SemanticWriteContext,
-) -> Result<PreparedWriteExecutionStep, LixError> {
-    let target = require_surface_binding(&context.public_surface_registry, "lix_file_by_version")?;
+) -> Result<WriteCommand, LixError> {
+    let target = require_resolved_surface(&context.public_surface_registry, "lix_file_by_version")?;
     let archive_id = plugin_storage_archive_file_id(parsed.manifest.key.as_str());
     let archive_path = plugin_storage_archive_path(parsed.manifest.key.as_str())?;
     let parsed_path = ParsedFilePath::try_from_path(&archive_path)?;
@@ -259,7 +258,7 @@ fn prepare_plugin_archive_write_step(
         .map(planned_row_to_public_change)
         .collect::<Result<Vec<_>, _>>()?;
 
-    prepare_public_tracked_write_step(
+    prepare_public_tracked_write_statement(
         context,
         target,
         "lix_file_by_version",
@@ -429,9 +428,9 @@ fn plugin_archive_binary_blob_ref_row(
     })
 }
 
-fn prepare_public_tracked_write_step(
+fn prepare_public_tracked_write_statement(
     context: &SemanticWriteContext,
-    target: SurfaceBinding,
+    target: ResolvedSurface,
     relation_name: &str,
     intended_post_state: Vec<PlannedStateRow>,
     filesystem_state: PlannedFilesystemState,
@@ -439,7 +438,7 @@ fn prepare_public_tracked_write_step(
     schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     public_surface_registry_effect: PreparedPublicSurfaceRegistryEffect,
     idempotency_purpose: &str,
-) -> Result<PreparedWriteExecutionStep, LixError> {
+) -> Result<WriteCommand, LixError> {
     let semantic_effects =
         semantic_plan_effects_from_changes(&changes, context.writer_key.as_deref())?;
     let write_payload = json!({
@@ -447,11 +446,11 @@ fn prepare_public_tracked_write_step(
         "changes": changes.iter().map(summarize_change).collect::<Vec<_>>(),
         "filesystem_files": filesystem_state.files.keys().cloned().collect::<Vec<_>>(),
     });
-    PreparedWriteExecutionStep::build(
-        PreparedWriteStep {
-            statement_kind: PreparedWriteStatementKind::Other,
+    WriteCommand::build(
+        PreparedWriteStatement {
+            statement_kind: PreparedWriteStatementKind::Write,
             result_contract: ResultContract::DmlNoReturning,
-            artifact: PreparedWriteArtifact::PublicWrite(PreparedPublicWriteArtifact {
+            artifact: PreparedWriteArtifact::PublicWrite(PreparedPublicWrite {
                 contract: PreparedPublicWriteContract {
                     operation_kind: PreparedWriteOperationKind::Insert,
                     target,
@@ -469,7 +468,7 @@ fn prepare_public_tracked_write_step(
                         }],
                     }),
                 },
-                execution: PreparedPublicWriteExecutionArtifact::Materialize(
+                execution: PreparedPublicWritePlanArtifact::Materialize(
                     PreparedPublicWriteMaterialization {
                         partitions: vec![PreparedPublicWriteExecutionPartition::Tracked(
                             PreparedTrackedWriteExecution {
@@ -496,9 +495,7 @@ fn prepare_public_tracked_write_step(
                     },
                 ),
             }),
-            diagnostic_context: PreparedWriteDiagnosticContext::new(
-                vec![relation_name.to_string()],
-            ),
+            diagnostic_context: WriteDiagnosticContext::new(vec![relation_name.to_string()]),
             public_surface_registry_effect,
         },
         &context.runtime_state,
@@ -652,10 +649,10 @@ fn summarize_planned_row(row: &PlannedStateRow) -> JsonValue {
     })
 }
 
-fn require_surface_binding(
+fn require_resolved_surface(
     public_surface_registry: &SurfaceRegistry,
     relation_name: &str,
-) -> Result<SurfaceBinding, LixError> {
+) -> Result<ResolvedSurface, LixError> {
     public_surface_registry
         .bind_relation_name(relation_name)
         .ok_or_else(|| {

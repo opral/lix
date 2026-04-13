@@ -11,7 +11,8 @@ use crate::live_state::untracked::{
 use crate::live_state::LiveRow;
 use crate::schema::LixActiveVersion;
 use crate::{
-    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
+    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
+    Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
@@ -23,7 +24,7 @@ struct SqliteBackend {
 
 struct SqliteTransaction {
     connection: Arc<Mutex<rusqlite::Connection>>,
-    mode: TransactionMode,
+    mode: TransactionBeginMode,
 }
 
 impl SqliteBackend {
@@ -51,14 +52,14 @@ impl LixBackend for SqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
             connection
                 .execute_batch(match mode {
-                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
-                    TransactionMode::Write => "BEGIN IMMEDIATE",
+                    TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN",
+                    TransactionBeginMode::Write => "BEGIN IMMEDIATE",
                 })
                 .map_err(sqlite_error)?;
         }
@@ -72,7 +73,7 @@ impl LixBackend for SqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction(TransactionMode::Write).await
+        self.begin_transaction(TransactionBeginMode::Write).await
     }
 }
 
@@ -82,7 +83,7 @@ impl LixBackendTransaction for SqliteTransaction {
         SqlDialect::Sqlite
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
 
@@ -174,7 +175,9 @@ async fn commit_untracked_rows(
     backend: &SqliteBackend,
     rows: Vec<LiveRow>,
 ) -> Result<(), LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
     crate::live_state::write_live_rows(transaction.as_mut(), &rows).await?;
     transaction.commit().await?;
     Ok(())

@@ -6,10 +6,10 @@ use super::contracts::effects::PlanEffects;
 use super::contracts::planned_statement::{
     MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use super::public_surface::{PreparedPublicRead, PreparedPublicWrite};
+use super::public_surface::{PublicReadPlan, PublicWritePlan};
 
 #[derive(Clone)]
-pub(crate) struct CompiledInternalExecution {
+pub(crate) struct CompiledDirectExecution {
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) mutations: Vec<MutationRow>,
@@ -18,7 +18,7 @@ pub(crate) struct CompiledInternalExecution {
 }
 
 pub(crate) struct CompiledExecution {
-    pub(crate) intent: crate::sql::prepare::intent::ExecutionIntent,
+    pub(crate) filesystem_intent: crate::sql::prepare::intent::FilesystemIntent,
     pub(crate) explain: Option<ExplainArtifacts>,
     pub(crate) result_contract: ResultContract,
     pub(crate) effects: PlanEffects,
@@ -27,36 +27,36 @@ pub(crate) struct CompiledExecution {
 }
 
 pub(crate) enum CompiledExecutionBody {
-    PublicRead(PreparedPublicRead),
-    PublicWrite(PreparedPublicWrite),
-    Internal(CompiledInternalExecution),
+    PublicRead(PublicReadPlan),
+    PublicWrite(PublicWritePlan),
+    Direct(CompiledDirectExecution),
 }
 
 impl CompiledExecution {
-    pub(crate) fn public_read(&self) -> Option<&PreparedPublicRead> {
+    pub(crate) fn public_read(&self) -> Option<&PublicReadPlan> {
         match &self.body {
             CompiledExecutionBody::PublicRead(read) => Some(read),
-            CompiledExecutionBody::PublicWrite(_) | CompiledExecutionBody::Internal(_) => None,
+            CompiledExecutionBody::PublicWrite(_) | CompiledExecutionBody::Direct(_) => None,
         }
     }
 
-    pub(crate) fn public_write(&self) -> Option<&PreparedPublicWrite> {
+    pub(crate) fn public_write(&self) -> Option<&PublicWritePlan> {
         match &self.body {
             CompiledExecutionBody::PublicWrite(write) => Some(write),
-            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Internal(_) => None,
+            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Direct(_) => None,
         }
     }
 
-    pub(crate) fn public_write_mut(&mut self) -> Option<&mut PreparedPublicWrite> {
+    pub(crate) fn public_write_mut(&mut self) -> Option<&mut PublicWritePlan> {
         match &mut self.body {
             CompiledExecutionBody::PublicWrite(write) => Some(write),
-            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Internal(_) => None,
+            CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::Direct(_) => None,
         }
     }
 
-    pub(crate) fn internal_execution(&self) -> Option<&CompiledInternalExecution> {
+    pub(crate) fn direct_execution(&self) -> Option<&CompiledDirectExecution> {
         match &self.body {
-            CompiledExecutionBody::Internal(internal) => Some(internal),
+            CompiledExecutionBody::Direct(direct) => Some(direct),
             CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::PublicWrite(_) => None,
         }
     }

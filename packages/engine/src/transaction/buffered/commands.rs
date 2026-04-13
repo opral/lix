@@ -5,15 +5,15 @@ use crate::QueryResult;
 use super::TransactionWriteDelta;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BufferedWriteExecutionRoute {
-    Internal,
-    PublicReadCommitted,
-    Other,
+pub(crate) enum BufferedWriteFlushClass {
+    DirectWrite,
+    CommittedRead,
+    NoPreFlush,
 }
 
 #[derive(Clone)]
 pub(crate) struct BufferedWriteCommandMetadata {
-    pub(crate) route: BufferedWriteExecutionRoute,
+    pub(crate) flush_class: BufferedWriteFlushClass,
     pub(crate) has_materialization_plan: bool,
     pub(crate) transaction_write_delta: Option<TransactionWriteDelta>,
     pub(crate) registry_mutated_during_planning: bool,
@@ -36,7 +36,7 @@ impl Default for BufferedWriteSessionEffects {
 
 pub(crate) struct BufferedWriteExecutionResult {
     pub(crate) public_result: QueryResult,
-    pub(crate) clear_pending_public_commit_session: bool,
+    pub(crate) clear_pending_commit_state: bool,
     pub(crate) session_effects: BufferedWriteSessionEffects,
     pub(crate) commit_outcome: TransactionCommitOutcome,
 }

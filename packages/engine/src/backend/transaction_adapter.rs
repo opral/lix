@@ -4,7 +4,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor, SqlDialect};
-use crate::{LixError, QueryResult, TransactionMode, Value};
+use crate::{LixError, QueryResult, TransactionBeginMode, Value};
 
 pub(crate) struct TransactionBackendAdapter<'a> {
     dialect: SqlDialect,
@@ -63,7 +63,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
 
     async fn begin_transaction(
         &self,
-        _mode: TransactionMode,
+        _mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

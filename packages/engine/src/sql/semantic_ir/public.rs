@@ -1,20 +1,19 @@
 use super::canonicalize::{
     canonicalize_read_parts, canonicalize_write, CanonicalizeError, CanonicalizedWrite,
 };
-use super::internal::NormalizedInternalStatements;
+use super::direct::NormalizedDirectStatements;
 use super::statement::BoundStatement;
 use crate::catalog::{
-    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogDirectReadSemantics,
-    SurfaceBinding, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
+    ResolvedSurface, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::diagnostics::schema_not_registered_error;
 use crate::sql::logical_plan::public_ir::{
-    BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadContract,
-    ReadPlan, StructuredPublicRead,
+    BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadPlan,
+    ReadVisibility, StructuredPublicRead,
 };
 use crate::sql::logical_plan::{
-    DependencySpec, DirectPublicReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
-    SurfaceReadPlan,
+    DependencySpec, HistoryReadPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan, SurfaceReadPlan,
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
@@ -25,7 +24,7 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadSemantics {
-    pub(crate) surface_bindings: Vec<SurfaceBinding>,
+    pub(crate) surface_bindings: Vec<ResolvedSurface>,
     pub(crate) broad_statement: Option<Box<BroadPublicReadStatement>>,
     pub(crate) surface_read_plan: Option<SurfaceReadPlan>,
 }
@@ -37,7 +36,7 @@ pub(crate) struct StructuredPublicReadAnalysis {
     pub(crate) dependency_spec: Option<DependencySpec>,
 }
 
-pub(crate) enum StructuredPublicReadPreparation {
+pub(crate) enum StructuredPublicReadDecision {
     Prepared(StructuredPublicReadAnalysis),
     Declined(BoundStatement),
 }
@@ -58,11 +57,11 @@ impl StructuredPublicReadAnalysis {
 
     pub(crate) fn logical_plan_with_direct_execution(
         &self,
-        direct_plan: DirectPublicReadPlan,
+        history_read_plan: HistoryReadPlan,
     ) -> PublicReadLogicalPlan {
-        PublicReadLogicalPlan::DirectHistory {
+        PublicReadLogicalPlan::HistoryRead {
             plan: self.surface_read_plan().clone(),
-            direct_plan,
+            history_read_plan,
         }
     }
 }
@@ -71,12 +70,12 @@ pub(crate) async fn prepare_structured_public_read_analysis(
     bound_statement: BoundStatement,
     registry: &SurfaceRegistry,
     active_history_root_commit_id: Option<&str>,
-) -> Result<StructuredPublicReadPreparation, LixError> {
+) -> Result<StructuredPublicReadDecision, LixError> {
     let structured_read = match canonicalize_read_parts(&bound_statement, registry) {
         Ok(parts) => StructuredPublicRead {
             bound_parameters: bound_statement.bound_parameters.clone(),
             requested_version_id: bound_statement
-                .execution_context
+                .statement_context
                 .requested_version_id
                 .clone(),
             surface_binding: parts.surface_binding,
@@ -86,7 +85,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
         Err(_error) => {
             match try_build_direct_state_history_structured_read(&bound_statement, registry)? {
                 Some(structured_read) => structured_read,
-                None => return Ok(StructuredPublicReadPreparation::Declined(bound_statement)),
+                None => return Ok(StructuredPublicReadDecision::Declined(bound_statement)),
             }
         }
     };
@@ -117,7 +116,7 @@ pub(crate) async fn prepare_structured_public_read_analysis(
         effective_state_plan: effective_state.as_ref().map(|(_, plan)| plan.clone()),
     };
 
-    Ok(StructuredPublicReadPreparation::Prepared(
+    Ok(StructuredPublicReadDecision::Prepared(
         StructuredPublicReadAnalysis {
             bound_statement,
             semantics: PublicReadSemantics {
@@ -135,11 +134,11 @@ fn bind_active_history_root_commit_id(
     active_history_root_commit_id: Option<&str>,
 ) -> Option<StructuredPublicRead> {
     let uses_active_history_root = matches!(
-        builtin_catalog_compiler_facade().direct_read_semantics(&structured_read.surface_binding),
-        Some(CatalogDirectReadSemantics::StateHistoryActiveVersion)
-            | Some(CatalogDirectReadSemantics::EntityHistoryActiveVersion)
-            | Some(CatalogDirectReadSemantics::DirectoryHistoryActiveVersion)
-            | Some(CatalogDirectReadSemantics::FileHistory {
+        builtin_catalog_compiler_facade().history_read_semantics(&structured_read.surface_binding),
+        Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
+            | Some(CatalogHistoryReadSemantics::EntityHistoryActiveVersion)
+            | Some(CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion)
+            | Some(CatalogHistoryReadSemantics::FileHistory {
                 active_version_lineage: true
             })
     );
@@ -247,7 +246,7 @@ pub(crate) fn analyze_public_write_semantics(
 pub(crate) enum SemanticStatement {
     PublicRead(PublicReadSemantics),
     PublicWrite(PublicWriteSemantics),
-    Internal(NormalizedInternalStatements),
+    Direct(NormalizedDirectStatements),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,7 +259,7 @@ pub(crate) struct BoundPublicLeaf {
 }
 
 impl BoundPublicLeaf {
-    pub(crate) fn from_surface_binding(binding: &SurfaceBinding) -> Self {
+    pub(crate) fn from_resolved_surface(binding: &ResolvedSurface) -> Self {
         Self {
             public_name: binding.descriptor.public_name.clone(),
             surface_family: binding.descriptor.surface_family,
@@ -339,14 +338,14 @@ fn try_build_direct_state_history_structured_read(
         return Ok(None);
     };
     if !matches!(
-        builtin_catalog_compiler_facade().direct_read_semantics(&surface_binding),
-        Some(CatalogDirectReadSemantics::StateHistoryActiveVersion)
+        builtin_catalog_compiler_facade().history_read_semantics(&surface_binding),
+        Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
     ) {
         return Ok(None);
     }
 
     let scan =
-        CanonicalStateScan::from_surface_binding(surface_binding.clone()).ok_or_else(|| {
+        CanonicalStateScan::from_resolved_surface(surface_binding.clone()).ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "state-history direct preparation could not derive a canonical state scan",
@@ -356,13 +355,13 @@ fn try_build_direct_state_history_structured_read(
     Ok(Some(StructuredPublicRead {
         bound_parameters: bound_statement.bound_parameters.clone(),
         requested_version_id: bound_statement
-            .execution_context
+            .statement_context
             .requested_version_id
             .clone(),
         surface_binding,
         read_command: ReadCommand {
             root: ReadPlan::scan(scan),
-            contract: ReadContract::CommittedAtStart,
+            contract: ReadVisibility::CommittedAtStart,
             requested_commit_mapping: None,
         },
         query: crate::sql::logical_plan::public_ir::NormalizedPublicReadQuery {

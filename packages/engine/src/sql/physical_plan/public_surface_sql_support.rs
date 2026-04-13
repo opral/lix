@@ -1,4 +1,4 @@
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
 use crate::SqlDialect;
 use sqlparser::ast::{Expr, Ident, Value as SqlValue, Visit, Visitor};
 use std::ops::ControlFlow;
@@ -118,7 +118,9 @@ pub(crate) fn is_live_state_raw_envelope_column(column: &str) -> bool {
     )
 }
 
-pub(crate) fn entity_surface_has_live_payload_collisions(surface_binding: &SurfaceBinding) -> bool {
+pub(crate) fn entity_surface_has_live_payload_collisions(
+    surface_binding: &ResolvedSurface,
+) -> bool {
     surface_binding.descriptor.surface_family == SurfaceFamily::Entity
         && surface_binding.descriptor.surface_variant != SurfaceVariant::History
         && surface_binding
@@ -128,7 +130,7 @@ pub(crate) fn entity_surface_has_live_payload_collisions(surface_binding: &Surfa
 }
 
 pub(crate) fn entity_surface_uses_payload_alias(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     column: &str,
 ) -> bool {
     entity_surface_has_live_payload_collisions(surface_binding)

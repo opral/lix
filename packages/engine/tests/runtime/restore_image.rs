@@ -10,7 +10,7 @@ use lix_engine::wasm::{NoopWasmRuntime, WasmRuntime};
 use lix_engine::{
     collapse_prepared_batch_for_dialect, CreateVersionOptions, Lix, LixBackend,
     LixBackendTransaction, LixConfig, LixError, PreparedBatch, QueryResult, SqlDialect,
-    TransactionMode, Value,
+    TransactionBeginMode, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -65,7 +65,7 @@ struct TestImageSqliteBackend {
 struct TestImageSqliteTransaction<'a> {
     conn: MutexGuard<'a, Connection>,
     finalized: bool,
-    mode: TransactionMode,
+    mode: TransactionBeginMode,
 }
 
 impl TestImageSqliteBackend {
@@ -96,7 +96,9 @@ impl LixBackend for TestImageSqliteBackend {
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut transaction = self.begin_transaction(TransactionMode::Deferred).await?;
+        let mut transaction = self
+            .begin_transaction(TransactionBeginMode::Deferred)
+            .await?;
         let result = transaction.execute(sql, params).await;
         match result {
             Ok(result) => {
@@ -112,14 +114,14 @@ impl LixBackend for TestImageSqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let conn = self.conn.lock().map_err(|_| {
             LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
         })?;
         conn.execute_batch(match mode {
-            TransactionMode::Read | TransactionMode::Deferred => "BEGIN TRANSACTION",
-            TransactionMode::Write => "BEGIN IMMEDIATE TRANSACTION",
+            TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN TRANSACTION",
+            TransactionBeginMode::Write => "BEGIN IMMEDIATE TRANSACTION",
         })
         .map_err(|error| {
             LixError::new(
@@ -220,7 +222,7 @@ impl LixBackend for TestImageSqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction(TransactionMode::Write).await
+        self.begin_transaction(TransactionBeginMode::Write).await
     }
 }
 
@@ -230,7 +232,7 @@ impl LixBackendTransaction for TestImageSqliteTransaction<'_> {
         SqlDialect::Sqlite
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
 

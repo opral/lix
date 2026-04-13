@@ -426,7 +426,7 @@ impl ObserveState {
                 session_dependency_generations,
             } => {
                 let latest_tick_seq =
-                    latest_observe_tick_seq(session.collaborators().backend().as_ref()).await?;
+                    latest_observe_tick_seq(session.session_runtime().backend().as_ref()).await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
@@ -474,7 +474,7 @@ impl ObserveState {
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
                 let observed_ticks = observe_ticks_since(
-                    session.collaborators().backend().as_ref(),
+                    session.session_runtime().backend().as_ref(),
                     last_seen_tick_seq,
                 )
                 .await?;
@@ -769,7 +769,7 @@ fn build_shared_observe_source(
         include: filter.writer_keys.iter().cloned().collect(),
         exclude: filter.exclude_writer_keys.iter().cloned().collect(),
     };
-    let state_commits = session.collaborators().state_commit_stream(filter);
+    let state_commits = session.session_runtime().state_commit_stream(filter);
 
     Ok(SharedObserveSource::new(
         query,
@@ -1024,7 +1024,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionMode,
+            _mode: crate::TransactionBeginMode,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(CountingObserveTransaction {
                 observe_query_hits: Arc::clone(&self.observe_query_hits),
@@ -1035,7 +1035,8 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
+            self.begin_transaction(crate::TransactionBeginMode::Write)
+                .await
         }
     }
 
@@ -1045,8 +1046,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionMode {
-            crate::TransactionMode::Write
+        fn mode(&self) -> crate::TransactionBeginMode {
+            crate::TransactionBeginMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
@@ -1089,7 +1090,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+                crate::session::runtime::SessionRuntime::new(lix.session_host()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1130,7 +1131,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+                crate::session::runtime::SessionRuntime::new(lix.session_host()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1236,7 +1237,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+                crate::session::runtime::SessionRuntime::new(lix.session_host()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1283,7 +1284,7 @@ mod tests {
                 Arc::new(NoopWasmRuntime),
             )));
             let session = Session::new_for_test(
-                crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+                crate::session::runtime::SessionRuntime::new(lix.session_host()),
                 "version-test".to_string(),
                 Vec::new(),
             );
@@ -1303,7 +1304,7 @@ mod tests {
                 .expect("initial poll should succeed");
             assert_eq!(observe_query_hits.load(Ordering::SeqCst), 1);
 
-            let mut context = session.new_execution_context(ExecuteOptions::default());
+            let mut context = session.new_execution_state(ExecuteOptions::default());
             context.bump_public_surface_registry_generation();
 
             state

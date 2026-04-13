@@ -1,10 +1,10 @@
-use crate::contracts::{PendingPublicCommitSession, PlanEffects};
+use crate::contracts::{PendingCommitState, PlanEffects};
 use crate::execution::step::{
-    empty_public_write_execution_outcome, execute_internal_transaction_write_unit_with_transaction,
+    empty_public_write_execution_outcome, execute_direct_transaction_write_unit_with_transaction,
     execute_public_tracked_transaction_write_unit_with_transaction,
-    execute_public_untracked_transaction_write_unit_with_transaction, SqlExecutionOutcome,
+    execute_public_untracked_transaction_write_unit_with_transaction, WriteExecutionOutcome,
 };
-use crate::transaction::WriteExecutionBindings;
+use crate::transaction::WriteExecutionHost;
 use crate::{LixBackendTransaction, LixError};
 
 use super::{TransactionWriteDelta, TransactionWriteUnit};
@@ -12,70 +12,70 @@ use super::{TransactionWriteDelta, TransactionWriteUnit};
 impl TransactionWriteDelta {
     pub(crate) async fn execute(
         &self,
-        bindings: &dyn WriteExecutionBindings,
+        host: &dyn WriteExecutionHost,
         transaction: &mut dyn LixBackendTransaction,
-        mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
-    ) -> Result<SqlExecutionOutcome, LixError> {
-        let mut combined = None;
+        mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
+    ) -> Result<WriteExecutionOutcome, LixError> {
+        let mut combined_write_outcome = None;
 
         for unit in &self.materialization_plan().units {
-            let outcome = match unit {
+            let write_outcome = match unit {
                 TransactionWriteUnit::PublicTracked(tracked) => {
                     execute_public_tracked_transaction_write_unit_with_transaction(
-                        bindings,
+                        host,
                         transaction,
                         tracked,
-                        pending_commit_session.as_deref_mut(),
+                        pending_commit_state.as_deref_mut(),
                     )
                     .await?
                 }
                 TransactionWriteUnit::PublicUntracked(untracked) => {
                     execute_public_untracked_transaction_write_unit_with_transaction(
-                        bindings,
+                        host,
                         transaction,
                         untracked,
                     )
                     .await?
                 }
-                TransactionWriteUnit::Internal(internal) => {
-                    execute_internal_transaction_write_unit_with_transaction(
-                        bindings,
+                TransactionWriteUnit::Direct(direct) => {
+                    execute_direct_transaction_write_unit_with_transaction(
+                        host,
                         transaction,
-                        internal,
+                        direct,
                     )
                     .await?
                 }
             };
 
-            if let Some(outcome) = outcome {
-                merge_sql_execution_outcome(&mut combined, outcome);
+            if let Some(write_outcome) = write_outcome {
+                merge_write_execution_outcome(&mut combined_write_outcome, write_outcome);
             }
         }
 
-        Ok(combined.unwrap_or_else(empty_public_write_execution_outcome))
+        Ok(combined_write_outcome.unwrap_or_else(empty_public_write_execution_outcome))
     }
 }
 
-fn merge_sql_execution_outcome(
-    combined: &mut Option<SqlExecutionOutcome>,
-    outcome: SqlExecutionOutcome,
+fn merge_write_execution_outcome(
+    combined_write_outcome: &mut Option<WriteExecutionOutcome>,
+    write_outcome: WriteExecutionOutcome,
 ) {
-    let Some(existing) = combined.as_mut() else {
-        *combined = Some(outcome);
+    let Some(existing_write_outcome) = combined_write_outcome.as_mut() else {
+        *combined_write_outcome = Some(write_outcome);
         return;
     };
 
-    existing
-        .internal_write_file_cache_targets
-        .extend(outcome.internal_write_file_cache_targets);
-    existing.plugin_changes_committed |= outcome.plugin_changes_committed;
-    existing
+    existing_write_outcome
+        .direct_write_file_cache_targets
+        .extend(write_outcome.direct_write_file_cache_targets);
+    existing_write_outcome.plugin_changes_committed |= write_outcome.plugin_changes_committed;
+    existing_write_outcome
         .state_commit_stream_changes
-        .extend(outcome.state_commit_stream_changes);
-    existing.observe_tick_emitted |= outcome.observe_tick_emitted;
+        .extend(write_outcome.state_commit_stream_changes);
+    existing_write_outcome.observe_tick_emitted |= write_outcome.observe_tick_emitted;
     merge_plan_effects_override(
-        &mut existing.plan_effects_override,
-        outcome.plan_effects_override,
+        &mut existing_write_outcome.plan_effects_override,
+        write_outcome.plan_effects_override,
     );
 }
 

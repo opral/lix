@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TransactionMode {
+pub enum TransactionBeginMode {
     Read,
     Write,
     Deferred,

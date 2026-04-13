@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind};
-use crate::contracts::{LiveStateQueryBackend, PendingSemanticStorage, PendingView};
-use crate::contracts::{PendingViewFilter, ScanConstraint, ScanField, ScanOperator};
+use crate::contracts::{LiveStateQueryBackend, PendingOverlayView, PendingSemanticStorage};
+use crate::contracts::{PendingOverlayFilter, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, RowReadMode};
 use crate::sql::{
     resolve_placeholder_index, CanonicalStateRowKey, PlaceholderState, PlannedWrite, ScopeProof,
@@ -71,7 +71,7 @@ enum LaneSelectorResult {
 
 pub(crate) async fn try_resolve_state_selector_rows_with_backend(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     planned_write: &PlannedWrite,
 ) -> Result<Option<Vec<CanonicalStateRowKey>>, LixError> {
     let Some(semantics) =
@@ -99,7 +99,7 @@ pub(crate) async fn try_resolve_state_selector_rows_with_backend(
         selector_rows.extend(
             resolve_rows_for_version(
                 backend,
-                pending_view,
+                pending_overlay_view,
                 &schema_key,
                 &version_id,
                 &constraints,
@@ -136,11 +136,11 @@ pub(crate) async fn try_resolve_state_selector_rows_with_backend(
 
 async fn resolve_rows_for_version(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     schema_key: &str,
     requested_version_id: &str,
     constraints: &[ScanConstraint],
-    filters: &[PendingViewFilter],
+    filters: &[PendingOverlayFilter],
 ) -> Result<Vec<SelectorCandidateRow>, LixError> {
     let mut visible = BTreeMap::<SelectorRowIdentity, SelectorCandidateRow>::new();
     let mut hidden = BTreeSet::<SelectorRowIdentity>::new();
@@ -148,7 +148,7 @@ async fn resolve_rows_for_version(
     for lane in selector_overlay_lanes_for_version(requested_version_id) {
         let lane_rows = scan_selector_lane(
             backend,
-            pending_view,
+            pending_overlay_view,
             schema_key,
             requested_version_id,
             lane,
@@ -185,7 +185,7 @@ async fn resolve_rows_for_version(
 
 async fn scan_selector_lane(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     schema_key: &str,
     requested_version_id: &str,
     lane: SelectorOverlayLane,
@@ -222,7 +222,7 @@ async fn scan_selector_lane(
         lane_rows.insert(row.identity(), LaneSelectorResult::Visible(row));
     }
 
-    let Some(pending_view) = pending_view else {
+    let Some(pending_overlay_view) = pending_overlay_view else {
         return Ok(lane_rows);
     };
 
@@ -232,7 +232,7 @@ async fn scan_selector_lane(
         PendingSemanticStorage::Tracked
     };
 
-    for pending in pending_view.visible_semantic_rows(pending_storage, schema_key) {
+    for pending in pending_overlay_view.visible_semantic_rows(pending_storage, schema_key) {
         if pending.version_id != storage_version_id
             || !crate::contracts::matches_constraints(
                 &pending.entity_id,
@@ -259,7 +259,7 @@ async fn scan_selector_lane(
             continue;
         }
 
-        let writer_key = pending_view.writer_key_annotation_for_state_row(
+        let writer_key = pending_overlay_view.writer_key_annotation_for_state_row(
             &pending.version_id,
             &pending.schema_key,
             &pending.entity_id,
@@ -376,7 +376,7 @@ fn resolved_selector_version_ids(planned_write: &PlannedWrite) -> Option<Vec<Str
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => planned_write
             .command
-            .execution_context
+            .statement_context
             .requested_version_id
             .clone()
             .map(|version_id| vec![version_id]),
@@ -421,7 +421,7 @@ fn selector_projected_version_id(
     }
 }
 
-fn compile_selector_filters(planned_write: &PlannedWrite) -> Option<Vec<PendingViewFilter>> {
+fn compile_selector_filters(planned_write: &PlannedWrite) -> Option<Vec<PendingOverlayFilter>> {
     let mut placeholder_state = PlaceholderState::new();
     planned_write
         .command
@@ -442,13 +442,13 @@ fn selector_filter_from_expr(
     expr: &Expr,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
-) -> Option<PendingViewFilter> {
+) -> Option<PendingOverlayFilter> {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
-        } => Some(PendingViewFilter::And(vec![
+        } => Some(PendingOverlayFilter::And(vec![
             selector_filter_from_expr(left, params, placeholder_state)?,
             selector_filter_from_expr(right, params, placeholder_state)?,
         ])),
@@ -456,7 +456,7 @@ fn selector_filter_from_expr(
             left,
             op: BinaryOperator::Or,
             right,
-        } => Some(PendingViewFilter::Or(vec![
+        } => Some(PendingOverlayFilter::Or(vec![
             selector_filter_from_expr(left, params, placeholder_state)?,
             selector_filter_from_expr(right, params, placeholder_state)?,
         ])),
@@ -470,11 +470,11 @@ fn selector_filter_from_expr(
             right.as_ref(),
             selector_value_from_expr(left, params, placeholder_state),
         ) {
-            (left, Some(value), _, _) => Some(PendingViewFilter::Equals(
+            (left, Some(value), _, _) => Some(PendingOverlayFilter::Equals(
                 selector_identifier_name(left)?,
                 value,
             )),
-            (_, _, right, Some(value)) => Some(PendingViewFilter::Equals(
+            (_, _, right, Some(value)) => Some(PendingOverlayFilter::Equals(
                 selector_identifier_name(right)?,
                 value,
             )),
@@ -484,14 +484,16 @@ fn selector_filter_from_expr(
             expr,
             list,
             negated: false,
-        } => Some(PendingViewFilter::In(
+        } => Some(PendingOverlayFilter::In(
             selector_identifier_name(expr)?,
             list.iter()
                 .map(|expr| selector_value_from_expr(expr, params, placeholder_state))
                 .collect::<Option<Vec<_>>>()?,
         )),
-        Expr::IsNull(expr) => Some(PendingViewFilter::IsNull(selector_identifier_name(expr)?)),
-        Expr::IsNotNull(expr) => Some(PendingViewFilter::IsNotNull(selector_identifier_name(
+        Expr::IsNull(expr) => Some(PendingOverlayFilter::IsNull(selector_identifier_name(
+            expr,
+        )?)),
+        Expr::IsNotNull(expr) => Some(PendingOverlayFilter::IsNotNull(selector_identifier_name(
             expr,
         )?)),
         Expr::Like {
@@ -499,7 +501,7 @@ fn selector_filter_from_expr(
             pattern,
             negated: false,
             ..
-        } => Some(PendingViewFilter::Like {
+        } => Some(PendingOverlayFilter::Like {
             column: selector_identifier_name(expr)?,
             pattern: selector_filter_text(&selector_value_from_expr(
                 pattern,
@@ -513,7 +515,7 @@ fn selector_filter_from_expr(
             pattern,
             negated: false,
             ..
-        } => Some(PendingViewFilter::Like {
+        } => Some(PendingOverlayFilter::Like {
             column: selector_identifier_name(expr)?,
             pattern: selector_filter_text(&selector_value_from_expr(
                 pattern,
@@ -583,26 +585,26 @@ fn selector_sql_value_as_engine_value(value: &ValueWithSpan) -> Option<Value> {
     }
 }
 
-fn selector_filter_matches_row(filter: &PendingViewFilter, row: &SelectorCandidateRow) -> bool {
+fn selector_filter_matches_row(filter: &PendingOverlayFilter, row: &SelectorCandidateRow) -> bool {
     match filter {
-        PendingViewFilter::And(filters) => filters
+        PendingOverlayFilter::And(filters) => filters
             .iter()
             .all(|filter| selector_filter_matches_row(filter, row)),
-        PendingViewFilter::Or(filters) => filters
+        PendingOverlayFilter::Or(filters) => filters
             .iter()
             .any(|filter| selector_filter_matches_row(filter, row)),
-        PendingViewFilter::Equals(column, expected) => {
+        PendingOverlayFilter::Equals(column, expected) => {
             selector_row_value(row, column).is_some_and(|actual| actual == *expected)
         }
-        PendingViewFilter::In(column, expected) => selector_row_value(row, column)
+        PendingOverlayFilter::In(column, expected) => selector_row_value(row, column)
             .is_some_and(|actual| expected.iter().any(|candidate| candidate == &actual)),
-        PendingViewFilter::IsNull(column) => {
+        PendingOverlayFilter::IsNull(column) => {
             matches!(selector_row_value(row, column), Some(Value::Null) | None)
         }
-        PendingViewFilter::IsNotNull(column) => {
+        PendingOverlayFilter::IsNotNull(column) => {
             !matches!(selector_row_value(row, column), Some(Value::Null) | None)
         }
-        PendingViewFilter::Like {
+        PendingOverlayFilter::Like {
             column,
             pattern,
             case_insensitive,

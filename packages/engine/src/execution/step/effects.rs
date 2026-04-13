@@ -19,7 +19,7 @@ impl ExecutionRuntimeEffects {
     }
 }
 
-pub(crate) fn derive_execution_runtime_effects(
+pub(crate) fn derive_compiler_cache_effects(
     statements: &[Statement],
 ) -> ExecutionRuntimeEffects {
     statements
@@ -81,7 +81,7 @@ fn function_args_empty(function: &Function) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_execution_runtime_effects, ExecutionRuntimeEffects};
+    use super::{derive_compiler_cache_effects, ExecutionRuntimeEffects};
     use crate::sql::parse_sql;
 
     #[test]
@@ -89,7 +89,7 @@ mod tests {
         let statements = parse_sql("SELECT lix_uuid_v7(), lix_timestamp(), 1")
             .expect("parse SQL should succeed");
         assert_eq!(
-            derive_execution_runtime_effects(&statements),
+            derive_compiler_cache_effects(&statements),
             ExecutionRuntimeEffects {
                 requires_deterministic_sequence_persistence: true,
             }
@@ -100,7 +100,7 @@ mod tests {
     fn deterministic_runtime_effects_ignore_plain_reads() {
         let statements = parse_sql("SELECT 1, 2, 3").expect("parse SQL should succeed");
         assert_eq!(
-            derive_execution_runtime_effects(&statements),
+            derive_compiler_cache_effects(&statements),
             ExecutionRuntimeEffects::default()
         );
     }

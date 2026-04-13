@@ -1,67 +1,24 @@
 use std::collections::BTreeMap;
 
-use super::program::{
-    PreparedParam, PreparedProgram, ProgramSlot, ProgramSlotId, SlotShape, WriteProgram, WriteStep,
+use super::statement_batch::{
+    CaptureShape, CaptureSlot, CaptureSlotId, PreparedParam, PreparedStatementBatch,
 };
-use super::{PreparedBatch, PreparedStatement};
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionMode, Value};
+use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn execute_write_program_with_backend(
-    backend: &dyn LixBackend,
-    program: WriteProgram,
-) -> Result<QueryResult, LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
-    let result = execute_write_program_steps_with_transaction(transaction.as_mut(), program).await;
-    match result {
-        Ok(result) => {
-            transaction.commit().await?;
-            Ok(result)
-        }
-        Err(error) => {
-            let _ = transaction.rollback().await;
-            Err(error)
-        }
-    }
-}
-
-pub(crate) async fn execute_write_program_with_transaction(
+pub(crate) async fn execute_prepared_statement_batch_with_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    program: WriteProgram,
+    statement_batch: &PreparedStatementBatch,
 ) -> Result<QueryResult, LixError> {
-    execute_write_program_steps_with_transaction(transaction, program).await
-}
-
-async fn execute_write_program_steps_with_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    program: WriteProgram,
-) -> Result<QueryResult, LixError> {
-    let mut batch = PreparedBatch { steps: Vec::new() };
-    for step in program.steps {
-        match step {
-            WriteStep::PreparedBatch(other) => batch.extend(other),
-            WriteStep::Statement { sql, params } => {
-                batch.push_statement(PreparedStatement { sql, params });
-            }
-        }
-    }
-    transaction.execute_batch(&batch).await
-}
-
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) async fn execute_prepared_program_with_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    program: &PreparedProgram,
-) -> Result<QueryResult, LixError> {
-    let slot_defs = program
+    let slot_defs = statement_batch
         .slots
         .iter()
         .map(|slot| (slot.id.clone(), slot))
         .collect::<BTreeMap<_, _>>();
-    let mut slot_values: BTreeMap<ProgramSlotId, QueryResult> = BTreeMap::new();
+    let mut slot_values: BTreeMap<CaptureSlotId, QueryResult> = BTreeMap::new();
     let mut last_result = empty_query_result();
 
-    for step in &program.steps {
+    for step in &statement_batch.steps {
         for relation in &step.relation_inputs {
             for setup_step in &relation.setup_steps {
                 let params = resolve_params(&slot_defs, &slot_values, &setup_step.params)?;
@@ -75,7 +32,10 @@ pub(crate) async fn execute_prepared_program_with_transaction(
         if let Some(slot_id) = &step.capture {
             let slot = slot_defs.get(slot_id).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!("prepared program referenced undefined slot '{}'", slot_id.0),
+                description: format!(
+                    "prepared statement batch referenced undefined capture slot '{}'",
+                    slot_id.0
+                ),
             })?;
             validate_slot_capture(slot, &result)?;
             slot_values.insert(slot_id.clone(), result.clone());
@@ -96,8 +56,8 @@ pub(crate) async fn execute_prepared_program_with_transaction(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn resolve_params(
-    slot_defs: &BTreeMap<ProgramSlotId, &ProgramSlot>,
-    slot_values: &BTreeMap<ProgramSlotId, QueryResult>,
+    slot_defs: &BTreeMap<CaptureSlotId, &CaptureSlot>,
+    slot_values: &BTreeMap<CaptureSlotId, QueryResult>,
     params: &[PreparedParam],
 ) -> Result<Vec<Value>, LixError> {
     params
@@ -116,15 +76,18 @@ fn resolve_params(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn resolve_scalar_slot(
-    slot_defs: &BTreeMap<ProgramSlotId, &ProgramSlot>,
-    slot_values: &BTreeMap<ProgramSlotId, QueryResult>,
-    slot_id: &ProgramSlotId,
+    slot_defs: &BTreeMap<CaptureSlotId, &CaptureSlot>,
+    slot_values: &BTreeMap<CaptureSlotId, QueryResult>,
+    slot_id: &CaptureSlotId,
 ) -> Result<Value, LixError> {
     let slot = slot_defs.get(slot_id).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("prepared program referenced undefined slot '{}'", slot_id.0),
+        description: format!(
+            "prepared statement batch referenced undefined capture slot '{}'",
+            slot_id.0
+        ),
     })?;
-    if slot.shape != SlotShape::Scalar {
+    if slot.shape != CaptureShape::Scalar {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
@@ -147,17 +110,20 @@ fn resolve_scalar_slot(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn resolve_row_column(
-    slot_defs: &BTreeMap<ProgramSlotId, &ProgramSlot>,
-    slot_values: &BTreeMap<ProgramSlotId, QueryResult>,
-    slot_id: &ProgramSlotId,
+    slot_defs: &BTreeMap<CaptureSlotId, &CaptureSlot>,
+    slot_values: &BTreeMap<CaptureSlotId, QueryResult>,
+    slot_id: &CaptureSlotId,
     column_name: &str,
 ) -> Result<Value, LixError> {
     let slot = slot_defs.get(slot_id).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("prepared program referenced undefined slot '{}'", slot_id.0),
+        description: format!(
+            "prepared statement batch referenced undefined capture slot '{}'",
+            slot_id.0
+        ),
     })?;
     match slot.shape {
-        SlotShape::OptionalRow | SlotShape::ExactlyOneRow => {}
+        CaptureShape::OptionalRow | CaptureShape::ExactlyOneRow => {}
         _ => {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -170,7 +136,7 @@ fn resolve_row_column(
     }
 
     let Some(result) = slot_values.get(slot_id) else {
-        return if slot.shape == SlotShape::OptionalRow {
+        return if slot.shape == CaptureShape::OptionalRow {
             Ok(Value::Null)
         } else {
             Err(LixError {
@@ -181,7 +147,7 @@ fn resolve_row_column(
     };
 
     let Some(row) = result.rows.first() else {
-        return if slot.shape == SlotShape::OptionalRow {
+        return if slot.shape == CaptureShape::OptionalRow {
             Ok(Value::Null)
         } else {
             Err(LixError {
@@ -213,9 +179,9 @@ fn resolve_row_column(
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn validate_slot_capture(slot: &ProgramSlot, result: &QueryResult) -> Result<(), LixError> {
+fn validate_slot_capture(slot: &CaptureSlot, result: &QueryResult) -> Result<(), LixError> {
     match slot.shape {
-        SlotShape::Scalar => {
+        CaptureShape::Scalar => {
             if result.rows.len() != 1 || result.rows.first().map(|row| row.len()) != Some(1) {
                 return Err(slot_shape_error(
                     slot,
@@ -223,17 +189,17 @@ fn validate_slot_capture(slot: &ProgramSlot, result: &QueryResult) -> Result<(),
                 ));
             }
         }
-        SlotShape::OptionalRow => {
+        CaptureShape::OptionalRow => {
             if result.rows.len() > 1 {
                 return Err(slot_shape_error(slot, "expected zero or one row"));
             }
         }
-        SlotShape::ExactlyOneRow => {
+        CaptureShape::ExactlyOneRow => {
             if result.rows.len() != 1 {
                 return Err(slot_shape_error(slot, "expected exactly one row"));
             }
         }
-        SlotShape::RowSet => {}
+        CaptureShape::RowSet => {}
     }
 
     if !slot.columns.is_empty() && !result.columns.is_empty() {
@@ -262,7 +228,7 @@ fn validate_slot_capture(slot: &ProgramSlot, result: &QueryResult) -> Result<(),
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-fn slot_shape_error(slot: &ProgramSlot, message: &str) -> LixError {
+fn slot_shape_error(slot: &CaptureSlot, message: &str) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("slot '{}' shape violation: {}", slot.id.0, message),
@@ -280,55 +246,16 @@ fn empty_query_result() -> QueryResult {
 mod tests {
     use async_trait::async_trait;
 
-    use super::super::program::{
-        PreparedParam, PreparedProgram, PreparedStep, ProgramSlot, ProgramSlotId, SlotColumn,
-        SlotShape, SlotValueType, WriteProgram,
+    use super::super::statement_batch::{
+        CaptureColumn, CaptureShape, CaptureSlot, CaptureSlotId, CaptureValueType, PreparedParam,
+        PreparedStatementBatch, PreparedStep,
     };
-    use super::{execute_prepared_program_with_transaction, execute_write_program_with_backend};
-    use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
-
-    #[derive(Default)]
-    struct FakeBackend {
-        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        fail_sql: Option<String>,
-    }
+    use super::execute_prepared_statement_batch_with_transaction;
+    use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
 
     struct FakeTransaction {
         log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
         fail_sql: Option<String>,
-    }
-
-    #[async_trait(?Send)]
-    impl LixBackend for FakeBackend {
-        fn dialect(&self) -> SqlDialect {
-            SqlDialect::Sqlite
-        }
-
-        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            self.log.lock().unwrap().push(format!("backend:{sql}"));
-            Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            })
-        }
-
-        async fn begin_transaction(
-            &self,
-            _mode: crate::TransactionMode,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.log.lock().unwrap().push("begin".to_string());
-            Ok(Box::new(FakeTransaction {
-                log: std::sync::Arc::clone(&self.log),
-                fail_sql: self.fail_sql.clone(),
-            }))
-        }
-
-        async fn begin_savepoint(
-            &self,
-            _name: &str,
-        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
-        }
     }
 
     #[async_trait(?Send)]
@@ -337,8 +264,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionMode {
-            crate::TransactionMode::Write
+        fn mode(&self) -> crate::TransactionBeginMode {
+            crate::TransactionBeginMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
@@ -370,78 +297,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owned_runner_commits_on_success() {
-        let backend = FakeBackend::default();
-        let mut program = WriteProgram::new();
-        program.push_statement("INSERT INTO test VALUES (1)", Vec::new());
-
-        execute_write_program_with_backend(&backend, program)
-            .await
-            .expect("program should succeed");
-
-        let log = backend.log.lock().unwrap().clone();
-        assert_eq!(
-            log,
-            vec![
-                "begin".to_string(),
-                "tx:INSERT INTO test VALUES (1)".to_string(),
-                "commit".to_string()
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn owned_runner_rolls_back_on_failure() {
-        let backend = FakeBackend {
-            log: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
-            fail_sql: Some("INSERT INTO fail VALUES (1)".to_string()),
-        };
-        let mut program = WriteProgram::new();
-        program.push_statement("INSERT INTO fail VALUES (1)", Vec::new());
-
-        let error = execute_write_program_with_backend(&backend, program)
-            .await
-            .expect_err("program should fail");
-        assert!(error.description.contains("boom"));
-
-        let log = backend.log.lock().unwrap().clone();
-        assert_eq!(
-            log,
-            vec![
-                "begin".to_string(),
-                "tx:INSERT INTO fail VALUES (1)".to_string(),
-                "rollback".to_string()
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn prepared_program_can_capture_and_reuse_slot_values() {
+    async fn prepared_statement_batch_can_capture_and_reuse_slot_values() {
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let mut transaction = FakeTransaction {
             log,
             fail_sql: None,
         };
-        let program = PreparedProgram {
-            slots: vec![ProgramSlot {
-                id: ProgramSlotId("scalar".to_string()),
-                shape: SlotShape::Scalar,
-                columns: vec![SlotColumn {
+        let statement_batch = PreparedStatementBatch {
+            slots: vec![CaptureSlot {
+                id: CaptureSlotId("scalar".to_string()),
+                shape: CaptureShape::Scalar,
+                columns: vec![CaptureColumn {
                     name: "one".to_string(),
-                    value_type: SlotValueType::Integer,
+                    value_type: CaptureValueType::Integer,
                 }],
             }],
             steps: vec![
                 PreparedStep {
                     sql: "SELECT 1 AS one".to_string(),
                     params: Vec::new(),
-                    capture: Some(ProgramSlotId("scalar".to_string())),
+                    capture: Some(CaptureSlotId("scalar".to_string())),
                     relation_inputs: Vec::new(),
                 },
                 PreparedStep {
                     sql: "INSERT INTO test VALUES ($1)".to_string(),
                     params: vec![PreparedParam::FromScalarSlot {
-                        slot: ProgramSlotId("scalar".to_string()),
+                        slot: CaptureSlotId("scalar".to_string()),
                     }],
                     capture: None,
                     relation_inputs: Vec::new(),
@@ -449,8 +330,8 @@ mod tests {
             ],
         };
 
-        execute_prepared_program_with_transaction(&mut transaction, &program)
+        execute_prepared_statement_batch_with_transaction(&mut transaction, &statement_batch)
             .await
-            .expect("program should succeed");
+            .expect("statement batch should succeed");
     }
 }

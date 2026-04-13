@@ -82,7 +82,7 @@ pub use row_api::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, write_live_rows,
     ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSemantics, RowReadMode,
 };
-pub(crate) use schema_access::LiveReadContract;
+pub(crate) use schema_access::LiveRowShape;
 pub use shared::identity::RowIdentity;
 pub(crate) use storage_metadata::{
     builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,
@@ -140,7 +140,7 @@ pub(crate) async fn list_installed_plugin_archive_refs(
 pub(crate) async fn derive_read_time_surface_rows(
     backend: &dyn LixBackend,
     registry: &crate::catalog::CatalogProjectionRegistry,
-    artifact: &crate::contracts::ReadTimeProjectionRead,
+    artifact: &crate::contracts::ReadTimeProjectionPlan,
 ) -> Result<Vec<crate::catalog::CatalogDerivedRow>, LixError> {
     projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry, artifact)
         .await
@@ -249,19 +249,19 @@ pub(crate) async fn mark_mode_with_backend(
     lifecycle::mark_live_state_mode_with_backend(backend, mode).await
 }
 
-pub(crate) fn read_contract_from_definition(
+pub(crate) fn live_row_shape_from_definition(
     schema_key: &str,
     schema_definition: Option<&JsonValue>,
-) -> Result<LiveReadContract, LixError> {
-    schema_access::read_contract_from_definition(schema_key, schema_definition)
+) -> Result<LiveRowShape, LixError> {
+    schema_access::live_row_shape_from_definition(schema_key, schema_definition)
 }
 
-pub(crate) fn compile_live_read_contract_from_registered_snapshots(
+pub(crate) fn compile_live_row_shape_from_registered_snapshots(
     schema_key: &str,
     rows: Vec<Vec<Value>>,
-) -> Result<LiveReadContract, LixError> {
+) -> Result<LiveRowShape, LixError> {
     let layout = storage::compile_registered_live_layout(schema_key, rows)?;
-    Ok(schema_access::live_read_contract_from_layout(layout))
+    Ok(schema_access::live_row_shape_from_layout(layout))
 }
 
 pub(crate) fn payload_column_name_for_schema(
@@ -269,7 +269,7 @@ pub(crate) fn payload_column_name_for_schema(
     schema_definition: Option<&JsonValue>,
     property_name: &str,
 ) -> Result<String, LixError> {
-    read_contract_from_definition(schema_key, schema_definition)?
+    live_row_shape_from_definition(schema_key, schema_definition)?
         .payload_column_name(property_name)
         .map(ToOwned::to_owned)
         .ok_or_else(|| {
@@ -289,7 +289,7 @@ pub(crate) fn normalized_projection_sql_for_schema(
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
     Ok(
-        read_contract_from_definition(schema_key, schema_definition)?
+        live_row_shape_from_definition(schema_key, schema_definition)?
             .normalized_projection_sql(table_alias),
     )
 }
@@ -301,7 +301,7 @@ pub(crate) fn snapshot_select_expr_for_schema(
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
     Ok(
-        read_contract_from_definition(schema_key, schema_definition)?
+        live_row_shape_from_definition(schema_key, schema_definition)?
             .snapshot_select_expr(dialect, table_alias),
     )
 }

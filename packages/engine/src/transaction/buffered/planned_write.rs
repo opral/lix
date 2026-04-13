@@ -2,16 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
-    FilesystemRelationKind, SurfaceBinding,
+    FilesystemRelationKind, ResolvedSurface,
 };
 use crate::contracts::PreparedWriteRuntimeState;
 use crate::contracts::{
     coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
     IdempotencyKey, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
-    PreparedInternalWriteArtifact, PreparedPublicWriteArtifact,
-    PreparedPublicWriteExecutionArtifact, PreparedPublicWriteExecutionPartition,
-    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteStep,
-    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
+    PreparedDirectWriteArtifact, PreparedPublicWrite, PreparedPublicWriteExecutionPartition,
+    PreparedPublicWritePlanArtifact, PreparedTrackedWriteExecution,
+    PreparedUntrackedWriteExecution, PreparedWriteStatement, ResultContract, RowIdentity,
+    SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
 };
 use crate::contracts::{PendingSemanticRow, PendingSemanticStorage};
 use crate::transaction::filesystem::runtime::{
@@ -19,7 +19,7 @@ use crate::transaction::filesystem::runtime::{
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
 use crate::transaction::filesystem::state::filesystem_transaction_state_from_planned;
-use crate::transaction::PendingWriteView;
+use crate::transaction::PendingWriteOverlayView;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -27,8 +27,8 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Clone)]
 pub(crate) struct TrackedTxnUnit {
-    pub(crate) public_writes: Vec<PreparedPublicWriteArtifact>,
-    pub(crate) public_write: PreparedPublicWriteArtifact,
+    pub(crate) public_writes: Vec<PreparedPublicWrite>,
+    pub(crate) public_write: PreparedPublicWrite,
     pub(crate) execution: PreparedTrackedWriteExecution,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) runtime_state: PreparedWriteRuntimeState,
@@ -55,7 +55,7 @@ impl TrackedTxnUnit {
 }
 
 fn build_tracked_txn_unit(
-    public_write: &PreparedPublicWriteArtifact,
+    public_write: &PreparedPublicWrite,
     execution: &PreparedTrackedWriteExecution,
     filesystem_state: &FilesystemTransactionState,
     runtime_state: &PreparedWriteRuntimeState,
@@ -79,8 +79,8 @@ pub(crate) struct PlannedPublicUntrackedWriteUnit {
 }
 
 #[derive(Clone)]
-pub(crate) struct PlannedInternalWriteUnit {
-    pub(crate) execution: PreparedInternalWriteArtifact,
+pub(crate) struct PlannedDirectWriteUnit {
+    pub(crate) execution: PreparedDirectWriteArtifact,
     pub(crate) result_contract: ResultContract,
     pub(crate) runtime_state: PreparedWriteRuntimeState,
 }
@@ -89,7 +89,7 @@ pub(crate) struct PlannedInternalWriteUnit {
 pub(crate) enum TransactionWriteUnit {
     PublicTracked(TrackedTxnUnit),
     PublicUntracked(PlannedPublicUntrackedWriteUnit),
-    Internal(PlannedInternalWriteUnit),
+    Direct(PlannedDirectWriteUnit),
 }
 
 #[derive(Clone, Default)]
@@ -183,8 +183,8 @@ impl TransactionWriteDelta {
         self.writer_key_overlay.clone()
     }
 
-    pub(crate) fn pending_write_view(&self) -> Option<PendingWriteView> {
-        PendingWriteView::new(
+    pub(crate) fn pending_write_overlay_view(&self) -> Option<PendingWriteOverlayView> {
+        PendingWriteOverlayView::new(
             self.registered_schema_overlay(),
             self.semantic_overlay(),
             self.filesystem_overlay(),
@@ -292,11 +292,13 @@ impl BufferedWriteJournal {
         Some(delta)
     }
 
-    pub(crate) fn pending_write_view(&self) -> Result<Option<PendingWriteView>, LixError> {
+    pub(crate) fn pending_write_overlay_view(
+        &self,
+    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
         Ok(self
             .staged_delta
             .as_ref()
-            .and_then(TransactionWriteDelta::pending_write_view))
+            .and_then(TransactionWriteDelta::pending_write_overlay_view))
     }
 
     fn current_materialization_plan(&self) -> Option<&PlannedWritePlan> {
@@ -417,7 +419,7 @@ impl PendingSemanticOverlay {
 }
 
 pub(crate) fn build_planned_write_plan(
-    prepared: &PreparedWriteStep,
+    prepared: &PreparedWriteStatement,
     runtime_state: &PreparedWriteRuntimeState,
 ) -> Option<PlannedWritePlan> {
     let mut units = Vec::new();
@@ -431,7 +433,7 @@ pub(crate) fn build_planned_write_plan(
                 .map(|resolved| resolved.filesystem_state())
                 .unwrap_or_default(),
         );
-        if let PreparedPublicWriteExecutionArtifact::Materialize(materialization) =
+        if let PreparedPublicWritePlanArtifact::Materialize(materialization) =
             &public_write.execution
         {
             for partition in &materialization.partitions {
@@ -479,12 +481,12 @@ pub(crate) fn build_planned_write_plan(
                 )));
             }
         }
-    } else if let Some(internal_execution) = prepared.internal_write() {
-        if internal_execution.read_only_query {
+    } else if let Some(direct_execution) = prepared.direct_write() {
+        if direct_execution.read_only_query {
             return None;
         }
-        units.push(TransactionWriteUnit::Internal(PlannedInternalWriteUnit {
-            execution: internal_execution.clone(),
+        units.push(TransactionWriteUnit::Direct(PlannedDirectWriteUnit {
+            execution: direct_execution.clone(),
             result_contract: prepared.result_contract,
             runtime_state: runtime_state.clone(),
         }));
@@ -500,7 +502,7 @@ pub(crate) fn build_planned_write_plan(
 }
 
 pub(crate) fn build_transaction_write_delta(
-    prepared: &PreparedWriteStep,
+    prepared: &PreparedWriteStatement,
     runtime_state: &PreparedWriteRuntimeState,
 ) -> Result<Option<TransactionWriteDelta>, LixError> {
     build_planned_write_plan(prepared, runtime_state)
@@ -508,9 +510,7 @@ pub(crate) fn build_transaction_write_delta(
         .transpose()
 }
 
-fn writer_key_only_commit_preconditions(
-    public_write: &PreparedPublicWriteArtifact,
-) -> CommitPreconditions {
+fn writer_key_only_commit_preconditions(public_write: &PreparedPublicWrite) -> CommitPreconditions {
     let write_lane = public_write
         .contract
         .requested_version_id
@@ -548,7 +548,7 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                     registrations.insert(row.schema_key.clone());
                 }
             }
-            TransactionWriteUnit::Internal(internal) => {
+            TransactionWriteUnit::Direct(internal) => {
                 for requirement in
                     coalesce_live_table_requirements(&internal.execution.live_table_requirements)
                 {
@@ -663,7 +663,7 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                     );
                 }
             }
-            TransactionWriteUnit::Internal(_) => {}
+            TransactionWriteUnit::Direct(_) => {}
         }
     }
     (!overlay.annotations.is_empty()).then_some(overlay)
@@ -675,7 +675,7 @@ pub(crate) fn planned_write_plan_is_independent_filesystem(plan: &PlannedWritePl
             TransactionWriteUnit::PublicTracked(tracked) => {
                 tracked_plan_is_coalescible_filesystem(tracked)
             }
-            TransactionWriteUnit::PublicUntracked(_) | TransactionWriteUnit::Internal(_) => false,
+            TransactionWriteUnit::PublicUntracked(_) | TransactionWriteUnit::Direct(_) => false,
         })
 }
 
@@ -754,7 +754,7 @@ fn collect_semantic_overlay_from_planned_write_plan(
                         overlay,
                     )?
             }
-            TransactionWriteUnit::Internal(internal) => {
+            TransactionWriteUnit::Direct(internal) => {
                 internal.execution.filesystem_state.files.is_empty()
                     && collect_semantic_overlay_from_mutation_rows(
                         &internal.execution.mutations,
@@ -786,7 +786,7 @@ fn collect_filesystem_overlay_from_planned_write_plan(
             TransactionWriteUnit::PublicTracked(tracked) => {
                 collect_filesystem_overlay_from_tracked_plan(tracked, overlay, &mut saw_entry)
             }
-            TransactionWriteUnit::PublicUntracked(_) | TransactionWriteUnit::Internal(_) => false,
+            TransactionWriteUnit::PublicUntracked(_) | TransactionWriteUnit::Direct(_) => false,
         };
         if !unit_supported {
             return false;
@@ -899,7 +899,7 @@ fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
 }
 
 fn collect_semantic_overlay_from_public_write(
-    public_write: &PreparedPublicWriteArtifact,
+    public_write: &PreparedPublicWrite,
     overlay: &mut PendingSemanticOverlay,
 ) -> Result<bool, LixError> {
     let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
@@ -1093,7 +1093,7 @@ fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
     is_catalog_filesystem_file_surface(&plan.public_write.contract.target)
 }
 
-fn is_catalog_filesystem_file_surface(target: &SurfaceBinding) -> bool {
+fn is_catalog_filesystem_file_surface(target: &ResolvedSurface) -> bool {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(target)
         .ok()

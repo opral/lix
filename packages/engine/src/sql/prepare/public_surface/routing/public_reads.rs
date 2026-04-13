@@ -1,8 +1,8 @@
 use crate::catalog::{
-    builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceBinding, SurfaceFamily,
+    builtin_catalog_compiler_facade, CatalogCompilerApi, ResolvedSurface, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant,
 };
-use crate::contracts::ReadTimeProjectionRead;
+use crate::contracts::ReadTimeProjectionPlan;
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::logical_plan::public_ir::{
@@ -90,15 +90,15 @@ fn apply_broad_routing_delay_for_test() {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PublicReadExecutionStrategy {
-    DirectHistory,
-    DerivedRowset(ReadTimeProjectionRead),
-    GeneralProgram,
+pub(crate) enum PublicReadPlanKind {
+    HistoryRead,
+    ReadTimeProjection(ReadTimeProjectionPlan),
+    PreparedBatch,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PublicReadExecutionStrategySelection {
-    pub(crate) strategy: PublicReadExecutionStrategy,
+pub(crate) struct PublicReadPlanChoice {
+    pub(crate) kind: PublicReadPlanKind,
     pub(crate) pass_traces: Vec<RoutingPassTrace>,
 }
 
@@ -108,10 +108,11 @@ pub(crate) struct RoutedBroadPublicRead {
     pub(crate) pass_traces: Vec<RoutingPassTrace>,
 }
 
-const EXECUTION_STRATEGY_ROUTE_PASS: RoutingPassMetadata = RoutingPassMetadata {
-    name: "public-read.route-execution-strategy",
+const PLAN_KIND_CLASSIFICATION_PASS: RoutingPassMetadata = RoutingPassMetadata {
+    name: "public-read.classify-plan-kind",
     order: 10,
-    description: "route structured public reads into direct-history or lowered-sql execution",
+    description:
+        "classify structured public reads as history-read, read-time-projection, or prepared-batch plans",
 };
 
 const LOWERABLE_BROAD_RELATION_ROUTE_PASS: RoutingPassMetadata = RoutingPassMetadata {
@@ -123,7 +124,7 @@ const LOWERABLE_BROAD_RELATION_ROUTE_PASS: RoutingPassMetadata = RoutingPassMeta
 const PUBLIC_READ_REGISTRY: RoutingPassRegistry = RoutingPassRegistry {
     name: "public-read",
     passes: &[
-        EXECUTION_STRATEGY_ROUTE_PASS,
+        PLAN_KIND_CLASSIFICATION_PASS,
         LOWERABLE_BROAD_RELATION_ROUTE_PASS,
     ],
 };
@@ -132,27 +133,24 @@ pub(crate) fn public_read_routing_pass_registry() -> &'static RoutingPassRegistr
     &PUBLIC_READ_REGISTRY
 }
 
-pub(crate) fn route_public_read_execution_strategy(
+pub(crate) fn classify_public_read_plan_kind(
     surface_read_plan: &SurfaceReadPlan,
-) -> PublicReadExecutionStrategySelection {
-    route_public_read_execution_strategy_with_settings(
-        surface_read_plan,
-        &RoutingPassSettings::default(),
-    )
+) -> PublicReadPlanChoice {
+    classify_public_read_plan_kind_with_settings(surface_read_plan, &RoutingPassSettings::default())
 }
 
-fn route_public_read_execution_strategy_with_settings(
+fn classify_public_read_plan_kind_with_settings(
     surface_read_plan: &SurfaceReadPlan,
     settings: &RoutingPassSettings,
-) -> PublicReadExecutionStrategySelection {
+) -> PublicReadPlanChoice {
     let metadata = public_read_routing_pass_registry().passes[0];
     let binding = &surface_read_plan.structured_read().surface_binding;
-    let strategy = if is_direct_only_history_surface(binding) {
-        PublicReadExecutionStrategy::DirectHistory
+    let kind = if is_direct_only_history_surface(binding) {
+        PublicReadPlanKind::HistoryRead
     } else if let Some(rowset_read) = try_compile_read_time_projection_read(surface_read_plan) {
-        PublicReadExecutionStrategy::DerivedRowset(rowset_read)
+        PublicReadPlanKind::ReadTimeProjection(rowset_read)
     } else {
-        PublicReadExecutionStrategy::GeneralProgram
+        PublicReadPlanKind::PreparedBatch
     };
     let trace = run_infallible_pass(metadata, settings, || {
         let mut diagnostics = vec![format!(
@@ -161,24 +159,20 @@ fn route_public_read_execution_strategy_with_settings(
             surface_family_name(binding.descriptor.surface_family),
             surface_variant_name(binding.descriptor.surface_variant)
         )];
-        diagnostics.push(match &strategy {
-            PublicReadExecutionStrategy::DirectHistory => {
-                "direct history execution strategy selected".to_string()
+        diagnostics.push(match &kind {
+            PublicReadPlanKind::HistoryRead => "history read plan kind selected".to_string(),
+            PublicReadPlanKind::ReadTimeProjection(_) => {
+                "read-time projection plan kind selected".to_string()
             }
-            PublicReadExecutionStrategy::DerivedRowset(_) => {
-                "derived rowset execution strategy selected".to_string()
-            }
-            PublicReadExecutionStrategy::GeneralProgram => {
-                "general lowered program execution strategy selected".to_string()
-            }
+            PublicReadPlanKind::PreparedBatch => "prepared batch plan kind selected".to_string(),
         });
         RoutingPassOutcome {
-            changed: !matches!(strategy, PublicReadExecutionStrategy::GeneralProgram),
+            changed: !matches!(kind, PublicReadPlanKind::PreparedBatch),
             diagnostics,
         }
     });
-    PublicReadExecutionStrategySelection {
-        strategy,
+    PublicReadPlanChoice {
+        kind,
         pass_traces: vec![trace],
     }
 }
@@ -2263,17 +2257,17 @@ fn collect_relation_names_in_sql_function_arg_expr<F>(
     }
 }
 
-fn is_direct_only_history_surface(binding: &SurfaceBinding) -> bool {
+fn is_direct_only_history_surface(binding: &ResolvedSurface) -> bool {
     builtin_catalog_compiler_facade()
-        .direct_read_semantics(binding)
+        .history_read_semantics(binding)
         .is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        public_read_routing_pass_registry, route_broad_public_read_statement,
-        route_public_read_execution_strategy, PublicReadExecutionStrategy,
+        classify_public_read_plan_kind, public_read_routing_pass_registry,
+        route_broad_public_read_statement, PublicReadPlanKind,
     };
     use crate::sql::logical_plan::public_ir::{
         BroadPublicReadProjectionItemKind, BroadPublicReadRelation, BroadPublicReadSetExpr,
@@ -2282,7 +2276,7 @@ mod tests {
     use crate::sql::logical_plan::{
         public_ir::{
             CanonicalAdminScan, CanonicalFilesystemScan, CanonicalStateScan,
-            NormalizedPublicReadQuery, ReadCommand, ReadContract, ReadPlan, StructuredPublicRead,
+            NormalizedPublicReadQuery, ReadCommand, ReadPlan, ReadVisibility, StructuredPublicRead,
         },
         SurfaceReadPlan,
     };
@@ -2293,11 +2287,11 @@ mod tests {
         let binding = crate::catalog::build_builtin_surface_registry()
             .bind_relation_name(surface_name)
             .expect("builtin surface should bind");
-        let root = if let Some(scan) = CanonicalStateScan::from_surface_binding(binding.clone()) {
+        let root = if let Some(scan) = CanonicalStateScan::from_resolved_surface(binding.clone()) {
             ReadPlan::scan(scan)
-        } else if let Some(scan) = CanonicalAdminScan::from_surface_binding(binding.clone()) {
+        } else if let Some(scan) = CanonicalAdminScan::from_resolved_surface(binding.clone()) {
             ReadPlan::admin_scan(scan)
-        } else if let Some(scan) = CanonicalFilesystemScan::from_surface_binding(binding.clone()) {
+        } else if let Some(scan) = CanonicalFilesystemScan::from_resolved_surface(binding.clone()) {
             ReadPlan::filesystem_scan(scan)
         } else {
             panic!("test helper only supports state/admin/filesystem surfaces");
@@ -2310,7 +2304,7 @@ mod tests {
                 surface_binding: binding,
                 read_command: ReadCommand {
                     root,
-                    contract: ReadContract::CommittedAtStart,
+                    contract: ReadVisibility::CommittedAtStart,
                     requested_commit_mapping: None,
                 },
                 query: NormalizedPublicReadQuery {
@@ -2341,7 +2335,7 @@ mod tests {
                 .map(|pass| pass.name)
                 .collect::<Vec<_>>(),
             vec![
-                "public-read.route-execution-strategy",
+                "public-read.classify-plan-kind",
                 "public-read.route-lowerable-relations"
             ]
         );
@@ -2468,78 +2462,69 @@ mod tests {
     }
 
     #[test]
-    fn direct_history_strategy_records_trace() {
+    fn history_read_plan_kind_records_trace() {
         let plan = surface_read_plan_for(
             "lix_state_history",
             vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
                 "entity_id",
             )))],
         );
-        let decision = route_public_read_execution_strategy(&plan);
+        let decision = classify_public_read_plan_kind(&plan);
 
-        assert!(matches!(
-            decision.strategy,
-            PublicReadExecutionStrategy::DirectHistory
-        ));
+        assert!(matches!(decision.kind, PublicReadPlanKind::HistoryRead));
         assert_eq!(decision.pass_traces.len(), 1);
         assert_eq!(
             decision.pass_traces[0].name,
-            "public-read.route-execution-strategy"
+            "public-read.classify-plan-kind"
         );
         assert!(decision.pass_traces[0].changed);
     }
 
     #[test]
-    fn derived_rowset_strategy_records_trace() {
+    fn read_time_projection_plan_kind_records_trace() {
         let plan = surface_read_plan_for(
             "lix_version",
             vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("id")))],
         );
-        let decision = route_public_read_execution_strategy(&plan);
+        let decision = classify_public_read_plan_kind(&plan);
 
         assert!(matches!(
-            decision.strategy,
-            PublicReadExecutionStrategy::DerivedRowset(_)
+            decision.kind,
+            PublicReadPlanKind::ReadTimeProjection(_)
         ));
         assert_eq!(
             decision.pass_traces[0].name,
-            "public-read.route-execution-strategy"
+            "public-read.classify-plan-kind"
         );
         assert!(decision.pass_traces[0].changed);
     }
 
     #[test]
-    fn general_program_strategy_records_trace() {
+    fn prepared_batch_plan_kind_records_trace() {
         let plan = surface_read_plan_for(
             "lix_version",
             vec![SelectItem::Wildcard(Default::default())],
         );
-        let decision = route_public_read_execution_strategy(&plan);
+        let decision = classify_public_read_plan_kind(&plan);
 
-        assert!(matches!(
-            decision.strategy,
-            PublicReadExecutionStrategy::GeneralProgram
-        ));
+        assert!(matches!(decision.kind, PublicReadPlanKind::PreparedBatch));
         assert_eq!(
             decision.pass_traces[0].name,
-            "public-read.route-execution-strategy"
+            "public-read.classify-plan-kind"
         );
         assert!(!decision.pass_traces[0].changed);
     }
 
     #[test]
-    fn non_declared_surface_does_not_route_to_derived_rowset() {
+    fn non_declared_surface_does_not_route_to_read_time_projection() {
         let plan = surface_read_plan_for(
             "lix_state",
             vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
                 "entity_id",
             )))],
         );
-        let decision = route_public_read_execution_strategy(&plan);
+        let decision = classify_public_read_plan_kind(&plan);
 
-        assert!(matches!(
-            decision.strategy,
-            PublicReadExecutionStrategy::GeneralProgram
-        ));
+        assert!(matches!(decision.kind, PublicReadPlanKind::PreparedBatch));
     }
 }

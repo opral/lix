@@ -2,7 +2,7 @@ use super::*;
 use crate::contracts::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
-use crate::contracts::{PendingSemanticStorage, PendingView};
+use crate::contracts::{PendingOverlayView, PendingSemanticStorage};
 use crate::live_state::{decode_registered_schema_row, scan_live_rows, LiveRowQuery, RowReadMode};
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
@@ -30,7 +30,7 @@ const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
 
 async fn load_latest_registered_schema(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     schema_key: &str,
 ) -> Result<Option<JsonValue>, crate::LixError> {
     let mut latest = None::<(SchemaKey, JsonValue)>;
@@ -59,8 +59,8 @@ async fn load_latest_registered_schema(
         }
     }
 
-    if let Some(pending_view) = pending_view {
-        for (_, snapshot_content) in pending_view.visible_registered_schema_entries() {
+    if let Some(pending_overlay_view) = pending_overlay_view {
+        for (_, snapshot_content) in pending_overlay_view.visible_registered_schema_entries() {
             let Some(snapshot_content) = snapshot_content else {
                 continue;
             };
@@ -75,7 +75,7 @@ async fn load_latest_registered_schema(
             PendingSemanticStorage::Tracked,
             PendingSemanticStorage::Untracked,
         ] {
-            for row in pending_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+            for row in pending_overlay_view.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
                 let Some(snapshot_content) = row.snapshot_content else {
                     continue;
                 };
@@ -232,7 +232,7 @@ fn authoritative_pre_state_row_for_effective_row(
 pub(super) async fn resolve_state_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -241,7 +241,7 @@ where
 {
     let state_schema = load_optional_annotation_schema(
         hydrator.backend(),
-        pending_view,
+        pending_overlay_view,
         planned_write,
         functions.clone(),
     )
@@ -260,7 +260,7 @@ where
 pub(super) async fn resolve_entity_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
 ) -> Result<ResolvedWritePlan, WriteResolveError>
@@ -269,7 +269,7 @@ where
 {
     let entity_schema = load_entity_schema(
         hydrator.backend(),
-        pending_view,
+        pending_overlay_view,
         planned_write,
         functions.clone(),
     )
@@ -347,7 +347,7 @@ impl StateBackedSurface<'_> {
                 )
                 .map_err(write_resolve_state_assignments_error)?;
                 for row in &mut rows {
-                    row.writer_key = planned_write.command.execution_context.writer_key.clone();
+                    row.writer_key = planned_write.command.statement_context.writer_key.clone();
                 }
                 Ok(rows)
             }
@@ -388,7 +388,7 @@ impl StateBackedSurface<'_> {
                         assignments,
                         planned_write
                             .command
-                            .execution_context
+                            .statement_context
                             .writer_key
                             .as_deref(),
                         self.update_context(),
@@ -406,7 +406,7 @@ impl StateBackedSurface<'_> {
             .map(|values| {
                 (
                     values,
-                    planned_write.command.execution_context.writer_key.clone(),
+                    planned_write.command.statement_context.writer_key.clone(),
                 )
             })
             .map_err(write_resolve_state_assignments_error),
@@ -700,7 +700,7 @@ fn resolve_state_backed_existing_write_from_rows(
                     schema_key: current_row.schema_key.clone(),
                     version_id: Some(target_version_id),
                     values: state_values_without_writer_key(&current_row.values),
-                    writer_key: planned_write.command.execution_context.writer_key.clone(),
+                    writer_key: planned_write.command.statement_context.writer_key.clone(),
                     tombstone: true,
                 });
                 partition.tombstones.push(row_ref.clone());
@@ -757,7 +757,7 @@ where
             &mut payload,
             planned_write
                 .command
-                .execution_context
+                .statement_context
                 .writer_key
                 .as_deref(),
             "public state insert resolver",
@@ -1048,7 +1048,7 @@ fn selector_row_version_id(
 
 async fn load_optional_annotation_schema<P>(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
 ) -> Result<Option<LoadedAnnotationSchema>, crate::LixError>
@@ -1059,7 +1059,7 @@ where
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        match load_latest_registered_schema(backend, pending_view, &schema_key).await? {
+        match load_latest_registered_schema(backend, pending_overlay_view, &schema_key).await? {
             Some(schema) => schema,
             None => {
                 return Ok(None);
@@ -1071,7 +1071,7 @@ where
 
 async fn load_entity_schema<P>(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
 ) -> Result<EntityWriteSchema, crate::LixError>
@@ -1082,7 +1082,7 @@ where
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        load_latest_registered_schema(backend, pending_view, &schema_key)
+        load_latest_registered_schema(backend, pending_overlay_view, &schema_key)
             .await?
             .ok_or_else(|| {
                 crate::LixError::new(

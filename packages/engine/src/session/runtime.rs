@@ -5,88 +5,22 @@ use async_trait::async_trait;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
 use crate::contracts::{
-    clone_boxed_function_provider, DynFunctionProvider, ExecutionRuntimeState,
+    clone_boxed_function_provider, DynFunctionProvider, FunctionRuntimeState,
     SharedFunctionProvider,
 };
 use crate::image::ImageChunkWriter;
 use crate::session::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::sql::SqlPreparationSeed;
+use crate::session::host::{SessionHost, WriteExecutionServices};
+use crate::sql::SqlCompilerSeed;
 use crate::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
-use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode};
+use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode};
 
-#[async_trait(?Send)]
-pub(crate) trait SessionServices: Send + Sync {
-    async fn ensure_initialized(&self) -> Result<(), LixError>;
-
-    fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync>;
-
-    fn access_to_internal(&self) -> bool;
-
-    async fn begin_write_unit(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
-
-    async fn begin_read_unit(
-        &self,
-        mode: TransactionMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
-
-    fn public_surface_registry(&self) -> SurfaceRegistry;
-
-    fn install_public_surface_registry(&self, registry: SurfaceRegistry);
-
-    async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError>;
-
-    async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError>;
-
-    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
-
-    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
-
-    async fn prepare_runtime_functions_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<
-        (
-            DeterministicSettings,
-            SharedFunctionProvider<RuntimeFunctionProvider>,
-        ),
-        LixError,
-    >;
-
-    fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream;
-
-    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>);
-
-    fn invalidate_deterministic_settings_cache(&self);
-
-    fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError>;
+pub(crate) struct SessionRuntime {
+    services: Arc<dyn SessionHost>,
 }
 
-#[async_trait(?Send)]
-pub(crate) trait WriteExecutionCollaborators:
-    crate::transaction::WriteExecutionBindings
-{
-    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
-
-    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache;
-
-    fn sql_preparation_seed<'a>(
-        &'a self,
-        functions: &'a DynFunctionProvider,
-        surface_registry: &'a SurfaceRegistry,
-    ) -> SqlPreparationSeed<'a>;
-
-    async fn prepare_execution_runtime_state(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<ExecutionRuntimeState, LixError>;
-}
-
-pub(crate) struct SessionCollaborators {
-    services: Arc<dyn SessionServices>,
-}
-
-impl SessionCollaborators {
-    pub(crate) fn new(services: Arc<dyn SessionServices>) -> Arc<Self> {
+impl SessionRuntime {
+    pub(crate) fn new(services: Arc<dyn SessionHost>) -> Arc<Self> {
         Arc::new(Self { services })
     }
 
@@ -110,7 +44,7 @@ impl SessionCollaborators {
 
     pub(crate) async fn begin_read_unit(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.services.begin_read_unit(mode).await
     }
@@ -142,24 +76,24 @@ impl SessionCollaborators {
         self.services.compiled_schema_cache()
     }
 
-    pub(crate) fn sql_preparation_seed<'a>(
+    pub(crate) fn sql_compiler_seed<'a>(
         &'a self,
         functions: &'a DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
-    ) -> SqlPreparationSeed<'a> {
-        SqlPreparationSeed {
+    ) -> SqlCompilerSeed<'a> {
+        SqlCompilerSeed {
             dialect: self.backend().dialect(),
             functions: clone_boxed_function_provider(functions),
             surface_registry,
         }
     }
 
-    pub(crate) async fn prepare_execution_runtime_state(
+    pub(crate) async fn prepare_function_runtime_state(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<ExecutionRuntimeState, LixError> {
+    ) -> Result<FunctionRuntimeState, LixError> {
         let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(ExecutionRuntimeState::from_prepared_parts(
+        Ok(FunctionRuntimeState::from_prepared_parts(
             settings.enabled,
             &functions,
         ))
@@ -238,27 +172,27 @@ impl SessionCollaborators {
 }
 
 #[async_trait(?Send)]
-impl WriteExecutionCollaborators for SessionCollaborators {
+impl WriteExecutionServices for SessionRuntime {
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
-        SessionCollaborators::catalog_projection_registry(self)
+        SessionRuntime::catalog_projection_registry(self)
     }
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
-        SessionCollaborators::compiled_schema_cache(self)
+        SessionRuntime::compiled_schema_cache(self)
     }
 
-    fn sql_preparation_seed<'a>(
+    fn sql_compiler_seed<'a>(
         &'a self,
         functions: &'a DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
-    ) -> SqlPreparationSeed<'a> {
-        SessionCollaborators::sql_preparation_seed(self, functions, surface_registry)
+    ) -> SqlCompilerSeed<'a> {
+        SessionRuntime::sql_compiler_seed(self, functions, surface_registry)
     }
 
-    async fn prepare_execution_runtime_state(
+    async fn prepare_function_runtime_state(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<ExecutionRuntimeState, LixError> {
-        SessionCollaborators::prepare_execution_runtime_state(self, backend).await
+    ) -> Result<FunctionRuntimeState, LixError> {
+        SessionRuntime::prepare_function_runtime_state(self, backend).await
     }
 }

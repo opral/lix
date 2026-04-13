@@ -1,9 +1,9 @@
 use async_trait::async_trait;
 
-use crate::contracts::PendingView;
+use crate::contracts::PendingOverlayView;
 use crate::contracts::TrackedCommitExecutionOutcome;
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
-use crate::contracts::{PendingPublicCommitSession, PreparedPublicReadArtifact};
+use crate::contracts::{PendingCommitState, PreparedPublicRead};
 #[cfg(test)]
 use crate::contracts::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
@@ -112,12 +112,12 @@ impl CommitOutcome {
 }
 
 #[async_trait(?Send)]
-pub(crate) trait WriteExecutionBindings {
-    async fn execute_prepared_public_read_with_pending_view(
+pub(crate) trait WriteExecutionHost {
+    async fn execute_prepared_public_read_with_pending_overlay_view(
         &self,
         transaction: &mut dyn LixBackendTransaction,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &PreparedPublicReadArtifact,
+        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError>;
 
     async fn persist_binary_blob_writes_in_transaction(
@@ -141,12 +141,12 @@ pub(crate) trait WriteExecutionBindings {
         &self,
         transaction: &mut dyn LixBackendTransaction,
         unit: &TrackedTxnUnit,
-        pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
+        pending_commit_state: Option<&mut Option<PendingCommitState>>,
     ) -> Result<TrackedCommitExecutionOutcome, LixError>;
 }
 
 #[derive(Default)]
-pub(crate) struct DeferredTransactionSideEffects {
+pub(crate) struct DeferredCommitEffects {
     pub(crate) filesystem_state:
         crate::transaction::filesystem::runtime::FilesystemTransactionState,
 }

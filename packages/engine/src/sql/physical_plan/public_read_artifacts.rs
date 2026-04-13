@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::catalog::SurfaceFamily;
-use crate::contracts::ReadTimeProjectionRead;
+use crate::contracts::ReadTimeProjectionPlan;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;
@@ -10,27 +10,27 @@ use crate::sql::logical_plan::SurfaceReadPlan;
 use crate::{LixError, SqlDialect};
 
 use super::lowerer::lower_read_for_execution_with_layouts;
-use super::plan::PreparedPublicReadExecution;
+use super::plan::PublicReadPhysicalPlan;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CompilerOwnedPublicReadExecutionSelection {
-    pub(crate) execution: PreparedPublicReadExecution,
+    pub(crate) execution: PublicReadPhysicalPlan,
     pub(crate) pushdown_decision: PushdownDecision,
 }
 
-pub(crate) fn compile_derived_rowset_execution(
+pub(crate) fn compile_read_time_projection_execution(
     surface_read_plan: &SurfaceReadPlan,
-    rowset_read: ReadTimeProjectionRead,
+    projection_read: ReadTimeProjectionPlan,
 ) -> CompilerOwnedPublicReadExecutionSelection {
     CompilerOwnedPublicReadExecutionSelection {
-        execution: PreparedPublicReadExecution::ReadTimeProjection(rowset_read),
+        execution: PublicReadPhysicalPlan::ReadTimeProjection(projection_read),
         pushdown_decision: read_time_projection_pushdown_decision(
             surface_read_plan.structured_read(),
         ),
     }
 }
 
-pub(crate) fn compile_general_public_read_execution(
+pub(crate) fn compile_prepared_batch_public_read_execution(
     dialect: SqlDialect,
     surface_read_plan: &SurfaceReadPlan,
     known_live_schema_definitions: &BTreeMap<String, serde_json::Value>,
@@ -42,7 +42,7 @@ pub(crate) fn compile_general_public_read_execution(
         ExplainStage::CapabilityResolution,
         capability_started.elapsed(),
     );
-    let Some(lowered_read) = lower_read_for_execution_with_layouts(
+    let Some(lowered_batch) = lower_read_for_execution_with_layouts(
         dialect,
         surface_read_plan.structured_read(),
         surface_read_plan.effective_state_request(),
@@ -53,10 +53,10 @@ pub(crate) fn compile_general_public_read_execution(
     else {
         return Ok(None);
     };
-    let pushdown_decision = lowered_read.pushdown_decision.clone();
+    let pushdown_decision = lowered_batch.pushdown_decision.clone();
 
     Ok(Some(CompilerOwnedPublicReadExecutionSelection {
-        execution: PreparedPublicReadExecution::LoweredSql(lowered_read),
+        execution: PublicReadPhysicalPlan::LoweredSql(lowered_batch),
         pushdown_decision,
     }))
 }

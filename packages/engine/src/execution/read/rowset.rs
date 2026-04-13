@@ -1,9 +1,10 @@
 use crate::contracts::{
-    PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
+    PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection,
+    ReadTimeProjectionPlan,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 
-use super::{ReadExecutionBindings, ReadTimeProjectionRow};
+use super::{ReadExecutionHost, ReadTimeProjectionRow};
 
 /// Bounded rowset execution over engine-supplied `ReadTime` projection rows.
 ///
@@ -11,10 +12,10 @@ use super::{ReadExecutionBindings, ReadTimeProjectionRow};
 /// projection, filter, order, limit, and `COUNT(*)`.
 pub(crate) async fn execute_read_time_projection_read(
     backend: &dyn LixBackend,
-    bindings: &dyn ReadExecutionBindings,
-    artifact: &ReadTimeProjectionRead,
+    host: &dyn ReadExecutionHost,
+    artifact: &ReadTimeProjectionPlan,
 ) -> Result<QueryResult, LixError> {
-    let rows = bindings
+    let rows = host
         .derive_read_time_projection_rows(backend, artifact)
         .await?;
     execute_read_time_projection_rows(rows, artifact)
@@ -22,7 +23,7 @@ pub(crate) async fn execute_read_time_projection_read(
 
 fn execute_read_time_projection_rows(
     rows: Vec<ReadTimeProjectionRow>,
-    artifact: &ReadTimeProjectionRead,
+    artifact: &ReadTimeProjectionPlan,
 ) -> Result<QueryResult, LixError> {
     let mut rows = rows
         .into_iter()
@@ -55,7 +56,7 @@ fn execute_read_time_projection_rows(
         .query
         .projections
         .iter()
-        .all(|projection| matches!(projection, PendingViewProjection::CountAll { .. }))
+        .all(|projection| matches!(projection, PendingOverlayProjection::CountAll { .. }))
     {
         return Ok(QueryResult {
             columns,
@@ -84,40 +85,40 @@ fn execute_read_time_projection_rows(
     })
 }
 
-fn read_time_projection_output_column(projection: &PendingViewProjection) -> String {
+fn read_time_projection_output_column(projection: &PendingOverlayProjection) -> String {
     match projection {
-        PendingViewProjection::Column { output_column, .. }
-        | PendingViewProjection::CountAll { output_column } => output_column.clone(),
+        PendingOverlayProjection::Column { output_column, .. }
+        | PendingOverlayProjection::CountAll { output_column } => output_column.clone(),
     }
 }
 
 fn read_time_projection_filter_matches_row(
-    filter: &PendingViewFilter,
+    filter: &PendingOverlayFilter,
     row: &ReadTimeProjectionRow,
 ) -> bool {
     match filter {
-        PendingViewFilter::And(filters) => filters
+        PendingOverlayFilter::And(filters) => filters
             .iter()
             .all(|filter| read_time_projection_filter_matches_row(filter, row)),
-        PendingViewFilter::Or(filters) => filters
+        PendingOverlayFilter::Or(filters) => filters
             .iter()
             .any(|filter| read_time_projection_filter_matches_row(filter, row)),
-        PendingViewFilter::Equals(column, expected) => {
+        PendingOverlayFilter::Equals(column, expected) => {
             read_time_projection_row_value(row, column).is_some_and(|actual| actual == *expected)
         }
-        PendingViewFilter::In(column, expected) => read_time_projection_row_value(row, column)
+        PendingOverlayFilter::In(column, expected) => read_time_projection_row_value(row, column)
             .is_some_and(|actual| expected.iter().any(|candidate| candidate == &actual)),
-        PendingViewFilter::IsNull(column) => {
+        PendingOverlayFilter::IsNull(column) => {
             matches!(
                 read_time_projection_row_value(row, column),
                 Some(Value::Null) | None
             )
         }
-        PendingViewFilter::IsNotNull(column) => !matches!(
+        PendingOverlayFilter::IsNotNull(column) => !matches!(
             read_time_projection_row_value(row, column),
             Some(Value::Null) | None
         ),
-        PendingViewFilter::Like {
+        PendingOverlayFilter::Like {
             column,
             pattern,
             case_insensitive,
@@ -133,10 +134,10 @@ fn read_time_projection_row_value(row: &ReadTimeProjectionRow, column: &str) -> 
 
 fn read_time_projection_value(
     row: &ReadTimeProjectionRow,
-    projection: &PendingViewProjection,
+    projection: &PendingOverlayProjection,
 ) -> Result<Value, LixError> {
     match projection {
-        PendingViewProjection::Column { source_column, .. } => {
+        PendingOverlayProjection::Column { source_column, .. } => {
             read_time_projection_row_value(row, source_column).ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -146,14 +147,14 @@ fn read_time_projection_value(
                 )
             })
         }
-        PendingViewProjection::CountAll { .. } => Ok(Value::Integer(1)),
+        PendingOverlayProjection::CountAll { .. } => Ok(Value::Integer(1)),
     }
 }
 
 fn compare_read_time_projection_rows(
     left: &ReadTimeProjectionRow,
     right: &ReadTimeProjectionRow,
-    order_by: &[PendingViewOrderClause],
+    order_by: &[PendingOverlayOrderClause],
 ) -> std::cmp::Ordering {
     for clause in order_by {
         let ordering = compare_projection_values(
@@ -257,18 +258,18 @@ mod tests {
         version_ref_schema_version, version_ref_snapshot_content,
     };
     use crate::contracts::{
-        PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
-        ReadTimeProjectionReadQuery, RowIdentity,
+        PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection, ProjectionQuery,
+        ReadTimeProjectionPlan, RowIdentity,
     };
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
     use crate::schema::LixCommit;
     use crate::sql::lower_catalog_relation_binding_to_source_sql;
     use crate::test_support::{
-        init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionBindings,
+        init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionHost,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionMode, Value};
+    use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionBeginMode, Value};
 
     #[derive(Debug, Clone)]
     struct VersionCaseDescriptor {
@@ -280,30 +281,30 @@ mod tests {
 
     #[test]
     fn executes_projection_filter_order_and_limit_over_supplied_rows() {
-        let artifact = ReadTimeProjectionRead {
+        let artifact = ReadTimeProjectionPlan {
             surface_name: "lix_version".into(),
             requested_version_id: None,
-            query: ReadTimeProjectionReadQuery {
+            query: ProjectionQuery {
                 projections: vec![
-                    PendingViewProjection::Column {
+                    PendingOverlayProjection::Column {
                         source_column: "id".into(),
                         output_column: "version_id".into(),
                     },
-                    PendingViewProjection::Column {
+                    PendingOverlayProjection::Column {
                         source_column: "commit_id".into(),
                         output_column: "commit_id".into(),
                     },
                 ],
-                filters: vec![PendingViewFilter::And(vec![
-                    PendingViewFilter::Like {
+                filters: vec![PendingOverlayFilter::And(vec![
+                    PendingOverlayFilter::Like {
                         column: "name".into(),
                         pattern: "main%".into(),
                         case_insensitive: false,
                     },
-                    PendingViewFilter::Equals("hidden".into(), Value::Boolean(false)),
-                    PendingViewFilter::IsNotNull("commit_id".into()),
+                    PendingOverlayFilter::Equals("hidden".into(), Value::Boolean(false)),
+                    PendingOverlayFilter::IsNotNull("commit_id".into()),
                 ])],
-                order_by: vec![PendingViewOrderClause {
+                order_by: vec![PendingOverlayOrderClause {
                     column: "id".into(),
                     descending: true,
                 }],
@@ -345,15 +346,15 @@ mod tests {
 
     #[test]
     fn counts_rows_after_filters_in_bounded_rowset_runtime() {
-        let artifact = ReadTimeProjectionRead {
+        let artifact = ReadTimeProjectionPlan {
             surface_name: "lix_version".into(),
             requested_version_id: None,
-            query: ReadTimeProjectionReadQuery {
-                projections: vec![PendingViewProjection::CountAll {
+            query: ProjectionQuery {
+                projections: vec![PendingOverlayProjection::CountAll {
                     output_column: "count".into(),
                 }],
-                filters: vec![PendingViewFilter::IsNotNull("commit_id".into())],
-                order_by: vec![PendingViewOrderClause {
+                filters: vec![PendingOverlayFilter::IsNotNull("commit_id".into())],
+                order_by: vec![PendingOverlayOrderClause {
                     column: "id".into(),
                     descending: false,
                 }],
@@ -403,34 +404,34 @@ mod tests {
         .await
         .expect("version projection case should seed");
 
-        let artifact = ReadTimeProjectionRead {
+        let artifact = ReadTimeProjectionPlan {
             surface_name: "lix_version".into(),
             requested_version_id: None,
-            query: ReadTimeProjectionReadQuery {
+            query: ProjectionQuery {
                 projections: vec![
-                    PendingViewProjection::Column {
+                    PendingOverlayProjection::Column {
                         source_column: "id".into(),
                         output_column: "id".into(),
                     },
-                    PendingViewProjection::Column {
+                    PendingOverlayProjection::Column {
                         source_column: "name".into(),
                         output_column: "name".into(),
                     },
-                    PendingViewProjection::Column {
+                    PendingOverlayProjection::Column {
                         source_column: "hidden".into(),
                         output_column: "hidden".into(),
                     },
-                    PendingViewProjection::Column {
+                    PendingOverlayProjection::Column {
                         source_column: "commit_id".into(),
                         output_column: "commit_id".into(),
                     },
                 ],
-                filters: vec![PendingViewFilter::Like {
+                filters: vec![PendingOverlayFilter::Like {
                     column: "name".into(),
                     pattern: "main%".into(),
                     case_insensitive: false,
                 }],
-                order_by: vec![PendingViewOrderClause {
+                order_by: vec![PendingOverlayOrderClause {
                     column: "id".into(),
                     descending: false,
                 }],
@@ -439,7 +440,7 @@ mod tests {
         };
 
         let actual =
-            execute_read_time_projection_read(&backend, &BuiltinReadExecutionBindings, &artifact)
+            execute_read_time_projection_read(&backend, &BuiltinReadExecutionHost, &artifact)
                 .await
                 .expect("read-time projection query should execute");
         let expected = current_admin_sql_query_result(
@@ -486,21 +487,21 @@ mod tests {
         .await
         .expect("version projection case should seed");
 
-        let artifact = ReadTimeProjectionRead {
+        let artifact = ReadTimeProjectionPlan {
             surface_name: "lix_version".into(),
             requested_version_id: None,
-            query: ReadTimeProjectionReadQuery {
-                projections: vec![PendingViewProjection::CountAll {
+            query: ProjectionQuery {
+                projections: vec![PendingOverlayProjection::CountAll {
                     output_column: "count".into(),
                 }],
-                filters: vec![PendingViewFilter::IsNotNull("commit_id".into())],
+                filters: vec![PendingOverlayFilter::IsNotNull("commit_id".into())],
                 order_by: Vec::new(),
                 limit: None,
             },
         };
 
         let actual =
-            execute_read_time_projection_read(&backend, &BuiltinReadExecutionBindings, &artifact)
+            execute_read_time_projection_read(&backend, &BuiltinReadExecutionHost, &artifact)
                 .await
                 .expect("read-time projection count query should execute");
         let expected = current_admin_sql_query_result(
@@ -613,7 +614,9 @@ mod tests {
         }];
         all_descriptors.extend(descriptors.iter().cloned());
 
-        let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await?;
         for (index, descriptor) in all_descriptors.iter().enumerate() {
             let timestamp = format!("2026-04-01T00:00:0{}Z", index);
             live_state::write_live_rows(

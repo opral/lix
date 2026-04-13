@@ -5,16 +5,11 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::backend::{
-    execute_write_program_with_transaction as execute_backend_write_program_with_transaction,
-    LixBackend, LixBackendTransaction, QueryExecutor,
-};
+use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
 use crate::catalog::{lookup_directory_id_by_path, FilesystemProjectionScope};
 use crate::common::NormalizedDirectoryPath;
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
-use crate::{LixError, QueryResult, SqlDialect, TransactionMode, Value};
-
-pub(crate) use crate::backend::WriteProgram;
+use crate::{LixError, QueryResult, SqlDialect, TransactionBeginMode, Value};
 
 pub(crate) async fn lookup_directory_id_by_path_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
@@ -78,7 +73,7 @@ impl<'a> LixBackend for TransactionExecutionBackend<'a> {
 
     async fn begin_transaction(
         &self,
-        _mode: TransactionMode,
+        _mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -96,13 +91,6 @@ impl<'a> LixBackend for TransactionExecutionBackend<'a> {
             description: "savepoints are not supported via TransactionExecutionBackend".to_string(),
         })
     }
-}
-
-pub(crate) async fn execute_write_program_with_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    program: WriteProgram,
-) -> Result<QueryResult, LixError> {
-    execute_backend_write_program_with_transaction(transaction, program).await
 }
 
 pub(crate) async fn normalize_sql_error_with_transaction_and_relation_names(

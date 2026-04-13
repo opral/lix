@@ -1,4 +1,4 @@
-use crate::catalog::SurfaceBinding;
+use crate::catalog::ResolvedSurface;
 use crate::contracts::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
@@ -64,7 +64,7 @@ pub(crate) enum StateHistoryPredicate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct StateHistoryDirectReadPlan {
+pub(crate) struct StateHistoryReadPlan {
     pub(crate) request: StateHistoryRequest,
     pub(crate) predicates: Vec<StateHistoryPredicate>,
     pub(crate) projections: Vec<StateHistoryProjection>,
@@ -121,8 +121,8 @@ pub(crate) enum EntityHistoryPredicate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct EntityHistoryDirectReadPlan {
-    pub(crate) surface_binding: SurfaceBinding,
+pub(crate) struct EntityHistoryReadPlan {
+    pub(crate) surface_binding: ResolvedSurface,
     pub(crate) request: StateHistoryRequest,
     pub(crate) predicates: Vec<EntityHistoryPredicate>,
     pub(crate) projections: Vec<EntityHistoryProjection>,
@@ -187,7 +187,7 @@ pub(crate) enum FileHistoryAggregate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct FileHistoryDirectReadPlan {
+pub(crate) struct FileHistoryReadPlan {
     pub(crate) request: FileHistoryRequest,
     pub(crate) predicates: Vec<FileHistoryPredicate>,
     pub(crate) projections: Vec<FileHistoryProjection>,
@@ -254,7 +254,7 @@ pub(crate) enum DirectoryHistoryAggregate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DirectoryHistoryDirectReadPlan {
+pub(crate) struct DirectoryHistoryReadPlan {
     pub(crate) request: DirectoryHistoryRequest,
     pub(crate) predicates: Vec<DirectoryHistoryPredicate>,
     pub(crate) projections: Vec<DirectoryHistoryProjection>,
@@ -269,9 +269,9 @@ pub(crate) struct DirectoryHistoryDirectReadPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectPublicReadPlan {
-    StateHistory(StateHistoryDirectReadPlan),
-    EntityHistory(EntityHistoryDirectReadPlan),
-    FileHistory(FileHistoryDirectReadPlan),
-    DirectoryHistory(DirectoryHistoryDirectReadPlan),
+pub(crate) enum HistoryReadPlan {
+    StateHistory(StateHistoryReadPlan),
+    EntityHistory(EntityHistoryReadPlan),
+    FileHistory(FileHistoryReadPlan),
+    DirectoryHistory(DirectoryHistoryReadPlan),
 }

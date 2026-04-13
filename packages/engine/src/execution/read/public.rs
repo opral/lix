@@ -1,59 +1,59 @@
 use crate::catalog::SurfaceReadFreshness;
-use crate::contracts::ReadExecutionBindings;
+use crate::contracts::ReadExecutionHost;
 use crate::contracts::{LiveStateQueryBackend, PendingPublicReadTransaction};
 use crate::contracts::{
-    PreparedPublicReadArtifact, PreparedPublicReadExecutionArtifact, PublicReadResultColumn,
+    PreparedPublicRead, PreparedPublicReadPlanArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
 use crate::diagnostics::sanitize_lowered_public_sql_error_description;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::{direct::execute_direct_public_read_with_backend, execute_read_time_projection_read};
+use super::{direct::execute_history_read_plan_with_backend, execute_read_time_projection_read};
 
 pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    bindings: &dyn ReadExecutionBindings,
-    artifact: &PreparedPublicReadArtifact,
+    host: &dyn ReadExecutionHost,
+    artifact: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     ensure_surface_read_freshness_in_transaction(transaction, artifact).await?;
     let backend = crate::backend::transaction_backend_view(transaction);
     execute_prepared_public_read_artifact_without_freshness_check_with_backend(
-        &backend, bindings, artifact,
+        &backend, host, artifact,
     )
     .await
 }
 
 pub(crate) async fn execute_prepared_public_read_artifact_with_backend(
     backend: &dyn LixBackend,
-    bindings: &dyn ReadExecutionBindings,
-    artifact: &PreparedPublicReadArtifact,
+    host: &dyn ReadExecutionHost,
+    artifact: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     ensure_surface_read_freshness(backend, artifact).await?;
     execute_prepared_public_read_artifact_without_freshness_check_with_backend(
-        backend, bindings, artifact,
+        backend, host, artifact,
     )
     .await
 }
 
 pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_check_with_backend(
     backend: &dyn LixBackend,
-    bindings: &dyn ReadExecutionBindings,
-    artifact: &PreparedPublicReadArtifact,
+    host: &dyn ReadExecutionHost,
+    artifact: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     let result = match &artifact.execution {
-        PreparedPublicReadExecutionArtifact::DerivedRowset(artifact) => {
-            execute_read_time_projection_read(backend, bindings, &artifact.read).await?
+        PreparedPublicReadPlanArtifact::ReadTimeProjection(artifact) => {
+            execute_read_time_projection_read(backend, host, &artifact.read).await?
         }
-        PreparedPublicReadExecutionArtifact::GeneralProgram(execution_artifact) => {
+        PreparedPublicReadPlanArtifact::PreparedBatch(execution_artifact) => {
             execute_prepared_batch_with_backend(backend, &execution_artifact.prepared_batch)
                 .await
                 .map_err(|error| {
                     translate_lowered_public_read_error(error, &artifact.surface_bindings)
                 })?
         }
-        PreparedPublicReadExecutionArtifact::DirectHistory(artifact) => {
-            execute_direct_public_read_with_backend(backend, &artifact.plan).await?
+        PreparedPublicReadPlanArtifact::HistoryRead(artifact) => {
+            execute_history_read_plan_with_backend(backend, &artifact.plan).await?
         }
     };
     Ok(finalize_prepared_public_read_result(result, artifact))
@@ -68,7 +68,7 @@ impl PendingPublicReadTransaction for dyn LixBackendTransaction + '_ {
 
 fn finalize_prepared_public_read_result(
     result: QueryResult,
-    artifact: &PreparedPublicReadArtifact,
+    artifact: &PreparedPublicRead,
 ) -> QueryResult {
     let result =
         decode_public_read_result_columns(result, artifact.contract.result_columns.as_ref());
@@ -154,7 +154,7 @@ fn apply_public_output_columns(
 
 async fn ensure_surface_read_freshness(
     backend: &dyn LixBackend,
-    artifact: &PreparedPublicReadArtifact,
+    artifact: &PreparedPublicRead,
 ) -> Result<(), LixError> {
     if artifact.freshness_contract == SurfaceReadFreshness::AllowsStaleProjection {
         return Ok(());
@@ -176,7 +176,7 @@ async fn ensure_surface_read_freshness(
 
 async fn ensure_surface_read_freshness_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    artifact: &PreparedPublicReadArtifact,
+    artifact: &PreparedPublicRead,
 ) -> Result<(), LixError> {
     if artifact.freshness_contract == SurfaceReadFreshness::AllowsStaleProjection {
         return Ok(());

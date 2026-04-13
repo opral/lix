@@ -2,7 +2,7 @@ use crate::catalog::FilesystemProjectionScope;
 use crate::common::escape_sql_string;
 use crate::common::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::contracts::{
-    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+    PendingFilesystemFileView, PendingOverlayView, PendingSemanticRow, PendingSemanticStorage,
 };
 use crate::live_state::tracked_relation_name;
 use crate::{LixBackend, LixError, SqlDialect, Value};
@@ -327,16 +327,21 @@ pub(crate) async fn load_file_row_by_id_without_path(
     }))
 }
 
-pub(crate) async fn load_directory_row_by_id_with_pending_write_view(
+pub(crate) async fn load_directory_row_by_id_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
-    if let Some(row) =
-        pending_directory_row_by_id(backend, pending_write_view, version_id, directory_id, scope)
-            .await?
+    if let Some(row) = pending_directory_row_by_id(
+        backend,
+        pending_write_overlay_view,
+        version_id,
+        directory_id,
+        scope,
+    )
+    .await?
     {
         return Ok(Some(row));
     }
@@ -346,22 +351,23 @@ pub(crate) async fn load_directory_row_by_id_with_pending_write_view(
         return Ok(None);
     };
 
-    if pending_directory_row_is_hidden(pending_write_view, version_id, &base_row.id) {
+    if pending_directory_row_is_hidden(pending_write_overlay_view, version_id, &base_row.id) {
         return Ok(None);
     }
 
     Ok(Some(base_row))
 }
 
-pub(crate) async fn load_directory_row_by_path_with_pending_write_view(
+pub(crate) async fn load_directory_row_by_path_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
     if let Some(row) =
-        pending_directory_row_by_path(backend, pending_write_view, version_id, path, scope).await?
+        pending_directory_row_by_path(backend, pending_write_overlay_view, version_id, path, scope)
+            .await?
     {
         return Ok(Some(row));
     }
@@ -370,22 +376,23 @@ pub(crate) async fn load_directory_row_by_path_with_pending_write_view(
         return Ok(None);
     };
 
-    if pending_directory_row_is_hidden(pending_write_view, version_id, &base_row.id) {
+    if pending_directory_row_is_hidden(pending_write_overlay_view, version_id, &base_row.id) {
         return Ok(None);
     }
 
     Ok(Some(base_row))
 }
 
-pub(crate) async fn load_file_row_by_path_with_pending_write_view(
+pub(crate) async fn load_file_row_by_path_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
     if let Some(row) =
-        pending_file_row_by_path(backend, pending_write_view, version_id, path, scope).await?
+        pending_file_row_by_path(backend, pending_write_overlay_view, version_id, path, scope)
+            .await?
     {
         return Ok(Some(row));
     }
@@ -394,22 +401,28 @@ pub(crate) async fn load_file_row_by_path_with_pending_write_view(
         return Ok(None);
     };
 
-    if pending_file_row_is_hidden(pending_write_view, version_id, &base_row.id) {
+    if pending_file_row_is_hidden(pending_write_overlay_view, version_id, &base_row.id) {
         return Ok(None);
     }
 
     Ok(Some(base_row))
 }
 
-pub(crate) async fn load_file_row_by_id_with_pending_write_view(
+pub(crate) async fn load_file_row_by_id_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
-    if let Some(row) =
-        pending_file_row_by_id(backend, pending_write_view, version_id, file_id, scope).await?
+    if let Some(row) = pending_file_row_by_id(
+        backend,
+        pending_write_overlay_view,
+        version_id,
+        file_id,
+        scope,
+    )
+    .await?
     {
         return Ok(Some(row));
     }
@@ -418,9 +431,9 @@ pub(crate) async fn load_file_row_by_id_with_pending_write_view(
         return Ok(None);
     };
 
-    let Some(pending) = pending_write_view
+    let Some(pending) = pending_write_overlay_view
         .into_iter()
-        .flat_map(PendingView::visible_files)
+        .flat_map(PendingOverlayView::visible_files)
         .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
     else {
         return Ok(Some(base_row));
@@ -434,16 +447,16 @@ pub(crate) async fn load_file_row_by_id_with_pending_write_view(
     Ok(Some(base_row))
 }
 
-pub(crate) async fn load_file_row_by_id_without_path_with_pending_write_view(
+pub(crate) async fn load_file_row_by_id_without_path_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
-    if let Some(mut row) = load_file_row_by_id_with_pending_write_view(
+    if let Some(mut row) = load_file_row_by_id_with_pending_write_overlay_view(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         file_id,
         scope,
@@ -456,16 +469,16 @@ pub(crate) async fn load_file_row_by_id_without_path_with_pending_write_view(
     Ok(None)
 }
 
-pub(crate) async fn lookup_directory_id_by_path_with_pending_write_view(
+pub(crate) async fn lookup_directory_id_by_path_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, FilesystemQueryError> {
-    Ok(load_directory_row_by_path_with_pending_write_view(
+    Ok(load_directory_row_by_path_with_pending_write_overlay_view(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         path,
         scope,
@@ -474,16 +487,16 @@ pub(crate) async fn lookup_directory_id_by_path_with_pending_write_view(
     .map(|row| row.id))
 }
 
-pub(crate) async fn lookup_file_id_by_path_with_pending_write_view(
+pub(crate) async fn lookup_file_id_by_path_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, FilesystemQueryError> {
-    Ok(load_file_row_by_path_with_pending_write_view(
+    Ok(load_file_row_by_path_with_pending_write_overlay_view(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         path,
         scope,
@@ -492,16 +505,16 @@ pub(crate) async fn lookup_file_id_by_path_with_pending_write_view(
     .map(|row| row.id))
 }
 
-pub(crate) async fn lookup_directory_path_by_id_with_pending_write_view(
+pub(crate) async fn lookup_directory_path_by_id_with_pending_write_overlay_view(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<String>, FilesystemQueryError> {
-    Ok(load_directory_row_by_id_with_pending_write_view(
+    Ok(load_directory_row_by_id_with_pending_write_overlay_view(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         directory_id,
         scope,
@@ -554,12 +567,12 @@ pub(crate) async fn load_file_rows_under_path(
 
 async fn pending_directory_row_by_id(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
-    let Some(pending) = pending_write_view
+    let Some(pending) = pending_write_overlay_view
         .into_iter()
         .flat_map(|view| {
             view.visible_directory_rows(
@@ -575,17 +588,17 @@ async fn pending_directory_row_by_id(
         return Ok(None);
     }
 
-    build_pending_directory_row(backend, pending_write_view, &pending, scope).await
+    build_pending_directory_row(backend, pending_write_overlay_view, &pending, scope).await
 }
 
 async fn pending_directory_row_by_path(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
-    for pending in pending_write_view.into_iter().flat_map(|view| {
+    for pending in pending_write_overlay_view.into_iter().flat_map(|view| {
         view.visible_directory_rows(
             PendingSemanticStorage::Tracked,
             FILESYSTEM_DIRECTORY_SCHEMA_KEY,
@@ -595,7 +608,8 @@ async fn pending_directory_row_by_path(
             continue;
         }
         let Some(row) =
-            build_pending_directory_row(backend, pending_write_view, &pending, scope).await?
+            build_pending_directory_row(backend, pending_write_overlay_view, &pending, scope)
+                .await?
         else {
             continue;
         };
@@ -608,14 +622,14 @@ async fn pending_directory_row_by_path(
 
 async fn pending_file_row_by_id(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
-    let Some(pending) = pending_write_view
+    let Some(pending) = pending_write_overlay_view
         .into_iter()
-        .flat_map(PendingView::visible_files)
+        .flat_map(PendingOverlayView::visible_files)
         .find(|pending| pending.version_id == version_id && pending.file_id == file_id)
     else {
         return Ok(None);
@@ -623,25 +637,25 @@ async fn pending_file_row_by_id(
     if pending.deleted {
         return Ok(None);
     }
-    build_pending_file_row(backend, pending_write_view, &pending, scope).await
+    build_pending_file_row(backend, pending_write_overlay_view, &pending, scope).await
 }
 
 async fn pending_file_row_by_path(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
-    for pending in pending_write_view
+    for pending in pending_write_overlay_view
         .into_iter()
-        .flat_map(PendingView::visible_files)
+        .flat_map(PendingOverlayView::visible_files)
     {
         if pending.version_id != version_id || pending.deleted {
             continue;
         }
         let Some(row) =
-            build_pending_file_row(backend, pending_write_view, &pending, scope).await?
+            build_pending_file_row(backend, pending_write_overlay_view, &pending, scope).await?
         else {
             continue;
         };
@@ -653,11 +667,11 @@ async fn pending_file_row_by_path(
 }
 
 fn pending_directory_row_is_hidden(
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     directory_id: &str,
 ) -> bool {
-    pending_write_view
+    pending_write_overlay_view
         .into_iter()
         .flat_map(|view| {
             view.visible_directory_rows(
@@ -669,13 +683,13 @@ fn pending_directory_row_is_hidden(
 }
 
 fn pending_file_row_is_hidden(
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     file_id: &str,
 ) -> bool {
-    pending_write_view
+    pending_write_overlay_view
         .into_iter()
-        .flat_map(PendingView::visible_files)
+        .flat_map(PendingOverlayView::visible_files)
         .any(|pending| {
             pending.version_id == version_id
                 && pending.file_id == file_id
@@ -685,7 +699,7 @@ fn pending_file_row_is_hidden(
 
 async fn build_pending_directory_row(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     row: &PendingSemanticRow,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
@@ -711,14 +725,15 @@ async fn build_pending_directory_row(
         .unwrap_or(false);
     let path = match parent_id.as_deref() {
         Some(parent_id) => {
-            let Some(parent_path) = Box::pin(lookup_directory_path_by_id_with_pending_write_view(
-                backend,
-                pending_write_view,
-                &row.version_id,
-                parent_id,
-                scope,
-            ))
-            .await?
+            let Some(parent_path) =
+                Box::pin(lookup_directory_path_by_id_with_pending_write_overlay_view(
+                    backend,
+                    pending_write_overlay_view,
+                    &row.version_id,
+                    parent_id,
+                    scope,
+                ))
+                .await?
             else {
                 return Ok(None);
             };
@@ -742,7 +757,7 @@ async fn build_pending_directory_row(
 
 async fn build_pending_file_row(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     row: &PendingFilesystemFileView,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
@@ -752,9 +767,9 @@ async fn build_pending_file_row(
     let path = match descriptor.directory_id.as_str() {
         "" => compose_file_path("/", &descriptor.name, descriptor.extension.as_deref()),
         directory_id => {
-            let Some(parent_path) = lookup_directory_path_by_id_with_pending_write_view(
+            let Some(parent_path) = lookup_directory_path_by_id_with_pending_write_overlay_view(
                 backend,
-                pending_write_view,
+                pending_write_overlay_view,
                 &row.version_id,
                 directory_id,
                 scope,
@@ -1497,7 +1512,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionMode,
+            _mode: crate::TransactionBeginMode,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
             Ok(Box::new(UnusedTransaction))
         }
@@ -1506,7 +1521,8 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
+            self.begin_transaction(crate::TransactionBeginMode::Write)
+                .await
         }
     }
 
@@ -1516,8 +1532,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionMode {
-            crate::TransactionMode::Write
+        fn mode(&self) -> crate::TransactionBeginMode {
+            crate::TransactionBeginMode::Write
         }
 
         async fn execute(

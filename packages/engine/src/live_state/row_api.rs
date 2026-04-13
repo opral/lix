@@ -10,7 +10,7 @@ use crate::canonical::{
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 use super::constraints::ScanConstraint;
-use super::schema_access::load_schema_read_contract_with_backend;
+use super::schema_access::load_live_row_shape_with_backend;
 use super::tracked::{
     apply_write_batch_in_transaction as apply_tracked_write_batch_in_transaction,
     ExactTrackedRowRequest, TrackedScanRequest,
@@ -215,7 +215,7 @@ async fn scan_tracked_rows(
     backend: &dyn LixBackend,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
-    let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+    let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
     let mut rows = scan_tracked_rows_with_backend(
         backend,
         &TrackedScanRequest {
@@ -254,7 +254,7 @@ async fn scan_untracked_rows(
     backend: &dyn LixBackend,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
-    let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+    let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
     let mut rows = scan_untracked_rows_with_backend(
         backend,
         &UntrackedScanRequest {
@@ -277,7 +277,7 @@ async fn load_exact_tracked_row(
     backend: &dyn LixBackend,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
-    let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+    let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
     if let Some(row) = load_exact_tracked_row_with_backend(
         backend,
         &ExactTrackedRowRequest {
@@ -328,7 +328,7 @@ async fn load_exact_untracked_row(
     backend: &dyn LixBackend,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
-    let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+    let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
     let row = load_exact_untracked_row_with_backend(
         backend,
         &ExactUntrackedRowRequest {
@@ -474,7 +474,7 @@ async fn load_exact_untracked_row_for_lane(
     request: &ExactLiveRowQuery,
     lane: EffectiveLane,
 ) -> Result<EffectiveLaneOutcome, LixError> {
-    let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+    let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
     let row = load_exact_untracked_row_with_backend(
         backend,
         &ExactUntrackedRowRequest {
@@ -691,7 +691,7 @@ async fn scan_lane_rows(
     lane: EffectiveLane,
 ) -> Result<Vec<LiveRow>, LixError> {
     if lane.is_untracked() {
-        let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+        let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
         return scan_untracked_rows_with_backend(
             backend,
             &UntrackedScanRequest {
@@ -711,7 +711,7 @@ async fn scan_lane_rows(
         .collect();
     }
 
-    let contract = load_schema_read_contract_with_backend(backend, &request.schema_key).await?;
+    let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
     let mut rows = scan_tracked_rows_with_backend(
         backend,
         &TrackedScanRequest {
@@ -792,7 +792,7 @@ async fn overlay_writer_key_annotations_on_tracked_live_rows(
 
 fn tracked_row_to_row(
     row: super::TrackedRow,
-    contract: &super::LiveReadContract,
+    contract: &super::LiveRowShape,
 ) -> Result<LiveRow, LixError> {
     let snapshot_content = Some(row_snapshot_text(&row.schema_key, &row.values, contract)?);
     Ok(LiveRow {
@@ -815,7 +815,7 @@ fn tracked_row_to_row(
 
 fn untracked_row_to_row(
     row: super::UntrackedRow,
-    contract: &super::LiveReadContract,
+    contract: &super::LiveRowShape,
 ) -> Result<LiveRow, LixError> {
     let snapshot_content = Some(row_snapshot_text(&row.schema_key, &row.values, contract)?);
     Ok(LiveRow {
@@ -858,7 +858,7 @@ fn tracked_tombstone_to_row(tombstone: super::TrackedTombstoneMarker) -> LiveRow
 fn row_snapshot_text(
     schema_key: &str,
     values: &BTreeMap<String, Value>,
-    contract: &super::LiveReadContract,
+    contract: &super::LiveRowShape,
 ) -> Result<String, LixError> {
     contract.snapshot_text_from_values(schema_key, values)
 }
@@ -986,7 +986,7 @@ mod tests {
         init_test_backend_core, seed_canonical_change_row, seed_live_state_status_row,
         seed_local_version_head, CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::{CommittedVersionFrontier, LixBackend, ReplayCursor, TransactionMode};
+    use crate::{CommittedVersionFrontier, LixBackend, ReplayCursor, TransactionBeginMode};
     use serde_json::Value as JsonValue;
 
     fn registered_schema_row(snapshot_content: Option<&str>) -> LiveRow {
@@ -1195,7 +1195,7 @@ mod tests {
         .expect("canonical commit should seed");
 
         let mut transaction = backend
-            .begin_transaction(TransactionMode::Write)
+            .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("write transaction should open");
         write_live_rows(

@@ -1,13 +1,13 @@
 #![allow(dead_code)]
 
-use super::PreparedBatch;
+use crate::backend::PreparedBatch;
 use crate::Value;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct ProgramSlotId(pub(crate) String);
+pub(crate) struct CaptureSlotId(pub(crate) String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SlotShape {
+pub(crate) enum CaptureShape {
     Scalar,
     OptionalRow,
     ExactlyOneRow,
@@ -15,7 +15,7 @@ pub(crate) enum SlotShape {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SlotValueType {
+pub(crate) enum CaptureValueType {
     Null,
     Boolean,
     Integer,
@@ -26,23 +26,23 @@ pub(crate) enum SlotValueType {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SlotColumn {
+pub(crate) struct CaptureColumn {
     pub(crate) name: String,
-    pub(crate) value_type: SlotValueType,
+    pub(crate) value_type: CaptureValueType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProgramSlot {
-    pub(crate) id: ProgramSlotId,
-    pub(crate) shape: SlotShape,
-    pub(crate) columns: Vec<SlotColumn>,
+pub(crate) struct CaptureSlot {
+    pub(crate) id: CaptureSlotId,
+    pub(crate) shape: CaptureShape,
+    pub(crate) columns: Vec<CaptureColumn>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PreparedParam {
     Literal(Value),
-    FromScalarSlot { slot: ProgramSlotId },
-    FromRowColumn { slot: ProgramSlotId, column: String },
+    FromScalarSlot { slot: CaptureSlotId },
+    FromRowColumn { slot: CaptureSlotId, column: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -58,7 +58,7 @@ pub(crate) struct PreparedRelationStep {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PreparedRelationInput {
-    pub(crate) slot: ProgramSlotId,
+    pub(crate) slot: CaptureSlotId,
     pub(crate) binding: RelationBinding,
     pub(crate) setup_steps: Vec<PreparedRelationStep>,
     pub(crate) cleanup_steps: Vec<PreparedRelationStep>,
@@ -68,13 +68,13 @@ pub(crate) struct PreparedRelationInput {
 pub(crate) struct PreparedStep {
     pub(crate) sql: String,
     pub(crate) params: Vec<PreparedParam>,
-    pub(crate) capture: Option<ProgramSlotId>,
+    pub(crate) capture: Option<CaptureSlotId>,
     pub(crate) relation_inputs: Vec<PreparedRelationInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct PreparedProgram {
-    pub(crate) slots: Vec<ProgramSlot>,
+pub(crate) struct PreparedStatementBatch {
+    pub(crate) slots: Vec<CaptureSlot>,
     pub(crate) steps: Vec<PreparedStep>,
 }
 
@@ -85,11 +85,11 @@ pub(crate) enum WriteStep {
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-pub(crate) struct WriteProgram {
+pub(crate) struct WriteBatch {
     pub(crate) steps: Vec<WriteStep>,
 }
 
-impl WriteProgram {
+impl WriteBatch {
     pub(crate) fn new() -> Self {
         Self { steps: Vec::new() }
     }
@@ -105,14 +105,14 @@ impl WriteProgram {
         });
     }
 
-    pub(crate) fn extend(&mut self, other: WriteProgram) {
+    pub(crate) fn extend(&mut self, other: WriteBatch) {
         self.steps.extend(other.steps);
     }
 }
 
-pub(crate) fn lower_write_program(program: WriteProgram) -> PreparedProgram {
+pub(crate) fn lower_write_batch(write_batch: WriteBatch) -> PreparedStatementBatch {
     let mut steps = Vec::new();
-    for step in program.steps {
+    for step in write_batch.steps {
         match step {
             WriteStep::PreparedBatch(batch) => {
                 for statement in batch.steps {
@@ -139,7 +139,7 @@ pub(crate) fn lower_write_program(program: WriteProgram) -> PreparedProgram {
         }
     }
 
-    PreparedProgram {
+    PreparedStatementBatch {
         slots: Vec::new(),
         steps,
     }

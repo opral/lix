@@ -7,12 +7,12 @@ pub(crate) struct LiveReadColumn {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct LiveReadContract {
+pub(crate) struct LiveRowShape {
     access: super::storage::LiveRowAccess,
     columns: Vec<LiveReadColumn>,
 }
 
-impl LiveReadContract {
+impl LiveRowShape {
     fn raw_access(&self) -> &super::storage::LiveRowAccess {
         &self.access
     }
@@ -75,36 +75,34 @@ impl LiveReadContract {
     }
 }
 
-pub(crate) async fn load_schema_read_contract_with_backend(
+pub(crate) async fn load_live_row_shape_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
-) -> Result<LiveReadContract, LixError> {
+) -> Result<LiveRowShape, LixError> {
     super::storage::load_live_row_access_with_backend(backend, schema_key)
         .await
-        .map(read_contract_from_storage)
+        .map(live_row_shape_from_storage)
 }
 
-pub(crate) async fn load_schema_read_contract_for_table_name(
+pub(crate) async fn load_live_row_shape_for_table_name(
     backend: &dyn LixBackend,
     table_name: &str,
-) -> Result<Option<LiveReadContract>, LixError> {
+) -> Result<Option<LiveRowShape>, LixError> {
     super::storage::load_live_row_access_for_table_name(backend, table_name)
         .await
-        .map(|access| access.map(read_contract_from_storage))
+        .map(|access| access.map(live_row_shape_from_storage))
 }
 
-pub(crate) fn read_contract_from_definition(
+pub(crate) fn live_row_shape_from_definition(
     schema_key: &str,
     schema_definition: Option<&JsonValue>,
-) -> Result<LiveReadContract, LixError> {
+) -> Result<LiveRowShape, LixError> {
     schema_layout(schema_key, schema_definition)
-        .map(|layout| read_contract_from_storage(super::storage::LiveRowAccess::new(layout)))
+        .map(|layout| live_row_shape_from_storage(super::storage::LiveRowAccess::new(layout)))
 }
 
-pub(crate) fn live_read_contract_from_layout(
-    layout: super::storage::LiveTableLayout,
-) -> LiveReadContract {
-    read_contract_from_storage(super::storage::LiveRowAccess::new(layout))
+pub(crate) fn live_row_shape_from_layout(layout: super::storage::LiveTableLayout) -> LiveRowShape {
+    live_row_shape_from_storage(super::storage::LiveRowAccess::new(layout))
 }
 
 pub(crate) async fn live_storage_relation_exists_with_backend(
@@ -152,13 +150,13 @@ pub(crate) fn snapshot_select_expr_for_schema(
     table_alias: Option<&str>,
 ) -> Result<String, LixError> {
     Ok(
-        read_contract_from_definition(schema_key, schema_definition)?
+        live_row_shape_from_definition(schema_key, schema_definition)?
             .snapshot_select_expr(dialect, table_alias),
     )
 }
 
-pub(crate) fn logical_snapshot_from_projected_row_with_contract(
-    access: Option<&LiveReadContract>,
+pub(crate) fn logical_snapshot_from_projected_row_with_shape(
+    access: Option<&LiveRowShape>,
     schema_key: &str,
     row: &[Value],
     snapshot_index: usize,
@@ -188,8 +186,8 @@ fn schema_layout(
     })
 }
 
-fn read_contract_from_storage(access: super::storage::LiveRowAccess) -> LiveReadContract {
-    LiveReadContract {
+fn live_row_shape_from_storage(access: super::storage::LiveRowAccess) -> LiveRowShape {
+    LiveRowShape {
         columns: access
             .columns()
             .iter()

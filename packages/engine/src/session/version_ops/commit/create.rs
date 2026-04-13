@@ -14,13 +14,13 @@ use crate::session::version_ops::{
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
     VersionSnapshot,
 };
-use crate::transaction::execute_write_program_with_transaction;
+use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
-    FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
-    FILESYSTEM_FILE_SCHEMA_KEY,
+    FilesystemSemanticChange, FilesystemTransactionState, WriteBatch,
+    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::SqlDialect;
 use crate::{
@@ -397,20 +397,20 @@ pub(crate) async fn create_commit(
         .map_err(backend_error)?;
     let deterministic_sequence_highest_seen =
         functions.deterministic_sequence_persist_highest_seen();
-    let mut write_program = crate::backend::WriteProgram::new();
-    write_program.push_statement(insert_idempotency_row_sql(&idempotency_write), Vec::new());
+    let mut write_batch = WriteBatch::new();
+    write_batch.push_statement(insert_idempotency_row_sql(&idempotency_write), Vec::new());
     if let Some(highest_seen) = deterministic_sequence_highest_seen {
-        write_program.push_statement(
+        write_batch.push_statement(
             build_ensure_runtime_sequence_row_sql(highest_seen, transaction.dialect()),
             Vec::new(),
         );
-        write_program.push_statement(
+        write_batch.push_statement(
             build_update_runtime_sequence_highest_sql(highest_seen, transaction.dialect()),
             Vec::new(),
         );
     }
     if let Some(observe_tick) = observe_tick.as_ref() {
-        write_program.push_statement(
+        write_batch.push_statement(
             build_observe_tick_insert_sql(observe_tick.writer_key.as_deref()),
             Vec::new(),
         );
@@ -439,13 +439,13 @@ pub(crate) async fn create_commit(
             data: payload.data,
         })
         .collect::<Vec<_>>();
-    crate::binary_cas::append_blob_writes_to_program(
-        &mut write_program,
+    crate::binary_cas::append_blob_writes_to_write_batch(
+        &mut write_batch,
         transaction.dialect(),
         &blob_writes,
     )
     .map_err(backend_error)?;
-    execute_write_program_with_transaction(transaction, write_program)
+    execute_write_batch_with_transaction(transaction, write_batch)
         .await
         .map_err(backend_error)?;
     Ok(CreateCommitResult {
@@ -1501,7 +1501,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1579,7 +1579,7 @@ mod tests {
             ),
         );
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1640,7 +1640,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1703,7 +1703,7 @@ mod tests {
         .await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1758,7 +1758,7 @@ mod tests {
         .await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1799,7 +1799,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1835,7 +1835,7 @@ mod tests {
         let backend = init_create_commit_backend().await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1869,7 +1869,7 @@ mod tests {
         let backend = init_create_commit_backend().await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1912,7 +1912,7 @@ mod tests {
         .expect("global local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1953,7 +1953,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -2013,7 +2013,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();

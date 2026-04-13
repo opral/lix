@@ -6,19 +6,19 @@ use serde_json::Value as JsonValue;
 use crate::contracts::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
 };
-use crate::contracts::{LiveReadShapeContract, LiveStateQueryBackend};
+use crate::contracts::{LiveRowShapeContract, LiveStateQueryBackend};
 use crate::{LixBackend, LixError, Value};
 
-use super::schema_access::LiveReadContract;
+use super::schema_access::LiveRowShape;
 use super::visible_rows::{scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane};
 use super::{schema_access, ScanConstraint, ScanField, ScanOperator};
 
 #[derive(Debug, Clone)]
-pub(crate) struct LiveReadShape {
-    contract: LiveReadContract,
+pub(crate) struct LiveRowShapeView {
+    contract: LiveRowShape,
 }
 
-impl LiveReadShape {
+impl LiveRowShapeView {
     pub(crate) fn property_names(&self) -> Vec<String> {
         self.contract
             .columns()
@@ -45,7 +45,7 @@ impl LiveReadShape {
         snapshot_index: usize,
         normalized_start_index: usize,
     ) -> Result<Option<JsonValue>, LixError> {
-        super::schema_access::logical_snapshot_from_projected_row_with_contract(
+        super::schema_access::logical_snapshot_from_projected_row_with_shape(
             Some(&self.contract),
             schema_key,
             row,
@@ -55,9 +55,9 @@ impl LiveReadShape {
     }
 }
 
-impl LiveReadShapeContract for LiveReadShape {
+impl LiveRowShapeContract for LiveRowShapeView {
     fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String {
-        LiveReadShape::normalized_projection_sql(self, table_alias)
+        LiveRowShapeView::normalized_projection_sql(self, table_alias)
     }
 
     fn snapshot_from_projected_row(
@@ -67,7 +67,7 @@ impl LiveReadShapeContract for LiveReadShape {
         snapshot_index: usize,
         normalized_start_index: usize,
     ) -> Result<Option<JsonValue>, LixError> {
-        LiveReadShape::snapshot_from_projected_row(
+        LiveRowShapeView::snapshot_from_projected_row(
             self,
             schema_key,
             row,
@@ -80,19 +80,19 @@ impl LiveReadShapeContract for LiveReadShape {
 pub(crate) async fn load_live_read_shape_with_backend(
     backend: &dyn LixBackend,
     schema_key: &str,
-) -> Result<LiveReadShape, LixError> {
-    schema_access::load_schema_read_contract_with_backend(backend, schema_key)
+) -> Result<LiveRowShapeView, LixError> {
+    schema_access::load_live_row_shape_with_backend(backend, schema_key)
         .await
-        .map(|contract| LiveReadShape { contract })
+        .map(|shape| LiveRowShapeView { contract: shape })
 }
 
 pub(crate) async fn load_live_read_shape_for_table_name(
     backend: &dyn LixBackend,
     table_name: &str,
-) -> Result<Option<LiveReadShape>, LixError> {
-    schema_access::load_schema_read_contract_for_table_name(backend, table_name)
+) -> Result<Option<LiveRowShapeView>, LixError> {
+    schema_access::load_live_row_shape_for_table_name(backend, table_name)
         .await
-        .map(|contract| contract.map(|contract| LiveReadShape { contract }))
+        .map(|shape| shape.map(|shape| LiveRowShapeView { contract: shape }))
 }
 
 pub(crate) async fn normalize_live_snapshot_values_with_backend(
@@ -160,7 +160,7 @@ fn scan_constraint_from_filter(filter: &LiveFilter) -> ScanConstraint {
 }
 
 fn snapshot_row_from_live_row(
-    shape: &LiveReadShape,
+    shape: &LiveRowShapeView,
     row: LiveReadRow,
 ) -> Result<LiveSnapshotRow, LixError> {
     Ok(LiveSnapshotRow {
@@ -181,10 +181,10 @@ impl LiveStateQueryBackend for dyn LixBackend + '_ {
     async fn load_live_read_shape_for_table_name(
         &self,
         table_name: &str,
-    ) -> Result<Option<Box<dyn LiveReadShapeContract>>, LixError> {
+    ) -> Result<Option<Box<dyn LiveRowShapeContract>>, LixError> {
         load_live_read_shape_for_table_name(self, table_name)
             .await
-            .map(|shape| shape.map(|shape| Box::new(shape) as Box<dyn LiveReadShapeContract>))
+            .map(|shape| shape.map(|shape| Box::new(shape) as Box<dyn LiveRowShapeContract>))
     }
 
     async fn load_live_snapshot_rows(

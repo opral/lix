@@ -91,7 +91,7 @@ pub(crate) fn sql_unknown_column_error(
 pub(crate) fn internal_table_access_denied_error() -> LixError {
     let inventory = crate::sql::builtin_relation_inventory();
     let available_tables = inventory.protected_builtin_public_surfaces.join(", ");
-    let internal_storage_namespaces = inventory
+    let internal_relation_namespaces = inventory
         .internal_relation_families
         .iter()
         .map(|family| format!("`{}*`", family.prefix))
@@ -100,7 +100,7 @@ pub(crate) fn internal_table_access_denied_error() -> LixError {
     build_error(
         "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
         format!(
-            "Direct writes against internal storage relations can lead to data corruption. {policy_choice} Protected internal storage includes exact built-in tables plus managed relation families such as {internal_storage_namespaces}. DDL against internal storage and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}.",
+            "Direct writes against internal storage relations can lead to data corruption. {policy_choice} Protected internal storage includes exact built-in tables plus managed relation families such as {internal_relation_namespaces}. DDL against internal storage and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}.",
             policy_choice = crate::sql::relation_policy_choice_summary(),
         ),
     )

@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::backend::QueryExecutor;
 use crate::canonical::append_changes;
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::{PendingPublicCommitLane, PendingPublicCommitSession};
+use crate::contracts::{PendingCommitLane, PendingCommitState};
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
-use crate::transaction::{execute_write_program_with_transaction, BinaryBlobWrite, WriteProgram};
+use crate::transaction::{execute_write_batch_with_transaction, BinaryBlobWrite, WriteBatch};
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, LixBackendTransaction, LixError, QueryResult, Value, VersionId,
@@ -39,11 +39,11 @@ impl QueryExecutor for TransactionCommitExecutor<'_> {
     }
 }
 
-pub(crate) fn pending_session_matches_create_commit(
-    session: &PendingPublicCommitSession,
+pub(crate) fn pending_commit_state_matches_create_commit(
+    session: &PendingCommitState,
     preconditions: &CreateCommitPreconditions,
 ) -> bool {
-    pending_public_commit_lane_matches_write_lane(&session.lane, &preconditions.write_lane)
+    pending_commit_lane_matches_write_lane(&session.lane, &preconditions.write_lane)
         && match &preconditions.expected_head {
             CreateCommitExpectedHead::CurrentHead => true,
             CreateCommitExpectedHead::CommitId(commit_id) => commit_id == &session.commit_id,
@@ -51,25 +51,25 @@ pub(crate) fn pending_session_matches_create_commit(
         }
 }
 
-pub(crate) async fn build_pending_public_commit_session(
+pub(crate) async fn build_pending_commit_state(
     transaction: &mut dyn LixBackendTransaction,
     lane: CreateCommitWriteLane,
     applied_output: &CreateCommitAppliedOutput,
-) -> Result<PendingPublicCommitSession, LixError> {
+) -> Result<PendingCommitState, LixError> {
     let seed = applied_output
         .pending_public_commit_seed
         .as_ref()
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public commit session requires a pending public commit seed",
+                "pending commit state requires a pending public commit seed",
             )
         })?;
     let commit_snapshot: JsonValue =
         serde_json::from_str(&seed.commit_snapshot_content).map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                format!("public commit session commit snapshot is invalid JSON: {error}"),
+                format!("pending commit state commit snapshot is invalid JSON: {error}"),
             )
         })?;
     let snapshot_id_result = transaction
@@ -97,45 +97,43 @@ pub(crate) async fn build_pending_public_commit_session(
         .ok_or_else(|| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
-                "public commit session could not load commit snapshot_id",
+                "pending commit state could not load commit snapshot_id",
             )
         })?;
 
-    Ok(PendingPublicCommitSession {
-        lane: pending_public_commit_lane_from_write_lane(&lane),
+    Ok(PendingCommitState {
+        lane: pending_commit_lane_from_write_lane(&lane),
         commit_id: seed.commit_id.clone(),
         commit_change_snapshot_id,
         commit_snapshot,
     })
 }
 
-fn pending_public_commit_lane_matches_write_lane(
-    pending_lane: &PendingPublicCommitLane,
+fn pending_commit_lane_matches_write_lane(
+    pending_lane: &PendingCommitLane,
     write_lane: &CreateCommitWriteLane,
 ) -> bool {
     match (pending_lane, write_lane) {
-        (PendingPublicCommitLane::Version(pending), CreateCommitWriteLane::Version(current)) => {
+        (PendingCommitLane::Version(pending), CreateCommitWriteLane::Version(current)) => {
             pending == current
         }
-        (PendingPublicCommitLane::GlobalAdmin, CreateCommitWriteLane::GlobalAdmin) => true,
+        (PendingCommitLane::GlobalAdmin, CreateCommitWriteLane::GlobalAdmin) => true,
         _ => false,
     }
 }
 
-fn pending_public_commit_lane_from_write_lane(
-    lane: &CreateCommitWriteLane,
-) -> PendingPublicCommitLane {
+fn pending_commit_lane_from_write_lane(lane: &CreateCommitWriteLane) -> PendingCommitLane {
     match lane {
         CreateCommitWriteLane::Version(version_id) => {
-            PendingPublicCommitLane::Version(version_id.clone())
+            PendingCommitLane::Version(version_id.clone())
         }
-        CreateCommitWriteLane::GlobalAdmin => PendingPublicCommitLane::GlobalAdmin,
+        CreateCommitWriteLane::GlobalAdmin => PendingCommitLane::GlobalAdmin,
     }
 }
 
 pub(crate) async fn merge_public_change_batch_into_pending_commit(
     transaction: &mut dyn LixBackendTransaction,
-    session: &mut PendingPublicCommitSession,
+    session: &mut PendingCommitState,
     changes: &[StagedChange],
     binary_blob_writes: &[BinaryBlobWrite],
     active_account_ids: &[String],
@@ -307,7 +305,7 @@ async fn load_version_info_for_staged_changes(
 }
 
 fn rewrite_generated_commit_result_for_pending_session(
-    session: &PendingPublicCommitSession,
+    session: &PendingCommitState,
     generated: GenerateCommitResult,
     change_count: usize,
     timestamp: &str,
@@ -371,7 +369,7 @@ async fn execute_generated_commit_result(
     tracked_live_rows: &[crate::live_state::LiveRow],
 ) -> Result<CanonicalCommitReceipt, LixError> {
     append_changes(transaction, &result.canonical_changes, functions).await?;
-    let mut program = WriteProgram::new();
+    let mut write_batch = WriteBatch::new();
     if !binary_blob_writes.is_empty() {
         let blob_writes = binary_blob_writes
             .iter()
@@ -382,13 +380,13 @@ async fn execute_generated_commit_result(
                 data: payload.data,
             })
             .collect::<Vec<_>>();
-        crate::binary_cas::append_blob_writes_to_program(
-            &mut program,
+        crate::binary_cas::append_blob_writes_to_write_batch(
+            &mut write_batch,
             transaction.dialect(),
             &blob_writes,
         )?;
     }
-    execute_write_program_with_transaction(transaction, program).await?;
+    execute_write_batch_with_transaction(transaction, write_batch).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
     let untracked_live_rows =
         untracked_live_rows_from_updated_version_refs(&receipt.updated_version_refs);

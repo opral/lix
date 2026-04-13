@@ -4,36 +4,32 @@ use crate::contracts::TrackedChangeView;
 use crate::contracts::{
     state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
 };
-use crate::contracts::{PendingPublicCommitSession, PlanEffects, SessionStateDelta};
-use crate::transaction::{TrackedTxnUnit, WriteExecutionBindings};
+use crate::contracts::{PendingCommitState, PlanEffects, SessionStateDelta};
+use crate::transaction::{TrackedTxnUnit, WriteExecutionHost};
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
-use super::runtime::SqlExecutionOutcome;
+use super::runtime::WriteExecutionOutcome;
 
 pub(crate) async fn run_public_tracked_append_txn_with_transaction(
-    bindings: &dyn WriteExecutionBindings,
+    host: &dyn WriteExecutionHost,
     transaction: &mut dyn LixBackendTransaction,
     unit: &TrackedTxnUnit,
-    pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
-) -> Result<Option<SqlExecutionOutcome>, LixError> {
-    let execution = bindings
-        .execute_public_tracked_append_txn_with_transaction(
-            transaction,
-            unit,
-            pending_commit_session,
-        )
+    pending_commit_state: Option<&mut Option<PendingCommitState>>,
+) -> Result<Option<WriteExecutionOutcome>, LixError> {
+    let tracked_write_outcome = host
+        .execute_public_tracked_append_txn_with_transaction(transaction, unit, pending_commit_state)
         .await?;
 
-    let plan_effects_override = if execution.plugin_changes_committed {
+    let plan_effects_override = if tracked_write_outcome.plugin_changes_committed {
         if unit.has_compiler_only_filesystem_changes() {
             plan_effects_from_tracked_changes(
-                &execution.applied_changes,
+                &tracked_write_outcome.applied_changes,
                 unit.public_write
                     .contract
                     .operation_kind
                     .state_commit_stream_operation(),
                 unit.writer_key.as_deref(),
-                execution.next_active_version_id.clone(),
+                tracked_write_outcome.next_active_version_id.clone(),
             )?
         } else {
             unit.execution.semantic_effects.clone()
@@ -42,17 +38,18 @@ pub(crate) async fn run_public_tracked_append_txn_with_transaction(
         PlanEffects::default()
     };
 
-    Ok(Some(SqlExecutionOutcome {
+    Ok(Some(WriteExecutionOutcome {
         public_result: QueryResult {
             rows: Vec::new(),
             columns: Vec::new(),
         },
-        internal_write_file_cache_targets: BTreeSet::new(),
-        plugin_changes_committed: execution.plugin_changes_committed,
-        canonical_commit_receipt: execution.receipt,
+        direct_write_file_cache_targets: BTreeSet::new(),
+        plugin_changes_committed: tracked_write_outcome.plugin_changes_committed,
+        canonical_commit_receipt: tracked_write_outcome.receipt,
         plan_effects_override: Some(plan_effects_override),
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: execution.plugin_changes_committed && unit.should_emit_observe_tick(),
+        observe_tick_emitted: tracked_write_outcome.plugin_changes_committed
+            && unit.should_emit_observe_tick(),
     }))
 }
 

@@ -1,16 +1,16 @@
 use crate::catalog::{
     load_directory_descriptors_by_parent_name_pairs,
     load_file_descriptors_by_directory_name_extension_triplets,
-    lookup_directory_id_by_path_with_pending_write_view,
-    lookup_directory_path_by_id_with_pending_write_view,
-    lookup_file_id_by_path_with_pending_write_view, FilesystemProjectionScope,
+    lookup_directory_id_by_path_with_pending_write_overlay_view,
+    lookup_directory_path_by_id_with_pending_write_overlay_view,
+    lookup_file_id_by_path_with_pending_write_overlay_view, FilesystemProjectionScope,
     FilesystemQueryError,
 };
 use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::contracts::PendingView;
+use crate::contracts::PendingOverlayView;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     DirectoryInsertAssignments, FileInsertAssignments,
@@ -126,7 +126,7 @@ struct PendingFileInsert {
 
 pub(super) async fn build_directory_insert_snapshot(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     assignments: &[DirectoryInsertAssignments],
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
@@ -134,7 +134,7 @@ pub(super) async fn build_directory_insert_snapshot(
     let requested_directory_ids = collect_requested_parent_directory_ids(assignments);
     let existing_directory_paths_by_id = resolve_visible_directory_paths_by_id(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         &requested_directory_ids,
         lookup_scope,
@@ -144,7 +144,7 @@ pub(super) async fn build_directory_insert_snapshot(
         collect_directory_insert_requests(assignments, &existing_directory_paths_by_id)?;
     let mut snapshot = build_insert_snapshot(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         &requested_directory_paths,
         &requested_file_paths,
@@ -157,7 +157,7 @@ pub(super) async fn build_directory_insert_snapshot(
 
 pub(super) async fn build_file_insert_snapshot(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     assignments: &[FileInsertAssignments],
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
@@ -166,7 +166,7 @@ pub(super) async fn build_file_insert_snapshot(
         collect_file_insert_requests(assignments);
     build_insert_snapshot(
         backend,
-        pending_write_view,
+        pending_write_overlay_view,
         version_id,
         &requested_directory_paths,
         &requested_file_paths,
@@ -467,7 +467,7 @@ fn register_directory_path_request(
 
 async fn build_insert_snapshot(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     requested_directory_paths: &BTreeSet<String>,
     requested_file_paths: &BTreeSet<String>,
@@ -492,7 +492,7 @@ async fn build_insert_snapshot(
     Ok(FilesystemInsertSnapshot {
         existing_directory_ids_by_path: merge_visible_directory_ids_by_path(
             backend,
-            pending_write_view,
+            pending_write_overlay_view,
             version_id,
             requested_directory_paths,
             lookup_scope,
@@ -502,7 +502,7 @@ async fn build_insert_snapshot(
         existing_directory_paths_by_id: BTreeMap::new(),
         existing_file_ids_by_path: merge_visible_file_ids_by_path(
             backend,
-            pending_write_view,
+            pending_write_overlay_view,
             version_id,
             requested_file_paths,
             lookup_scope,
@@ -514,16 +514,16 @@ async fn build_insert_snapshot(
 
 async fn resolve_visible_directory_paths_by_id(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     directory_ids: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
     let mut resolved = BTreeMap::new();
     for directory_id in directory_ids {
-        if let Some(path) = lookup_directory_path_by_id_with_pending_write_view(
+        if let Some(path) = lookup_directory_path_by_id_with_pending_write_overlay_view(
             backend,
-            pending_write_view,
+            pending_write_overlay_view,
             version_id,
             directory_id,
             lookup_scope,
@@ -538,21 +538,21 @@ async fn resolve_visible_directory_paths_by_id(
 
 async fn merge_visible_directory_ids_by_path(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     requested_paths: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
     committed_directory_ids_by_path: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
-    if !pending_write_view.is_some_and(|view| view.has_overlays()) {
+    if !pending_write_overlay_view.is_some_and(|view| view.has_overlays()) {
         return Ok(committed_directory_ids_by_path);
     }
 
     let mut resolved = BTreeMap::new();
     for path in requested_paths {
-        if let Some(directory_id) = lookup_directory_id_by_path_with_pending_write_view(
+        if let Some(directory_id) = lookup_directory_id_by_path_with_pending_write_overlay_view(
             backend,
-            pending_write_view,
+            pending_write_overlay_view,
             version_id,
             &NormalizedDirectoryPath::from_normalized(path.clone()),
             lookup_scope,
@@ -567,13 +567,13 @@ async fn merge_visible_directory_ids_by_path(
 
 async fn merge_visible_file_ids_by_path(
     backend: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     version_id: &str,
     requested_paths: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
     committed_file_ids_by_path: BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
-    if !pending_write_view.is_some_and(|view| view.has_overlays()) {
+    if !pending_write_overlay_view.is_some_and(|view| view.has_overlays()) {
         return Ok(committed_file_ids_by_path);
     }
 
@@ -581,9 +581,9 @@ async fn merge_visible_file_ids_by_path(
     for path in requested_paths {
         let parsed =
             ParsedFilePath::from_normalized_path(path.clone()).map_err(filesystem_path_error)?;
-        if let Some(file_id) = lookup_file_id_by_path_with_pending_write_view(
+        if let Some(file_id) = lookup_file_id_by_path_with_pending_write_overlay_view(
             backend,
-            pending_write_view,
+            pending_write_overlay_view,
             version_id,
             &parsed,
             lookup_scope,

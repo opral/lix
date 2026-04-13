@@ -1,5 +1,5 @@
 use crate::contracts::{
-    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+    PendingFilesystemFileView, PendingOverlayView, PendingSemanticRow, PendingSemanticStorage,
 };
 use crate::transaction::buffered::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
@@ -7,14 +7,14 @@ use crate::transaction::buffered::{
 };
 
 #[derive(Clone, Default)]
-pub(crate) struct PendingWriteView {
+pub(crate) struct PendingWriteOverlayView {
     registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
     semantic_overlay: Option<PendingSemanticOverlay>,
     filesystem_overlay: Option<PendingFilesystemOverlay>,
     writer_key_overlay: Option<PendingWriterKeyOverlay>,
 }
 
-impl PendingWriteView {
+impl PendingWriteOverlayView {
     pub(crate) fn new(
         registered_schema_overlay: Option<PendingRegisteredSchemaOverlay>,
         semantic_overlay: Option<PendingSemanticOverlay>,
@@ -54,7 +54,7 @@ impl PendingWriteView {
     }
 }
 
-impl PendingView for PendingWriteView {
+impl PendingOverlayView for PendingWriteOverlayView {
     fn has_overlays(&self) -> bool {
         self.has_overlays()
     }

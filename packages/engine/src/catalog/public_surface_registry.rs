@@ -269,7 +269,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionMode,
+            _mode: crate::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",

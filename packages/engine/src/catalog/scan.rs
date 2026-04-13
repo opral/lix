@@ -1,7 +1,7 @@
 use crate::catalog::{
-    bind_surface_relation, direct_read_semantics, DefaultScopeSemantics, FilesystemProjectionScope,
-    FilesystemRelationKind, RelationBindContext, RelationBinding, SurfaceBinding, SurfaceFamily,
-    SurfaceVariant,
+    bind_surface_relation, history_read_semantics, DefaultScopeSemantics,
+    FilesystemProjectionScope, FilesystemRelationKind, RelationBindContext, RelationBinding,
+    ResolvedSurface, SurfaceFamily, SurfaceVariant,
 };
 use crate::LixError;
 
@@ -24,7 +24,7 @@ pub(crate) enum CatalogAdminScanKind {
 }
 
 pub(crate) fn filesystem_scan_semantics(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<CatalogFilesystemScanSemantics>, LixError> {
     if surface_binding.descriptor.surface_family != SurfaceFamily::Filesystem {
         return Ok(None);
@@ -44,14 +44,14 @@ pub(crate) fn filesystem_scan_semantics(
         }));
     }
 
-    Ok(match direct_read_semantics(surface_binding) {
-        Some(crate::catalog::CatalogDirectReadSemantics::FileHistory { .. }) => {
+    Ok(match history_read_semantics(surface_binding) {
+        Some(crate::catalog::CatalogHistoryReadSemantics::FileHistory { .. }) => {
             Some(CatalogFilesystemScanSemantics {
                 kind: FilesystemRelationKind::File,
                 version_scope: CatalogScanVersionScope::History,
             })
         }
-        Some(crate::catalog::CatalogDirectReadSemantics::DirectoryHistoryActiveVersion) => {
+        Some(crate::catalog::CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion) => {
             Some(CatalogFilesystemScanSemantics {
                 kind: FilesystemRelationKind::Directory,
                 version_scope: CatalogScanVersionScope::History,
@@ -61,12 +61,12 @@ pub(crate) fn filesystem_scan_semantics(
     })
 }
 
-pub(crate) fn is_working_changes_surface(surface_binding: &SurfaceBinding) -> bool {
+pub(crate) fn is_working_changes_surface(surface_binding: &ResolvedSurface) -> bool {
     surface_binding.descriptor.surface_family == SurfaceFamily::Change
         && surface_binding.descriptor.surface_variant == SurfaceVariant::WorkingChanges
 }
 
-pub(crate) fn admin_scan_kind(surface_binding: &SurfaceBinding) -> Option<CatalogAdminScanKind> {
+pub(crate) fn admin_scan_kind(surface_binding: &ResolvedSurface) -> Option<CatalogAdminScanKind> {
     (surface_binding.descriptor.surface_family == SurfaceFamily::Admin
         && surface_binding.default_scope == DefaultScopeSemantics::GlobalAdmin)
         .then_some(CatalogAdminScanKind::Version)
