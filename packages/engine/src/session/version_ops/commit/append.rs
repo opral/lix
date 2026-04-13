@@ -1,8 +1,6 @@
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::PendingPublicCommitSession;
-use crate::execution::write::filesystem::runtime::{
-    binary_blob_writes_from_filesystem_state, FilesystemTransactionState,
-};
+use crate::transaction::{binary_blob_writes_from_filesystem_state, FilesystemTransactionState};
 use crate::{LixBackendTransaction, LixError};
 
 use super::create::create_commit;

@@ -2,16 +2,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
+use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
 use crate::LixError;
 use crate::Value;
-
-pub(crate) trait SchemaAnnotationEvaluator {
-    fn evaluate_schema_annotation_expression(
-        &self,
-        expression: &str,
-        variables: &JsonMap<String, JsonValue>,
-    ) -> Result<JsonValue, LixError>;
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LixcolOverrideValue {
@@ -37,6 +30,7 @@ pub(crate) fn collect_lixcol_overrides(
     schema: &JsonValue,
     schema_key: &str,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<Vec<LixcolOverride>, LixError> {
     reject_removed_lixcol_version_override(schema, schema_key)?;
 
@@ -51,7 +45,8 @@ pub(crate) fn collect_lixcol_overrides(
         "lixcol_untracked",
         "lixcol_writer_key",
     ] {
-        let Some(value) = extract_lixcol_scalar_override(schema, schema_key, key, evaluator)?
+        let Some(value) =
+            extract_lixcol_scalar_override(schema, schema_key, key, evaluator, functions)?
         else {
             continue;
         };
@@ -67,9 +62,10 @@ pub(crate) fn collect_state_column_overrides(
     schema: &JsonValue,
     schema_key: &str,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<BTreeMap<String, Value>, LixError> {
     let mut out = BTreeMap::new();
-    for override_entry in collect_lixcol_overrides(schema, schema_key, evaluator)? {
+    for override_entry in collect_lixcol_overrides(schema, schema_key, evaluator, functions)? {
         let Some(column) = entity_state_column_name(&override_entry.key) else {
             continue;
         };
@@ -85,9 +81,10 @@ pub(crate) fn collect_dynamic_entity_surface_overrides(
     schema: &JsonValue,
     schema_key: &str,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<Vec<DynamicEntitySurfaceOverride>, LixError> {
     let mut overrides = Vec::new();
-    for override_entry in collect_lixcol_overrides(schema, schema_key, evaluator)? {
+    for override_entry in collect_lixcol_overrides(schema, schema_key, evaluator, functions)? {
         let Some(column) = dynamic_entity_surface_column_name(&override_entry.key) else {
             continue;
         };
@@ -102,8 +99,14 @@ pub(crate) fn collect_dynamic_entity_surface_overrides(
 pub(crate) fn collect_state_column_overrides_with_shared_runtime(
     schema: &JsonValue,
     schema_key: &str,
+    functions: &DynFunctionProvider,
 ) -> Result<BTreeMap<String, Value>, LixError> {
-    collect_state_column_overrides(schema, schema_key, crate::runtime::cel::shared_runtime())
+    collect_state_column_overrides(
+        schema,
+        schema_key,
+        crate::services::cel_runtime::shared_runtime(),
+        functions,
+    )
 }
 
 fn raw_lixcol_override_expression<'a>(schema: &'a JsonValue, key: &str) -> Option<&'a str> {
@@ -136,6 +139,7 @@ fn evaluate_lixcol_override(
     schema_key: &str,
     key: &str,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<Option<JsonValue>, LixError> {
     let Some(raw_expression) = raw_lixcol_override_expression(schema, key) else {
         return Ok(None);
@@ -145,7 +149,7 @@ fn evaluate_lixcol_override(
         return Ok(None);
     }
     evaluator
-        .evaluate_schema_annotation_expression(expression, &JsonMap::new())
+        .evaluate_schema_annotation_expression(expression, &JsonMap::new(), functions)
         .map(Some)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -161,8 +165,10 @@ fn extract_lixcol_scalar_override(
     schema_key: &str,
     key: &str,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<Option<LixcolOverrideValue>, LixError> {
-    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator)? else {
+    let Some(value) = evaluate_lixcol_override(schema, schema_key, key, evaluator, functions)?
+    else {
         return Ok(None);
     };
     match value {
@@ -225,11 +231,18 @@ mod tests {
     use super::{
         collect_dynamic_entity_surface_overrides, DynamicEntitySurfaceOverride, LixcolOverrideValue,
     };
-    use crate::runtime::cel::shared_runtime;
+    use crate::contracts::{clone_boxed_function_provider, SharedFunctionProvider};
+    use crate::services::cel_runtime::shared_runtime;
+    use crate::services::functions::SystemFunctionProvider;
     use serde_json::json;
+
+    fn system_functions() -> crate::contracts::DynFunctionProvider {
+        clone_boxed_function_provider(&SharedFunctionProvider::new(SystemFunctionProvider))
+    }
 
     #[test]
     fn dynamic_entity_surface_overrides_map_lixcol_keys_to_surface_columns() {
+        let functions = system_functions();
         let overrides = collect_dynamic_entity_surface_overrides(
             &json!({
                 "x-lix-key": "message",
@@ -242,6 +255,7 @@ mod tests {
             }),
             "message",
             shared_runtime(),
+            &functions,
         )
         .expect("surface overrides should parse");
 
@@ -266,6 +280,7 @@ mod tests {
 
     #[test]
     fn dynamic_entity_surface_overrides_reject_removed_version_override() {
+        let functions = system_functions();
         let error = collect_dynamic_entity_surface_overrides(
             &json!({
                 "x-lix-key": "message",
@@ -275,6 +290,7 @@ mod tests {
             }),
             "message",
             shared_runtime(),
+            &functions,
         )
         .expect_err("removed version override should be rejected");
 

@@ -5,6 +5,8 @@ mod dependency;
 mod direct_read;
 mod directory;
 mod file;
+mod filesystem_query;
+mod public_surface_registry;
 mod read_surface;
 mod registry;
 mod scan;
@@ -17,10 +19,10 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
+use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, collect_dynamic_entity_surface_overrides,
     decode_lixcol_literal, DynamicEntitySurfaceOverride, LixcolOverrideValue,
-    SchemaAnnotationEvaluator,
 };
 use crate::LixError;
 
@@ -76,6 +78,10 @@ pub(crate) use file::{
     LixFileByVersionProjection,
 };
 #[allow(unused_imports)]
+pub(crate) use filesystem_query::*;
+#[allow(unused_imports)]
+pub(crate) use public_surface_registry::load_public_surface_registry_with_backend;
+#[allow(unused_imports)]
 pub(crate) use read_surface::{
     explicit_version_counterpart_surface_name, read_preparation_semantics,
     CatalogReadPreparationSemantics,
@@ -107,6 +113,7 @@ pub(crate) fn build_builtin_surface_registry() -> SurfaceRegistry {
 pub(crate) fn dynamic_entity_surface_spec_from_schema(
     schema: &JsonValue,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<DynamicEntitySurfaceSpec, LixError> {
     let schema_key = schema
         .get("x-lix-key")
@@ -145,7 +152,8 @@ pub(crate) fn dynamic_entity_surface_spec_from_schema(
         })
         .unwrap_or_default();
 
-    let predicate_overrides = collect_dynamic_override_predicates(schema, schema_key, evaluator)?;
+    let predicate_overrides =
+        collect_dynamic_override_predicates(schema, schema_key, evaluator, functions)?;
 
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
@@ -348,13 +356,16 @@ fn collect_dynamic_override_predicates(
     schema: &JsonValue,
     schema_key: &str,
     evaluator: &dyn SchemaAnnotationEvaluator,
+    functions: &DynFunctionProvider,
 ) -> Result<Vec<SurfaceOverridePredicate>, LixError> {
-    collect_dynamic_entity_surface_overrides(schema, schema_key, evaluator).map(|overrides| {
-        overrides
-            .into_iter()
-            .map(dynamic_surface_override_to_predicate)
-            .collect()
-    })
+    collect_dynamic_entity_surface_overrides(schema, schema_key, evaluator, functions).map(
+        |overrides| {
+            overrides
+                .into_iter()
+                .map(dynamic_surface_override_to_predicate)
+                .collect()
+        },
+    )
 }
 
 fn dynamic_surface_override_to_predicate(

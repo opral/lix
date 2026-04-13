@@ -5,9 +5,10 @@ use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, CanonicalChange, CanonicalStateIdentity,
     CanonicalStateRow,
 };
-use crate::contracts::{StateCommitStreamChange, StateCommitStreamOperation};
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::functions::LixFunctionProvider;
+use crate::contracts::LixFunctionProvider;
+use crate::contracts::{
+    ExecutionRuntimeState, StateCommitStreamChange, StateCommitStreamOperation,
+};
 use crate::session::version_ops::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };
@@ -331,7 +332,7 @@ async fn append_undo_redo_commit_in_transaction(
 ) -> Result<AppliedUndoRedoCommit, LixError> {
     let runtime_state = checkpoint_runtime_state(tx).await?;
     let mut functions = runtime_state.provider().clone();
-    crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+    crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut functions,
     )

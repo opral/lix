@@ -7,23 +7,20 @@ use std::sync::{Arc, OnceLock};
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
+use super::engine::Engine;
+use super::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::CompiledSchemaCache;
+use crate::contracts::SharedFunctionProvider;
+use crate::contracts::{CompiledSchemaCache, ExecutionRuntimeState, WasmRuntime};
 use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
 };
-use crate::runtime::deterministic_mode::{
+use crate::session::deterministic_mode::{
     global_deterministic_settings_storage_scope, parse_deterministic_settings_value,
     DeterministicSettings, RuntimeFunctionProvider,
 };
-use crate::runtime::functions::SharedFunctionProvider;
-use crate::runtime::streams::{
-    StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
-};
-use crate::runtime::wasm::WasmRuntime;
-use crate::runtime::Runtime;
 use crate::session::observe::observe_owned_session;
 use crate::streams::StateCommitStream as PublicStateCommitStream;
 use crate::{
@@ -101,7 +98,7 @@ pub struct InitResult {
 /// let rows = lix.execute("SELECT * FROM lix_state", &[]).await?;
 /// ```
 pub struct Lix {
-    runtime: Arc<Runtime>,
+    engine: Arc<Engine>,
     boot_key_values: Vec<BootKeyValue>,
     // `Lix` is the public shell around the workspace session. `Lix::open(...)`
     // populates this eagerly, while the hidden `Lix::boot(...)` path fills it after
@@ -112,7 +109,7 @@ pub struct Lix {
 impl Clone for Lix {
     fn clone(&self) -> Self {
         let cloned = Self {
-            runtime: Arc::clone(&self.runtime),
+            engine: Arc::clone(&self.engine),
             boot_key_values: self.boot_key_values.clone(),
             workspace_session: OnceLock::new(),
         };
@@ -130,7 +127,7 @@ impl Lix {
         let catalog_projection_registry =
             Arc::new(crate::catalog::builtin_catalog_projection_registry().clone());
         Self {
-            runtime: Arc::new(Runtime::new(
+            engine: Arc::new(Engine::new(
                 config.backend,
                 config.wasm_runtime,
                 config.access_to_internal,
@@ -143,12 +140,12 @@ impl Lix {
         }
     }
 
-    pub(crate) fn runtime(&self) -> &Arc<Runtime> {
-        &self.runtime
+    pub(crate) fn engine(&self) -> &Arc<Engine> {
+        &self.engine
     }
 
     pub(crate) fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
-        self.runtime.backend()
+        self.engine.backend()
     }
 
     pub(crate) fn boot_key_values(&self) -> &[BootKeyValue] {
@@ -156,19 +153,19 @@ impl Lix {
     }
 
     pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
-        self.runtime.public_surface_registry()
+        self.engine.public_surface_registry()
     }
 
     pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
-        self.runtime.install_public_surface_registry(registry);
+        self.engine.install_public_surface_registry(registry);
     }
 
     pub(crate) fn clear_public_surface_registry(&self) {
-        self.runtime.clear_public_surface_registry();
+        self.engine.clear_public_surface_registry();
     }
 
     pub(crate) async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
-        self.runtime
+        self.engine
             .load_public_surface_registry_from_backend()
             .await
     }
@@ -182,31 +179,31 @@ impl Lix {
     }
 
     pub(crate) fn catalog_projection_registry(&self) -> &Arc<CatalogProjectionRegistry> {
-        self.runtime.catalog_projection_registry()
+        self.engine.catalog_projection_registry()
     }
 
     pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
-        self.runtime.try_mark_init_in_progress()
+        self.engine.try_mark_init_in_progress()
     }
 
     pub(crate) fn deterministic_boot_pending(&self) -> bool {
-        self.runtime.deterministic_boot_pending()
+        self.engine.deterministic_boot_pending()
     }
 
     pub(crate) fn clear_deterministic_boot_pending(&self) {
-        self.runtime.clear_deterministic_boot_pending();
+        self.engine.clear_deterministic_boot_pending();
     }
 
     pub(crate) fn mark_init_completed(&self) {
-        self.runtime.mark_init_completed();
+        self.engine.mark_init_completed();
     }
 
     pub(crate) fn reset_init_state(&self) {
-        self.runtime.reset_init_state();
+        self.engine.reset_init_state();
     }
 
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        self.runtime.invalidate_installed_plugins_cache()
+        self.engine.invalidate_installed_plugins_cache()
     }
 
     pub(crate) async fn prepare_runtime_functions_with_backend(
@@ -220,7 +217,7 @@ impl Lix {
         LixError,
     > {
         let storage_scope = global_deterministic_settings_storage_scope();
-        self.runtime
+        self.engine
             .prepare_runtime_functions_with_backend(backend, &storage_scope)
             .await
     }
@@ -228,7 +225,7 @@ impl Lix {
     pub(crate) fn session_services(
         &self,
     ) -> Arc<dyn crate::session::collaborators::SessionServices> {
-        Arc::new(LixRuntimeSessionServices::new(Arc::clone(&self.runtime)))
+        Arc::new(LixEngineSessionServices::new(Arc::clone(&self.engine)))
     }
 
     pub(crate) async fn open_workspace_session(&self) -> Result<Session, LixError> {
@@ -476,7 +473,7 @@ impl Lix {
     }
 
     pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> PublicStateCommitStream {
-        self.runtime().state_commit_stream(filter)
+        self.engine().state_commit_stream(filter)
     }
 
     pub async fn live_state_projection_status(&self) -> Result<ProjectionStatus, LixError> {
@@ -505,9 +502,9 @@ impl Lix {
         let apply = crate::live_state::apply_rebuild_plan(self.backend().as_ref(), &plan).await?;
 
         if let Err(error) =
-            crate::execution::write::filesystem::materialize::materialize_file_data_with_plugins(
+            crate::execution::step::filesystem::materialize::materialize_file_data_with_plugins(
                 self.backend().as_ref(),
-                self.runtime().as_ref(),
+                self.engine().as_ref(),
                 &plan,
             )
             .await
@@ -548,12 +545,12 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
     }
 
     fn compiled_schema_cache(&self) -> &dyn crate::contracts::CompiledSchemaCache {
-        self.runtime().schema_cache()
+        self.engine().schema_cache()
     }
 
     fn sql_preparation_seed<'a>(
         &'a self,
-        functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+        functions: &'a crate::contracts::DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
     ) -> crate::sql::SqlPreparationSeed<'a> {
         crate::sql::SqlPreparationSeed {
@@ -566,18 +563,17 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
     async fn prepare_execution_runtime_state(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<crate::runtime::execution_state::ExecutionRuntimeState, LixError> {
+    ) -> Result<ExecutionRuntimeState, LixError> {
         let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(
-            crate::runtime::execution_state::ExecutionRuntimeState::from_prepared_parts(
-                settings, functions,
-            ),
-        )
+        Ok(ExecutionRuntimeState::from_prepared_parts(
+            settings.enabled,
+            &functions,
+        ))
     }
 }
 
 #[async_trait(?Send)]
-impl crate::execution::write::WriteExecutionBindings for Lix {
+impl crate::transaction::WriteExecutionBindings for Lix {
     async fn execute_prepared_public_read_with_pending_view(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
@@ -596,7 +592,7 @@ impl crate::execution::write::WriteExecutionBindings for Lix {
     async fn persist_binary_blob_writes_in_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        writes: &[crate::execution::write::filesystem::runtime::BinaryBlobWrite],
+        writes: &[crate::transaction::BinaryBlobWrite],
     ) -> Result<(), LixError> {
         crate::session::write_execution_bindings::persist_binary_blob_writes(transaction, writes)
             .await
@@ -624,7 +620,7 @@ impl crate::execution::write::WriteExecutionBindings for Lix {
     async fn execute_public_tracked_append_txn_with_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        unit: &crate::execution::write::buffered::TrackedTxnUnit,
+        unit: &crate::transaction::TrackedTxnUnit,
         pending_commit_session: Option<&mut Option<crate::contracts::PendingPublicCommitSession>>,
     ) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
         crate::session::write_execution_bindings::execute_public_tracked_append(
@@ -636,20 +632,20 @@ impl crate::execution::write::WriteExecutionBindings for Lix {
     }
 }
 
-pub(crate) struct LixRuntimeSessionServices {
-    runtime: Arc<Runtime>,
+pub(crate) struct LixEngineSessionServices {
+    engine: Arc<Engine>,
 }
 
-impl LixRuntimeSessionServices {
-    pub(crate) fn new(runtime: Arc<Runtime>) -> Self {
-        Self { runtime }
+impl LixEngineSessionServices {
+    pub(crate) fn new(engine: Arc<Engine>) -> Self {
+        Self { engine }
     }
 }
 
 #[async_trait(?Send)]
-impl crate::session::collaborators::SessionServices for LixRuntimeSessionServices {
+impl crate::session::collaborators::SessionServices for LixEngineSessionServices {
     async fn ensure_initialized(&self) -> Result<(), LixError> {
-        if crate::live_state::load_mode_with_backend(self.runtime.backend().as_ref()).await?
+        if crate::live_state::load_mode_with_backend(self.engine.backend().as_ref()).await?
             == crate::live_state::LiveStateMode::Uninitialized
         {
             return Err(crate::common::not_initialized_error());
@@ -658,48 +654,48 @@ impl crate::session::collaborators::SessionServices for LixRuntimeSessionService
     }
 
     fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
-        self.runtime.backend()
+        self.engine.backend()
     }
 
     fn access_to_internal(&self) -> bool {
-        self.runtime.access_to_internal()
+        self.engine.access_to_internal()
     }
 
     async fn begin_write_unit(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.runtime.begin_write_unit().await
+        self.engine.begin_write_unit().await
     }
 
     async fn begin_read_unit(
         &self,
         mode: TransactionMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.runtime.begin_read_unit(mode).await
+        self.engine.begin_read_unit(mode).await
     }
 
     fn public_surface_registry(&self) -> SurfaceRegistry {
-        self.runtime.public_surface_registry()
+        self.engine.public_surface_registry()
     }
 
     fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
-        self.runtime.install_public_surface_registry(registry);
+        self.engine.install_public_surface_registry(registry);
     }
 
     async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
-        self.runtime
+        self.engine
             .load_public_surface_registry_from_backend()
             .await
     }
 
     async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        self.runtime.backend().export_image(writer).await
+        self.engine.backend().export_image(writer).await
     }
 
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
-        self.runtime.catalog_projection_registry().as_ref()
+        self.engine.catalog_projection_registry().as_ref()
     }
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
-        self.runtime.schema_cache()
+        self.engine.schema_cache()
     }
 
     async fn prepare_runtime_functions_with_backend(
@@ -713,25 +709,25 @@ impl crate::session::collaborators::SessionServices for LixRuntimeSessionService
         LixError,
     > {
         let storage_scope = global_deterministic_settings_storage_scope();
-        self.runtime
+        self.engine
             .prepare_runtime_functions_with_backend(backend, &storage_scope)
             .await
     }
 
     fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
-        self.runtime.state_commit_stream(filter)
+        self.engine.state_commit_stream(filter)
     }
 
     fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.runtime.emit_state_commit_stream_changes(changes);
+        self.engine.emit_state_commit_stream_changes(changes);
     }
 
     fn invalidate_deterministic_settings_cache(&self) {
-        self.runtime.invalidate_deterministic_settings_cache();
+        self.engine.invalidate_deterministic_settings_cache();
     }
 
     fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        self.runtime.invalidate_installed_plugins_cache()
+        self.engine.invalidate_installed_plugins_cache()
     }
 }
 
@@ -760,7 +756,7 @@ fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
 mod tests {
     use super::should_invalidate_installed_plugins_cache_for_sql;
     use super::*;
-    use crate::runtime::wasm::NoopWasmRuntime;
+    use crate::services::wasm_runtime::NoopWasmRuntime;
     use crate::sql::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state,
         extract_explicit_transaction_script, is_query_only_statements, optimize_state_resolution,
@@ -979,7 +975,7 @@ mod tests {
 
         {
             let mut cache = lix
-                .runtime()
+                .engine()
                 .installed_plugins_cache()
                 .write()
                 .expect("installed plugins cache lock");
@@ -994,7 +990,7 @@ mod tests {
             .expect("mark plugin cache invalidation");
 
         assert!(
-            lix.runtime()
+            lix.engine()
                 .installed_plugins_cache()
                 .read()
                 .expect("installed plugins cache lock")
@@ -1006,7 +1002,7 @@ mod tests {
         assert!(commit_called.load(Ordering::SeqCst));
         assert!(!rollback_called.load(Ordering::SeqCst));
         assert!(
-            lix.runtime()
+            lix.engine()
                 .installed_plugins_cache()
                 .read()
                 .expect("installed plugins cache lock")
@@ -1034,7 +1030,7 @@ mod tests {
 
         {
             let mut cache = lix
-                .runtime()
+                .engine()
                 .installed_plugins_cache()
                 .write()
                 .expect("installed plugins cache lock");
@@ -1052,7 +1048,7 @@ mod tests {
         assert!(!commit_called.load(Ordering::SeqCst));
         assert!(rollback_called.load(Ordering::SeqCst));
         assert!(
-            lix.runtime()
+            lix.engine()
                 .installed_plugins_cache()
                 .read()
                 .expect("installed plugins cache lock")

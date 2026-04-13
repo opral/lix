@@ -949,7 +949,7 @@ mod tests {
         build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery,
         OBSERVE_TICK_POLL_INTERVAL,
     };
-    use crate::runtime::wasm::NoopWasmRuntime;
+    use crate::services::wasm_runtime::NoopWasmRuntime;
     use crate::{
         ExecuteOptions, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
         Session, SqlDialect, Value,

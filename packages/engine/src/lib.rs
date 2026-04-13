@@ -9,28 +9,28 @@ mod diagnostics;
 pub(crate) mod execution;
 mod init;
 pub mod live_state;
-mod runtime;
 mod schema;
+mod services;
 pub mod session;
 pub(crate) mod sql;
 #[cfg(test)]
 mod test_support;
+pub(crate) mod transaction;
 
 pub mod image {
     pub use crate::backend::{ImageChunkReader, ImageChunkWriter};
 }
 
 pub mod streams {
-    pub use crate::runtime::streams::{
+    pub use crate::api::streams::{
         StateCommitStream, StateCommitStreamBatch, StateCommitStreamChange,
         StateCommitStreamFilter, StateCommitStreamOperation,
     };
 }
 
 pub mod wasm {
-    pub use crate::runtime::wasm::{
-        NoopWasmRuntime, WasmComponentInstance, WasmLimits, WasmRuntime,
-    };
+    pub use crate::contracts::{WasmComponentInstance, WasmLimits, WasmRuntime};
+    pub use crate::services::wasm_runtime::NoopWasmRuntime;
 }
 
 pub use schema::{

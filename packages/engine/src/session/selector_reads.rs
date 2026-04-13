@@ -7,20 +7,20 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::PendingView;
 use crate::contracts::{
-    PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
+    DynFunctionProvider, PendingPublicReadExecutionBackend, PendingView, ReadExecutionBindings,
+    ReadTimeProjectionRow,
 };
 use crate::session::read_preparation::{
     bootstrap_prepared_public_read_collaborators,
     prepare_required_active_public_read_artifact_with_backend, PreparedPublicReadCollaborators,
 };
 use crate::session::state_selector::try_resolve_state_selector_rows_with_backend;
-use crate::session::write_resolution::{WriteResolveError, WriteSelectorResolver};
 use crate::sql::{
     public_selector_column_name, public_selector_version_column, CanonicalStateRowKey,
     PlannedWrite, ScopeProof,
 };
+use crate::transaction::{WriteResolveError, WriteSelectorResolver};
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 const GLOBAL_VERSION_ID: &str = "global";
@@ -37,9 +37,10 @@ impl<'a> SessionWriteSelectorResolver<'a> {
         backend: &'a dyn LixBackend,
         projection_registry: &'a CatalogProjectionRegistry,
         pending_view: Option<&'a dyn PendingView>,
+        functions: &DynFunctionProvider,
     ) -> Result<Self, LixError> {
         let prepared_read_collaborators =
-            bootstrap_prepared_public_read_collaborators(backend, pending_view).await?;
+            bootstrap_prepared_public_read_collaborators(backend, pending_view, functions).await?;
         Ok(Self {
             backend,
             projection_registry,

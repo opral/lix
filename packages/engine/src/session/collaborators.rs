@@ -4,14 +4,14 @@ use async_trait::async_trait;
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::{clone_boxed_function_provider, SharedFunctionProvider};
-use crate::image::ImageChunkWriter;
-use crate::runtime::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
-use crate::runtime::execution_state::ExecutionRuntimeState;
-use crate::runtime::streams::{
-    StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter,
+use crate::contracts::{
+    clone_boxed_function_provider, DynFunctionProvider, ExecutionRuntimeState,
+    SharedFunctionProvider,
 };
+use crate::image::ImageChunkWriter;
+use crate::session::deterministic_mode::{DeterministicSettings, RuntimeFunctionProvider};
 use crate::sql::SqlPreparationSeed;
+use crate::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode};
 
 #[async_trait(?Send)]
@@ -63,7 +63,7 @@ pub(crate) trait SessionServices: Send + Sync {
 
 #[async_trait(?Send)]
 pub(crate) trait WriteExecutionCollaborators:
-    crate::execution::write::WriteExecutionBindings
+    crate::transaction::WriteExecutionBindings
 {
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;
 
@@ -71,7 +71,7 @@ pub(crate) trait WriteExecutionCollaborators:
 
     fn sql_preparation_seed<'a>(
         &'a self,
-        functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+        functions: &'a DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
     ) -> SqlPreparationSeed<'a>;
 
@@ -144,7 +144,7 @@ impl SessionCollaborators {
 
     pub(crate) fn sql_preparation_seed<'a>(
         &'a self,
-        functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+        functions: &'a DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
     ) -> SqlPreparationSeed<'a> {
         SqlPreparationSeed {
@@ -160,7 +160,8 @@ impl SessionCollaborators {
     ) -> Result<ExecutionRuntimeState, LixError> {
         let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
         Ok(ExecutionRuntimeState::from_prepared_parts(
-            settings, functions,
+            settings.enabled,
+            &functions,
         ))
     }
 
@@ -248,7 +249,7 @@ impl WriteExecutionCollaborators for SessionCollaborators {
 
     fn sql_preparation_seed<'a>(
         &'a self,
-        functions: &'a SharedFunctionProvider<RuntimeFunctionProvider>,
+        functions: &'a DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
     ) -> SqlPreparationSeed<'a> {
         SessionCollaborators::sql_preparation_seed(self, functions, surface_registry)

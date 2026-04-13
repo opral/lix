@@ -22,15 +22,15 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "api",
             "execution",
             "init",
-            "runtime",
+            "services",
             "session",
             "sql",
         ],
     },
     ForbiddenDependencyRule {
         from_scope: "backend",
-        reason: "backend is a lower persistence owner; shared SQL helpers must move to neutral foundation and runtime must stay above it",
-        forbidden_scopes: &["runtime", "sql"],
+        reason: "backend is a lower persistence owner; shared SQL helpers must move to neutral foundation and services must stay above it",
+        forbidden_scopes: &["services", "sql"],
     },
     ForbiddenDependencyRule {
         from_scope: "contracts",
@@ -41,25 +41,37 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "execution",
             "api",
             "live_state",
-            "runtime",
+            "services",
             "session",
             "sql",
         ],
     },
     ForbiddenDependencyRule {
-        from_scope: "runtime",
-        reason: "runtime is a sidecar and must not reacquire execution, root-shell, workflow, or compiler owners; sealed live_state root APIs are allowed",
-        forbidden_scopes: &["execution", "api", "session", "sql"],
+        from_scope: "services",
+        reason: "services are leaf sidecar capabilities and may depend only on neutral foundations like common/contracts, not on engine composition or semantic owner roots",
+        forbidden_scopes: &[
+            "api",
+            "backend",
+            "canonical",
+            "catalog",
+            "diagnostics",
+            "execution",
+            "init",
+            "live_state",
+            "schema",
+            "session",
+            "sql",
+        ],
     },
     ForbiddenDependencyRule {
         from_scope: "live_state",
-        reason: "live_state is the generic projection engine and must not reacquire runtime sidecars or write orchestration owners",
-        forbidden_scopes: &["execution", "runtime"],
+        reason: "live_state is the generic projection engine and must not reacquire services sidecars or write orchestration owners",
+        forbidden_scopes: &["execution", "services"],
     },
     ForbiddenDependencyRule {
         from_scope: "sql",
-        reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or session/runtime owners directly; sealed owner-root query-contract APIs plus acyclic internal-relation inventory roots are allowed",
-        forbidden_scopes: &["backend", "execution", "runtime", "session"],
+        reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or session/services owners directly; sealed owner-root query-contract APIs plus acyclic internal-relation inventory roots are allowed",
+        forbidden_scopes: &["backend", "execution", "services", "session"],
     },
     ForbiddenDependencyRule {
         from_scope: "execution",
@@ -68,7 +80,7 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "canonical",
             "api",
             "init",
-            "runtime",
+            "services",
             "session",
             "sql",
         ],
@@ -86,7 +98,7 @@ const TARGET_CORE_MODULES: &[&str] = &[
     "contracts",
     "execution",
     "live_state",
-    "runtime",
+    "services",
     "session",
     "sql",
 ];
@@ -125,6 +137,12 @@ struct SealedOwnerViolation {
     imported_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ImportPathViolation {
+    importer_file: String,
+    imported_path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UseToken {
     DblColon,
@@ -137,6 +155,7 @@ enum UseToken {
 }
 
 const SEALED_OWNER_SNAPSHOT_PATH: &str = "tests/sealed_owner_violations.txt";
+const ALLOWED_SERVICE_FOUNDATION_ROOTS: &[&str] = &["common", "contracts"];
 
 fn engine_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1582,15 +1601,15 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
             if imported_path.len() < 2 {
                 continue;
             }
-            let owner_root = &imported_path[0];
+            let owner_root = imported_path[0].as_str();
             if owner_root == current_root {
                 continue;
             }
-
-            let Some(owner_child_modules) = child_modules.get(owner_root) else {
+            if sealed_owner_allows_importer(owner_root, &relative_path) {
                 continue;
-            };
-            if !owner_child_modules.contains(&imported_path[1]) {
+            }
+
+            if !violates_sealed_owner_boundary(owner_root, &imported_path, &child_modules) {
                 continue;
             }
 
@@ -1604,8 +1623,31 @@ fn current_sealed_owner_violations() -> Vec<SealedOwnerViolation> {
     violations.into_iter().collect()
 }
 
+fn violates_sealed_owner_boundary(
+    owner_root: &str,
+    imported_path: &[String],
+    child_modules: &BTreeMap<String, BTreeSet<String>>,
+) -> bool {
+    if sealed_owner_root_facade_owners().contains(owner_root) {
+        return true;
+    }
+
+    child_modules
+        .get(owner_root)
+        .is_some_and(|owner_child_modules| owner_child_modules.contains(&imported_path[1]))
+}
+
+fn sealed_owner_root_facade_owners() -> BTreeSet<&'static str> {
+    ["api"].into_iter().collect()
+}
+
+fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
+    matches!(owner_root, "api") && importer_file == "lib.rs"
+}
+
 fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
     [
+        "api",
         "binary_cas",
         "backend",
         "canonical",
@@ -1617,6 +1659,7 @@ fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
         "live_state",
         "schema",
         "sql",
+        "transaction",
     ]
     .into_iter()
     .collect()
@@ -1670,6 +1713,160 @@ fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -
     rendered
 }
 
+fn render_grouped_import_path_violations(violations: &[ImportPathViolation]) -> String {
+    let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for violation in violations {
+        grouped
+            .entry(violation.importer_file.as_str())
+            .or_default()
+            .push(violation.imported_path.as_str());
+    }
+
+    let mut rendered = String::new();
+    for (file, imported_paths) in grouped {
+        let _ = writeln!(&mut rendered, "{file}:");
+        for imported_path in imported_paths {
+            let _ = writeln!(&mut rendered, "  - {imported_path}");
+        }
+    }
+
+    rendered
+}
+
+fn top_level_module_set() -> HashSet<String> {
+    let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
+    parse_top_level_modules(&lib_source).into_iter().collect()
+}
+
+fn services_child_modules() -> BTreeSet<String> {
+    let Some(relative_path) = root_module_entry_relative_path("services") else {
+        panic!("expected a top-level `services` root when validating services structure rules");
+    };
+    let source = read_engine_source(&relative_path);
+    parse_declared_modules(&strip_test_code(&source))
+        .into_iter()
+        .collect()
+}
+
+fn current_services_direct_child_import_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let service_children = services_child_modules();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        let current_module_path = module_path_for_file(&relative_path);
+        if current_module_path
+            .first()
+            .is_some_and(|root| root == "services")
+        {
+            continue;
+        }
+
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path.first().is_none_or(|root| root != "services") {
+                continue;
+            }
+
+            let imported_child = imported_path.get(1);
+            let imports_declared_service_child =
+                imported_child.is_some_and(|child| service_children.contains(child));
+            let stays_within_direct_child_surface = imported_path.len() <= 3;
+            if imports_declared_service_child && stays_within_direct_child_surface {
+                continue;
+            }
+
+            violations.insert(ImportPathViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_services_external_dependency_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        let current_module_path = module_path_for_file(&relative_path);
+        if current_module_path
+            .first()
+            .is_none_or(|root| root != "services")
+        {
+            continue;
+        }
+
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            let Some(imported_root) = imported_path.first() else {
+                continue;
+            };
+            if imported_root == "services" {
+                continue;
+            }
+            if ALLOWED_SERVICE_FOUNDATION_ROOTS.contains(&imported_root.as_str()) {
+                continue;
+            }
+
+            violations.insert(ImportPathViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let service_children = services_child_modules();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        let current_module_path = module_path_for_file(&relative_path);
+        if current_module_path
+            .first()
+            .is_none_or(|root| root != "services")
+        {
+            continue;
+        }
+        let Some(current_child) = current_module_path.get(1) else {
+            continue;
+        };
+
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path.first().is_none_or(|root| root != "services") {
+                continue;
+            }
+            let Some(imported_child) = imported_path.get(1) else {
+                continue;
+            };
+            if !service_children.contains(imported_child) {
+                continue;
+            }
+            if imported_child == current_child {
+                continue;
+            }
+
+            violations.insert(ImportPathViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
 fn write_sealed_owner_violations_snapshot(rendered: &str) {
     let snapshot_path = engine_root().join(SEALED_OWNER_SNAPSHOT_PATH);
     if let Some(parent) = snapshot_path.parent() {
@@ -1705,5 +1902,46 @@ fn sealed_owner_whitelist_has_no_current_violations() {
         "owners marked sealed still have child-module import leaks.\n\nSealed owners: {}\n\nCurrent violations:\n{}",
         sealed_owners.iter().copied().collect::<Vec<_>>().join(", "),
         render_grouped_sealed_owner_violations(&violations),
+    );
+}
+
+// `services` intentionally does not get a giant root facade. Outside code may
+// depend on `services::child::*`, but not on deeper implementation paths.
+#[test]
+fn services_imports_are_limited_to_direct_child_namespaces() {
+    let violations = current_services_direct_child_import_violations();
+
+    assert!(
+        violations.is_empty(),
+        "outside `services/*`, imports into `services` must target a direct child capability namespace only.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
+    );
+}
+
+// Leaf `services/*` modules are standalone capabilities. They may depend on
+// neutral foundations like `common` and `contracts`, but not on engine
+// composition, semantic owners, or other top-level roots.
+#[test]
+fn services_has_no_external_root_dependencies() {
+    let violations = current_services_external_dependency_violations();
+
+    assert!(
+        violations.is_empty(),
+        "`services/*` leaf modules may only import neutral foundation roots (`common`, `contracts`) outside `services`.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
+    );
+}
+
+// Direct child `services/*` modules are also standalone relative to each
+// other. If two services need shared pieces, that code should move to neutral
+// ground or the capabilities should be merged.
+#[test]
+fn services_direct_children_do_not_import_sibling_services() {
+    let violations = current_services_sibling_dependency_violations();
+
+    assert!(
+        violations.is_empty(),
+        "direct child `services/*` modules must not import sibling service namespaces.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
     );
 }

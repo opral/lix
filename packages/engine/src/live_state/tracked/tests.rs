@@ -1,7 +1,6 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
-use crate::execution::write::transaction::{ReadContext, TransactionDelta, WriteTransaction};
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
 use crate::live_state::row_api::{load_exact_live_row, ExactLiveRowQuery, LiveRowSemantics};
@@ -11,6 +10,7 @@ use crate::live_state::tracked::{
     TrackedWriteRow,
 };
 use crate::session::workspace::init as init_workspace;
+use crate::transaction::{LiveStateWriteTransaction, ReadContext, TransactionDelta};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value,
 };
@@ -203,7 +203,7 @@ async fn commit_tracked_rows(
 ) -> Result<(), LixError> {
     let read_context = ReadContext::new(backend, backend, backend);
     let backend_txn = backend.begin_transaction(TransactionMode::Write).await?;
-    let mut write_tx = WriteTransaction::new(backend_txn, read_context);
+    let mut write_tx = LiveStateWriteTransaction::new(backend_txn, read_context);
     let schema_keys = rows
         .iter()
         .map(|row| row.schema_key.clone())
