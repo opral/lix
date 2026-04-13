@@ -124,7 +124,7 @@ pub(crate) fn lower_broad_public_read_for_execution(
 }
 
 pub(crate) fn broad_public_relation_supports_terminal_render(
-    binding: &ResolvedSurface,
+    binding: &ResolvedRelation,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
@@ -2610,13 +2610,13 @@ fn build_supported_public_read_surface_sql(
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
     let facade = crate::catalog::catalog_compiler_facade_for_registry(registry);
-    let Some(surface_binding) = facade.resolve_surface(surface_name) else {
+    let Some(resolved_relation) = facade.resolve_surface(surface_name) else {
         return Ok(None);
     };
 
-    match surface_binding.descriptor.surface_family {
+    match resolved_relation.descriptor.surface_family {
         SurfaceFamily::State => build_public_state_surface_sql(
-            &surface_binding,
+            &resolved_relation,
             registry,
             dialect,
             active_version_id,
@@ -2624,30 +2624,30 @@ fn build_supported_public_read_surface_sql(
         ),
         SurfaceFamily::Entity => build_entity_surface_sql_for_broad_lowering(
             dialect,
-            &surface_binding,
+            &resolved_relation,
             active_version_id,
             known_live_layouts,
         ),
         SurfaceFamily::Filesystem => build_nested_filesystem_surface_sql(
             dialect,
             active_version_id,
-            &surface_binding.descriptor.public_name,
+            &resolved_relation.descriptor.public_name,
         ),
-        SurfaceFamily::Admin => build_public_admin_surface_sql(dialect, &surface_binding),
+        SurfaceFamily::Admin => build_public_admin_surface_sql(dialect, &resolved_relation),
         SurfaceFamily::Change => {
-            build_public_change_surface_sql(dialect, &surface_binding, active_version_id)
+            build_public_change_surface_sql(dialect, &resolved_relation, active_version_id)
         }
     }
 }
 
 fn build_public_state_surface_sql(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
-    let Some(state_scan) = CanonicalStateScan::from_resolved_surface(surface_binding.clone())
+    let Some(state_scan) = CanonicalStateScan::from_resolved_relation(resolved_relation.clone())
     else {
         return Ok(None);
     };
@@ -2662,11 +2662,11 @@ fn build_public_state_surface_sql(
         include_untracked_overlay: true,
         include_tombstones: state_scan.include_tombstones,
         predicate_classes: Vec::new(),
-        required_columns: surface_binding
+        required_columns: resolved_relation
             .descriptor
             .visible_columns
             .iter()
-            .chain(surface_binding.descriptor.hidden_columns.iter())
+            .chain(resolved_relation.descriptor.hidden_columns.iter())
             .cloned()
             .collect(),
     };
@@ -2676,7 +2676,7 @@ fn build_public_state_surface_sql(
     build_state_source_sql(
         dialect,
         active_version_id,
-        surface_binding,
+        resolved_relation,
         &request,
         &[],
         known_live_layouts,
@@ -2685,9 +2685,9 @@ fn build_public_state_surface_sql(
 
 fn build_public_admin_surface_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Result<Option<String>, LixError> {
-    let Some(admin_scan) = CanonicalAdminScan::from_resolved_surface(surface_binding.clone())
+    let Some(admin_scan) = CanonicalAdminScan::from_resolved_relation(resolved_relation.clone())
     else {
         return Ok(None);
     };
@@ -2696,10 +2696,10 @@ fn build_public_admin_surface_sql(
 
 fn build_public_change_surface_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     active_version_id: Option<&str>,
 ) -> Result<Option<String>, LixError> {
-    if CanonicalWorkingChangesScan::from_resolved_surface(surface_binding.clone()).is_some() {
+    if CanonicalWorkingChangesScan::from_resolved_relation(resolved_relation.clone()).is_some() {
         let Some(active_version_id) = active_version_id else {
             return Ok(None);
         };
@@ -2708,7 +2708,7 @@ fn build_public_change_surface_sql(
             active_version_id,
         )));
     }
-    if CanonicalChangeScan::from_resolved_surface(surface_binding.clone()).is_some() {
+    if CanonicalChangeScan::from_resolved_relation(resolved_relation.clone()).is_some() {
         return Ok(Some(build_change_source_sql()));
     }
     Ok(None)
@@ -2716,16 +2716,20 @@ fn build_public_change_surface_sql(
 
 fn build_entity_surface_sql_for_broad_lowering(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     active_version_id: Option<&str>,
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
-    let Some(schema_key) = surface_binding.implicit_overrides.fixed_schema_key.clone() else {
+    let Some(schema_key) = resolved_relation
+        .implicit_overrides
+        .fixed_schema_key
+        .clone()
+    else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "public-surface lowering requires fixed schema binding for '{}'",
-                surface_binding.descriptor.public_name
+                resolved_relation.descriptor.public_name
             ),
         });
     };
@@ -2734,13 +2738,13 @@ fn build_entity_surface_sql_for_broad_lowering(
     {
         return Ok(None);
     }
-    let Some(state_scan) = CanonicalStateScan::from_resolved_surface(surface_binding.clone())
+    let Some(state_scan) = CanonicalStateScan::from_resolved_relation(resolved_relation.clone())
     else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "public-surface lowering could not build canonical state scan for '{}'",
-                surface_binding.descriptor.public_name
+                resolved_relation.descriptor.public_name
             ),
         });
     };
@@ -2751,11 +2755,11 @@ fn build_entity_surface_sql_for_broad_lowering(
         include_untracked_overlay: true,
         include_tombstones: state_scan.include_tombstones,
         predicate_classes: Vec::new(),
-        required_columns: surface_binding
+        required_columns: resolved_relation
             .descriptor
             .visible_columns
             .iter()
-            .chain(surface_binding.descriptor.hidden_columns.iter())
+            .chain(resolved_relation.descriptor.hidden_columns.iter())
             .cloned()
             .collect(),
     };
@@ -2766,7 +2770,7 @@ fn build_entity_surface_sql_for_broad_lowering(
         build_entity_source_sql(
             dialect,
             active_version_id,
-            surface_binding,
+            resolved_relation,
             &request,
             &[],
             known_live_layouts,
@@ -2775,7 +2779,7 @@ fn build_entity_surface_sql_for_broad_lowering(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "public-surface lowering could not lower entity surface '{}'",
-                surface_binding.descriptor.public_name
+                resolved_relation.descriptor.public_name
             ),
         })?,
     ))

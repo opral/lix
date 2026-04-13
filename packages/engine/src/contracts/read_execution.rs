@@ -24,7 +24,7 @@ pub trait ReadExecutionHost {
 
 #[async_trait(?Send)]
 pub trait PendingPublicReadHost {
-    async fn execute_prepared_public_read_with_pending_overlay(
+    async fn execute_pending_overlay_public_read(
         &self,
         host: &dyn ReadExecutionHost,
         pending_overlay: Option<&dyn PendingOverlay>,

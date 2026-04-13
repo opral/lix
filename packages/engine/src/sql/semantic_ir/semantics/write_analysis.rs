@@ -1,6 +1,6 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationBinding,
-    FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedSurface,
+    FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedRelation,
     SurfaceOverrideValue,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
@@ -71,7 +71,7 @@ pub(crate) fn analyze_write(
 fn analyze_filesystem_write_intent(
     canonicalized: &CanonicalizedWrite,
 ) -> Result<Option<FilesystemWriteIntent>, WriteAnalysisError> {
-    let filesystem_kind = filesystem_surface_kind(&canonicalized.surface_binding)?;
+    let filesystem_kind = filesystem_surface_kind(&canonicalized.resolved_relation)?;
     match (
         filesystem_kind,
         canonicalized.write_command.operation_kind,
@@ -144,7 +144,7 @@ fn analyze_write_scope(
         return Ok(ScopeProof::SingleVersion(version_id));
     }
 
-    match canonicalized.surface_binding.default_scope {
+    match canonicalized.resolved_relation.default_scope {
         crate::catalog::DefaultScopeSemantics::ActiveVersion => {
             if canonicalized
                 .write_command
@@ -171,7 +171,7 @@ fn insert_scope_proof(canonicalized: &CanonicalizedWrite) -> Option<ScopeProof> 
         return None;
     };
 
-    Some(match canonicalized.surface_binding.default_scope {
+    Some(match canonicalized.resolved_relation.default_scope {
         crate::catalog::DefaultScopeSemantics::ActiveVersion => {
             insert_scope_for_active_version_surface(canonicalized, rows)
         }
@@ -483,7 +483,7 @@ fn forced_write_version_id(canonicalized: &CanonicalizedWrite) -> Option<String>
 
 fn surface_forces_global_scope(canonicalized: &CanonicalizedWrite) -> bool {
     canonicalized
-        .surface_binding
+        .resolved_relation
         .implicit_overrides
         .predicate_overrides
         .iter()
@@ -498,7 +498,7 @@ fn derive_write_schema_facts(canonicalized: &CanonicalizedWrite) -> SchemaProof 
     }
 
     if let Some(schema_key) = canonicalized
-        .surface_binding
+        .resolved_relation
         .implicit_overrides
         .fixed_schema_key
         .clone()
@@ -513,7 +513,7 @@ fn derive_write_schema_facts(canonicalized: &CanonicalizedWrite) -> SchemaProof 
 }
 
 fn derive_write_target_facts(canonicalized: &CanonicalizedWrite) -> Option<TargetSetProof> {
-    let target_key = match canonicalized.surface_binding.descriptor.surface_family {
+    let target_key = match canonicalized.resolved_relation.descriptor.surface_family {
         crate::catalog::SurfaceFamily::Filesystem | crate::catalog::SurfaceFamily::Admin => "id",
         _ => "entity_id",
     };
@@ -523,7 +523,7 @@ fn derive_write_target_facts(canonicalized: &CanonicalizedWrite) -> Option<Targe
 }
 
 fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<String> {
-    let binding = filesystem_surface_binding(&canonicalized.surface_binding)
+    let binding = filesystem_surface_binding(&canonicalized.resolved_relation)
         .ok()
         .flatten()?;
     Some(match binding.kind {
@@ -533,10 +533,10 @@ fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<Str
 }
 
 fn filesystem_surface_binding(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Result<Option<FilesystemRelationBinding>, WriteAnalysisError> {
     let Some(binding) = builtin_catalog_compiler_facade()
-        .bind_surface_runtime_relation(surface_binding, RelationBindContext::default())
+        .bind_surface_runtime_relation(resolved_relation, RelationBindContext::default())
         .map_err(|error| WriteAnalysisError {
             message: error.description,
         })?
@@ -551,9 +551,9 @@ fn filesystem_surface_binding(
 }
 
 fn filesystem_surface_kind(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Result<Option<FilesystemRelationKind>, WriteAnalysisError> {
-    Ok(filesystem_surface_binding(surface_binding)?.map(|binding| binding.kind))
+    Ok(filesystem_surface_binding(resolved_relation)?.map(|binding| binding.kind))
 }
 
 fn write_text_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<String> {

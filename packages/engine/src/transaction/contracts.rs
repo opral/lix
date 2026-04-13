@@ -133,7 +133,7 @@ pub(crate) trait WriteExecutionContext {
         backend: &dyn LixBackend,
     ) -> Result<FunctionBindings, LixError>;
 
-    async fn execute_prepared_public_read_with_pending_overlay(
+    async fn execute_pending_overlay_public_read(
         &self,
         transaction: &mut dyn LixBackendTransaction,
         pending_overlay: Option<&dyn PendingOverlay>,

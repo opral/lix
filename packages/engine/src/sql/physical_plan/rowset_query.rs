@@ -67,7 +67,7 @@ pub(crate) fn try_compile_read_time_projection_read(
 ) -> Option<ReadTimeProjectionPlan> {
     let structured_read = surface_read_plan.structured_read();
     let surface_name = structured_read
-        .surface_binding
+        .resolved_relation
         .descriptor
         .public_name
         .clone();

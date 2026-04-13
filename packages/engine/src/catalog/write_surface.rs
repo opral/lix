@@ -1,6 +1,6 @@
 use crate::catalog::{
     bind_surface_relation, DefaultScopeSemantics, FilesystemProjectionScope,
-    FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedSurface, SurfaceFamily,
+    FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedRelation, SurfaceFamily,
 };
 use crate::LixError;
 
@@ -41,16 +41,16 @@ pub(crate) struct CatalogWriteSurfaceSemantics {
 }
 
 pub(crate) fn write_surface_semantics(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError> {
-    if !surface_binding.resolution_capabilities.semantic_write {
+    if !resolved_relation.resolution_capabilities.semantic_write {
         return Ok(None);
     }
 
-    let semantics = match surface_binding.descriptor.surface_family {
+    let semantics = match resolved_relation.descriptor.surface_family {
         SurfaceFamily::State => Some(CatalogWriteSurfaceSemantics {
             target_kind: CatalogWriteTargetKind::State,
-            version_semantics: state_version_semantics(surface_binding),
+            version_semantics: state_version_semantics(resolved_relation),
             filesystem_kind: None,
             filesystem_scope: None,
             supports_untracked_writes: true,
@@ -58,14 +58,14 @@ pub(crate) fn write_surface_semantics(
         }),
         SurfaceFamily::Entity => Some(CatalogWriteSurfaceSemantics {
             target_kind: CatalogWriteTargetKind::Entity,
-            version_semantics: version_semantics_for_binding(surface_binding),
+            version_semantics: version_semantics_for_binding(resolved_relation),
             filesystem_kind: None,
             filesystem_scope: None,
             supports_untracked_writes: true,
             admin_behavior: None,
         }),
-        SurfaceFamily::Filesystem => filesystem_write_surface_semantics(surface_binding)?,
-        SurfaceFamily::Admin => admin_write_surface_semantics(surface_binding),
+        SurfaceFamily::Filesystem => filesystem_write_surface_semantics(resolved_relation)?,
+        SurfaceFamily::Admin => admin_write_surface_semantics(resolved_relation),
         SurfaceFamily::Change => None,
     };
 
@@ -73,10 +73,10 @@ pub(crate) fn write_surface_semantics(
 }
 
 fn filesystem_write_surface_semantics(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Result<Option<CatalogWriteSurfaceSemantics>, LixError> {
     let Some(RelationBinding::FilesystemRelation(binding)) =
-        bind_surface_relation(surface_binding, RelationBindContext::default())?
+        bind_surface_relation(resolved_relation, RelationBindContext::default())?
     else {
         return Ok(None);
     };
@@ -99,10 +99,10 @@ fn filesystem_write_surface_semantics(
 }
 
 fn admin_write_surface_semantics(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Option<CatalogWriteSurfaceSemantics> {
-    (surface_binding.descriptor.surface_family == SurfaceFamily::Admin
-        && surface_binding.default_scope == DefaultScopeSemantics::GlobalAdmin)
+    (resolved_relation.descriptor.surface_family == SurfaceFamily::Admin
+        && resolved_relation.default_scope == DefaultScopeSemantics::GlobalAdmin)
         .then_some(CatalogWriteSurfaceSemantics {
             target_kind: CatalogWriteTargetKind::Admin,
             version_semantics: CatalogWriteVersionSemantics::GlobalAdmin,
@@ -114,9 +114,9 @@ fn admin_write_surface_semantics(
 }
 
 fn version_semantics_for_binding(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> CatalogWriteVersionSemantics {
-    match surface_binding.default_scope {
+    match resolved_relation.default_scope {
         crate::catalog::DefaultScopeSemantics::ActiveVersion => {
             CatalogWriteVersionSemantics::ActiveVersionDefault
         }
@@ -133,16 +133,16 @@ fn version_semantics_for_binding(
     }
 }
 
-fn state_version_semantics(surface_binding: &ResolvedSurface) -> CatalogWriteVersionSemantics {
-    if surface_binding.default_scope == DefaultScopeSemantics::ActiveVersion
-        && !surface_binding
+fn state_version_semantics(resolved_relation: &ResolvedRelation) -> CatalogWriteVersionSemantics {
+    if resolved_relation.default_scope == DefaultScopeSemantics::ActiveVersion
+        && !resolved_relation
             .descriptor
             .surface_traits
             .exposes_version_column
     {
         CatalogWriteVersionSemantics::ActiveVersionDefaultRejectedVersionId
     } else {
-        version_semantics_for_binding(surface_binding)
+        version_semantics_for_binding(resolved_relation)
     }
 }
 

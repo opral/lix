@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 use crate::catalog::{
     bind_surface_relation, CatalogHistoryReadSemantics, CatalogProjectionInputVersionScope,
     CatalogProjectionRegistry, FilesystemRelationBinding, FilesystemRelationKind,
-    RelationBindContext, RelationBinding, ResolvedSurface, SchemaRelationBinding, SurfaceFamily,
+    RelationBindContext, RelationBinding, ResolvedRelation, SchemaRelationBinding, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant, VersionRelationBinding,
 };
 use crate::contracts::SessionDependency;
@@ -111,24 +111,24 @@ pub(crate) fn dependency_metadata_for_surface_name(
 
 pub(crate) fn dependency_metadata_for_surface_binding(
     declarations: &CatalogProjectionRegistry,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError> {
     let mut metadata = CatalogSurfaceDependencyMetadata::default();
     metadata.note_public_surface_registry();
-    metadata.merge_relation_name(surface_binding.descriptor.public_name.clone());
+    metadata.merge_relation_name(resolved_relation.descriptor.public_name.clone());
 
-    if metadata.merge_projection_inputs(&surface_binding.descriptor.public_name, declarations) {
+    if metadata.merge_projection_inputs(&resolved_relation.descriptor.public_name, declarations) {
         return Ok(Some(metadata));
     }
 
-    let bound_relation = bind_surface_relation(surface_binding, RelationBindContext::default())?;
+    let bound_relation = bind_surface_relation(resolved_relation, RelationBindContext::default())?;
     match bound_relation {
         Some(RelationBinding::SchemaRelation(binding)) => {
             metadata.merge_schema_relation(&binding);
             if matches!(
                 (
-                    surface_binding.descriptor.surface_family,
-                    surface_binding.descriptor.surface_variant,
+                    resolved_relation.descriptor.surface_family,
+                    resolved_relation.descriptor.surface_variant,
                 ),
                 (
                     SurfaceFamily::State | SurfaceFamily::Entity,
@@ -148,11 +148,11 @@ pub(crate) fn dependency_metadata_for_surface_binding(
             Ok(Some(metadata))
         }
         None => match (
-            surface_binding.descriptor.surface_family,
-            surface_binding.descriptor.surface_variant,
+            resolved_relation.descriptor.surface_family,
+            resolved_relation.descriptor.surface_variant,
         ) {
             (SurfaceFamily::Filesystem, SurfaceVariant::History) => {
-                match crate::catalog::history_read_semantics(surface_binding) {
+                match crate::catalog::history_read_semantics(resolved_relation) {
                     Some(CatalogHistoryReadSemantics::FileHistory {
                         active_version_lineage,
                     }) => {
@@ -183,7 +183,7 @@ pub(crate) fn dependency_metadata_for_surface_binding(
                 Ok(Some(metadata))
             }
             (SurfaceFamily::Change, _)
-                if surface_binding
+                if resolved_relation
                     .descriptor
                     .resolution_capabilities
                     .canonical_change_scan =>

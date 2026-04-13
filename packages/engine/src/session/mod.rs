@@ -6,19 +6,19 @@
 //! from canonical version refs and committed graph state.
 
 pub(crate) mod checkpoint_ops;
+pub(crate) mod compiler_state;
 pub(crate) mod deterministic_mode;
-pub(crate) mod execution_state;
 pub(crate) mod host;
 mod init;
 pub(crate) mod observe;
-pub(crate) mod pending_reads;
+pub(crate) mod pending_overlay_public_reads;
 pub(crate) mod plugin;
+pub(crate) mod plugin_install_writes;
 pub(crate) mod public_read_execution;
 pub(crate) mod public_read_preparation;
 mod public_surface_registry;
 mod selector_reads;
-pub(crate) mod semantic_write;
-pub(crate) mod state_selector;
+pub(crate) mod state_write_target_resolver;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
 pub(crate) mod write_execution_context;
@@ -41,18 +41,18 @@ use crate::contracts::{
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::read::execute_prepared_read_batch_in_committed_read_transaction;
 use crate::image::ImageChunkWriter;
-use crate::session::execution_state::{
-    SessionCompilerCache, SessionCompilerCacheHandle, SessionExecutionState,
+use crate::session::compiler_state::{
+    SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
 };
 use crate::session::host::{
     prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
     SessionHost,
 };
+use crate::session::plugin_install_writes::{
+    prepare_registered_schema_write_statement, PluginInstallWriteContext,
+};
 pub(crate) use crate::session::public_surface_registry::apply_registered_schema_snapshot_to_surface_registry;
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
-use crate::session::semantic_write::{
-    prepare_registered_schema_write_statement, SemanticWriteContext,
-};
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
@@ -118,7 +118,7 @@ pub struct SessionTransaction<'a> {
     session_host: &'a dyn SessionHost,
     session: &'a Session,
     pub(crate) write_transaction: Option<BufferedWriteTransaction<'a>>,
-    pub(crate) context: SessionExecutionState,
+    pub(crate) context: SessionCompilerState,
 }
 
 impl Session {
@@ -352,8 +352,8 @@ impl Session {
         self.session_host.export_image(writer).await
     }
 
-    pub(crate) fn new_execution_state(&self, options: ExecuteOptions) -> SessionExecutionState {
-        SessionExecutionState::new(
+    pub(crate) fn new_compiler_state(&self, options: ExecuteOptions) -> SessionCompilerState {
+        SessionCompilerState::new(
             options,
             self.public_surface_registry(),
             Arc::clone(&self.compiler_cache),
@@ -441,7 +441,7 @@ impl Session {
             return Err(transaction_control_statement_denied_error());
         }
 
-        let mut context = self.new_execution_state(options);
+        let mut context = self.new_compiler_state(options);
         let runtime_bindings = context.runtime_binding_values()?;
         let statement_batch = StatementBatch::compile(
             parsed_statements,
@@ -607,16 +607,13 @@ impl Session {
                     Ok(result) => {
                         context.clear_function_bindings();
                         let outcome = write_transaction
-                            .commit_buffered_write(
-                                &execution_context,
-                                context.buffered_write_execution_input(),
-                            )
+                            .commit(&execution_context, context.buffered_write_execution_input())
                             .await?;
                         self.apply_transaction_commit_outcome(outcome).await?;
                         Ok(result)
                     }
                     Err(error) => {
-                        let _ = write_transaction.rollback_buffered_write().await;
+                        let _ = write_transaction.rollback().await;
                         context.clear_function_bindings();
                         Err(error)
                     }
@@ -635,7 +632,7 @@ impl Session {
             session_host: self.session_host.as_ref(),
             session: self,
             write_transaction: Some(BufferedWriteTransaction::new(transaction)),
-            context: self.new_execution_state(options),
+            context: self.new_compiler_state(options),
         })
     }
 
@@ -802,7 +799,7 @@ fn baseline_committed_read_transaction_mode(
 }
 
 fn committed_read_context<'a>(
-    context: &'a SessionExecutionState,
+    context: &'a SessionCompilerState,
     session_host: &'a dyn SessionHost,
     function_bindings: &'a FunctionBindings,
     execution_mode: SessionExecutionMode,
@@ -896,7 +893,7 @@ impl<'a> SessionTransaction<'a> {
             &mut self.context,
         )
         .await?;
-        let semantic_context = SemanticWriteContext::new(
+        let plugin_install_context = PluginInstallWriteContext::new(
             prepared_write_function_bindings_for_execution(
                 self.context
                     .function_bindings()
@@ -906,7 +903,7 @@ impl<'a> SessionTransaction<'a> {
             self.context.active_account_ids.clone(),
             self.context.options.writer_key.clone(),
         );
-        let statement = prepare_registered_schema_write_statement(schema, &semantic_context)?;
+        let statement = prepare_registered_schema_write_statement(schema, &plugin_install_context)?;
         let write_transaction = self
             .write_transaction
             .as_mut()
@@ -975,7 +972,7 @@ impl<'a> SessionTransaction<'a> {
         })?;
         let execution_context = self.execution_context();
         let outcome = write_transaction
-            .commit_buffered_write(
+            .commit(
                 &execution_context,
                 self.context.buffered_write_execution_input(),
             )
@@ -988,7 +985,7 @@ impl<'a> SessionTransaction<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
         })?;
-        write_transaction.rollback_buffered_write().await
+        write_transaction.rollback().await
     }
 
     #[allow(dead_code)]
@@ -1297,7 +1294,7 @@ mod tests {
             let parsed_statements =
                 parse_sql("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
             let runtime_bindings = session
-                .new_execution_state(ExecuteOptions::default())
+                .new_compiler_state(ExecuteOptions::default())
                 .runtime_binding_values()
                 .expect("runtime bindings should succeed");
             let statement_batch = StatementBatch::compile(

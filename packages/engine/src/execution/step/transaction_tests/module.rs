@@ -9,7 +9,7 @@ use crate::live_state::untracked::{
     UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::live_state::writer_key::WRITER_KEY_TABLE;
-use crate::transaction::{LiveStateWriteTransaction, ReadContext, TransactionDelta};
+use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
     Value,
@@ -256,7 +256,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     init_workspace(&backend)
         .await
         .expect("workspace init should succeed");
-    let read_context = ReadContext::new(&backend, &backend, &backend);
+    let read_context = OverlayReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await
@@ -328,7 +328,7 @@ async fn isolated_transaction_rejects_staging_after_execute() {
     init_workspace(&backend)
         .await
         .expect("workspace init should succeed");
-    let read_context = ReadContext::new(&backend, &backend, &backend);
+    let read_context = OverlayReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await
@@ -365,7 +365,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     init_workspace(&backend)
         .await
         .expect("workspace init should succeed");
-    let read_context = ReadContext::new(&backend, &backend, &backend);
+    let read_context = OverlayReadContext::new(&backend, &backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await

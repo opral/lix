@@ -1292,7 +1292,7 @@ mod tests {
                 .expect("initial poll should succeed");
             assert_eq!(observe_query_hits.load(Ordering::SeqCst), 1);
 
-            let mut context = session.new_execution_state(ExecuteOptions::default());
+            let mut context = session.new_compiler_state(ExecuteOptions::default());
             context.bump_public_surface_registry_generation();
 
             state

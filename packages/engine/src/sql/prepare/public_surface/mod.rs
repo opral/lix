@@ -71,7 +71,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PublicReadPlan {
     pub(crate) freshness_contract: SurfaceReadFreshness,
-    pub(crate) surface_bindings: Vec<String>,
+    pub(crate) resolved_relations: Vec<String>,
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PublicReadPhysicalPlan,
     pub(crate) bound_parameters: Vec<Value>,
@@ -112,8 +112,8 @@ impl PublicReadPlan {
     }
 
     #[cfg(test)]
-    pub(crate) fn surface_bindings(&self) -> &[String] {
-        &self.surface_bindings
+    pub(crate) fn resolved_relations(&self) -> &[String] {
+        &self.resolved_relations
     }
 }
 
@@ -123,7 +123,7 @@ pub(crate) struct PublicWritePlan {
     pub(crate) planned_write: PlannedWrite,
     pub(crate) explain_plan: PreparedPublicWriteExplainPlan,
     pub(crate) change_batches: Vec<ChangeBatch>,
-    pub(crate) surface_bindings: Vec<String>,
+    pub(crate) resolved_relations: Vec<String>,
     pub(crate) execution: PublicWritePhysicalPlan,
     pub(crate) explain: ExplainArtifacts,
 }
@@ -158,7 +158,7 @@ pub(crate) enum PublicPlanKind {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BoundPublicReadSummary {
-    bound_surface_bindings: Vec<crate::catalog::ResolvedSurface>,
+    bound_surface_bindings: Vec<crate::catalog::ResolvedRelation>,
     internal_relations: Vec<String>,
     external_relations: Vec<String>,
     requested_history_root_commit_ids: Vec<String>,
@@ -629,7 +629,7 @@ fn merge_surface_read_freshness(
 }
 
 fn bound_surface_freshness_contract(
-    bindings: &[crate::catalog::ResolvedSurface],
+    bindings: &[crate::catalog::ResolvedRelation],
 ) -> Option<SurfaceReadFreshness> {
     let mut bindings = bindings.iter();
     let first = bindings.next()?;
@@ -1229,7 +1229,11 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         planned_write,
         explain_plan,
         change_batches: Vec::new(),
-        surface_bindings: vec![canonicalized.surface_binding.descriptor.public_name.clone()],
+        resolved_relations: vec![canonicalized
+            .resolved_relation
+            .descriptor
+            .public_name
+            .clone()],
         execution,
         canonicalized: canonicalized.clone(),
     }))
@@ -1529,19 +1533,19 @@ pub(crate) fn public_write_preparation_error(
     message: &str,
 ) -> Option<LixError> {
     public_write_preparation_error_for_surface(
-        &canonicalized.surface_binding,
+        &canonicalized.resolved_relation,
         canonicalized.write_command.operation_kind,
         message,
     )
 }
 
 fn public_write_preparation_error_for_surface(
-    surface_binding: &crate::catalog::ResolvedSurface,
+    resolved_relation: &crate::catalog::ResolvedRelation,
     operation_kind: WriteOperationKind,
     message: &str,
 ) -> Option<LixError> {
-    let public_name = surface_binding.descriptor.public_name.as_str();
-    if surface_binding.descriptor.capability == SurfaceCapability::ReadOnly
+    let public_name = resolved_relation.descriptor.public_name.as_str();
+    if resolved_relation.descriptor.capability == SurfaceCapability::ReadOnly
         || message.contains("is not writable in public lowering")
         || message.contains("is not writable in public write planning")
         || message.contains("does not support INSERT")
@@ -1564,7 +1568,7 @@ fn public_write_preparation_error_for_surface(
     if (message.contains("write analysis requires version_id")
         || message.contains("requires a concrete version_id"))
         && builtin_catalog_compiler_facade()
-            .write_surface_semantics(surface_binding)
+            .write_surface_semantics(resolved_relation)
             .ok()
             .flatten()
             .is_some_and(|semantics| {
@@ -1582,26 +1586,26 @@ fn public_write_preparation_error_for_surface(
         ));
     }
 
-    match surface_binding.descriptor.surface_family {
+    match resolved_relation.descriptor.surface_family {
         SurfaceFamily::Filesystem => Some(public_filesystem_write_error(public_name, message)),
         SurfaceFamily::State | SurfaceFamily::Entity => {
             Some(LixError::new("LIX_ERROR_UNKNOWN", message))
         }
         SurfaceFamily::Admin => Some(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            normalize_admin_public_write_message(surface_binding, message),
+            normalize_admin_public_write_message(resolved_relation, message),
         )),
         _ => None,
     }
 }
 
 fn normalize_admin_public_write_message<'a>(
-    surface_binding: &crate::catalog::ResolvedSurface,
+    resolved_relation: &crate::catalog::ResolvedRelation,
     message: &'a str,
 ) -> std::borrow::Cow<'a, str> {
-    let public_name = surface_binding.descriptor.public_name.as_str();
+    let public_name = resolved_relation.descriptor.public_name.as_str();
     match builtin_catalog_compiler_facade()
-        .write_surface_semantics(surface_binding)
+        .write_surface_semantics(resolved_relation)
         .ok()
         .flatten()
         .and_then(|semantics| semantics.admin_behavior)
@@ -1666,11 +1670,11 @@ fn top_level_write_target_name(statement: &Statement) -> Option<String> {
 }
 
 fn filesystem_surface_kind(
-    surface_binding: &crate::catalog::ResolvedSurface,
+    resolved_relation: &crate::catalog::ResolvedRelation,
 ) -> Option<crate::catalog::FilesystemRelationKind> {
     let binding = crate::catalog::builtin_catalog_compiler_facade()
         .bind_surface_runtime_relation(
-            surface_binding,
+            resolved_relation,
             crate::catalog::RelationBindContext::default(),
         )
         .ok()
@@ -2535,7 +2539,7 @@ mod tests {
         .await
         .expect("builtin entity read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_key_value"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_key_value"]);
         assert_eq!(
             prepared
                 .explain
@@ -2616,12 +2620,12 @@ mod tests {
         .await
         .expect("registered-schema entity read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["message"]);
+        assert_eq!(prepared.resolved_relations(), vec!["message"]);
         assert_eq!(
             prepared
                 .structured_read()
                 .expect("registered-schema entity read should use canonicalized path")
-                .surface_binding
+                .resolved_relation
                 .implicit_overrides
                 .fixed_schema_key
                 .as_deref(),
@@ -2893,7 +2897,7 @@ mod tests {
         .expect("builtin entity by-version read should canonicalize");
 
         assert_eq!(
-            prepared.surface_bindings(),
+            prepared.resolved_relations(),
             vec!["lix_key_value_by_version"]
         );
         assert_eq!(
@@ -2945,7 +2949,7 @@ mod tests {
                     .await
                     .expect("builtin entity history read should canonicalize");
 
-                    assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
+                    assert_eq!(prepared.resolved_relations(), vec!["lix_key_value_history"]);
                     assert_eq!(
                         prepared
                             .explain
@@ -3001,7 +3005,7 @@ mod tests {
         .await
         .expect("change read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_change"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_change"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -3049,7 +3053,7 @@ mod tests {
         .await
         .expect("working-changes read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_working_changes"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_working_changes"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -3101,7 +3105,7 @@ mod tests {
         .await
         .expect("filesystem read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_file"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_file"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -3165,7 +3169,7 @@ mod tests {
         .expect("filesystem by-version read should canonicalize");
 
         assert_eq!(
-            prepared.surface_bindings(),
+            prepared.resolved_relations(),
             vec!["lix_directory_by_version"]
         );
         assert!(prepared.effective_state_request().is_none());
@@ -3215,7 +3219,7 @@ mod tests {
         .await
         .expect("filesystem history read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_file_history"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_file_history"]);
         assert!(prepared.effective_state_request().is_none());
         assert!(prepared.effective_state_plan().is_none());
         assert_eq!(
@@ -3275,7 +3279,7 @@ mod tests {
         .expect("filesystem by-version history read should canonicalize");
 
         assert_eq!(
-            prepared.surface_bindings(),
+            prepared.resolved_relations(),
             vec!["lix_file_history_by_version"]
         );
         assert_eq!(
@@ -3343,7 +3347,7 @@ mod tests {
         .await
         .expect("directory history read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_directory_history"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_directory_history"]);
         assert_eq!(
             prepared
                 .explain
@@ -3518,7 +3522,7 @@ mod tests {
 
                     match prepared {
                         PublicPlan::Read(prepared) => {
-                            assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
+                            assert_eq!(prepared.resolved_relations(), vec!["lix_key_value_history"]);
                             assert!(
                                 prepared.explain.compiled_artifacts.lowered_sql.is_empty(),
                                 "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
@@ -3563,7 +3567,7 @@ mod tests {
         .await
         .expect("explain state read should canonicalize");
 
-        assert_eq!(prepared.surface_bindings(), vec!["lix_state"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_state"]);
         assert_eq!(
             prepared
                 .explain
@@ -3725,7 +3729,7 @@ mod tests {
         assert!(prepared.structured_read().is_none());
         assert!(prepared.dependency_spec().is_some());
         assert_eq!(
-            prepared.surface_bindings(),
+            prepared.resolved_relations(),
             vec!["lix_state", "lix_state_by_version"]
         );
         assert_eq!(
@@ -3813,7 +3817,7 @@ mod tests {
 
         assert!(prepared.structured_read().is_none());
         assert_eq!(
-            prepared.surface_bindings(),
+            prepared.resolved_relations(),
             vec!["lix_state", "lix_state_by_version"]
         );
     }
@@ -3840,7 +3844,7 @@ mod tests {
         .expect("group-by/having public read should prepare through public lowering");
 
         assert!(prepared.structured_read().is_none());
-        assert_eq!(prepared.surface_bindings(), vec!["lix_state"]);
+        assert_eq!(prepared.resolved_relations(), vec!["lix_state"]);
         let lowered_sql = prepared
             .explain
             .compiled_artifacts
@@ -4114,7 +4118,7 @@ mod tests {
                     .await
                     .expect("session runtime function read should prepare through public lowering");
 
-                    assert_eq!(prepared.surface_bindings(), vec!["lix_version"]);
+                    assert_eq!(prepared.resolved_relations(), vec!["lix_version"]);
                     match &prepared.execution {
                         PublicReadPhysicalPlan::LoweredSql(_) => {
                             let lowered_sql = prepared

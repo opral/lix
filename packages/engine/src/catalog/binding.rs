@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::{
-    DefaultScopeSemantics, ResolvedSurface, SurfaceColumnType, SurfaceFamily,
+    DefaultScopeSemantics, ResolvedRelation, SurfaceColumnType, SurfaceFamily,
     SurfaceOverridePredicate, SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
@@ -99,21 +99,23 @@ pub(crate) struct RelationBindContext<'a> {
     pub(crate) current_heads: Option<&'a BTreeMap<String, String>>,
 }
 
-pub(crate) fn bind_schema_relation(surface_binding: &ResolvedSurface) -> Option<RelationBinding> {
-    let schema_key = surface_binding
+pub(crate) fn bind_schema_relation(
+    resolved_relation: &ResolvedRelation,
+) -> Option<RelationBinding> {
+    let schema_key = resolved_relation
         .implicit_overrides
         .fixed_schema_key
         .clone()?;
     Some(RelationBinding::SchemaRelation(SchemaRelationBinding {
-        public_name: surface_binding.descriptor.public_name.clone(),
+        public_name: resolved_relation.descriptor.public_name.clone(),
         schema_key,
-        surface_family: surface_binding.descriptor.surface_family,
-        surface_variant: surface_binding.descriptor.surface_variant,
-        default_scope: surface_binding.default_scope,
-        expose_version_id: surface_binding.implicit_overrides.expose_version_id,
-        visible_columns: surface_binding.exposed_columns.clone(),
-        column_types: surface_binding.column_types.clone(),
-        predicate_overrides: surface_binding
+        surface_family: resolved_relation.descriptor.surface_family,
+        surface_variant: resolved_relation.descriptor.surface_variant,
+        default_scope: resolved_relation.default_scope,
+        expose_version_id: resolved_relation.implicit_overrides.expose_version_id,
+        visible_columns: resolved_relation.exposed_columns.clone(),
+        column_types: resolved_relation.column_types.clone(),
+        predicate_overrides: resolved_relation
             .implicit_overrides
             .predicate_overrides
             .clone(),
@@ -200,11 +202,11 @@ pub(crate) fn bind_named_relation(
 }
 
 pub(crate) fn bind_surface_relation(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     context: RelationBindContext<'_>,
 ) -> Result<Option<RelationBinding>, LixError> {
     if let Some(binding) = bind_named_relation(
-        &surface_binding.descriptor.public_name,
+        &resolved_relation.descriptor.public_name,
         RelationBindContext {
             active_version_id: context.active_version_id,
             current_heads: context.current_heads,
@@ -213,7 +215,7 @@ pub(crate) fn bind_surface_relation(
         return Ok(Some(binding));
     }
 
-    Ok(bind_schema_relation(surface_binding))
+    Ok(bind_schema_relation(resolved_relation))
 }
 
 pub(crate) fn bind_registry_relation(
@@ -221,8 +223,8 @@ pub(crate) fn bind_registry_relation(
     relation_name: &str,
     context: RelationBindContext<'_>,
 ) -> Result<Option<RelationBinding>, LixError> {
-    let Some(surface_binding) = registry.bind_relation_name(relation_name) else {
+    let Some(resolved_relation) = registry.bind_relation_name(relation_name) else {
         return Ok(None);
     };
-    bind_surface_relation(&surface_binding, context)
+    bind_surface_relation(&resolved_relation, context)
 }

@@ -1322,16 +1322,16 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
         .get("details")
         .map(|value| json_object(value, "semantic_statement.details"))
         .expect("semantic_statement should include details");
-    let surface_bindings = json_array(
+    let resolved_relations = json_array(
         semantic_details
-            .get("surface_bindings")
-            .expect("semantic_statement.details should include surface_bindings"),
-        "surface_bindings",
+            .get("resolved_relations")
+            .expect("semantic_statement.details should include resolved_relations"),
+        "resolved_relations",
     );
-    assert_eq!(surface_bindings.len(), 1);
-    let surface_binding = json_object(&surface_bindings[0], "surface_binding");
+    assert_eq!(resolved_relations.len(), 1);
+    let resolved_relation = json_object(&resolved_relations[0], "resolved_relation");
     assert_object_keys(
-        surface_binding,
+        resolved_relation,
         &[
             "capability",
             "default_scope",
@@ -1346,54 +1346,54 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
             "surface_variant",
             "visible_columns",
         ],
-        "surface_binding",
+        "resolved_relation",
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("public_name")
             .and_then(JsonValue::as_str),
         Some("lix_state")
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("surface_family")
             .and_then(JsonValue::as_str),
         Some("state")
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("surface_variant")
             .and_then(JsonValue::as_str),
         Some("default")
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("capability")
             .and_then(JsonValue::as_str),
         Some("read_write")
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("read_freshness")
             .and_then(JsonValue::as_str),
         Some("requires_fresh_projection")
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("read_semantics")
             .and_then(JsonValue::as_str),
         Some("workspace_effective")
     );
     assert_eq!(
-        surface_binding
+        resolved_relation
             .get("default_scope")
             .and_then(JsonValue::as_str),
         Some("active_version")
     );
     assert!(!json_bool_at(
-        &surface_bindings[0],
+        &resolved_relations[0],
         "expose_version_id",
-        "surface_binding"
+        "resolved_relation"
     ));
     let effective_state_request = semantic_details
         .get("effective_state_request")
@@ -1502,7 +1502,7 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
 
     let compiled_artifacts = json_object_at(explain_json, "compiled_artifacts", "explain_json");
     assert!(
-        compiled_artifacts.get("surface_bindings").is_none(),
+        compiled_artifacts.get("resolved_relations").is_none(),
         "compiled_artifacts should not duplicate typed surface bindings as top-level names"
     );
     let bound_public_leaves = json_array(
@@ -1657,7 +1657,7 @@ fn assert_entity_history_read_plan_contract(explain_json: &JsonValue) {
             "request",
             "result_columns",
             "sort_keys",
-            "surface_binding",
+            "resolved_relation",
             "wildcard_columns",
             "wildcard_projection",
         ],
@@ -1895,7 +1895,7 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
 
     let compiled_artifacts = json_object_at(explain_json, "compiled_artifacts", "explain_json");
     assert!(
-        compiled_artifacts.get("surface_bindings").is_none(),
+        compiled_artifacts.get("resolved_relations").is_none(),
         "compiled_artifacts should not duplicate typed surface bindings as top-level names"
     );
     assert!(

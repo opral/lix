@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::contracts::{entity_id_in_constraint, EffectiveRowsRequest};
 use crate::live_state::EffectiveRowsResolver;
-use crate::transaction::{CommitOutcome, ReadContext, TransactionDelta, TransactionJournal};
+use crate::transaction::{CommitOutcome, OverlayReadContext, TransactionDelta, TransactionJournal};
 use crate::LixError;
 
 use super::coordinator::TransactionCoordinator;
@@ -10,14 +10,14 @@ use super::write_plan::WritePlan;
 use super::write_runner::apply_write_plan;
 
 pub(crate) struct LiveStateWriteState<'a> {
-    read_context: ReadContext<'a>,
+    read_context: OverlayReadContext<'a>,
     journal: TransactionJournal,
     outcome: CommitOutcome,
     executed: bool,
 }
 
 impl<'a> LiveStateWriteState<'a> {
-    pub(crate) fn new(read_context: ReadContext<'a>) -> Self {
+    pub(crate) fn new(read_context: OverlayReadContext<'a>) -> Self {
         Self {
             read_context,
             journal: TransactionJournal::default(),
@@ -67,7 +67,7 @@ impl<'a> LiveStateWriteState<'a> {
 }
 
 pub(crate) async fn prepare_materialization_plan(
-    read_context: &ReadContext<'_>,
+    read_context: &OverlayReadContext<'_>,
     journal: &TransactionJournal,
 ) -> Result<WritePlan, LixError> {
     let Some(pending) = journal.write_journal().pending_row_overlay() else {

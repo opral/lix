@@ -1,3 +1,9 @@
+//! State write-target resolution helpers.
+//!
+//! This module resolves the concrete state rows a write will target across
+//! local/global and tracked/untracked overlay lanes before the write pipeline
+//! falls back to public selector queries.
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
@@ -15,14 +21,14 @@ use crate::{LixBackend, LixError, Value};
 const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum SelectorOverlayLane {
+enum WriteTargetOverlayLane {
     LocalUntracked,
     LocalTracked,
     GlobalUntracked,
     GlobalTracked,
 }
 
-impl SelectorOverlayLane {
+impl WriteTargetOverlayLane {
     fn is_global(self) -> bool {
         matches!(self, Self::GlobalTracked | Self::GlobalUntracked)
     }
@@ -39,7 +45,7 @@ struct SelectorRowIdentity {
 }
 
 #[derive(Debug, Clone)]
-struct SelectorCandidateRow {
+struct CandidateWriteTargetRow {
     entity_id: String,
     schema_key: String,
     schema_version: String,
@@ -54,7 +60,7 @@ struct SelectorCandidateRow {
     values: BTreeMap<String, Value>,
 }
 
-impl SelectorCandidateRow {
+impl CandidateWriteTargetRow {
     fn identity(&self) -> SelectorRowIdentity {
         SelectorRowIdentity {
             entity_id: self.entity_id.clone(),
@@ -65,12 +71,12 @@ impl SelectorCandidateRow {
 
 #[derive(Debug, Clone)]
 enum LaneSelectorResult {
-    Visible(SelectorCandidateRow),
+    Visible(CandidateWriteTargetRow),
     Tombstone,
     Missing,
 }
 
-pub(crate) async fn try_resolve_state_selector_rows_with_backend(
+pub(crate) async fn try_resolve_state_write_targets_with_backend(
     backend: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
     planned_write: &PlannedWrite,
@@ -142,8 +148,8 @@ async fn resolve_rows_for_version(
     requested_version_id: &str,
     constraints: &[ScanConstraint],
     filters: &[PendingOverlayFilter],
-) -> Result<Vec<SelectorCandidateRow>, LixError> {
-    let mut visible = BTreeMap::<SelectorRowIdentity, SelectorCandidateRow>::new();
+) -> Result<Vec<CandidateWriteTargetRow>, LixError> {
+    let mut visible = BTreeMap::<SelectorRowIdentity, CandidateWriteTargetRow>::new();
     let mut hidden = BTreeSet::<SelectorRowIdentity>::new();
 
     for lane in selector_overlay_lanes_for_version(requested_version_id) {
@@ -189,7 +195,7 @@ async fn scan_selector_lane(
     pending_overlay: Option<&dyn PendingOverlay>,
     schema_key: &str,
     requested_version_id: &str,
-    lane: SelectorOverlayLane,
+    lane: WriteTargetOverlayLane,
     constraints: &[ScanConstraint],
 ) -> Result<BTreeMap<SelectorRowIdentity, LaneSelectorResult>, LixError> {
     let storage_version_id = selector_storage_version_id(requested_version_id, lane);
@@ -272,7 +278,7 @@ async fn scan_selector_lane(
             pending.snapshot_content.as_deref(),
         )
         .await?;
-        let row = SelectorCandidateRow {
+        let row = CandidateWriteTargetRow {
             entity_id: pending.entity_id,
             schema_key: pending.schema_key,
             schema_version: pending.schema_version,
@@ -300,10 +306,10 @@ async fn candidate_row_from_live_row(
     backend: &dyn LixBackend,
     row: LiveRow,
     requested_version_id: &str,
-    lane: SelectorOverlayLane,
+    lane: WriteTargetOverlayLane,
     snapshot_content: Option<String>,
     writer_key_override: Option<String>,
-) -> Result<SelectorCandidateRow, LixError> {
+) -> Result<CandidateWriteTargetRow, LixError> {
     let LiveRow {
         entity_id,
         file_id,
@@ -325,7 +331,7 @@ async fn candidate_row_from_live_row(
     )
     .await?;
 
-    Ok(SelectorCandidateRow {
+    Ok(CandidateWriteTargetRow {
         entity_id,
         schema_key,
         schema_version,
@@ -390,19 +396,19 @@ fn resolved_selector_version_ids(planned_write: &PlannedWrite) -> Option<Vec<Str
     }
 }
 
-fn selector_overlay_lanes_for_version(version_id: &str) -> Vec<SelectorOverlayLane> {
+fn selector_overlay_lanes_for_version(version_id: &str) -> Vec<WriteTargetOverlayLane> {
     let mut lanes = vec![
-        SelectorOverlayLane::LocalUntracked,
-        SelectorOverlayLane::LocalTracked,
+        WriteTargetOverlayLane::LocalUntracked,
+        WriteTargetOverlayLane::LocalTracked,
     ];
     if version_id != GLOBAL_VERSION_ID {
-        lanes.push(SelectorOverlayLane::GlobalUntracked);
-        lanes.push(SelectorOverlayLane::GlobalTracked);
+        lanes.push(WriteTargetOverlayLane::GlobalUntracked);
+        lanes.push(WriteTargetOverlayLane::GlobalTracked);
     }
     lanes
 }
 
-fn selector_storage_version_id(requested_version_id: &str, lane: SelectorOverlayLane) -> String {
+fn selector_storage_version_id(requested_version_id: &str, lane: WriteTargetOverlayLane) -> String {
     if lane.is_global() {
         GLOBAL_VERSION_ID.to_string()
     } else {
@@ -412,7 +418,7 @@ fn selector_storage_version_id(requested_version_id: &str, lane: SelectorOverlay
 
 fn selector_projected_version_id(
     requested_version_id: &str,
-    lane: SelectorOverlayLane,
+    lane: WriteTargetOverlayLane,
     source_version_id: &str,
 ) -> String {
     if lane.is_global() && source_version_id == GLOBAL_VERSION_ID {
@@ -586,7 +592,10 @@ fn selector_sql_value_as_engine_value(value: &ValueWithSpan) -> Option<Value> {
     }
 }
 
-fn selector_filter_matches_row(filter: &PendingOverlayFilter, row: &SelectorCandidateRow) -> bool {
+fn selector_filter_matches_row(
+    filter: &PendingOverlayFilter,
+    row: &CandidateWriteTargetRow,
+) -> bool {
     match filter {
         PendingOverlayFilter::And(filters) => filters
             .iter()
@@ -615,7 +624,7 @@ fn selector_filter_matches_row(filter: &PendingOverlayFilter, row: &SelectorCand
     }
 }
 
-fn selector_row_value(row: &SelectorCandidateRow, column: &str) -> Option<Value> {
+fn selector_row_value(row: &CandidateWriteTargetRow, column: &str) -> Option<Value> {
     match column {
         "entity_id" | "lixcol_entity_id" => Some(Value::Text(row.entity_id.clone())),
         "schema_key" | "lixcol_schema_key" => Some(Value::Text(row.schema_key.clone())),

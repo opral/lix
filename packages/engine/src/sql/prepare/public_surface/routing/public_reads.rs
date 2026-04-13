@@ -1,5 +1,5 @@
 use crate::catalog::{
-    builtin_catalog_compiler_facade, CatalogCompilerApi, ResolvedSurface, SurfaceFamily,
+    builtin_catalog_compiler_facade, CatalogCompilerApi, ResolvedRelation, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::ReadTimeProjectionPlan;
@@ -144,7 +144,7 @@ fn classify_public_read_plan_kind_with_settings(
     settings: &RoutingPassSettings,
 ) -> PublicReadPlanChoice {
     let metadata = public_read_routing_pass_registry().passes[0];
-    let binding = &surface_read_plan.structured_read().surface_binding;
+    let binding = &surface_read_plan.structured_read().resolved_relation;
     let kind = if is_direct_only_history_surface(binding) {
         PublicReadPlanKind::HistoryRead
     } else if let Some(rowset_read) = try_compile_read_time_projection_read(surface_read_plan) {
@@ -2257,7 +2257,7 @@ fn collect_relation_names_in_sql_function_arg_expr<F>(
     }
 }
 
-fn is_direct_only_history_surface(binding: &ResolvedSurface) -> bool {
+fn is_direct_only_history_surface(binding: &ResolvedRelation) -> bool {
     builtin_catalog_compiler_facade()
         .history_read_semantics(binding)
         .is_some()
@@ -2287,11 +2287,12 @@ mod tests {
         let binding = crate::catalog::build_builtin_surface_registry()
             .bind_relation_name(surface_name)
             .expect("builtin surface should bind");
-        let root = if let Some(scan) = CanonicalStateScan::from_resolved_surface(binding.clone()) {
+        let root = if let Some(scan) = CanonicalStateScan::from_resolved_relation(binding.clone()) {
             ReadPlan::scan(scan)
-        } else if let Some(scan) = CanonicalAdminScan::from_resolved_surface(binding.clone()) {
+        } else if let Some(scan) = CanonicalAdminScan::from_resolved_relation(binding.clone()) {
             ReadPlan::admin_scan(scan)
-        } else if let Some(scan) = CanonicalFilesystemScan::from_resolved_surface(binding.clone()) {
+        } else if let Some(scan) = CanonicalFilesystemScan::from_resolved_relation(binding.clone())
+        {
             ReadPlan::filesystem_scan(scan)
         } else {
             panic!("test helper only supports state/admin/filesystem surfaces");
@@ -2301,7 +2302,7 @@ mod tests {
             read: StructuredPublicRead {
                 bound_parameters: Vec::new(),
                 requested_version_id: Some("main".to_string()),
-                surface_binding: binding,
+                resolved_relation: binding,
                 read_command: ReadCommand {
                     root,
                     contract: ReadVisibility::CommittedAtStart,

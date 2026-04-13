@@ -1,7 +1,7 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemProjectionScope,
     FilesystemRelationBinding, FilesystemRelationKind, RelationBindContext, RelationBinding,
-    ResolvedSurface, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
+    ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::EffectiveStateRequest;
@@ -90,7 +90,7 @@ impl RenderRelationSubstitutionCollector {
 mod broad;
 
 pub(crate) fn broad_public_relation_supports_terminal_render(
-    binding: &ResolvedSurface,
+    binding: &ResolvedRelation,
     registry: &SurfaceRegistry,
     dialect: SqlDialect,
     active_version_id: Option<&str>,
@@ -132,7 +132,7 @@ pub(crate) fn lower_read_for_execution_with_layouts(
     current_version_heads: &BTreeMap<String, String>,
 ) -> Result<Option<LoweredReadBatch>, LixError> {
     let result_columns = lowered_result_columns(structured_read);
-    match structured_read.surface_binding.descriptor.surface_family {
+    match structured_read.resolved_relation.descriptor.surface_family {
         SurfaceFamily::State => {
             let Some(effective_state_request) = effective_state_request else {
                 return Ok(None);
@@ -223,13 +223,13 @@ fn lower_state_read_for_execution(
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<LoweredReadBatch>, LixError> {
     if let Some(error) =
-        state_read_exposed_column_error(&canonicalized.surface_binding, effective_state_request)
+        state_read_exposed_column_error(&canonicalized.resolved_relation, effective_state_request)
     {
         return Err(error);
     }
 
     let (pushdown_predicates, residual_selection) =
-        if entity_surface_has_live_payload_collisions(&canonicalized.surface_binding) {
+        if entity_surface_has_live_payload_collisions(&canonicalized.resolved_relation) {
             (Vec::new(), canonicalized.query.selection.clone())
         } else {
             split_state_selection_for_pushdown(
@@ -240,7 +240,7 @@ fn lower_state_read_for_execution(
     let Some(source_sql) = build_state_source_sql(
         dialect,
         canonicalized.requested_version_id.as_deref(),
-        &canonicalized.surface_binding,
+        &canonicalized.resolved_relation,
         effective_state_request,
         &pushdown_predicates,
         known_live_layouts,
@@ -288,13 +288,13 @@ fn build_lowered_read_batch(
     let derived_alias = structured_read.query.source_alias.clone().or_else(|| {
         Some(TableAlias {
             explicit: true,
-            name: Ident::new(&structured_read.surface_binding.descriptor.public_name),
+            name: Ident::new(&structured_read.resolved_relation.descriptor.public_name),
             columns: Vec::new(),
         })
     });
 
     let relation = substitutions.replacement_table_factor(
-        &structured_read.surface_binding.descriptor.public_name,
+        &structured_read.resolved_relation.descriptor.public_name,
         derived_alias,
         source_sql,
     );
@@ -352,7 +352,7 @@ fn build_lowered_read_batch(
 fn lowered_result_columns(structured_read: &StructuredPublicRead) -> LoweredResultColumns {
     if structured_read.query.uses_wildcard_projection() {
         let columns = structured_read
-            .surface_binding
+            .resolved_relation
             .column_types
             .iter()
             .map(|(name, column_type)| {
@@ -371,7 +371,7 @@ fn lowered_result_columns(structured_read: &StructuredPublicRead) -> LoweredResu
             .projection
             .iter()
             .map(|item| {
-                lowered_result_column_for_projection_item(item, &structured_read.surface_binding)
+                lowered_result_column_for_projection_item(item, &structured_read.resolved_relation)
             })
             .collect(),
     )
@@ -379,7 +379,7 @@ fn lowered_result_columns(structured_read: &StructuredPublicRead) -> LoweredResu
 
 fn lowered_result_column_for_projection_item(
     item: &SelectItem,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> LoweredResultColumn {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -397,7 +397,7 @@ fn lowered_result_column_for_projection_item(
         _ => return LoweredResultColumn::Untyped,
     };
 
-    surface_column_type(surface_binding, column)
+    surface_column_type(resolved_relation, column)
         .map(lowered_result_column_from_surface_type)
         .unwrap_or(LoweredResultColumn::Untyped)
 }
@@ -413,20 +413,20 @@ fn lowered_result_column_from_surface_type(column_type: SurfaceColumnType) -> Lo
 }
 
 fn surface_column_type(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Option<SurfaceColumnType> {
-    surface_binding
+    resolved_relation
         .column_types
         .iter()
         .find_map(|(candidate, kind)| candidate.eq_ignore_ascii_case(column).then_some(*kind))
 }
 
 fn state_read_exposed_column_error(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     effective_state_request: &EffectiveStateRequest,
 ) -> Option<LixError> {
-    let exposed = surface_binding
+    let exposed = resolved_relation
         .exposed_columns
         .iter()
         .map(|column| column.to_ascii_lowercase())
@@ -441,25 +441,25 @@ fn state_read_exposed_column_error(
         return None;
     }
     if let Some(explicit_version_surface) = builtin_catalog_compiler_facade()
-        .explicit_version_counterpart_surface_name(surface_binding, &missing)
+        .explicit_version_counterpart_surface_name(resolved_relation, &missing)
     {
         return Some(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "{} does not expose version_id; use {} for explicit version filters",
-                surface_binding.descriptor.public_name, explicit_version_surface
+                resolved_relation.descriptor.public_name, explicit_version_surface
             ),
         });
     }
     let column = missing[0].clone();
-    let available = surface_binding
+    let available = resolved_relation
         .exposed_columns
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
     Some(sql_unknown_column_error(
         &column,
-        Some(&surface_binding.descriptor.public_name),
+        Some(&resolved_relation.descriptor.public_name),
         &available,
         None,
     ))
@@ -483,7 +483,7 @@ fn lower_entity_read_for_execution(
     let Some(source_sql) = build_entity_source_sql(
         dialect,
         canonicalized.requested_version_id.as_deref(),
-        &canonicalized.surface_binding,
+        &canonicalized.resolved_relation,
         effective_state_request,
         &pushdown_predicates,
         known_live_layouts,
@@ -523,7 +523,7 @@ fn lower_working_changes_read_for_execution(
                 "LIX_ERROR_UNKNOWN",
                 format!(
                     "public read '{}' requires a session-requested active version id",
-                    canonicalized.surface_binding.descriptor.public_name
+                    canonicalized.resolved_relation.descriptor.public_name
                 ),
             )
         })?;
@@ -930,7 +930,7 @@ fn lower_filesystem_read_for_execution(
     };
     let active_version_id = canonicalized.requested_version_id.as_deref();
     let Some(binding) =
-        bind_filesystem_surface_binding(&canonicalized.surface_binding, active_version_id)?
+        bind_filesystem_surface_binding(&canonicalized.resolved_relation, active_version_id)?
     else {
         return Ok(None);
     };
@@ -976,11 +976,11 @@ fn bind_filesystem_surface_relation(
 }
 
 fn bind_filesystem_surface_binding(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     active_version_id: Option<&str>,
 ) -> Result<Option<FilesystemRelationBinding>, LixError> {
     let Some(binding) = builtin_catalog_compiler_facade().bind_surface_runtime_relation(
-        surface_binding,
+        resolved_relation,
         RelationBindContext {
             active_version_id,
             current_heads: None,
@@ -1022,17 +1022,17 @@ fn filesystem_binding_matches_read(
 fn build_state_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
-    let sql = match surface_binding.descriptor.surface_variant {
+    let sql = match resolved_relation.descriptor.surface_variant {
         SurfaceVariant::Default | SurfaceVariant::ByVersion => build_effective_state_source_sql(
             dialect,
             active_version_id,
             effective_state_request,
-            surface_binding,
+            resolved_relation,
             pushdown_predicates,
             known_live_layouts,
         )?,
@@ -1072,24 +1072,24 @@ fn build_admin_source_sql_with_current_heads(
 fn build_entity_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     effective_state_request: &EffectiveStateRequest,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<Option<String>, LixError> {
-    let projection = entity_projection_sql(surface_binding, effective_state_request);
+    let projection = entity_projection_sql(resolved_relation, effective_state_request);
     let projection = if projection.is_empty() {
         "entity_id AS lixcol_entity_id".to_string()
     } else {
         projection.join(", ")
     };
-    let state_source_sql = match surface_binding.descriptor.surface_variant {
+    let state_source_sql = match resolved_relation.descriptor.surface_variant {
         SurfaceVariant::Default | SurfaceVariant::ByVersion => {
             Some(build_effective_public_read_source_sql(
                 dialect,
                 active_version_id,
                 effective_state_request,
-                surface_binding,
+                resolved_relation,
                 pushdown_predicates,
                 known_live_layouts,
                 false,
@@ -1102,7 +1102,7 @@ fn build_entity_source_sql(
         return Ok(None);
     };
     let mut predicates = Vec::new();
-    for predicate in &surface_binding.implicit_overrides.predicate_overrides {
+    for predicate in &resolved_relation.implicit_overrides.predicate_overrides {
         predicates.push(render_override_predicate(predicate));
     }
 
@@ -1121,7 +1121,7 @@ fn build_effective_state_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     effective_state_request: &EffectiveStateRequest,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
 ) -> Result<String, LixError> {
@@ -1133,7 +1133,7 @@ fn build_effective_state_source_sql(
         dialect,
         active_version_id,
         effective_state_request,
-        surface_binding,
+        resolved_relation,
         pushdown_predicates,
         known_live_layouts,
         include_snapshot_content,
@@ -1209,12 +1209,12 @@ fn canonical_filesystem_scan(
 }
 
 fn entity_projection_sql(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     effective_state_request: &EffectiveStateRequest,
 ) -> Vec<String> {
     let mut projections = Vec::new();
     for column in &effective_state_request.required_columns {
-        let Some(expression) = entity_projection_sql_for_column(surface_binding, column) else {
+        let Some(expression) = entity_projection_sql_for_column(resolved_relation, column) else {
             continue;
         };
         if !projections.iter().any(|existing| existing == &expression) {
@@ -1225,23 +1225,23 @@ fn entity_projection_sql(
 }
 
 fn entity_projection_sql_for_column(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     column: &str,
 ) -> Option<String> {
     if let Some(source_column) =
-        entity_hidden_alias_source_column(column, surface_binding.descriptor.surface_variant)
+        entity_hidden_alias_source_column(column, resolved_relation.descriptor.surface_variant)
     {
         let alias = render_identifier(column);
         return Some(format!("{source_column} AS {alias}"));
     }
 
-    if surface_binding
+    if resolved_relation
         .exposed_columns
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(column))
     {
         let alias = render_identifier(column);
-        let expression = if entity_surface_uses_payload_alias(surface_binding, column) {
+        let expression = if entity_surface_uses_payload_alias(resolved_relation, column) {
             render_identifier(&entity_surface_payload_alias(column))
         } else {
             render_identifier(column)

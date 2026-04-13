@@ -1,6 +1,6 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
-    FilesystemRelationKind, ResolvedSurface,
+    FilesystemRelationKind, ResolvedRelation,
 };
 use crate::contracts::should_invalidate_deterministic_settings_cache;
 use crate::contracts::{
@@ -224,7 +224,7 @@ fn public_write_filesystem_payload_changes_already_committed(
         })
 }
 
-fn is_catalog_filesystem_file_surface(target: &ResolvedSurface) -> bool {
+fn is_catalog_filesystem_file_surface(target: &ResolvedRelation) -> bool {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(target)
         .ok()

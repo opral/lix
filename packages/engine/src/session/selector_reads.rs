@@ -14,7 +14,7 @@ use crate::session::public_read_preparation::{
     build_read_preparation_context, prepare_required_active_public_read_artifact_with_backend,
     ReadPreparationContext,
 };
-use crate::session::state_selector::try_resolve_state_selector_rows_with_backend;
+use crate::session::state_write_target_resolver::try_resolve_state_write_targets_with_backend;
 use crate::sql::{
     public_selector_column_name, public_selector_version_column, CanonicalStateRowKey,
     PlannedWrite, ScopeProof,
@@ -72,11 +72,7 @@ impl<'a> SessionWriteSelectorResolver<'a> {
         )
         .await?;
         self.backend
-            .execute_prepared_public_read_with_pending_overlay(
-                self,
-                self.pending_overlay,
-                &artifact,
-            )
+            .execute_pending_overlay_public_read(self, self.pending_overlay, &artifact)
             .await
     }
 }
@@ -187,7 +183,7 @@ impl WriteSelectorResolver for SessionWriteSelectorResolver<'_> {
         &self,
         planned_write: &PlannedWrite,
     ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
-        if let Some(rows) = try_resolve_state_selector_rows_with_backend(
+        if let Some(rows) = try_resolve_state_write_targets_with_backend(
             self.backend,
             self.pending_overlay,
             planned_write,

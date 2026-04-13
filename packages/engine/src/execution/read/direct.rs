@@ -447,7 +447,7 @@ fn project_entity_history_row(
             .wildcard_columns
             .iter()
             .map(|column| {
-                entity_history_field_from_column_name(&plan.surface_binding, column)
+                entity_history_field_from_column_name(&plan.resolved_relation, column)
                     .map(|field| entity_history_field_value(row, &field))
                     .unwrap_or(Value::Null)
             })
@@ -1050,14 +1050,14 @@ fn state_history_field_from_column_name(column: &str) -> Option<PreparedStateHis
 }
 
 fn entity_history_field_from_column_name(
-    surface_binding: &crate::catalog::ResolvedSurface,
+    resolved_relation: &crate::catalog::ResolvedRelation,
     column: &str,
 ) -> Option<PreparedEntityHistoryField> {
     let lowercase = column.to_ascii_lowercase();
     if let Some(field) = state_history_field_from_column_name(column) {
         return Some(PreparedEntityHistoryField::State(field));
     }
-    if surface_binding
+    if resolved_relation
         .descriptor
         .visible_columns
         .iter()

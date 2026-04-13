@@ -50,7 +50,7 @@ pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_chec
             execute_prepared_batch_with_backend(backend, &execution_artifact.prepared_batch)
                 .await
                 .map_err(|error| {
-                    translate_lowered_public_read_error(error, &artifact.surface_bindings)
+                    translate_lowered_public_read_error(error, &artifact.resolved_relations)
                 })?
         }
         PreparedPublicReadPlanArtifact::HistoryRead(artifact) => {
@@ -170,7 +170,7 @@ async fn ensure_surface_read_freshness(
     }
 
     Err(public_read_projection_stale_error(
-        &artifact.surface_bindings,
+        &artifact.resolved_relations,
         &status,
     ))
 }
@@ -195,7 +195,7 @@ async fn ensure_surface_read_freshness_in_transaction(
         return Ok(());
     }
     Err(public_read_projection_stale_error(
-        &artifact.surface_bindings,
+        &artifact.resolved_relations,
         &status,
     ))
 }

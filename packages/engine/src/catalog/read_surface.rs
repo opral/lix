@@ -1,5 +1,5 @@
 use crate::catalog::{
-    state_by_version_relation_name, DefaultScopeSemantics, ResolvedSurface, SurfaceFamily,
+    state_by_version_relation_name, DefaultScopeSemantics, ResolvedRelation, SurfaceFamily,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -8,7 +8,7 @@ pub(crate) struct CatalogReadPreparationSemantics {
 }
 
 pub(crate) fn explicit_version_counterpart_surface_name(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     missing_columns: &[String],
 ) -> Option<String> {
     let requests_version_column = missing_columns
@@ -19,9 +19,9 @@ pub(crate) fn explicit_version_counterpart_surface_name(
         return None;
     }
 
-    (surface_binding.descriptor.surface_family == SurfaceFamily::State
-        && surface_binding.default_scope == DefaultScopeSemantics::ActiveVersion
-        && !surface_binding
+    (resolved_relation.descriptor.surface_family == SurfaceFamily::State
+        && resolved_relation.default_scope == DefaultScopeSemantics::ActiveVersion
+        && !resolved_relation
             .descriptor
             .surface_traits
             .exposes_version_column)
@@ -29,12 +29,12 @@ pub(crate) fn explicit_version_counterpart_surface_name(
 }
 
 pub(crate) fn read_preparation_semantics(
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> CatalogReadPreparationSemantics {
     CatalogReadPreparationSemantics {
-        requires_current_version_heads: surface_binding.descriptor.surface_family
+        requires_current_version_heads: resolved_relation.descriptor.surface_family
             == SurfaceFamily::Admin
-            && surface_binding.default_scope == DefaultScopeSemantics::GlobalAdmin,
+            && resolved_relation.default_scope == DefaultScopeSemantics::GlobalAdmin,
     }
 }
 

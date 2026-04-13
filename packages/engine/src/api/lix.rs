@@ -565,7 +565,7 @@ impl crate::transaction::WriteExecutionContext for Lix {
             &functions,
         ))
     }
-    async fn execute_prepared_public_read_with_pending_overlay(
+    async fn execute_pending_overlay_public_read(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
         pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,

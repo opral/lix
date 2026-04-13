@@ -7,18 +7,18 @@
 
 mod backend;
 pub(crate) mod buffered;
+mod buffered_write_transaction;
 mod contracts;
 pub(crate) mod filesystem;
 #[cfg(test)]
 mod live_state_write_transaction;
 mod observe_tick;
 pub(crate) mod overlay;
+#[cfg(test)]
+mod overlay_read_context;
 pub(crate) mod pipeline;
 mod prepared_step;
 mod prepared_write;
-#[cfg(test)]
-mod read_context;
-mod unit;
 mod write_batch;
 
 pub(crate) use crate::contracts::TransactionCommitOutcome;
@@ -31,6 +31,9 @@ pub(crate) use buffered::{
     apply_schema_registrations_in_transaction, BufferedWriteCommandMetadata,
     BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
     PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit, TrackedTxnUnit, TransactionWriteDelta,
+};
+pub(crate) use buffered_write_transaction::{
+    BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
 };
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
@@ -55,6 +58,8 @@ pub(crate) use overlay::{
     PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
     PendingWriteOverlay,
 };
+#[cfg(test)]
+pub(crate) use overlay_read_context::OverlayReadContext;
 pub(crate) use pipeline::resolution::prepared_artifacts::SchemaProof;
 #[cfg(test)]
 pub(crate) use pipeline::resolution::resolve_write_plan_with_functions;
@@ -67,7 +72,4 @@ pub(crate) use pipeline::{
 };
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};
-#[cfg(test)]
-pub(crate) use read_context::ReadContext;
-pub(crate) use unit::{BorrowedBufferedWriteTransaction, BufferedWriteTransaction};
 pub(crate) use write_batch::execute_write_batch_with_transaction;

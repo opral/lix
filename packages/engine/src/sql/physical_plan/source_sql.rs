@@ -1,6 +1,6 @@
 //! Compiler-owned public surface source SQL builders.
 
-use crate::catalog::{RelationBinding, ResolvedSurface, SurfaceVariant};
+use crate::catalog::{RelationBinding, ResolvedRelation, SurfaceVariant};
 use crate::contracts::EffectiveStateRequest;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{
@@ -47,7 +47,7 @@ pub(crate) fn build_effective_public_read_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     effective_state_request: &EffectiveStateRequest,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
@@ -62,21 +62,21 @@ pub(crate) fn build_effective_public_read_source_sql(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "public state read lowerer requires a bounded schema set for '{}'",
-                surface_binding.descriptor.public_name
+                resolved_relation.descriptor.public_name
             ),
         });
     }
 
     let (target_version_predicates, source_predicates) =
         split_effective_state_pushdown_predicates(pushdown_predicates);
-    let target_versions_cte = match surface_binding.descriptor.surface_variant {
+    let target_versions_cte = match resolved_relation.descriptor.surface_variant {
         SurfaceVariant::Default => {
             active_target_versions_cte_sql(active_version_id.ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
                         "public read '{}' requires a session-requested active version id",
-                        surface_binding.descriptor.public_name
+                        resolved_relation.descriptor.public_name
                     ),
                 )
             })?)
@@ -93,7 +93,7 @@ pub(crate) fn build_effective_public_read_source_sql(
     };
     let schema_winner_rows_sql = effective_state_schema_winner_rows_sql(
         dialect,
-        surface_binding,
+        resolved_relation,
         &schema_keys,
         &source_predicates,
         effective_state_request,
@@ -808,21 +808,22 @@ fn render_overlay_where_clause_sql(
 
 fn effective_state_schema_winner_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     schema_keys: &[String],
     source_predicates: &[Expr],
     effective_state_request: &EffectiveStateRequest,
     known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
 ) -> String {
-    let payload_columns = effective_state_payload_columns(effective_state_request, surface_binding);
+    let payload_columns =
+        effective_state_payload_columns(effective_state_request, resolved_relation);
     schema_keys
         .iter()
         .map(|schema_key| {
             if schema_key == "lix_commit" {
                 return build_direct_canonical_header_state_rows_sql(
                     dialect,
-                    surface_binding,
+                    resolved_relation,
                     "lix_commit",
                     &payload_columns,
                     known_live_layouts,
@@ -834,7 +835,7 @@ fn effective_state_schema_winner_rows_sql(
             if schema_key == "lix_change_set" {
                 return build_direct_canonical_header_state_rows_sql(
                     dialect,
-                    surface_binding,
+                    resolved_relation,
                     "lix_change_set",
                     &payload_columns,
                     known_live_layouts,
@@ -846,10 +847,10 @@ fn effective_state_schema_winner_rows_sql(
             if schema_key == "lix_change_set_element" {
                 return build_change_set_element_state_rows_sql(
                     dialect,
-                    surface_binding,
+                    resolved_relation,
                     &payload_columns,
                     known_live_layouts,
-                    surface_binding.descriptor.surface_variant,
+                    resolved_relation.descriptor.surface_variant,
                     source_predicates,
                     include_snapshot_content,
                 );
@@ -857,10 +858,10 @@ fn effective_state_schema_winner_rows_sql(
             if schema_key == "lix_commit_edge" {
                 return build_commit_edge_state_rows_sql(
                     dialect,
-                    surface_binding,
+                    resolved_relation,
                     &payload_columns,
                     known_live_layouts,
-                    surface_binding.descriptor.surface_variant,
+                    resolved_relation.descriptor.surface_variant,
                     source_predicates,
                     include_snapshot_content,
                 );
@@ -868,10 +869,10 @@ fn effective_state_schema_winner_rows_sql(
             if schema_key == "lix_change_author" {
                 return build_change_author_state_rows_sql(
                     dialect,
-                    surface_binding,
+                    resolved_relation,
                     &payload_columns,
                     known_live_layouts,
-                    surface_binding.descriptor.surface_variant,
+                    resolved_relation.descriptor.surface_variant,
                     source_predicates,
                     include_snapshot_content,
                 );
@@ -902,7 +903,7 @@ fn effective_state_schema_winner_rows_sql(
             });
             let ranked_payload_projection = render_state_payload_projection_list(
                 dialect,
-                surface_binding,
+                resolved_relation,
                 schema_key,
                 "ranked",
                 &payload_columns,
@@ -1095,7 +1096,7 @@ fn effective_state_schema_winner_rows_sql(
 
 fn build_direct_canonical_header_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     schema_key: &str,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
@@ -1131,7 +1132,7 @@ fn build_direct_canonical_header_state_rows_sql(
     };
     let payload_projection = render_state_payload_projection_list(
         dialect,
-        surface_binding,
+        resolved_relation,
         schema_key,
         "direct_rows",
         payload_columns,
@@ -1282,7 +1283,7 @@ fn json_object_sql(dialect: SqlDialect, fields: &[(&str, &str)]) -> String {
 
 fn build_change_set_element_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     surface_variant: SurfaceVariant,
@@ -1319,7 +1320,7 @@ fn build_change_set_element_state_rows_sql(
         render_qualified_where_clause_sql(source_predicates, " AND ", "direct_rows");
     let payload_projection = render_state_payload_projection_list(
         dialect,
-        surface_binding,
+        resolved_relation,
         "lix_change_set_element",
         "direct_rows",
         payload_columns,
@@ -1417,7 +1418,7 @@ fn build_change_set_element_state_rows_sql(
 
 fn build_commit_edge_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     surface_variant: SurfaceVariant,
@@ -1443,7 +1444,7 @@ fn build_commit_edge_state_rows_sql(
         render_qualified_where_clause_sql(source_predicates, " AND ", "direct_rows");
     let payload_projection = render_state_payload_projection_list(
         dialect,
-        surface_binding,
+        resolved_relation,
         "lix_commit_edge",
         "direct_rows",
         payload_columns,
@@ -1518,7 +1519,7 @@ fn build_commit_edge_state_rows_sql(
 
 fn build_change_author_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     surface_variant: SurfaceVariant,
@@ -1551,7 +1552,7 @@ fn build_change_author_state_rows_sql(
         render_qualified_where_clause_sql(source_predicates, " AND ", "direct_rows");
     let payload_projection = render_state_payload_projection_list(
         dialect,
-        surface_binding,
+        resolved_relation,
         "lix_change_author",
         "direct_rows",
         payload_columns,
@@ -1640,14 +1641,14 @@ fn builtin_payload_column_name(schema_key: &str, property_name: &str) -> String 
 
 fn effective_state_payload_columns(
     effective_state_request: &EffectiveStateRequest,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
 ) -> Vec<String> {
     effective_state_request
         .required_columns
         .iter()
         .filter(|column| {
             !is_live_state_envelope_column(column)
-                || entity_surface_uses_payload_alias(surface_binding, column)
+                || entity_surface_uses_payload_alias(resolved_relation, column)
         })
         .cloned()
         .collect()
@@ -1695,7 +1696,7 @@ fn is_live_state_envelope_column(column: &str) -> bool {
 
 fn render_state_payload_projection_list(
     dialect: SqlDialect,
-    surface_binding: &ResolvedSurface,
+    resolved_relation: &ResolvedRelation,
     schema_key: &str,
     table_alias: &str,
     payload_columns: &[String],
@@ -1717,7 +1718,7 @@ fn render_state_payload_projection_list(
                     table_alias,
                     column,
                 );
-                let alias = if entity_surface_uses_payload_alias(surface_binding, column) {
+                let alias = if entity_surface_uses_payload_alias(resolved_relation, column) {
                     entity_surface_payload_alias(column)
                 } else {
                     column.clone()
