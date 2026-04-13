@@ -4,9 +4,9 @@ use crate::catalog::{
 };
 use crate::contracts::should_invalidate_deterministic_settings_cache;
 use crate::contracts::{
-    PlannedFilesystemState, PreparedPublicWriteExecutionPartition, PreparedWriteStatement,
+    BufferedWriteExecutionInput, PlannedFilesystemState, PreparedPublicWriteExecutionPartition,
+    PreparedWriteStatement,
 };
-use crate::execution::step::BufferedWriteExecutionInput;
 use crate::transaction::{
     binary_blob_writes_from_filesystem_state,
     compile_filesystem_finalization_from_state_in_transaction,
@@ -18,7 +18,7 @@ use crate::transaction::{
 };
 use crate::{LixBackendTransaction, LixError};
 
-use super::runtime::WriteExecutionOutcome;
+use super::direct_execution::WriteExecutionOutcome;
 
 pub(crate) fn command_metadata(
     step: &WriteCommand,

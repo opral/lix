@@ -14,8 +14,8 @@ use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::SharedFunctionProvider;
 use crate::contracts::{CompiledSchemaCache, FunctionBindings, WasmRuntime};
 use crate::live_state::{
-    mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
-    LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
+    LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
+    ProjectionStatus,
 };
 use crate::session::deterministic_mode::{
     global_deterministic_settings_storage_scope, parse_deterministic_settings_value,
@@ -493,23 +493,8 @@ impl Lix {
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildReport, LixError> {
-        let plan = crate::live_state::rebuild_plan(self.backend().as_ref(), req).await?;
-        let apply = crate::live_state::apply_rebuild_plan(self.backend().as_ref(), &plan).await?;
-
-        if let Err(error) =
-            crate::execution::step::filesystem::materialize::materialize_file_data_with_plugins(
-                self.backend().as_ref(),
-                self.engine().as_ref(),
-                &plan,
-            )
+        crate::live_state::rebuild_projection(self.backend().as_ref(), self.engine().as_ref(), req)
             .await
-        {
-            let _ =
-                mark_mode_with_backend(self.backend().as_ref(), LiveStateMode::NeedsRebuild).await;
-            return Err(error);
-        }
-
-        Ok(LiveStateRebuildReport { plan, apply })
     }
 
     pub async fn begin_transaction_with_options(
@@ -1125,7 +1110,7 @@ mod tests {
                     ));
                     crate::live_state::mark_mode_with_backend(
                         &backend,
-                        LiveStateMode::NeedsRebuild,
+                        crate::live_state::LiveStateMode::NeedsRebuild,
                     )
                     .await
                     .expect("marking live_state stale should succeed");

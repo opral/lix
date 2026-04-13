@@ -10,6 +10,7 @@ mod apply;
 pub(crate) mod filesystem;
 mod loader;
 mod plan;
+mod rebuild_files;
 mod types;
 
 pub use types::{
@@ -20,6 +21,7 @@ pub use types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 
+use crate::contracts::{FilesystemPluginMaterializer, LiveStateMode};
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub async fn rebuild_plan(
@@ -57,5 +59,24 @@ pub async fn rebuild(
 ) -> Result<LiveStateRebuildReport, LixError> {
     let plan = rebuild_plan(backend, req).await?;
     let apply = apply_rebuild_plan(backend, &plan).await?;
+    Ok(LiveStateRebuildReport { plan, apply })
+}
+
+pub(crate) async fn rebuild_projection(
+    backend: &dyn LixBackend,
+    plugin_materializer: &dyn FilesystemPluginMaterializer,
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildReport, LixError> {
+    let plan = rebuild_plan(backend, req).await?;
+    let apply = apply_rebuild_plan(backend, &plan).await?;
+
+    if let Err(error) =
+        rebuild_files::rebuild_file_payloads_with_plugins(backend, plugin_materializer, &plan).await
+    {
+        let _ =
+            crate::live_state::mark_mode_with_backend(backend, LiveStateMode::NeedsRebuild).await;
+        return Err(error);
+    }
+
     Ok(LiveStateRebuildReport { plan, apply })
 }

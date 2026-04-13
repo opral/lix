@@ -3,18 +3,18 @@ use std::collections::BTreeSet;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::PlannedStateRow;
 use crate::live_state::{write_live_rows, LiveRow};
+use crate::transaction::pipeline::WriteExecutionOutcome;
 use crate::transaction::{
     compile_filesystem_finalization_from_state_in_transaction, PlannedPublicUntrackedWriteUnit,
     WriteExecutionContext,
 };
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
-use super::registered_schema_bootstrap::mirror_registered_schema_planned_rows_in_transaction;
-use super::runtime::WriteExecutionOutcome;
+use super::registered_schema_mirror::mirror_registered_schema_planned_rows_in_transaction;
 
 const GLOBAL_VERSION_ID: &str = "global";
 
-pub(crate) async fn run_public_untracked_write_txn_with_transaction(
+pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transaction(
     execution_context: &dyn WriteExecutionContext,
     transaction: &mut dyn LixBackendTransaction,
     plan: &PlannedPublicUntrackedWriteUnit,

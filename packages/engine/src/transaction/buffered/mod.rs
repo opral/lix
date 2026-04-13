@@ -1,10 +1,14 @@
 mod buffered_write_state;
 pub(crate) mod commands;
 mod coordinator;
+mod direct_apply;
 mod execution;
 #[cfg(test)]
 mod live_state_write_state;
 mod planned_write;
+mod registered_schema_mirror;
+mod tracked_apply;
+mod untracked_apply;
 #[cfg(test)]
 mod write_plan;
 #[cfg(test)]

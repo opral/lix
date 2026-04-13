@@ -6,8 +6,6 @@ use crate::contracts::{
 };
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
-use super::registered_schema_bootstrap::mirror_registered_schema_mutations_in_transaction;
-
 pub(crate) struct WriteExecutionOutcome {
     pub(crate) public_result: QueryResult,
     pub(crate) direct_write_file_cache_targets: BTreeSet<(String, String)>,
@@ -43,7 +41,6 @@ pub(crate) async fn execute_direct_execution_with_transaction(
     let _ = (functions, writer_key, direct.should_refresh_file_cache);
     let direct_result =
         execute_prepared_with_transaction(transaction, &direct.prepared_batch).await?;
-    mirror_registered_schema_mutations_in_transaction(transaction, &direct.mutations).await?;
     let public_result = public_result_from_contract(result_contract, &direct_result);
 
     Ok(WriteExecutionOutcome {
