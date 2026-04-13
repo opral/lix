@@ -1,16 +1,15 @@
 use crate::contracts::CommittedStateHistoryReader;
 use crate::contracts::{
-    DirectoryHistoryRow, FileHistoryRow, PreparedDirectDirectoryHistoryField,
-    PreparedDirectEntityHistoryField, PreparedDirectFileHistoryField, PreparedDirectPublicRead,
-    PreparedDirectStateHistoryField, PreparedDirectoryHistoryAggregate,
-    PreparedDirectoryHistoryDirectReadPlan, PreparedDirectoryHistoryPredicate,
-    PreparedDirectoryHistorySortKey, PreparedEntityHistoryDirectReadPlan,
-    PreparedEntityHistoryPredicate, PreparedEntityHistorySortKey, PreparedFileHistoryAggregate,
-    PreparedFileHistoryDirectReadPlan, PreparedFileHistoryPredicate, PreparedFileHistorySortKey,
+    DirectoryHistoryRow, FileHistoryRow, PreparedDirectoryHistoryAggregate,
+    PreparedDirectoryHistoryField, PreparedDirectoryHistoryPredicate,
+    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedEntityHistoryField,
+    PreparedEntityHistoryPredicate, PreparedEntityHistoryReadPlan, PreparedEntityHistorySortKey,
+    PreparedFileHistoryAggregate, PreparedFileHistoryField, PreparedFileHistoryPredicate,
+    PreparedFileHistoryReadPlan, PreparedFileHistorySortKey, PreparedHistoryReadPlan,
     PreparedStateHistoryAggregate, PreparedStateHistoryAggregatePredicate,
-    PreparedStateHistoryDirectReadPlan, PreparedStateHistoryPredicate,
-    PreparedStateHistoryProjectionValue, PreparedStateHistorySortKey,
-    PreparedStateHistorySortValue, StateHistoryRow,
+    PreparedStateHistoryField, PreparedStateHistoryPredicate, PreparedStateHistoryProjectionValue,
+    PreparedStateHistoryReadPlan, PreparedStateHistorySortKey, PreparedStateHistorySortValue,
+    StateHistoryRow,
 };
 use crate::execution::read::filesystem::history::{
     load_directory_history_rows, load_file_history_rows,
@@ -19,29 +18,29 @@ use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 
-pub(crate) async fn execute_direct_public_read_with_backend(
+pub(crate) async fn execute_history_read_plan_with_backend(
     backend: &dyn LixBackend,
-    plan: &PreparedDirectPublicRead,
+    plan: &PreparedHistoryReadPlan,
 ) -> Result<QueryResult, LixError> {
     match plan {
-        PreparedDirectPublicRead::StateHistory(plan) => {
-            execute_direct_state_history_read(backend, plan).await
+        PreparedHistoryReadPlan::StateHistory(plan) => {
+            execute_state_history_read(backend, plan).await
         }
-        PreparedDirectPublicRead::EntityHistory(plan) => {
-            execute_direct_entity_history_read(backend, plan).await
+        PreparedHistoryReadPlan::EntityHistory(plan) => {
+            execute_entity_history_read(backend, plan).await
         }
-        PreparedDirectPublicRead::FileHistory(plan) => {
-            execute_direct_file_history_read(backend, plan).await
+        PreparedHistoryReadPlan::FileHistory(plan) => {
+            execute_file_history_read(backend, plan).await
         }
-        PreparedDirectPublicRead::DirectoryHistory(plan) => {
-            execute_direct_directory_history_read(backend, plan).await
+        PreparedHistoryReadPlan::DirectoryHistory(plan) => {
+            execute_directory_history_read(backend, plan).await
         }
     }
 }
 
-async fn execute_direct_state_history_read(
+async fn execute_state_history_read(
     backend: &dyn LixBackend,
-    plan: &PreparedStateHistoryDirectReadPlan,
+    plan: &PreparedStateHistoryReadPlan,
 ) -> Result<QueryResult, LixError> {
     let mut rows = backend
         .load_committed_state_history_rows(&plan.request)
@@ -49,7 +48,7 @@ async fn execute_direct_state_history_read(
     rows.retain(|row| state_history_row_matches_predicates(row, &plan.predicates));
 
     if state_history_plan_uses_grouping(plan) {
-        return execute_grouped_direct_state_history_read(rows, plan);
+        return execute_grouped_state_history_read(rows, plan);
     }
 
     rows.sort_by(|left, right| compare_state_history_rows(left, right, &plan.sort_keys));
@@ -79,9 +78,9 @@ async fn execute_direct_state_history_read(
     Ok(QueryResult { rows, columns })
 }
 
-async fn execute_direct_entity_history_read(
+async fn execute_entity_history_read(
     backend: &dyn LixBackend,
-    plan: &PreparedEntityHistoryDirectReadPlan,
+    plan: &PreparedEntityHistoryReadPlan,
 ) -> Result<QueryResult, LixError> {
     let rows = backend
         .load_committed_state_history_rows(&plan.request)
@@ -130,7 +129,7 @@ impl EntityHistoryRowView {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     format!(
-                        "direct entity-history execution could not parse snapshot_content: {error}"
+                        "entity-history read execution could not parse snapshot_content: {error}"
                     ),
                 )
             })?),
@@ -140,7 +139,7 @@ impl EntityHistoryRowView {
     }
 }
 
-fn state_history_plan_uses_grouping(plan: &PreparedStateHistoryDirectReadPlan) -> bool {
+fn state_history_plan_uses_grouping(plan: &PreparedStateHistoryReadPlan) -> bool {
     !plan.group_by_fields.is_empty()
         || plan.having.is_some()
         || plan.projections.iter().any(|projection| {
@@ -151,9 +150,9 @@ fn state_history_plan_uses_grouping(plan: &PreparedStateHistoryDirectReadPlan) -
         })
 }
 
-fn execute_grouped_direct_state_history_read(
+fn execute_grouped_state_history_read(
     rows: Vec<StateHistoryRow>,
-    plan: &PreparedStateHistoryDirectReadPlan,
+    plan: &PreparedStateHistoryReadPlan,
 ) -> Result<QueryResult, LixError> {
     let mut groups = BTreeMap::<String, StateHistoryGroupAccumulator>::new();
     for row in rows {
@@ -412,14 +411,14 @@ fn compare_entity_history_rows(
 
 fn project_state_history_row(
     row: &StateHistoryRow,
-    plan: &PreparedStateHistoryDirectReadPlan,
+    plan: &PreparedStateHistoryReadPlan,
 ) -> Vec<Value> {
     if plan.wildcard_projection {
         return plan
             .wildcard_columns
             .iter()
             .map(|column| {
-                direct_state_history_field_from_column_name_for_projection(column)
+                state_history_field_from_column_name_for_projection(column)
                     .map(|field| state_history_field_value(row, &field))
                     .unwrap_or(Value::Null)
             })
@@ -441,14 +440,14 @@ fn project_state_history_row(
 
 fn project_entity_history_row(
     row: &EntityHistoryRowView,
-    plan: &PreparedEntityHistoryDirectReadPlan,
+    plan: &PreparedEntityHistoryReadPlan,
 ) -> Vec<Value> {
     if plan.wildcard_projection {
         return plan
             .wildcard_columns
             .iter()
             .map(|column| {
-                direct_entity_history_field_from_column_name(&plan.surface_binding, column)
+                entity_history_field_from_column_name(&plan.surface_binding, column)
                     .map(|field| entity_history_field_value(row, &field))
                     .unwrap_or(Value::Null)
             })
@@ -463,13 +462,11 @@ fn project_entity_history_row(
 
 fn entity_history_field_value(
     row: &EntityHistoryRowView,
-    field: &PreparedDirectEntityHistoryField,
+    field: &PreparedEntityHistoryField,
 ) -> Value {
     match field {
-        PreparedDirectEntityHistoryField::State(field) => {
-            state_history_field_value(&row.row, field)
-        }
-        PreparedDirectEntityHistoryField::Property(property) => row
+        PreparedEntityHistoryField::State(field) => state_history_field_value(&row.row, field),
+        PreparedEntityHistoryField::Property(property) => row
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.get(property))
@@ -499,7 +496,7 @@ fn json_value_to_public_value(value: &JsonValue) -> Value {
 fn compare_state_history_groups(
     left: &StateHistoryGroupAccumulator,
     right: &StateHistoryGroupAccumulator,
-    plan: &PreparedStateHistoryDirectReadPlan,
+    plan: &PreparedStateHistoryReadPlan,
 ) -> std::cmp::Ordering {
     if plan.sort_keys.is_empty() {
         return std::cmp::Ordering::Equal;
@@ -533,8 +530,8 @@ fn compare_state_history_groups(
 
 fn state_history_group_field_value(
     group: &StateHistoryGroupAccumulator,
-    group_by_fields: &[PreparedDirectStateHistoryField],
-    field: &PreparedDirectStateHistoryField,
+    group_by_fields: &[PreparedStateHistoryField],
+    field: &PreparedStateHistoryField,
 ) -> Value {
     group_by_fields
         .iter()
@@ -545,7 +542,7 @@ fn state_history_group_field_value(
 
 fn project_state_history_group(
     group: &StateHistoryGroupAccumulator,
-    plan: &PreparedStateHistoryDirectReadPlan,
+    plan: &PreparedStateHistoryReadPlan,
 ) -> Vec<Value> {
     plan.projections
         .iter()
@@ -560,61 +557,56 @@ fn project_state_history_group(
         .collect()
 }
 
-fn direct_state_history_field_from_column_name_for_projection(
+fn state_history_field_from_column_name_for_projection(
     column: &str,
-) -> Option<PreparedDirectStateHistoryField> {
+) -> Option<PreparedStateHistoryField> {
     match column.to_ascii_lowercase().as_str() {
-        "entity_id" => Some(PreparedDirectStateHistoryField::EntityId),
-        "schema_key" => Some(PreparedDirectStateHistoryField::SchemaKey),
-        "file_id" => Some(PreparedDirectStateHistoryField::FileId),
-        "plugin_key" => Some(PreparedDirectStateHistoryField::PluginKey),
-        "snapshot_content" => Some(PreparedDirectStateHistoryField::SnapshotContent),
-        "metadata" => Some(PreparedDirectStateHistoryField::Metadata),
-        "schema_version" => Some(PreparedDirectStateHistoryField::SchemaVersion),
-        "change_id" => Some(PreparedDirectStateHistoryField::ChangeId),
-        "commit_id" => Some(PreparedDirectStateHistoryField::CommitId),
-        "commit_created_at" => Some(PreparedDirectStateHistoryField::CommitCreatedAt),
-        "root_commit_id" => Some(PreparedDirectStateHistoryField::RootCommitId),
-        "depth" => Some(PreparedDirectStateHistoryField::Depth),
-        "version_id" => Some(PreparedDirectStateHistoryField::VersionId),
+        "entity_id" => Some(PreparedStateHistoryField::EntityId),
+        "schema_key" => Some(PreparedStateHistoryField::SchemaKey),
+        "file_id" => Some(PreparedStateHistoryField::FileId),
+        "plugin_key" => Some(PreparedStateHistoryField::PluginKey),
+        "snapshot_content" => Some(PreparedStateHistoryField::SnapshotContent),
+        "metadata" => Some(PreparedStateHistoryField::Metadata),
+        "schema_version" => Some(PreparedStateHistoryField::SchemaVersion),
+        "change_id" => Some(PreparedStateHistoryField::ChangeId),
+        "commit_id" => Some(PreparedStateHistoryField::CommitId),
+        "commit_created_at" => Some(PreparedStateHistoryField::CommitCreatedAt),
+        "root_commit_id" => Some(PreparedStateHistoryField::RootCommitId),
+        "depth" => Some(PreparedStateHistoryField::Depth),
+        "version_id" => Some(PreparedStateHistoryField::VersionId),
         _ => None,
     }
 }
 
-fn state_history_field_value(
-    row: &StateHistoryRow,
-    field: &PreparedDirectStateHistoryField,
-) -> Value {
+fn state_history_field_value(row: &StateHistoryRow, field: &PreparedStateHistoryField) -> Value {
     match field {
-        PreparedDirectStateHistoryField::EntityId => Value::Text(row.entity_id.clone()),
-        PreparedDirectStateHistoryField::SchemaKey => Value::Text(row.schema_key.clone()),
-        PreparedDirectStateHistoryField::FileId => Value::Text(row.file_id.clone()),
-        PreparedDirectStateHistoryField::PluginKey => Value::Text(row.plugin_key.clone()),
-        PreparedDirectStateHistoryField::SnapshotContent => row
+        PreparedStateHistoryField::EntityId => Value::Text(row.entity_id.clone()),
+        PreparedStateHistoryField::SchemaKey => Value::Text(row.schema_key.clone()),
+        PreparedStateHistoryField::FileId => Value::Text(row.file_id.clone()),
+        PreparedStateHistoryField::PluginKey => Value::Text(row.plugin_key.clone()),
+        PreparedStateHistoryField::SnapshotContent => row
             .snapshot_content
             .as_ref()
             .map(|value: &String| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectStateHistoryField::Metadata => row
+        PreparedStateHistoryField::Metadata => row
             .metadata
             .as_ref()
             .map(|value: &String| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectStateHistoryField::SchemaVersion => Value::Text(row.schema_version.clone()),
-        PreparedDirectStateHistoryField::ChangeId => Value::Text(row.change_id.clone()),
-        PreparedDirectStateHistoryField::CommitId => Value::Text(row.commit_id.clone()),
-        PreparedDirectStateHistoryField::CommitCreatedAt => {
-            Value::Text(row.commit_created_at.clone())
-        }
-        PreparedDirectStateHistoryField::RootCommitId => Value::Text(row.root_commit_id.clone()),
-        PreparedDirectStateHistoryField::Depth => Value::Integer(row.depth),
-        PreparedDirectStateHistoryField::VersionId => Value::Text(row.version_id.clone()),
+        PreparedStateHistoryField::SchemaVersion => Value::Text(row.schema_version.clone()),
+        PreparedStateHistoryField::ChangeId => Value::Text(row.change_id.clone()),
+        PreparedStateHistoryField::CommitId => Value::Text(row.commit_id.clone()),
+        PreparedStateHistoryField::CommitCreatedAt => Value::Text(row.commit_created_at.clone()),
+        PreparedStateHistoryField::RootCommitId => Value::Text(row.root_commit_id.clone()),
+        PreparedStateHistoryField::Depth => Value::Integer(row.depth),
+        PreparedStateHistoryField::VersionId => Value::Text(row.version_id.clone()),
     }
 }
 
-async fn execute_direct_file_history_read(
+async fn execute_file_history_read(
     backend: &dyn LixBackend,
-    plan: &PreparedFileHistoryDirectReadPlan,
+    plan: &PreparedFileHistoryReadPlan,
 ) -> Result<QueryResult, LixError> {
     let mut rows = load_file_history_rows(backend, &plan.request).await?;
     rows.retain(|row| file_history_row_matches_predicates(row, &plan.predicates));
@@ -735,14 +727,14 @@ fn compare_file_history_rows(
 
 fn project_file_history_row(
     row: &FileHistoryRow,
-    plan: &PreparedFileHistoryDirectReadPlan,
+    plan: &PreparedFileHistoryReadPlan,
 ) -> Vec<Value> {
     if plan.wildcard_projection {
         return plan
             .wildcard_columns
             .iter()
             .map(|column| {
-                direct_file_history_field_from_column_name_for_projection(column)
+                file_history_field_from_column_name_for_projection(column)
                     .map(|field| file_history_field_value(row, &field))
                     .unwrap_or(Value::Null)
             })
@@ -755,80 +747,74 @@ fn project_file_history_row(
         .collect()
 }
 
-fn direct_file_history_field_from_column_name_for_projection(
+fn file_history_field_from_column_name_for_projection(
     column: &str,
-) -> Option<PreparedDirectFileHistoryField> {
+) -> Option<PreparedFileHistoryField> {
     match column.to_ascii_lowercase().as_str() {
-        "id" => Some(PreparedDirectFileHistoryField::Id),
-        "path" => Some(PreparedDirectFileHistoryField::Path),
-        "data" => Some(PreparedDirectFileHistoryField::Data),
-        "metadata" => Some(PreparedDirectFileHistoryField::Metadata),
-        "hidden" => Some(PreparedDirectFileHistoryField::Hidden),
-        "lixcol_entity_id" => Some(PreparedDirectFileHistoryField::EntityId),
-        "lixcol_schema_key" => Some(PreparedDirectFileHistoryField::SchemaKey),
-        "lixcol_file_id" => Some(PreparedDirectFileHistoryField::FileId),
-        "lixcol_version_id" => Some(PreparedDirectFileHistoryField::VersionId),
-        "lixcol_plugin_key" => Some(PreparedDirectFileHistoryField::PluginKey),
-        "lixcol_schema_version" => Some(PreparedDirectFileHistoryField::SchemaVersion),
-        "lixcol_change_id" => Some(PreparedDirectFileHistoryField::ChangeId),
-        "lixcol_metadata" => Some(PreparedDirectFileHistoryField::LixcolMetadata),
-        "lixcol_commit_id" => Some(PreparedDirectFileHistoryField::CommitId),
-        "lixcol_commit_created_at" => Some(PreparedDirectFileHistoryField::CommitCreatedAt),
-        "lixcol_root_commit_id" => Some(PreparedDirectFileHistoryField::RootCommitId),
-        "lixcol_depth" => Some(PreparedDirectFileHistoryField::Depth),
+        "id" => Some(PreparedFileHistoryField::Id),
+        "path" => Some(PreparedFileHistoryField::Path),
+        "data" => Some(PreparedFileHistoryField::Data),
+        "metadata" => Some(PreparedFileHistoryField::Metadata),
+        "hidden" => Some(PreparedFileHistoryField::Hidden),
+        "lixcol_entity_id" => Some(PreparedFileHistoryField::EntityId),
+        "lixcol_schema_key" => Some(PreparedFileHistoryField::SchemaKey),
+        "lixcol_file_id" => Some(PreparedFileHistoryField::FileId),
+        "lixcol_version_id" => Some(PreparedFileHistoryField::VersionId),
+        "lixcol_plugin_key" => Some(PreparedFileHistoryField::PluginKey),
+        "lixcol_schema_version" => Some(PreparedFileHistoryField::SchemaVersion),
+        "lixcol_change_id" => Some(PreparedFileHistoryField::ChangeId),
+        "lixcol_metadata" => Some(PreparedFileHistoryField::LixcolMetadata),
+        "lixcol_commit_id" => Some(PreparedFileHistoryField::CommitId),
+        "lixcol_commit_created_at" => Some(PreparedFileHistoryField::CommitCreatedAt),
+        "lixcol_root_commit_id" => Some(PreparedFileHistoryField::RootCommitId),
+        "lixcol_depth" => Some(PreparedFileHistoryField::Depth),
         _ => None,
     }
 }
 
-fn file_history_field_value(row: &FileHistoryRow, field: &PreparedDirectFileHistoryField) -> Value {
+fn file_history_field_value(row: &FileHistoryRow, field: &PreparedFileHistoryField) -> Value {
     match field {
-        PreparedDirectFileHistoryField::Id => Value::Text(row.id.clone()),
-        PreparedDirectFileHistoryField::Path => row
+        PreparedFileHistoryField::Id => Value::Text(row.id.clone()),
+        PreparedFileHistoryField::Path => row
             .path
             .as_ref()
             .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectFileHistoryField::Data => row
+        PreparedFileHistoryField::Data => row
             .data
             .as_ref()
             .map(|value| Value::Blob(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectFileHistoryField::Metadata => row
+        PreparedFileHistoryField::Metadata => row
             .metadata
             .as_ref()
             .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectFileHistoryField::Hidden => {
-            row.hidden.map(Value::Boolean).unwrap_or(Value::Null)
-        }
-        PreparedDirectFileHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),
-        PreparedDirectFileHistoryField::SchemaKey => Value::Text(row.lixcol_schema_key.clone()),
-        PreparedDirectFileHistoryField::FileId => Value::Text(row.lixcol_file_id.clone()),
-        PreparedDirectFileHistoryField::VersionId => Value::Text(row.lixcol_version_id.clone()),
-        PreparedDirectFileHistoryField::PluginKey => Value::Text(row.lixcol_plugin_key.clone()),
-        PreparedDirectFileHistoryField::SchemaVersion => {
-            Value::Text(row.lixcol_schema_version.clone())
-        }
-        PreparedDirectFileHistoryField::ChangeId => Value::Text(row.lixcol_change_id.clone()),
-        PreparedDirectFileHistoryField::LixcolMetadata => row
+        PreparedFileHistoryField::Hidden => row.hidden.map(Value::Boolean).unwrap_or(Value::Null),
+        PreparedFileHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),
+        PreparedFileHistoryField::SchemaKey => Value::Text(row.lixcol_schema_key.clone()),
+        PreparedFileHistoryField::FileId => Value::Text(row.lixcol_file_id.clone()),
+        PreparedFileHistoryField::VersionId => Value::Text(row.lixcol_version_id.clone()),
+        PreparedFileHistoryField::PluginKey => Value::Text(row.lixcol_plugin_key.clone()),
+        PreparedFileHistoryField::SchemaVersion => Value::Text(row.lixcol_schema_version.clone()),
+        PreparedFileHistoryField::ChangeId => Value::Text(row.lixcol_change_id.clone()),
+        PreparedFileHistoryField::LixcolMetadata => row
             .lixcol_metadata
             .as_ref()
             .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectFileHistoryField::CommitId => Value::Text(row.lixcol_commit_id.clone()),
-        PreparedDirectFileHistoryField::CommitCreatedAt => {
+        PreparedFileHistoryField::CommitId => Value::Text(row.lixcol_commit_id.clone()),
+        PreparedFileHistoryField::CommitCreatedAt => {
             Value::Text(row.lixcol_commit_created_at.clone())
         }
-        PreparedDirectFileHistoryField::RootCommitId => {
-            Value::Text(row.lixcol_root_commit_id.clone())
-        }
-        PreparedDirectFileHistoryField::Depth => Value::Integer(row.lixcol_depth),
+        PreparedFileHistoryField::RootCommitId => Value::Text(row.lixcol_root_commit_id.clone()),
+        PreparedFileHistoryField::Depth => Value::Integer(row.lixcol_depth),
     }
 }
 
-async fn execute_direct_directory_history_read(
+async fn execute_directory_history_read(
     backend: &dyn LixBackend,
-    plan: &PreparedDirectoryHistoryDirectReadPlan,
+    plan: &PreparedDirectoryHistoryReadPlan,
 ) -> Result<QueryResult, LixError> {
     let mut rows = load_directory_history_rows(backend, &plan.request).await?;
     rows.retain(|row| directory_history_row_matches_predicates(row, &plan.predicates));
@@ -952,14 +938,14 @@ fn compare_directory_history_rows(
 
 fn project_directory_history_row(
     row: &DirectoryHistoryRow,
-    plan: &PreparedDirectoryHistoryDirectReadPlan,
+    plan: &PreparedDirectoryHistoryReadPlan,
 ) -> Vec<Value> {
     if plan.wildcard_projection {
         return plan
             .wildcard_columns
             .iter()
             .map(|column| {
-                direct_directory_history_field_from_column_name_for_projection(column)
+                directory_history_field_from_column_name_for_projection(column)
                     .map(|field| directory_history_field_value(row, &field))
                     .unwrap_or(Value::Null)
             })
@@ -972,114 +958,104 @@ fn project_directory_history_row(
         .collect()
 }
 
-fn direct_directory_history_field_from_column_name_for_projection(
+fn directory_history_field_from_column_name_for_projection(
     column: &str,
-) -> Option<PreparedDirectDirectoryHistoryField> {
+) -> Option<PreparedDirectoryHistoryField> {
     match column.to_ascii_lowercase().as_str() {
-        "id" => Some(PreparedDirectDirectoryHistoryField::Id),
-        "parent_id" => Some(PreparedDirectDirectoryHistoryField::ParentId),
-        "name" => Some(PreparedDirectDirectoryHistoryField::Name),
-        "path" => Some(PreparedDirectDirectoryHistoryField::Path),
-        "hidden" => Some(PreparedDirectDirectoryHistoryField::Hidden),
-        "lixcol_entity_id" => Some(PreparedDirectDirectoryHistoryField::EntityId),
-        "lixcol_schema_key" => Some(PreparedDirectDirectoryHistoryField::SchemaKey),
-        "lixcol_file_id" => Some(PreparedDirectDirectoryHistoryField::FileId),
-        "lixcol_version_id" => Some(PreparedDirectDirectoryHistoryField::VersionId),
-        "lixcol_plugin_key" => Some(PreparedDirectDirectoryHistoryField::PluginKey),
-        "lixcol_schema_version" => Some(PreparedDirectDirectoryHistoryField::SchemaVersion),
-        "lixcol_change_id" => Some(PreparedDirectDirectoryHistoryField::ChangeId),
-        "lixcol_metadata" => Some(PreparedDirectDirectoryHistoryField::LixcolMetadata),
-        "lixcol_commit_id" => Some(PreparedDirectDirectoryHistoryField::CommitId),
-        "lixcol_commit_created_at" => Some(PreparedDirectDirectoryHistoryField::CommitCreatedAt),
-        "lixcol_root_commit_id" => Some(PreparedDirectDirectoryHistoryField::RootCommitId),
-        "lixcol_depth" => Some(PreparedDirectDirectoryHistoryField::Depth),
+        "id" => Some(PreparedDirectoryHistoryField::Id),
+        "parent_id" => Some(PreparedDirectoryHistoryField::ParentId),
+        "name" => Some(PreparedDirectoryHistoryField::Name),
+        "path" => Some(PreparedDirectoryHistoryField::Path),
+        "hidden" => Some(PreparedDirectoryHistoryField::Hidden),
+        "lixcol_entity_id" => Some(PreparedDirectoryHistoryField::EntityId),
+        "lixcol_schema_key" => Some(PreparedDirectoryHistoryField::SchemaKey),
+        "lixcol_file_id" => Some(PreparedDirectoryHistoryField::FileId),
+        "lixcol_version_id" => Some(PreparedDirectoryHistoryField::VersionId),
+        "lixcol_plugin_key" => Some(PreparedDirectoryHistoryField::PluginKey),
+        "lixcol_schema_version" => Some(PreparedDirectoryHistoryField::SchemaVersion),
+        "lixcol_change_id" => Some(PreparedDirectoryHistoryField::ChangeId),
+        "lixcol_metadata" => Some(PreparedDirectoryHistoryField::LixcolMetadata),
+        "lixcol_commit_id" => Some(PreparedDirectoryHistoryField::CommitId),
+        "lixcol_commit_created_at" => Some(PreparedDirectoryHistoryField::CommitCreatedAt),
+        "lixcol_root_commit_id" => Some(PreparedDirectoryHistoryField::RootCommitId),
+        "lixcol_depth" => Some(PreparedDirectoryHistoryField::Depth),
         _ => None,
     }
 }
 
 fn directory_history_field_value(
     row: &DirectoryHistoryRow,
-    field: &PreparedDirectDirectoryHistoryField,
+    field: &PreparedDirectoryHistoryField,
 ) -> Value {
     match field {
-        PreparedDirectDirectoryHistoryField::Id => Value::Text(row.id.clone()),
-        PreparedDirectDirectoryHistoryField::ParentId => row
+        PreparedDirectoryHistoryField::Id => Value::Text(row.id.clone()),
+        PreparedDirectoryHistoryField::ParentId => row
             .parent_id
             .as_ref()
             .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectDirectoryHistoryField::Name => Value::Text(row.name.clone()),
-        PreparedDirectDirectoryHistoryField::Path => row
+        PreparedDirectoryHistoryField::Name => Value::Text(row.name.clone()),
+        PreparedDirectoryHistoryField::Path => row
             .path
             .as_ref()
             .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectDirectoryHistoryField::Hidden => {
+        PreparedDirectoryHistoryField::Hidden => {
             row.hidden.map(Value::Boolean).unwrap_or(Value::Null)
         }
-        PreparedDirectDirectoryHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),
-        PreparedDirectDirectoryHistoryField::SchemaKey => {
-            Value::Text(row.lixcol_schema_key.clone())
-        }
-        PreparedDirectDirectoryHistoryField::FileId => Value::Text(row.lixcol_file_id.clone()),
-        PreparedDirectDirectoryHistoryField::VersionId => {
-            Value::Text(row.lixcol_version_id.clone())
-        }
-        PreparedDirectDirectoryHistoryField::PluginKey => {
-            Value::Text(row.lixcol_plugin_key.clone())
-        }
-        PreparedDirectDirectoryHistoryField::SchemaVersion => {
+        PreparedDirectoryHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),
+        PreparedDirectoryHistoryField::SchemaKey => Value::Text(row.lixcol_schema_key.clone()),
+        PreparedDirectoryHistoryField::FileId => Value::Text(row.lixcol_file_id.clone()),
+        PreparedDirectoryHistoryField::VersionId => Value::Text(row.lixcol_version_id.clone()),
+        PreparedDirectoryHistoryField::PluginKey => Value::Text(row.lixcol_plugin_key.clone()),
+        PreparedDirectoryHistoryField::SchemaVersion => {
             Value::Text(row.lixcol_schema_version.clone())
         }
-        PreparedDirectDirectoryHistoryField::ChangeId => Value::Text(row.lixcol_change_id.clone()),
-        PreparedDirectDirectoryHistoryField::LixcolMetadata => row
+        PreparedDirectoryHistoryField::ChangeId => Value::Text(row.lixcol_change_id.clone()),
+        PreparedDirectoryHistoryField::LixcolMetadata => row
             .lixcol_metadata
             .as_ref()
             .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
-        PreparedDirectDirectoryHistoryField::CommitId => Value::Text(row.lixcol_commit_id.clone()),
-        PreparedDirectDirectoryHistoryField::CommitCreatedAt => {
+        PreparedDirectoryHistoryField::CommitId => Value::Text(row.lixcol_commit_id.clone()),
+        PreparedDirectoryHistoryField::CommitCreatedAt => {
             Value::Text(row.lixcol_commit_created_at.clone())
         }
-        PreparedDirectDirectoryHistoryField::RootCommitId => {
+        PreparedDirectoryHistoryField::RootCommitId => {
             Value::Text(row.lixcol_root_commit_id.clone())
         }
-        PreparedDirectDirectoryHistoryField::Depth => Value::Integer(row.lixcol_depth),
+        PreparedDirectoryHistoryField::Depth => Value::Integer(row.lixcol_depth),
     }
 }
 
-fn direct_state_history_field_from_column_name(
-    column: &str,
-) -> Option<PreparedDirectStateHistoryField> {
+fn state_history_field_from_column_name(column: &str) -> Option<PreparedStateHistoryField> {
     match column.to_ascii_lowercase().as_str() {
-        "entity_id" | "lixcol_entity_id" => Some(PreparedDirectStateHistoryField::EntityId),
-        "schema_key" | "lixcol_schema_key" => Some(PreparedDirectStateHistoryField::SchemaKey),
-        "file_id" | "lixcol_file_id" => Some(PreparedDirectStateHistoryField::FileId),
-        "plugin_key" | "lixcol_plugin_key" => Some(PreparedDirectStateHistoryField::PluginKey),
-        "snapshot_content" => Some(PreparedDirectStateHistoryField::SnapshotContent),
-        "metadata" | "lixcol_metadata" => Some(PreparedDirectStateHistoryField::Metadata),
+        "entity_id" | "lixcol_entity_id" => Some(PreparedStateHistoryField::EntityId),
+        "schema_key" | "lixcol_schema_key" => Some(PreparedStateHistoryField::SchemaKey),
+        "file_id" | "lixcol_file_id" => Some(PreparedStateHistoryField::FileId),
+        "plugin_key" | "lixcol_plugin_key" => Some(PreparedStateHistoryField::PluginKey),
+        "snapshot_content" => Some(PreparedStateHistoryField::SnapshotContent),
+        "metadata" | "lixcol_metadata" => Some(PreparedStateHistoryField::Metadata),
         "schema_version" | "lixcol_schema_version" => {
-            Some(PreparedDirectStateHistoryField::SchemaVersion)
+            Some(PreparedStateHistoryField::SchemaVersion)
         }
-        "change_id" | "lixcol_change_id" => Some(PreparedDirectStateHistoryField::ChangeId),
-        "commit_id" | "lixcol_commit_id" => Some(PreparedDirectStateHistoryField::CommitId),
-        "commit_created_at" => Some(PreparedDirectStateHistoryField::CommitCreatedAt),
-        "root_commit_id" | "lixcol_root_commit_id" => {
-            Some(PreparedDirectStateHistoryField::RootCommitId)
-        }
-        "depth" | "lixcol_depth" => Some(PreparedDirectStateHistoryField::Depth),
-        "version_id" | "lixcol_version_id" => Some(PreparedDirectStateHistoryField::VersionId),
+        "change_id" | "lixcol_change_id" => Some(PreparedStateHistoryField::ChangeId),
+        "commit_id" | "lixcol_commit_id" => Some(PreparedStateHistoryField::CommitId),
+        "commit_created_at" => Some(PreparedStateHistoryField::CommitCreatedAt),
+        "root_commit_id" | "lixcol_root_commit_id" => Some(PreparedStateHistoryField::RootCommitId),
+        "depth" | "lixcol_depth" => Some(PreparedStateHistoryField::Depth),
+        "version_id" | "lixcol_version_id" => Some(PreparedStateHistoryField::VersionId),
         _ => None,
     }
 }
 
-fn direct_entity_history_field_from_column_name(
-    surface_binding: &crate::catalog::SurfaceBinding,
+fn entity_history_field_from_column_name(
+    surface_binding: &crate::catalog::ResolvedSurface,
     column: &str,
-) -> Option<PreparedDirectEntityHistoryField> {
+) -> Option<PreparedEntityHistoryField> {
     let lowercase = column.to_ascii_lowercase();
-    if let Some(field) = direct_state_history_field_from_column_name(column) {
-        return Some(PreparedDirectEntityHistoryField::State(field));
+    if let Some(field) = state_history_field_from_column_name(column) {
+        return Some(PreparedEntityHistoryField::State(field));
     }
     if surface_binding
         .descriptor
@@ -1087,7 +1063,7 @@ fn direct_entity_history_field_from_column_name(
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(column))
     {
-        return Some(PreparedDirectEntityHistoryField::Property(lowercase));
+        return Some(PreparedEntityHistoryField::Property(lowercase));
     }
     None
 }

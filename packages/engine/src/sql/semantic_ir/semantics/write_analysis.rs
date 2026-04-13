@@ -1,6 +1,6 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationBinding,
-    FilesystemRelationKind, RelationBindContext, RelationBinding, SurfaceBinding,
+    FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedSurface,
     SurfaceOverrideValue,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
@@ -148,7 +148,7 @@ fn analyze_write_scope(
         crate::catalog::DefaultScopeSemantics::ActiveVersion => {
             if canonicalized
                 .write_command
-                .execution_context
+                .statement_context
                 .requested_version_id
                 .is_some()
             {
@@ -194,7 +194,7 @@ fn insert_scope_for_active_version_surface(
 
     let Some(active_version_id) = canonicalized
         .write_command
-        .execution_context
+        .statement_context
         .requested_version_id
         .as_ref()
     else {
@@ -377,7 +377,7 @@ fn selector_expr_text_value(expr: &Expr, canonicalized: &CanonicalizedWrite) -> 
     match evaluate_public_write_expr_to_value(
         expr,
         &canonicalized.write_command.bound_parameters,
-        &canonicalized.write_command.execution_context,
+        &canonicalized.write_command.statement_context,
     )
     .ok()?
     {
@@ -533,7 +533,7 @@ fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<Str
 }
 
 fn filesystem_surface_binding(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<FilesystemRelationBinding>, WriteAnalysisError> {
     let Some(binding) = builtin_catalog_compiler_facade()
         .bind_surface_runtime_relation(surface_binding, RelationBindContext::default())
@@ -551,7 +551,7 @@ fn filesystem_surface_binding(
 }
 
 fn filesystem_surface_kind(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<FilesystemRelationKind>, WriteAnalysisError> {
     Ok(filesystem_surface_binding(surface_binding)?.map(|binding| binding.kind))
 }
@@ -654,7 +654,7 @@ mod tests {
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
-    use crate::sql::semantic_ir::ExecutionContext;
+    use crate::sql::semantic_ir::StatementContext;
     use std::collections::BTreeSet;
 
     fn canonicalized_write(
@@ -667,9 +667,9 @@ mod tests {
         let bound = bind_statement(
             statement,
             Vec::new(),
-            ExecutionContext {
+            StatementContext {
                 requested_version_id: Some(requested_version_id.to_string()),
-                ..ExecutionContext::default()
+                ..StatementContext::default()
             },
         );
         canonicalize_write(bound, &registry).expect("write should canonicalize")

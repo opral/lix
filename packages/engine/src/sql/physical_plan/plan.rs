@@ -1,9 +1,9 @@
-use crate::contracts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionRead};
+use crate::contracts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionPlan};
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
-use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
+use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::PlannedStateRow;
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::contracts::effects::PlanEffects;
@@ -14,19 +14,19 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PhysicalPlan {
-    PublicRead(PreparedPublicReadExecution),
-    PublicWrite(PreparedPublicWriteExecution),
+    PublicRead(PublicReadPhysicalPlan),
+    PublicWrite(PublicWritePhysicalPlan),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PreparedPublicReadExecution {
-    LoweredSql(LoweredReadProgram),
-    ReadTimeProjection(ReadTimeProjectionRead),
-    Direct(DirectPublicReadPlan),
+pub(crate) enum PublicReadPhysicalPlan {
+    LoweredSql(LoweredReadBatch),
+    ReadTimeProjection(ReadTimeProjectionPlan),
+    HistoryRead(HistoryReadPlan),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct LoweredReadProgram {
+pub(crate) struct LoweredReadBatch {
     pub(crate) statements: Vec<LoweredReadStatement>,
     pub(crate) pushdown_decision: PushdownDecision,
     pub(crate) result_columns: LoweredResultColumns,
@@ -309,7 +309,7 @@ pub(crate) enum LoweredResultColumns {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PreparedPublicWriteExecution {
+pub(crate) enum PublicWritePhysicalPlan {
     Noop,
     Materialize(PublicWriteMaterialization),
 }
@@ -321,12 +321,12 @@ pub(crate) struct PublicWriteMaterialization {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PublicWriteExecutionPartition {
-    Tracked(TrackedWriteExecution),
-    Untracked(UntrackedWriteExecution),
+    Tracked(TrackedWritePlan),
+    Untracked(UntrackedWritePlan),
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TrackedWriteExecution {
+pub(crate) struct TrackedWritePlan {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub(crate) change_batch: Option<ChangeBatch>,
     pub(crate) create_preconditions: CommitPreconditions,
@@ -334,7 +334,7 @@ pub(crate) struct TrackedWriteExecution {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct UntrackedWriteExecution {
+pub(crate) struct UntrackedWritePlan {
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
     pub(crate) semantic_effects: PlanEffects,
     pub(crate) persist_filesystem_payloads_before_write: bool,

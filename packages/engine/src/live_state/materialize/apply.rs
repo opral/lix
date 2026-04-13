@@ -13,13 +13,15 @@ use crate::live_state::LiveStateMode;
 use crate::live_state::{
     mark_live_state_ready_at_latest_replay_cursor_in_transaction, register_schema_in_transaction,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     backend: &dyn LixBackend,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
     transaction
         .execute(
             &build_set_live_state_mode_sql(LiveStateMode::Rebuilding),

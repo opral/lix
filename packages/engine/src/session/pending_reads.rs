@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
 
 use crate::contracts::{
-    DynFunctionProvider, PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
-    PendingViewReadQuery, PendingViewReadStorage, PreparedPublicReadArtifact,
-    PublicReadExecutionMode, PublicReadResultColumn, PublicReadResultColumns,
+    DynFunctionProvider, PendingOverlayFilter, PendingOverlayLane, PendingOverlayOrderClause,
+    PendingOverlayProjection, PendingOverlayQuery, PreparedPublicRead, PublicReadResultColumn,
+    PublicReadResultColumns, PublicReadSource,
 };
 use crate::contracts::{
-    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+    PendingFilesystemFileView, PendingOverlayView, PendingSemanticRow, PendingSemanticStorage,
 };
 use crate::live_state::{
-    compile_live_read_contract_from_registered_snapshots, read_contract_from_definition,
-    scan_visible_live_rows, LiveReadContract, LiveReadRow, LiveStorageLane, ScanConstraint,
-    ScanField, ScanOperator,
+    compile_live_row_shape_from_registered_snapshots, live_row_shape_from_definition,
+    scan_visible_live_rows, LiveReadRow, LiveRowShape, LiveStorageLane, ScanConstraint, ScanField,
+    ScanOperator,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -22,25 +22,26 @@ const GLOBAL_VERSION_ID: &str = "global";
 
 struct TransactionReadModel<'a> {
     base: &'a dyn LixBackend,
-    pending_view: Option<&'a dyn PendingView>,
+    pending_overlay_view: Option<&'a dyn PendingOverlayView>,
     functions: Option<&'a DynFunctionProvider>,
 }
 
 impl<'a> TransactionReadModel<'a> {
     fn new(
         base: &'a dyn LixBackend,
-        pending_view: Option<&'a dyn PendingView>,
+        pending_overlay_view: Option<&'a dyn PendingOverlayView>,
         functions: Option<&'a DynFunctionProvider>,
     ) -> Self {
         Self {
             base,
-            pending_view,
+            pending_overlay_view,
             functions,
         }
     }
 
     fn has_pending_visibility(&self) -> bool {
-        self.pending_view.is_some_and(PendingView::has_overlays)
+        self.pending_overlay_view
+            .is_some_and(PendingOverlayView::has_overlays)
     }
 
     async fn bootstrap_public_surface_registry(
@@ -77,13 +78,13 @@ impl<'a> TransactionReadModel<'a> {
 
     async fn execute_prepared_public_read(
         &self,
-        public_read: &PreparedPublicReadArtifact,
+        public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError> {
-        match public_read.contract.execution_mode() {
-            PublicReadExecutionMode::PendingView => {
+        match public_read.contract.source() {
+            PublicReadSource::PendingOverlay => {
                 let query = public_read
                     .contract
-                    .pending_view_query
+                    .pending_overlay_query
                     .as_ref()
                     .expect("pending-view public reads must lower to a typed live-table query");
                 let result = self.execute_live_table_query(query).await?;
@@ -92,7 +93,7 @@ impl<'a> TransactionReadModel<'a> {
                 }
                 Ok(result)
             }
-            PublicReadExecutionMode::Committed(_) => Err(LixError::new(
+            PublicReadSource::Committed(_) => Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "committed public read execution does not belong to live_state pending overlays",
             )),
@@ -125,8 +126,10 @@ impl<'a> TransactionReadModel<'a> {
             rows.insert(key.entity_id(), snapshot_content.clone());
         }
 
-        if let Some(pending_view) = self.pending_view {
-            for (entity_id, snapshot_content) in pending_view.visible_registered_schema_entries() {
+        if let Some(pending_overlay_view) = self.pending_overlay_view {
+            for (entity_id, snapshot_content) in
+                pending_overlay_view.visible_registered_schema_entries()
+            {
                 match snapshot_content {
                     Some(snapshot_content) => {
                         rows.insert(entity_id, snapshot_content);
@@ -137,7 +140,7 @@ impl<'a> TransactionReadModel<'a> {
                 }
             }
 
-            for row in pending_view
+            for row in pending_overlay_view
                 .visible_semantic_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY)
             {
                 if row.version_id != GLOBAL_VERSION_ID {
@@ -168,9 +171,9 @@ impl<'a> TransactionReadModel<'a> {
             .iter()
             .map(|column| column.property_name.clone())
             .collect::<Vec<_>>();
-        let storage = pending_semantic_storage(query.storage);
-        let mut rows = match query.storage {
-            PendingViewReadStorage::Tracked => scan_visible_live_rows(
+        let storage = pending_semantic_storage(query.lane);
+        let mut rows = match query.lane {
+            PendingOverlayLane::Tracked => scan_visible_live_rows(
                 self.base,
                 LiveStorageLane::Tracked,
                 &query.schema_key,
@@ -182,7 +185,7 @@ impl<'a> TransactionReadModel<'a> {
             .into_iter()
             .map(|row| visible_live_row_from_raw(&access, row, false))
             .collect::<Result<Vec<_>, _>>()?,
-            PendingViewReadStorage::Untracked => scan_visible_live_rows(
+            PendingOverlayLane::Untracked => scan_visible_live_rows(
                 self.base,
                 LiveStorageLane::Untracked,
                 &query.schema_key,
@@ -199,12 +202,11 @@ impl<'a> TransactionReadModel<'a> {
             .drain(..)
             .map(|row| (visible_live_row_identity(&row), row))
             .collect::<BTreeMap<_, _>>();
-        if let Some(pending_view) = self.pending_view {
-            for row in pending_view.visible_semantic_rows(storage, &query.schema_key) {
+        if let Some(pending_overlay_view) = self.pending_overlay_view {
+            for row in pending_overlay_view.visible_semantic_rows(storage, &query.schema_key) {
                 let visible = visible_live_row_from_pending(&access, &row)?;
                 let identity = visible_live_row_identity(&visible);
-                if visible.is_tombstone && matches!(query.storage, PendingViewReadStorage::Tracked)
-                {
+                if visible.is_tombstone && matches!(query.lane, PendingOverlayLane::Tracked) {
                     by_identity.remove(&identity);
                 } else {
                     by_identity.insert(identity, visible);
@@ -269,8 +271,8 @@ impl<'a> TransactionReadModel<'a> {
         })
     }
 
-    async fn load_live_row_access(&self, schema_key: &str) -> Result<LiveReadContract, LixError> {
-        if let Ok(contract) = read_contract_from_definition(schema_key, None) {
+    async fn load_live_row_access(&self, schema_key: &str) -> Result<LiveRowShape, LixError> {
+        if let Ok(contract) = live_row_shape_from_definition(schema_key, None) {
             return Ok(contract);
         }
 
@@ -280,19 +282,19 @@ impl<'a> TransactionReadModel<'a> {
             .into_values()
             .map(|snapshot_content| vec![Value::Text(snapshot_content)])
             .collect::<Vec<_>>();
-        compile_live_read_contract_from_registered_snapshots(schema_key, rows)
+        compile_live_row_shape_from_registered_snapshots(schema_key, rows)
     }
 
     fn apply_filesystem_overlay_to_rows(
         &self,
         query: &LiveTableOverlayQuery,
-        access: &LiveReadContract,
+        access: &LiveRowShape,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
     ) {
-        let Some(pending_view) = self.pending_view else {
+        let Some(pending_overlay_view) = self.pending_overlay_view else {
             return;
         };
-        if query.storage != PendingViewReadStorage::Tracked
+        if query.lane != PendingOverlayLane::Tracked
             || !matches!(
                 query.schema_key.as_str(),
                 "lix_file_descriptor" | "lix_directory_descriptor"
@@ -301,8 +303,8 @@ impl<'a> TransactionReadModel<'a> {
             return;
         }
 
-        for pending in
-            pending_view.visible_directory_rows(PendingSemanticStorage::Tracked, &query.schema_key)
+        for pending in pending_overlay_view
+            .visible_directory_rows(PendingSemanticStorage::Tracked, &query.schema_key)
         {
             let Ok(visible) = visible_live_row_from_pending(access, &pending) else {
                 continue;
@@ -319,7 +321,7 @@ impl<'a> TransactionReadModel<'a> {
             return;
         }
 
-        for pending in pending_view.visible_files() {
+        for pending in pending_overlay_view.visible_files() {
             if pending.deleted {
                 rows.retain(|_, row| {
                     !(row.schema_key == "lix_file_descriptor"
@@ -352,15 +354,15 @@ impl<'a> TransactionReadModel<'a> {
         query: &LiveTableOverlayQuery,
         rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
     ) {
-        if query.storage != PendingViewReadStorage::Tracked {
+        if query.lane != PendingOverlayLane::Tracked {
             return;
         }
-        let Some(pending_view) = self.pending_view else {
+        let Some(pending_overlay_view) = self.pending_overlay_view else {
             return;
         };
 
         for row in rows.values_mut() {
-            let Some(writer_key) = pending_view.writer_key_annotation_for_state_row(
+            let Some(writer_key) = pending_overlay_view.writer_key_annotation_for_state_row(
                 &row.version_id,
                 &row.schema_key,
                 &row.entity_id,
@@ -379,52 +381,52 @@ impl<'a> TransactionReadModel<'a> {
 
 pub(crate) async fn build_surface_registry(
     base: &dyn LixBackend,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
     functions: &DynFunctionProvider,
 ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
-    TransactionReadModel::new(base, pending_write_view, Some(functions))
+    TransactionReadModel::new(base, pending_write_overlay_view, Some(functions))
         .bootstrap_public_surface_registry()
         .await
 }
 
-pub(crate) async fn execute_prepared_public_read_with_pending_view(
+pub(crate) async fn execute_prepared_public_read_with_pending_overlay_view(
     base: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
-    public_read: &PreparedPublicReadArtifact,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    TransactionReadModel::new(base, pending_view, None)
+    TransactionReadModel::new(base, pending_overlay_view, None)
         .execute_prepared_public_read(public_read)
         .await
 }
 
-pub(crate) async fn execute_prepared_public_read_with_pending_view_in_transaction(
+pub(crate) async fn execute_prepared_public_read_with_pending_overlay_view_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    pending_view: Option<&dyn PendingView>,
-    public_read: &PreparedPublicReadArtifact,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    match public_read.contract.execution_mode() {
-        PublicReadExecutionMode::PendingView => {
+    match public_read.contract.source() {
+        PublicReadSource::PendingOverlay => {
             let backend = crate::backend::transaction_backend_view(transaction);
-            TransactionReadModel::new(&backend, pending_view, None)
+            TransactionReadModel::new(&backend, pending_overlay_view, None)
                 .execute_prepared_public_read(public_read)
                 .await
         }
-        PublicReadExecutionMode::Committed(_) => Err(LixError::new(
+        PublicReadSource::Committed(_) => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             "committed public read execution does not belong to live_state pending overlays",
         )),
     }
 }
 
-type LiveTableOverlayQuery = PendingViewReadQuery;
-type LiveProjection = PendingViewProjection;
-type LiveFilter = PendingViewFilter;
-type LiveOrderClause = PendingViewOrderClause;
+type LiveTableOverlayQuery = PendingOverlayQuery;
+type LiveProjection = PendingOverlayProjection;
+type LiveFilter = PendingOverlayFilter;
+type LiveOrderClause = PendingOverlayOrderClause;
 
-fn pending_semantic_storage(storage: PendingViewReadStorage) -> PendingSemanticStorage {
-    match storage {
-        PendingViewReadStorage::Tracked => PendingSemanticStorage::Tracked,
-        PendingViewReadStorage::Untracked => PendingSemanticStorage::Untracked,
+fn pending_semantic_storage(lane: PendingOverlayLane) -> PendingSemanticStorage {
+    match lane {
+        PendingOverlayLane::Tracked => PendingSemanticStorage::Tracked,
+        PendingOverlayLane::Untracked => PendingSemanticStorage::Untracked,
     }
 }
 
@@ -551,7 +553,7 @@ fn scan_constraints_from_live_filters(filters: &[LiveFilter]) -> Vec<ScanConstra
 }
 
 fn visible_live_row_from_raw(
-    access: &LiveReadContract,
+    access: &LiveRowShape,
     row: LiveReadRow,
     untracked: bool,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
@@ -575,7 +577,7 @@ fn visible_live_row_from_raw(
 }
 
 fn visible_live_row_from_pending(
-    access: &LiveReadContract,
+    access: &LiveRowShape,
     pending: &PendingSemanticRow,
 ) -> Result<OverlayVisibleLiveRow, LixError> {
     Ok(OverlayVisibleLiveRow {
@@ -597,7 +599,7 @@ fn visible_live_row_from_pending(
 }
 
 fn visible_live_row_from_pending_filesystem_state(
-    access: &LiveReadContract,
+    access: &LiveRowShape,
     pending: &PendingFilesystemFileView,
 ) -> Option<OverlayVisibleLiveRow> {
     let descriptor = pending.descriptor.as_ref()?;

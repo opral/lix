@@ -1,6 +1,6 @@
-//! Semantic ownership for normalized internal statement batches.
+//! Semantic ownership for normalized direct statement batches.
 //!
-//! This stage owns the front-end normalization output for internal SQL after
+//! This stage owns the front-end normalization output for direct SQL after
 //! parse/bind but before later planning and execution-specific wrapping.
 
 use crate::contracts::PreparedStatement;
@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct InternalStatementRewrite {
+pub(crate) struct DirectStatementRewrite {
     pub(crate) statements: Vec<Statement>,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) effect_only: bool,
@@ -30,7 +30,7 @@ pub(crate) struct InternalStatementRewrite {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct NormalizedInternalStatements {
+pub(crate) struct NormalizedDirectStatements {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatement>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
@@ -57,14 +57,14 @@ enum RewrittenStatementBinding {
     Prepared(PreparedStatement),
 }
 
-impl NormalizedInternalStatements {
+impl NormalizedDirectStatements {
     pub(crate) fn semantic_statement(&self) -> super::public::SemanticStatement {
-        super::public::SemanticStatement::Internal(self.clone())
+        super::public::SemanticStatement::Direct(self.clone())
     }
 }
 
-impl From<NormalizedInternalStatements> for PlannedStatementSet {
-    fn from(output: NormalizedInternalStatements) -> Self {
+impl From<NormalizedDirectStatements> for PlannedStatementSet {
+    fn from(output: NormalizedDirectStatements) -> Self {
         let _ = output.semantic_statement();
         Self {
             prepared_statements: output.prepared_statements,
@@ -75,13 +75,13 @@ impl From<NormalizedInternalStatements> for PlannedStatementSet {
     }
 }
 
-pub(crate) async fn rewrite_internal_statement<P>(
+pub(crate) async fn rewrite_direct_statement<P>(
     statement: Statement,
     _params: &[Value],
     _writer_key: Option<&str>,
     _known_live_schema_definitions: &BTreeMap<String, JsonValue>,
     _provider: &mut P,
-) -> Result<InternalStatementRewrite, LixError>
+) -> Result<DirectStatementRewrite, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
@@ -90,8 +90,8 @@ where
     Ok(output)
 }
 
-fn passthrough_output(statement: Statement) -> InternalStatementRewrite {
-    InternalStatementRewrite {
+fn passthrough_output(statement: Statement) -> DirectStatementRewrite {
+    DirectStatementRewrite {
         statements: vec![statement],
         prepared_statements: Vec::new(),
         effect_only: false,
@@ -102,7 +102,7 @@ fn passthrough_output(statement: Statement) -> InternalStatementRewrite {
     }
 }
 
-fn validate_statement_output(output: &InternalStatementRewrite) -> Result<(), LixError> {
+fn validate_statement_output(output: &DirectStatementRewrite) -> Result<(), LixError> {
     if output.statements.is_empty()
         && output.prepared_statements.is_empty()
         && !(output.effect_only
@@ -137,13 +137,13 @@ fn validate_statement_output(output: &InternalStatementRewrite) -> Result<(), Li
     Ok(())
 }
 
-pub(crate) async fn prepare_internal_statements_to_plan<P>(
+pub(crate) async fn prepare_direct_statements_to_plan<P>(
     dialect: SqlDialect,
     statements: Vec<Statement>,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
     writer_key: Option<&str>,
-) -> Result<NormalizedInternalStatements, LixError>
+) -> Result<NormalizedDirectStatements, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -159,7 +159,7 @@ async fn prepare_rewritten_statements<P>(
     params: &[Value],
     provider: &mut P,
     writer_key: Option<&str>,
-) -> Result<NormalizedInternalStatements, LixError>
+) -> Result<NormalizedDirectStatements, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
 {
@@ -170,7 +170,7 @@ where
     let mut update_validations: Vec<UpdateValidationPlan> = Vec::new();
 
     for (statement_index, statement) in statements.into_iter().enumerate() {
-        let output = Box::pin(rewrite_internal_statement(
+        let output = Box::pin(rewrite_direct_statement(
             statement,
             params,
             writer_key,
@@ -181,13 +181,13 @@ where
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "prepare_internal_statements_to_plan rewrite failed for statement {}: {}",
+                "prepare_direct_statements_to_plan rewrite failed for statement {}: {}",
                 statement_index, error.description
             ),
         })?;
 
         accumulate_rewrite_output(
-            from_internal_rewrite(output),
+            from_direct_rewrite(output),
             provider,
             dialect,
             &mut rewritten,
@@ -206,7 +206,7 @@ where
     let (normalized_sql, prepared_statements) =
         render_statements_with_params(&rewritten, params, dialect)?;
 
-    Ok(NormalizedInternalStatements {
+    Ok(NormalizedDirectStatements {
         sql: normalized_sql,
         prepared_statements,
         live_table_requirements,
@@ -282,7 +282,7 @@ fn render_statements_with_params(
     Ok((rendered.join("; "), prepared_statements))
 }
 
-fn from_internal_rewrite(output: InternalStatementRewrite) -> StatementRewriteOutput {
+fn from_direct_rewrite(output: DirectStatementRewrite) -> StatementRewriteOutput {
     StatementRewriteOutput {
         statements: output.statements,
         prepared_statements: output.prepared_statements,

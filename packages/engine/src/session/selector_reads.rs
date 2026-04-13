@@ -8,7 +8,7 @@ use sqlparser::ast::{
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::{
-    DynFunctionProvider, PendingPublicReadExecutionBackend, PendingView, ReadExecutionBindings,
+    DynFunctionProvider, PendingOverlayView, PendingPublicReadHost, ReadExecutionHost,
     ReadTimeProjectionRow,
 };
 use crate::session::read_preparation::{
@@ -28,7 +28,7 @@ const GLOBAL_VERSION_ID: &str = "global";
 pub(crate) struct SessionWriteSelectorResolver<'a> {
     backend: &'a dyn LixBackend,
     projection_registry: &'a CatalogProjectionRegistry,
-    pending_view: Option<&'a dyn PendingView>,
+    pending_overlay_view: Option<&'a dyn PendingOverlayView>,
     prepared_read_collaborators: PreparedPublicReadCollaborators,
 }
 
@@ -36,15 +36,16 @@ impl<'a> SessionWriteSelectorResolver<'a> {
     pub(crate) async fn new(
         backend: &'a dyn LixBackend,
         projection_registry: &'a CatalogProjectionRegistry,
-        pending_view: Option<&'a dyn PendingView>,
+        pending_overlay_view: Option<&'a dyn PendingOverlayView>,
         functions: &DynFunctionProvider,
     ) -> Result<Self, LixError> {
         let prepared_read_collaborators =
-            bootstrap_prepared_public_read_collaborators(backend, pending_view, functions).await?;
+            bootstrap_prepared_public_read_collaborators(backend, pending_overlay_view, functions)
+                .await?;
         Ok(Self {
             backend,
             projection_registry,
-            pending_view,
+            pending_overlay_view,
             prepared_read_collaborators,
         })
     }
@@ -67,25 +68,29 @@ impl<'a> SessionWriteSelectorResolver<'a> {
             active_version_id,
             planned_write
                 .command
-                .execution_context
+                .statement_context
                 .writer_key
                 .as_deref(),
         )
         .await?;
         self.backend
-            .execute_prepared_public_read_with_pending_view(self, self.pending_view, &artifact)
+            .execute_prepared_public_read_with_pending_overlay_view(
+                self,
+                self.pending_overlay_view,
+                &artifact,
+            )
             .await
     }
 }
 
 #[async_trait(?Send)]
-impl ReadExecutionBindings for SessionWriteSelectorResolver<'_> {
+impl ReadExecutionHost for SessionWriteSelectorResolver<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::contracts::ReadTimeProjectionRead,
+        artifact: &crate::contracts::ReadTimeProjectionPlan,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        crate::session::read_execution_bindings::derive_read_time_projection_rows_with_registry(
+        crate::session::read_execution_host::derive_read_time_projection_rows_with_registry(
             self.projection_registry,
             backend,
             artifact,
@@ -107,7 +112,7 @@ fn selector_read_preparation_version_id(planned_write: &PlannedWrite) -> &str {
         | ScopeProof::Unknown
         | ScopeProof::Unbounded => planned_write
             .command
-            .execution_context
+            .statement_context
             .requested_version_id
             .as_deref()
             .unwrap_or(GLOBAL_VERSION_ID),
@@ -186,7 +191,7 @@ impl WriteSelectorResolver for SessionWriteSelectorResolver<'_> {
     ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
         if let Some(rows) = try_resolve_state_selector_rows_with_backend(
             self.backend,
-            self.pending_view,
+            self.pending_overlay_view,
             planned_write,
         )
         .await

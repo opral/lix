@@ -1,21 +1,21 @@
 use crate::contracts::SqlPreparationMetadataReader;
 use crate::contracts::{
-    PreparedBatch, PreparedDerivedRowsetReadArtifact, PreparedDirectDirectoryHistoryField,
-    PreparedDirectEntityHistoryField, PreparedDirectFileHistoryField,
-    PreparedDirectHistoryReadArtifact, PreparedDirectPublicRead, PreparedDirectStateHistoryField,
-    PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryDirectReadPlan,
+    PreparedBatch, PreparedBatchReadArtifact, PreparedDirectReadArtifact,
+    PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryField,
     PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryProjection,
-    PreparedDirectoryHistorySortKey, PreparedEntityHistoryDirectReadPlan,
-    PreparedEntityHistoryPredicate, PreparedEntityHistoryProjection, PreparedEntityHistorySortKey,
-    PreparedExplainMode, PreparedFileHistoryAggregate, PreparedFileHistoryDirectReadPlan,
-    PreparedFileHistoryPredicate, PreparedFileHistoryProjection, PreparedFileHistorySortKey,
-    PreparedGeneralProgramReadArtifact, PreparedInternalReadArtifact, PreparedPublicReadArtifact,
-    PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
-    PreparedReadStep, PreparedStateHistoryAggregate, PreparedStateHistoryAggregatePredicate,
-    PreparedStateHistoryDirectReadPlan, PreparedStateHistoryPredicate,
-    PreparedStateHistoryProjection, PreparedStateHistoryProjectionValue,
-    PreparedStateHistorySortKey, PreparedStateHistorySortValue, PreparedStatement,
-    PublicReadResultColumn, PublicReadResultColumns, ReadDiagnosticContext,
+    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedEntityHistoryField,
+    PreparedEntityHistoryPredicate, PreparedEntityHistoryProjection, PreparedEntityHistoryReadPlan,
+    PreparedEntityHistorySortKey, PreparedExplainMode, PreparedFileHistoryAggregate,
+    PreparedFileHistoryField, PreparedFileHistoryPredicate, PreparedFileHistoryProjection,
+    PreparedFileHistoryReadPlan, PreparedFileHistorySortKey, PreparedHistoryReadArtifact,
+    PreparedHistoryReadPlan, PreparedPublicRead, PreparedPublicReadPlanArtifact,
+    PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
+    PreparedReadTimeProjectionArtifact, PreparedStateHistoryAggregate,
+    PreparedStateHistoryAggregatePredicate, PreparedStateHistoryField,
+    PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
+    PreparedStateHistoryProjectionValue, PreparedStateHistoryReadPlan, PreparedStateHistorySortKey,
+    PreparedStateHistorySortValue, PreparedStatement, PublicReadResultColumn,
+    PublicReadResultColumns, ReadDiagnosticContext,
 };
 use crate::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
@@ -23,143 +23,141 @@ use crate::diagnostics::{
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
-    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
-    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
-    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate, FileHistoryDirectReadPlan,
-    FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey, StateHistoryAggregate,
-    StateHistoryAggregatePredicate, StateHistoryDirectReadPlan, StateHistoryPredicate,
-    StateHistoryProjection, StateHistoryProjectionValue, StateHistorySortKey,
-    StateHistorySortValue,
+    DirectStateHistoryField, DirectoryHistoryAggregate, DirectoryHistoryPredicate,
+    DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
+    EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan, EntityHistorySortKey,
+    FileHistoryAggregate, FileHistoryPredicate, FileHistoryProjection, FileHistoryReadPlan,
+    FileHistorySortKey, HistoryReadPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
+    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
 };
 use crate::sql::physical_plan::{
-    LoweredResultColumn, LoweredResultColumns, PreparedPublicReadExecution,
+    LoweredResultColumn, LoweredResultColumns, PublicReadPhysicalPlan,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, TransactionMode, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode, Value};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use std::ops::ControlFlow;
 
-use super::execution_program::{BoundStatementTemplateInstance, ExecutionProgram};
+use super::execution_program::{BoundStatementInstance, StatementBatch};
 use super::{
-    compile_execution_from_template_instance_with_context, load_sql_compiler_metadata_with_reader,
-    CompiledExecution, PreparationPolicy, PreparedPublicRead, SqlPreparationContext,
-    SqlPreparationSeed,
+    compile_execution_from_bound_statement_with_context, load_sql_compiler_metadata_with_reader,
+    CompilePolicy, CompiledExecution, PublicReadPlan, SqlCompilerContext, SqlCompilerSeed,
 };
 
-pub(crate) struct CommittedReadProgramContext<'a> {
+pub(crate) struct CommittedReadContext<'a> {
     pub(crate) active_version_id: &'a str,
     pub(crate) active_account_ids: &'a [String],
     pub(crate) writer_key: Option<&'a str>,
-    pub(crate) preparation_seed: SqlPreparationSeed<'a>,
-    pub(crate) base_transaction_mode: TransactionMode,
+    pub(crate) compiler_seed: SqlCompilerSeed<'a>,
+    pub(crate) base_transaction_mode: TransactionBeginMode,
 }
 
-pub(crate) async fn prepare_committed_read_program_with_backend(
+pub(crate) async fn prepare_committed_read_batch_with_backend(
     backend: &dyn LixBackend,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    read_context: &CommittedReadProgramContext<'_>,
-) -> Result<PreparedReadProgram, LixError> {
+    statement_batch: &StatementBatch,
+    allow_internal_relations: bool,
+    read_context: &CommittedReadContext<'_>,
+) -> Result<PreparedReadBatch, LixError> {
     let mut metadata_reader = backend;
-    prepare_committed_read_program_from_reader(
+    prepare_committed_read_batch_from_reader(
         &mut metadata_reader,
-        program,
-        allow_internal_tables,
+        statement_batch,
+        allow_internal_relations,
         read_context,
     )
     .await
 }
 
-pub(crate) async fn prepare_committed_read_program_in_transaction(
+pub(crate) async fn prepare_committed_read_batch_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    read_context: &CommittedReadProgramContext<'_>,
-) -> Result<PreparedReadProgram, LixError> {
+    statement_batch: &StatementBatch,
+    allow_internal_relations: bool,
+    read_context: &CommittedReadContext<'_>,
+) -> Result<PreparedReadBatch, LixError> {
     let mut metadata_reader = transaction;
-    prepare_committed_read_program_from_reader(
+    prepare_committed_read_batch_from_reader(
         &mut metadata_reader,
-        program,
-        allow_internal_tables,
+        statement_batch,
+        allow_internal_relations,
         read_context,
     )
     .await
 }
 
-async fn prepare_committed_read_program_from_reader(
+async fn prepare_committed_read_batch_from_reader(
     metadata_reader: &mut dyn SqlPreparationMetadataReader,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    read_context: &CommittedReadProgramContext<'_>,
-) -> Result<PreparedReadProgram, LixError> {
+    statement_batch: &StatementBatch,
+    allow_internal_relations: bool,
+    read_context: &CommittedReadContext<'_>,
+) -> Result<PreparedReadBatch, LixError> {
     let active_history_root_commit_id = metadata_reader
         .load_active_history_root_commit_id_for_preparation(read_context.active_version_id)
         .await?;
     let compiler_metadata = load_sql_compiler_metadata_with_reader(
         metadata_reader,
-        read_context.preparation_seed.surface_registry,
+        read_context.compiler_seed.surface_registry,
     )
     .await?;
-    let preparation_context = read_context
-        .preparation_seed
+    let compiler_context = read_context
+        .compiler_seed
         .with_compiler_metadata(&compiler_metadata, active_history_root_commit_id.as_deref());
 
-    compile_committed_read_program(
-        &preparation_context,
-        program,
-        allow_internal_tables,
+    compile_committed_read_batch(
+        &compiler_context,
+        statement_batch,
+        allow_internal_relations,
         read_context,
     )
     .await
 }
 
-pub(crate) async fn compile_committed_read_program(
-    preparation_context: &dyn SqlPreparationContext,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    read_context: &CommittedReadProgramContext<'_>,
-) -> Result<PreparedReadProgram, LixError> {
+pub(crate) async fn compile_committed_read_batch(
+    compiler_context: &dyn SqlCompilerContext,
+    statement_batch: &StatementBatch,
+    allow_internal_relations: bool,
+    read_context: &CommittedReadContext<'_>,
+) -> Result<PreparedReadBatch, LixError> {
     let mut mode = read_context.base_transaction_mode;
-    let mut steps = Vec::new();
+    let mut statements = Vec::new();
 
-    for step in program.steps() {
-        let prepared_step = compile_committed_read_step(
-            preparation_context,
-            step,
-            allow_internal_tables,
+    for statement in statement_batch.steps() {
+        let prepared_statement = compile_committed_read_statement(
+            compiler_context,
+            statement,
+            allow_internal_relations,
             read_context,
         )
         .await?;
-        mode = merge_committed_read_transaction_mode(mode, prepared_step.transaction_mode);
-        steps.push(prepared_step);
+        mode = merge_committed_read_transaction_mode(mode, prepared_statement.transaction_mode);
+        statements.push(prepared_statement);
     }
 
-    Ok(PreparedReadProgram {
+    Ok(PreparedReadBatch {
         transaction_mode: mode,
-        steps,
+        statements,
     })
 }
 
-async fn compile_committed_read_step(
-    preparation_context: &dyn SqlPreparationContext,
-    bound_statement_template: &BoundStatementTemplateInstance,
-    allow_internal_tables: bool,
-    read_context: &CommittedReadProgramContext<'_>,
-) -> Result<PreparedReadStep, LixError> {
-    let source_sql = vec![bound_statement_template.statement().to_string()];
-    let relation_names = collect_statement_relation_names(bound_statement_template.statement());
+async fn compile_committed_read_statement(
+    compiler_context: &dyn SqlCompilerContext,
+    bound_statement: &BoundStatementInstance,
+    allow_internal_relations: bool,
+    read_context: &CommittedReadContext<'_>,
+) -> Result<PreparedReadStatement, LixError> {
+    let source_sql = vec![bound_statement.statement().to_string()];
+    let relation_names = collect_statement_relation_names(bound_statement.statement());
     let diagnostic_context =
-        base_read_diagnostic_context(preparation_context, source_sql, relation_names);
+        base_read_diagnostic_context(compiler_context, source_sql, relation_names);
     let compiled = compile_committed_execution_step(
         &diagnostic_context,
-        preparation_context,
-        bound_statement_template,
-        allow_internal_tables,
+        compiler_context,
+        bound_statement,
+        allow_internal_relations,
         read_context,
     )
     .await?;
-    prepared_read_step_from_compiled_execution(
-        preparation_context.dialect(),
+    prepared_read_statement_from_compiled_execution(
+        compiler_context.dialect(),
         compiled,
         diagnostic_context,
     )
@@ -167,19 +165,19 @@ async fn compile_committed_read_step(
 
 async fn compile_committed_execution_step(
     diagnostic_context: &ReadDiagnosticContext,
-    preparation_context: &dyn SqlPreparationContext,
-    bound_statement_template: &BoundStatementTemplateInstance,
-    allow_internal_tables: bool,
-    read_context: &CommittedReadProgramContext<'_>,
+    compiler_context: &dyn SqlCompilerContext,
+    bound_statement: &BoundStatementInstance,
+    allow_internal_relations: bool,
+    read_context: &CommittedReadContext<'_>,
 ) -> Result<CompiledExecution, LixError> {
-    match compile_execution_from_template_instance_with_context(
-        preparation_context,
-        bound_statement_template,
+    match compile_execution_from_bound_statement_with_context(
+        compiler_context,
+        bound_statement,
         read_context.active_version_id,
         read_context.active_account_ids,
         read_context.writer_key,
-        allow_internal_tables,
-        PreparationPolicy {
+        allow_internal_relations,
+        CompilePolicy {
             skip_side_effect_collection: false,
         },
     )
@@ -193,11 +191,11 @@ async fn compile_committed_execution_step(
     }
 }
 
-fn prepared_read_step_from_compiled_execution(
+fn prepared_read_statement_from_compiled_execution(
     dialect: crate::SqlDialect,
     compiled: CompiledExecution,
     mut diagnostic_context: ReadDiagnosticContext,
-) -> Result<PreparedReadStep, LixError> {
+) -> Result<PreparedReadStatement, LixError> {
     let transaction_mode = transaction_mode_for_committed_read_execution(&compiled)?;
     diagnostic_context.plain_explain_template = compiled
         .plain_explain()
@@ -221,8 +219,8 @@ fn prepared_read_step_from_compiled_execution(
 
     let artifact = if let Some(public_read) = compiled.public_read() {
         PreparedReadArtifact::Public(prepare_public_read_artifact(public_read, dialect)?)
-    } else if let Some(internal) = compiled.internal_execution() {
-        PreparedReadArtifact::Internal(PreparedInternalReadArtifact {
+    } else if let Some(internal) = compiled.direct_execution() {
+        PreparedReadArtifact::Direct(PreparedDirectReadArtifact {
             prepared_batch: PreparedBatch {
                 steps: internal.prepared_statements.clone(),
             },
@@ -235,7 +233,7 @@ fn prepared_read_step_from_compiled_execution(
         ));
     };
 
-    Ok(PreparedReadStep {
+    Ok(PreparedReadStatement {
         transaction_mode,
         artifact,
         diagnostic_context,
@@ -243,7 +241,7 @@ fn prepared_read_step_from_compiled_execution(
 }
 
 fn base_read_diagnostic_context(
-    preparation_context: &dyn SqlPreparationContext,
+    compiler_context: &dyn SqlCompilerContext,
     source_sql: Vec<String>,
     relation_names: Vec<String>,
 ) -> ReadDiagnosticContext {
@@ -251,7 +249,7 @@ fn base_read_diagnostic_context(
         source_sql,
         relation_names: relation_names.clone(),
         catalog_snapshot: build_read_diagnostic_catalog_snapshot(
-            preparation_context.surface_registry(),
+            compiler_context.surface_registry(),
             &relation_names,
         ),
         explain_mode: None,
@@ -261,40 +259,38 @@ fn base_read_diagnostic_context(
 }
 
 pub(crate) fn prepare_public_read_artifact(
-    public_read: &PreparedPublicRead,
+    public_read: &PublicReadPlan,
     dialect: crate::SqlDialect,
-) -> Result<PreparedPublicReadArtifact, LixError> {
+) -> Result<PreparedPublicRead, LixError> {
     let mut contract = super::public_surface::read::prepared_public_read_contract(public_read);
     if contract.result_columns.is_none() {
         contract.result_columns = result_columns_for_public_read_execution(&public_read.execution);
     }
 
     let execution = match &public_read.execution {
-        PreparedPublicReadExecution::ReadTimeProjection(read) => {
-            PreparedPublicReadExecutionArtifact::DerivedRowset(PreparedDerivedRowsetReadArtifact {
+        PublicReadPhysicalPlan::ReadTimeProjection(read) => {
+            PreparedPublicReadPlanArtifact::ReadTimeProjection(PreparedReadTimeProjectionArtifact {
                 read: read.clone(),
             })
         }
-        PreparedPublicReadExecution::LoweredSql(lowered) => {
-            PreparedPublicReadExecutionArtifact::GeneralProgram(
-                PreparedGeneralProgramReadArtifact {
-                    prepared_batch: prepared_batch_from_lowered_read(
-                        dialect,
-                        lowered,
-                        &public_read.bound_parameters,
-                        &public_read.runtime_bindings,
-                    )?,
-                },
-            )
+        PublicReadPhysicalPlan::LoweredSql(lowered) => {
+            PreparedPublicReadPlanArtifact::PreparedBatch(PreparedBatchReadArtifact {
+                prepared_batch: prepared_batch_from_lowered_batch(
+                    dialect,
+                    lowered,
+                    &public_read.bound_parameters,
+                    &public_read.runtime_bindings,
+                )?,
+            })
         }
-        PreparedPublicReadExecution::Direct(plan) => {
-            PreparedPublicReadExecutionArtifact::DirectHistory(PreparedDirectHistoryReadArtifact {
-                plan: prepared_direct_public_read(plan),
+        PublicReadPhysicalPlan::HistoryRead(plan) => {
+            PreparedPublicReadPlanArtifact::HistoryRead(PreparedHistoryReadArtifact {
+                plan: prepared_history_read_plan(plan),
             })
         }
     };
 
-    Ok(PreparedPublicReadArtifact {
+    Ok(PreparedPublicRead {
         contract,
         freshness_contract: public_read.freshness_contract,
         surface_bindings: public_read.surface_bindings.clone(),
@@ -303,9 +299,9 @@ pub(crate) fn prepare_public_read_artifact(
     })
 }
 
-fn prepared_batch_from_lowered_read(
+fn prepared_batch_from_lowered_batch(
     dialect: crate::SqlDialect,
-    lowered: &crate::sql::physical_plan::LoweredReadProgram,
+    lowered: &crate::sql::physical_plan::LoweredReadBatch,
     params: &[Value],
     runtime_bindings: &crate::sql::binder::RuntimeBindingValues,
 ) -> Result<PreparedBatch, LixError> {
@@ -318,24 +314,24 @@ fn prepared_batch_from_lowered_read(
 }
 
 fn result_columns_for_public_read_execution(
-    execution: &PreparedPublicReadExecution,
+    execution: &PublicReadPhysicalPlan,
 ) -> Option<PublicReadResultColumns> {
     match execution {
-        PreparedPublicReadExecution::ReadTimeProjection(_) => None,
-        PreparedPublicReadExecution::LoweredSql(lowered) => Some(
+        PublicReadPhysicalPlan::ReadTimeProjection(_) => None,
+        PublicReadPhysicalPlan::LoweredSql(lowered) => Some(
             public_read_result_columns_from_lowered(&lowered.result_columns),
         ),
-        PreparedPublicReadExecution::Direct(plan) => Some(match plan {
-            DirectPublicReadPlan::StateHistory(plan) => {
+        PublicReadPhysicalPlan::HistoryRead(plan) => Some(match plan {
+            HistoryReadPlan::StateHistory(plan) => {
                 public_read_result_columns_from_lowered(&plan.result_columns)
             }
-            DirectPublicReadPlan::EntityHistory(plan) => {
+            HistoryReadPlan::EntityHistory(plan) => {
                 public_read_result_columns_from_lowered(&plan.result_columns)
             }
-            DirectPublicReadPlan::FileHistory(plan) => {
+            HistoryReadPlan::FileHistory(plan) => {
                 public_read_result_columns_from_lowered(&plan.result_columns)
             }
-            DirectPublicReadPlan::DirectoryHistory(plan) => {
+            HistoryReadPlan::DirectoryHistory(plan) => {
                 public_read_result_columns_from_lowered(&plan.result_columns)
             }
         }),
@@ -373,27 +369,25 @@ fn public_read_result_column_from_lowered(kind: LoweredResultColumn) -> PublicRe
     }
 }
 
-fn prepared_direct_public_read(plan: &DirectPublicReadPlan) -> PreparedDirectPublicRead {
+fn prepared_history_read_plan(plan: &HistoryReadPlan) -> PreparedHistoryReadPlan {
     match plan {
-        DirectPublicReadPlan::StateHistory(plan) => {
-            PreparedDirectPublicRead::StateHistory(prepared_state_history_direct_read_plan(plan))
+        HistoryReadPlan::StateHistory(plan) => {
+            PreparedHistoryReadPlan::StateHistory(prepared_state_history_read_plan(plan))
         }
-        DirectPublicReadPlan::EntityHistory(plan) => {
-            PreparedDirectPublicRead::EntityHistory(prepared_entity_history_direct_read_plan(plan))
+        HistoryReadPlan::EntityHistory(plan) => {
+            PreparedHistoryReadPlan::EntityHistory(prepared_entity_history_read_plan(plan))
         }
-        DirectPublicReadPlan::FileHistory(plan) => {
-            PreparedDirectPublicRead::FileHistory(prepared_file_history_direct_read_plan(plan))
+        HistoryReadPlan::FileHistory(plan) => {
+            PreparedHistoryReadPlan::FileHistory(prepared_file_history_read_plan(plan))
         }
-        DirectPublicReadPlan::DirectoryHistory(plan) => PreparedDirectPublicRead::DirectoryHistory(
-            prepared_directory_history_direct_read_plan(plan),
-        ),
+        HistoryReadPlan::DirectoryHistory(plan) => {
+            PreparedHistoryReadPlan::DirectoryHistory(prepared_directory_history_read_plan(plan))
+        }
     }
 }
 
-fn prepared_state_history_direct_read_plan(
-    plan: &StateHistoryDirectReadPlan,
-) -> PreparedStateHistoryDirectReadPlan {
-    PreparedStateHistoryDirectReadPlan {
+fn prepared_state_history_read_plan(plan: &StateHistoryReadPlan) -> PreparedStateHistoryReadPlan {
+    PreparedStateHistoryReadPlan {
         request: plan.request.clone(),
         predicates: plan
             .predicates
@@ -413,7 +407,7 @@ fn prepared_state_history_direct_read_plan(
             .group_by_fields
             .iter()
             .cloned()
-            .map(prepared_direct_state_history_field)
+            .map(prepared_state_history_field)
             .collect(),
         having: plan
             .having
@@ -430,10 +424,10 @@ fn prepared_state_history_direct_read_plan(
     }
 }
 
-fn prepared_entity_history_direct_read_plan(
-    plan: &EntityHistoryDirectReadPlan,
-) -> PreparedEntityHistoryDirectReadPlan {
-    PreparedEntityHistoryDirectReadPlan {
+fn prepared_entity_history_read_plan(
+    plan: &EntityHistoryReadPlan,
+) -> PreparedEntityHistoryReadPlan {
+    PreparedEntityHistoryReadPlan {
         surface_binding: plan.surface_binding.clone(),
         request: plan.request.clone(),
         predicates: plan
@@ -461,10 +455,8 @@ fn prepared_entity_history_direct_read_plan(
     }
 }
 
-fn prepared_file_history_direct_read_plan(
-    plan: &FileHistoryDirectReadPlan,
-) -> PreparedFileHistoryDirectReadPlan {
-    PreparedFileHistoryDirectReadPlan {
+fn prepared_file_history_read_plan(plan: &FileHistoryReadPlan) -> PreparedFileHistoryReadPlan {
+    PreparedFileHistoryReadPlan {
         request: plan.request.clone(),
         predicates: plan
             .predicates
@@ -493,10 +485,10 @@ fn prepared_file_history_direct_read_plan(
     }
 }
 
-fn prepared_directory_history_direct_read_plan(
-    plan: &DirectoryHistoryDirectReadPlan,
-) -> PreparedDirectoryHistoryDirectReadPlan {
-    PreparedDirectoryHistoryDirectReadPlan {
+fn prepared_directory_history_read_plan(
+    plan: &DirectoryHistoryReadPlan,
+) -> PreparedDirectoryHistoryReadPlan {
+    PreparedDirectoryHistoryReadPlan {
         request: plan.request.clone(),
         predicates: plan
             .predicates
@@ -528,27 +520,21 @@ fn prepared_directory_history_direct_read_plan(
     }
 }
 
-fn prepared_direct_state_history_field(
-    field: DirectStateHistoryField,
-) -> PreparedDirectStateHistoryField {
+fn prepared_state_history_field(field: DirectStateHistoryField) -> PreparedStateHistoryField {
     match field {
-        DirectStateHistoryField::EntityId => PreparedDirectStateHistoryField::EntityId,
-        DirectStateHistoryField::SchemaKey => PreparedDirectStateHistoryField::SchemaKey,
-        DirectStateHistoryField::FileId => PreparedDirectStateHistoryField::FileId,
-        DirectStateHistoryField::PluginKey => PreparedDirectStateHistoryField::PluginKey,
-        DirectStateHistoryField::SnapshotContent => {
-            PreparedDirectStateHistoryField::SnapshotContent
-        }
-        DirectStateHistoryField::Metadata => PreparedDirectStateHistoryField::Metadata,
-        DirectStateHistoryField::SchemaVersion => PreparedDirectStateHistoryField::SchemaVersion,
-        DirectStateHistoryField::ChangeId => PreparedDirectStateHistoryField::ChangeId,
-        DirectStateHistoryField::CommitId => PreparedDirectStateHistoryField::CommitId,
-        DirectStateHistoryField::CommitCreatedAt => {
-            PreparedDirectStateHistoryField::CommitCreatedAt
-        }
-        DirectStateHistoryField::RootCommitId => PreparedDirectStateHistoryField::RootCommitId,
-        DirectStateHistoryField::Depth => PreparedDirectStateHistoryField::Depth,
-        DirectStateHistoryField::VersionId => PreparedDirectStateHistoryField::VersionId,
+        DirectStateHistoryField::EntityId => PreparedStateHistoryField::EntityId,
+        DirectStateHistoryField::SchemaKey => PreparedStateHistoryField::SchemaKey,
+        DirectStateHistoryField::FileId => PreparedStateHistoryField::FileId,
+        DirectStateHistoryField::PluginKey => PreparedStateHistoryField::PluginKey,
+        DirectStateHistoryField::SnapshotContent => PreparedStateHistoryField::SnapshotContent,
+        DirectStateHistoryField::Metadata => PreparedStateHistoryField::Metadata,
+        DirectStateHistoryField::SchemaVersion => PreparedStateHistoryField::SchemaVersion,
+        DirectStateHistoryField::ChangeId => PreparedStateHistoryField::ChangeId,
+        DirectStateHistoryField::CommitId => PreparedStateHistoryField::CommitId,
+        DirectStateHistoryField::CommitCreatedAt => PreparedStateHistoryField::CommitCreatedAt,
+        DirectStateHistoryField::RootCommitId => PreparedStateHistoryField::RootCommitId,
+        DirectStateHistoryField::Depth => PreparedStateHistoryField::Depth,
+        DirectStateHistoryField::VersionId => PreparedStateHistoryField::VersionId,
     }
 }
 
@@ -565,7 +551,7 @@ fn prepared_state_history_projection_value(
 ) -> PreparedStateHistoryProjectionValue {
     match value {
         StateHistoryProjectionValue::Field(field) => {
-            PreparedStateHistoryProjectionValue::Field(prepared_direct_state_history_field(field))
+            PreparedStateHistoryProjectionValue::Field(prepared_state_history_field(field))
         }
         StateHistoryProjectionValue::Aggregate(aggregate) => {
             PreparedStateHistoryProjectionValue::Aggregate(prepared_state_history_aggregate(
@@ -589,7 +575,7 @@ fn prepared_state_history_sort_value(
 ) -> PreparedStateHistorySortValue {
     match value {
         StateHistorySortValue::Field(field) => {
-            PreparedStateHistorySortValue::Field(prepared_direct_state_history_field(field))
+            PreparedStateHistorySortValue::Field(prepared_state_history_field(field))
         }
         StateHistorySortValue::Aggregate(aggregate) => {
             PreparedStateHistorySortValue::Aggregate(prepared_state_history_aggregate(aggregate))
@@ -610,31 +596,31 @@ fn prepared_state_history_predicate(
 ) -> PreparedStateHistoryPredicate {
     match predicate {
         StateHistoryPredicate::Eq(field, value) => {
-            PreparedStateHistoryPredicate::Eq(prepared_direct_state_history_field(field), value)
+            PreparedStateHistoryPredicate::Eq(prepared_state_history_field(field), value)
         }
         StateHistoryPredicate::NotEq(field, value) => {
-            PreparedStateHistoryPredicate::NotEq(prepared_direct_state_history_field(field), value)
+            PreparedStateHistoryPredicate::NotEq(prepared_state_history_field(field), value)
         }
         StateHistoryPredicate::Gt(field, value) => {
-            PreparedStateHistoryPredicate::Gt(prepared_direct_state_history_field(field), value)
+            PreparedStateHistoryPredicate::Gt(prepared_state_history_field(field), value)
         }
         StateHistoryPredicate::GtEq(field, value) => {
-            PreparedStateHistoryPredicate::GtEq(prepared_direct_state_history_field(field), value)
+            PreparedStateHistoryPredicate::GtEq(prepared_state_history_field(field), value)
         }
         StateHistoryPredicate::Lt(field, value) => {
-            PreparedStateHistoryPredicate::Lt(prepared_direct_state_history_field(field), value)
+            PreparedStateHistoryPredicate::Lt(prepared_state_history_field(field), value)
         }
         StateHistoryPredicate::LtEq(field, value) => {
-            PreparedStateHistoryPredicate::LtEq(prepared_direct_state_history_field(field), value)
+            PreparedStateHistoryPredicate::LtEq(prepared_state_history_field(field), value)
         }
         StateHistoryPredicate::In(field, values) => {
-            PreparedStateHistoryPredicate::In(prepared_direct_state_history_field(field), values)
+            PreparedStateHistoryPredicate::In(prepared_state_history_field(field), values)
         }
         StateHistoryPredicate::IsNull(field) => {
-            PreparedStateHistoryPredicate::IsNull(prepared_direct_state_history_field(field))
+            PreparedStateHistoryPredicate::IsNull(prepared_state_history_field(field))
         }
         StateHistoryPredicate::IsNotNull(field) => {
-            PreparedStateHistoryPredicate::IsNotNull(prepared_direct_state_history_field(field))
+            PreparedStateHistoryPredicate::IsNotNull(prepared_state_history_field(field))
         }
     }
 }
@@ -682,15 +668,13 @@ fn prepared_state_history_aggregate_predicate(
     }
 }
 
-fn prepared_direct_entity_history_field(
-    field: DirectEntityHistoryField,
-) -> PreparedDirectEntityHistoryField {
+fn prepared_entity_history_field(field: DirectEntityHistoryField) -> PreparedEntityHistoryField {
     match field {
         DirectEntityHistoryField::Property(property) => {
-            PreparedDirectEntityHistoryField::Property(property)
+            PreparedEntityHistoryField::Property(property)
         }
         DirectEntityHistoryField::State(field) => {
-            PreparedDirectEntityHistoryField::State(prepared_direct_state_history_field(field))
+            PreparedEntityHistoryField::State(prepared_state_history_field(field))
         }
     }
 }
@@ -700,14 +684,14 @@ fn prepared_entity_history_projection(
 ) -> PreparedEntityHistoryProjection {
     PreparedEntityHistoryProjection {
         output_name: projection.output_name,
-        field: prepared_direct_entity_history_field(projection.field),
+        field: prepared_entity_history_field(projection.field),
     }
 }
 
 fn prepared_entity_history_sort_key(key: EntityHistorySortKey) -> PreparedEntityHistorySortKey {
     PreparedEntityHistorySortKey {
         output_name: key.output_name,
-        field: key.field.map(prepared_direct_entity_history_field),
+        field: key.field.map(prepared_entity_history_field),
         descending: key.descending,
     }
 }
@@ -717,57 +701,54 @@ fn prepared_entity_history_predicate(
 ) -> PreparedEntityHistoryPredicate {
     match predicate {
         EntityHistoryPredicate::Eq(field, value) => {
-            PreparedEntityHistoryPredicate::Eq(prepared_direct_entity_history_field(field), value)
+            PreparedEntityHistoryPredicate::Eq(prepared_entity_history_field(field), value)
         }
-        EntityHistoryPredicate::NotEq(field, value) => PreparedEntityHistoryPredicate::NotEq(
-            prepared_direct_entity_history_field(field),
-            value,
-        ),
+        EntityHistoryPredicate::NotEq(field, value) => {
+            PreparedEntityHistoryPredicate::NotEq(prepared_entity_history_field(field), value)
+        }
         EntityHistoryPredicate::Gt(field, value) => {
-            PreparedEntityHistoryPredicate::Gt(prepared_direct_entity_history_field(field), value)
+            PreparedEntityHistoryPredicate::Gt(prepared_entity_history_field(field), value)
         }
         EntityHistoryPredicate::GtEq(field, value) => {
-            PreparedEntityHistoryPredicate::GtEq(prepared_direct_entity_history_field(field), value)
+            PreparedEntityHistoryPredicate::GtEq(prepared_entity_history_field(field), value)
         }
         EntityHistoryPredicate::Lt(field, value) => {
-            PreparedEntityHistoryPredicate::Lt(prepared_direct_entity_history_field(field), value)
+            PreparedEntityHistoryPredicate::Lt(prepared_entity_history_field(field), value)
         }
         EntityHistoryPredicate::LtEq(field, value) => {
-            PreparedEntityHistoryPredicate::LtEq(prepared_direct_entity_history_field(field), value)
+            PreparedEntityHistoryPredicate::LtEq(prepared_entity_history_field(field), value)
         }
         EntityHistoryPredicate::In(field, values) => {
-            PreparedEntityHistoryPredicate::In(prepared_direct_entity_history_field(field), values)
+            PreparedEntityHistoryPredicate::In(prepared_entity_history_field(field), values)
         }
         EntityHistoryPredicate::IsNull(field) => {
-            PreparedEntityHistoryPredicate::IsNull(prepared_direct_entity_history_field(field))
+            PreparedEntityHistoryPredicate::IsNull(prepared_entity_history_field(field))
         }
         EntityHistoryPredicate::IsNotNull(field) => {
-            PreparedEntityHistoryPredicate::IsNotNull(prepared_direct_entity_history_field(field))
+            PreparedEntityHistoryPredicate::IsNotNull(prepared_entity_history_field(field))
         }
     }
 }
 
-fn prepared_direct_file_history_field(
-    field: DirectFileHistoryField,
-) -> PreparedDirectFileHistoryField {
+fn prepared_file_history_field(field: DirectFileHistoryField) -> PreparedFileHistoryField {
     match field {
-        DirectFileHistoryField::Id => PreparedDirectFileHistoryField::Id,
-        DirectFileHistoryField::Path => PreparedDirectFileHistoryField::Path,
-        DirectFileHistoryField::Data => PreparedDirectFileHistoryField::Data,
-        DirectFileHistoryField::Metadata => PreparedDirectFileHistoryField::Metadata,
-        DirectFileHistoryField::Hidden => PreparedDirectFileHistoryField::Hidden,
-        DirectFileHistoryField::EntityId => PreparedDirectFileHistoryField::EntityId,
-        DirectFileHistoryField::SchemaKey => PreparedDirectFileHistoryField::SchemaKey,
-        DirectFileHistoryField::FileId => PreparedDirectFileHistoryField::FileId,
-        DirectFileHistoryField::VersionId => PreparedDirectFileHistoryField::VersionId,
-        DirectFileHistoryField::PluginKey => PreparedDirectFileHistoryField::PluginKey,
-        DirectFileHistoryField::SchemaVersion => PreparedDirectFileHistoryField::SchemaVersion,
-        DirectFileHistoryField::ChangeId => PreparedDirectFileHistoryField::ChangeId,
-        DirectFileHistoryField::LixcolMetadata => PreparedDirectFileHistoryField::LixcolMetadata,
-        DirectFileHistoryField::CommitId => PreparedDirectFileHistoryField::CommitId,
-        DirectFileHistoryField::CommitCreatedAt => PreparedDirectFileHistoryField::CommitCreatedAt,
-        DirectFileHistoryField::RootCommitId => PreparedDirectFileHistoryField::RootCommitId,
-        DirectFileHistoryField::Depth => PreparedDirectFileHistoryField::Depth,
+        DirectFileHistoryField::Id => PreparedFileHistoryField::Id,
+        DirectFileHistoryField::Path => PreparedFileHistoryField::Path,
+        DirectFileHistoryField::Data => PreparedFileHistoryField::Data,
+        DirectFileHistoryField::Metadata => PreparedFileHistoryField::Metadata,
+        DirectFileHistoryField::Hidden => PreparedFileHistoryField::Hidden,
+        DirectFileHistoryField::EntityId => PreparedFileHistoryField::EntityId,
+        DirectFileHistoryField::SchemaKey => PreparedFileHistoryField::SchemaKey,
+        DirectFileHistoryField::FileId => PreparedFileHistoryField::FileId,
+        DirectFileHistoryField::VersionId => PreparedFileHistoryField::VersionId,
+        DirectFileHistoryField::PluginKey => PreparedFileHistoryField::PluginKey,
+        DirectFileHistoryField::SchemaVersion => PreparedFileHistoryField::SchemaVersion,
+        DirectFileHistoryField::ChangeId => PreparedFileHistoryField::ChangeId,
+        DirectFileHistoryField::LixcolMetadata => PreparedFileHistoryField::LixcolMetadata,
+        DirectFileHistoryField::CommitId => PreparedFileHistoryField::CommitId,
+        DirectFileHistoryField::CommitCreatedAt => PreparedFileHistoryField::CommitCreatedAt,
+        DirectFileHistoryField::RootCommitId => PreparedFileHistoryField::RootCommitId,
+        DirectFileHistoryField::Depth => PreparedFileHistoryField::Depth,
     }
 }
 
@@ -776,14 +757,14 @@ fn prepared_file_history_projection(
 ) -> PreparedFileHistoryProjection {
     PreparedFileHistoryProjection {
         output_name: projection.output_name,
-        field: prepared_direct_file_history_field(projection.field),
+        field: prepared_file_history_field(projection.field),
     }
 }
 
 fn prepared_file_history_sort_key(key: FileHistorySortKey) -> PreparedFileHistorySortKey {
     PreparedFileHistorySortKey {
         output_name: key.output_name,
-        field: key.field.map(prepared_direct_file_history_field),
+        field: key.field.map(prepared_file_history_field),
         descending: key.descending,
     }
 }
@@ -793,31 +774,31 @@ fn prepared_file_history_predicate(
 ) -> PreparedFileHistoryPredicate {
     match predicate {
         FileHistoryPredicate::Eq(field, value) => {
-            PreparedFileHistoryPredicate::Eq(prepared_direct_file_history_field(field), value)
+            PreparedFileHistoryPredicate::Eq(prepared_file_history_field(field), value)
         }
         FileHistoryPredicate::NotEq(field, value) => {
-            PreparedFileHistoryPredicate::NotEq(prepared_direct_file_history_field(field), value)
+            PreparedFileHistoryPredicate::NotEq(prepared_file_history_field(field), value)
         }
         FileHistoryPredicate::Gt(field, value) => {
-            PreparedFileHistoryPredicate::Gt(prepared_direct_file_history_field(field), value)
+            PreparedFileHistoryPredicate::Gt(prepared_file_history_field(field), value)
         }
         FileHistoryPredicate::GtEq(field, value) => {
-            PreparedFileHistoryPredicate::GtEq(prepared_direct_file_history_field(field), value)
+            PreparedFileHistoryPredicate::GtEq(prepared_file_history_field(field), value)
         }
         FileHistoryPredicate::Lt(field, value) => {
-            PreparedFileHistoryPredicate::Lt(prepared_direct_file_history_field(field), value)
+            PreparedFileHistoryPredicate::Lt(prepared_file_history_field(field), value)
         }
         FileHistoryPredicate::LtEq(field, value) => {
-            PreparedFileHistoryPredicate::LtEq(prepared_direct_file_history_field(field), value)
+            PreparedFileHistoryPredicate::LtEq(prepared_file_history_field(field), value)
         }
         FileHistoryPredicate::In(field, values) => {
-            PreparedFileHistoryPredicate::In(prepared_direct_file_history_field(field), values)
+            PreparedFileHistoryPredicate::In(prepared_file_history_field(field), values)
         }
         FileHistoryPredicate::IsNull(field) => {
-            PreparedFileHistoryPredicate::IsNull(prepared_direct_file_history_field(field))
+            PreparedFileHistoryPredicate::IsNull(prepared_file_history_field(field))
         }
         FileHistoryPredicate::IsNotNull(field) => {
-            PreparedFileHistoryPredicate::IsNotNull(prepared_direct_file_history_field(field))
+            PreparedFileHistoryPredicate::IsNotNull(prepared_file_history_field(field))
         }
     }
 }
@@ -830,35 +811,31 @@ fn prepared_file_history_aggregate(
     }
 }
 
-fn prepared_direct_directory_history_field(
+fn prepared_directory_history_field(
     field: DirectDirectoryHistoryField,
-) -> PreparedDirectDirectoryHistoryField {
+) -> PreparedDirectoryHistoryField {
     match field {
-        DirectDirectoryHistoryField::Id => PreparedDirectDirectoryHistoryField::Id,
-        DirectDirectoryHistoryField::ParentId => PreparedDirectDirectoryHistoryField::ParentId,
-        DirectDirectoryHistoryField::Name => PreparedDirectDirectoryHistoryField::Name,
-        DirectDirectoryHistoryField::Path => PreparedDirectDirectoryHistoryField::Path,
-        DirectDirectoryHistoryField::Hidden => PreparedDirectDirectoryHistoryField::Hidden,
-        DirectDirectoryHistoryField::EntityId => PreparedDirectDirectoryHistoryField::EntityId,
-        DirectDirectoryHistoryField::SchemaKey => PreparedDirectDirectoryHistoryField::SchemaKey,
-        DirectDirectoryHistoryField::FileId => PreparedDirectDirectoryHistoryField::FileId,
-        DirectDirectoryHistoryField::VersionId => PreparedDirectDirectoryHistoryField::VersionId,
-        DirectDirectoryHistoryField::PluginKey => PreparedDirectDirectoryHistoryField::PluginKey,
-        DirectDirectoryHistoryField::SchemaVersion => {
-            PreparedDirectDirectoryHistoryField::SchemaVersion
-        }
-        DirectDirectoryHistoryField::ChangeId => PreparedDirectDirectoryHistoryField::ChangeId,
+        DirectDirectoryHistoryField::Id => PreparedDirectoryHistoryField::Id,
+        DirectDirectoryHistoryField::ParentId => PreparedDirectoryHistoryField::ParentId,
+        DirectDirectoryHistoryField::Name => PreparedDirectoryHistoryField::Name,
+        DirectDirectoryHistoryField::Path => PreparedDirectoryHistoryField::Path,
+        DirectDirectoryHistoryField::Hidden => PreparedDirectoryHistoryField::Hidden,
+        DirectDirectoryHistoryField::EntityId => PreparedDirectoryHistoryField::EntityId,
+        DirectDirectoryHistoryField::SchemaKey => PreparedDirectoryHistoryField::SchemaKey,
+        DirectDirectoryHistoryField::FileId => PreparedDirectoryHistoryField::FileId,
+        DirectDirectoryHistoryField::VersionId => PreparedDirectoryHistoryField::VersionId,
+        DirectDirectoryHistoryField::PluginKey => PreparedDirectoryHistoryField::PluginKey,
+        DirectDirectoryHistoryField::SchemaVersion => PreparedDirectoryHistoryField::SchemaVersion,
+        DirectDirectoryHistoryField::ChangeId => PreparedDirectoryHistoryField::ChangeId,
         DirectDirectoryHistoryField::LixcolMetadata => {
-            PreparedDirectDirectoryHistoryField::LixcolMetadata
+            PreparedDirectoryHistoryField::LixcolMetadata
         }
-        DirectDirectoryHistoryField::CommitId => PreparedDirectDirectoryHistoryField::CommitId,
+        DirectDirectoryHistoryField::CommitId => PreparedDirectoryHistoryField::CommitId,
         DirectDirectoryHistoryField::CommitCreatedAt => {
-            PreparedDirectDirectoryHistoryField::CommitCreatedAt
+            PreparedDirectoryHistoryField::CommitCreatedAt
         }
-        DirectDirectoryHistoryField::RootCommitId => {
-            PreparedDirectDirectoryHistoryField::RootCommitId
-        }
-        DirectDirectoryHistoryField::Depth => PreparedDirectDirectoryHistoryField::Depth,
+        DirectDirectoryHistoryField::RootCommitId => PreparedDirectoryHistoryField::RootCommitId,
+        DirectDirectoryHistoryField::Depth => PreparedDirectoryHistoryField::Depth,
     }
 }
 
@@ -867,7 +844,7 @@ fn prepared_directory_history_projection(
 ) -> PreparedDirectoryHistoryProjection {
     PreparedDirectoryHistoryProjection {
         output_name: projection.output_name,
-        field: prepared_direct_directory_history_field(projection.field),
+        field: prepared_directory_history_field(projection.field),
     }
 }
 
@@ -876,7 +853,7 @@ fn prepared_directory_history_sort_key(
 ) -> PreparedDirectoryHistorySortKey {
     PreparedDirectoryHistorySortKey {
         output_name: key.output_name,
-        field: key.field.map(prepared_direct_directory_history_field),
+        field: key.field.map(prepared_directory_history_field),
         descending: key.descending,
     }
 }
@@ -885,41 +862,32 @@ fn prepared_directory_history_predicate(
     predicate: DirectoryHistoryPredicate,
 ) -> PreparedDirectoryHistoryPredicate {
     match predicate {
-        DirectoryHistoryPredicate::Eq(field, value) => PreparedDirectoryHistoryPredicate::Eq(
-            prepared_direct_directory_history_field(field),
-            value,
-        ),
-        DirectoryHistoryPredicate::NotEq(field, value) => PreparedDirectoryHistoryPredicate::NotEq(
-            prepared_direct_directory_history_field(field),
-            value,
-        ),
-        DirectoryHistoryPredicate::Gt(field, value) => PreparedDirectoryHistoryPredicate::Gt(
-            prepared_direct_directory_history_field(field),
-            value,
-        ),
-        DirectoryHistoryPredicate::GtEq(field, value) => PreparedDirectoryHistoryPredicate::GtEq(
-            prepared_direct_directory_history_field(field),
-            value,
-        ),
-        DirectoryHistoryPredicate::Lt(field, value) => PreparedDirectoryHistoryPredicate::Lt(
-            prepared_direct_directory_history_field(field),
-            value,
-        ),
-        DirectoryHistoryPredicate::LtEq(field, value) => PreparedDirectoryHistoryPredicate::LtEq(
-            prepared_direct_directory_history_field(field),
-            value,
-        ),
-        DirectoryHistoryPredicate::In(field, values) => PreparedDirectoryHistoryPredicate::In(
-            prepared_direct_directory_history_field(field),
-            values,
-        ),
-        DirectoryHistoryPredicate::IsNull(field) => PreparedDirectoryHistoryPredicate::IsNull(
-            prepared_direct_directory_history_field(field),
-        ),
+        DirectoryHistoryPredicate::Eq(field, value) => {
+            PreparedDirectoryHistoryPredicate::Eq(prepared_directory_history_field(field), value)
+        }
+        DirectoryHistoryPredicate::NotEq(field, value) => {
+            PreparedDirectoryHistoryPredicate::NotEq(prepared_directory_history_field(field), value)
+        }
+        DirectoryHistoryPredicate::Gt(field, value) => {
+            PreparedDirectoryHistoryPredicate::Gt(prepared_directory_history_field(field), value)
+        }
+        DirectoryHistoryPredicate::GtEq(field, value) => {
+            PreparedDirectoryHistoryPredicate::GtEq(prepared_directory_history_field(field), value)
+        }
+        DirectoryHistoryPredicate::Lt(field, value) => {
+            PreparedDirectoryHistoryPredicate::Lt(prepared_directory_history_field(field), value)
+        }
+        DirectoryHistoryPredicate::LtEq(field, value) => {
+            PreparedDirectoryHistoryPredicate::LtEq(prepared_directory_history_field(field), value)
+        }
+        DirectoryHistoryPredicate::In(field, values) => {
+            PreparedDirectoryHistoryPredicate::In(prepared_directory_history_field(field), values)
+        }
+        DirectoryHistoryPredicate::IsNull(field) => {
+            PreparedDirectoryHistoryPredicate::IsNull(prepared_directory_history_field(field))
+        }
         DirectoryHistoryPredicate::IsNotNull(field) => {
-            PreparedDirectoryHistoryPredicate::IsNotNull(prepared_direct_directory_history_field(
-                field,
-            ))
+            PreparedDirectoryHistoryPredicate::IsNotNull(prepared_directory_history_field(field))
         }
     }
 }
@@ -933,30 +901,32 @@ fn prepared_directory_history_aggregate(
 }
 
 fn merge_committed_read_transaction_mode(
-    current: TransactionMode,
-    next: TransactionMode,
-) -> TransactionMode {
+    current: TransactionBeginMode,
+    next: TransactionBeginMode,
+) -> TransactionBeginMode {
     match (current, next) {
-        (TransactionMode::Write, _) | (_, TransactionMode::Write) => TransactionMode::Write,
-        (TransactionMode::Deferred, _) | (_, TransactionMode::Deferred) => {
-            TransactionMode::Deferred
+        (TransactionBeginMode::Write, _) | (_, TransactionBeginMode::Write) => {
+            TransactionBeginMode::Write
         }
-        _ => TransactionMode::Read,
+        (TransactionBeginMode::Deferred, _) | (_, TransactionBeginMode::Deferred) => {
+            TransactionBeginMode::Deferred
+        }
+        _ => TransactionBeginMode::Read,
     }
 }
 
 fn transaction_mode_for_committed_read_execution(
     compiled: &CompiledExecution,
-) -> Result<TransactionMode, LixError> {
+) -> Result<TransactionBeginMode, LixError> {
     if compiled.plain_explain().is_some() {
-        return Ok(TransactionMode::Read);
+        return Ok(TransactionBeginMode::Read);
     }
     if let Some(public_read) = compiled.public_read() {
         return Ok(public_read.committed_read_mode().transaction_mode());
     }
-    if compiled.internal_execution().is_some() {
+    if compiled.direct_execution().is_some() {
         return if compiled.read_only_query {
-            Ok(TransactionMode::Read)
+            Ok(TransactionBeginMode::Read)
         } else {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",

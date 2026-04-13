@@ -23,7 +23,7 @@ pub(crate) const RELATION_POLICY_MODEL: RelationPolicyModel =
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RelationPolicy {
-    InternalStorage,
+    InternalRelation,
     ProtectedBuiltinPublicSurface,
     UserDefinedPublicSurface,
     UserDefinedPrivateRelation,
@@ -51,8 +51,8 @@ pub(crate) fn classify_relation_name(
     surface_registry: Option<&SurfaceRegistry>,
 ) -> RelationPolicy {
     let normalized = normalize_relation_name(relation_name);
-    if is_internal_storage_relation_name(&normalized) {
-        return RelationPolicy::InternalStorage;
+    if is_internal_relation_name(&normalized) {
+        return RelationPolicy::InternalRelation;
     }
 
     if let Some(registry) = surface_registry {
@@ -69,17 +69,17 @@ pub(crate) fn classify_builtin_relation_name(relation_name: &str) -> RelationPol
     classify_relation_name(relation_name, None)
 }
 
-pub(crate) fn object_name_is_internal_storage_relation(name: &ObjectName) -> bool {
+pub(crate) fn object_name_is_internal_relation(name: &ObjectName) -> bool {
     matches!(
         classify_builtin_object_name(name),
-        Some(RelationPolicy::InternalStorage)
+        Some(RelationPolicy::InternalRelation)
     )
 }
 
 pub(crate) fn object_name_is_protected_builtin_ddl_target(name: &ObjectName) -> bool {
     matches!(
         classify_builtin_object_name(name),
-        Some(RelationPolicy::InternalStorage | RelationPolicy::ProtectedBuiltinPublicSurface)
+        Some(RelationPolicy::InternalRelation | RelationPolicy::ProtectedBuiltinPublicSurface)
     )
 }
 
@@ -135,7 +135,7 @@ fn classify_registry_surface_name(
     })
 }
 
-fn is_internal_storage_relation_name(normalized_relation_name: &str) -> bool {
+fn is_internal_relation_name(normalized_relation_name: &str) -> bool {
     normalized_relation_name.starts_with(crate::live_state::INTERNAL_RELATION_PREFIX)
         || builtin_internal_exact_relation_names()
             .iter()
@@ -173,11 +173,11 @@ mod tests {
     fn classifies_exact_internal_relations() {
         assert_eq!(
             classify_builtin_relation_name("lix_internal_snapshot"),
-            RelationPolicy::InternalStorage
+            RelationPolicy::InternalRelation
         );
         assert_eq!(
             classify_builtin_relation_name("LIX_INTERNAL_REGISTERED_SCHEMA_BOOTSTRAP"),
-            RelationPolicy::InternalStorage
+            RelationPolicy::InternalRelation
         );
     }
 
@@ -185,7 +185,7 @@ mod tests {
     fn classifies_live_storage_family_through_internal_relation_prefix() {
         assert_eq!(
             classify_builtin_relation_name(&tracked_relation_name("lix_key_value")),
-            RelationPolicy::InternalStorage
+            RelationPolicy::InternalRelation
         );
     }
 

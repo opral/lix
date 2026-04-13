@@ -116,7 +116,7 @@ impl SimulatedLix {
                 }
                 result
             }
-            StatementKind::Other => self.lix.execute_with_options(sql, params, options).await,
+            StatementKind::Utility => self.lix.execute_with_options(sql, params, options).await,
         }
     }
 
@@ -989,12 +989,12 @@ pub fn default_simulations() -> Vec<Simulation> {
 enum StatementKind {
     Read,
     Write,
-    Other,
+    Utility,
 }
 
 fn classify_statement(sql: &str) -> StatementKind {
     let Some(keyword) = first_keyword(sql) else {
-        return StatementKind::Other;
+        return StatementKind::Utility;
     };
     let keyword = keyword.to_ascii_lowercase();
 
@@ -1002,7 +1002,7 @@ fn classify_statement(sql: &str) -> StatementKind {
         "select" | "pragma" | "show" | "describe" | "desc" | "explain" => StatementKind::Read,
         "insert" | "update" | "delete" | "replace" | "merge" => StatementKind::Write,
         "with" => classify_with_statement(sql),
-        _ => StatementKind::Other,
+        _ => StatementKind::Utility,
     }
 }
 

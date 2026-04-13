@@ -24,7 +24,7 @@ use crate::live_state::{
 use crate::schema::LixVersionRef;
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, ReplayCursor,
-    TransactionMode,
+    TransactionBeginMode,
 };
 
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
@@ -271,7 +271,9 @@ async fn recover_live_state_projection_replay_state(
     backend: &dyn LixBackend,
     target: Option<&ReplayCursor>,
 ) -> Result<(), LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
     let recovery_result = match target {
         Some(target) => {
             replay::mark_live_state_projection_ready_at_replay_cursor_in_transaction(
@@ -319,7 +321,9 @@ async fn apply_live_state_replay_scope_to_cursor(
     scope: &LiveStateRebuildScope,
     target: Option<&ReplayCursor>,
 ) -> Result<(), LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
     let apply_result = crate::live_state::rebuild_scope_in_transaction(
         transaction.as_mut(),
         &LiveStateRebuildRequest {
@@ -374,7 +378,7 @@ mod tests {
     };
     use crate::CreateVersionOptions;
     use crate::ReplayCursor;
-    use crate::{CommittedVersionFrontier, LixBackend, TransactionMode};
+    use crate::{CommittedVersionFrontier, LixBackend, TransactionBeginMode};
     use std::collections::BTreeMap;
 
     async fn init_projection_backend() -> TestSqliteBackend {
@@ -483,7 +487,7 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(TransactionMode::Write)
+            .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let receipt = CanonicalCommitReceipt {
@@ -591,7 +595,7 @@ mod tests {
                 .expect("version-c creation should produce a replay cursor");
 
             let mut transaction = backend
-                .begin_transaction(TransactionMode::Write)
+                .begin_transaction(TransactionBeginMode::Write)
                 .await
                 .expect("staleness transaction should open");
             replay::mark_live_state_projection_needs_rebuild_at_replay_cursor_in_transaction(

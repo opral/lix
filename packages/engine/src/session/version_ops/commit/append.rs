@@ -1,5 +1,5 @@
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::PendingPublicCommitSession;
+use crate::contracts::PendingCommitState;
 use crate::transaction::{binary_blob_writes_from_filesystem_state, FilesystemTransactionState};
 use crate::{LixBackendTransaction, LixError};
 
@@ -11,8 +11,8 @@ pub(crate) use super::create::{
     CreateCommitWriteLane,
 };
 use super::pending::{
-    build_pending_public_commit_session, create_commit_error_to_lix_error,
-    merge_public_change_batch_into_pending_commit, pending_session_matches_create_commit,
+    build_pending_commit_state, create_commit_error_to_lix_error,
+    merge_public_change_batch_into_pending_commit, pending_commit_state_matches_create_commit,
 };
 use super::types::{
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
@@ -87,13 +87,13 @@ pub(crate) async fn append_tracked_with_pending_public_session(
     args: BufferedTrackedAppendArgs,
     functions: &mut dyn LixFunctionProvider,
     mut invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
-    mut pending_session: Option<&mut Option<PendingPublicCommitSession>>,
+    mut pending_session: Option<&mut Option<PendingCommitState>>,
     allow_pending_session_merge: bool,
 ) -> Result<BufferedTrackedAppendOutcome, LixError> {
     if let Some(session_slot) = pending_session.as_deref_mut() {
         let can_merge = allow_pending_session_merge
             && session_slot.as_ref().is_some_and(|session| {
-                pending_session_matches_create_commit(session, &args.preconditions)
+                pending_commit_state_matches_create_commit(session, &args.preconditions)
             });
         if can_merge {
             let binary_blob_writes =
@@ -108,9 +108,9 @@ pub(crate) async fn append_tracked_with_pending_public_session(
                     .await
                     .map_err(create_commit_error_to_lix_error)?;
             }
-            let session = session_slot.as_mut().expect(
-                "pending public commit session should exist when merge preconditions match",
-            );
+            let session = session_slot
+                .as_mut()
+                .expect("pending pending commit state should exist when merge preconditions match");
             let receipt = merge_public_change_batch_into_pending_commit(
                 transaction,
                 session,
@@ -155,10 +155,7 @@ pub(crate) async fn append_tracked_with_pending_public_session(
     if let Some(session_slot) = pending_session {
         *session_slot = if matches!(create_result.disposition, CreateCommitDisposition::Applied) {
             if let Some(applied_output) = create_result.applied_output.as_ref() {
-                Some(
-                    build_pending_public_commit_session(transaction, write_lane, applied_output)
-                        .await?,
-                )
+                Some(build_pending_commit_state(transaction, write_lane, applied_output).await?)
             } else {
                 None
             }
@@ -181,11 +178,13 @@ mod tests {
     use super::{
         append_tracked, append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
         CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-        CreateCommitPreconditions, CreateCommitWriteLane, PendingPublicCommitSession,
+        CreateCommitPreconditions, CreateCommitWriteLane, PendingCommitState,
     };
     use crate::contracts::LixFunctionProvider;
-    use crate::contracts::PendingPublicCommitLane;
-    use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionMode, Value};
+    use crate::contracts::PendingCommitLane;
+    use crate::{
+        LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode, Value,
+    };
     use async_trait::async_trait;
 
     #[derive(Default)]
@@ -212,8 +211,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> TransactionMode {
-            TransactionMode::Write
+        fn mode(&self) -> TransactionBeginMode {
+            TransactionBeginMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
@@ -323,8 +322,8 @@ mod tests {
             live_state_mode: Some("needs_rebuild".to_string()),
         };
         let mut functions = NoopFunctionProvider;
-        let mut pending_session = Some(PendingPublicCommitSession {
-            lane: PendingPublicCommitLane::Version("version-a".to_string()),
+        let mut pending_session = Some(PendingCommitState {
+            lane: PendingCommitLane::Version("version-a".to_string()),
             commit_id: "commit-123".to_string(),
             commit_change_snapshot_id: "snapshot-1".to_string(),
             commit_snapshot: serde_json::json!({ "change_set_id": "change-set-1" }),

@@ -7,22 +7,22 @@ use std::sync::Mutex;
 
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::BufferedWriteExecutionInput;
-use crate::contracts::{ExecuteOptions, ExecutionRuntimeState, SessionStateDelta};
+use crate::contracts::{ExecuteOptions, FunctionRuntimeState, SessionStateDelta};
 use crate::sql::RuntimeBindingValues;
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
 use crate::LixError;
 
-pub(crate) type SessionExecutionRuntimeHandle = Arc<SessionExecutionRuntime>;
+pub(crate) type SessionCompilerCacheHandle = Arc<SessionCompilerCache>;
 
-pub(crate) struct SessionExecutionRuntime {
+pub(crate) struct SessionCompilerCache {
     public_surface_registry_generation: AtomicU64,
     #[cfg(test)]
     statement_template_cache: Mutex<BTreeMap<StatementTemplateCacheKey, StatementTemplate>>,
 }
 
-impl SessionExecutionRuntime {
-    pub(crate) fn new() -> SessionExecutionRuntimeHandle {
+impl SessionCompilerCache {
+    pub(crate) fn new() -> SessionCompilerCacheHandle {
         Arc::new(Self {
             public_surface_registry_generation: AtomicU64::new(0),
             #[cfg(test)]
@@ -65,40 +65,40 @@ impl SessionExecutionRuntime {
     }
 }
 
-pub(crate) struct ExecutionContext {
+pub(crate) struct SessionExecutionState {
     pub(crate) options: ExecuteOptions,
     pub(crate) public_surface_registry: SurfaceRegistry,
-    session_runtime: SessionExecutionRuntimeHandle,
+    compiler_cache: SessionCompilerCacheHandle,
     pub(crate) active_version_id: String,
     pub(crate) active_account_ids: Vec<String>,
-    execution_runtime_state: Option<ExecutionRuntimeState>,
+    function_runtime_state: Option<FunctionRuntimeState>,
 }
 
-impl ExecutionContext {
+impl SessionExecutionState {
     pub(crate) fn new(
         options: ExecuteOptions,
         public_surface_registry: SurfaceRegistry,
-        session_runtime: SessionExecutionRuntimeHandle,
+        compiler_cache: SessionCompilerCacheHandle,
         active_version_id: String,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
             options,
             public_surface_registry,
-            session_runtime,
+            compiler_cache,
             active_version_id,
             active_account_ids,
-            execution_runtime_state: None,
+            function_runtime_state: None,
         }
     }
 
     pub(crate) fn bump_public_surface_registry_generation(&mut self) {
-        self.session_runtime
+        self.compiler_cache
             .bump_public_surface_registry_generation();
     }
 
     pub(crate) fn public_surface_registry_generation(&self) -> u64 {
-        self.session_runtime.public_surface_registry_generation()
+        self.compiler_cache.public_surface_registry_generation()
     }
 
     pub(crate) fn install_public_surface_registry(&mut self, registry: SurfaceRegistry) {
@@ -111,7 +111,7 @@ impl ExecutionContext {
         &self,
         key: &StatementTemplateCacheKey,
     ) -> Option<StatementTemplate> {
-        self.session_runtime.cached_statement_template(key)
+        self.compiler_cache.cached_statement_template(key)
     }
 
     #[cfg(test)]
@@ -120,19 +120,19 @@ impl ExecutionContext {
         key: StatementTemplateCacheKey,
         template: StatementTemplate,
     ) {
-        self.session_runtime.cache_statement_template(key, template);
+        self.compiler_cache.cache_statement_template(key, template);
     }
 
-    pub(crate) fn execution_runtime_state(&self) -> Option<&ExecutionRuntimeState> {
-        self.execution_runtime_state.as_ref()
+    pub(crate) fn function_runtime_state(&self) -> Option<&FunctionRuntimeState> {
+        self.function_runtime_state.as_ref()
     }
 
-    pub(crate) fn set_execution_runtime_state(&mut self, runtime_state: ExecutionRuntimeState) {
-        self.execution_runtime_state = Some(runtime_state);
+    pub(crate) fn set_function_runtime_state(&mut self, runtime_state: FunctionRuntimeState) {
+        self.function_runtime_state = Some(runtime_state);
     }
 
-    pub(crate) fn clear_execution_runtime_state(&mut self) {
-        self.execution_runtime_state = None;
+    pub(crate) fn clear_function_runtime_state(&mut self) {
+        self.function_runtime_state = None;
     }
 
     pub(crate) fn runtime_binding_values(&self) -> Result<RuntimeBindingValues, LixError> {

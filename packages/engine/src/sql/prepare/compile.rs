@@ -1,48 +1,48 @@
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::DynFunctionProvider;
 use crate::sql::explain::{
-    build_internal_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
-    ExplainRequest, ExplainStage, ExplainTimingCollector, InternalExplainBuildInput,
+    build_direct_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
+    DirectExplainBuildInput, ExplainRequest, ExplainStage, ExplainTimingCollector,
 };
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::time::Duration;
 use std::time::Instant;
 
-use super::compiled::{CompiledExecution, CompiledExecutionBody, CompiledInternalExecution};
+use super::compiled::{CompiledDirectExecution, CompiledExecution, CompiledExecutionBody};
 use super::compiler_metadata::SqlCompilerMetadata;
 use super::contracts::effects::PlanEffects;
 use super::contracts::planned_statement::PlannedStatementSet;
 use super::contracts::requirements::PlanRequirements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
-use super::execution_program::BoundStatementTemplateInstance;
-use super::intent::{collect_execution_intent, ExecutionIntent, IntentCollectionPolicy};
+use super::execution_program::BoundStatementInstance;
+use super::intent::{collect_filesystem_intent, EffectCollectionPolicy, FilesystemIntent};
 use super::preprocess::preprocess_with_surfaces_to_logical_plan;
 use super::public_surface::{
-    finalize_public_write_execution, prepare_public_execution_with_registry_context_and_functions,
-    PreparedPublicExecution, PreparedPublicWrite,
+    finalize_public_write_execution, prepare_public_plan_with_registry_context_and_functions,
+    PublicPlan, PublicWritePlan,
 };
 use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
 
-pub(crate) struct PreparationPolicy {
+pub(crate) struct CompilePolicy {
     pub(crate) skip_side_effect_collection: bool,
 }
 
 #[derive(Clone)]
-pub(crate) struct SqlPreparationSeed<'a> {
+pub(crate) struct SqlCompilerSeed<'a> {
     pub(crate) dialect: SqlDialect,
     pub(crate) functions: DynFunctionProvider,
     pub(crate) surface_registry: &'a SurfaceRegistry,
 }
 
-impl<'a> SqlPreparationSeed<'a> {
+impl<'a> SqlCompilerSeed<'a> {
     pub(crate) fn with_compiler_metadata(
         &self,
         compiler_metadata: &'a SqlCompilerMetadata,
         active_history_root_commit_id: Option<&'a str>,
-    ) -> DefaultSqlPreparationContext<'a> {
-        DefaultSqlPreparationContext {
+    ) -> DefaultSqlCompilerContext<'a> {
+        DefaultSqlCompilerContext {
             dialect: self.dialect,
             functions: self.functions.clone(),
             surface_registry: self.surface_registry,
@@ -52,7 +52,7 @@ impl<'a> SqlPreparationSeed<'a> {
     }
 }
 
-pub(crate) trait SqlPreparationContext {
+pub(crate) trait SqlCompilerContext {
     fn dialect(&self) -> SqlDialect;
 
     fn functions(&self) -> &DynFunctionProvider;
@@ -66,7 +66,7 @@ pub(crate) trait SqlPreparationContext {
     }
 }
 
-pub(crate) struct DefaultSqlPreparationContext<'a> {
+pub(crate) struct DefaultSqlCompilerContext<'a> {
     pub(crate) dialect: SqlDialect,
     pub(crate) functions: DynFunctionProvider,
     pub(crate) surface_registry: &'a SurfaceRegistry,
@@ -74,7 +74,7 @@ pub(crate) struct DefaultSqlPreparationContext<'a> {
     pub(crate) active_history_root_commit_id: Option<&'a str>,
 }
 
-impl SqlPreparationContext for DefaultSqlPreparationContext<'_> {
+impl SqlCompilerContext for DefaultSqlCompilerContext<'_> {
     fn dialect(&self) -> SqlDialect {
         self.dialect
     }
@@ -103,18 +103,18 @@ struct StaticCompilationArtifacts<'a> {
 }
 
 async fn compile_execution_with_context(
-    preparation_context: &dyn SqlPreparationContext,
+    compiler_context: &dyn SqlCompilerContext,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
-    policy: PreparationPolicy,
+    allow_internal_relations: bool,
+    policy: CompilePolicy,
     static_artifacts: StaticCompilationArtifacts<'_>,
 ) -> Result<CompiledExecution, LixError> {
-    let dialect = preparation_context.dialect();
-    let functions = preparation_context.functions().clone();
+    let dialect = compiler_context.dialect();
+    let functions = compiler_context.functions().clone();
 
     let mut statements = parsed_statements.to_vec();
     crate::sql::prepare::filesystem_insert_ids::ensure_generated_filesystem_insert_ids(
@@ -135,23 +135,23 @@ async fn compile_execution_with_context(
         .cloned()
         .unwrap_or_else(|| derive_plan_requirements(&statements));
 
-    let public_execution = prepare_public_execution_for_compile(
+    let public_plan = prepare_public_plan_for_compile(
         dialect,
-        preparation_context.surface_registry(),
-        preparation_context.compiler_metadata(),
+        compiler_context.surface_registry(),
+        compiler_context.compiler_metadata(),
         &statements,
         params,
         active_version_id,
-        preparation_context.active_history_root_commit_id(),
+        compiler_context.active_history_root_commit_id(),
         active_account_ids,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         static_artifacts.parse_duration,
     )
     .await?;
-    let (public_read, mut public_write) = match public_execution {
-        Some(PreparedPublicExecution::Read(prepared)) => (Some(prepared), None),
-        Some(PreparedPublicExecution::Write(prepared)) => (None, Some(prepared)),
+    let (public_read, mut public_write) = match public_plan {
+        Some(PublicPlan::Read(prepared)) => (Some(prepared), None),
+        Some(PublicPlan::Write(prepared)) => (None, Some(prepared)),
         None => (None, None),
     };
     let skip_side_effect_collection = policy.skip_side_effect_collection
@@ -164,23 +164,23 @@ async fn compile_execution_with_context(
         });
 
     let public_read_owns_execution = public_read.is_some();
-    let explain_internal_execution =
+    let explain_direct_execution =
         explain_request.is_some() && !public_read_owns_execution && public_write.is_none();
 
-    let intent = if let Some(public_write) = public_write.as_ref() {
-        derived_public_execution_intent(public_write)
+    let filesystem_intent = if let Some(public_write) = public_write.as_ref() {
+        derived_public_write_filesystem_intent(public_write)
     } else if public_read_owns_execution {
-        ExecutionIntent {
+        FilesystemIntent {
             filesystem_state: Default::default(),
         }
-    } else if explain_internal_execution {
-        ExecutionIntent {
+    } else if explain_direct_execution {
+        FilesystemIntent {
             filesystem_state: Default::default(),
         }
     } else {
-        collect_execution_intent(
+        collect_filesystem_intent(
             &requirements,
-            IntentCollectionPolicy {
+            EffectCollectionPolicy {
                 skip_side_effect_collection,
             },
         )
@@ -188,7 +188,7 @@ async fn compile_execution_with_context(
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "compile_execution intent collection failed: {}",
+                "compile_execution filesystem effect collection failed: {}",
                 error.description
             ),
         })?
@@ -198,24 +198,27 @@ async fn compile_execution_with_context(
     if let Some(public_write) = public_write.as_mut() {
         let planned_write = public_write.planned_write.clone();
         if let Some(execution) = public_write.materialization_mut() {
-            finalize_public_write_execution(execution, &planned_write, &intent.filesystem_state)
-                .map_err(|error| LixError {
-                    code: error.code,
-                    description: format!(
-                        "compile_execution public execution finalization failed: {}",
-                        error.description
-                    ),
-                })?;
+            finalize_public_write_execution(
+                execution,
+                &planned_write,
+                &filesystem_intent.filesystem_state,
+            )
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "compile_execution public execution finalization failed: {}",
+                    error.description
+                ),
+            })?;
         }
     }
 
     let result_contract = result_contract_for_statements(&statements);
-    let mut internal_explain = None;
-    let (effects, internal_execution) = if public_write_owns_execution || public_read_owns_execution
-    {
+    let mut direct_explain = None;
+    let (effects, direct_execution) = if public_write_owns_execution || public_read_owns_execution {
         (PlanEffects::default(), None)
     } else {
-        let internal_source_statements = explained
+        let direct_source_statements = explained
             .as_ref()
             .and_then(|explained| {
                 explained
@@ -224,11 +227,11 @@ async fn compile_execution_with_context(
                     .map(|_| vec![explained.statement.clone()])
             })
             .unwrap_or_else(|| statements.clone());
-        let internal_logical_planning_started = Instant::now();
-        let internal_logical_plan = preprocess_with_surfaces_to_logical_plan(
+        let direct_logical_planning_started = Instant::now();
+        let direct_logical_plan = preprocess_with_surfaces_to_logical_plan(
             dialect,
-            preparation_context.surface_registry(),
-            internal_source_statements,
+            compiler_context.surface_registry(),
+            direct_source_statements,
             params,
             functions.clone(),
             writer_key,
@@ -238,16 +241,16 @@ async fn compile_execution_with_context(
         .map_err(|error| LixError {
             code: error.code,
             description: format!(
-                "compile_execution internal compilation failed: {}",
+                "compile_execution direct compilation failed: {}",
                 error.description
             ),
         })?;
-        let internal_logical_planning_duration = internal_logical_planning_started.elapsed();
+        let direct_logical_planning_duration = direct_logical_planning_started.elapsed();
         let preprocess: PlannedStatementSet =
-            internal_logical_plan.normalized_statements.clone().into();
-        validate_compiled_internal_execution(&preprocess, internal_logical_plan.result_contract)?;
+            direct_logical_plan.normalized_statements.clone().into();
+        validate_compiled_direct_execution(&preprocess, direct_logical_plan.result_contract)?;
         let effects = derive_plan_effects(&preprocess, writer_key).map_err(LixError::from)?;
-        let internal_execution = CompiledInternalExecution {
+        let direct_execution = CompiledDirectExecution {
             prepared_statements: preprocess.prepared_statements,
             live_table_requirements: preprocess.live_table_requirements,
             mutations: preprocess.mutations,
@@ -258,33 +261,29 @@ async fn compile_execution_with_context(
             let mut stage_timings = ExplainTimingCollector::new(static_artifacts.parse_duration);
             stage_timings.record(
                 ExplainStage::LogicalPlanning,
-                internal_logical_planning_duration,
+                direct_logical_planning_duration,
             );
-            internal_explain = Some(build_internal_explain_artifacts(
-                InternalExplainBuildInput {
-                    request,
-                    logical_plan: internal_logical_plan.clone(),
-                    stage_timings: stage_timings.finish(),
-                },
-            ));
+            direct_explain = Some(build_direct_explain_artifacts(DirectExplainBuildInput {
+                request,
+                logical_plan: direct_logical_plan.clone(),
+                stage_timings: stage_timings.finish(),
+            }));
         }
-        (effects, Some(internal_execution))
+        (effects, Some(direct_execution))
     };
 
-    let body = match (public_read, public_write, internal_execution) {
+    let body = match (public_read, public_write, direct_execution) {
         (Some(public_read), None, None) => CompiledExecutionBody::PublicRead(public_read),
         (None, Some(public_write), None) => CompiledExecutionBody::PublicWrite(public_write),
-        (None, None, Some(internal_execution)) => {
-            CompiledExecutionBody::Internal(internal_execution)
-        }
-        (public_read, public_write, internal_execution) => {
+        (None, None, Some(direct_execution)) => CompiledExecutionBody::Direct(direct_execution),
+        (public_read, public_write, direct_execution) => {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                    "compiled execution must have exactly one body; got public_read={}, public_write={}, internal={}",
+                    "compiled execution must have exactly one body; got public_read={}, public_write={}, direct={}",
                     public_read.is_some(),
                     public_write.is_some(),
-                    internal_execution.is_some()
+                    direct_execution.is_some()
                 ),
             ));
         }
@@ -301,11 +300,11 @@ async fn compile_execution_with_context(
             .request
             .as_ref()
             .map(|_| write.explain.clone()),
-        CompiledExecutionBody::Internal(_) => internal_explain,
+        CompiledExecutionBody::Direct(_) => direct_explain,
     };
 
     Ok(CompiledExecution {
-        intent,
+        filesystem_intent,
         explain,
         result_contract,
         effects,
@@ -314,7 +313,7 @@ async fn compile_execution_with_context(
     })
 }
 
-async fn prepare_public_execution_for_compile(
+async fn prepare_public_plan_for_compile(
     dialect: SqlDialect,
     registry: &crate::catalog::SurfaceRegistry,
     compiler_metadata: &SqlCompilerMetadata,
@@ -324,10 +323,10 @@ async fn prepare_public_execution_for_compile(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
+    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicExecution>, LixError> {
-    prepare_public_execution_with_registry_context_and_functions(
+) -> Result<Option<PublicPlan>, LixError> {
+    prepare_public_plan_with_registry_context_and_functions(
         dialect,
         registry,
         compiler_metadata,
@@ -337,48 +336,48 @@ async fn prepare_public_execution_for_compile(
         active_history_root_commit_id,
         active_account_ids,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         parse_duration,
     )
     .await
 }
 
-pub(crate) async fn compile_execution_from_template_instance_with_context(
-    preparation_context: &dyn SqlPreparationContext,
-    template_instance: &BoundStatementTemplateInstance,
+pub(crate) async fn compile_execution_from_bound_statement_with_context(
+    compiler_context: &dyn SqlCompilerContext,
+    bound_statement: &BoundStatementInstance,
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
-    policy: PreparationPolicy,
+    allow_internal_relations: bool,
+    policy: CompilePolicy,
 ) -> Result<CompiledExecution, LixError> {
     compile_execution_with_context(
-        preparation_context,
-        std::slice::from_ref(template_instance.statement()),
-        template_instance.params(),
+        compiler_context,
+        std::slice::from_ref(bound_statement.statement()),
+        bound_statement.params(),
         active_version_id,
         active_account_ids,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         policy,
         StaticCompilationArtifacts {
-            parse_duration: template_instance.parse_duration(),
-            plan_requirements: Some(template_instance.plan_requirements()),
+            parse_duration: bound_statement.parse_duration(),
+            plan_requirements: Some(bound_statement.plan_requirements()),
         },
     )
     .await
 }
 
-fn derived_public_execution_intent(
-    prepared: &PreparedPublicWrite,
-) -> crate::sql::prepare::intent::ExecutionIntent {
+fn derived_public_write_filesystem_intent(
+    prepared: &PublicWritePlan,
+) -> crate::sql::prepare::intent::FilesystemIntent {
     let Some(resolved) = prepared.planned_write.resolved_write_plan.as_ref() else {
-        return crate::sql::prepare::intent::ExecutionIntent {
+        return crate::sql::prepare::intent::FilesystemIntent {
             filesystem_state: Default::default(),
         };
     };
 
-    crate::sql::prepare::intent::ExecutionIntent {
+    crate::sql::prepare::intent::FilesystemIntent {
         filesystem_state: resolved.filesystem_state(),
     }
 }
@@ -394,17 +393,17 @@ fn validate_explain_execution_support(
 
     match body {
         CompiledExecutionBody::PublicRead(_) => Ok(()),
-        CompiledExecutionBody::Internal(_) if read_only_query => Ok(()),
+        CompiledExecutionBody::Direct(_) if read_only_query => Ok(()),
         CompiledExecutionBody::PublicWrite(_) => {
             Err(unsupported_explain_analyze_error("public write statements"))
         }
-        CompiledExecutionBody::Internal(_) => Err(unsupported_explain_analyze_error(
-            "mutating internal statements",
+        CompiledExecutionBody::Direct(_) => Err(unsupported_explain_analyze_error(
+            "mutating direct statements",
         )),
     }
 }
 
-fn validate_compiled_internal_execution(
+fn validate_compiled_direct_execution(
     preprocess: &PlannedStatementSet,
     result_contract: ResultContract,
 ) -> Result<(), LixError> {
@@ -415,7 +414,7 @@ fn validate_compiled_internal_execution(
     {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "sql compiler produced an internal execution without statements",
+            "sql compiler produced a direct execution without statements",
         ));
     }
     Ok(())

@@ -12,7 +12,7 @@ use super::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStre
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::SharedFunctionProvider;
-use crate::contracts::{CompiledSchemaCache, ExecutionRuntimeState, WasmRuntime};
+use crate::contracts::{CompiledSchemaCache, FunctionRuntimeState, WasmRuntime};
 use crate::live_state::{
     mark_mode_with_backend, LiveStateApplyReport, LiveStateMode, LiveStateRebuildPlan,
     LiveStateRebuildReport, LiveStateRebuildRequest, ProjectionStatus,
@@ -27,7 +27,7 @@ use crate::{
     AdditionalSessionOptions, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
     ExecuteOptions, ExecuteResult, LixBackend, LixBackendTransaction, LixError,
     MergeVersionOptions, MergeVersionResult, ObserveEventsOwned, ObserveQuery, RedoOptions,
-    RedoResult, Session, SessionTransaction, TransactionMode, UndoOptions, UndoResult, Value,
+    RedoResult, Session, SessionTransaction, TransactionBeginMode, UndoOptions, UndoResult, Value,
 };
 
 const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";
@@ -222,15 +222,13 @@ impl Lix {
             .await
     }
 
-    pub(crate) fn session_services(
-        &self,
-    ) -> Arc<dyn crate::session::collaborators::SessionServices> {
-        Arc::new(LixEngineSessionServices::new(Arc::clone(&self.engine)))
+    pub(crate) fn session_host(&self) -> Arc<dyn crate::session::host::SessionHost> {
+        Arc::new(LixEngineSessionHost::new(Arc::clone(&self.engine)))
     }
 
     pub(crate) async fn open_workspace_session(&self) -> Result<Session, LixError> {
-        Session::open_workspace(crate::session::collaborators::SessionCollaborators::new(
-            self.session_services(),
+        Session::open_workspace(crate::session::runtime::SessionRuntime::new(
+            self.session_host(),
         ))
         .await
     }
@@ -539,7 +537,7 @@ impl Lix {
 }
 
 #[async_trait(?Send)]
-impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
+impl crate::session::host::WriteExecutionServices for Lix {
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
         self.catalog_projection_registry().as_ref()
     }
@@ -548,24 +546,24 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
         self.engine().schema_cache()
     }
 
-    fn sql_preparation_seed<'a>(
+    fn sql_compiler_seed<'a>(
         &'a self,
         functions: &'a crate::contracts::DynFunctionProvider,
         surface_registry: &'a SurfaceRegistry,
-    ) -> crate::sql::SqlPreparationSeed<'a> {
-        crate::sql::SqlPreparationSeed {
+    ) -> crate::sql::SqlCompilerSeed<'a> {
+        crate::sql::SqlCompilerSeed {
             dialect: self.backend().dialect(),
             functions: crate::contracts::clone_boxed_function_provider(functions),
             surface_registry,
         }
     }
 
-    async fn prepare_execution_runtime_state(
+    async fn prepare_function_runtime_state(
         &self,
         backend: &dyn LixBackend,
-    ) -> Result<ExecutionRuntimeState, LixError> {
+    ) -> Result<FunctionRuntimeState, LixError> {
         let (settings, functions) = self.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(ExecutionRuntimeState::from_prepared_parts(
+        Ok(FunctionRuntimeState::from_prepared_parts(
             settings.enabled,
             &functions,
         ))
@@ -573,17 +571,17 @@ impl crate::session::collaborators::WriteExecutionCollaborators for Lix {
 }
 
 #[async_trait(?Send)]
-impl crate::transaction::WriteExecutionBindings for Lix {
-    async fn execute_prepared_public_read_with_pending_view(
+impl crate::transaction::WriteExecutionHost for Lix {
+    async fn execute_prepared_public_read_with_pending_overlay_view(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        pending_view: Option<&dyn crate::contracts::PendingView>,
-        public_read: &crate::contracts::PreparedPublicReadArtifact,
+        pending_overlay_view: Option<&dyn crate::contracts::PendingOverlayView>,
+        public_read: &crate::contracts::PreparedPublicRead,
     ) -> Result<crate::QueryResult, LixError> {
-        crate::session::write_execution_bindings::execute_prepared_public_read_with_registry(
+        crate::session::write_execution_host::execute_prepared_public_read_with_registry(
             self.catalog_projection_registry().as_ref(),
             transaction,
-            pending_view,
+            pending_overlay_view,
             public_read,
         )
         .await
@@ -594,18 +592,15 @@ impl crate::transaction::WriteExecutionBindings for Lix {
         transaction: &mut dyn crate::LixBackendTransaction,
         writes: &[crate::transaction::BinaryBlobWrite],
     ) -> Result<(), LixError> {
-        crate::session::write_execution_bindings::persist_binary_blob_writes(transaction, writes)
-            .await
+        crate::session::write_execution_host::persist_binary_blob_writes(transaction, writes).await
     }
 
     async fn garbage_collect_unreachable_binary_cas_in_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_bindings::garbage_collect_unreachable_binary_cas(
-            transaction,
-        )
-        .await
+        crate::session::write_execution_host::garbage_collect_unreachable_binary_cas(transaction)
+            .await
     }
 
     async fn persist_runtime_sequence_in_transaction(
@@ -613,37 +608,36 @@ impl crate::transaction::WriteExecutionBindings for Lix {
         transaction: &mut dyn crate::LixBackendTransaction,
         functions: &SharedFunctionProvider<Box<dyn crate::contracts::LixFunctionProvider + Send>>,
     ) -> Result<(), LixError> {
-        crate::session::write_execution_bindings::persist_runtime_sequence(transaction, functions)
-            .await
+        crate::session::write_execution_host::persist_runtime_sequence(transaction, functions).await
     }
 
     async fn execute_public_tracked_append_txn_with_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
         unit: &crate::transaction::TrackedTxnUnit,
-        pending_commit_session: Option<&mut Option<crate::contracts::PendingPublicCommitSession>>,
+        pending_commit_state: Option<&mut Option<crate::contracts::PendingCommitState>>,
     ) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
-        crate::session::write_execution_bindings::execute_public_tracked_append(
+        crate::session::write_execution_host::execute_public_tracked_append(
             transaction,
             unit,
-            pending_commit_session,
+            pending_commit_state,
         )
         .await
     }
 }
 
-pub(crate) struct LixEngineSessionServices {
+pub(crate) struct LixEngineSessionHost {
     engine: Arc<Engine>,
 }
 
-impl LixEngineSessionServices {
+impl LixEngineSessionHost {
     pub(crate) fn new(engine: Arc<Engine>) -> Self {
         Self { engine }
     }
 }
 
 #[async_trait(?Send)]
-impl crate::session::collaborators::SessionServices for LixEngineSessionServices {
+impl crate::session::host::SessionHost for LixEngineSessionHost {
     async fn ensure_initialized(&self) -> Result<(), LixError> {
         if crate::live_state::load_mode_with_backend(self.engine.backend().as_ref()).await?
             == crate::live_state::LiveStateMode::Uninitialized
@@ -667,7 +661,7 @@ impl crate::session::collaborators::SessionServices for LixEngineSessionServices
 
     async fn begin_read_unit(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.engine.begin_read_unit(mode).await
     }
@@ -762,7 +756,7 @@ mod tests {
         extract_explicit_transaction_script, is_query_only_statements, optimize_state_resolution,
         parse_sql_statements, PlaceholderState,
     };
-    use crate::TransactionMode;
+    use crate::TransactionBeginMode;
     use crate::{
         ExecuteOptions, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
         Session, SqlDialect, Value,
@@ -780,7 +774,7 @@ mod tests {
     struct TestTransaction {
         commit_called: Arc<AtomicBool>,
         rollback_called: Arc<AtomicBool>,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     }
 
     #[async_trait(?Send)]
@@ -804,7 +798,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            mode: TransactionMode,
+            mode: TransactionBeginMode,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             Ok(Box::new(TestTransaction {
                 commit_called: Arc::clone(&self.commit_called),
@@ -817,7 +811,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(TransactionMode::Write).await
+            self.begin_transaction(TransactionBeginMode::Write).await
         }
     }
 
@@ -827,7 +821,7 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> TransactionMode {
+        fn mode(&self) -> TransactionBeginMode {
             self.mode
         }
 
@@ -920,9 +914,7 @@ mod tests {
                         Arc::new(NoopWasmRuntime),
                     )));
                     let session = Session::new_for_test(
-                        crate::session::collaborators::SessionCollaborators::new(
-                            lix.session_services(),
-                        ),
+                        crate::session::runtime::SessionRuntime::new(lix.session_host()),
                         "version-test".to_string(),
                         Vec::new(),
                     );
@@ -968,7 +960,7 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         )));
         let session = Session::new_for_test(
-            crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+            crate::session::runtime::SessionRuntime::new(lix.session_host()),
             "version-test".to_string(),
             Vec::new(),
         );
@@ -1023,7 +1015,7 @@ mod tests {
             Arc::new(NoopWasmRuntime),
         )));
         let session = Session::new_for_test(
-            crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+            crate::session::runtime::SessionRuntime::new(lix.session_host()),
             "version-test".to_string(),
             Vec::new(),
         );

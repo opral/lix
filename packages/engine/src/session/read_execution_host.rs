@@ -1,20 +1,18 @@
 use async_trait::async_trait;
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::PendingView;
-use crate::contracts::{
-    PendingPublicReadExecutionBackend, ReadExecutionBindings, ReadTimeProjectionRow,
-};
-use crate::contracts::{PreparedPublicReadArtifact, ReadTimeProjectionRead};
+use crate::contracts::PendingOverlayView;
+use crate::contracts::{PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionRow};
+use crate::contracts::{PreparedPublicRead, ReadTimeProjectionPlan};
 use crate::execution::read::execute_prepared_public_read_artifact_with_backend;
-use crate::session::collaborators::SessionCollaborators;
+use crate::session::runtime::SessionRuntime;
 use crate::{LixBackend, LixError, QueryResult};
 
-pub(crate) struct CatalogProjectionRegistryReadExecutionBindings<'a> {
+pub(crate) struct CatalogProjectionRegistryReadExecutionHost<'a> {
     projection_registry: &'a CatalogProjectionRegistry,
 }
 
-impl<'a> CatalogProjectionRegistryReadExecutionBindings<'a> {
+impl<'a> CatalogProjectionRegistryReadExecutionHost<'a> {
     pub(crate) fn new(projection_registry: &'a CatalogProjectionRegistry) -> Self {
         Self {
             projection_registry,
@@ -25,7 +23,7 @@ impl<'a> CatalogProjectionRegistryReadExecutionBindings<'a> {
 pub(crate) async fn derive_read_time_projection_rows_with_registry(
     projection_registry: &CatalogProjectionRegistry,
     backend: &dyn LixBackend,
-    artifact: &ReadTimeProjectionRead,
+    artifact: &ReadTimeProjectionPlan,
 ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
     Ok(
         crate::live_state::derive_read_time_surface_rows(backend, projection_registry, artifact)
@@ -41,11 +39,11 @@ pub(crate) async fn derive_read_time_projection_rows_with_registry(
 }
 
 #[async_trait(?Send)]
-impl ReadExecutionBindings for CatalogProjectionRegistryReadExecutionBindings<'_> {
+impl ReadExecutionHost for CatalogProjectionRegistryReadExecutionHost<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &ReadTimeProjectionRead,
+        artifact: &ReadTimeProjectionPlan,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
         derive_read_time_projection_rows_with_registry(self.projection_registry, backend, artifact)
             .await
@@ -53,11 +51,11 @@ impl ReadExecutionBindings for CatalogProjectionRegistryReadExecutionBindings<'_
 }
 
 #[async_trait(?Send)]
-impl ReadExecutionBindings for SessionCollaborators {
+impl ReadExecutionHost for SessionRuntime {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &ReadTimeProjectionRead,
+        artifact: &ReadTimeProjectionPlan,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
         derive_read_time_projection_rows_with_registry(
             self.catalog_projection_registry(),
@@ -69,25 +67,24 @@ impl ReadExecutionBindings for SessionCollaborators {
 }
 
 #[async_trait(?Send)]
-impl PendingPublicReadExecutionBackend for dyn LixBackend + '_ {
-    async fn execute_prepared_public_read_with_pending_view(
+impl PendingPublicReadHost for dyn LixBackend + '_ {
+    async fn execute_prepared_public_read_with_pending_overlay_view(
         &self,
-        bindings: &dyn ReadExecutionBindings,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &PreparedPublicReadArtifact,
+        host: &dyn ReadExecutionHost,
+        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError> {
-        match public_read.contract.execution_mode() {
-            crate::contracts::PublicReadExecutionMode::PendingView => {
-                crate::session::pending_reads::execute_prepared_public_read_with_pending_view(
+        match public_read.contract.source() {
+            crate::contracts::PublicReadSource::PendingOverlay => {
+                crate::session::pending_reads::execute_prepared_public_read_with_pending_overlay_view(
                     self,
-                    pending_view,
+                    pending_overlay_view,
                     public_read,
                 )
                 .await
             }
-            crate::contracts::PublicReadExecutionMode::Committed(_) => {
-                execute_prepared_public_read_artifact_with_backend(self, bindings, public_read)
-                    .await
+            crate::contracts::PublicReadSource::Committed(_) => {
+                execute_prepared_public_read_artifact_with_backend(self, host, public_read).await
             }
         }
     }

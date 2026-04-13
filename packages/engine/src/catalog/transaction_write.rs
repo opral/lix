@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CatalogTransactionInsertSemantics {
@@ -9,7 +9,7 @@ pub(crate) struct CatalogTransactionInsertSemantics {
 }
 
 pub(crate) fn transaction_insert_semantics(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Option<CatalogTransactionInsertSemantics> {
     match (
         surface_binding.descriptor.surface_family,

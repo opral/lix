@@ -71,7 +71,7 @@ pub trait WriterKeyReadView {
     ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError>;
 }
 
-pub trait PendingView {
+pub trait PendingOverlayView {
     fn has_overlays(&self) -> bool {
         false
     }
@@ -151,29 +151,29 @@ pub trait PendingStateOverlay {
         file_id: &str,
     ) -> Option<Option<String>>;
 
-    fn as_pending_view(&self) -> &dyn PendingView;
+    fn as_pending_overlay_view(&self) -> &dyn PendingOverlayView;
 }
 
 pub struct PendingStateOverlayRef<'a> {
-    view: &'a dyn PendingView,
+    view: &'a dyn PendingOverlayView,
 }
 
 impl<'a> PendingStateOverlayRef<'a> {
-    pub fn new(view: &'a dyn PendingView) -> Self {
+    pub fn new(view: &'a dyn PendingOverlayView) -> Self {
         Self { view }
     }
 }
 
 impl<T> PendingStateOverlay for T
 where
-    T: PendingView,
+    T: PendingOverlayView,
 {
     fn visible_semantic_rows(
         &self,
         storage: PendingSemanticStorage,
         schema_key: &str,
     ) -> Vec<PendingSemanticRow> {
-        PendingView::visible_semantic_rows(self, storage, schema_key)
+        PendingOverlayView::visible_semantic_rows(self, storage, schema_key)
     }
 
     fn writer_key_annotation_for_state_row(
@@ -183,23 +183,23 @@ where
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        PendingView::writer_key_annotation_for_state_row(
+        PendingOverlayView::writer_key_annotation_for_state_row(
             self, version_id, schema_key, entity_id, file_id,
         )
     }
 
-    fn as_pending_view(&self) -> &dyn PendingView {
+    fn as_pending_overlay_view(&self) -> &dyn PendingOverlayView {
         self
     }
 }
 
-impl PendingStateOverlay for dyn PendingView + '_ {
+impl PendingStateOverlay for dyn PendingOverlayView + '_ {
     fn visible_semantic_rows(
         &self,
         storage: PendingSemanticStorage,
         schema_key: &str,
     ) -> Vec<PendingSemanticRow> {
-        PendingView::visible_semantic_rows(self, storage, schema_key)
+        PendingOverlayView::visible_semantic_rows(self, storage, schema_key)
     }
 
     fn writer_key_annotation_for_state_row(
@@ -209,12 +209,12 @@ impl PendingStateOverlay for dyn PendingView + '_ {
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        PendingView::writer_key_annotation_for_state_row(
+        PendingOverlayView::writer_key_annotation_for_state_row(
             self, version_id, schema_key, entity_id, file_id,
         )
     }
 
-    fn as_pending_view(&self) -> &dyn PendingView {
+    fn as_pending_overlay_view(&self) -> &dyn PendingOverlayView {
         self
     }
 }
@@ -225,7 +225,7 @@ impl PendingStateOverlay for PendingStateOverlayRef<'_> {
         storage: PendingSemanticStorage,
         schema_key: &str,
     ) -> Vec<PendingSemanticRow> {
-        PendingView::visible_semantic_rows(self.view, storage, schema_key)
+        PendingOverlayView::visible_semantic_rows(self.view, storage, schema_key)
     }
 
     fn writer_key_annotation_for_state_row(
@@ -235,17 +235,17 @@ impl PendingStateOverlay for PendingStateOverlayRef<'_> {
         entity_id: &str,
         file_id: &str,
     ) -> Option<Option<String>> {
-        PendingView::writer_key_annotation_for_state_row(
+        PendingOverlayView::writer_key_annotation_for_state_row(
             self.view, version_id, schema_key, entity_id, file_id,
         )
     }
 
-    fn as_pending_view(&self) -> &dyn PendingView {
+    fn as_pending_overlay_view(&self) -> &dyn PendingOverlayView {
         self.view
     }
 }
 
-pub trait LiveReadShapeContract {
+pub trait LiveRowShapeContract {
     fn normalized_projection_sql(&self, table_alias: Option<&str>) -> String;
 
     fn snapshot_from_projected_row(
@@ -357,7 +357,7 @@ pub trait LiveStateQueryBackend {
     async fn load_live_read_shape_for_table_name(
         &self,
         table_name: &str,
-    ) -> Result<Option<Box<dyn LiveReadShapeContract>>, LixError>;
+    ) -> Result<Option<Box<dyn LiveRowShapeContract>>, LixError>;
 
     async fn load_live_snapshot_rows(
         &self,

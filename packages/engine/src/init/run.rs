@@ -10,7 +10,7 @@ use crate::live_state::{
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::session;
-use crate::{Lix, LixBackend, LixError, SqlDialect, TransactionMode};
+use crate::{Lix, LixBackend, LixError, SqlDialect, TransactionBeginMode};
 
 use super::filesystem;
 use super::seed::InitExecutor;
@@ -34,7 +34,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
 
     let mut transaction = lix
         .backend()
-        .begin_transaction(TransactionMode::Write)
+        .begin_transaction(TransactionBeginMode::Write)
         .await?;
     let mut claimed_bootstrap = false;
     let init_result = async {

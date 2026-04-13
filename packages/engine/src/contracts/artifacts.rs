@@ -4,10 +4,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{Expr, Statement};
 
-use crate::catalog::{SurfaceBinding, SurfaceReadFreshness};
+use crate::catalog::{ResolvedSurface, SurfaceReadFreshness};
 use crate::common::{LixError, Value};
 use crate::contracts::ReplayCursor;
-use crate::contracts::TransactionMode;
+use crate::contracts::TransactionBeginMode;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedStatement {
@@ -105,14 +105,14 @@ pub struct CanonicalCommitReceipt {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum PendingPublicCommitLane {
+pub enum PendingCommitLane {
     Version(String),
     GlobalAdmin,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct PendingPublicCommitSession {
-    pub lane: PendingPublicCommitLane,
+pub struct PendingCommitState {
+    pub lane: PendingCommitLane,
     pub commit_id: String,
     pub commit_change_snapshot_id: String,
     pub commit_snapshot: JsonValue,
@@ -238,40 +238,40 @@ pub enum CommittedReadMode {
 }
 
 impl CommittedReadMode {
-    pub fn transaction_mode(self) -> TransactionMode {
+    pub fn transaction_mode(self) -> TransactionBeginMode {
         match self {
-            Self::CommittedOnly => TransactionMode::Read,
-            Self::MaterializedState => TransactionMode::Deferred,
+            Self::CommittedOnly => TransactionBeginMode::Read,
+            Self::MaterializedState => TransactionBeginMode::Deferred,
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PublicReadExecutionMode {
-    PendingView,
+pub enum PublicReadSource {
+    PendingOverlay,
     Committed(CommittedReadMode),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub enum PendingViewReadStorage {
+pub enum PendingOverlayLane {
     Tracked,
     Untracked,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct PendingViewReadQuery {
-    pub storage: PendingViewReadStorage,
+pub struct PendingOverlayQuery {
+    pub lane: PendingOverlayLane,
     pub schema_key: String,
     pub version_id: String,
-    pub projections: Vec<PendingViewProjection>,
-    pub filters: Vec<PendingViewFilter>,
-    pub order_by: Vec<PendingViewOrderClause>,
+    pub projections: Vec<PendingOverlayProjection>,
+    pub filters: Vec<PendingOverlayFilter>,
+    pub order_by: Vec<PendingOverlayOrderClause>,
     pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PendingViewProjection {
+pub enum PendingOverlayProjection {
     Column {
         source_column: String,
         output_column: String,
@@ -282,7 +282,7 @@ pub enum PendingViewProjection {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum PendingViewFilter {
+pub enum PendingOverlayFilter {
     Equals(String, Value),
     In(String, Vec<Value>),
     IsNull(String),
@@ -292,12 +292,12 @@ pub enum PendingViewFilter {
         pattern: String,
         case_insensitive: bool,
     },
-    And(Vec<PendingViewFilter>),
-    Or(Vec<PendingViewFilter>),
+    And(Vec<PendingOverlayFilter>),
+    Or(Vec<PendingOverlayFilter>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PendingViewOrderClause {
+pub struct PendingOverlayOrderClause {
     pub column: String,
     pub descending: bool,
 }
@@ -309,10 +309,10 @@ pub struct PendingViewOrderClause {
 /// surface.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct ReadTimeProjectionReadQuery {
-    pub projections: Vec<PendingViewProjection>,
-    pub filters: Vec<PendingViewFilter>,
-    pub order_by: Vec<PendingViewOrderClause>,
+pub struct ProjectionQuery {
+    pub projections: Vec<PendingOverlayProjection>,
+    pub filters: Vec<PendingOverlayFilter>,
+    pub order_by: Vec<PendingOverlayOrderClause>,
     pub limit: Option<usize>,
 }
 
@@ -320,15 +320,15 @@ pub struct ReadTimeProjectionReadQuery {
 /// `ReadTime` projection output.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct ReadTimeProjectionRead {
+pub(crate) struct ReadTimeProjectionPlan {
     pub(crate) surface_name: String,
     pub(crate) requested_version_id: Option<String>,
-    pub(crate) query: ReadTimeProjectionReadQuery,
+    pub(crate) query: ProjectionQuery,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
-pub enum PreparedDirectPublicReadKind {
+pub enum PreparedHistoryReadPlanKind {
     StateHistory,
     EntityHistory,
     FileHistory,
@@ -337,7 +337,7 @@ pub enum PreparedDirectPublicReadKind {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedDirectStateHistoryField {
+pub enum PreparedStateHistoryField {
     EntityId,
     SchemaKey,
     FileId,
@@ -362,7 +362,7 @@ pub enum PreparedStateHistoryAggregate {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedStateHistoryProjectionValue {
-    Field(PreparedDirectStateHistoryField),
+    Field(PreparedStateHistoryField),
     Aggregate(PreparedStateHistoryAggregate),
 }
 
@@ -376,7 +376,7 @@ pub struct PreparedStateHistoryProjection {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedStateHistorySortValue {
-    Field(PreparedDirectStateHistoryField),
+    Field(PreparedStateHistoryField),
     Aggregate(PreparedStateHistoryAggregate),
 }
 
@@ -391,15 +391,15 @@ pub struct PreparedStateHistorySortKey {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedStateHistoryPredicate {
-    Eq(PreparedDirectStateHistoryField, Value),
-    NotEq(PreparedDirectStateHistoryField, Value),
-    Gt(PreparedDirectStateHistoryField, Value),
-    GtEq(PreparedDirectStateHistoryField, Value),
-    Lt(PreparedDirectStateHistoryField, Value),
-    LtEq(PreparedDirectStateHistoryField, Value),
-    In(PreparedDirectStateHistoryField, Vec<Value>),
-    IsNull(PreparedDirectStateHistoryField),
-    IsNotNull(PreparedDirectStateHistoryField),
+    Eq(PreparedStateHistoryField, Value),
+    NotEq(PreparedStateHistoryField, Value),
+    Gt(PreparedStateHistoryField, Value),
+    GtEq(PreparedStateHistoryField, Value),
+    Lt(PreparedStateHistoryField, Value),
+    LtEq(PreparedStateHistoryField, Value),
+    In(PreparedStateHistoryField, Vec<Value>),
+    IsNull(PreparedStateHistoryField),
+    IsNotNull(PreparedStateHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -415,13 +415,13 @@ pub enum PreparedStateHistoryAggregatePredicate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedStateHistoryDirectReadPlan {
+pub struct PreparedStateHistoryReadPlan {
     pub request: StateHistoryRequest,
     pub predicates: Vec<PreparedStateHistoryPredicate>,
     pub projections: Vec<PreparedStateHistoryProjection>,
     pub wildcard_projection: bool,
     pub wildcard_columns: Vec<String>,
-    pub group_by_fields: Vec<PreparedDirectStateHistoryField>,
+    pub group_by_fields: Vec<PreparedStateHistoryField>,
     pub having: Option<PreparedStateHistoryAggregatePredicate>,
     pub sort_keys: Vec<PreparedStateHistorySortKey>,
     pub limit: Option<u64>,
@@ -430,44 +430,44 @@ pub struct PreparedStateHistoryDirectReadPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedDirectEntityHistoryField {
+pub enum PreparedEntityHistoryField {
     Property(String),
-    State(PreparedDirectStateHistoryField),
+    State(PreparedStateHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct PreparedEntityHistoryProjection {
     pub output_name: String,
-    pub field: PreparedDirectEntityHistoryField,
+    pub field: PreparedEntityHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct PreparedEntityHistorySortKey {
     pub output_name: String,
-    pub field: Option<PreparedDirectEntityHistoryField>,
+    pub field: Option<PreparedEntityHistoryField>,
     pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedEntityHistoryPredicate {
-    Eq(PreparedDirectEntityHistoryField, Value),
-    NotEq(PreparedDirectEntityHistoryField, Value),
-    Gt(PreparedDirectEntityHistoryField, Value),
-    GtEq(PreparedDirectEntityHistoryField, Value),
-    Lt(PreparedDirectEntityHistoryField, Value),
-    LtEq(PreparedDirectEntityHistoryField, Value),
-    In(PreparedDirectEntityHistoryField, Vec<Value>),
-    IsNull(PreparedDirectEntityHistoryField),
-    IsNotNull(PreparedDirectEntityHistoryField),
+    Eq(PreparedEntityHistoryField, Value),
+    NotEq(PreparedEntityHistoryField, Value),
+    Gt(PreparedEntityHistoryField, Value),
+    GtEq(PreparedEntityHistoryField, Value),
+    Lt(PreparedEntityHistoryField, Value),
+    LtEq(PreparedEntityHistoryField, Value),
+    In(PreparedEntityHistoryField, Vec<Value>),
+    IsNull(PreparedEntityHistoryField),
+    IsNotNull(PreparedEntityHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedEntityHistoryDirectReadPlan {
-    pub surface_binding: SurfaceBinding,
+pub struct PreparedEntityHistoryReadPlan {
+    pub surface_binding: ResolvedSurface,
     pub request: StateHistoryRequest,
     pub predicates: Vec<PreparedEntityHistoryPredicate>,
     pub projections: Vec<PreparedEntityHistoryProjection>,
@@ -480,7 +480,7 @@ pub struct PreparedEntityHistoryDirectReadPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedDirectFileHistoryField {
+pub enum PreparedFileHistoryField {
     Id,
     Path,
     Data,
@@ -504,29 +504,29 @@ pub enum PreparedDirectFileHistoryField {
 #[allow(dead_code)]
 pub struct PreparedFileHistoryProjection {
     pub output_name: String,
-    pub field: PreparedDirectFileHistoryField,
+    pub field: PreparedFileHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct PreparedFileHistorySortKey {
     pub output_name: String,
-    pub field: Option<PreparedDirectFileHistoryField>,
+    pub field: Option<PreparedFileHistoryField>,
     pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedFileHistoryPredicate {
-    Eq(PreparedDirectFileHistoryField, Value),
-    NotEq(PreparedDirectFileHistoryField, Value),
-    Gt(PreparedDirectFileHistoryField, Value),
-    GtEq(PreparedDirectFileHistoryField, Value),
-    Lt(PreparedDirectFileHistoryField, Value),
-    LtEq(PreparedDirectFileHistoryField, Value),
-    In(PreparedDirectFileHistoryField, Vec<Value>),
-    IsNull(PreparedDirectFileHistoryField),
-    IsNotNull(PreparedDirectFileHistoryField),
+    Eq(PreparedFileHistoryField, Value),
+    NotEq(PreparedFileHistoryField, Value),
+    Gt(PreparedFileHistoryField, Value),
+    GtEq(PreparedFileHistoryField, Value),
+    Lt(PreparedFileHistoryField, Value),
+    LtEq(PreparedFileHistoryField, Value),
+    In(PreparedFileHistoryField, Vec<Value>),
+    IsNull(PreparedFileHistoryField),
+    IsNotNull(PreparedFileHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -537,7 +537,7 @@ pub enum PreparedFileHistoryAggregate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedFileHistoryDirectReadPlan {
+pub struct PreparedFileHistoryReadPlan {
     pub request: FileHistoryRequest,
     pub predicates: Vec<PreparedFileHistoryPredicate>,
     pub projections: Vec<PreparedFileHistoryProjection>,
@@ -552,7 +552,7 @@ pub struct PreparedFileHistoryDirectReadPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedDirectDirectoryHistoryField {
+pub enum PreparedDirectoryHistoryField {
     Id,
     ParentId,
     Name,
@@ -576,29 +576,29 @@ pub enum PreparedDirectDirectoryHistoryField {
 #[allow(dead_code)]
 pub struct PreparedDirectoryHistoryProjection {
     pub output_name: String,
-    pub field: PreparedDirectDirectoryHistoryField,
+    pub field: PreparedDirectoryHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub struct PreparedDirectoryHistorySortKey {
     pub output_name: String,
-    pub field: Option<PreparedDirectDirectoryHistoryField>,
+    pub field: Option<PreparedDirectoryHistoryField>,
     pub descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedDirectoryHistoryPredicate {
-    Eq(PreparedDirectDirectoryHistoryField, Value),
-    NotEq(PreparedDirectDirectoryHistoryField, Value),
-    Gt(PreparedDirectDirectoryHistoryField, Value),
-    GtEq(PreparedDirectDirectoryHistoryField, Value),
-    Lt(PreparedDirectDirectoryHistoryField, Value),
-    LtEq(PreparedDirectDirectoryHistoryField, Value),
-    In(PreparedDirectDirectoryHistoryField, Vec<Value>),
-    IsNull(PreparedDirectDirectoryHistoryField),
-    IsNotNull(PreparedDirectDirectoryHistoryField),
+    Eq(PreparedDirectoryHistoryField, Value),
+    NotEq(PreparedDirectoryHistoryField, Value),
+    Gt(PreparedDirectoryHistoryField, Value),
+    GtEq(PreparedDirectoryHistoryField, Value),
+    Lt(PreparedDirectoryHistoryField, Value),
+    LtEq(PreparedDirectoryHistoryField, Value),
+    In(PreparedDirectoryHistoryField, Vec<Value>),
+    IsNull(PreparedDirectoryHistoryField),
+    IsNotNull(PreparedDirectoryHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -609,7 +609,7 @@ pub enum PreparedDirectoryHistoryAggregate {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedDirectoryHistoryDirectReadPlan {
+pub struct PreparedDirectoryHistoryReadPlan {
     pub request: DirectoryHistoryRequest,
     pub predicates: Vec<PreparedDirectoryHistoryPredicate>,
     pub projections: Vec<PreparedDirectoryHistoryProjection>,
@@ -624,21 +624,21 @@ pub struct PreparedDirectoryHistoryDirectReadPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedDirectPublicRead {
-    StateHistory(PreparedStateHistoryDirectReadPlan),
-    EntityHistory(PreparedEntityHistoryDirectReadPlan),
-    FileHistory(PreparedFileHistoryDirectReadPlan),
-    DirectoryHistory(PreparedDirectoryHistoryDirectReadPlan),
+pub enum PreparedHistoryReadPlan {
+    StateHistory(PreparedStateHistoryReadPlan),
+    EntityHistory(PreparedEntityHistoryReadPlan),
+    FileHistory(PreparedFileHistoryReadPlan),
+    DirectoryHistory(PreparedDirectoryHistoryReadPlan),
 }
 
 #[allow(dead_code)]
-impl PreparedDirectPublicRead {
-    pub fn kind(&self) -> PreparedDirectPublicReadKind {
+impl PreparedHistoryReadPlan {
+    pub fn kind(&self) -> PreparedHistoryReadPlanKind {
         match self {
-            Self::StateHistory(_) => PreparedDirectPublicReadKind::StateHistory,
-            Self::EntityHistory(_) => PreparedDirectPublicReadKind::EntityHistory,
-            Self::FileHistory(_) => PreparedDirectPublicReadKind::FileHistory,
-            Self::DirectoryHistory(_) => PreparedDirectPublicReadKind::DirectoryHistory,
+            Self::StateHistory(_) => PreparedHistoryReadPlanKind::StateHistory,
+            Self::EntityHistory(_) => PreparedHistoryReadPlanKind::EntityHistory,
+            Self::FileHistory(_) => PreparedHistoryReadPlanKind::FileHistory,
+            Self::DirectoryHistory(_) => PreparedHistoryReadPlanKind::DirectoryHistory,
         }
     }
 }
@@ -647,50 +647,50 @@ impl PreparedDirectPublicRead {
 ///
 /// This intentionally stays on contract-owned DTOs. It does not depend on
 /// SQL AST, binder output, logical-plan IR, or executor-private wrapper types.
-/// Closed execution contract for compiler-selected derived-rowset reads.
+/// Closed execution contract for compiler-selected read-time projection reads.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedDerivedRowsetReadArtifact {
-    pub(crate) read: ReadTimeProjectionRead,
+pub(crate) struct PreparedReadTimeProjectionArtifact {
+    pub(crate) read: ReadTimeProjectionPlan,
 }
 
-/// Closed execution contract for compiler-selected lowered read programs.
+/// Closed execution contract for compiler-selected prepared-batch reads.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedGeneralProgramReadArtifact {
+pub(crate) struct PreparedBatchReadArtifact {
     pub(crate) prepared_batch: PreparedBatch,
 }
 
-/// Closed execution contract for compiler-selected direct history reads.
+/// Closed execution contract for compiler-selected history reads.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) struct PreparedDirectHistoryReadArtifact {
-    pub(crate) plan: PreparedDirectPublicRead,
+pub(crate) struct PreparedHistoryReadArtifact {
+    pub(crate) plan: PreparedHistoryReadPlan,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub(crate) enum PreparedPublicReadExecutionArtifact {
-    DerivedRowset(PreparedDerivedRowsetReadArtifact),
-    GeneralProgram(PreparedGeneralProgramReadArtifact),
-    DirectHistory(PreparedDirectHistoryReadArtifact),
+pub(crate) enum PreparedPublicReadPlanArtifact {
+    ReadTimeProjection(PreparedReadTimeProjectionArtifact),
+    PreparedBatch(PreparedBatchReadArtifact),
+    HistoryRead(PreparedHistoryReadArtifact),
 }
 
 /// Runtime-neutral prepared public-read package.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedPublicReadArtifact {
+pub struct PreparedPublicRead {
     pub contract: PreparedPublicReadContract,
     pub freshness_contract: SurfaceReadFreshness,
     pub surface_bindings: Vec<String>,
     pub public_output_columns: Option<Vec<String>>,
-    pub execution: PreparedPublicReadExecutionArtifact,
+    pub execution: PreparedPublicReadPlanArtifact,
 }
 
-/// Runtime-neutral prepared internal-read package.
+/// Runtime-neutral prepared direct-read package.
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedInternalReadArtifact {
+pub struct PreparedDirectReadArtifact {
     pub prepared_batch: PreparedBatch,
     pub result_contract: ResultContract,
 }
@@ -746,23 +746,23 @@ pub struct ReadDiagnosticContext {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedReadArtifact {
-    Public(PreparedPublicReadArtifact),
-    Internal(PreparedInternalReadArtifact),
+    Public(PreparedPublicRead),
+    Direct(PreparedDirectReadArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedReadStep {
-    pub transaction_mode: TransactionMode,
+pub struct PreparedReadStatement {
+    pub transaction_mode: TransactionBeginMode,
     pub artifact: PreparedReadArtifact,
     pub diagnostic_context: ReadDiagnosticContext,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedReadProgram {
-    pub transaction_mode: TransactionMode,
-    pub steps: Vec<PreparedReadStep>,
+pub struct PreparedReadBatch {
+    pub transaction_mode: TransactionBeginMode,
+    pub statements: Vec<PreparedReadStatement>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,7 +770,7 @@ pub struct PreparedReadProgram {
 pub enum PreparedWriteStatementKind {
     Query,
     Explain,
-    Other,
+    Write,
 }
 
 #[allow(dead_code)]
@@ -779,7 +779,7 @@ impl PreparedWriteStatementKind {
         match statement {
             Statement::Query(_) => Self::Query,
             Statement::Explain { .. } => Self::Explain,
-            _ => Self::Other,
+            _ => Self::Write,
         }
     }
 }
@@ -817,7 +817,7 @@ pub enum PreparedInsertOnConflictAction {
 /// compiler-owned statement structures.
 #[derive(Debug, Clone, PartialEq, Default)]
 #[allow(dead_code)]
-pub struct PreparedWriteDiagnosticContext {
+pub struct WriteDiagnosticContext {
     pub relation_names: Vec<String>,
     pub explain_mode: Option<PreparedExplainMode>,
     pub plain_explain_template: Option<PreparedExplainTemplate>,
@@ -825,7 +825,7 @@ pub struct PreparedWriteDiagnosticContext {
 }
 
 #[allow(dead_code)]
-impl PreparedWriteDiagnosticContext {
+impl WriteDiagnosticContext {
     pub fn new(relation_names: Vec<String>) -> Self {
         Self {
             relation_names,
@@ -905,7 +905,7 @@ impl PreparedResolvedWritePlan {
 #[allow(dead_code)]
 pub struct PreparedPublicWriteContract {
     pub operation_kind: PreparedWriteOperationKind,
-    pub target: SurfaceBinding,
+    pub target: ResolvedSurface,
     pub on_conflict_action: Option<PreparedInsertOnConflictAction>,
     pub requested_version_id: Option<String>,
     pub active_account_ids: Vec<String>,
@@ -945,33 +945,31 @@ pub struct PreparedPublicWriteMaterialization {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedPublicWriteExecutionArtifact {
+pub enum PreparedPublicWritePlanArtifact {
     Noop,
     Materialize(PreparedPublicWriteMaterialization),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedPublicWriteArtifact {
+pub struct PreparedPublicWrite {
     pub contract: PreparedPublicWriteContract,
-    pub execution: PreparedPublicWriteExecutionArtifact,
+    pub execution: PreparedPublicWritePlanArtifact,
 }
 
 #[allow(dead_code)]
-impl PreparedPublicWriteArtifact {
+impl PreparedPublicWrite {
     pub fn materialization(&self) -> Option<&PreparedPublicWriteMaterialization> {
         match &self.execution {
-            PreparedPublicWriteExecutionArtifact::Noop => None,
-            PreparedPublicWriteExecutionArtifact::Materialize(materialization) => {
-                Some(materialization)
-            }
+            PreparedPublicWritePlanArtifact::Noop => None,
+            PreparedPublicWritePlanArtifact::Materialize(materialization) => Some(materialization),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedInternalWriteArtifact {
+pub struct PreparedDirectWriteArtifact {
     pub prepared_batch: PreparedBatch,
     pub live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub mutations: Vec<MutationRow>,
@@ -986,49 +984,43 @@ pub struct PreparedInternalWriteArtifact {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedWriteArtifact {
-    PublicRead(PreparedPublicReadArtifact),
-    PublicWrite(PreparedPublicWriteArtifact),
-    Internal(PreparedInternalWriteArtifact),
+    PublicRead(PreparedPublicRead),
+    PublicWrite(PreparedPublicWrite),
+    Direct(PreparedDirectWriteArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedWriteStep {
+pub struct PreparedWriteStatement {
     pub statement_kind: PreparedWriteStatementKind,
     pub result_contract: ResultContract,
     pub artifact: PreparedWriteArtifact,
-    pub diagnostic_context: PreparedWriteDiagnosticContext,
+    pub diagnostic_context: WriteDiagnosticContext,
     pub public_surface_registry_effect: PreparedPublicSurfaceRegistryEffect,
 }
 
 #[allow(dead_code)]
-impl PreparedWriteStep {
-    pub fn public_read(&self) -> Option<&PreparedPublicReadArtifact> {
+impl PreparedWriteStatement {
+    pub fn public_read(&self) -> Option<&PreparedPublicRead> {
         match &self.artifact {
             PreparedWriteArtifact::PublicRead(read) => Some(read),
-            PreparedWriteArtifact::PublicWrite(_) | PreparedWriteArtifact::Internal(_) => None,
+            PreparedWriteArtifact::PublicWrite(_) | PreparedWriteArtifact::Direct(_) => None,
         }
     }
 
-    pub fn public_write(&self) -> Option<&PreparedPublicWriteArtifact> {
+    pub fn public_write(&self) -> Option<&PreparedPublicWrite> {
         match &self.artifact {
             PreparedWriteArtifact::PublicWrite(write) => Some(write),
-            PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::Internal(_) => None,
+            PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::Direct(_) => None,
         }
     }
 
-    pub fn internal_write(&self) -> Option<&PreparedInternalWriteArtifact> {
+    pub fn direct_write(&self) -> Option<&PreparedDirectWriteArtifact> {
         match &self.artifact {
-            PreparedWriteArtifact::Internal(internal) => Some(internal),
+            PreparedWriteArtifact::Direct(direct) => Some(direct),
             PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::PublicWrite(_) => None,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedWriteProgram {
-    pub steps: Vec<PreparedWriteStep>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1046,16 +1038,16 @@ pub enum PublicReadResultColumns {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PreparedPublicReadContract {
     pub committed_mode: CommittedReadMode,
-    pub pending_view_query: Option<PendingViewReadQuery>,
+    pub pending_overlay_query: Option<PendingOverlayQuery>,
     pub result_columns: Option<PublicReadResultColumns>,
 }
 
 impl PreparedPublicReadContract {
-    pub fn execution_mode(&self) -> PublicReadExecutionMode {
-        if self.pending_view_query.is_some() {
-            PublicReadExecutionMode::PendingView
+    pub fn source(&self) -> PublicReadSource {
+        if self.pending_overlay_query.is_some() {
+            PublicReadSource::PendingOverlay
         } else {
-            PublicReadExecutionMode::Committed(self.committed_mode)
+            PublicReadSource::Committed(self.committed_mode)
         }
     }
 }
@@ -1494,7 +1486,7 @@ pub enum ResultContract {
     Select,
     DmlNoReturning,
     DmlReturning,
-    Other,
+    Nothing,
 }
 
 pub fn result_contract_for_statements(statements: &[Statement]) -> ResultContract {
@@ -1521,7 +1513,7 @@ pub fn result_contract_for_statements(statements: &[Statement]) -> ResultContrac
                 ResultContract::DmlNoReturning
             }
         }
-        Some(_) | None => ResultContract::Other,
+        Some(_) | None => ResultContract::Nothing,
     }
 }
 
@@ -2171,13 +2163,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        FileHistoryRequest, PreparedBatch, PreparedDerivedRowsetReadArtifact,
-        PreparedDirectHistoryReadArtifact, PreparedDirectPublicRead, PreparedExplainMode,
-        PreparedFileHistoryDirectReadPlan, PreparedInternalReadArtifact,
-        PreparedPublicReadArtifact, PreparedPublicReadContract,
-        PreparedPublicReadExecutionArtifact, PreparedReadArtifact, PreparedReadProgram,
-        PreparedReadStep, PreparedStatement, ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext,
-        ReadTimeProjectionRead, ReadTimeProjectionReadQuery, ResultContract,
+        FileHistoryRequest, PreparedBatch, PreparedDirectReadArtifact, PreparedExplainMode,
+        PreparedFileHistoryReadPlan, PreparedHistoryReadArtifact, PreparedHistoryReadPlan,
+        PreparedPublicRead, PreparedPublicReadContract, PreparedPublicReadPlanArtifact,
+        PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
+        PreparedReadTimeProjectionArtifact, PreparedStatement, ProjectionQuery,
+        ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext, ReadTimeProjectionPlan,
+        ResultContract,
     };
     use crate::catalog::SurfaceReadFreshness;
     use crate::Value;
@@ -2196,19 +2188,19 @@ mod tests {
 
     #[test]
     fn read_time_projection_read_keeps_query_shape_runtime_neutral() {
-        let artifact = ReadTimeProjectionRead {
+        let artifact = ReadTimeProjectionPlan {
             surface_name: "lix_version".into(),
             requested_version_id: None,
-            query: ReadTimeProjectionReadQuery {
-                projections: vec![super::PendingViewProjection::Column {
+            query: ProjectionQuery {
+                projections: vec![super::PendingOverlayProjection::Column {
                     source_column: "id".into(),
                     output_column: "id".into(),
                 }],
-                filters: vec![super::PendingViewFilter::Equals(
+                filters: vec![super::PendingOverlayFilter::Equals(
                     "hidden".into(),
                     Value::Boolean(false),
                 )],
-                order_by: vec![super::PendingViewOrderClause {
+                order_by: vec![super::PendingOverlayOrderClause {
                     column: "name".into(),
                     descending: false,
                 }],
@@ -2225,22 +2217,22 @@ mod tests {
 
     #[test]
     fn prepared_public_read_artifact_stays_on_contract_dtos() {
-        let artifact = PreparedPublicReadArtifact {
+        let artifact = PreparedPublicRead {
             contract: PreparedPublicReadContract {
                 committed_mode: super::CommittedReadMode::CommittedOnly,
-                pending_view_query: None,
+                pending_overlay_query: None,
                 result_columns: None,
             },
             freshness_contract: SurfaceReadFreshness::AllowsStaleProjection,
             surface_bindings: vec!["lix_version".into()],
             public_output_columns: None,
-            execution: PreparedPublicReadExecutionArtifact::DerivedRowset(
-                PreparedDerivedRowsetReadArtifact {
-                    read: ReadTimeProjectionRead {
+            execution: PreparedPublicReadPlanArtifact::ReadTimeProjection(
+                PreparedReadTimeProjectionArtifact {
+                    read: ReadTimeProjectionPlan {
                         surface_name: "lix_version".into(),
                         requested_version_id: None,
-                        query: ReadTimeProjectionReadQuery {
-                            projections: vec![super::PendingViewProjection::Column {
+                        query: ProjectionQuery {
+                            projections: vec![super::PendingOverlayProjection::Column {
                                 source_column: "id".into(),
                                 output_column: "id".into(),
                             }],
@@ -2254,20 +2246,20 @@ mod tests {
         };
 
         match artifact.execution {
-            PreparedPublicReadExecutionArtifact::DerivedRowset(artifact) => {
+            PreparedPublicReadPlanArtifact::ReadTimeProjection(artifact) => {
                 assert_eq!(artifact.read.surface_name, "lix_version");
             }
             _ => panic!("expected read-time projection execution artifact"),
         }
         assert_eq!(
-            artifact.contract.execution_mode(),
-            super::PublicReadExecutionMode::Committed(super::CommittedReadMode::CommittedOnly)
+            artifact.contract.source(),
+            super::PublicReadSource::Committed(super::CommittedReadMode::CommittedOnly)
         );
     }
 
     #[test]
-    fn prepared_internal_read_artifact_keeps_lowered_statements_runtime_neutral() {
-        let artifact = PreparedInternalReadArtifact {
+    fn prepared_direct_read_artifact_keeps_lowered_statements_runtime_neutral() {
+        let artifact = PreparedDirectReadArtifact {
             prepared_batch: PreparedBatch {
                 steps: vec![PreparedStatement {
                     sql: "SELECT 1".into(),
@@ -2310,34 +2302,32 @@ mod tests {
     }
 
     #[test]
-    fn prepared_read_program_wraps_public_or_internal_artifacts_with_diagnostics() {
-        let public_step = PreparedReadStep {
-            transaction_mode: crate::TransactionMode::Deferred,
-            artifact: PreparedReadArtifact::Public(PreparedPublicReadArtifact {
+    fn prepared_read_batch_wraps_public_or_direct_artifacts_with_diagnostics() {
+        let public_statement = PreparedReadStatement {
+            transaction_mode: crate::TransactionBeginMode::Deferred,
+            artifact: PreparedReadArtifact::Public(PreparedPublicRead {
                 contract: PreparedPublicReadContract {
                     committed_mode: super::CommittedReadMode::MaterializedState,
-                    pending_view_query: None,
+                    pending_overlay_query: None,
                     result_columns: None,
                 },
                 freshness_contract: SurfaceReadFreshness::RequiresFreshProjection,
                 surface_bindings: vec!["lix_file".into()],
                 public_output_columns: None,
-                execution: PreparedPublicReadExecutionArtifact::DirectHistory(
-                    PreparedDirectHistoryReadArtifact {
-                        plan: PreparedDirectPublicRead::FileHistory(
-                            PreparedFileHistoryDirectReadPlan {
-                                request: FileHistoryRequest::default(),
-                                predicates: Vec::new(),
-                                projections: Vec::new(),
-                                wildcard_projection: true,
-                                wildcard_columns: vec!["id".into()],
-                                sort_keys: Vec::new(),
-                                limit: None,
-                                offset: 0,
-                                aggregate: None,
-                                aggregate_output_name: None,
-                            },
-                        ),
+                execution: PreparedPublicReadPlanArtifact::HistoryRead(
+                    PreparedHistoryReadArtifact {
+                        plan: PreparedHistoryReadPlan::FileHistory(PreparedFileHistoryReadPlan {
+                            request: FileHistoryRequest::default(),
+                            predicates: Vec::new(),
+                            projections: Vec::new(),
+                            wildcard_projection: true,
+                            wildcard_columns: vec!["id".into()],
+                            sort_keys: Vec::new(),
+                            limit: None,
+                            offset: 0,
+                            aggregate: None,
+                            aggregate_output_name: None,
+                        }),
                     },
                 ),
             }),
@@ -2354,9 +2344,9 @@ mod tests {
                 analyzed_explain_template: None,
             },
         };
-        let internal_step = PreparedReadStep {
-            transaction_mode: crate::TransactionMode::Read,
-            artifact: PreparedReadArtifact::Internal(PreparedInternalReadArtifact {
+        let direct_statement = PreparedReadStatement {
+            transaction_mode: crate::TransactionBeginMode::Read,
+            artifact: PreparedReadArtifact::Direct(PreparedDirectReadArtifact {
                 prepared_batch: PreparedBatch {
                     steps: vec![PreparedStatement {
                         sql: "SELECT 1".into(),
@@ -2374,31 +2364,32 @@ mod tests {
                 analyzed_explain_template: None,
             },
         };
-        let program = PreparedReadProgram {
-            transaction_mode: crate::TransactionMode::Deferred,
-            steps: vec![public_step, internal_step],
+        let batch = PreparedReadBatch {
+            transaction_mode: crate::TransactionBeginMode::Deferred,
+            statements: vec![public_statement, direct_statement],
         };
 
-        assert_eq!(program.steps.len(), 2);
-        assert_eq!(program.transaction_mode, crate::TransactionMode::Deferred);
-        match &program.steps[0].artifact {
+        assert_eq!(batch.statements.len(), 2);
+        assert_eq!(
+            batch.transaction_mode,
+            crate::TransactionBeginMode::Deferred
+        );
+        match &batch.statements[0].artifact {
             PreparedReadArtifact::Public(public) => match &public.execution {
-                PreparedPublicReadExecutionArtifact::DirectHistory(
-                    PreparedDirectHistoryReadArtifact {
-                        plan: PreparedDirectPublicRead::FileHistory(_),
-                    },
-                ) => {
+                PreparedPublicReadPlanArtifact::HistoryRead(PreparedHistoryReadArtifact {
+                    plan: PreparedHistoryReadPlan::FileHistory(_),
+                }) => {
                     assert_eq!(public.surface_bindings, vec!["lix_file".to_string()]);
                 }
-                _ => panic!("expected direct public read artifact"),
+                _ => panic!("expected history read artifact"),
             },
             _ => panic!("expected public read step"),
         }
-        match &program.steps[1].artifact {
-            PreparedReadArtifact::Internal(internal) => {
-                assert_eq!(internal.prepared_batch.steps[0].sql, "SELECT 1");
+        match &batch.statements[1].artifact {
+            PreparedReadArtifact::Direct(direct) => {
+                assert_eq!(direct.prepared_batch.steps[0].sql, "SELECT 1");
             }
-            _ => panic!("expected internal read step"),
+            _ => panic!("expected direct read step"),
         }
     }
 }

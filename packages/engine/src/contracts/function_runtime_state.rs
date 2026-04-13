@@ -3,12 +3,12 @@ use super::{
 };
 
 #[derive(Clone)]
-pub(crate) struct ExecutionRuntimeState {
+pub(crate) struct FunctionRuntimeState {
     deterministic_enabled: bool,
     functions: DynFunctionProvider,
 }
 
-impl ExecutionRuntimeState {
+impl FunctionRuntimeState {
     pub(crate) fn from_prepared_parts<P>(
         deterministic_enabled: bool,
         functions: &SharedFunctionProvider<P>,

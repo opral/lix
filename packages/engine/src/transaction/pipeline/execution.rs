@@ -2,41 +2,41 @@ use std::time::Duration;
 
 use sqlparser::ast::Statement;
 
-use crate::contracts::PendingView;
 use crate::contracts::{
-    PendingPublicCommitSession, PreparedPublicWriteExecutionPartition, PreparedWriteStep,
+    render_analyzed_explain_result, render_plain_explain_result, PendingCommitState,
+    PendingOverlayView, PreparedPublicWriteExecutionPartition, PreparedWriteStatement,
     SessionStateDelta,
 };
 use crate::execution::step::{
-    command_metadata, complete_sql_command_execution,
-    execute_prepared_write_execution_step_with_transaction, PreparedWriteExecutionStep,
-    PreparedWriteExecutionStepResult,
+    command_metadata, complete_sql_command_execution, empty_public_write_execution_outcome,
+    execute_direct_execution_with_transaction,
 };
-use crate::session::collaborators::WriteExecutionCollaborators;
-use crate::session::execution_context::ExecutionContext;
+use crate::session::execution_state::SessionExecutionState;
+use crate::session::host::WriteExecutionServices;
 #[cfg(test)]
 use crate::sql::parse_sql_with_timing;
 #[cfg(test)]
 use crate::sql::PlaceholderState;
-use crate::sql::{BoundStatementTemplateInstance, ExecutionProgram};
+use crate::sql::{BoundStatementInstance, StatementBatch};
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
 use crate::transaction::pipeline::{
-    bootstrap_prepared_write_preparation_context, ensure_execution_runtime_state_for_write_scope,
-    prepare_buffered_write_execution_step, PreparedWriteContextStamp,
-    PreparedWriteExecutionBoundary,
+    bootstrap_prepared_write_preparation_context, ensure_function_runtime_state_for_write_scope,
+    prepare_buffered_write_execution_step,
 };
 use crate::transaction::{
-    BorrowedBufferedWriteTransaction, BufferedWriteCommandMetadata, BufferedWriteExecutionRoute,
-    BufferedWriteSessionEffects, BufferedWriteTransaction, DeferredTransactionSideEffects,
-    PendingWriteView, TransactionWriteDelta, WriteExecutionBindings,
+    apply_schema_registrations_in_transaction,
+    normalize_sql_error_with_transaction_and_relation_names, BorrowedBufferedWriteTransaction,
+    BufferedWriteCommandMetadata, BufferedWriteFlushClass, BufferedWriteSessionEffects,
+    BufferedWriteTransaction, DeferredCommitEffects, PendingWriteOverlayView,
+    TransactionWriteDelta, WriteCommand, WriteExecutionHost, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PreparedWriteContextInvalidation {
     None,
-    RegenerateFromPendingView,
+    RegenerateFromPendingOverlay,
     RegenerateFromCommittedState,
 }
 
@@ -47,108 +47,108 @@ impl PreparedWriteContextInvalidation {
 }
 
 pub(crate) async fn execute_parsed_statements_in_write_transaction(
-    collaborators: &dyn WriteExecutionCollaborators,
+    services: &dyn WriteExecutionServices,
     write_transaction: &mut BufferedWriteTransaction<'_>,
     parsed_statements: Vec<Statement>,
     params: &[Value],
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
+    allow_internal_relations: bool,
+    context: &mut SessionExecutionState,
     parse_duration: Option<Duration>,
 ) -> Result<ExecuteResult, LixError> {
     let dialect = write_transaction.backend_transaction_mut()?.dialect();
     let runtime_bindings = context.runtime_binding_values()?;
-    let program = ExecutionProgram::compile(
+    let statement_batch = StatementBatch::compile(
         parsed_statements,
         params,
         dialect,
         &runtime_bindings,
         parse_duration,
     )?;
-    ensure_execution_runtime_state_for_write_scope(
-        collaborators,
+    ensure_function_runtime_state_for_write_scope(
+        services,
         write_transaction.backend_transaction_mut()?,
         context,
     )
     .await?;
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
-    execute_execution_program_with_buffered_write_scope(
-        collaborators,
+    execute_statement_batch_with_buffered_write_scope(
+        services,
         &mut scope,
-        &program,
-        allow_internal_tables,
+        &statement_batch,
+        allow_internal_relations,
         context,
     )
     .await
 }
 
 pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
-    collaborators: &dyn WriteExecutionCollaborators,
+    services: &dyn WriteExecutionServices,
     write_transaction: &mut BorrowedBufferedWriteTransaction<'_>,
     parsed_statements: Vec<Statement>,
     params: &[Value],
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
+    allow_internal_relations: bool,
+    context: &mut SessionExecutionState,
     parse_duration: Option<Duration>,
 ) -> Result<ExecuteResult, LixError> {
     let dialect = write_transaction.backend_transaction_mut().dialect();
     let runtime_bindings = context.runtime_binding_values()?;
-    let program = ExecutionProgram::compile(
+    let statement_batch = StatementBatch::compile(
         parsed_statements,
         params,
         dialect,
         &runtime_bindings,
         parse_duration,
     )?;
-    ensure_execution_runtime_state_for_write_scope(
-        collaborators,
+    ensure_function_runtime_state_for_write_scope(
+        services,
         write_transaction.backend_transaction_mut(),
         context,
     )
     .await?;
     let mut scope = SqlBufferedWriteScope::Borrowed(write_transaction);
-    execute_execution_program_with_buffered_write_scope(
-        collaborators,
+    execute_statement_batch_with_buffered_write_scope(
+        services,
         &mut scope,
-        &program,
-        allow_internal_tables,
+        &statement_batch,
+        allow_internal_relations,
         context,
     )
     .await
 }
 
-pub(crate) async fn execute_execution_program_with_write_transaction(
-    collaborators: &dyn WriteExecutionCollaborators,
+pub(crate) async fn execute_statement_batch_with_write_transaction(
+    services: &dyn WriteExecutionServices,
     write_transaction: &mut BufferedWriteTransaction<'_>,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
+    statement_batch: &StatementBatch,
+    allow_internal_relations: bool,
+    context: &mut SessionExecutionState,
 ) -> Result<ExecuteResult, LixError> {
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
-    execute_execution_program_with_buffered_write_scope(
-        collaborators,
+    execute_statement_batch_with_buffered_write_scope(
+        services,
         &mut scope,
-        program,
-        allow_internal_tables,
+        statement_batch,
+        allow_internal_relations,
         context,
     )
     .await
 }
 
-async fn execute_execution_program_with_buffered_write_scope(
-    collaborators: &dyn WriteExecutionCollaborators,
+async fn execute_statement_batch_with_buffered_write_scope(
+    services: &dyn WriteExecutionServices,
     write_transaction: &mut SqlBufferedWriteScope<'_, '_>,
-    program: &ExecutionProgram,
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
+    statement_batch: &StatementBatch,
+    allow_internal_relations: bool,
+    context: &mut SessionExecutionState,
 ) -> Result<ExecuteResult, LixError> {
     let mut results = Vec::new();
 
-    for step in program.steps() {
-        let result = execute_bound_statement_template_instance_in_buffered_write_scope(
-            collaborators,
+    for step in statement_batch.steps() {
+        let result = execute_bound_statement_in_buffered_write_scope(
+            services,
             write_transaction,
             step,
-            allow_internal_tables,
+            allow_internal_relations,
             context,
             None,
             false,
@@ -158,7 +158,7 @@ async fn execute_execution_program_with_buffered_write_scope(
     }
 
     if crate::sql::should_invalidate_installed_plugins_cache_for_statements(
-        program.source_statements(),
+        statement_batch.source_statements(),
     ) {
         write_transaction.mark_installed_plugins_cache_invalidation_pending();
     }
@@ -168,22 +168,23 @@ async fn execute_execution_program_with_buffered_write_scope(
     })
 }
 
-async fn execute_bound_statement_template_instance_in_buffered_write_scope(
-    collaborators: &dyn WriteExecutionCollaborators,
+async fn execute_bound_statement_in_buffered_write_scope(
+    services: &dyn WriteExecutionServices,
     write_transaction: &mut SqlBufferedWriteScope<'_, '_>,
-    bound_statement_template: &BoundStatementTemplateInstance,
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
-    deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
+    bound_statement: &BoundStatementInstance,
+    allow_internal_relations: bool,
+    context: &mut SessionExecutionState,
+    deferred_commit_effects: Option<&mut DeferredCommitEffects>,
     skip_side_effect_collection: bool,
 ) -> Result<QueryResult, LixError> {
     loop {
-        let pending_write_view = write_transaction.buffered_write_pending_write_view()?;
+        let pending_write_overlay_view =
+            write_transaction.buffered_write_pending_write_overlay_view()?;
         let prepared_context = {
             let transaction = write_transaction.backend_transaction_mut()?;
             bootstrap_prepared_write_preparation_context(
                 transaction,
-                pending_write_view.as_ref(),
+                pending_write_overlay_view.as_ref(),
                 context,
             )
             .await?
@@ -191,34 +192,28 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
         let command = {
             let transaction = write_transaction.backend_transaction_mut()?;
             prepare_buffered_write_execution_step(
-                collaborators,
+                services,
                 transaction,
-                pending_write_view.as_ref(),
-                bound_statement_template,
+                pending_write_overlay_view.as_ref(),
+                bound_statement,
                 &prepared_context,
-                allow_internal_tables,
+                allow_internal_relations,
                 context,
                 skip_side_effect_collection,
             )
             .await
         };
-        let command: PreparedWriteExecutionBoundary = match command {
+        let command: WriteCommand = match command {
             Ok(command) => command,
             Err(error) if !write_transaction.buffered_write_journal_is_empty() => {
                 write_transaction
-                    .flush_buffered_write_journal(collaborators, context)
+                    .flush_buffered_write_journal(services, context)
                     .await?;
                 let _ = error;
                 continue;
             }
             Err(error) => return Err(error),
         };
-        debug_assert_eq!(
-            command.prepared_context_stamp(),
-            PreparedWriteContextStamp::capture(context),
-            "prepared write boundary should carry the current prepared-context stamp",
-        );
-        let command = command.into_execution_step()?;
 
         let metadata = command_metadata(&command)?;
         if let Some(statement_delta) = metadata.transaction_write_delta.clone() {
@@ -226,7 +221,7 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
                 write_transaction.can_stage_transaction_write_delta(&statement_delta)?;
             if !write_transaction.buffered_write_journal_is_empty() && !continuation_safe {
                 write_transaction
-                    .flush_buffered_write_journal(collaborators, context)
+                    .flush_buffered_write_journal(services, context)
                     .await?;
                 continue;
             }
@@ -238,11 +233,12 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
             let invalidation = prepared_write_context_invalidation_for_metadata(&metadata);
             if !invalidation.is_none() {
                 write_transaction.mark_public_surface_registry_refresh_pending();
-                let pending_write_view = write_transaction.buffered_write_pending_write_view()?;
+                let pending_write_overlay_view =
+                    write_transaction.buffered_write_pending_write_overlay_view()?;
                 let transaction = write_transaction.backend_transaction_mut()?;
                 apply_prepared_write_context_invalidation(
                     transaction,
-                    pending_write_view.as_ref(),
+                    pending_write_overlay_view.as_ref(),
                     context,
                     invalidation,
                 )
@@ -256,39 +252,38 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
 
         if should_flush_before_command(&metadata, write_transaction) {
             write_transaction
-                .flush_buffered_write_journal(collaborators, context)
+                .flush_buffered_write_journal(services, context)
                 .await?;
             continue;
         }
 
-        let mut pending_public_commit_session =
-            write_transaction.take_pending_public_commit_session();
-        let step_result = {
+        let mut pending_commit_state = write_transaction.take_pending_commit_state();
+        let write_result = {
             let transaction = write_transaction.backend_transaction_mut()?;
-            execute_prepared_write_execution_step_with_transaction(
-                collaborators,
+            execute_write_command_with_transaction(
+                services,
                 transaction,
                 &command,
-                pending_write_view.as_ref(),
-                Some(&mut pending_public_commit_session),
+                pending_write_overlay_view.as_ref(),
+                Some(&mut pending_commit_state),
             )
             .await?
         };
-        write_transaction.restore_pending_public_commit_session(pending_public_commit_session);
+        write_transaction.restore_pending_commit_state(pending_commit_state);
 
-        match step_result {
-            PreparedWriteExecutionStepResult::Immediate(public_result) => return Ok(public_result),
-            PreparedWriteExecutionStepResult::Outcome(execution) => {
+        match write_result {
+            WriteResult::Immediate(public_result) => return Ok(public_result),
+            WriteResult::Outcome(write_outcome) => {
                 let execution_input = context.buffered_write_execution_input();
-                let execution = {
+                let buffered_write_outcome = {
                     let transaction = write_transaction.backend_transaction_mut()?;
                     complete_sql_command_execution(
-                        collaborators,
+                        services,
                         transaction,
                         &command,
-                        execution,
+                        write_outcome,
                         &execution_input,
-                        deferred_side_effects,
+                        deferred_commit_effects,
                         skip_side_effect_collection,
                     )
                     .await?
@@ -296,7 +291,7 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
                 {
                     let invalidation = apply_completed_sql_command_session_effects(
                         context,
-                        &execution.session_effects,
+                        &buffered_write_outcome.session_effects,
                     );
                     if !invalidation.is_none() {
                         let transaction = write_transaction.backend_transaction_mut()?;
@@ -310,21 +305,159 @@ async fn execute_bound_statement_template_instance_in_buffered_write_scope(
                     }
                 }
 
-                if execution.clear_pending_public_commit_session {
-                    write_transaction.clear_pending_public_commit_session();
+                if buffered_write_outcome.clear_pending_commit_state {
+                    write_transaction.clear_pending_commit_state();
                 }
                 write_transaction
                     .buffered_write_commit_outcome_mut()
-                    .merge(execution.commit_outcome);
-                return Ok(execution.public_result);
+                    .merge(buffered_write_outcome.commit_outcome);
+                return Ok(buffered_write_outcome.public_result);
             }
         }
     }
 }
 
+async fn execute_write_command_with_transaction(
+    host: &dyn WriteExecutionHost,
+    transaction: &mut dyn LixBackendTransaction,
+    command: &WriteCommand,
+    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    pending_commit_state: Option<&mut Option<PendingCommitState>>,
+) -> Result<WriteResult, LixError> {
+    match command.path() {
+        WritePath::ExplainOnly => execute_explain_write_command(command),
+        WritePath::PendingRead(public_read) | WritePath::CommittedRead(public_read) => {
+            execute_read_query_write_command(
+                host,
+                transaction,
+                command,
+                pending_write_overlay_view,
+                public_read,
+            )
+            .await
+        }
+        WritePath::BufferedDelta(delta) => {
+            let write_outcome = delta
+                .execute(host, transaction, pending_commit_state)
+                .await?;
+            Ok(WriteResult::Outcome(write_outcome))
+        }
+        WritePath::NoopWrite => Ok(WriteResult::Outcome(empty_public_write_execution_outcome())),
+        WritePath::DirectWrite(direct) => {
+            execute_direct_write_command(transaction, command, direct).await
+        }
+    }
+}
+
+fn execute_explain_write_command(command: &WriteCommand) -> Result<WriteResult, LixError> {
+    let template = command
+        .diagnostic_context()
+        .plain_explain_template
+        .as_ref()
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "plain explain path expected a non-analyze explain template",
+            )
+        })?;
+    Ok(WriteResult::Immediate(render_plain_explain_result(
+        template,
+    )?))
+}
+
+async fn execute_read_query_write_command(
+    host: &dyn WriteExecutionHost,
+    transaction: &mut dyn LixBackendTransaction,
+    command: &WriteCommand,
+    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    public_read: &crate::contracts::PreparedPublicRead,
+) -> Result<WriteResult, LixError> {
+    let execution_started = std::time::Instant::now();
+    let public_result = match host
+        .execute_prepared_public_read_with_pending_overlay_view(
+            transaction,
+            pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
+            public_read,
+        )
+        .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let normalized = normalize_sql_error_with_transaction_and_relation_names(
+                transaction,
+                error,
+                command.diagnostic_context().relation_names(),
+            )
+            .await;
+            return Err(normalized);
+        }
+    };
+    if let Some(template) = command
+        .diagnostic_context()
+        .analyzed_explain_template
+        .as_ref()
+    {
+        return Ok(WriteResult::Immediate(render_analyzed_explain_result(
+            template,
+            &public_result,
+            execution_started.elapsed(),
+        )?));
+    }
+    Ok(WriteResult::Immediate(public_result))
+}
+
+async fn execute_direct_write_command(
+    transaction: &mut dyn LixBackendTransaction,
+    command: &WriteCommand,
+    direct: &crate::contracts::PreparedDirectWriteArtifact,
+) -> Result<WriteResult, LixError> {
+    apply_schema_registrations_in_transaction(transaction, command.schema_registrations()).await?;
+    let execution_started = std::time::Instant::now();
+    match execute_direct_execution_with_transaction(
+        transaction,
+        direct,
+        command.prepared().result_contract,
+        command.runtime_state().functions(),
+        direct.writer_key.as_deref(),
+    )
+    .await
+    .map_err(LixError::from)
+    {
+        Ok(write_outcome) => {
+            if let Some(template) = command
+                .diagnostic_context()
+                .analyzed_explain_template
+                .as_ref()
+            {
+                return Ok(WriteResult::Immediate(render_analyzed_explain_result(
+                    template,
+                    &write_outcome.public_result,
+                    execution_started.elapsed(),
+                )?));
+            }
+            Ok(WriteResult::Outcome(write_outcome))
+        }
+        Err(error) => {
+            let normalized = normalize_sql_error_with_transaction_and_relation_names(
+                transaction,
+                error,
+                command.diagnostic_context().relation_names(),
+            )
+            .await;
+            Err(LixError {
+                code: normalized.code,
+                description: format!(
+                    "transaction direct execution failed: {}",
+                    normalized.description
+                ),
+            })
+        }
+    }
+}
+
 fn apply_buffered_write_planning_effects(
-    step: &PreparedWriteExecutionStep,
-    context: &mut ExecutionContext,
+    step: &WriteCommand,
+    context: &mut SessionExecutionState,
 ) -> Result<(), LixError> {
     context.apply_session_state_delta(&planning_session_delta(step.prepared()));
     Ok(())
@@ -334,7 +467,7 @@ fn prepared_write_context_invalidation_for_metadata(
     metadata: &BufferedWriteCommandMetadata,
 ) -> PreparedWriteContextInvalidation {
     if metadata.registry_mutated_during_planning {
-        PreparedWriteContextInvalidation::RegenerateFromPendingView
+        PreparedWriteContextInvalidation::RegenerateFromPendingOverlay
     } else {
         PreparedWriteContextInvalidation::None
     }
@@ -352,26 +485,26 @@ fn prepared_write_context_invalidation_for_session_effects(
 
 async fn apply_prepared_write_context_invalidation(
     transaction: &mut dyn LixBackendTransaction,
-    pending_write_view: Option<&PendingWriteView>,
-    context: &mut ExecutionContext,
+    pending_write_overlay_view: Option<&PendingWriteOverlayView>,
+    context: &mut SessionExecutionState,
     invalidation: PreparedWriteContextInvalidation,
-) -> Result<Option<PreparedWriteContextStamp>, LixError> {
+) -> Result<(), LixError> {
     let registry = match invalidation {
-        PreparedWriteContextInvalidation::None => return Ok(None),
-        PreparedWriteContextInvalidation::RegenerateFromPendingView => {
-            let runtime_state = context.execution_runtime_state().expect(
+        PreparedWriteContextInvalidation::None => return Ok(()),
+        PreparedWriteContextInvalidation::RegenerateFromPendingOverlay => {
+            let runtime_state = context.function_runtime_state().expect(
                 "prepared write context invalidation requires an initialized execution runtime state",
             );
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::session::pending_reads::build_surface_registry(
                 &backend,
-                pending_write_view.map(|view| view as &dyn PendingView),
+                pending_write_overlay_view.map(|view| view as &dyn PendingOverlayView),
                 runtime_state.provider(),
             )
             .await?
         }
         PreparedWriteContextInvalidation::RegenerateFromCommittedState => {
-            let runtime_state = context.execution_runtime_state().expect(
+            let runtime_state = context.function_runtime_state().expect(
                 "prepared write context invalidation requires an initialized execution runtime state",
             );
             let backend = crate::backend::transaction_backend_view(transaction);
@@ -384,18 +517,18 @@ async fn apply_prepared_write_context_invalidation(
         }
     };
     context.install_public_surface_registry(registry);
-    Ok(Some(PreparedWriteContextStamp::capture(context)))
+    Ok(())
 }
 
 fn apply_completed_sql_command_session_effects(
-    context: &mut ExecutionContext,
+    context: &mut SessionExecutionState,
     effects: &BufferedWriteSessionEffects,
 ) -> PreparedWriteContextInvalidation {
     context.apply_session_state_delta(&effects.session_delta);
     prepared_write_context_invalidation_for_session_effects(effects)
 }
 
-fn planning_session_delta(prepared: &PreparedWriteStep) -> SessionStateDelta {
+fn planning_session_delta(prepared: &PreparedWriteStatement) -> SessionStateDelta {
     if let Some(public_write) = prepared.public_write() {
         return public_write
             .materialization()
@@ -419,8 +552,8 @@ fn planning_session_delta(prepared: &PreparedWriteStep) -> SessionStateDelta {
     }
 
     prepared
-        .internal_write()
-        .map(|internal| internal.effects.session_delta.clone())
+        .direct_write()
+        .map(|direct| direct.effects.session_delta.clone())
         .unwrap_or_default()
 }
 
@@ -429,9 +562,9 @@ fn bind_single_statement_template(
     transaction: &mut dyn LixBackendTransaction,
     sql: &str,
     params: &[Value],
-    allow_internal_tables: bool,
-    context: &mut ExecutionContext,
-) -> Result<BoundStatementTemplateInstance, LixError> {
+    allow_internal_relations: bool,
+    context: &mut SessionExecutionState,
+) -> Result<BoundStatementInstance, LixError> {
     let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
     let parsed_statements = parsed.statements;
     if parsed_statements.len() != 1 {
@@ -447,7 +580,7 @@ fn bind_single_statement_template(
     let cache_key = StatementTemplateCacheKey::new(
         sql,
         dialect,
-        allow_internal_tables,
+        allow_internal_relations,
         context.public_surface_registry_generation(),
     );
     let template = match context.cached_statement_template(&cache_key) {
@@ -471,15 +604,15 @@ fn should_flush_before_command(
     metadata: &BufferedWriteCommandMetadata,
     write_transaction: &SqlBufferedWriteScope<'_, '_>,
 ) -> bool {
-    match metadata.route {
-        BufferedWriteExecutionRoute::Internal => {
+    match metadata.flush_class {
+        BufferedWriteFlushClass::DirectWrite => {
             !write_transaction.buffered_write_journal_is_empty()
                 && !metadata.has_materialization_plan
         }
-        BufferedWriteExecutionRoute::PublicReadCommitted => {
+        BufferedWriteFlushClass::CommittedRead => {
             !write_transaction.buffered_write_journal_is_empty()
         }
-        BufferedWriteExecutionRoute::Other => false,
+        BufferedWriteFlushClass::NoPreFlush => false,
     }
 }
 
@@ -505,11 +638,15 @@ impl SqlBufferedWriteScope<'_, '_> {
         }
     }
 
-    fn buffered_write_pending_write_view(&self) -> Result<Option<PendingWriteView>, LixError> {
+    fn buffered_write_pending_write_overlay_view(
+        &self,
+    ) -> Result<Option<PendingWriteOverlayView>, LixError> {
         match self {
-            Self::Owned(write_transaction) => write_transaction.buffered_write_pending_write_view(),
+            Self::Owned(write_transaction) => {
+                write_transaction.buffered_write_pending_write_overlay_view()
+            }
             Self::Borrowed(write_transaction) => {
-                write_transaction.buffered_write_pending_write_view()
+                write_transaction.buffered_write_pending_write_overlay_view()
             }
         }
     }
@@ -542,38 +679,31 @@ impl SqlBufferedWriteScope<'_, '_> {
         }
     }
 
-    fn clear_pending_public_commit_session(&mut self) {
+    fn clear_pending_commit_state(&mut self) {
+        match self {
+            Self::Owned(write_transaction) => write_transaction.clear_pending_commit_state(),
+            Self::Borrowed(write_transaction) => write_transaction.clear_pending_commit_state(),
+        }
+    }
+
+    fn take_pending_commit_state(&mut self) -> Option<PendingCommitState> {
         match self {
             Self::Owned(write_transaction) => {
-                write_transaction.clear_pending_public_commit_session()
+                std::mem::take(write_transaction.pending_commit_state_mut())
             }
             Self::Borrowed(write_transaction) => {
-                write_transaction.clear_pending_public_commit_session()
+                std::mem::take(write_transaction.pending_commit_state_mut())
             }
         }
     }
 
-    fn take_pending_public_commit_session(&mut self) -> Option<PendingPublicCommitSession> {
+    fn restore_pending_commit_state(&mut self, session: Option<PendingCommitState>) {
         match self {
             Self::Owned(write_transaction) => {
-                std::mem::take(write_transaction.pending_public_commit_session_mut())
+                *write_transaction.pending_commit_state_mut() = session;
             }
             Self::Borrowed(write_transaction) => {
-                std::mem::take(write_transaction.pending_public_commit_session_mut())
-            }
-        }
-    }
-
-    fn restore_pending_public_commit_session(
-        &mut self,
-        session: Option<PendingPublicCommitSession>,
-    ) {
-        match self {
-            Self::Owned(write_transaction) => {
-                *write_transaction.pending_public_commit_session_mut() = session;
-            }
-            Self::Borrowed(write_transaction) => {
-                *write_transaction.pending_public_commit_session_mut() = session;
+                *write_transaction.pending_commit_state_mut() = session;
             }
         }
     }
@@ -602,19 +732,19 @@ impl SqlBufferedWriteScope<'_, '_> {
 
     async fn flush_buffered_write_journal(
         &mut self,
-        bindings: &dyn WriteExecutionBindings,
-        context: &mut ExecutionContext,
+        host: &dyn WriteExecutionHost,
+        context: &mut SessionExecutionState,
     ) -> Result<(), LixError> {
         let mut execution_input = context.buffered_write_execution_input();
         match self {
             Self::Owned(write_transaction) => {
                 write_transaction
-                    .flush_buffered_write_journal(bindings, &mut execution_input)
+                    .flush_buffered_write_journal(host, &mut execution_input)
                     .await
             }
             Self::Borrowed(write_transaction) => {
                 write_transaction
-                    .flush_buffered_write_journal(bindings, &mut execution_input)
+                    .flush_buffered_write_journal(host, &mut execution_input)
                     .await
             }
         }?;
@@ -661,7 +791,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionMode,
+            _mode: crate::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -673,7 +803,8 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionMode::Write).await
+            self.begin_transaction(crate::TransactionBeginMode::Write)
+                .await
         }
     }
 
@@ -683,8 +814,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionMode {
-            crate::TransactionMode::Write
+        fn mode(&self) -> crate::TransactionBeginMode {
+            crate::TransactionBeginMode::Write
         }
 
         async fn execute(
@@ -716,7 +847,7 @@ mod tests {
 
     fn test_session(lix: &Arc<Lix>) -> Session {
         Session::new_for_test(
-            crate::session::collaborators::SessionCollaborators::new(lix.session_services()),
+            crate::session::runtime::SessionRuntime::new(lix.session_host()),
             "version-test".to_string(),
             Vec::new(),
         )
@@ -730,7 +861,7 @@ mod tests {
         let cache_key = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 0);
         let mut transaction = NoopTransaction;
 
-        let mut first_context = session.new_execution_context(ExecuteOptions::default());
+        let mut first_context = session.new_execution_state(ExecuteOptions::default());
         assert!(
             first_context
                 .cached_statement_template(&cache_key)
@@ -747,7 +878,7 @@ mod tests {
             "first bind should populate the session-owned statement template cache"
         );
 
-        let second_context = session.new_execution_context(ExecuteOptions::default());
+        let second_context = session.new_execution_state(ExecuteOptions::default());
         assert!(
             second_context
                 .cached_statement_template(&cache_key)
@@ -766,7 +897,7 @@ mod tests {
         let cache_key_v1 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 1);
         let mut transaction = NoopTransaction;
 
-        let mut initial_context = session_a.new_execution_context(ExecuteOptions::default());
+        let mut initial_context = session_a.new_execution_state(ExecuteOptions::default());
         bind_single_statement_template(&mut transaction, sql, &[], false, &mut initial_context)
             .expect("initial template bind should succeed");
         assert!(
@@ -778,7 +909,7 @@ mod tests {
         assert_eq!(session_a.snapshot().public_surface_registry_generation, 0);
         assert_eq!(session_b.snapshot().public_surface_registry_generation, 0);
 
-        let mut bumped_context = session_a.new_execution_context(ExecuteOptions::default());
+        let mut bumped_context = session_a.new_execution_state(ExecuteOptions::default());
         bumped_context.bump_public_surface_registry_generation();
         assert_eq!(session_a.snapshot().public_surface_registry_generation, 1);
         assert_eq!(
@@ -787,7 +918,7 @@ mod tests {
             "another session should not inherit the bumped registry generation"
         );
 
-        let mut session_a_after_bump = session_a.new_execution_context(ExecuteOptions::default());
+        let mut session_a_after_bump = session_a.new_execution_state(ExecuteOptions::default());
         assert!(
             session_a_after_bump
                 .cached_statement_template(&cache_key_v1)
@@ -809,7 +940,7 @@ mod tests {
             "binding after the bump should populate the new cache namespace"
         );
 
-        let session_b_context = session_b.new_execution_context(ExecuteOptions::default());
+        let session_b_context = session_b.new_execution_state(ExecuteOptions::default());
         assert!(
             session_b_context
                 .cached_statement_template(&cache_key_v0)

@@ -6,9 +6,7 @@ use crate::canonical::{
     CanonicalStateRow,
 };
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::{
-    ExecutionRuntimeState, StateCommitStreamChange, StateCommitStreamOperation,
-};
+use crate::contracts::{FunctionRuntimeState, StateCommitStreamChange, StateCommitStreamOperation};
 use crate::session::version_ops::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };
@@ -392,18 +390,17 @@ async fn append_undo_redo_commit_in_transaction(
 
 async fn checkpoint_runtime_state(
     tx: &mut SessionTransaction<'_>,
-) -> Result<ExecutionRuntimeState, LixError> {
-    if let Some(runtime_state) = tx.context.execution_runtime_state().cloned() {
+) -> Result<FunctionRuntimeState, LixError> {
+    if let Some(runtime_state) = tx.context.function_runtime_state().cloned() {
         return Ok(runtime_state);
     }
 
-    let collaborators = tx.collaborators();
+    let session_runtime = tx.session_runtime();
     let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
-    let runtime_state = collaborators
-        .prepare_execution_runtime_state(&backend)
+    let runtime_state = session_runtime
+        .prepare_function_runtime_state(&backend)
         .await?;
-    tx.context
-        .set_execution_runtime_state(runtime_state.clone());
+    tx.context.set_function_runtime_state(runtime_state.clone());
     Ok(runtime_state)
 }
 

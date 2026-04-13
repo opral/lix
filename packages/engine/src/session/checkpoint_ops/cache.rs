@@ -5,7 +5,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
 };
 use crate::common::escape_sql_string;
-use crate::contracts::{ChangeBatch, PreparedPublicWriteArtifact, PreparedWriteOperationKind};
+use crate::contracts::{ChangeBatch, PreparedPublicWrite, PreparedWriteOperationKind};
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 const HISTORY_INIT_STATEMENTS: &[&str] = &[
@@ -23,7 +23,7 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
 
 pub(crate) async fn apply_public_version_last_checkpoint_side_effects(
     transaction: &mut dyn LixBackendTransaction,
-    public_write: &PreparedPublicWriteArtifact,
+    public_write: &PreparedPublicWrite,
     batch: &ChangeBatch,
 ) -> Result<(), LixError> {
     let Some(semantics) =
@@ -73,7 +73,7 @@ pub(crate) async fn upsert_last_checkpoint_for_version_in_transaction(
 }
 
 fn version_checkpoint_rows_from_resolved_write(
-    public_write: &PreparedPublicWriteArtifact,
+    public_write: &PreparedPublicWrite,
     batch: &ChangeBatch,
 ) -> Vec<(String, String)> {
     if let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() {
@@ -129,7 +129,7 @@ fn version_checkpoint_rows_from_resolved_write(
 }
 
 fn version_ids_from_resolved_write(
-    public_write: &PreparedPublicWriteArtifact,
+    public_write: &PreparedPublicWrite,
     batch: &ChangeBatch,
 ) -> Vec<String> {
     if let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() {

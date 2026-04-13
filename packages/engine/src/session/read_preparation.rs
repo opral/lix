@@ -11,7 +11,7 @@ use sqlparser::ast::Statement;
 use crate::backend::QueryExecutor;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::SqlPreparationMetadataReader;
-use crate::contracts::{DynFunctionProvider, PendingView, PreparedPublicReadArtifact};
+use crate::contracts::{DynFunctionProvider, PendingOverlayView, PreparedPublicRead};
 use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
 use crate::session::version_ops::load_version_head_commit_map_with_executor;
 use crate::sql::{
@@ -27,12 +27,15 @@ pub(crate) struct PreparedPublicReadCollaborators {
 
 pub(crate) async fn bootstrap_prepared_public_read_collaborators(
     backend: &dyn LixBackend,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
     functions: &DynFunctionProvider,
 ) -> Result<PreparedPublicReadCollaborators, LixError> {
-    let registry =
-        crate::session::pending_reads::build_surface_registry(backend, pending_view, functions)
-            .await?;
+    let registry = crate::session::pending_reads::build_surface_registry(
+        backend,
+        pending_overlay_view,
+        functions,
+    )
+    .await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
     Ok(PreparedPublicReadCollaborators {
         registry,
@@ -47,7 +50,7 @@ pub(crate) async fn prepare_required_active_public_read_artifact_with_backend(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Result<PreparedPublicReadArtifact, LixError> {
+) -> Result<PreparedPublicRead, LixError> {
     let mut metadata_reader = backend;
     prepare_required_active_public_read_artifact_with_reader(
         &mut metadata_reader,
@@ -69,7 +72,7 @@ async fn prepare_required_active_public_read_artifact_with_reader(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Result<PreparedPublicReadArtifact, LixError> {
+) -> Result<PreparedPublicRead, LixError> {
     let active_history_root_commit_id = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;

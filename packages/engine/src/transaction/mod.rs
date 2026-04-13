@@ -15,25 +15,26 @@ mod observe_tick;
 pub(crate) mod overlay;
 pub(crate) mod pipeline;
 mod prepared_step;
+mod prepared_write;
 #[cfg(test)]
 mod read_context;
 mod unit;
+mod write_batch;
 
-pub(crate) use crate::backend::WriteProgram;
 pub(crate) use crate::contracts::TransactionCommitOutcome;
+pub(crate) use crate::execution::WriteBatch;
 pub(crate) use backend::{
-    execute_write_program_with_transaction, lookup_directory_id_by_path_in_transaction,
+    lookup_directory_id_by_path_in_transaction,
     normalize_sql_error_with_transaction_and_relation_names, TransactionExecutionBackend,
 };
 pub(crate) use buffered::{
-    apply_schema_registrations_in_transaction, build_transaction_write_delta,
-    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
-    BufferedWriteSessionEffects, PlannedInternalWriteUnit, PlannedPublicUntrackedWriteUnit,
-    TrackedTxnUnit, TransactionWriteDelta,
+    apply_schema_registrations_in_transaction, BufferedWriteCommandMetadata,
+    BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
+    PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit, TrackedTxnUnit, TransactionWriteDelta,
 };
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
-pub(crate) use contracts::{DeferredTransactionSideEffects, WriteExecutionBindings};
+pub(crate) use contracts::{DeferredCommitEffects, WriteExecutionHost};
 #[cfg(test)]
 pub(crate) use filesystem::runtime::FilesystemTransactionFileState;
 pub(crate) use filesystem::runtime::{
@@ -50,18 +51,20 @@ pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
 #[cfg(test)]
 pub(crate) use live_state_write_transaction::LiveStateWriteTransaction;
 pub(crate) use observe_tick::append_observe_tick_in_transaction;
-pub(crate) use overlay::PendingWriteView;
+pub(crate) use overlay::PendingWriteOverlayView;
 pub(crate) use pipeline::resolution::prepared_artifacts::SchemaProof;
 #[cfg(test)]
 pub(crate) use pipeline::resolution::resolve_write_plan_with_functions;
 pub(crate) use pipeline::{
-    ensure_execution_runtime_state_for_write_scope,
-    execute_execution_program_with_write_transaction,
+    ensure_function_runtime_state_for_write_scope,
     execute_parsed_statements_in_borrowed_write_transaction,
-    execute_parsed_statements_in_write_transaction, prepared_write_runtime_state_for_execution,
-    validate_commit_time_write, WriteResolveError, WriteSelectorResolver,
+    execute_parsed_statements_in_write_transaction, execute_statement_batch_with_write_transaction,
+    prepared_write_runtime_state_for_execution, validate_commit_time_write, WriteResolveError,
+    WriteSelectorResolver,
 };
-pub(crate) use prepared_step::{stage_prepared_write_step, PreparedWriteStepStager};
+pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
+pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};
 #[cfg(test)]
 pub(crate) use read_context::ReadContext;
 pub(crate) use unit::{BorrowedBufferedWriteTransaction, BufferedWriteTransaction};
+pub(crate) use write_batch::execute_write_batch_with_transaction;

@@ -1,7 +1,7 @@
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
 use crate::contracts::{
-    PendingViewFilter, PendingViewOrderClause, PendingViewProjection, ReadTimeProjectionRead,
-    ReadTimeProjectionReadQuery,
+    PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection, ProjectionQuery,
+    ReadTimeProjectionPlan,
 };
 use crate::sql::logical_plan::SurfaceReadPlan;
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
@@ -13,9 +13,9 @@ use sqlparser::ast::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CompiledPublicRowsetQuery {
-    pub(crate) projections: Vec<PendingViewProjection>,
-    pub(crate) filters: Vec<PendingViewFilter>,
-    pub(crate) order_by: Vec<PendingViewOrderClause>,
+    pub(crate) projections: Vec<PendingOverlayProjection>,
+    pub(crate) filters: Vec<PendingOverlayFilter>,
+    pub(crate) order_by: Vec<PendingOverlayOrderClause>,
     pub(crate) limit: Option<usize>,
 }
 
@@ -64,7 +64,7 @@ pub(crate) fn compile_public_rowset_query(
 
 pub(crate) fn try_compile_read_time_projection_read(
     surface_read_plan: &SurfaceReadPlan,
-) -> Option<ReadTimeProjectionRead> {
+) -> Option<ReadTimeProjectionPlan> {
     let structured_read = surface_read_plan.structured_read();
     let surface_name = structured_read
         .surface_binding
@@ -85,20 +85,20 @@ pub(crate) fn try_compile_read_time_projection_read(
     let uses_count_all = query
         .projections
         .iter()
-        .any(|projection| matches!(projection, PendingViewProjection::CountAll { .. }));
+        .any(|projection| matches!(projection, PendingOverlayProjection::CountAll { .. }));
     if uses_count_all
         && !query
             .projections
             .iter()
-            .all(|projection| matches!(projection, PendingViewProjection::CountAll { .. }))
+            .all(|projection| matches!(projection, PendingOverlayProjection::CountAll { .. }))
     {
         return None;
     }
 
-    Some(ReadTimeProjectionRead {
+    Some(ReadTimeProjectionPlan {
         surface_name,
         requested_version_id: structured_read.requested_version_id.clone(),
-        query: ReadTimeProjectionReadQuery {
+        query: ProjectionQuery {
             projections: query.projections,
             filters: query.filters,
             order_by: query.order_by,
@@ -110,7 +110,7 @@ pub(crate) fn try_compile_read_time_projection_read(
 fn rowset_projection_from_select_item(
     item: &SelectItem,
     table_alias: Option<&str>,
-) -> Option<PendingViewProjection> {
+) -> Option<PendingOverlayProjection> {
     match item {
         SelectItem::UnnamedExpr(expr) => rowset_projection_from_expr(
             expr,
@@ -128,12 +128,12 @@ fn rowset_projection_from_expr(
     expr: &Expr,
     table_alias: Option<&str>,
     output_column: String,
-) -> Option<PendingViewProjection> {
+) -> Option<PendingOverlayProjection> {
     if rowset_expr_is_count_all(expr) {
-        return Some(PendingViewProjection::CountAll { output_column });
+        return Some(PendingOverlayProjection::CountAll { output_column });
     }
 
-    Some(PendingViewProjection::Column {
+    Some(PendingOverlayProjection::Column {
         source_column: rowset_identifier_name(expr, table_alias)?,
         output_column,
     })
@@ -144,13 +144,13 @@ fn rowset_filter_from_expr(
     table_alias: Option<&str>,
     params: &[Value],
     placeholder_state: &mut PlaceholderState,
-) -> Option<PendingViewFilter> {
+) -> Option<PendingOverlayFilter> {
     match expr {
         Expr::BinaryOp {
             left,
             op: BinaryOperator::And,
             right,
-        } => Some(PendingViewFilter::And(vec![
+        } => Some(PendingOverlayFilter::And(vec![
             rowset_filter_from_expr(left, table_alias, params, placeholder_state)?,
             rowset_filter_from_expr(right, table_alias, params, placeholder_state)?,
         ])),
@@ -158,7 +158,7 @@ fn rowset_filter_from_expr(
             left,
             op: BinaryOperator::Or,
             right,
-        } => Some(PendingViewFilter::Or(vec![
+        } => Some(PendingOverlayFilter::Or(vec![
             rowset_filter_from_expr(left, table_alias, params, placeholder_state)?,
             rowset_filter_from_expr(right, table_alias, params, placeholder_state)?,
         ])),
@@ -172,11 +172,11 @@ fn rowset_filter_from_expr(
             right.as_ref(),
             rowset_value_from_expr(left, params, placeholder_state),
         ) {
-            (left, Some(value), _, _) => Some(PendingViewFilter::Equals(
+            (left, Some(value), _, _) => Some(PendingOverlayFilter::Equals(
                 rowset_identifier_name(left, table_alias)?,
                 value,
             )),
-            (_, _, right, Some(value)) => Some(PendingViewFilter::Equals(
+            (_, _, right, Some(value)) => Some(PendingOverlayFilter::Equals(
                 rowset_identifier_name(right, table_alias)?,
                 value,
             )),
@@ -186,17 +186,17 @@ fn rowset_filter_from_expr(
             expr,
             list,
             negated: false,
-        } => Some(PendingViewFilter::In(
+        } => Some(PendingOverlayFilter::In(
             rowset_identifier_name(expr, table_alias)?,
             list.iter()
                 .map(|expr| rowset_value_from_expr(expr, params, placeholder_state))
                 .collect::<Option<Vec<_>>>()?,
         )),
-        Expr::IsNull(expr) => Some(PendingViewFilter::IsNull(rowset_identifier_name(
+        Expr::IsNull(expr) => Some(PendingOverlayFilter::IsNull(rowset_identifier_name(
             expr,
             table_alias,
         )?)),
-        Expr::IsNotNull(expr) => Some(PendingViewFilter::IsNotNull(rowset_identifier_name(
+        Expr::IsNotNull(expr) => Some(PendingOverlayFilter::IsNotNull(rowset_identifier_name(
             expr,
             table_alias,
         )?)),
@@ -205,7 +205,7 @@ fn rowset_filter_from_expr(
             pattern,
             negated: false,
             ..
-        } => Some(PendingViewFilter::Like {
+        } => Some(PendingOverlayFilter::Like {
             column: rowset_identifier_name(expr, table_alias)?,
             pattern: rowset_value_from_expr(pattern, params, placeholder_state)
                 .and_then(|value| rowset_filter_text(&value))?,
@@ -216,7 +216,7 @@ fn rowset_filter_from_expr(
             pattern,
             negated: false,
             ..
-        } => Some(PendingViewFilter::Like {
+        } => Some(PendingOverlayFilter::Like {
             column: rowset_identifier_name(expr, table_alias)?,
             pattern: rowset_value_from_expr(pattern, params, placeholder_state)
                 .and_then(|value| rowset_filter_text(&value))?,
@@ -232,7 +232,7 @@ fn rowset_filter_from_expr(
 fn rowset_order_by_from_clause(
     order_by: &OrderBy,
     table_alias: Option<&str>,
-) -> Option<Vec<PendingViewOrderClause>> {
+) -> Option<Vec<PendingOverlayOrderClause>> {
     let sqlparser::ast::OrderByKind::Expressions(expressions) = &order_by.kind else {
         return None;
     };
@@ -245,8 +245,8 @@ fn rowset_order_by_from_clause(
 fn rowset_order_clause_from_expr(
     expr: &OrderByExpr,
     table_alias: Option<&str>,
-) -> Option<PendingViewOrderClause> {
-    Some(PendingViewOrderClause {
+) -> Option<PendingOverlayOrderClause> {
+    Some(PendingOverlayOrderClause {
         column: rowset_identifier_name(&expr.expr, table_alias)?,
         descending: expr.options.asc == Some(false),
     })

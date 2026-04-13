@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use crate::catalog::{
-    bind_surface_relation, CatalogDirectReadSemantics, CatalogProjectionInputVersionScope,
+    bind_surface_relation, CatalogHistoryReadSemantics, CatalogProjectionInputVersionScope,
     CatalogProjectionRegistry, FilesystemRelationBinding, FilesystemRelationKind,
-    RelationBindContext, RelationBinding, SchemaRelationBinding, SurfaceBinding, SurfaceFamily,
+    RelationBindContext, RelationBinding, ResolvedSurface, SchemaRelationBinding, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant, VersionRelationBinding,
 };
 use crate::contracts::SessionDependency;
@@ -111,7 +111,7 @@ pub(crate) fn dependency_metadata_for_surface_name(
 
 pub(crate) fn dependency_metadata_for_surface_binding(
     declarations: &CatalogProjectionRegistry,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Result<Option<CatalogSurfaceDependencyMetadata>, LixError> {
     let mut metadata = CatalogSurfaceDependencyMetadata::default();
     metadata.note_public_surface_registry();
@@ -152,8 +152,8 @@ pub(crate) fn dependency_metadata_for_surface_binding(
             surface_binding.descriptor.surface_variant,
         ) {
             (SurfaceFamily::Filesystem, SurfaceVariant::History) => {
-                match crate::catalog::direct_read_semantics(surface_binding) {
-                    Some(CatalogDirectReadSemantics::FileHistory {
+                match crate::catalog::history_read_semantics(surface_binding) {
+                    Some(CatalogHistoryReadSemantics::FileHistory {
                         active_version_lineage,
                     }) => {
                         metadata.merge_schema_key("lix_file_descriptor");
@@ -164,7 +164,7 @@ pub(crate) fn dependency_metadata_for_surface_binding(
                         }
                         Ok(Some(metadata))
                     }
-                    Some(CatalogDirectReadSemantics::DirectoryHistoryActiveVersion) => {
+                    Some(CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion) => {
                         metadata.merge_schema_key("lix_directory_descriptor");
                         metadata.note_active_version();
                         Ok(Some(metadata))

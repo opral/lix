@@ -1,9 +1,8 @@
 use crate::sql::logical_plan::direct_reads::{
-    DirectPublicReadPlan, DirectoryHistoryDirectReadPlan, FileHistoryDirectReadPlan,
-    StateHistoryDirectReadPlan,
+    DirectoryHistoryReadPlan, FileHistoryReadPlan, HistoryReadPlan, StateHistoryReadPlan,
 };
 use crate::sql::logical_plan::plan::{
-    InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
+    DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
 };
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadGroupByKind, BroadPublicReadJoinConstraint, BroadPublicReadJoinKind,
@@ -31,7 +30,7 @@ pub(crate) fn verify_logical_plan(plan: &LogicalPlan) -> Result<(), LogicalPlanV
     match plan {
         LogicalPlan::PublicRead(plan) => verify_public_read_logical_plan(plan),
         LogicalPlan::PublicWrite(plan) => verify_public_write_logical_plan(plan),
-        LogicalPlan::Internal(plan) => verify_internal_logical_plan(plan),
+        LogicalPlan::Direct(plan) => verify_direct_logical_plan(plan),
     }
 }
 
@@ -47,14 +46,17 @@ pub(crate) fn verify_public_read_logical_plan(
                 ));
             }
         }
-        PublicReadLogicalPlan::DirectHistory { plan, direct_plan } => {
+        PublicReadLogicalPlan::HistoryRead {
+            plan,
+            history_read_plan,
+        } => {
             let read = plan.structured_read();
             if read.surface_binding.descriptor.public_name.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
                     "direct history read must target a named surface",
                 ));
             }
-            verify_direct_public_read_plan(direct_plan)?;
+            verify_direct_public_read_plan(history_read_plan)?;
         }
         PublicReadLogicalPlan::Broad {
             broad_statement,
@@ -459,8 +461,8 @@ pub(crate) fn verify_public_write_logical_plan(
     Ok(())
 }
 
-pub(crate) fn verify_internal_logical_plan(
-    plan: &InternalLogicalPlan,
+pub(crate) fn verify_direct_logical_plan(
+    plan: &DirectLogicalPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     if plan.normalized_statements.prepared_statements.is_empty()
         && !matches!(plan.result_contract, ResultContract::DmlNoReturning)
@@ -476,11 +478,11 @@ pub(crate) fn verify_internal_logical_plan(
 }
 
 fn verify_direct_public_read_plan(
-    plan: &DirectPublicReadPlan,
+    plan: &HistoryReadPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     match plan {
-        DirectPublicReadPlan::StateHistory(plan) => verify_state_history_direct_plan(plan),
-        DirectPublicReadPlan::EntityHistory(plan) => {
+        HistoryReadPlan::StateHistory(plan) => verify_state_history_read_plan(plan),
+        HistoryReadPlan::EntityHistory(plan) => {
             if plan.surface_binding.descriptor.public_name.is_empty() {
                 Err(LogicalPlanVerificationError::new(
                     "entity history direct read must target a named surface",
@@ -489,13 +491,13 @@ fn verify_direct_public_read_plan(
                 Ok(())
             }
         }
-        DirectPublicReadPlan::FileHistory(plan) => verify_file_history_direct_plan(plan),
-        DirectPublicReadPlan::DirectoryHistory(plan) => verify_directory_history_direct_plan(plan),
+        HistoryReadPlan::FileHistory(plan) => verify_file_history_read_plan(plan),
+        HistoryReadPlan::DirectoryHistory(plan) => verify_directory_history_read_plan(plan),
     }
 }
 
-fn verify_state_history_direct_plan(
-    plan: &StateHistoryDirectReadPlan,
+fn verify_state_history_read_plan(
+    plan: &StateHistoryReadPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     if plan.having.is_some() && plan.group_by_fields.is_empty() && plan.projections.is_empty() {
         return Err(LogicalPlanVerificationError::new(
@@ -506,8 +508,8 @@ fn verify_state_history_direct_plan(
     Ok(())
 }
 
-fn verify_file_history_direct_plan(
-    plan: &FileHistoryDirectReadPlan,
+fn verify_file_history_read_plan(
+    plan: &FileHistoryReadPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     match (&plan.aggregate, &plan.aggregate_output_name) {
         (Some(_), Some(_)) | (None, None) => Ok(()),
@@ -520,8 +522,8 @@ fn verify_file_history_direct_plan(
     }
 }
 
-fn verify_directory_history_direct_plan(
-    plan: &DirectoryHistoryDirectReadPlan,
+fn verify_directory_history_read_plan(
+    plan: &DirectoryHistoryReadPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     match (&plan.aggregate, &plan.aggregate_output_name) {
         (Some(_), Some(_)) | (None, None) => Ok(()),

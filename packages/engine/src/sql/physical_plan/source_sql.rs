@@ -1,6 +1,6 @@
 //! Compiler-owned public surface source SQL builders.
 
-use crate::catalog::{RelationBinding, SurfaceBinding, SurfaceVariant};
+use crate::catalog::{RelationBinding, ResolvedSurface, SurfaceVariant};
 use crate::contracts::EffectiveStateRequest;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{
@@ -47,7 +47,7 @@ pub(crate) fn build_effective_public_read_source_sql(
     dialect: SqlDialect,
     active_version_id: Option<&str>,
     effective_state_request: &EffectiveStateRequest,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     pushdown_predicates: &[Expr],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     include_snapshot_content: bool,
@@ -808,7 +808,7 @@ fn render_overlay_where_clause_sql(
 
 fn effective_state_schema_winner_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     schema_keys: &[String],
     source_predicates: &[Expr],
     effective_state_request: &EffectiveStateRequest,
@@ -1095,7 +1095,7 @@ fn effective_state_schema_winner_rows_sql(
 
 fn build_direct_canonical_header_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     schema_key: &str,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
@@ -1282,7 +1282,7 @@ fn json_object_sql(dialect: SqlDialect, fields: &[(&str, &str)]) -> String {
 
 fn build_change_set_element_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     surface_variant: SurfaceVariant,
@@ -1417,7 +1417,7 @@ fn build_change_set_element_state_rows_sql(
 
 fn build_commit_edge_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     surface_variant: SurfaceVariant,
@@ -1518,7 +1518,7 @@ fn build_commit_edge_state_rows_sql(
 
 fn build_change_author_state_rows_sql(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     payload_columns: &[String],
     known_live_layouts: &BTreeMap<String, JsonValue>,
     surface_variant: SurfaceVariant,
@@ -1640,7 +1640,7 @@ fn builtin_payload_column_name(schema_key: &str, property_name: &str) -> String 
 
 fn effective_state_payload_columns(
     effective_state_request: &EffectiveStateRequest,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> Vec<String> {
     effective_state_request
         .required_columns
@@ -1695,7 +1695,7 @@ fn is_live_state_envelope_column(column: &str) -> bool {
 
 fn render_state_payload_projection_list(
     dialect: SqlDialect,
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     schema_key: &str,
     table_alias: &str,
     payload_columns: &[String],

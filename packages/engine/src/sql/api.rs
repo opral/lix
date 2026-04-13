@@ -32,21 +32,19 @@ pub(crate) use super::logical_plan::DependencySpec;
 #[cfg(test)]
 pub(crate) use super::optimizer::optimize_state_resolution;
 pub(crate) use super::parser::{parse_sql, parse_sql_statements, parse_sql_with_timing};
-pub(crate) use super::physical_plan::{
-    PreparedPublicWriteExecution, PublicWriteExecutionPartition,
-};
+pub(crate) use super::physical_plan::{PublicWriteExecutionPartition, PublicWritePhysicalPlan};
 #[cfg(test)]
 pub(crate) use super::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};
 pub(crate) use super::prepare::{
     build_public_write_execution, build_public_write_invariant_trace,
-    compile_execution_from_template_instance_with_context, finalize_public_write_execution,
+    compile_execution_from_bound_statement_with_context, finalize_public_write_execution,
     load_sql_compiler_metadata, load_sql_compiler_metadata_with_reader,
-    load_sql_compiler_metadata_with_reader_and_pending_view,
-    prepare_committed_read_program_in_transaction, prepare_committed_read_program_with_backend,
+    load_sql_compiler_metadata_with_reader_and_pending_overlay_view,
+    prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
     prepare_public_read_artifact, public_authoritative_write_error, public_write_preparation_error,
-    BoundStatementTemplateInstance, CommittedReadProgramContext, CompiledExecution,
-    ExecutionProgram, PreparationPolicy, PreparedPublicExecution, PreparedPublicRead,
-    PreparedPublicWrite, SqlCompilerMetadata, SqlPreparationSeed, UpdateValidationPlan,
+    BoundStatementInstance, CommittedReadContext, CompilePolicy, CompiledExecution, PublicPlan,
+    PublicReadPlan, PublicWritePlan, SqlCompilerMetadata, SqlCompilerSeed, StatementBatch,
+    UpdateValidationPlan,
 };
 pub(crate) use super::semantic_ir::semantics::changes::{
     build_change_batches, derive_commit_preconditions,
@@ -77,7 +75,7 @@ pub(crate) use super::support::{
 /// Prepare either a public read or a public write from already-parsed SQL
 /// statements using catalog-owned surface semantics and compiler metadata.
 #[allow(dead_code)]
-pub(crate) async fn prepare_public_execution(
+pub(crate) async fn prepare_public_plan(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
     compiler_metadata: &SqlCompilerMetadata,
@@ -87,10 +85,10 @@ pub(crate) async fn prepare_public_execution(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
+    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicExecution>, LixError> {
-    super::prepare::public_surface::prepare_public_execution_with_registry_context_and_functions(
+) -> Result<Option<PublicPlan>, LixError> {
+    super::prepare::public_surface::prepare_public_plan_with_registry_context_and_functions(
         dialect,
         registry,
         compiler_metadata,
@@ -100,7 +98,7 @@ pub(crate) async fn prepare_public_execution(
         active_history_root_commit_id,
         active_account_ids,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -119,9 +117,9 @@ pub(crate) async fn prepare_public_read(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
+    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicRead>, LixError> {
+) -> Result<Option<PublicReadPlan>, LixError> {
     super::prepare::try_prepare_public_read_with_registry_and_internal_access(
         dialect,
         registry,
@@ -131,7 +129,7 @@ pub(crate) async fn prepare_public_read(
         active_version_id,
         active_history_root_commit_id,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -150,7 +148,7 @@ pub(crate) async fn prepare_public_write(
     active_account_ids: &[String],
     writer_key: Option<&str>,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicWrite>, LixError> {
+) -> Result<Option<PublicWritePlan>, LixError> {
     super::prepare::public_surface::try_prepare_public_write_with_registry_and_functions(
         dialect,
         registry,
@@ -241,8 +239,8 @@ pub(crate) fn compiled_explain_diagnostics(
 /// Refresh explain artifacts for a materialized public write using root SQL
 /// orchestration rather than explain-stage types at the call site.
 pub(crate) fn refresh_materialized_public_write_explain(
-    public_write: &mut PreparedPublicWrite,
-    execution: PreparedPublicWriteExecution,
+    public_write: &mut PublicWritePlan,
+    execution: PublicWritePhysicalPlan,
     change_batches: Vec<ChangeBatch>,
     physical_planning_duration: Duration,
 ) {

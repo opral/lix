@@ -273,15 +273,11 @@ fn dense_index_for_source(
 fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
     match statement {
         Statement::Insert(insert) => match &insert.table {
-            TableObject::TableName(name) => {
-                crate::sql::object_name_is_internal_storage_relation(name)
-            }
+            TableObject::TableName(name) => crate::sql::object_name_is_internal_relation(name),
             _ => false,
         },
         Statement::Update(update) => match &update.table.relation {
-            TableFactor::Table { name, .. } => {
-                crate::sql::object_name_is_internal_storage_relation(name)
-            }
+            TableFactor::Table { name, .. } => crate::sql::object_name_is_internal_relation(name),
             _ => false,
         },
         Statement::Delete(delete) => {
@@ -291,7 +287,7 @@ fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
             };
             tables.iter().any(|table| match &table.relation {
                 TableFactor::Table { name, .. } => {
-                    crate::sql::object_name_is_internal_storage_relation(name)
+                    crate::sql::object_name_is_internal_relation(name)
                 }
                 _ => false,
             })

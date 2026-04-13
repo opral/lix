@@ -925,7 +925,7 @@ mod tests {
         .await
         .expect("status row should seed");
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 
@@ -978,7 +978,7 @@ mod tests {
         .await
         .expect("status row should seed");
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 
@@ -1012,7 +1012,7 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 
@@ -1054,7 +1054,7 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 

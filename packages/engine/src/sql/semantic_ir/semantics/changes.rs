@@ -195,7 +195,7 @@ fn build_change_batch_for_partition(
     Ok(ChangeBatch {
         changes,
         write_lane,
-        writer_key: planned_write.command.execution_context.writer_key.clone(),
+        writer_key: planned_write.command.statement_context.writer_key.clone(),
         semantic_effects,
     })
 }
@@ -211,7 +211,7 @@ fn build_idempotency_key(
         "operation": write_operation_kind_name(planned_write.command.operation_kind),
         "partition_index": partition_index,
         "lane": write_lane_name(write_lane),
-        "writer_key": planned_write.command.execution_context.writer_key,
+        "writer_key": planned_write.command.statement_context.writer_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
         "resolved_rows": summarize_partition_rows(partition),
     });
@@ -378,7 +378,7 @@ mod tests {
     use crate::sql::logical_plan::public_ir::WriteLane;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
-    use crate::sql::semantic_ir::ExecutionContext;
+    use crate::sql::semantic_ir::StatementContext;
     use crate::{CreateVersionOptions, Value};
 
     async fn planned_write_with_params(
@@ -405,10 +405,10 @@ mod tests {
         let bound = bind_statement(
             statement,
             params,
-            ExecutionContext {
+            StatementContext {
                 requested_version_id: Some(session.active_version_id()),
                 writer_key: Some("writer-a".to_string()),
-                ..ExecutionContext::default()
+                ..StatementContext::default()
             },
         );
         let canonicalized =

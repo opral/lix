@@ -5,28 +5,28 @@ use crate::sql::prepare::contracts::requirements::PlanRequirements;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct IntentCollectionPolicy {
+pub(crate) struct EffectCollectionPolicy {
     pub(crate) skip_side_effect_collection: bool,
 }
 
-pub(crate) struct ExecutionIntent {
+pub(crate) struct FilesystemIntent {
     pub(crate) filesystem_state: PlannedFilesystemState,
 }
 
-pub(crate) async fn collect_execution_intent(
+pub(crate) async fn collect_filesystem_intent(
     requirements: &PlanRequirements,
-    policy: IntentCollectionPolicy,
-) -> Result<ExecutionIntent, LixError> {
+    policy: EffectCollectionPolicy,
+) -> Result<FilesystemIntent, LixError> {
     let filesystem_state = if policy.skip_side_effect_collection || requirements.read_only_query {
         PlannedFilesystemState::default()
     } else {
-        // Raw SQL intent collection no longer stages filesystem ops through a separate
-        // event stream. Public and transaction-local filesystem writes are carried by the
-        // typed filesystem state built during write planning.
+        // Raw SQL filesystem-effect collection no longer stages filesystem ops through a
+        // separate event stream. Public and transaction-local filesystem writes are carried
+        // by the typed filesystem state built during write planning.
         PlannedFilesystemState::default()
     };
 
-    Ok(ExecutionIntent { filesystem_state })
+    Ok(FilesystemIntent { filesystem_state })
 }
 
 pub(crate) fn authoritative_binary_blob_write_targets_from_planned_state(

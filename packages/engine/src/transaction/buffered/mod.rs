@@ -12,7 +12,7 @@ mod write_runner;
 
 pub(crate) use buffered_write_state::BufferedWriteState;
 pub(crate) use commands::{
-    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteExecutionRoute,
+    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteFlushClass,
     BufferedWriteSessionEffects,
 };
 pub(crate) use coordinator::{apply_schema_registrations_in_transaction, TransactionCoordinator};
@@ -23,8 +23,8 @@ pub(crate) use live_state_write_state::LiveStateWriteState;
 pub(crate) use planned_write::{
     build_transaction_write_delta, BufferedWriteJournal, PendingFilesystemOverlay,
     PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PendingWriterKeyOverlay,
-    PlannedInternalWriteUnit, PlannedPublicUntrackedWriteUnit, TrackedTxnUnit,
-    TransactionWriteDelta, TransactionWriteUnit,
+    PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit, TrackedTxnUnit, TransactionWriteDelta,
+    TransactionWriteUnit,
 };
 #[cfg(test)]
 pub(crate) use write_plan::{WriteDelta, WriteJournal};

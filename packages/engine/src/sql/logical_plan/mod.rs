@@ -13,18 +13,16 @@ pub(crate) mod verify;
 pub(crate) use dependency_spec::{DependencyPrecision, DependencySpec};
 pub(crate) use direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
-    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
-    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
-    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate, FileHistoryDirectReadPlan,
-    FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey, StateHistoryAggregate,
-    StateHistoryAggregatePredicate, StateHistoryDirectReadPlan, StateHistoryPredicate,
-    StateHistoryProjection, StateHistoryProjectionValue, StateHistorySortKey,
-    StateHistorySortValue,
+    DirectStateHistoryField, DirectoryHistoryAggregate, DirectoryHistoryPredicate,
+    DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
+    EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan, EntityHistorySortKey,
+    FileHistoryAggregate, FileHistoryPredicate, FileHistoryProjection, FileHistoryReadPlan,
+    FileHistorySortKey, HistoryReadPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
+    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
 };
 pub(crate) use plan::{
-    InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
-    SurfaceReadPlan,
+    DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan, SurfaceReadPlan,
 };
 pub(crate) use result_contract::{result_contract_for_statements, ResultContract};
-pub(crate) use verify::verify_logical_plan;
+pub(crate) use verify::{verify_direct_logical_plan, verify_logical_plan};

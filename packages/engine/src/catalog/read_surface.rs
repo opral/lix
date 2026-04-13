@@ -1,5 +1,5 @@
 use crate::catalog::{
-    state_by_version_relation_name, DefaultScopeSemantics, SurfaceBinding, SurfaceFamily,
+    state_by_version_relation_name, DefaultScopeSemantics, ResolvedSurface, SurfaceFamily,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -8,7 +8,7 @@ pub(crate) struct CatalogReadPreparationSemantics {
 }
 
 pub(crate) fn explicit_version_counterpart_surface_name(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
     missing_columns: &[String],
 ) -> Option<String> {
     let requests_version_column = missing_columns
@@ -29,7 +29,7 @@ pub(crate) fn explicit_version_counterpart_surface_name(
 }
 
 pub(crate) fn read_preparation_semantics(
-    surface_binding: &SurfaceBinding,
+    surface_binding: &ResolvedSurface,
 ) -> CatalogReadPreparationSemantics {
     CatalogReadPreparationSemantics {
         requires_current_version_heads: surface_binding.descriptor.surface_family

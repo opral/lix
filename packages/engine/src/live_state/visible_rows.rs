@@ -5,7 +5,7 @@ use crate::live_state::writer_key::load_writer_key_annotations_with_executor;
 use crate::{LixBackend, LixError, Value};
 
 use super::constraints::ScanConstraint;
-use super::schema_access::LiveReadContract;
+use super::schema_access::LiveRowShape;
 use super::shared::identity::RowIdentity;
 use super::tracked::{
     scan_rows_with_executor as scan_tracked_rows_with_executor, TrackedRow, TrackedScanRequest,
@@ -76,13 +76,13 @@ impl LiveReadRow {
         &self.values
     }
 
-    pub(crate) fn snapshot_text(&self, access: &LiveReadContract) -> Result<String, LixError> {
+    pub(crate) fn snapshot_text(&self, access: &LiveRowShape) -> Result<String, LixError> {
         access.snapshot_text_from_values(self.schema_key(), self.values())
     }
 
     pub(crate) fn snapshot_json(
         &self,
-        access: &LiveReadContract,
+        access: &LiveRowShape,
     ) -> Result<serde_json::Value, LixError> {
         access.snapshot_json_from_values(self.schema_key(), self.values())
     }

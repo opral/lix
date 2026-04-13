@@ -246,7 +246,7 @@ mod tests {
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
-    use crate::sql::semantic_ir::ExecutionContext;
+    use crate::sql::semantic_ir::StatementContext;
     use crate::{SqlDialect, Value};
 
     fn structured_read(
@@ -259,7 +259,7 @@ mod tests {
         let bound = bind_statement(
             statement,
             params,
-            ExecutionContext::with_dialect(SqlDialect::Sqlite),
+            StatementContext::with_dialect(SqlDialect::Sqlite),
         );
         canonicalize_read(bound, registry)
             .expect("query should canonicalize")

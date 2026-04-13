@@ -368,7 +368,7 @@ fn classify_broad_public_read_relation(
     }
     if matches!(
         classify_relation_name(relation_name, Some(registry)),
-        RelationPolicy::InternalStorage
+        RelationPolicy::InternalRelation
     ) {
         return BroadPublicReadRelation::Internal(normalized);
     }

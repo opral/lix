@@ -1,6 +1,6 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogSurfaceDependencyMetadata,
-    SurfaceBinding, SurfaceFamily,
+    ResolvedSurface, SurfaceFamily,
 };
 use crate::contracts::SessionDependency;
 use crate::sql::logical_plan::public_ir::{ReadPlan, StructuredPublicRead};
@@ -132,7 +132,7 @@ fn expr_contains_expression_subquery(expr: &Expr) -> bool {
 }
 
 pub(crate) fn derive_dependency_spec_from_bound_public_surface_bindings(
-    bindings: &[SurfaceBinding],
+    bindings: &[ResolvedSurface],
 ) -> Option<DependencySpec> {
     let mut iter = bindings.iter();
     let first = iter.next()?;
@@ -153,7 +153,7 @@ fn with_public_surface_registry_dependency(mut spec: DependencySpec) -> Dependen
     spec
 }
 
-fn dependency_spec_for_bound_surface(binding: &SurfaceBinding) -> DependencySpec {
+fn dependency_spec_for_bound_surface(binding: &ResolvedSurface) -> DependencySpec {
     if matches!(
         binding.descriptor.surface_family,
         SurfaceFamily::State | SurfaceFamily::Entity
@@ -166,19 +166,21 @@ fn dependency_spec_for_bound_surface(binding: &SurfaceBinding) -> DependencySpec
     spec
 }
 
-fn dependency_spec_for_filesystem_scan(binding: &crate::catalog::SurfaceBinding) -> DependencySpec {
+fn dependency_spec_for_filesystem_scan(
+    binding: &crate::catalog::ResolvedSurface,
+) -> DependencySpec {
     let mut spec = dependency_spec_from_catalog_metadata(binding);
     spec.precision = DependencyPrecision::Conservative;
     spec
 }
 
-fn dependency_spec_for_state_like_surface(binding: &SurfaceBinding) -> DependencySpec {
+fn dependency_spec_for_state_like_surface(binding: &ResolvedSurface) -> DependencySpec {
     let mut spec = dependency_spec_from_catalog_metadata(binding);
     spec.precision = DependencyPrecision::Conservative;
     spec
 }
 
-fn dependency_spec_from_catalog_metadata(binding: &SurfaceBinding) -> DependencySpec {
+fn dependency_spec_from_catalog_metadata(binding: &ResolvedSurface) -> DependencySpec {
     match builtin_catalog_compiler_facade().dependency_metadata_for_binding(binding) {
         Ok(Some(metadata)) => dependency_spec_from_catalog_surface_metadata(metadata),
         Ok(None) | Err(_) => DependencySpec {
@@ -477,7 +479,7 @@ mod tests {
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::logical_plan::DependencyPrecision;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
-    use crate::sql::semantic_ir::ExecutionContext;
+    use crate::sql::semantic_ir::StatementContext;
     use crate::{SqlDialect, Value};
     use std::collections::BTreeSet;
 
@@ -491,7 +493,7 @@ mod tests {
         let bound = bind_statement(
             statement,
             params,
-            ExecutionContext::with_dialect(SqlDialect::Sqlite),
+            StatementContext::with_dialect(SqlDialect::Sqlite),
         );
         canonicalize_read(bound, registry)
             .expect("query should canonicalize")

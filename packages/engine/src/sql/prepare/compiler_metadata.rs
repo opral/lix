@@ -2,7 +2,7 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::{PendingSemanticStorage, PendingView, SqlPreparationMetadataReader};
+use crate::contracts::{PendingOverlayView, PendingSemanticStorage, SqlPreparationMetadataReader};
 use crate::live_state::tracked_relation_name;
 use crate::schema::{
     builtin_schema_definition, lix_state_surface_schema_definition,
@@ -32,15 +32,15 @@ pub(crate) async fn load_sql_compiler_metadata_with_reader(
     reader: &mut dyn SqlPreparationMetadataReader,
     registry: &SurfaceRegistry,
 ) -> Result<SqlCompilerMetadata, LixError> {
-    load_sql_compiler_metadata_with_reader_and_pending_view(reader, registry, None).await
+    load_sql_compiler_metadata_with_reader_and_pending_overlay_view(reader, registry, None).await
 }
 
-pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_view(
+pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_overlay_view(
     reader: &mut dyn SqlPreparationMetadataReader,
     registry: &SurfaceRegistry,
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
 ) -> Result<SqlCompilerMetadata, LixError> {
-    let pending_schemas = collect_pending_latest_schema_entries(pending_view)?;
+    let pending_schemas = collect_pending_latest_schema_entries(pending_overlay_view)?;
     let mut known_live_schema_definitions = BTreeMap::new();
     for schema_key in registry.registered_state_surface_schema_keys() {
         known_live_schema_definitions.insert(
@@ -151,14 +151,14 @@ fn schema_from_registered_value_json(raw: &str) -> Result<JsonValue, LixError> {
 }
 
 fn collect_pending_latest_schema_entries(
-    pending_view: Option<&dyn PendingView>,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
 ) -> Result<BTreeMap<String, PendingLatestSchemaEntry>, LixError> {
     let mut entries = BTreeMap::new();
-    let Some(pending_view) = pending_view else {
+    let Some(pending_overlay_view) = pending_overlay_view else {
         return Ok(entries);
     };
 
-    for (_, snapshot_content) in pending_view.visible_registered_schema_entries() {
+    for (_, snapshot_content) in pending_overlay_view.visible_registered_schema_entries() {
         let Some(snapshot_content) = snapshot_content.as_deref() else {
             continue;
         };
@@ -169,7 +169,7 @@ fn collect_pending_latest_schema_entries(
         PendingSemanticStorage::Tracked,
         PendingSemanticStorage::Untracked,
     ] {
-        for row in pending_view.visible_semantic_rows(storage, "lix_registered_schema") {
+        for row in pending_overlay_view.visible_semantic_rows(storage, "lix_registered_schema") {
             if row.tombstone {
                 continue;
             }

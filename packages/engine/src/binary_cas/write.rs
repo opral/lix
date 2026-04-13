@@ -6,7 +6,7 @@ use crate::binary_cas::schema::{
 };
 use crate::binary_cas::BinaryBlobWrite;
 use crate::services::functions::timestamp;
-use crate::transaction::{execute_write_program_with_transaction, WriteProgram};
+use crate::transaction::{execute_write_batch_with_transaction, WriteBatch};
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 use std::collections::BTreeMap;
 
@@ -70,15 +70,15 @@ pub(crate) async fn persist_blob_writes_in_transaction(
         return Ok(());
     }
 
-    let mut program = WriteProgram::new();
-    append_blob_writes_to_program(&mut program, transaction.dialect(), writes)?;
-    execute_write_program_with_transaction(transaction, program).await?;
+    let mut write_batch = WriteBatch::new();
+    append_blob_writes_to_write_batch(&mut write_batch, transaction.dialect(), writes)?;
+    execute_write_batch_with_transaction(transaction, write_batch).await?;
 
     Ok(())
 }
 
-pub(crate) fn append_blob_writes_to_program(
-    program: &mut WriteProgram,
+pub(crate) fn append_blob_writes_to_write_batch(
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
@@ -94,24 +94,24 @@ pub(crate) fn append_blob_writes_to_program(
             data: write.data,
         })
         .collect::<Vec<_>>();
-    let appended = build_binary_blob_fastcdc_write_program(dialect, &payloads)?;
-    program.extend(appended);
+    let appended = build_binary_blob_fastcdc_write_batch(dialect, &payloads)?;
+    write_batch.extend(appended);
     Ok(())
 }
 
-pub(crate) fn build_binary_blob_fastcdc_write_program(
+pub(crate) fn build_binary_blob_fastcdc_write_batch(
     dialect: SqlDialect,
     payloads: &[BinaryBlobWriteInput<'_>],
-) -> Result<WriteProgram, LixError> {
+) -> Result<WriteBatch, LixError> {
     let batch = build_binary_cas_write_batch(payloads)?;
-    let mut program = WriteProgram::new();
+    let mut write_batch = WriteBatch::new();
 
-    push_blob_manifest_rows(&mut program, dialect, &batch.blob_manifest_rows);
-    push_blob_store_rows(&mut program, dialect, &batch.blob_store_rows);
-    push_chunk_store_rows(&mut program, dialect, &batch.chunk_store_rows);
-    push_manifest_chunk_rows(&mut program, dialect, &batch.manifest_chunk_rows);
+    push_blob_manifest_rows(&mut write_batch, dialect, &batch.blob_manifest_rows);
+    push_blob_store_rows(&mut write_batch, dialect, &batch.blob_store_rows);
+    push_chunk_store_rows(&mut write_batch, dialect, &batch.chunk_store_rows);
+    push_manifest_chunk_rows(&mut write_batch, dialect, &batch.manifest_chunk_rows);
 
-    Ok(program)
+    Ok(write_batch)
 }
 
 fn build_binary_cas_write_batch(
@@ -220,12 +220,12 @@ fn build_binary_cas_write_batch(
 }
 
 fn push_blob_manifest_rows(
-    program: &mut WriteProgram,
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     rows: &[BinaryBlobManifestRow],
 ) {
     push_chunked_payload_statement(
-        program,
+        write_batch,
         dialect,
         rows,
         4,
@@ -240,12 +240,12 @@ fn push_blob_manifest_rows(
 }
 
 fn push_blob_store_rows(
-    program: &mut WriteProgram,
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     rows: &[BinaryBlobStoreRow],
 ) {
     push_chunked_payload_statement(
-        program,
+        write_batch,
         dialect,
         rows,
         4,
@@ -260,12 +260,12 @@ fn push_blob_store_rows(
 }
 
 fn push_chunk_store_rows(
-    program: &mut WriteProgram,
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     rows: &[BinaryChunkStoreRow],
 ) {
     push_chunked_payload_statement(
-        program,
+        write_batch,
         dialect,
         rows,
         6,
@@ -285,12 +285,12 @@ fn push_chunk_store_rows(
 }
 
 fn push_manifest_chunk_rows(
-    program: &mut WriteProgram,
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     rows: &[BinaryBlobManifestChunkRow],
 ) {
     push_chunked_payload_statement(
-        program,
+        write_batch,
         dialect,
         rows,
         4,
@@ -305,7 +305,7 @@ fn push_manifest_chunk_rows(
 }
 
 fn push_chunked_payload_statement<Row>(
-    program: &mut WriteProgram,
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     rows: &[Row],
     params_per_row: usize,
@@ -327,7 +327,7 @@ fn push_chunked_payload_statement<Row>(
         for row in chunk {
             bind_row(row, &mut params);
         }
-        program.push_statement(build_sql(&placeholders), params);
+        write_batch.push_statement(build_sql(&placeholders), params);
     }
 }
 

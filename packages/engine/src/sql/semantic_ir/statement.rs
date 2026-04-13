@@ -8,18 +8,18 @@ pub(crate) enum StatementKind {
     Update,
     Delete,
     Explain,
-    Other,
+    Utility,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct ExecutionContext {
+pub(crate) struct StatementContext {
     pub(crate) dialect: Option<SqlDialect>,
     pub(crate) writer_key: Option<String>,
     pub(crate) requested_version_id: Option<String>,
     pub(crate) active_account_ids: Vec<String>,
 }
 
-impl ExecutionContext {
+impl StatementContext {
     #[cfg(test)]
     pub(crate) fn with_dialect(dialect: SqlDialect) -> Self {
         Self {
@@ -32,7 +32,7 @@ impl ExecutionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BoundStatementMetadata {
     pub(crate) statement_kind: StatementKind,
-    pub(crate) execution_context: ExecutionContext,
+    pub(crate) statement_context: StatementContext,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -41,5 +41,5 @@ pub(crate) struct BoundStatement {
     pub(crate) statement_kind: StatementKind,
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) normalized_scalar_literals: Vec<Value>,
-    pub(crate) execution_context: ExecutionContext,
+    pub(crate) statement_context: StatementContext,
 }

@@ -174,7 +174,7 @@ async fn merge_version_in_transaction(
                 .ok_or_else(|| LixError::unknown("transaction is no longer active"))?;
             let mut execution_input = tx.context.buffered_write_execution_input();
             write_transaction
-                .prepare_buffered_write_commit(tx.collaborators, &mut execution_input)
+                .prepare_buffered_write_commit(tx.session_runtime, &mut execution_input)
                 .await?;
             tx.context
                 .apply_buffered_write_execution_input(&execution_input);
@@ -296,12 +296,12 @@ async fn merge_version_in_transaction(
         ));
     }
 
-    let collaborators = tx.collaborators();
+    let session_runtime = tx.session_runtime();
     let active_account_ids = tx.context.active_account_ids.clone();
     let (target_head_after_commit_id, created_merge_commit_id, receipt) = {
         let transaction = tx.backend_transaction_mut()?;
         let backend = crate::backend::transaction_backend_view(transaction);
-        let (_settings, functions) = collaborators
+        let (_settings, functions) = session_runtime
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
         let mut functions = functions;

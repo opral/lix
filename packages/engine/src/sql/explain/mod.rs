@@ -5,14 +5,14 @@
 
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationKind,
-    RelationBindContext, RelationBinding, SurfaceBinding, SurfaceCapability, SurfaceFamily,
+    RelationBindContext, RelationBinding, ResolvedSurface, SurfaceCapability, SurfaceFamily,
     SurfaceReadFreshness, SurfaceReadSemantics, SurfaceVariant,
 };
 use crate::contracts::{
     ChangeBatch, CommitPreconditions, DirectoryHistoryRequest, EffectiveStateRequest,
     EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
     FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PreparedExplainTemplate,
-    PreparedStatement, PublicChange, ReadTimeProjectionRead, SemanticEffect, SessionDependency,
+    PreparedStatement, PublicChange, ReadTimeProjectionPlan, SemanticEffect, SessionDependency,
     SessionStateDelta, StateCommitStreamChange, StateHistoryContentMode, StateHistoryLineageScope,
     StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
 };
@@ -20,14 +20,13 @@ use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
 use crate::sql::logical_plan::direct_reads::{
     DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectPublicReadPlan, DirectStateHistoryField, DirectoryHistoryAggregate,
-    DirectoryHistoryDirectReadPlan, DirectoryHistoryPredicate, DirectoryHistoryProjection,
-    DirectoryHistorySortKey, EntityHistoryDirectReadPlan, EntityHistoryPredicate,
-    EntityHistoryProjection, EntityHistorySortKey, FileHistoryAggregate, FileHistoryDirectReadPlan,
-    FileHistoryPredicate, FileHistoryProjection, FileHistorySortKey, StateHistoryAggregate,
-    StateHistoryAggregatePredicate, StateHistoryDirectReadPlan, StateHistoryPredicate,
-    StateHistoryProjection, StateHistoryProjectionValue, StateHistorySortKey,
-    StateHistorySortValue,
+    DirectStateHistoryField, DirectoryHistoryAggregate, DirectoryHistoryPredicate,
+    DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
+    EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan, EntityHistorySortKey,
+    FileHistoryAggregate, FileHistoryPredicate, FileHistoryProjection, FileHistoryReadPlan,
+    FileHistorySortKey, HistoryReadPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
+    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
 };
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
@@ -43,29 +42,29 @@ use crate::sql::logical_plan::public_ir::{
     FilesystemKind, InsertOnConflict, InsertOnConflictAction, MutationPayload,
     NormalizedPublicReadQuery, OptionalTextPatch, PlannedFilesystemDescriptor,
     PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow, PlannedWrite, ReadCommand,
-    ReadContract, ReadPlan, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage,
-    SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof, VersionScope,
-    WriteCommand, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind, WriteSelector,
+    ReadPlan, ReadVisibility, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan,
+    RowLineage, SchemaProof, ScopeProof, StateSourceKind, StructuredPublicRead, TargetSetProof,
+    VersionScope, WriteCommand, WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+    WriteSelector,
 };
 use crate::sql::logical_plan::{
-    DependencyPrecision, DependencySpec, InternalLogicalPlan, LogicalPlan, PublicReadLogicalPlan,
+    DependencyPrecision, DependencySpec, DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan,
     PublicWriteLogicalPlan, ResultContract,
 };
 use crate::sql::physical_plan::plan::{
     LoweredReadStatement, LoweredReadStatementShape, LoweredStatementBindings,
 };
 use crate::sql::physical_plan::{
-    LoweredReadProgram, LoweredResultColumn, LoweredResultColumns, PhysicalPlan,
-    PreparedPublicReadExecution, PreparedPublicWriteExecution, PublicWriteExecutionPartition,
-    PublicWriteMaterialization, TerminalRelationRenderNode, TrackedWriteExecution,
-    UntrackedWriteExecution,
+    LoweredReadBatch, LoweredResultColumn, LoweredResultColumns, PhysicalPlan,
+    PublicReadPhysicalPlan, PublicWriteExecutionPartition, PublicWriteMaterialization,
+    PublicWritePhysicalPlan, TerminalRelationRenderNode, TrackedWritePlan, UntrackedWritePlan,
 };
 use crate::sql::prepare::contracts::effects::PlanEffects;
 use crate::sql::prepare::contracts::planned_statement::{
     MutationOperation, MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 use crate::sql::prepare::public_surface::routing::RoutingPassTrace;
-use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
+use crate::sql::semantic_ir::direct::NormalizedDirectStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, StateSourceAuthority,
 };
@@ -97,9 +96,9 @@ pub(crate) enum ExplainMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainPublicReadStrategy {
+pub(crate) enum ExplainPublicReadPlanKind {
     Structured,
-    DirectHistory,
+    HistoryRead,
     Broad,
 }
 
@@ -357,7 +356,7 @@ pub(crate) enum ExplainResultContract {
     Select,
     DmlNoReturning,
     DmlReturning,
-    Other,
+    Nothing,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -420,7 +419,7 @@ pub(crate) struct BoundPublicLeafSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct SurfaceBindingSnapshot {
+pub(crate) struct ResolvedSurfaceSnapshot {
     pub(crate) public_name: String,
     pub(crate) surface_family: ExplainSurfaceFamily,
     pub(crate) surface_variant: ExplainSurfaceVariant,
@@ -556,7 +555,7 @@ pub(crate) struct UpdateValidationPlanSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct InternalStatementsSnapshot {
+pub(crate) struct DirectStatementsSnapshot {
     pub(crate) sql: String,
     pub(crate) prepared_statements: Vec<PreparedStatementSnapshot>,
     pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirementSnapshot>,
@@ -565,7 +564,7 @@ pub(crate) struct InternalStatementsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ExecutionContextSnapshot {
+pub(crate) struct StatementContextSnapshot {
     pub(crate) dialect: Option<ExplainSqlDialect>,
     pub(crate) writer_key: Option<String>,
     pub(crate) requested_version_id: Option<String>,
@@ -591,7 +590,7 @@ pub(crate) struct SortKeySnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalStateScanSnapshot {
-    pub(crate) binding: SurfaceBindingSnapshot,
+    pub(crate) binding: ResolvedSurfaceSnapshot,
     pub(crate) version_scope: ExplainVersionScope,
     pub(crate) expose_version_id: bool,
     pub(crate) include_tombstones: bool,
@@ -607,25 +606,25 @@ pub(crate) struct EntityProjectionSpecSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalFilesystemScanSnapshot {
-    pub(crate) binding: SurfaceBindingSnapshot,
+    pub(crate) binding: ResolvedSurfaceSnapshot,
     pub(crate) kind: ExplainFilesystemKind,
     pub(crate) version_scope: ExplainVersionScope,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalAdminScanSnapshot {
-    pub(crate) binding: SurfaceBindingSnapshot,
+    pub(crate) binding: ResolvedSurfaceSnapshot,
     pub(crate) kind: ExplainCanonicalAdminKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalChangeScanSnapshot {
-    pub(crate) binding: SurfaceBindingSnapshot,
+    pub(crate) binding: ResolvedSurfaceSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct CanonicalWorkingChangesScanSnapshot {
-    pub(crate) binding: SurfaceBindingSnapshot,
+    pub(crate) binding: ResolvedSurfaceSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -678,7 +677,7 @@ pub(crate) struct NormalizedPublicReadQuerySnapshot {
 pub(crate) struct StructuredPublicReadSnapshot {
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) requested_version_id: Option<String>,
-    pub(crate) surface_binding: SurfaceBindingSnapshot,
+    pub(crate) surface_binding: ResolvedSurfaceSnapshot,
     pub(crate) read_command: Box<ReadCommandSnapshot>,
     pub(crate) query: NormalizedPublicReadQuerySnapshot,
 }
@@ -707,13 +706,13 @@ pub(crate) struct InsertOnConflictSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct WriteCommandSnapshot {
     pub(crate) operation_kind: ExplainWriteOperationKind,
-    pub(crate) target: SurfaceBindingSnapshot,
+    pub(crate) target: ResolvedSurfaceSnapshot,
     pub(crate) selector: WriteSelectorSnapshot,
     pub(crate) payload: MutationPayloadSnapshot,
     pub(crate) on_conflict: Option<InsertOnConflictSnapshot>,
     pub(crate) requested_mode: ExplainWriteModeRequest,
     pub(crate) bound_parameters: Vec<Value>,
-    pub(crate) execution_context: ExecutionContextSnapshot,
+    pub(crate) statement_context: StatementContextSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -858,12 +857,12 @@ pub(crate) struct PublicWriteMaterializationSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum PublicWriteExecutionPartitionSnapshot {
-    Tracked(TrackedWriteExecutionSnapshot),
-    Untracked(UntrackedWriteExecutionSnapshot),
+    Tracked(TrackedWritePlanSnapshot),
+    Untracked(UntrackedWritePlanSnapshot),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct TrackedWriteExecutionSnapshot {
+pub(crate) struct TrackedWritePlanSnapshot {
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirementSnapshot>,
     pub(crate) change_batch: Option<ChangeBatchSnapshot>,
     pub(crate) create_preconditions: CommitPreconditionsSnapshot,
@@ -871,7 +870,7 @@ pub(crate) struct TrackedWriteExecutionSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct UntrackedWriteExecutionSnapshot {
+pub(crate) struct UntrackedWritePlanSnapshot {
     pub(crate) intended_post_state: Vec<PlannedStateRowSnapshot>,
     pub(crate) semantic_effects: PlanEffectsSnapshot,
     pub(crate) persist_filesystem_payloads_before_write: bool,
@@ -926,7 +925,7 @@ pub(crate) struct LoweredResultColumnsSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct LoweredReadProgramSnapshot {
+pub(crate) struct LoweredReadBatchSnapshot {
     pub(crate) statements: Vec<LoweredReadStatementSnapshot>,
     pub(crate) pushdown_decision: PushdownExplainArtifacts,
     pub(crate) result_columns: LoweredResultColumnsSnapshot,
@@ -1130,7 +1129,7 @@ pub(crate) struct StateHistoryAggregatePredicateSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct StateHistoryDirectPlanSnapshot {
+pub(crate) struct StateHistoryReadPlanSnapshot {
     pub(crate) request: StateHistoryRequestSnapshot,
     pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectStateHistoryField>>,
     pub(crate) projections: Vec<StateHistoryProjectionSnapshot>,
@@ -1145,7 +1144,7 @@ pub(crate) struct StateHistoryDirectPlanSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct EntityHistoryDirectPlanSnapshot {
+pub(crate) struct EntityHistoryReadPlanSnapshot {
     pub(crate) request: StateHistoryRequestSnapshot,
     pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectEntityHistoryField>>,
     pub(crate) projections: Vec<DirectFieldProjectionSnapshot<ExplainDirectEntityHistoryField>>,
@@ -1155,11 +1154,11 @@ pub(crate) struct EntityHistoryDirectPlanSnapshot {
     pub(crate) wildcard_projection: bool,
     pub(crate) wildcard_columns: Vec<String>,
     pub(crate) result_columns: LoweredResultColumnsSnapshot,
-    pub(crate) surface_binding: SurfaceBindingSnapshot,
+    pub(crate) surface_binding: ResolvedSurfaceSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct FileHistoryDirectPlanSnapshot {
+pub(crate) struct FileHistoryReadPlanSnapshot {
     pub(crate) request: FileHistoryRequestSnapshot,
     pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectFileHistoryField>>,
     pub(crate) projections: Vec<DirectFieldProjectionSnapshot<ExplainDirectFileHistoryField>>,
@@ -1174,7 +1173,7 @@ pub(crate) struct FileHistoryDirectPlanSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct DirectoryHistoryDirectPlanSnapshot {
+pub(crate) struct DirectoryHistoryReadPlanSnapshot {
     pub(crate) request: DirectoryHistoryRequestSnapshot,
     pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectDirectoryHistoryField>>,
     pub(crate) projections: Vec<DirectFieldProjectionSnapshot<ExplainDirectDirectoryHistoryField>>,
@@ -1190,23 +1189,23 @@ pub(crate) struct DirectoryHistoryDirectPlanSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum ExplainDirectPublicReadPlan {
-    StateHistory(Box<StateHistoryDirectPlanSnapshot>),
-    EntityHistory(Box<EntityHistoryDirectPlanSnapshot>),
-    FileHistory(Box<FileHistoryDirectPlanSnapshot>),
-    DirectoryHistory(Box<DirectoryHistoryDirectPlanSnapshot>),
+pub(crate) enum ExplainHistoryReadPlan {
+    StateHistory(Box<StateHistoryReadPlanSnapshot>),
+    EntityHistory(Box<EntityHistoryReadPlanSnapshot>),
+    FileHistory(Box<FileHistoryReadPlanSnapshot>),
+    DirectoryHistory(Box<DirectoryHistoryReadPlanSnapshot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainPublicReadExecution {
-    LoweredSql(Box<LoweredReadProgramSnapshot>),
-    ReadTimeProjection(Box<ExplainReadTimeProjectionReadSnapshot>),
-    Direct(Box<ExplainDirectPublicReadPlan>),
+    LoweredSql(Box<LoweredReadBatchSnapshot>),
+    ReadTimeProjection(Box<ExplainReadTimeProjectionPlanSnapshot>),
+    HistoryRead(Box<ExplainHistoryReadPlan>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ExplainReadTimeProjectionReadSnapshot {
+pub(crate) struct ExplainReadTimeProjectionPlanSnapshot {
     pub(crate) surface_name: String,
     pub(crate) projection_count: usize,
     pub(crate) filter_count: usize,
@@ -1706,8 +1705,8 @@ pub(crate) enum ExplainBroadSqlFunctionArgExprSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainBroadPublicReadRelationSnapshot {
-    Public(SurfaceBindingSnapshot),
-    LoweredPublic(SurfaceBindingSnapshot),
+    Public(ResolvedSurfaceSnapshot),
+    LoweredPublic(ResolvedSurfaceSnapshot),
     Internal { relation_name: String },
     External { relation_name: String },
     Cte { relation_name: String },
@@ -1732,8 +1731,8 @@ pub(crate) struct ExplainSurfaceReadPlanSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadLogicalPlan {
-    pub(crate) strategy: ExplainPublicReadStrategy,
-    pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
+    pub(crate) strategy: ExplainPublicReadPlanKind,
+    pub(crate) surface_bindings: Vec<ResolvedSurfaceSnapshot>,
     pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
@@ -1745,7 +1744,7 @@ pub(crate) struct ExplainPublicReadLogicalPlan {
     pub(crate) dependency_spec: Option<Box<DependencySpecSnapshot>>,
     pub(crate) effective_state_request: Option<Box<EffectiveStateRequestSnapshot>>,
     pub(crate) effective_state_plan: Option<Box<EffectiveStatePlanSnapshot>>,
-    pub(crate) direct_plan: Option<Box<ExplainDirectPublicReadPlan>>,
+    pub(crate) history_read_plan: Option<Box<ExplainHistoryReadPlan>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1754,8 +1753,8 @@ pub(crate) struct ExplainPublicWriteLogicalPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ExplainInternalLogicalPlan {
-    pub(crate) statements: Box<InternalStatementsSnapshot>,
+pub(crate) struct ExplainDirectLogicalPlan {
+    pub(crate) statements: Box<DirectStatementsSnapshot>,
     pub(crate) result_contract: ExplainResultContract,
 }
 
@@ -1764,12 +1763,12 @@ pub(crate) struct ExplainInternalLogicalPlan {
 pub(crate) enum ExplainSemanticStatement {
     PublicRead(Box<ExplainPublicReadSemantics>),
     PublicWrite(Box<ExplainPublicWriteSemantics>),
-    Internal(Box<InternalStatementsSnapshot>),
+    Direct(Box<DirectStatementsSnapshot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicReadSemantics {
-    pub(crate) surface_bindings: Vec<SurfaceBindingSnapshot>,
+    pub(crate) surface_bindings: Vec<ResolvedSurfaceSnapshot>,
     pub(crate) relation_bindings: Vec<ExplainRelationBindingSnapshot>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) broad_statement: Option<Box<ExplainBroadPublicReadStatementSnapshot>>,
@@ -1782,7 +1781,7 @@ pub(crate) struct ExplainPublicReadSemantics {
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct ExplainPublicWriteSemantics {
-    pub(crate) surface_binding: SurfaceBindingSnapshot,
+    pub(crate) surface_binding: ResolvedSurfaceSnapshot,
     pub(crate) write_command: Box<WriteCommandSnapshot>,
 }
 
@@ -1791,7 +1790,7 @@ pub(crate) struct ExplainPublicWriteSemantics {
 pub(crate) enum ExplainLogicalPlanSnapshot {
     PublicRead(Box<ExplainPublicReadLogicalPlan>),
     PublicWrite(Box<ExplainPublicWriteLogicalPlan>),
-    Internal(Box<ExplainInternalLogicalPlan>),
+    Direct(Box<ExplainDirectLogicalPlan>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2007,7 +2006,7 @@ fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> Strin
             details.surface_binding.public_name,
             explain_write_operation_kind_label(details.write_command.operation_kind),
         ),
-        ExplainSemanticStatement::Internal(statements) => format!(
+        ExplainSemanticStatement::Direct(statements) => format!(
             "kind: internal\nprepared_statements: {}\nmutations: {}\nupdate_validations: {}",
             statements.prepared_statements.len(),
             statements.mutations.len(),
@@ -2023,7 +2022,7 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
                 "kind: public_read".to_string(),
                 format!(
                     "strategy: {}",
-                    explain_public_read_strategy_label(details.strategy)
+                    explain_public_read_plan_kind_label(details.strategy)
                 ),
                 format!("surfaces: {}", join_public_names(&details.surface_bindings)),
                 format!(
@@ -2058,8 +2057,8 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
                 yes_no(details.read.is_some())
             ));
             lines.push(format!(
-                "direct_plan: {}",
-                yes_no(details.direct_plan.is_some())
+                "history_read_plan: {}",
+                yes_no(details.history_read_plan.is_some())
             ));
             lines.push(format!(
                 "dependency_spec: {}",
@@ -2077,7 +2076,7 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
             explain_write_operation_kind_label(details.planned_write.command.operation_kind),
             explain_state_source_kind_label(details.planned_write.state_source),
         ),
-        ExplainLogicalPlanSnapshot::Internal(details) => format!(
+        ExplainLogicalPlanSnapshot::Direct(details) => format!(
             "kind: internal\nresult_contract: {}\nprepared_statements: {}\nmutations: {}",
             explain_result_contract_label(details.result_contract),
             details.statements.prepared_statements.len(),
@@ -2089,10 +2088,10 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
 fn render_physical_plan_text(plan: &ExplainPhysicalPlanSnapshot) -> String {
     match plan {
         ExplainPhysicalPlanSnapshot::PublicRead(execution) => match execution.as_ref() {
-            ExplainPublicReadExecution::LoweredSql(program) => format!(
+            ExplainPublicReadExecution::LoweredSql(batch) => format!(
                 "kind: public_read\nexecution: lowered_sql\nstatements: {}\nresult_columns: {}",
-                program.statements.len(),
-                explain_lowered_result_columns_kind_label(program.result_columns.kind),
+                batch.statements.len(),
+                explain_lowered_result_columns_kind_label(batch.result_columns.kind),
             ),
             ExplainPublicReadExecution::ReadTimeProjection(read) => format!(
                 "kind: public_read\nexecution: read_time_projection\nsurface: {}\nprojections: {}\nfilters: {}\norder_by: {}\nlimit: {}",
@@ -2102,9 +2101,9 @@ fn render_physical_plan_text(plan: &ExplainPhysicalPlanSnapshot) -> String {
                 read.order_by_count,
                 read.limit.map(|value| value.to_string()).unwrap_or_else(|| "none".to_string()),
             ),
-            ExplainPublicReadExecution::Direct(plan) => format!(
-                "kind: public_read\nexecution: direct\ndirect_plan: {}",
-                explain_direct_public_read_plan_label(plan),
+            ExplainPublicReadExecution::HistoryRead(plan) => format!(
+                "kind: public_read\nexecution: history_read\nhistory_read_plan: {}",
+                explain_history_read_plan_label(plan),
             ),
         },
         ExplainPhysicalPlanSnapshot::PublicWrite(execution) => match execution.as_ref() {
@@ -2383,7 +2382,7 @@ pub(crate) struct PublicReadExplainBuildInput {
     pub(crate) semantics: PublicReadSemantics,
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) optimized_logical_plan: PublicReadLogicalPlan,
-    pub(crate) execution: PreparedPublicReadExecution,
+    pub(crate) execution: PublicReadPhysicalPlan,
     pub(crate) compiled_artifacts: PublicReadExplainCompiledArtifacts,
     pub(crate) routing_passes: Vec<RoutingPassTrace>,
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
@@ -2394,16 +2393,16 @@ pub(crate) struct PublicWriteExplainBuildInput {
     pub(crate) request: Option<ExplainRequest>,
     pub(crate) semantics: PublicWriteSemantics,
     pub(crate) planned_write: PlannedWrite,
-    pub(crate) execution: PreparedPublicWriteExecution,
+    pub(crate) execution: PublicWritePhysicalPlan,
     pub(crate) change_batches: Vec<ChangeBatch>,
     pub(crate) invariant_trace: Option<PublicWriteInvariantTrace>,
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct InternalExplainBuildInput {
+pub(crate) struct DirectExplainBuildInput {
     pub(crate) request: ExplainRequest,
-    pub(crate) logical_plan: InternalLogicalPlan,
+    pub(crate) logical_plan: DirectLogicalPlan,
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
 }
 
@@ -2592,18 +2591,16 @@ fn broad_public_read_explain_artifacts_collapsed(
         && logical_plan == optimized_logical_plan
 }
 
-pub(crate) fn build_internal_explain_artifacts(
-    input: InternalExplainBuildInput,
-) -> ExplainArtifacts {
-    let compiled_artifacts = compiled_artifacts_for_internal(&input.logical_plan);
+pub(crate) fn build_direct_explain_artifacts(input: DirectExplainBuildInput) -> ExplainArtifacts {
+    let compiled_artifacts = compiled_artifacts_for_direct(&input.logical_plan);
 
     build_explain_artifacts(
         Some(input.request),
-        Some(SemanticStatement::Internal(
+        Some(SemanticStatement::Direct(
             input.logical_plan.normalized_statements.clone(),
         )),
-        Some(LogicalPlan::Internal(input.logical_plan.clone())),
-        Some(LogicalPlan::Internal(input.logical_plan)),
+        Some(LogicalPlan::Direct(input.logical_plan.clone())),
+        Some(LogicalPlan::Direct(input.logical_plan)),
         None,
         compiled_artifacts,
         Vec::new(),
@@ -2655,7 +2652,7 @@ fn compiled_artifacts_for_public_read(
         bound_public_leaves: semantics
             .surface_bindings
             .iter()
-            .map(BoundPublicLeaf::from_surface_binding)
+            .map(BoundPublicLeaf::from_resolved_surface)
             .map(|leaf| bound_public_leaf_snapshot(&leaf))
             .collect(),
         dependency_spec: optimized_logical_plan
@@ -2698,7 +2695,7 @@ fn compiled_artifacts_for_public_write(
     let target = &planned_write.command.target;
 
     CompiledExplainArtifacts {
-        bound_public_leaves: vec![BoundPublicLeaf::from_surface_binding(target)]
+        bound_public_leaves: vec![BoundPublicLeaf::from_resolved_surface(target)]
             .iter()
             .map(bound_public_leaf_snapshot)
             .collect(),
@@ -2739,7 +2736,7 @@ fn compiled_artifacts_for_public_write(
     }
 }
 
-fn compiled_artifacts_for_internal(logical_plan: &InternalLogicalPlan) -> CompiledExplainArtifacts {
+fn compiled_artifacts_for_direct(logical_plan: &DirectLogicalPlan) -> CompiledExplainArtifacts {
     let statements = &logical_plan.normalized_statements;
 
     CompiledExplainArtifacts {
@@ -2823,8 +2820,8 @@ fn semantic_statement_snapshot(statement: &SemanticStatement) -> ExplainSemantic
         SemanticStatement::PublicWrite(semantics) => ExplainSemanticStatement::PublicWrite(
             Box::new(public_write_semantics_snapshot(semantics)),
         ),
-        SemanticStatement::Internal(statements) => {
-            ExplainSemanticStatement::Internal(Box::new(internal_statements_snapshot(statements)))
+        SemanticStatement::Direct(statements) => {
+            ExplainSemanticStatement::Direct(Box::new(direct_statements_snapshot(statements)))
         }
     }
 }
@@ -2834,7 +2831,7 @@ fn public_read_semantics_snapshot(semantics: &PublicReadSemantics) -> ExplainPub
         surface_bindings: semantics
             .surface_bindings
             .iter()
-            .map(surface_binding_snapshot)
+            .map(resolved_surface_snapshot)
             .collect(),
         relation_bindings: surface_relation_binding_snapshots(&semantics.surface_bindings),
         broad_statement: semantics
@@ -2895,17 +2892,15 @@ fn public_write_semantics_snapshot(
     semantics: &PublicWriteSemantics,
 ) -> ExplainPublicWriteSemantics {
     ExplainPublicWriteSemantics {
-        surface_binding: surface_binding_snapshot(&semantics.canonicalized.surface_binding),
+        surface_binding: resolved_surface_snapshot(&semantics.canonicalized.surface_binding),
         write_command: Box::new(write_command_snapshot(
             &semantics.canonicalized.write_command,
         )),
     }
 }
 
-fn internal_statements_snapshot(
-    statements: &NormalizedInternalStatements,
-) -> InternalStatementsSnapshot {
-    InternalStatementsSnapshot {
+fn direct_statements_snapshot(statements: &NormalizedDirectStatements) -> DirectStatementsSnapshot {
+    DirectStatementsSnapshot {
         sql: statements.sql.clone(),
         prepared_statements: statements
             .prepared_statements
@@ -3699,10 +3694,12 @@ fn broad_public_read_relation_snapshot(
 ) -> ExplainBroadPublicReadRelationSnapshot {
     match relation {
         BroadPublicReadRelation::Public(binding) => {
-            ExplainBroadPublicReadRelationSnapshot::Public(surface_binding_snapshot(binding))
+            ExplainBroadPublicReadRelationSnapshot::Public(resolved_surface_snapshot(binding))
         }
         BroadPublicReadRelation::LoweredPublic(binding) => {
-            ExplainBroadPublicReadRelationSnapshot::LoweredPublic(surface_binding_snapshot(binding))
+            ExplainBroadPublicReadRelationSnapshot::LoweredPublic(resolved_surface_snapshot(
+                binding,
+            ))
         }
         BroadPublicReadRelation::Internal(name) => {
             ExplainBroadPublicReadRelationSnapshot::Internal {
@@ -4647,8 +4644,8 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
         LogicalPlan::PublicRead(plan) => {
             ExplainLogicalPlanSnapshot::PublicRead(Box::new(match plan {
                 PublicReadLogicalPlan::Structured { plan } => ExplainPublicReadLogicalPlan {
-                    strategy: ExplainPublicReadStrategy::Structured,
-                    surface_bindings: vec![surface_binding_snapshot(&plan.read.surface_binding)],
+                    strategy: ExplainPublicReadPlanKind::Structured,
+                    surface_bindings: vec![resolved_surface_snapshot(&plan.read.surface_binding)],
                     relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
                         &plan.read.surface_binding,
                     )),
@@ -4668,45 +4665,46 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                         .effective_state_plan()
                         .map(effective_state_plan_snapshot)
                         .map(Box::new),
-                    direct_plan: None,
+                    history_read_plan: None,
                 },
-                PublicReadLogicalPlan::DirectHistory { plan, direct_plan } => {
-                    ExplainPublicReadLogicalPlan {
-                        strategy: ExplainPublicReadStrategy::DirectHistory,
-                        surface_bindings: vec![surface_binding_snapshot(
-                            &plan.read.surface_binding,
-                        )],
-                        relation_bindings: surface_relation_binding_snapshots(
-                            std::slice::from_ref(&plan.read.surface_binding),
-                        ),
-                        broad_statement: None,
-                        broad_relation_summary: None,
-                        surface_read_plan: Some(Box::new(surface_read_plan_snapshot(plan))),
-                        read: Some(Box::new(structured_public_read_snapshot(&plan.read))),
-                        dependency_spec: plan
-                            .dependency_spec()
-                            .map(dependency_spec_snapshot)
-                            .map(Box::new),
-                        effective_state_request: plan
-                            .effective_state_request()
-                            .map(effective_state_request_snapshot)
-                            .map(Box::new),
-                        effective_state_plan: plan
-                            .effective_state_plan()
-                            .map(effective_state_plan_snapshot)
-                            .map(Box::new),
-                        direct_plan: Some(Box::new(direct_public_read_plan_snapshot(direct_plan))),
-                    }
-                }
+                PublicReadLogicalPlan::HistoryRead {
+                    plan,
+                    history_read_plan,
+                } => ExplainPublicReadLogicalPlan {
+                    strategy: ExplainPublicReadPlanKind::HistoryRead,
+                    surface_bindings: vec![resolved_surface_snapshot(&plan.read.surface_binding)],
+                    relation_bindings: surface_relation_binding_snapshots(std::slice::from_ref(
+                        &plan.read.surface_binding,
+                    )),
+                    broad_statement: None,
+                    broad_relation_summary: None,
+                    surface_read_plan: Some(Box::new(surface_read_plan_snapshot(plan))),
+                    read: Some(Box::new(structured_public_read_snapshot(&plan.read))),
+                    dependency_spec: plan
+                        .dependency_spec()
+                        .map(dependency_spec_snapshot)
+                        .map(Box::new),
+                    effective_state_request: plan
+                        .effective_state_request()
+                        .map(effective_state_request_snapshot)
+                        .map(Box::new),
+                    effective_state_plan: plan
+                        .effective_state_plan()
+                        .map(effective_state_plan_snapshot)
+                        .map(Box::new),
+                    history_read_plan: Some(Box::new(history_read_plan_snapshot(
+                        history_read_plan,
+                    ))),
+                },
                 PublicReadLogicalPlan::Broad {
                     broad_statement,
                     surface_bindings,
                     dependency_spec,
                 } => ExplainPublicReadLogicalPlan {
-                    strategy: ExplainPublicReadStrategy::Broad,
+                    strategy: ExplainPublicReadPlanKind::Broad,
                     surface_bindings: surface_bindings
                         .iter()
-                        .map(surface_binding_snapshot)
+                        .map(resolved_surface_snapshot)
                         .collect(),
                     relation_bindings: surface_relation_binding_snapshots(surface_bindings),
                     broad_statement: Some(Box::new(broad_public_read_statement_snapshot(
@@ -4723,7 +4721,7 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                         .map(Box::new),
                     effective_state_request: None,
                     effective_state_plan: None,
-                    direct_plan: None,
+                    history_read_plan: None,
                 },
             }))
         }
@@ -4732,15 +4730,15 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 planned_write: Box::new(planned_write_snapshot(&plan.planned_write)),
             }))
         }
-        LogicalPlan::Internal(plan) => {
-            ExplainLogicalPlanSnapshot::Internal(Box::new(internal_logical_plan_snapshot(plan)))
+        LogicalPlan::Direct(plan) => {
+            ExplainLogicalPlanSnapshot::Direct(Box::new(direct_logical_plan_snapshot(plan)))
         }
     }
 }
 
-fn internal_logical_plan_snapshot(plan: &InternalLogicalPlan) -> ExplainInternalLogicalPlan {
-    ExplainInternalLogicalPlan {
-        statements: Box::new(internal_statements_snapshot(&plan.normalized_statements)),
+fn direct_logical_plan_snapshot(plan: &DirectLogicalPlan) -> ExplainDirectLogicalPlan {
+    ExplainDirectLogicalPlan {
+        statements: Box::new(direct_statements_snapshot(&plan.normalized_statements)),
         result_contract: result_contract_snapshot(plan.result_contract),
     }
 }
@@ -4757,27 +4755,27 @@ fn physical_plan_snapshot(plan: &PhysicalPlan) -> ExplainPhysicalPlanSnapshot {
 }
 
 fn public_read_execution_snapshot(
-    execution: &PreparedPublicReadExecution,
+    execution: &PublicReadPhysicalPlan,
 ) -> ExplainPublicReadExecution {
     match execution {
-        PreparedPublicReadExecution::LoweredSql(program) => {
-            ExplainPublicReadExecution::LoweredSql(Box::new(lowered_read_program_snapshot(program)))
+        PublicReadPhysicalPlan::LoweredSql(batch) => {
+            ExplainPublicReadExecution::LoweredSql(Box::new(lowered_read_batch_snapshot(batch)))
         }
-        PreparedPublicReadExecution::ReadTimeProjection(read) => {
+        PublicReadPhysicalPlan::ReadTimeProjection(read) => {
             ExplainPublicReadExecution::ReadTimeProjection(Box::new(
                 read_time_projection_read_snapshot(read),
             ))
         }
-        PreparedPublicReadExecution::Direct(plan) => {
-            ExplainPublicReadExecution::Direct(Box::new(direct_public_read_plan_snapshot(plan)))
+        PublicReadPhysicalPlan::HistoryRead(plan) => {
+            ExplainPublicReadExecution::HistoryRead(Box::new(history_read_plan_snapshot(plan)))
         }
     }
 }
 
 fn read_time_projection_read_snapshot(
-    read: &ReadTimeProjectionRead,
-) -> ExplainReadTimeProjectionReadSnapshot {
-    ExplainReadTimeProjectionReadSnapshot {
+    read: &ReadTimeProjectionPlan,
+) -> ExplainReadTimeProjectionPlanSnapshot {
+    ExplainReadTimeProjectionPlanSnapshot {
         surface_name: read.surface_name.clone(),
         projection_count: read.query.projections.len(),
         filter_count: read.query.filters.len(),
@@ -4787,11 +4785,11 @@ fn read_time_projection_read_snapshot(
 }
 
 fn public_write_execution_snapshot(
-    execution: &PreparedPublicWriteExecution,
+    execution: &PublicWritePhysicalPlan,
 ) -> ExplainPublicWriteExecution {
     match execution {
-        PreparedPublicWriteExecution::Noop => ExplainPublicWriteExecution::Noop,
-        PreparedPublicWriteExecution::Materialize(materialization) => {
+        PublicWritePhysicalPlan::Noop => ExplainPublicWriteExecution::Noop,
+        PublicWritePhysicalPlan::Materialize(materialization) => {
             ExplainPublicWriteExecution::Materialize(Box::new(
                 public_write_materialization_snapshot(materialization),
             ))
@@ -4816,22 +4814,18 @@ fn public_write_execution_partition_snapshot(
 ) -> PublicWriteExecutionPartitionSnapshot {
     match partition {
         PublicWriteExecutionPartition::Tracked(execution) => {
-            PublicWriteExecutionPartitionSnapshot::Tracked(tracked_write_execution_snapshot(
-                execution,
-            ))
+            PublicWriteExecutionPartitionSnapshot::Tracked(tracked_write_plan_snapshot(execution))
         }
         PublicWriteExecutionPartition::Untracked(execution) => {
-            PublicWriteExecutionPartitionSnapshot::Untracked(untracked_write_execution_snapshot(
+            PublicWriteExecutionPartitionSnapshot::Untracked(untracked_write_plan_snapshot(
                 execution,
             ))
         }
     }
 }
 
-fn tracked_write_execution_snapshot(
-    execution: &TrackedWriteExecution,
-) -> TrackedWriteExecutionSnapshot {
-    TrackedWriteExecutionSnapshot {
+fn tracked_write_plan_snapshot(execution: &TrackedWritePlan) -> TrackedWritePlanSnapshot {
+    TrackedWritePlanSnapshot {
         schema_live_table_requirements: execution
             .schema_live_table_requirements
             .iter()
@@ -4843,10 +4837,8 @@ fn tracked_write_execution_snapshot(
     }
 }
 
-fn untracked_write_execution_snapshot(
-    execution: &UntrackedWriteExecution,
-) -> UntrackedWriteExecutionSnapshot {
-    UntrackedWriteExecutionSnapshot {
+fn untracked_write_plan_snapshot(execution: &UntrackedWritePlan) -> UntrackedWritePlanSnapshot {
+    UntrackedWritePlanSnapshot {
         intended_post_state: execution
             .intended_post_state
             .iter()
@@ -4862,7 +4854,7 @@ fn structured_public_read_snapshot(read: &StructuredPublicRead) -> StructuredPub
     StructuredPublicReadSnapshot {
         bound_parameters: read.bound_parameters.clone(),
         requested_version_id: read.requested_version_id.clone(),
-        surface_binding: surface_binding_snapshot(&read.surface_binding),
+        surface_binding: resolved_surface_snapshot(&read.surface_binding),
         read_command: Box::new(read_command_snapshot(&read.read_command)),
         query: normalized_public_read_query_snapshot(&read.query),
     }
@@ -4931,7 +4923,7 @@ fn read_plan_snapshot(plan: &ReadPlan) -> ExplainReadPlan {
 
 fn canonical_state_scan_snapshot(scan: &CanonicalStateScan) -> CanonicalStateScanSnapshot {
     CanonicalStateScanSnapshot {
-        binding: surface_binding_snapshot(&scan.binding),
+        binding: resolved_surface_snapshot(&scan.binding),
         version_scope: version_scope_snapshot(scan.version_scope),
         expose_version_id: scan.expose_version_id,
         include_tombstones: scan.include_tombstones,
@@ -4949,7 +4941,7 @@ fn canonical_filesystem_scan_snapshot(
     scan: &CanonicalFilesystemScan,
 ) -> CanonicalFilesystemScanSnapshot {
     CanonicalFilesystemScanSnapshot {
-        binding: surface_binding_snapshot(&scan.binding),
+        binding: resolved_surface_snapshot(&scan.binding),
         kind: filesystem_kind_snapshot(scan.kind),
         version_scope: version_scope_snapshot(scan.version_scope),
     }
@@ -4957,14 +4949,14 @@ fn canonical_filesystem_scan_snapshot(
 
 fn canonical_admin_scan_snapshot(scan: &CanonicalAdminScan) -> CanonicalAdminScanSnapshot {
     CanonicalAdminScanSnapshot {
-        binding: surface_binding_snapshot(&scan.binding),
+        binding: resolved_surface_snapshot(&scan.binding),
         kind: canonical_admin_kind_snapshot(scan.kind),
     }
 }
 
 fn canonical_change_scan_snapshot(scan: &CanonicalChangeScan) -> CanonicalChangeScanSnapshot {
     CanonicalChangeScanSnapshot {
-        binding: surface_binding_snapshot(&scan.binding),
+        binding: resolved_surface_snapshot(&scan.binding),
     }
 }
 
@@ -4972,7 +4964,7 @@ fn canonical_working_changes_scan_snapshot(
     scan: &CanonicalWorkingChangesScan,
 ) -> CanonicalWorkingChangesScanSnapshot {
     CanonicalWorkingChangesScanSnapshot {
-        binding: surface_binding_snapshot(&scan.binding),
+        binding: resolved_surface_snapshot(&scan.binding),
     }
 }
 
@@ -5022,7 +5014,7 @@ fn planned_write_snapshot(plan: &PlannedWrite) -> PlannedWriteSnapshot {
 fn write_command_snapshot(command: &WriteCommand) -> WriteCommandSnapshot {
     WriteCommandSnapshot {
         operation_kind: write_operation_kind_snapshot(command.operation_kind),
-        target: surface_binding_snapshot(&command.target),
+        target: resolved_surface_snapshot(&command.target),
         selector: write_selector_snapshot(&command.selector),
         payload: mutation_payload_snapshot(&command.payload),
         on_conflict: command
@@ -5031,7 +5023,7 @@ fn write_command_snapshot(command: &WriteCommand) -> WriteCommandSnapshot {
             .map(insert_on_conflict_snapshot),
         requested_mode: write_mode_request_snapshot(command.requested_mode),
         bound_parameters: command.bound_parameters.clone(),
-        execution_context: execution_context_snapshot(&command.execution_context),
+        statement_context: statement_context_snapshot(&command.statement_context),
     }
 }
 
@@ -5062,10 +5054,10 @@ fn insert_on_conflict_snapshot(conflict: &InsertOnConflict) -> InsertOnConflictS
     }
 }
 
-fn execution_context_snapshot(
-    context: &crate::sql::semantic_ir::ExecutionContext,
-) -> ExecutionContextSnapshot {
-    ExecutionContextSnapshot {
+fn statement_context_snapshot(
+    context: &crate::sql::semantic_ir::StatementContext,
+) -> StatementContextSnapshot {
+    StatementContextSnapshot {
         dialect: context.dialect.map(sql_dialect_snapshot),
         writer_key: context.writer_key.clone(),
         requested_version_id: context.requested_version_id.clone(),
@@ -5307,15 +5299,15 @@ fn plan_effects_snapshot(effects: &PlanEffects) -> PlanEffectsSnapshot {
     }
 }
 
-fn lowered_read_program_snapshot(program: &LoweredReadProgram) -> LoweredReadProgramSnapshot {
-    LoweredReadProgramSnapshot {
-        statements: program
+fn lowered_read_batch_snapshot(batch: &LoweredReadBatch) -> LoweredReadBatchSnapshot {
+    LoweredReadBatchSnapshot {
+        statements: batch
             .statements
             .iter()
             .map(lowered_read_statement_snapshot)
             .collect(),
-        pushdown_decision: pushdown_snapshot(&program.pushdown_decision),
-        result_columns: lowered_result_columns_snapshot(&program.result_columns),
+        pushdown_decision: pushdown_snapshot(&batch.pushdown_decision),
+        result_columns: lowered_result_columns_snapshot(&batch.result_columns),
     }
 }
 
@@ -5402,29 +5394,25 @@ fn lowered_result_columns_snapshot(columns: &LoweredResultColumns) -> LoweredRes
     }
 }
 
-fn direct_public_read_plan_snapshot(plan: &DirectPublicReadPlan) -> ExplainDirectPublicReadPlan {
+fn history_read_plan_snapshot(plan: &HistoryReadPlan) -> ExplainHistoryReadPlan {
     match plan {
-        DirectPublicReadPlan::StateHistory(plan) => ExplainDirectPublicReadPlan::StateHistory(
-            Box::new(state_history_direct_plan_snapshot(plan)),
-        ),
-        DirectPublicReadPlan::EntityHistory(plan) => ExplainDirectPublicReadPlan::EntityHistory(
-            Box::new(entity_history_direct_plan_snapshot(plan)),
-        ),
-        DirectPublicReadPlan::FileHistory(plan) => ExplainDirectPublicReadPlan::FileHistory(
-            Box::new(file_history_direct_plan_snapshot(plan)),
-        ),
-        DirectPublicReadPlan::DirectoryHistory(plan) => {
-            ExplainDirectPublicReadPlan::DirectoryHistory(Box::new(
-                directory_history_direct_plan_snapshot(plan),
-            ))
+        HistoryReadPlan::StateHistory(plan) => {
+            ExplainHistoryReadPlan::StateHistory(Box::new(state_history_read_plan_snapshot(plan)))
         }
+        HistoryReadPlan::EntityHistory(plan) => {
+            ExplainHistoryReadPlan::EntityHistory(Box::new(entity_history_read_plan_snapshot(plan)))
+        }
+        HistoryReadPlan::FileHistory(plan) => {
+            ExplainHistoryReadPlan::FileHistory(Box::new(file_history_read_plan_snapshot(plan)))
+        }
+        HistoryReadPlan::DirectoryHistory(plan) => ExplainHistoryReadPlan::DirectoryHistory(
+            Box::new(directory_history_read_plan_snapshot(plan)),
+        ),
     }
 }
 
-fn state_history_direct_plan_snapshot(
-    plan: &StateHistoryDirectReadPlan,
-) -> StateHistoryDirectPlanSnapshot {
-    StateHistoryDirectPlanSnapshot {
+fn state_history_read_plan_snapshot(plan: &StateHistoryReadPlan) -> StateHistoryReadPlanSnapshot {
+    StateHistoryReadPlanSnapshot {
         request: state_history_request_snapshot(&plan.request),
         predicates: plan
             .predicates
@@ -5444,7 +5432,7 @@ fn state_history_direct_plan_snapshot(
         group_by: plan
             .group_by_fields
             .iter()
-            .map(direct_state_history_field_snapshot)
+            .map(state_history_field_snapshot)
             .collect(),
         having: plan
             .having
@@ -5458,10 +5446,10 @@ fn state_history_direct_plan_snapshot(
     }
 }
 
-fn entity_history_direct_plan_snapshot(
-    plan: &EntityHistoryDirectReadPlan,
-) -> EntityHistoryDirectPlanSnapshot {
-    EntityHistoryDirectPlanSnapshot {
+fn entity_history_read_plan_snapshot(
+    plan: &EntityHistoryReadPlan,
+) -> EntityHistoryReadPlanSnapshot {
+    EntityHistoryReadPlanSnapshot {
         request: state_history_request_snapshot(&plan.request),
         predicates: plan
             .predicates
@@ -5483,14 +5471,12 @@ fn entity_history_direct_plan_snapshot(
         wildcard_projection: plan.wildcard_projection,
         wildcard_columns: plan.wildcard_columns.clone(),
         result_columns: lowered_result_columns_snapshot(&plan.result_columns),
-        surface_binding: surface_binding_snapshot(&plan.surface_binding),
+        surface_binding: resolved_surface_snapshot(&plan.surface_binding),
     }
 }
 
-fn file_history_direct_plan_snapshot(
-    plan: &FileHistoryDirectReadPlan,
-) -> FileHistoryDirectPlanSnapshot {
-    FileHistoryDirectPlanSnapshot {
+fn file_history_read_plan_snapshot(plan: &FileHistoryReadPlan) -> FileHistoryReadPlanSnapshot {
+    FileHistoryReadPlanSnapshot {
         request: file_history_request_snapshot(&plan.request),
         predicates: plan
             .predicates
@@ -5517,10 +5503,10 @@ fn file_history_direct_plan_snapshot(
     }
 }
 
-fn directory_history_direct_plan_snapshot(
-    plan: &DirectoryHistoryDirectReadPlan,
-) -> DirectoryHistoryDirectPlanSnapshot {
-    DirectoryHistoryDirectPlanSnapshot {
+fn directory_history_read_plan_snapshot(
+    plan: &DirectoryHistoryReadPlan,
+) -> DirectoryHistoryReadPlanSnapshot {
+    DirectoryHistoryReadPlanSnapshot {
         request: directory_history_request_snapshot(&plan.request),
         predicates: plan
             .predicates
@@ -5596,8 +5582,8 @@ fn directory_history_request_snapshot(
     }
 }
 
-fn surface_binding_snapshot(binding: &SurfaceBinding) -> SurfaceBindingSnapshot {
-    SurfaceBindingSnapshot {
+fn resolved_surface_snapshot(binding: &ResolvedSurface) -> ResolvedSurfaceSnapshot {
+    ResolvedSurfaceSnapshot {
         public_name: binding.descriptor.public_name.clone(),
         surface_family: surface_family_snapshot(binding.descriptor.surface_family),
         surface_variant: surface_variant_snapshot(binding.descriptor.surface_variant),
@@ -5614,7 +5600,7 @@ fn surface_binding_snapshot(binding: &SurfaceBinding) -> SurfaceBindingSnapshot 
 }
 
 fn surface_relation_binding_snapshots(
-    bindings: &[SurfaceBinding],
+    bindings: &[ResolvedSurface],
 ) -> Vec<ExplainRelationBindingSnapshot> {
     bindings
         .iter()
@@ -5876,9 +5862,9 @@ fn canonical_admin_kind_snapshot(kind: CanonicalAdminKind) -> ExplainCanonicalAd
     }
 }
 
-fn read_contract_snapshot(contract: ReadContract) -> ExplainReadContract {
+fn read_contract_snapshot(contract: ReadVisibility) -> ExplainReadContract {
     match contract {
-        ReadContract::CommittedAtStart => ExplainReadContract::CommittedAtStart,
+        ReadVisibility::CommittedAtStart => ExplainReadContract::CommittedAtStart,
     }
 }
 
@@ -5969,7 +5955,7 @@ fn result_contract_snapshot(contract: ResultContract) -> ExplainResultContract {
         ResultContract::Select => ExplainResultContract::Select,
         ResultContract::DmlNoReturning => ExplainResultContract::DmlNoReturning,
         ResultContract::DmlReturning => ExplainResultContract::DmlReturning,
-        ResultContract::Other => ExplainResultContract::Other,
+        ResultContract::Nothing => ExplainResultContract::Nothing,
     }
 }
 
@@ -6090,9 +6076,7 @@ fn state_source_kind_snapshot(kind: StateSourceKind) -> ExplainStateSourceKind {
     }
 }
 
-fn direct_state_history_field_snapshot(
-    field: &DirectStateHistoryField,
-) -> ExplainDirectStateHistoryField {
+fn state_history_field_snapshot(field: &DirectStateHistoryField) -> ExplainDirectStateHistoryField {
     match field {
         DirectStateHistoryField::EntityId => ExplainDirectStateHistoryField::EntityId,
         DirectStateHistoryField::SchemaKey => ExplainDirectStateHistoryField::SchemaKey,
@@ -6110,7 +6094,7 @@ fn direct_state_history_field_snapshot(
     }
 }
 
-fn direct_entity_history_field_snapshot(
+fn entity_history_field_snapshot(
     field: &DirectEntityHistoryField,
 ) -> ExplainDirectEntityHistoryField {
     match field {
@@ -6118,14 +6102,12 @@ fn direct_entity_history_field_snapshot(
             ExplainDirectEntityHistoryField::Property(name.clone())
         }
         DirectEntityHistoryField::State(field) => {
-            ExplainDirectEntityHistoryField::State(direct_state_history_field_snapshot(field))
+            ExplainDirectEntityHistoryField::State(state_history_field_snapshot(field))
         }
     }
 }
 
-fn direct_file_history_field_snapshot(
-    field: &DirectFileHistoryField,
-) -> ExplainDirectFileHistoryField {
+fn file_history_field_snapshot(field: &DirectFileHistoryField) -> ExplainDirectFileHistoryField {
     match field {
         DirectFileHistoryField::Id => ExplainDirectFileHistoryField::Id,
         DirectFileHistoryField::Path => ExplainDirectFileHistoryField::Path,
@@ -6147,7 +6129,7 @@ fn direct_file_history_field_snapshot(
     }
 }
 
-fn direct_directory_history_field_snapshot(
+fn directory_history_field_snapshot(
     field: &DirectDirectoryHistoryField,
 ) -> ExplainDirectDirectoryHistoryField {
     match field {
@@ -6179,7 +6161,7 @@ fn direct_directory_history_field_snapshot(
     }
 }
 
-fn direct_aggregate_snapshot(_: &StateHistoryAggregate) -> ExplainDirectAggregate {
+fn history_aggregate_snapshot(_: &StateHistoryAggregate) -> ExplainDirectAggregate {
     ExplainDirectAggregate::Count
 }
 
@@ -6191,7 +6173,7 @@ fn directory_history_aggregate_snapshot(_: &DirectoryHistoryAggregate) -> Explai
     ExplainDirectAggregate::Count
 }
 
-fn direct_predicate_snapshot<Field>(
+fn history_predicate_snapshot<Field>(
     operator: ExplainPredicateOperator,
     field: Field,
     value: Option<Value>,
@@ -6212,12 +6194,12 @@ fn state_history_projection_snapshot(
         output_name: projection.output_name.clone(),
         value: match &projection.value {
             StateHistoryProjectionValue::Field(field) => {
-                StateHistoryProjectionValueSnapshot::Field(direct_state_history_field_snapshot(
-                    field,
-                ))
+                StateHistoryProjectionValueSnapshot::Field(state_history_field_snapshot(field))
             }
             StateHistoryProjectionValue::Aggregate(aggregate) => {
-                StateHistoryProjectionValueSnapshot::Aggregate(direct_aggregate_snapshot(aggregate))
+                StateHistoryProjectionValueSnapshot::Aggregate(history_aggregate_snapshot(
+                    aggregate,
+                ))
             }
         },
     }
@@ -6228,10 +6210,10 @@ fn state_history_sort_key_snapshot(key: &StateHistorySortKey) -> StateHistorySor
         output_name: key.output_name.clone(),
         value: key.value.as_ref().map(|value| match value {
             StateHistorySortValue::Field(field) => {
-                StateHistorySortValueSnapshot::Field(direct_state_history_field_snapshot(field))
+                StateHistorySortValueSnapshot::Field(state_history_field_snapshot(field))
             }
             StateHistorySortValue::Aggregate(aggregate) => {
-                StateHistorySortValueSnapshot::Aggregate(direct_aggregate_snapshot(aggregate))
+                StateHistorySortValueSnapshot::Aggregate(history_aggregate_snapshot(aggregate))
             }
         }),
         descending: key.descending,
@@ -6242,57 +6224,57 @@ fn state_history_predicate_snapshot(
     predicate: &StateHistoryPredicate,
 ) -> DirectPredicateSnapshot<ExplainDirectStateHistoryField> {
     match predicate {
-        StateHistoryPredicate::Eq(field, value) => direct_predicate_snapshot(
+        StateHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        StateHistoryPredicate::NotEq(field, value) => direct_predicate_snapshot(
+        StateHistoryPredicate::NotEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::NotEq,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        StateHistoryPredicate::Gt(field, value) => direct_predicate_snapshot(
+        StateHistoryPredicate::Gt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Gt,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        StateHistoryPredicate::GtEq(field, value) => direct_predicate_snapshot(
+        StateHistoryPredicate::GtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::GtEq,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        StateHistoryPredicate::Lt(field, value) => direct_predicate_snapshot(
+        StateHistoryPredicate::Lt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Lt,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        StateHistoryPredicate::LtEq(field, value) => direct_predicate_snapshot(
+        StateHistoryPredicate::LtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::LtEq,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        StateHistoryPredicate::In(field, values) => direct_predicate_snapshot(
+        StateHistoryPredicate::In(field, values) => history_predicate_snapshot(
             ExplainPredicateOperator::In,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             None,
             values.clone(),
         ),
-        StateHistoryPredicate::IsNull(field) => direct_predicate_snapshot(
+        StateHistoryPredicate::IsNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNull,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
-        StateHistoryPredicate::IsNotNull(field) => direct_predicate_snapshot(
+        StateHistoryPredicate::IsNotNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNotNull,
-            direct_state_history_field_snapshot(field),
+            state_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
@@ -6355,7 +6337,7 @@ fn state_history_aggregate_predicate_snapshot_with_operator(
 ) -> StateHistoryAggregatePredicateSnapshot {
     StateHistoryAggregatePredicateSnapshot {
         operator,
-        aggregate: direct_aggregate_snapshot(aggregate),
+        aggregate: history_aggregate_snapshot(aggregate),
         value,
     }
 }
@@ -6365,7 +6347,7 @@ fn entity_history_projection_snapshot(
 ) -> DirectFieldProjectionSnapshot<ExplainDirectEntityHistoryField> {
     DirectFieldProjectionSnapshot {
         output_name: projection.output_name.clone(),
-        field: direct_entity_history_field_snapshot(&projection.field),
+        field: entity_history_field_snapshot(&projection.field),
     }
 }
 
@@ -6374,7 +6356,7 @@ fn entity_history_sort_key_snapshot(
 ) -> DirectSortKeySnapshot<ExplainDirectEntityHistoryField> {
     DirectSortKeySnapshot {
         output_name: key.output_name.clone(),
-        field: key.field.as_ref().map(direct_entity_history_field_snapshot),
+        field: key.field.as_ref().map(entity_history_field_snapshot),
         descending: key.descending,
     }
 }
@@ -6383,57 +6365,57 @@ fn entity_history_predicate_snapshot(
     predicate: &EntityHistoryPredicate,
 ) -> DirectPredicateSnapshot<ExplainDirectEntityHistoryField> {
     match predicate {
-        EntityHistoryPredicate::Eq(field, value) => direct_predicate_snapshot(
+        EntityHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        EntityHistoryPredicate::NotEq(field, value) => direct_predicate_snapshot(
+        EntityHistoryPredicate::NotEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::NotEq,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        EntityHistoryPredicate::Gt(field, value) => direct_predicate_snapshot(
+        EntityHistoryPredicate::Gt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Gt,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        EntityHistoryPredicate::GtEq(field, value) => direct_predicate_snapshot(
+        EntityHistoryPredicate::GtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::GtEq,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        EntityHistoryPredicate::Lt(field, value) => direct_predicate_snapshot(
+        EntityHistoryPredicate::Lt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Lt,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        EntityHistoryPredicate::LtEq(field, value) => direct_predicate_snapshot(
+        EntityHistoryPredicate::LtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::LtEq,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        EntityHistoryPredicate::In(field, values) => direct_predicate_snapshot(
+        EntityHistoryPredicate::In(field, values) => history_predicate_snapshot(
             ExplainPredicateOperator::In,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             None,
             values.clone(),
         ),
-        EntityHistoryPredicate::IsNull(field) => direct_predicate_snapshot(
+        EntityHistoryPredicate::IsNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNull,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
-        EntityHistoryPredicate::IsNotNull(field) => direct_predicate_snapshot(
+        EntityHistoryPredicate::IsNotNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNotNull,
-            direct_entity_history_field_snapshot(field),
+            entity_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
@@ -6445,7 +6427,7 @@ fn file_history_projection_snapshot(
 ) -> DirectFieldProjectionSnapshot<ExplainDirectFileHistoryField> {
     DirectFieldProjectionSnapshot {
         output_name: projection.output_name.clone(),
-        field: direct_file_history_field_snapshot(&projection.field),
+        field: file_history_field_snapshot(&projection.field),
     }
 }
 
@@ -6454,7 +6436,7 @@ fn file_history_sort_key_snapshot(
 ) -> DirectSortKeySnapshot<ExplainDirectFileHistoryField> {
     DirectSortKeySnapshot {
         output_name: key.output_name.clone(),
-        field: key.field.as_ref().map(direct_file_history_field_snapshot),
+        field: key.field.as_ref().map(file_history_field_snapshot),
         descending: key.descending,
     }
 }
@@ -6463,57 +6445,57 @@ fn file_history_predicate_snapshot(
     predicate: &FileHistoryPredicate,
 ) -> DirectPredicateSnapshot<ExplainDirectFileHistoryField> {
     match predicate {
-        FileHistoryPredicate::Eq(field, value) => direct_predicate_snapshot(
+        FileHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        FileHistoryPredicate::NotEq(field, value) => direct_predicate_snapshot(
+        FileHistoryPredicate::NotEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::NotEq,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        FileHistoryPredicate::Gt(field, value) => direct_predicate_snapshot(
+        FileHistoryPredicate::Gt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Gt,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        FileHistoryPredicate::GtEq(field, value) => direct_predicate_snapshot(
+        FileHistoryPredicate::GtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::GtEq,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        FileHistoryPredicate::Lt(field, value) => direct_predicate_snapshot(
+        FileHistoryPredicate::Lt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Lt,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        FileHistoryPredicate::LtEq(field, value) => direct_predicate_snapshot(
+        FileHistoryPredicate::LtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::LtEq,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        FileHistoryPredicate::In(field, values) => direct_predicate_snapshot(
+        FileHistoryPredicate::In(field, values) => history_predicate_snapshot(
             ExplainPredicateOperator::In,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             None,
             values.clone(),
         ),
-        FileHistoryPredicate::IsNull(field) => direct_predicate_snapshot(
+        FileHistoryPredicate::IsNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNull,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
-        FileHistoryPredicate::IsNotNull(field) => direct_predicate_snapshot(
+        FileHistoryPredicate::IsNotNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNotNull,
-            direct_file_history_field_snapshot(field),
+            file_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
@@ -6525,7 +6507,7 @@ fn directory_history_projection_snapshot(
 ) -> DirectFieldProjectionSnapshot<ExplainDirectDirectoryHistoryField> {
     DirectFieldProjectionSnapshot {
         output_name: projection.output_name.clone(),
-        field: direct_directory_history_field_snapshot(&projection.field),
+        field: directory_history_field_snapshot(&projection.field),
     }
 }
 
@@ -6534,10 +6516,7 @@ fn directory_history_sort_key_snapshot(
 ) -> DirectSortKeySnapshot<ExplainDirectDirectoryHistoryField> {
     DirectSortKeySnapshot {
         output_name: key.output_name.clone(),
-        field: key
-            .field
-            .as_ref()
-            .map(direct_directory_history_field_snapshot),
+        field: key.field.as_ref().map(directory_history_field_snapshot),
         descending: key.descending,
     }
 }
@@ -6546,57 +6525,57 @@ fn directory_history_predicate_snapshot(
     predicate: &DirectoryHistoryPredicate,
 ) -> DirectPredicateSnapshot<ExplainDirectDirectoryHistoryField> {
     match predicate {
-        DirectoryHistoryPredicate::Eq(field, value) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::NotEq(field, value) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::NotEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::NotEq,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::Gt(field, value) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::Gt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Gt,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::GtEq(field, value) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::GtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::GtEq,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::Lt(field, value) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::Lt(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Lt,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::LtEq(field, value) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::LtEq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::LtEq,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             Some(value.clone()),
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::In(field, values) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::In(field, values) => history_predicate_snapshot(
             ExplainPredicateOperator::In,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             None,
             values.clone(),
         ),
-        DirectoryHistoryPredicate::IsNull(field) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::IsNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNull,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
-        DirectoryHistoryPredicate::IsNotNull(field) => direct_predicate_snapshot(
+        DirectoryHistoryPredicate::IsNotNull(field) => history_predicate_snapshot(
             ExplainPredicateOperator::IsNotNull,
-            direct_directory_history_field_snapshot(field),
+            directory_history_field_snapshot(field),
             None,
             Vec::new(),
         ),
@@ -6617,11 +6596,11 @@ fn explain_mode_label(mode: ExplainMode) -> &'static str {
     }
 }
 
-fn explain_public_read_strategy_label(strategy: ExplainPublicReadStrategy) -> &'static str {
+fn explain_public_read_plan_kind_label(strategy: ExplainPublicReadPlanKind) -> &'static str {
     match strategy {
-        ExplainPublicReadStrategy::Structured => "structured",
-        ExplainPublicReadStrategy::DirectHistory => "direct_history",
-        ExplainPublicReadStrategy::Broad => "broad",
+        ExplainPublicReadPlanKind::Structured => "structured",
+        ExplainPublicReadPlanKind::HistoryRead => "history_read",
+        ExplainPublicReadPlanKind::Broad => "broad",
     }
 }
 
@@ -6645,7 +6624,7 @@ fn explain_result_contract_label(contract: ExplainResultContract) -> &'static st
         ExplainResultContract::Select => "select",
         ExplainResultContract::DmlNoReturning => "dml_no_returning",
         ExplainResultContract::DmlReturning => "dml_returning",
-        ExplainResultContract::Other => "other",
+        ExplainResultContract::Nothing => "nothing",
     }
 }
 
@@ -6671,16 +6650,16 @@ fn explain_stage_label(stage: ExplainStage) -> &'static str {
     }
 }
 
-fn explain_direct_public_read_plan_label(plan: &ExplainDirectPublicReadPlan) -> &'static str {
+fn explain_history_read_plan_label(plan: &ExplainHistoryReadPlan) -> &'static str {
     match plan {
-        ExplainDirectPublicReadPlan::StateHistory(_) => "state_history",
-        ExplainDirectPublicReadPlan::EntityHistory(_) => "entity_history",
-        ExplainDirectPublicReadPlan::FileHistory(_) => "file_history",
-        ExplainDirectPublicReadPlan::DirectoryHistory(_) => "directory_history",
+        ExplainHistoryReadPlan::StateHistory(_) => "state_history",
+        ExplainHistoryReadPlan::EntityHistory(_) => "entity_history",
+        ExplainHistoryReadPlan::FileHistory(_) => "file_history",
+        ExplainHistoryReadPlan::DirectoryHistory(_) => "directory_history",
     }
 }
 
-fn join_public_names(bindings: &[SurfaceBindingSnapshot]) -> String {
+fn join_public_names(bindings: &[ResolvedSurfaceSnapshot]) -> String {
     if bindings.is_empty() {
         return "(none)".to_string();
     }

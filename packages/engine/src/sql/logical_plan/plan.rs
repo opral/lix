@@ -1,12 +1,12 @@
-use crate::catalog::SurfaceBinding;
+use crate::catalog::ResolvedSurface;
 use crate::contracts::EffectiveStateRequest;
 use crate::sql::logical_plan::dependency_spec::DependencySpec;
-use crate::sql::logical_plan::direct_reads::DirectPublicReadPlan;
+use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, PlannedWrite, StructuredPublicRead,
 };
 use crate::sql::logical_plan::result_contract::ResultContract;
-use crate::sql::semantic_ir::internal::NormalizedInternalStatements;
+use crate::sql::semantic_ir::direct::NormalizedDirectStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,13 +40,13 @@ pub(crate) enum PublicReadLogicalPlan {
     Structured {
         plan: SurfaceReadPlan,
     },
-    DirectHistory {
+    HistoryRead {
         plan: SurfaceReadPlan,
-        direct_plan: DirectPublicReadPlan,
+        history_read_plan: HistoryReadPlan,
     },
     Broad {
         broad_statement: Box<BroadPublicReadStatement>,
-        surface_bindings: Vec<SurfaceBinding>,
+        surface_bindings: Vec<ResolvedSurface>,
         dependency_spec: Option<DependencySpec>,
     },
 }
@@ -54,7 +54,7 @@ pub(crate) enum PublicReadLogicalPlan {
 impl PublicReadLogicalPlan {
     pub(crate) fn surface_read_plan(&self) -> Option<&SurfaceReadPlan> {
         match self {
-            Self::Structured { plan } | Self::DirectHistory { plan, .. } => Some(plan),
+            Self::Structured { plan } | Self::HistoryRead { plan, .. } => Some(plan),
             Self::Broad { .. } => None,
         }
     }
@@ -93,8 +93,8 @@ pub(crate) struct PublicWriteLogicalPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct InternalLogicalPlan {
-    pub(crate) normalized_statements: NormalizedInternalStatements,
+pub(crate) struct DirectLogicalPlan {
+    pub(crate) normalized_statements: NormalizedDirectStatements,
     pub(crate) result_contract: ResultContract,
 }
 
@@ -102,5 +102,5 @@ pub(crate) struct InternalLogicalPlan {
 pub(crate) enum LogicalPlan {
     PublicRead(PublicReadLogicalPlan),
     PublicWrite(PublicWriteLogicalPlan),
-    Internal(InternalLogicalPlan),
+    Direct(DirectLogicalPlan),
 }

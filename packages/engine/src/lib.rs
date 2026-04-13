@@ -49,7 +49,7 @@ pub use common::{
 };
 pub use common::{ExecuteResult, QueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
-pub use contracts::{CommittedVersionFrontier, ExecuteOptions, ReplayCursor, TransactionMode};
+pub use contracts::{CommittedVersionFrontier, ExecuteOptions, ReplayCursor, TransactionBeginMode};
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,

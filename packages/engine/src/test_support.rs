@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::PendingView;
+use crate::contracts::PendingOverlayView;
 use crate::contracts::SharedFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::services::functions::SystemFunctionProvider;
@@ -15,7 +15,7 @@ use crate::sql::{PlannedWrite, ResolvedWritePlan};
 use crate::transaction::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
-    QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
+    QueryResult, ReplayCursor, Session, SqlDialect, TransactionBeginMode, Value,
 };
 
 type SqlPredicate = Arc<dyn Fn(&str, &[Value]) -> bool + Send + Sync>;
@@ -29,7 +29,7 @@ pub(crate) enum TestSqliteBackendEvent {
         in_transaction: bool,
     },
     BeginTransaction {
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     },
     Commit,
     Rollback,
@@ -62,7 +62,7 @@ pub(crate) struct TestSqliteBackend {
 struct TestSqliteTransaction {
     connection: Arc<Mutex<rusqlite::Connection>>,
     state: Arc<Mutex<TestSqliteBackendState>>,
-    mode: TransactionMode,
+    mode: TransactionBeginMode,
 }
 
 impl TestSqliteBackend {
@@ -164,14 +164,14 @@ impl LixBackend for TestSqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         {
             let connection = self.connection.lock().expect("sqlite connection lock");
             connection
                 .execute_batch(match mode {
-                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN",
-                    TransactionMode::Write => "BEGIN IMMEDIATE",
+                    TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN",
+                    TransactionBeginMode::Write => "BEGIN IMMEDIATE",
                 })
                 .map_err(sqlite_error)?;
         }
@@ -191,7 +191,7 @@ impl LixBackend for TestSqliteBackend {
         &self,
         _name: &str,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.begin_transaction(TransactionMode::Write).await
+        self.begin_transaction(TransactionBeginMode::Write).await
     }
 }
 
@@ -201,7 +201,7 @@ impl LixBackendTransaction for TestSqliteTransaction {
         SqlDialect::Sqlite
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
 
@@ -244,15 +244,15 @@ pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Lix>, S
 }
 
 #[cfg(test)]
-pub(crate) struct BuiltinReadExecutionBindings;
+pub(crate) struct BuiltinReadExecutionHost;
 
 #[cfg(test)]
 #[async_trait(?Send)]
-impl crate::contracts::ReadExecutionBindings for BuiltinReadExecutionBindings {
+impl crate::contracts::ReadExecutionHost for BuiltinReadExecutionHost {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::contracts::ReadTimeProjectionRead,
+        artifact: &crate::contracts::ReadTimeProjectionPlan,
     ) -> Result<Vec<crate::contracts::ReadTimeProjectionRow>, LixError> {
         Ok(crate::live_state::derive_read_time_surface_rows(
             backend,
@@ -274,7 +274,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     backend: &dyn LixBackend,
     projection_registry: &CatalogProjectionRegistry,
     planned_write: &PlannedWrite,
-    pending_write_view: Option<&dyn PendingView>,
+    pending_write_overlay_view: Option<&dyn PendingOverlayView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     let selector_functions = crate::contracts::clone_boxed_function_provider(
         &SharedFunctionProvider::new(SystemFunctionProvider),
@@ -282,7 +282,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     let selector_resolver = SessionWriteSelectorResolver::new(
         backend,
         projection_registry,
-        pending_write_view,
+        pending_write_overlay_view,
         &selector_functions,
     )
     .await
@@ -292,7 +292,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     resolve_write_plan_with_functions(
         backend,
         planned_write,
-        pending_write_view,
+        pending_write_overlay_view,
         SharedFunctionProvider::new(SystemFunctionProvider),
         &selector_resolver,
     )
@@ -320,7 +320,9 @@ pub(crate) async fn commit_untracked_rows(
     backend: &TestSqliteBackend,
     rows: Vec<LiveRow>,
 ) -> Result<(), LixError> {
-    let mut transaction = backend.begin_transaction(TransactionMode::Write).await?;
+    let mut transaction = backend
+        .begin_transaction(TransactionBeginMode::Write)
+        .await?;
     write_live_rows(transaction.as_mut(), &rows).await?;
     transaction.commit().await?;
     Ok(())
@@ -572,7 +574,7 @@ mod tests {
             .await
             .expect("direct select should succeed");
         let mut tx = backend
-            .begin_transaction(TransactionMode::Write)
+            .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         tx.execute("SELECT 2 AS two", &[])
@@ -594,7 +596,7 @@ mod tests {
         assert!(events.iter().any(|event| matches!(
             event,
             TestSqliteBackendEvent::BeginTransaction {
-                mode: TransactionMode::Write
+                mode: TransactionBeginMode::Write
             }
         )));
         assert!(events.iter().any(|event| matches!(

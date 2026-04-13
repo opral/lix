@@ -6,7 +6,7 @@ mod read;
 pub(crate) mod schema;
 mod write;
 
-use crate::backend::WriteProgram;
+use crate::transaction::WriteBatch;
 use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,12 +39,12 @@ pub(crate) async fn persist_blob_writes_in_transaction(
     write::persist_blob_writes_in_transaction(transaction, writes).await
 }
 
-pub(crate) fn append_blob_writes_to_program(
-    program: &mut WriteProgram,
+pub(crate) fn append_blob_writes_to_write_batch(
+    write_batch: &mut WriteBatch,
     dialect: SqlDialect,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
-    write::append_blob_writes_to_program(program, dialect, writes)
+    write::append_blob_writes_to_write_batch(write_batch, dialect, writes)
 }
 
 pub(crate) async fn garbage_collect_unreachable_in_transaction(

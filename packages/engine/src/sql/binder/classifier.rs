@@ -1,4 +1,4 @@
-use crate::sql::semantic_ir::{BoundStatementMetadata, ExecutionContext, StatementKind};
+use crate::sql::semantic_ir::{BoundStatementMetadata, StatementContext, StatementKind};
 use sqlparser::ast::Statement;
 
 pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
@@ -8,16 +8,16 @@ pub(crate) fn classify_statement(statement: &Statement) -> StatementKind {
         Statement::Update(_) => StatementKind::Update,
         Statement::Delete(_) => StatementKind::Delete,
         Statement::Explain { .. } | Statement::ExplainTable { .. } => StatementKind::Explain,
-        _ => StatementKind::Other,
+        _ => StatementKind::Utility,
     }
 }
 
 pub(crate) fn bind_statement_metadata(
     statement: &Statement,
-    execution_context: ExecutionContext,
+    statement_context: StatementContext,
 ) -> BoundStatementMetadata {
     BoundStatementMetadata {
         statement_kind: classify_statement(statement),
-        execution_context,
+        statement_context,
     }
 }

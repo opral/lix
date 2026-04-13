@@ -1,11 +1,10 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
-    FilesystemRelationKind, SurfaceBinding,
+    FilesystemRelationKind, ResolvedSurface,
 };
 use crate::contracts::should_invalidate_deterministic_settings_cache;
 use crate::contracts::{
-    PlannedFilesystemState, PreparedPublicWriteExecutionPartition, PreparedWriteStep,
-    PublicReadExecutionMode,
+    PlannedFilesystemState, PreparedPublicWriteExecutionPartition, PreparedWriteStatement,
 };
 use crate::execution::step::BufferedWriteExecutionInput;
 use crate::transaction::{
@@ -13,36 +12,27 @@ use crate::transaction::{
     compile_filesystem_finalization_from_state_in_transaction,
     filesystem_transaction_state_from_planned, merge_filesystem_transaction_state,
     persist_filesystem_payload_changes_in_transaction, BufferedWriteCommandMetadata,
-    BufferedWriteExecutionResult, BufferedWriteExecutionRoute, BufferedWriteSessionEffects,
-    DeferredTransactionSideEffects, TransactionCommitOutcome, WriteExecutionBindings,
+    BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
+    DeferredCommitEffects, TransactionCommitOutcome, WriteCommand, WriteExecutionHost, WritePath,
 };
 use crate::{LixBackendTransaction, LixError};
 
-use super::runtime::{
-    PreparedWriteExecutionRoute, PreparedWriteExecutionStep, SqlExecutionOutcome,
-};
+use super::runtime::WriteExecutionOutcome;
 
 pub(crate) fn command_metadata(
-    step: &PreparedWriteExecutionStep,
+    step: &WriteCommand,
 ) -> Result<BufferedWriteCommandMetadata, LixError> {
-    let route = match step.route() {
-        PreparedWriteExecutionRoute::Explain => BufferedWriteExecutionRoute::Other,
-        PreparedWriteExecutionRoute::Internal(_) => BufferedWriteExecutionRoute::Internal,
-        PreparedWriteExecutionRoute::PublicRead(public_read)
-            if matches!(
-                public_read.contract.execution_mode(),
-                PublicReadExecutionMode::Committed(_)
-            ) =>
-        {
-            BufferedWriteExecutionRoute::PublicReadCommitted
+    let flush_class = match step.path() {
+        WritePath::ExplainOnly => BufferedWriteFlushClass::NoPreFlush,
+        WritePath::DirectWrite(_) => BufferedWriteFlushClass::DirectWrite,
+        WritePath::CommittedRead(_) => BufferedWriteFlushClass::CommittedRead,
+        WritePath::PendingRead(_) | WritePath::BufferedDelta(_) | WritePath::NoopWrite => {
+            BufferedWriteFlushClass::NoPreFlush
         }
-        PreparedWriteExecutionRoute::PublicRead(_)
-        | PreparedWriteExecutionRoute::TransactionWriteDelta(_)
-        | PreparedWriteExecutionRoute::PublicWriteNoop => BufferedWriteExecutionRoute::Other,
     };
 
     Ok(BufferedWriteCommandMetadata {
-        route,
+        flush_class,
         has_materialization_plan: step.has_materialization_plan(),
         transaction_write_delta: step
             .is_bufferable_write()
@@ -53,16 +43,16 @@ pub(crate) fn command_metadata(
 }
 
 pub(crate) async fn complete_sql_command_execution(
-    bindings: &dyn WriteExecutionBindings,
+    host: &dyn WriteExecutionHost,
     transaction: &mut dyn LixBackendTransaction,
-    step: &PreparedWriteExecutionStep,
-    execution: SqlExecutionOutcome,
+    step: &WriteCommand,
+    write_outcome: WriteExecutionOutcome,
     execution_input: &BufferedWriteExecutionInput,
-    deferred_side_effects: Option<&mut DeferredTransactionSideEffects>,
+    deferred_commit_effects: Option<&mut DeferredCommitEffects>,
     skip_side_effect_collection: bool,
 ) -> Result<BufferedWriteExecutionResult, LixError> {
     let mut commit_outcome = TransactionCommitOutcome::default();
-    let clear_pending_public_commit_session = execution.plan_effects_override.is_none()
+    let clear_pending_commit_state = write_outcome.plan_effects_override.is_none()
         && !matches!(
             step.statement_kind(),
             crate::contracts::PreparedWriteStatementKind::Query
@@ -71,10 +61,10 @@ pub(crate) async fn complete_sql_command_execution(
 
     let default_effects = step
         .prepared()
-        .internal_write()
+        .direct_write()
         .map(|internal| internal.effects.clone())
         .unwrap_or_default();
-    let active_effects = execution
+    let active_effects = write_outcome
         .plan_effects_override
         .as_ref()
         .unwrap_or(&default_effects);
@@ -86,16 +76,16 @@ pub(crate) async fn complete_sql_command_execution(
         !session_effects.public_surface_registry_effect.is_none();
 
     let mut state_commit_stream_changes = active_effects.state_commit_stream_changes.clone();
-    state_commit_stream_changes.extend(execution.state_commit_stream_changes.clone());
+    state_commit_stream_changes.extend(write_outcome.state_commit_stream_changes.clone());
     commit_outcome.invalidate_deterministic_settings_cache =
         should_invalidate_deterministic_settings_cache(
             step.prepared()
-                .internal_write()
+                .direct_write()
                 .map(|internal| internal.mutations.as_slice())
                 .unwrap_or(&[]),
             &state_commit_stream_changes,
         );
-    commit_outcome.invalidate_installed_plugins_cache = execution.plugin_changes_committed;
+    commit_outcome.invalidate_installed_plugins_cache = write_outcome.plugin_changes_committed;
     commit_outcome
         .state_commit_stream_changes
         .extend(state_commit_stream_changes);
@@ -103,8 +93,8 @@ pub(crate) async fn complete_sql_command_execution(
     let write_handled_by_planned_write = step.transaction_write_delta().is_some();
 
     if write_handled_by_planned_write {
-    } else if skip_side_effect_collection && deferred_side_effects.is_none() {
-    } else if let Some(deferred) = deferred_side_effects {
+    } else if skip_side_effect_collection && deferred_commit_effects.is_none() {
+    } else if let Some(deferred) = deferred_commit_effects {
         let filesystem_state =
             filesystem_transaction_state_from_planned(&prepared_filesystem_state(step.prepared()));
         merge_filesystem_transaction_state(&mut deferred.filesystem_state, &filesystem_state);
@@ -115,8 +105,7 @@ pub(crate) async fn complete_sql_command_execution(
             filesystem_transaction_state_from_planned(&prepared_filesystem_state(step.prepared()));
         let binary_blob_writes = binary_blob_writes_from_filesystem_state(&filesystem_state);
         if !filesystem_payload_changes_already_committed {
-            bindings
-                .persist_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
+            host.persist_binary_blob_writes_in_transaction(transaction, &binary_blob_writes)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -135,7 +124,7 @@ pub(crate) async fn complete_sql_command_execution(
                     &filesystem_state,
                     execution_input.writer_key(),
                     step.prepared()
-                        .internal_write()
+                        .direct_write()
                         .map(|internal| internal.mutations.as_slice())
                         .unwrap_or(&[]),
                 )
@@ -167,8 +156,7 @@ pub(crate) async fn complete_sql_command_execution(
             .as_ref()
             .is_some_and(|compiled| compiled.should_run_gc)
         {
-            bindings
-                .garbage_collect_unreachable_binary_cas_in_transaction(transaction)
+            host.garbage_collect_unreachable_binary_cas_in_transaction(transaction)
                 .await
                 .map_err(|error| LixError {
                     code: error.code,
@@ -181,8 +169,7 @@ pub(crate) async fn complete_sql_command_execution(
     }
 
     if !write_handled_by_planned_write {
-        bindings
-            .persist_runtime_sequence_in_transaction(transaction, step.runtime_state().functions())
+        host.persist_runtime_sequence_in_transaction(transaction, step.runtime_state().functions())
             .await
             .map_err(|error| LixError {
                 code: error.code,
@@ -194,14 +181,14 @@ pub(crate) async fn complete_sql_command_execution(
     }
 
     Ok(BufferedWriteExecutionResult {
-        public_result: execution.public_result,
-        clear_pending_public_commit_session,
+        public_result: write_outcome.public_result,
+        clear_pending_commit_state,
         session_effects,
         commit_outcome,
     })
 }
 
-fn prepared_filesystem_state(prepared: &PreparedWriteStep) -> PlannedFilesystemState {
+fn prepared_filesystem_state(prepared: &PreparedWriteStatement) -> PlannedFilesystemState {
     if let Some(public_write) = prepared.public_write() {
         public_write
             .contract
@@ -209,14 +196,16 @@ fn prepared_filesystem_state(prepared: &PreparedWriteStep) -> PlannedFilesystemS
             .as_ref()
             .map(|resolved| resolved.filesystem_state())
             .unwrap_or_default()
-    } else if let Some(internal) = prepared.internal_write() {
+    } else if let Some(internal) = prepared.direct_write() {
         internal.filesystem_state.clone()
     } else {
         PlannedFilesystemState::default()
     }
 }
 
-fn public_write_filesystem_payload_changes_already_committed(prepared: &PreparedWriteStep) -> bool {
+fn public_write_filesystem_payload_changes_already_committed(
+    prepared: &PreparedWriteStatement,
+) -> bool {
     let Some(public_write) = prepared.public_write() else {
         return false;
     };
@@ -228,7 +217,7 @@ fn public_write_filesystem_payload_changes_already_committed(prepared: &Prepared
         })
 }
 
-fn is_catalog_filesystem_file_surface(target: &SurfaceBinding) -> bool {
+fn is_catalog_filesystem_file_surface(target: &ResolvedSurface) -> bool {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(target)
         .ok()

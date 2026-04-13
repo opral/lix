@@ -1,11 +1,11 @@
 use crate::contracts::ExecuteOptions;
-use crate::contracts::ExecutionRuntimeState;
+use crate::contracts::FunctionRuntimeState;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     write_live_rows, LiveRow,
 };
-use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
+use crate::session::execution_state::{SessionCompilerCache, SessionExecutionState};
 use crate::session::version_ops::load_version_head_commit_id_with_executor;
 use crate::sql::parse_sql;
 use crate::transaction::{
@@ -19,7 +19,7 @@ pub(crate) const LIX_ID_KEY: &str = "lix_id";
 pub(crate) struct InitExecutor<'engine, 'tx> {
     lix: &'engine Lix,
     write_transaction: BorrowedBufferedWriteTransaction<'tx>,
-    context: ExecutionContext,
+    context: SessionExecutionState,
 }
 
 impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
@@ -30,10 +30,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(Self {
             lix,
             write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
-            context: ExecutionContext::new(
+            context: SessionExecutionState::new(
                 ExecuteOptions::default(),
                 lix.public_surface_registry(),
-                SessionExecutionRuntime::new(),
+                SessionCompilerCache::new(),
                 GLOBAL_VERSION_ID.to_string(),
                 Vec::new(),
             ),
@@ -109,7 +109,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn persist_runtime_state(&mut self) -> Result<(), LixError> {
-        let Some(runtime_state) = self.context.execution_runtime_state().cloned() else {
+        let Some(runtime_state) = self.context.function_runtime_state().cloned() else {
             return Ok(());
         };
         crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
@@ -119,8 +119,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await
     }
 
-    async fn ensure_runtime_state(&mut self) -> Result<ExecutionRuntimeState, LixError> {
-        if let Some(runtime_state) = self.context.execution_runtime_state().cloned() {
+    async fn ensure_runtime_state(&mut self) -> Result<FunctionRuntimeState, LixError> {
+        if let Some(runtime_state) = self.context.function_runtime_state().cloned() {
             return Ok(runtime_state);
         }
         let backend = crate::backend::transaction_backend_view(
@@ -130,10 +130,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .lix
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
-        let runtime_state =
-            ExecutionRuntimeState::from_prepared_parts(settings.enabled, &functions);
+        let runtime_state = FunctionRuntimeState::from_prepared_parts(settings.enabled, &functions);
         self.context
-            .set_execution_runtime_state(runtime_state.clone());
+            .set_function_runtime_state(runtime_state.clone());
         Ok(runtime_state)
     }
 

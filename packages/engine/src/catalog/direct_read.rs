@@ -1,39 +1,39 @@
-use crate::catalog::{SurfaceBinding, SurfaceFamily, SurfaceVariant};
+use crate::catalog::{ResolvedSurface, SurfaceFamily, SurfaceVariant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CatalogDirectReadSemantics {
+pub(crate) enum CatalogHistoryReadSemantics {
     StateHistoryActiveVersion,
     EntityHistoryActiveVersion,
     FileHistory { active_version_lineage: bool },
     DirectoryHistoryActiveVersion,
 }
 
-pub(crate) fn direct_read_semantics(
-    surface_binding: &SurfaceBinding,
-) -> Option<CatalogDirectReadSemantics> {
+pub(crate) fn history_read_semantics(
+    surface_binding: &ResolvedSurface,
+) -> Option<CatalogHistoryReadSemantics> {
     match (
         surface_binding.descriptor.surface_family,
         surface_binding.descriptor.surface_variant,
         surface_binding.descriptor.public_name.as_str(),
     ) {
         (SurfaceFamily::State, SurfaceVariant::History, "lix_state_history") => {
-            Some(CatalogDirectReadSemantics::StateHistoryActiveVersion)
+            Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
         }
         (SurfaceFamily::Entity, SurfaceVariant::History, _) => {
-            Some(CatalogDirectReadSemantics::EntityHistoryActiveVersion)
+            Some(CatalogHistoryReadSemantics::EntityHistoryActiveVersion)
         }
         (SurfaceFamily::Filesystem, SurfaceVariant::History, "lix_file_history") => {
-            Some(CatalogDirectReadSemantics::FileHistory {
+            Some(CatalogHistoryReadSemantics::FileHistory {
                 active_version_lineage: true,
             })
         }
         (SurfaceFamily::Filesystem, SurfaceVariant::History, "lix_file_history_by_version") => {
-            Some(CatalogDirectReadSemantics::FileHistory {
+            Some(CatalogHistoryReadSemantics::FileHistory {
                 active_version_lineage: false,
             })
         }
         (SurfaceFamily::Filesystem, SurfaceVariant::History, "lix_directory_history") => {
-            Some(CatalogDirectReadSemantics::DirectoryHistoryActiveVersion)
+            Some(CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion)
         }
         _ => None,
     }
@@ -41,27 +41,27 @@ pub(crate) fn direct_read_semantics(
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_read_semantics, CatalogDirectReadSemantics};
+    use super::{history_read_semantics, CatalogHistoryReadSemantics};
     use crate::catalog::build_builtin_surface_registry;
 
     #[test]
-    fn builtin_history_surfaces_expose_direct_read_semantics() {
+    fn builtin_history_surfaces_expose_history_read_semantics() {
         let registry = build_builtin_surface_registry();
 
         let state = registry
             .bind_relation_name("lix_state_history")
             .expect("lix_state_history should bind");
         assert_eq!(
-            direct_read_semantics(&state),
-            Some(CatalogDirectReadSemantics::StateHistoryActiveVersion)
+            history_read_semantics(&state),
+            Some(CatalogHistoryReadSemantics::StateHistoryActiveVersion)
         );
 
         let file = registry
             .bind_relation_name("lix_file_history")
             .expect("lix_file_history should bind");
         assert_eq!(
-            direct_read_semantics(&file),
-            Some(CatalogDirectReadSemantics::FileHistory {
+            history_read_semantics(&file),
+            Some(CatalogHistoryReadSemantics::FileHistory {
                 active_version_lineage: true,
             })
         );
@@ -70,8 +70,8 @@ mod tests {
             .bind_relation_name("lix_file_history_by_version")
             .expect("lix_file_history_by_version should bind");
         assert_eq!(
-            direct_read_semantics(&file_by_version),
-            Some(CatalogDirectReadSemantics::FileHistory {
+            history_read_semantics(&file_by_version),
+            Some(CatalogHistoryReadSemantics::FileHistory {
                 active_version_lineage: false,
             })
         );
@@ -80,8 +80,8 @@ mod tests {
             .bind_relation_name("lix_directory_history")
             .expect("lix_directory_history should bind");
         assert_eq!(
-            direct_read_semantics(&directory),
-            Some(CatalogDirectReadSemantics::DirectoryHistoryActiveVersion)
+            history_read_semantics(&directory),
+            Some(CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion)
         );
     }
 }

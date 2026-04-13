@@ -10,14 +10,14 @@ use crate::contracts::parse_active_version_snapshot;
 use crate::contracts::TrackedChangeView;
 use crate::contracts::TrackedCommitExecutionOutcome;
 use crate::contracts::{
-    ChangeBatch, CommitPreconditions, ExpectedHead, PendingPublicCommitSession,
-    PreparedPublicReadArtifact, PreparedPublicWriteArtifact, PublicChange, SchemaKey, WriteLane,
+    ChangeBatch, CommitPreconditions, ExpectedHead, PendingCommitState, PreparedPublicRead,
+    PreparedPublicWrite, PublicChange, SchemaKey, WriteLane,
 };
-use crate::contracts::{CompiledSchemaCache, PendingView};
+use crate::contracts::{CompiledSchemaCache, PendingOverlayView};
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
-use crate::session::collaborators::SessionCollaborators;
-use crate::session::read_execution_bindings::CatalogProjectionRegistryReadExecutionBindings;
+use crate::session::read_execution_host::CatalogProjectionRegistryReadExecutionHost;
+use crate::session::runtime::SessionRuntime;
 use crate::session::version_ops::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
     CreateCommitAppliedOutput, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
@@ -26,7 +26,7 @@ use crate::session::version_ops::commit::{
 };
 use crate::transaction::{
     resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
-    TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionBindings,
+    TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionHost,
 };
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
@@ -67,12 +67,12 @@ impl CompiledSchemaCache for WriteCompiledSchemaCache {
 }
 
 struct PublicCommitInvariantChecker<'a> {
-    public_write: &'a PreparedPublicWriteArtifact,
+    public_write: &'a PreparedPublicWrite,
     schema_cache: WriteCompiledSchemaCache,
 }
 
 impl<'a> PublicCommitInvariantChecker<'a> {
-    fn new(public_write: &'a PreparedPublicWriteArtifact) -> Self {
+    fn new(public_write: &'a PreparedPublicWrite) -> Self {
         Self {
             public_write,
             schema_cache: WriteCompiledSchemaCache::new(),
@@ -97,17 +97,17 @@ impl CreateCommitInvariantChecker for PublicCommitInvariantChecker<'_> {
 }
 
 #[async_trait(?Send)]
-impl WriteExecutionBindings for SessionCollaborators {
-    async fn execute_prepared_public_read_with_pending_view(
+impl WriteExecutionHost for SessionRuntime {
+    async fn execute_prepared_public_read_with_pending_overlay_view(
         &self,
         transaction: &mut dyn LixBackendTransaction,
-        pending_view: Option<&dyn PendingView>,
-        public_read: &PreparedPublicReadArtifact,
+        pending_overlay_view: Option<&dyn PendingOverlayView>,
+        public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError> {
         execute_prepared_public_read_with_registry(
             self.catalog_projection_registry(),
             transaction,
-            pending_view,
+            pending_overlay_view,
             public_read,
         )
         .await
@@ -140,33 +140,32 @@ impl WriteExecutionBindings for SessionCollaborators {
         &self,
         transaction: &mut dyn LixBackendTransaction,
         unit: &TrackedTxnUnit,
-        mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
+        mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
     ) -> Result<TrackedCommitExecutionOutcome, LixError> {
-        execute_public_tracked_append(transaction, unit, pending_commit_session.as_deref_mut())
-            .await
+        execute_public_tracked_append(transaction, unit, pending_commit_state.as_deref_mut()).await
     }
 }
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
     projection_registry: &CatalogProjectionRegistry,
     transaction: &mut dyn LixBackendTransaction,
-    pending_view: Option<&dyn PendingView>,
-    public_read: &PreparedPublicReadArtifact,
+    pending_overlay_view: Option<&dyn PendingOverlayView>,
+    public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    match public_read.contract.execution_mode() {
-        crate::contracts::PublicReadExecutionMode::PendingView => {
-            crate::session::pending_reads::execute_prepared_public_read_with_pending_view_in_transaction(
+    match public_read.contract.source() {
+        crate::contracts::PublicReadSource::PendingOverlay => {
+            crate::session::pending_reads::execute_prepared_public_read_with_pending_overlay_view_in_transaction(
                 transaction,
-                pending_view,
+                pending_overlay_view,
                 public_read,
             )
             .await
         }
-        crate::contracts::PublicReadExecutionMode::Committed(_) => {
-            let bindings = CatalogProjectionRegistryReadExecutionBindings::new(projection_registry);
+        crate::contracts::PublicReadSource::Committed(_) => {
+            let host = CatalogProjectionRegistryReadExecutionHost::new(projection_registry);
             crate::execution::read::execute_prepared_public_read_artifact_in_transaction(
                 transaction,
-                &bindings,
+                &host,
                 public_read,
             )
             .await
@@ -210,7 +209,7 @@ pub(crate) async fn persist_runtime_sequence(
 pub(crate) async fn execute_public_tracked_append(
     transaction: &mut dyn LixBackendTransaction,
     unit: &TrackedTxnUnit,
-    mut pending_commit_session: Option<&mut Option<PendingPublicCommitSession>>,
+    mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
 ) -> Result<TrackedCommitExecutionOutcome, LixError> {
     let writer_key_updates = tracked_writer_key_updates_for_unit(unit);
     if unit
@@ -239,7 +238,7 @@ pub(crate) async fn execute_public_tracked_append(
     let mut create_commit_functions = unit.runtime_state.functions().clone();
     let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
 
-    if pending_commit_session
+    if pending_commit_state
         .as_ref()
         .is_some_and(|slot| slot.as_ref().is_some())
         && !unit.has_compiler_only_filesystem_changes()
@@ -277,7 +276,7 @@ pub(crate) async fn execute_public_tracked_append(
         },
         &mut create_commit_functions,
         invariant_checker,
-        pending_commit_session.as_deref_mut(),
+        pending_commit_state.as_deref_mut(),
         !unit.has_compiler_only_filesystem_changes(),
     )
     .await?;
@@ -424,7 +423,7 @@ fn canonical_create_commit_preconditions_for_tracked_unit(
 fn canonical_create_commit_preconditions_from_public_write(
     commit_preconditions: &CommitPreconditions,
     batch: Option<&ChangeBatch>,
-    public_write: &PreparedPublicWriteArtifact,
+    public_write: &PreparedPublicWrite,
 ) -> Result<CreateCommitPreconditions, LixError> {
     let write_lane = match &commit_preconditions.write_lane {
         WriteLane::SingleVersion(version_id) => CreateCommitWriteLane::Version(version_id.clone()),

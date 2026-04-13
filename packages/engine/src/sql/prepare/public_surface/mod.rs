@@ -40,9 +40,8 @@ use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, Wr
 use crate::sql::logical_plan::DependencySpec;
 use crate::sql::logical_plan::{verify_logical_plan, LogicalPlan, PublicReadLogicalPlan};
 use crate::sql::physical_plan::{
-    LoweredReadProgram, PreparedPublicReadExecution, PreparedPublicWriteExecution,
-    PublicWriteExecutionPartition, PublicWriteMaterialization, TrackedWriteExecution,
-    UntrackedWriteExecution,
+    LoweredReadBatch, PublicReadPhysicalPlan, PublicWriteExecutionPartition,
+    PublicWriteMaterialization, PublicWritePhysicalPlan, TrackedWritePlan, UntrackedWritePlan,
 };
 use crate::sql::prepare::contracts::effects::PlanEffects;
 use crate::sql::prepare::contracts::planned_statement::SchemaLiveTableRequirement;
@@ -53,8 +52,8 @@ use crate::sql::prepare::intent::{
 use crate::sql::semantic_ir::canonicalize::CanonicalizedWrite;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
 use crate::sql::semantic_ir::{
-    analyze_public_write_semantics, BoundStatement, ExecutionContext, PublicWriteInvariantTrace,
-    PublicWriteSemantics,
+    analyze_public_write_semantics, BoundStatement, PublicWriteInvariantTrace,
+    PublicWriteSemantics, StatementContext,
 };
 use crate::sql::{classify_relation_name, protected_builtin_public_surface_names, RelationPolicy};
 #[cfg(test)]
@@ -70,18 +69,18 @@ use std::ops::ControlFlow;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PreparedPublicRead {
+pub(crate) struct PublicReadPlan {
     pub(crate) freshness_contract: SurfaceReadFreshness,
     pub(crate) surface_bindings: Vec<String>,
     pub(crate) logical_plan: PublicReadLogicalPlan,
-    pub(crate) execution: PreparedPublicReadExecution,
+    pub(crate) execution: PublicReadPhysicalPlan,
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) runtime_bindings: RuntimeBindingValues,
     pub(crate) public_output_columns: Option<Vec<String>>,
     pub(crate) explain: ExplainArtifacts,
 }
 
-impl PreparedPublicRead {
+impl PublicReadPlan {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn structured_read(&self) -> Option<&StructuredPublicRead> {
         self.logical_plan.structured_read()
@@ -100,11 +99,11 @@ impl PreparedPublicRead {
         self.logical_plan.dependency_spec()
     }
 
-    pub(crate) fn lowered_read(&self) -> Option<&LoweredReadProgram> {
+    pub(crate) fn lowered_batch(&self) -> Option<&LoweredReadBatch> {
         match &self.execution {
-            PreparedPublicReadExecution::LoweredSql(lowered) => Some(lowered),
-            PreparedPublicReadExecution::ReadTimeProjection(_) => None,
-            PreparedPublicReadExecution::Direct(_) => None,
+            PublicReadPhysicalPlan::LoweredSql(lowered) => Some(lowered),
+            PublicReadPhysicalPlan::ReadTimeProjection(_) => None,
+            PublicReadPhysicalPlan::HistoryRead(_) => None,
         }
     }
 
@@ -119,13 +118,13 @@ impl PreparedPublicRead {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct PreparedPublicWrite {
+pub(crate) struct PublicWritePlan {
     pub(crate) canonicalized: CanonicalizedWrite,
     pub(crate) planned_write: PlannedWrite,
     pub(crate) explain_plan: PreparedPublicWriteExplainPlan,
     pub(crate) change_batches: Vec<ChangeBatch>,
     pub(crate) surface_bindings: Vec<String>,
-    pub(crate) execution: PreparedPublicWriteExecution,
+    pub(crate) execution: PublicWritePhysicalPlan,
     pub(crate) explain: ExplainArtifacts,
 }
 
@@ -136,30 +135,30 @@ pub(crate) struct PreparedPublicWriteExplainPlan {
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
 }
 
-impl PreparedPublicWrite {
+impl PublicWritePlan {
     pub(crate) fn materialization_mut(&mut self) -> Option<&mut PublicWriteMaterialization> {
         match &mut self.execution {
-            PreparedPublicWriteExecution::Noop => None,
-            PreparedPublicWriteExecution::Materialize(materialization) => Some(materialization),
+            PublicWritePhysicalPlan::Noop => None,
+            PublicWritePhysicalPlan::Materialize(materialization) => Some(materialization),
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PreparedPublicExecution {
-    Read(PreparedPublicRead),
-    Write(PreparedPublicWrite),
+pub(crate) enum PublicPlan {
+    Read(PublicReadPlan),
+    Write(PublicWritePlan),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum PublicExecutionRoute {
+pub(crate) enum PublicPlanKind {
     Read,
     Write,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct BoundPublicReadSummary {
-    bound_surface_bindings: Vec<crate::catalog::SurfaceBinding>,
+    bound_surface_bindings: Vec<crate::catalog::ResolvedSurface>,
     internal_relations: Vec<String>,
     external_relations: Vec<String>,
     requested_history_root_commit_ids: Vec<String>,
@@ -168,19 +167,19 @@ struct BoundPublicReadSummary {
 pub(crate) mod read;
 
 #[cfg(test)]
-pub(crate) async fn prepare_public_execution(
+pub(crate) async fn prepare_public_plan(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-) -> Result<Option<PreparedPublicExecution>, LixError> {
+) -> Result<Option<PublicPlan>, LixError> {
     let mut metadata_reader = backend;
     let active_history_root_commit_id: Option<String> = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
         .await?;
-    prepare_public_execution_with_internal_access(
+    prepare_public_plan_with_internal_access(
         backend,
         parsed_statements,
         params,
@@ -193,7 +192,7 @@ pub(crate) async fn prepare_public_execution(
     .await
 }
 
-pub(crate) async fn prepare_public_execution_with_registry_context_and_functions(
+pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
     dialect: SqlDialect,
     registry: &SurfaceRegistry,
     compiler_metadata: &super::SqlCompilerMetadata,
@@ -203,22 +202,22 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
+    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicExecution>, LixError> {
+) -> Result<Option<PublicPlan>, LixError> {
     if let Some(surface_name) = first_removed_builtin_surface_reference(parsed_statements) {
         return Err(removed_builtin_surface_unknown_table_error(&surface_name));
     }
 
-    let Some(route) = classify_public_execution_route_with_registry(registry, parsed_statements)
+    let Some(plan_kind) = classify_public_plan_kind_with_registry(registry, parsed_statements)
     else {
         return Ok(None);
     };
 
-    match route {
-        PublicExecutionRoute::Write => {
+    match plan_kind {
+        PublicPlanKind::Write => {
             let target_name = public_write_target_name(registry, parsed_statements)
-                .expect("public write route must expose a target name");
+                .expect("public write plan kind must expose a target name");
             let prepared = try_prepare_public_write_with_registry_and_functions(
                 dialect,
                 registry,
@@ -231,7 +230,7 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
             )
             .await?;
             prepared
-                .map(PreparedPublicExecution::Write)
+                .map(PublicPlan::Write)
                 .ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -242,7 +241,7 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
                 })
                 .map(Some)
         }
-        PublicExecutionRoute::Read => {
+        PublicPlanKind::Read => {
             if parsed_statements.len() != 1 {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -259,11 +258,11 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
                 active_version_id,
                 active_history_root_commit_id,
                 writer_key,
-                allow_internal_tables,
+                allow_internal_relations,
                 parse_duration,
             )
             .await?
-            .map(PreparedPublicExecution::Read)
+            .map(PublicPlan::Read)
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -276,7 +275,7 @@ pub(crate) async fn prepare_public_execution_with_registry_context_and_functions
 }
 
 #[cfg(test)]
-pub(crate) async fn prepare_public_execution_with_internal_access(
+pub(crate) async fn prepare_public_plan_with_internal_access(
     backend: &dyn LixBackend,
     parsed_statements: &[Statement],
     params: &[Value],
@@ -284,8 +283,8 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
-) -> Result<Option<PreparedPublicExecution>, LixError> {
+    allow_internal_relations: bool,
+) -> Result<Option<PublicPlan>, LixError> {
     let functions = crate::contracts::clone_boxed_function_provider(
         &crate::contracts::SharedFunctionProvider::new(
             crate::services::functions::SystemFunctionProvider,
@@ -300,7 +299,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata =
         crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
-    prepare_public_execution_with_registry_context_and_functions(
+    prepare_public_plan_with_registry_context_and_functions(
         backend.dialect(),
         &registry,
         &compiler_metadata,
@@ -310,7 +309,7 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
         active_history_root_commit_id,
         active_account_ids,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         None,
     )
     .await
@@ -325,9 +324,9 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
-    allow_internal_tables: bool,
+    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicRead>, LixError> {
+) -> Result<Option<PublicReadPlan>, LixError> {
     read::try_prepare_public_read_with_registry_and_internal_access(
         dialect,
         registry,
@@ -337,7 +336,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
         active_version_id,
         active_history_root_commit_id,
         writer_key,
-        allow_internal_tables,
+        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -485,7 +484,7 @@ pub(crate) async fn prepare_public_read(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Option<PreparedPublicRead> {
+) -> Option<PublicReadPlan> {
     let mut metadata_reader = backend;
     let active_history_root_commit_id: Option<String> = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
@@ -510,7 +509,7 @@ pub(crate) async fn prepare_public_read_strict(
     params: &[Value],
     active_version_id: &str,
     writer_key: Option<&str>,
-) -> Result<Option<PreparedPublicRead>, LixError> {
+) -> Result<Option<PublicReadPlan>, LixError> {
     let mut metadata_reader = backend;
     let active_history_root_commit_id: Option<String> = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
@@ -535,17 +534,17 @@ fn statements_reference_public_surface(
         .any(|statement| statement_references_public_surface(registry, statement))
 }
 
-pub(crate) fn classify_public_execution_route_with_registry(
+pub(crate) fn classify_public_plan_kind_with_registry(
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
-) -> Option<PublicExecutionRoute> {
+) -> Option<PublicPlanKind> {
     if !statements_reference_public_surface(registry, parsed_statements) {
         return None;
     }
     if public_write_target_name(registry, parsed_statements).is_some() {
-        return Some(PublicExecutionRoute::Write);
+        return Some(PublicPlanKind::Write);
     }
-    Some(PublicExecutionRoute::Read)
+    Some(PublicPlanKind::Read)
 }
 
 pub(crate) fn statement_references_public_surface(
@@ -588,7 +587,7 @@ fn summarize_bound_public_read_statement(
             bound_surface_bindings.push(binding);
         } else if matches!(
             classify_relation_name(&relation_name, Some(registry)),
-            RelationPolicy::InternalStorage
+            RelationPolicy::InternalRelation
         ) {
             internal_relations.push(relation_name);
         } else {
@@ -630,7 +629,7 @@ fn merge_surface_read_freshness(
 }
 
 fn bound_surface_freshness_contract(
-    bindings: &[crate::catalog::SurfaceBinding],
+    bindings: &[crate::catalog::ResolvedSurface],
 ) -> Option<SurfaceReadFreshness> {
     let mut bindings = bindings.iter();
     let first = bindings.next()?;
@@ -1133,7 +1132,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     active_account_ids: &[String],
     writer_key: Option<&str>,
     parse_duration: Option<Duration>,
-) -> Result<Option<PreparedPublicWrite>, LixError> {
+) -> Result<Option<PublicWritePlan>, LixError> {
     if parsed_statements.len() != 1 {
         return Ok(None);
     }
@@ -1145,7 +1144,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     let bound_statement = bind_statement(
         statement,
         params.to_vec(),
-        ExecutionContext {
+        StatementContext {
             dialect: Some(dialect),
             writer_key: writer_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
@@ -1214,7 +1213,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         semantics: write_analysis.semantics.clone(),
         stage_timings: stage_timings.finish(),
     };
-    let execution = PreparedPublicWriteExecution::Noop;
+    let execution = PublicWritePhysicalPlan::Noop;
     let explain = build_public_write_explain_artifacts(PublicWriteExplainBuildInput {
         request: explain_request,
         semantics: write_analysis.semantics.clone(),
@@ -1225,7 +1224,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         stage_timings: explain_plan.stage_timings.clone(),
     });
 
-    Ok(Some(PreparedPublicWrite {
+    Ok(Some(PublicWritePlan {
         explain,
         planned_write,
         explain_plan,
@@ -1240,7 +1239,7 @@ pub(crate) fn build_public_write_execution(
     planned_write: &PlannedWrite,
     change_batches: &[ChangeBatch],
     commit_preconditions: &[CommitPreconditions],
-) -> Result<Option<PreparedPublicWriteExecution>, LixError> {
+) -> Result<Option<PublicWritePhysicalPlan>, LixError> {
     let Some(resolved) = planned_write.resolved_write_plan.as_ref() else {
         return Ok(None);
     };
@@ -1270,26 +1269,25 @@ pub(crate) fn build_public_write_execution(
                     return Ok(None);
                 };
 
-                partitions.push(PublicWriteExecutionPartition::Tracked(
-                    TrackedWriteExecution {
-                        schema_live_table_requirements:
-                            schema_live_table_requirements_from_partition(partition),
-                        create_preconditions: commit_preconditions.clone(),
-                        semantic_effects: semantic_plan_effects_from_changes(
-                            &change_batch.changes,
-                            state_commit_stream_operation(planned_write.command.operation_kind),
-                            change_batch.writer_key.as_deref(),
-                        )?,
-                        change_batch: Some(change_batch),
-                    },
-                ));
+                partitions.push(PublicWriteExecutionPartition::Tracked(TrackedWritePlan {
+                    schema_live_table_requirements: schema_live_table_requirements_from_partition(
+                        partition,
+                    ),
+                    create_preconditions: commit_preconditions.clone(),
+                    semantic_effects: semantic_plan_effects_from_changes(
+                        &change_batch.changes,
+                        state_commit_stream_operation(planned_write.command.operation_kind),
+                        change_batch.writer_key.as_deref(),
+                    )?,
+                    change_batch: Some(change_batch),
+                }));
             }
             crate::sql::logical_plan::public_ir::WriteMode::Untracked => {
                 if !public_untracked_operation_supported(planned_write) {
                     return Ok(None);
                 }
                 partitions.push(PublicWriteExecutionPartition::Untracked(
-                    UntrackedWriteExecution {
+                    UntrackedWritePlan {
                         intended_post_state: partition.intended_post_state.clone(),
                         semantic_effects: PlanEffects::default(),
                         persist_filesystem_payloads_before_write,
@@ -1304,9 +1302,9 @@ pub(crate) fn build_public_write_execution(
     }
 
     Ok(Some(if partitions.is_empty() {
-        PreparedPublicWriteExecution::Noop
+        PublicWritePhysicalPlan::Noop
     } else {
-        PreparedPublicWriteExecution::Materialize(PublicWriteMaterialization { partitions })
+        PublicWritePhysicalPlan::Materialize(PublicWriteMaterialization { partitions })
     }))
 }
 
@@ -1431,7 +1429,7 @@ fn semantic_plan_effects_from_untracked_public_write(
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(
                 planned_write
                     .command
-                    .execution_context
+                    .statement_context
                     .writer_key
                     .as_deref(),
             ),
@@ -1538,7 +1536,7 @@ pub(crate) fn public_write_preparation_error(
 }
 
 fn public_write_preparation_error_for_surface(
-    surface_binding: &crate::catalog::SurfaceBinding,
+    surface_binding: &crate::catalog::ResolvedSurface,
     operation_kind: WriteOperationKind,
     message: &str,
 ) -> Option<LixError> {
@@ -1598,7 +1596,7 @@ fn public_write_preparation_error_for_surface(
 }
 
 fn normalize_admin_public_write_message<'a>(
-    surface_binding: &crate::catalog::SurfaceBinding,
+    surface_binding: &crate::catalog::ResolvedSurface,
     message: &'a str,
 ) -> std::borrow::Cow<'a, str> {
     let public_name = surface_binding.descriptor.public_name.as_str();
@@ -1668,7 +1666,7 @@ fn top_level_write_target_name(statement: &Statement) -> Option<String> {
 }
 
 fn filesystem_surface_kind(
-    surface_binding: &crate::catalog::SurfaceBinding,
+    surface_binding: &crate::catalog::ResolvedSurface,
 ) -> Option<crate::catalog::FilesystemRelationKind> {
     let binding = crate::catalog::builtin_catalog_compiler_facade()
         .bind_surface_runtime_relation(
@@ -1774,8 +1772,8 @@ pub(crate) fn build_public_write_invariant_trace(
 #[cfg(test)]
 mod tests {
     use super::{
-        prepare_public_execution, prepare_public_read, prepare_public_read_strict,
-        PreparedPublicExecution, PreparedPublicReadExecution,
+        prepare_public_plan, prepare_public_read, prepare_public_read_strict, PublicPlan,
+        PublicReadPhysicalPlan,
     };
     use crate::catalog::SurfaceReadFreshness;
     use crate::contracts::GLOBAL_VERSION_ID;
@@ -1800,12 +1798,11 @@ mod tests {
         explain::{
             ExplainPhysicalPlanSnapshot, ExplainPublicReadExecution, ExplainTimingCollector,
         },
-        logical_plan::{DependencyPrecision, DirectPublicReadPlan},
-        semantic_ir::ExecutionContext,
+        logical_plan::{DependencyPrecision, HistoryReadPlan},
+        semantic_ir::StatementContext,
     };
     use crate::test_support::{
-        seed_canonical_change_row, BuiltinReadExecutionBindings, CanonicalChangeSeed,
-        TestSqliteBackend,
+        seed_canonical_change_row, BuiltinReadExecutionHost, CanonicalChangeSeed, TestSqliteBackend,
     };
     use crate::{LixBackend, LixError, Session, SqlDialect, Value};
     use async_trait::async_trait;
@@ -1990,7 +1987,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionMode,
+            _mode: crate::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -2022,7 +2019,7 @@ mod tests {
     }
 
     fn stage_duration_us(
-        prepared: &super::PreparedPublicRead,
+        prepared: &super::PublicReadPlan,
         stage: crate::sql::explain::ExplainStage,
     ) -> Option<u64> {
         prepared
@@ -2152,14 +2149,14 @@ mod tests {
             SurfaceReadFreshness::AllowsStaleProjection
         );
         match &admin_read.execution {
-            PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
                 assert_eq!(artifact.surface_name, "lix_version");
                 assert!(admin_read.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("plain lix_version read should use read-time projection execution")
             }
-            PreparedPublicReadExecution::Direct(_) => {
+            PublicReadPhysicalPlan::HistoryRead(_) => {
                 panic!("plain lix_version read should not use direct execution")
             }
         }
@@ -2186,13 +2183,13 @@ mod tests {
                     .expect("plain lix_version read should prepare");
 
                     match &prepared.execution {
-                        PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+                        PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
                             assert_eq!(artifact.surface_name, "lix_version");
                         }
-                        PreparedPublicReadExecution::LoweredSql(_) => {
+                        PublicReadPhysicalPlan::LoweredSql(_) => {
                             panic!("plain lix_version read should not lower canonical admin SQL")
                         }
-                        PreparedPublicReadExecution::Direct(_) => {
+                        PublicReadPhysicalPlan::HistoryRead(_) => {
                             panic!("plain lix_version read should not use direct execution")
                         }
                     }
@@ -2210,7 +2207,7 @@ mod tests {
                                 ExplainPublicReadExecution::LoweredSql(_) => {
                                     panic!("plain lix_version explain should not report lowered SQL execution")
                                 }
-                                ExplainPublicReadExecution::Direct(_) => {
+                                ExplainPublicReadExecution::HistoryRead(_) => {
                                     panic!("plain lix_version explain should not report direct execution")
                                 }
                             }
@@ -2259,7 +2256,7 @@ mod tests {
                     .expect("descriptor-only lix_version read should prepare");
                     assert!(matches!(
                         prepared.execution,
-                        PreparedPublicReadExecution::ReadTimeProjection(_)
+                        PublicReadPhysicalPlan::ReadTimeProjection(_)
                     ));
                     assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
@@ -2267,7 +2264,7 @@ mod tests {
                         .expect("descriptor-only lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
-                        &BuiltinReadExecutionBindings,
+                        &BuiltinReadExecutionHost,
                         &artifact,
                     )
                     .await
@@ -2331,7 +2328,7 @@ mod tests {
                     .expect("descriptor+ref lix_version read should prepare");
                     assert!(matches!(
                         prepared.execution,
-                        PreparedPublicReadExecution::ReadTimeProjection(_)
+                        PublicReadPhysicalPlan::ReadTimeProjection(_)
                     ));
                     assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
@@ -2339,7 +2336,7 @@ mod tests {
                         .expect("descriptor+ref lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
-                        &BuiltinReadExecutionBindings,
+                        &BuiltinReadExecutionHost,
                         &artifact,
                     )
                     .await
@@ -2418,7 +2415,7 @@ mod tests {
                     .expect("multi-version lix_version read should prepare");
                     assert!(matches!(
                         prepared.execution,
-                        PreparedPublicReadExecution::ReadTimeProjection(_)
+                        PublicReadPhysicalPlan::ReadTimeProjection(_)
                     ));
                     assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
@@ -2426,7 +2423,7 @@ mod tests {
                         .expect("multi-version lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
-                        &BuiltinReadExecutionBindings,
+                        &BuiltinReadExecutionHost,
                         &artifact,
                     )
                     .await
@@ -2546,7 +2543,7 @@ mod tests {
                 .iter()
                 .map(|pass| pass.name)
                 .collect::<Vec<_>>(),
-            vec!["public-read.route-execution-strategy"]
+            vec!["public-read.classify-plan-kind"]
         );
         assert_eq!(
             prepared
@@ -2956,7 +2953,7 @@ mod tests {
                             .iter()
                             .map(|pass| pass.name)
                             .collect::<Vec<_>>(),
-                        vec!["public-read.route-execution-strategy"]
+                        vec!["public-read.classify-plan-kind"]
                     );
                     assert_eq!(
                         prepared
@@ -2970,9 +2967,9 @@ mod tests {
                         vec!["key = 'hello'".to_string()]
                     );
                     match &prepared.execution {
-                        PreparedPublicReadExecution::Direct(
-                            DirectPublicReadPlan::EntityHistory(plan),
-                        ) => {
+                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
+                            plan,
+                        )) => {
                             assert_eq!(
                                 plan.request.root_scope,
                                 StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
@@ -3138,14 +3135,14 @@ mod tests {
             vec!["id = 'file-1'".to_string()]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
                 assert_eq!(artifact.surface_name, "lix_file");
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("filesystem read should use read-time projection execution")
             }
-            PreparedPublicReadExecution::Direct(_) => {
+            PublicReadPhysicalPlan::HistoryRead(_) => {
                 panic!("filesystem read should not use direct execution")
             }
         }
@@ -3188,14 +3185,14 @@ mod tests {
             ]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::ReadTimeProjection(artifact) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
                 assert_eq!(artifact.surface_name, "lix_directory_by_version");
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("filesystem by-version read should use read-time projection execution")
             }
-            PreparedPublicReadExecution::Direct(_) => {
+            PublicReadPhysicalPlan::HistoryRead(_) => {
                 panic!("filesystem by-version read should not use direct execution")
             }
         }
@@ -3233,26 +3230,26 @@ mod tests {
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(plan)) => {
                 assert_eq!(
                     plan.request.root_scope,
                     FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
                 panic!("filesystem history read should not use state-history direct plan")
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
                 panic!("filesystem history read should not use entity-history direct plan")
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
                 panic!("filesystem history read should not use directory-history direct plan")
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("filesystem history read should not use lowered SQL")
             }
-            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
                 panic!("filesystem history read should not use read-time projection execution")
             }
         }
@@ -3296,32 +3293,32 @@ mod tests {
             ]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(plan)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(plan)) => {
                 assert_eq!(
                     plan.request.version_scope,
                     FileHistoryVersionScope::RequestedVersions(vec!["version-a".to_string()])
                 );
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
                 panic!(
                     "filesystem by-version history read should not use state-history direct plan"
                 )
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
                 panic!(
                     "filesystem by-version history read should not use entity-history direct plan"
                 )
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
                 panic!(
                     "filesystem by-version history read should not use directory-history direct plan"
                 )
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("filesystem by-version history read should not use lowered SQL")
             }
-            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
                 panic!(
                     "filesystem by-version history read should not use read-time projection execution"
                 )
@@ -3362,7 +3359,7 @@ mod tests {
             ]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(plan)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(plan)) => {
                 assert_eq!(
                     plan.request.root_scope,
                     FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
@@ -3370,19 +3367,19 @@ mod tests {
                 assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
                 panic!("directory history read should not use state-history direct plan")
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
                 panic!("directory history read should not use entity-history direct plan")
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
                 panic!("directory history read should not use file-history direct plan")
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("directory history read should not use lowered SQL")
             }
-            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
                 panic!("directory history read should not use read-time projection execution")
             }
         }
@@ -3415,7 +3412,7 @@ mod tests {
                     .expect("filesystem history read should canonicalize");
 
                     match &prepared.execution {
-                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(
+                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(
                             plan,
                         )) => {
                             assert_eq!(
@@ -3423,25 +3420,25 @@ mod tests {
                                 FileHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
                         }
-                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(
+                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(
                             _,
                         )) => {
                             panic!("filesystem history read should not use state-history direct plan")
                         }
-                        PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(
+                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
                             _,
                         )) => {
                             panic!("filesystem history read should not use entity-history direct plan")
                         }
-                        PreparedPublicReadExecution::Direct(
-                            DirectPublicReadPlan::DirectoryHistory(_),
+                        PublicReadPhysicalPlan::HistoryRead(
+                            HistoryReadPlan::DirectoryHistory(_),
                         ) => {
                             panic!("filesystem history read should not use directory-history direct plan")
                         }
-                        PreparedPublicReadExecution::LoweredSql(_) => {
+                        PublicReadPhysicalPlan::LoweredSql(_) => {
                             panic!("filesystem history read should not use lowered SQL")
                         }
-                        PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                        PublicReadPhysicalPlan::ReadTimeProjection(_) => {
                             panic!(
                                 "filesystem history read should not use read-time projection execution"
                             )
@@ -3478,9 +3475,9 @@ mod tests {
                     .expect("entity history read should canonicalize");
 
                     match &prepared.execution {
-                        PreparedPublicReadExecution::Direct(
-                            DirectPublicReadPlan::EntityHistory(plan),
-                        ) => {
+                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
+                            plan,
+                        )) => {
                             assert_eq!(
                                 plan.request.root_scope,
                                 StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
@@ -3504,7 +3501,7 @@ mod tests {
                 .expect("test runtime should build")
                 .block_on(async move {
                     let backend = FakeBackend::default();
-                    let prepared = prepare_public_execution(
+                    let prepared = prepare_public_plan(
                         &backend,
                         &parse_one(
                             "EXPLAIN SELECT key FROM lix_key_value_history \
@@ -3520,7 +3517,7 @@ mod tests {
                     .expect("history EXPLAIN should route through public execution");
 
                     match prepared {
-                        PreparedPublicExecution::Read(prepared) => {
+                        PublicPlan::Read(prepared) => {
                             assert_eq!(prepared.surface_bindings(), vec!["lix_key_value_history"]);
                             assert!(
                                 prepared.explain.compiled_artifacts.lowered_sql.is_empty(),
@@ -3543,7 +3540,7 @@ mod tests {
                                 "direct-history EXPLAIN should not record artifact_preparation timing"
                             );
                         }
-                        PreparedPublicExecution::Write(_) => {
+                        PublicPlan::Write(_) => {
                             panic!("history EXPLAIN must not route through public write execution")
                         }
                     }
@@ -3590,7 +3587,7 @@ mod tests {
     }
 
     #[test]
-    fn classifies_public_reads_through_public_execution() {
+    fn classifies_public_reads_through_public_plan() {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3598,7 +3595,7 @@ mod tests {
                 .expect("test runtime should build")
                 .block_on(async move {
                     let backend = FakeBackend::default();
-                    let prepared = prepare_public_execution(
+                    let prepared = prepare_public_plan(
                         &backend,
                         &parse_one(
                             "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value'",
@@ -3611,13 +3608,13 @@ mod tests {
                     .await
                     .expect("public read classification should succeed");
 
-                    assert!(matches!(prepared, Some(PreparedPublicExecution::Read(_))));
+                    assert!(matches!(prepared, Some(PublicPlan::Read(_))));
                 })
         });
     }
 
     #[test]
-    fn classifies_public_writes_through_public_execution() {
+    fn classifies_public_writes_through_public_plan() {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3626,7 +3623,7 @@ mod tests {
                 .block_on(async move {
                     let (backend, session) = boot_real_backend().await;
                     let active_version_id = session.active_version_id();
-                    let prepared = prepare_public_execution(
+                    let prepared = prepare_public_plan(
                         &backend,
                         &parse_one(
                             "INSERT INTO lix_key_value (key, value) VALUES ('phase1-boundary', 'ok')",
@@ -3639,7 +3636,7 @@ mod tests {
                     .await
                     .expect("public write classification should succeed");
 
-                    assert!(matches!(prepared, Some(PreparedPublicExecution::Write(_))));
+                    assert!(matches!(prepared, Some(PublicPlan::Write(_))));
                 })
         });
     }
@@ -3653,7 +3650,7 @@ mod tests {
                 .expect("test runtime should build")
                 .block_on(async move {
                     let backend = FakeBackend::default();
-                    let error = prepare_public_execution(
+                    let error = prepare_public_plan(
                         &backend,
                         &parse_one(
                             "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
@@ -3686,16 +3683,12 @@ mod tests {
                         "INSERT INTO lix_commit (id, change_set_id) VALUES ('c1', 'cs1')",
                         "INSERT INTO lix_change_set (id) VALUES ('cs1')",
                     ] {
-                        let error = prepare_public_execution(
-                            &backend,
-                            &parse_one(sql),
-                            &[],
-                            "main",
-                            &[],
-                            None,
-                        )
-                        .await
-                        .expect_err("read-only public write should be rejected by public lowering");
+                        let error =
+                            prepare_public_plan(&backend, &parse_one(sql), &[], "main", &[], None)
+                                .await
+                                .expect_err(
+                                    "read-only public write should be rejected by public lowering",
+                                );
                         assert_eq!(error.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");
                     }
                 })
@@ -3788,7 +3781,7 @@ mod tests {
         let bound = bind_public_read_statement(
             statement,
             Vec::new(),
-            ExecutionContext {
+            StatementContext {
                 dialect: Some(SqlDialect::Sqlite),
                 writer_key: None,
                 requested_version_id: Some("main".to_string()),
@@ -3869,7 +3862,7 @@ mod tests {
                 .expect("test runtime should build")
                 .block_on(async move {
                     let backend = FakeBackend::default();
-                    let prepared = prepare_public_execution(
+                    let prepared = prepare_public_plan(
                         &backend,
                         &parse_one(
                             "WITH lix_state AS (SELECT 'shadow' AS entity_id) SELECT entity_id FROM lix_state",
@@ -4001,26 +3994,26 @@ mod tests {
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(plan)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(plan)) => {
                 assert_eq!(
                     plan.request.root_scope,
                     StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
                 );
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::EntityHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
                 panic!("state-history read should not use entity-history direct plan")
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::FileHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
                 panic!("state-history read should not use file-history direct plan")
             }
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::DirectoryHistory(_)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
                 panic!("state-history read should not use directory-history direct plan")
             }
-            PreparedPublicReadExecution::LoweredSql(_) => {
+            PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("state-history read should not use lowered SQL")
             }
-            PreparedPublicReadExecution::ReadTimeProjection(_) => {
+            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
                 panic!("state-history read should not use read-time projection execution")
             }
         }
@@ -4058,7 +4051,7 @@ mod tests {
             vec!["root_commit_id = 'commit-1'".to_string()]
         );
         match &prepared.execution {
-            PreparedPublicReadExecution::Direct(DirectPublicReadPlan::StateHistory(plan)) => {
+            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(plan)) => {
                 assert_eq!(
                     plan.request.root_scope,
                     StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
@@ -4123,7 +4116,7 @@ mod tests {
 
                     assert_eq!(prepared.surface_bindings(), vec!["lix_version"]);
                     match &prepared.execution {
-                        PreparedPublicReadExecution::LoweredSql(_) => {
+                        PublicReadPhysicalPlan::LoweredSql(_) => {
                             let lowered_sql = prepared
                                 .explain
                                 .compiled_artifacts
@@ -4136,12 +4129,12 @@ mod tests {
                             assert!(lowered_sql.contains("current_refs"));
                             assert!(!lowered_sql.contains("FROM lix_state_by_version"));
                         }
-                        PreparedPublicReadExecution::ReadTimeProjection(_) => {
+                        PublicReadPhysicalPlan::ReadTimeProjection(_) => {
                             panic!(
                                 "runtime-function lix_version read should fall back to lowered SQL"
                             )
                         }
-                        PreparedPublicReadExecution::Direct(_) => {
+                        PublicReadPhysicalPlan::HistoryRead(_) => {
                             panic!(
                                 "runtime-function lix_version read should not use direct execution"
                             )
@@ -4159,7 +4152,7 @@ mod tests {
         live_state::register_schema(backend, version_ref_schema_key()).await?;
 
         let mut transaction = backend
-            .begin_transaction(crate::TransactionMode::Write)
+            .begin_transaction(crate::TransactionBeginMode::Write)
             .await?;
         for (index, descriptor) in descriptors.iter().enumerate() {
             let timestamp = format!("2026-04-02T00:00:0{}Z", index);
