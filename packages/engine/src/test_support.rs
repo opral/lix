@@ -6,12 +6,13 @@ use rusqlite::types::{Value as SqliteValue, ValueRef};
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::contracts::PendingView;
+use crate::contracts::SharedFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
-use crate::runtime::functions::{SharedFunctionProvider, SystemFunctionProvider};
-use crate::runtime::wasm::NoopWasmRuntime;
-use crate::session::write_resolution::{resolve_write_plan_with_functions, WriteResolveError};
+use crate::services::functions::SystemFunctionProvider;
+use crate::services::wasm_runtime::NoopWasmRuntime;
 use crate::session::SessionWriteSelectorResolver;
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
+use crate::transaction::{resolve_write_plan_with_functions, WriteResolveError};
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
     QueryResult, ReplayCursor, Session, SqlDialect, TransactionMode, Value,
@@ -273,18 +274,25 @@ pub(crate) async fn resolve_write_plan_for_test(
     backend: &dyn LixBackend,
     projection_registry: &CatalogProjectionRegistry,
     planned_write: &PlannedWrite,
-    pending_transaction_view: Option<&dyn PendingView>,
+    pending_write_view: Option<&dyn PendingView>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let selector_resolver =
-        SessionWriteSelectorResolver::new(backend, projection_registry, pending_transaction_view)
-            .await
-            .map_err(|error| WriteResolveError {
-                message: error.description,
-            })?;
+    let selector_functions = crate::contracts::clone_boxed_function_provider(
+        &SharedFunctionProvider::new(SystemFunctionProvider),
+    );
+    let selector_resolver = SessionWriteSelectorResolver::new(
+        backend,
+        projection_registry,
+        pending_write_view,
+        &selector_functions,
+    )
+    .await
+    .map_err(|error| WriteResolveError {
+        message: error.description,
+    })?;
     resolve_write_plan_with_functions(
         backend,
         planned_write,
-        pending_transaction_view,
+        pending_write_view,
         SharedFunctionProvider::new(SystemFunctionProvider),
         &selector_resolver,
     )

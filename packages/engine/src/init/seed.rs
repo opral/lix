@@ -1,15 +1,16 @@
 use crate::contracts::ExecuteOptions;
+use crate::contracts::ExecutionRuntimeState;
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::execution::write::buffered_write_transaction::BorrowedBufferedWriteTransaction;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     write_live_rows, LiveRow,
 };
-use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::session::execution_context::{ExecutionContext, SessionExecutionRuntime};
 use crate::session::version_ops::load_version_head_commit_id_with_executor;
-use crate::session::write_preparation::execute_parsed_statements_in_borrowed_write_transaction;
 use crate::sql::parse_sql;
+use crate::transaction::{
+    execute_parsed_statements_in_borrowed_write_transaction, BorrowedBufferedWriteTransaction,
+};
 use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
@@ -88,7 +89,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
         let mut runtime_functions = runtime_state.provider().clone();
-        crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
@@ -99,7 +100,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     pub(crate) async fn generate_runtime_timestamp(&mut self) -> Result<String, LixError> {
         let runtime_state = self.ensure_runtime_state().await?;
         let mut runtime_functions = runtime_state.provider().clone();
-        crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             &mut runtime_functions,
         )
@@ -111,7 +112,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let Some(runtime_state) = self.context.execution_runtime_state().cloned() else {
             return Ok(());
         };
-        crate::runtime::deterministic_mode::persist_runtime_sequence_in_transaction(
+        crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
             self.write_transaction.backend_transaction_mut(),
             runtime_state.provider(),
         )
@@ -129,7 +130,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .lix
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
-        let runtime_state = ExecutionRuntimeState::from_prepared_parts(settings, functions);
+        let runtime_state =
+            ExecutionRuntimeState::from_prepared_parts(settings.enabled, &functions);
         self.context
             .set_execution_runtime_state(runtime_state.clone());
         Ok(runtime_state)

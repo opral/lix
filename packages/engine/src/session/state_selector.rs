@@ -360,9 +360,7 @@ fn selector_scan_constraints(planned_write: &PlannedWrite) -> Vec<ScanConstraint
 
 fn resolved_selector_schema_key(planned_write: &PlannedWrite) -> Option<String> {
     match &planned_write.schema_proof {
-        crate::session::write_resolution::prepared_artifacts::SchemaProof::Exact(schema_keys)
-            if schema_keys.len() == 1 =>
-        {
+        crate::transaction::SchemaProof::Exact(schema_keys) if schema_keys.len() == 1 => {
             schema_keys.iter().next().cloned()
         }
         _ => planned_write

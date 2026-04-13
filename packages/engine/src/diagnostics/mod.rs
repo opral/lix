@@ -11,6 +11,12 @@ fn build_error(code: &str, description: impl Into<String>) -> LixError {
     LixError::new(code, description.into())
 }
 
+fn system_functions() -> crate::contracts::DynFunctionProvider {
+    crate::contracts::clone_boxed_function_provider(&crate::contracts::SharedFunctionProvider::new(
+        crate::services::functions::SystemFunctionProvider,
+    ))
+}
+
 pub(crate) fn table_not_found_read_error() -> LixError {
     let available_tables = crate::sql::protected_builtin_public_surface_names().join(", ");
     build_error(
@@ -347,7 +353,13 @@ async fn resolve_available_columns(
         return Vec::new();
     };
 
-    let registry = match crate::runtime::load_public_surface_registry_with_backend(backend).await {
+    let registry = match crate::catalog::load_public_surface_registry_with_backend(
+        backend,
+        crate::services::cel_runtime::shared_runtime(),
+        &system_functions(),
+    )
+    .await
+    {
         Ok(registry) => registry,
         Err(_) => return Vec::new(),
     };
@@ -357,7 +369,13 @@ async fn resolve_available_columns(
 }
 
 async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
-    match crate::runtime::load_public_surface_registry_with_backend(backend).await {
+    match crate::catalog::load_public_surface_registry_with_backend(
+        backend,
+        crate::services::cel_runtime::shared_runtime(),
+        &system_functions(),
+    )
+    .await
+    {
         Ok(registry) => registry.public_surface_names(),
         Err(_) => builtin_public_surface_names(),
     }
@@ -368,7 +386,13 @@ async fn public_surfaces_in_relation_names_with_backend(
     relation_names: &[String],
     fallback_statements: Option<&[Statement]>,
 ) -> Vec<String> {
-    let registry = match crate::runtime::load_public_surface_registry_with_backend(backend).await {
+    let registry = match crate::catalog::load_public_surface_registry_with_backend(
+        backend,
+        crate::services::cel_runtime::shared_runtime(),
+        &system_functions(),
+    )
+    .await
+    {
         Ok(registry) => registry,
         Err(_) => {
             return fallback_statements

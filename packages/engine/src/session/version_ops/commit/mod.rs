@@ -1,6 +1,6 @@
 //! Commit authoring and orchestration boundary.
 //!
-//! `execution/write/commit` owns commit authoring, preflight, receipts,
+//! `transaction` owns commit authoring, preflight, receipts,
 //! idempotency, and the atomic write path that composes canonical facts with
 //! local refs, workspace annotations, and narrow live-state hooks.
 

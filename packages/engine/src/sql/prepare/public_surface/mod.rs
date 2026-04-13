@@ -286,9 +286,18 @@ pub(crate) async fn prepare_public_execution_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_tables: bool,
 ) -> Result<Option<PreparedPublicExecution>, LixError> {
-    let registry = crate::runtime::load_public_surface_registry_with_backend(backend)
-        .await
-        .map_err(|error| LixError::new(error.code, error.description))?;
+    let functions = crate::contracts::clone_boxed_function_provider(
+        &crate::contracts::SharedFunctionProvider::new(
+            crate::services::functions::SystemFunctionProvider,
+        ),
+    );
+    let registry = crate::catalog::load_public_surface_registry_with_backend(
+        backend,
+        crate::services::cel_runtime::shared_runtime(),
+        &functions,
+    )
+    .await
+    .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata =
         crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
     prepare_public_execution_with_registry_context_and_functions(

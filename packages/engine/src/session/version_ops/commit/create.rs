@@ -6,21 +6,21 @@ use crate::contracts::version_ref_snapshot_content;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{MutationRow, OptionalTextPatch};
-use crate::execution::write::filesystem::runtime::{
-    compile_filesystem_transaction_state_from_state,
-    filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
-    BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
-    FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
-    FILESYSTEM_FILE_SCHEMA_KEY,
-};
-use crate::execution::write::transaction::execute_write_program_with_transaction;
-use crate::runtime::deterministic_mode::{
+use crate::session::deterministic_mode::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
 };
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
     VersionSnapshot,
+};
+use crate::transaction::execute_write_program_with_transaction;
+use crate::transaction::{
+    compile_filesystem_transaction_state_from_state,
+    filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
+    BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
+    FilesystemSemanticChange, FilesystemTransactionState, FILESYSTEM_DESCRIPTOR_FILE_ID,
+    FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::SqlDialect;
 use crate::{
@@ -1296,14 +1296,12 @@ mod tests {
     use crate::contracts::LixFunctionProvider;
     use crate::contracts::OptionalTextPatch;
     use crate::contracts::GLOBAL_VERSION_ID;
-    use crate::execution::write::filesystem::runtime::{
-        FilesystemTransactionFileState, FilesystemTransactionState,
-    };
     use crate::session::version_ops::commit::UpdatedVersionRef;
     use crate::test_support::{
         init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::transaction::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
         LixBackend, LixBackendTransaction, LixError, Value, VersionId,

@@ -2,14 +2,14 @@ use async_trait::async_trait;
 
 use crate::catalog::FilesystemProjectionScope;
 use crate::common::NormalizedDirectoryPath;
-use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
-use crate::execution::write::transaction::lookup_directory_id_by_path_in_transaction;
-use crate::execution::write::{
-    install_plugin_archive_with_writer, stage_prepared_write_step, PluginInstallWriteExecutor,
-    PreparedWriteExecutionStep, SemanticWriteContext,
+use crate::execution::step::PreparedWriteExecutionStep;
+use crate::session::semantic_write::{
+    install_plugin_archive_with_writer, PluginInstallWriteExecutor, SemanticWriteContext,
 };
-use crate::session::write_pipeline::{
-    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
+use crate::transaction::{
+    ensure_execution_runtime_state_for_write_scope, lookup_directory_id_by_path_in_transaction,
+    prepared_write_runtime_state_for_execution, stage_prepared_write_step,
+    BufferedWriteTransaction,
 };
 use crate::{ExecuteOptions, LixError, Session};
 

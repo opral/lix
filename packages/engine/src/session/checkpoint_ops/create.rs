@@ -3,8 +3,7 @@ use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
-use crate::runtime::execution_state::ExecutionRuntimeState;
+use crate::contracts::{ExecutionRuntimeState, GLOBAL_VERSION_ID};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::super::version_ops::context::require_target_version_context_in_transaction;
@@ -215,7 +214,7 @@ async fn checkpoint_runtime_state(
         .prepare_execution_runtime_state(&backend)
         .await?;
     let mut runtime_functions = runtime_state.provider().clone();
-    crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+    crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
         tx.backend_transaction_mut()?,
         &mut runtime_functions,
     )

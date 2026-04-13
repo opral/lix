@@ -7,6 +7,7 @@
 
 pub(crate) mod checkpoint_ops;
 pub(crate) mod collaborators;
+pub(crate) mod deterministic_mode;
 pub(crate) mod execution_context;
 mod init;
 pub(crate) mod observe;
@@ -16,14 +17,11 @@ mod public_surface_registry;
 pub(crate) mod read_execution_bindings;
 pub(crate) mod read_preparation;
 mod selector_reads;
+pub(crate) mod semantic_write;
 pub(crate) mod state_selector;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
 pub(crate) mod write_execution_bindings;
-pub(crate) mod write_pipeline;
-pub(crate) mod write_preparation;
-pub(crate) mod write_resolution;
-pub(crate) mod write_validation;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -37,31 +35,22 @@ use sqlparser::ast::Statement;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::ExecuteOptions;
 use crate::contracts::TransactionCommitOutcome;
-use crate::contracts::{SessionDependency, SessionExecutionMode, SessionStateSnapshot};
+use crate::contracts::{
+    ExecutionRuntimeState, SessionDependency, SessionExecutionMode, SessionStateSnapshot,
+};
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::read::execute_prepared_read_program_in_committed_read_transaction;
-use crate::execution::write::buffered_write_transaction::BufferedWriteTransaction;
-use crate::execution::write::{
-    prepare_registered_schema_write_step, stage_prepared_write_step, SemanticWriteContext,
-};
 use crate::image::ImageChunkWriter;
-use crate::runtime::execution_state::ExecutionRuntimeState;
 use crate::session::collaborators::SessionCollaborators;
 use crate::session::execution_context::{
     ExecutionContext, SessionExecutionRuntime, SessionExecutionRuntimeHandle,
 };
 pub(crate) use crate::session::public_surface_registry::apply_registered_schema_snapshot_to_surface_registry;
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
+use crate::session::semantic_write::{prepare_registered_schema_write_step, SemanticWriteContext};
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
-};
-use crate::session::write_pipeline::{
-    ensure_execution_runtime_state_for_write_scope, prepared_write_runtime_state_for_execution,
-};
-use crate::session::write_preparation::{
-    execute_execution_program_with_write_transaction,
-    execute_parsed_statements_in_write_transaction,
 };
 #[cfg(test)]
 use crate::sql::parse_sql;
@@ -71,6 +60,12 @@ use crate::sql::{
     reject_internal_table_writes, reject_public_create_table, CommittedReadProgramContext,
     ExecutionProgram,
 };
+use crate::transaction::{
+    ensure_execution_runtime_state_for_write_scope,
+    execute_execution_program_with_write_transaction,
+    execute_parsed_statements_in_write_transaction, prepared_write_runtime_state_for_execution,
+};
+use crate::transaction::{stage_prepared_write_step, BufferedWriteTransaction};
 use crate::{ExecuteResult, LixError, Value};
 
 pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
@@ -505,7 +500,7 @@ impl Session {
                     "committed execution should retain an execution runtime state during execution",
                 );
 
-                if !runtime_state.settings().enabled {
+                if !runtime_state.deterministic_enabled() {
                     let committed_read_context = committed_read_program_context(
                         &context,
                         self.collaborators.as_ref(),
@@ -547,7 +542,7 @@ impl Session {
                         .begin_read_unit(crate::TransactionMode::Write)
                         .await?;
                     let mut runtime_functions = runtime_state.provider().clone();
-                    crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+                    crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
                         transaction.as_mut(),
                         &mut runtime_functions,
                     )
@@ -575,7 +570,7 @@ impl Session {
                     .await;
                     match result {
                         Ok(result) => {
-                            crate::runtime::deterministic_mode::persist_runtime_sequence_in_transaction(
+                            crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
                                 transaction.as_mut(),
                                 runtime_state.provider(),
                             )
@@ -793,7 +788,7 @@ fn baseline_committed_read_transaction_mode(
     match execution_mode {
         SessionExecutionMode::CommittedRead => crate::TransactionMode::Read,
         SessionExecutionMode::CommittedRuntimeMutation => {
-            if runtime_state.settings().enabled {
+            if runtime_state.deterministic_enabled() {
                 crate::TransactionMode::Write
             } else {
                 crate::TransactionMode::Read
@@ -1187,7 +1182,7 @@ mod tests {
     fn test_lix(backend: RecordingBackend) -> Arc<crate::Lix> {
         Arc::new(crate::Lix::boot(crate::LixConfig::new(
             Box::new(backend),
-            Arc::new(crate::runtime::wasm::NoopWasmRuntime),
+            Arc::new(crate::services::wasm_runtime::NoopWasmRuntime),
         )))
     }
 

@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 
 use crate::contracts::{
-    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
+    DynFunctionProvider, PendingViewFilter, PendingViewOrderClause, PendingViewProjection,
+    PendingViewReadQuery, PendingViewReadStorage, PreparedPublicReadArtifact,
+    PublicReadExecutionMode, PublicReadResultColumn, PublicReadResultColumns,
 };
 use crate::contracts::{
-    PendingViewFilter, PendingViewOrderClause, PendingViewProjection, PendingViewReadQuery,
-    PendingViewReadStorage, PreparedPublicReadArtifact, PublicReadExecutionMode,
-    PublicReadResultColumn, PublicReadResultColumns,
+    PendingFilesystemFileView, PendingSemanticRow, PendingSemanticStorage, PendingView,
 };
 use crate::live_state::{
     compile_live_read_contract_from_registered_snapshots, read_contract_from_definition,
@@ -23,11 +23,20 @@ const GLOBAL_VERSION_ID: &str = "global";
 struct TransactionReadModel<'a> {
     base: &'a dyn LixBackend,
     pending_view: Option<&'a dyn PendingView>,
+    functions: Option<&'a DynFunctionProvider>,
 }
 
 impl<'a> TransactionReadModel<'a> {
-    fn new(base: &'a dyn LixBackend, pending_view: Option<&'a dyn PendingView>) -> Self {
-        Self { base, pending_view }
+    fn new(
+        base: &'a dyn LixBackend,
+        pending_view: Option<&'a dyn PendingView>,
+        functions: Option<&'a DynFunctionProvider>,
+    ) -> Self {
+        Self {
+            base,
+            pending_view,
+            functions,
+        }
     }
 
     fn has_pending_visibility(&self) -> bool {
@@ -37,8 +46,16 @@ impl<'a> TransactionReadModel<'a> {
     async fn bootstrap_public_surface_registry(
         &self,
     ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
+        let functions = self
+            .functions
+            .expect("surface registry bootstrap requires explicit runtime functions");
         if !self.has_pending_visibility() {
-            return crate::runtime::load_public_surface_registry_with_backend(self.base).await;
+            return crate::catalog::load_public_surface_registry_with_backend(
+                self.base,
+                crate::services::cel_runtime::shared_runtime(),
+                functions,
+            )
+            .await;
         }
 
         let mut registry = crate::catalog::build_builtin_surface_registry();
@@ -52,6 +69,7 @@ impl<'a> TransactionReadModel<'a> {
             crate::session::apply_registered_schema_snapshot_to_surface_registry(
                 &mut registry,
                 &snapshot,
+                functions,
             )?;
         }
         Ok(registry)
@@ -361,9 +379,10 @@ impl<'a> TransactionReadModel<'a> {
 
 pub(crate) async fn build_surface_registry(
     base: &dyn LixBackend,
-    pending_transaction_view: Option<&dyn PendingView>,
+    pending_write_view: Option<&dyn PendingView>,
+    functions: &DynFunctionProvider,
 ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
-    TransactionReadModel::new(base, pending_transaction_view)
+    TransactionReadModel::new(base, pending_write_view, Some(functions))
         .bootstrap_public_surface_registry()
         .await
 }
@@ -373,7 +392,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_view(
     pending_view: Option<&dyn PendingView>,
     public_read: &PreparedPublicReadArtifact,
 ) -> Result<QueryResult, LixError> {
-    TransactionReadModel::new(base, pending_view)
+    TransactionReadModel::new(base, pending_view, None)
         .execute_prepared_public_read(public_read)
         .await
 }
@@ -386,7 +405,7 @@ pub(crate) async fn execute_prepared_public_read_with_pending_view_in_transactio
     match public_read.contract.execution_mode() {
         PublicReadExecutionMode::PendingView => {
             let backend = crate::backend::transaction_backend_view(transaction);
-            TransactionReadModel::new(&backend, pending_view)
+            TransactionReadModel::new(&backend, pending_view, None)
                 .execute_prepared_public_read(public_read)
                 .await
         }

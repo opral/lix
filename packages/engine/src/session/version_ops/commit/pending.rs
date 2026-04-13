@@ -4,9 +4,8 @@ use crate::backend::QueryExecutor;
 use crate::canonical::append_changes;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::{PendingPublicCommitLane, PendingPublicCommitSession};
-use crate::execution::write::filesystem::runtime::BinaryBlobWrite;
-use crate::execution::write::transaction::{execute_write_program_with_transaction, WriteProgram};
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
+use crate::transaction::{execute_write_program_with_transaction, BinaryBlobWrite, WriteProgram};
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, LixBackendTransaction, LixError, QueryResult, Value, VersionId,

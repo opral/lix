@@ -8,18 +8,13 @@ use crate::catalog::CatalogProjectionRegistry;
 use crate::common::escape_sql_string;
 use crate::contracts::parse_active_version_snapshot;
 use crate::contracts::TrackedChangeView;
+use crate::contracts::TrackedCommitExecutionOutcome;
 use crate::contracts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PendingPublicCommitSession,
     PreparedPublicReadArtifact, PreparedPublicWriteArtifact, PublicChange, SchemaKey, WriteLane,
 };
 use crate::contracts::{CompiledSchemaCache, PendingView};
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
-use crate::execution::write::buffered::TrackedTxnUnit;
-use crate::execution::write::filesystem::runtime::{
-    resolve_binary_blob_writes_in_transaction, BinaryBlobWrite,
-};
-use crate::execution::write::transaction::TransactionExecutionBackend;
-use crate::execution::write::{TrackedCommitExecutionOutcome, WriteExecutionBindings};
 use crate::live_state::RowIdentity;
 use crate::session::collaborators::SessionCollaborators;
 use crate::session::read_execution_bindings::CatalogProjectionRegistryReadExecutionBindings;
@@ -29,7 +24,10 @@ use crate::session::version_ops::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
     CreateCommitPreconditions, CreateCommitWriteLane, StagedChange,
 };
-use crate::session::write_validation::validate_commit_time_write;
+use crate::transaction::{
+    resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
+    TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionBindings,
+};
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
@@ -202,7 +200,7 @@ pub(crate) async fn persist_runtime_sequence(
     transaction: &mut dyn LixBackendTransaction,
     functions: &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
 ) -> Result<(), LixError> {
-    crate::runtime::deterministic_mode::persist_runtime_sequence_in_transaction(
+    crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
         transaction,
         functions,
     )
@@ -246,7 +244,7 @@ pub(crate) async fn execute_public_tracked_append(
         .is_some_and(|slot| slot.as_ref().is_some())
         && !unit.has_compiler_only_filesystem_changes()
     {
-        crate::runtime::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
+        crate::session::deterministic_mode::ensure_runtime_sequence_initialized_in_transaction(
             transaction,
             &mut create_commit_functions,
         )
@@ -297,7 +295,7 @@ pub(crate) async fn execute_public_tracked_append(
             .deterministic_sequence_persist_highest_seen()
             .is_some()
     {
-        crate::runtime::deterministic_mode::persist_runtime_sequence_in_transaction(
+        crate::session::deterministic_mode::persist_runtime_sequence_in_transaction(
             transaction,
             &create_commit_functions,
         )
