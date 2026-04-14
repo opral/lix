@@ -14,18 +14,7 @@ use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::CompiledSchemaCache;
 use crate::contracts::{
-    clone_boxed_function_provider, FunctionBindings, LixFunctionProvider,
-    PreparedWriteFunctionBindings, SharedFunctionProvider,
-};
-use crate::contracts::{
-    PreparedBatch, PreparedDirectWriteArtifact, PreparedExplainMode,
-    PreparedInsertOnConflictAction, PreparedPublicSurfaceRegistryEffect,
-    PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
-    PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
-    PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
-    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteArtifact,
-    PreparedWriteOperationKind, PreparedWriteStatement, PreparedWriteStatementKind,
-    UpdateValidationInput, UpdateValidationInputRow, WriteDiagnosticContext,
+    clone_boxed_function_provider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
@@ -38,9 +27,11 @@ use crate::sql::{
     load_sql_compiler_metadata_with_reader_and_pending_overlay, prepare_public_read_artifact,
     public_authoritative_write_error, public_write_preparation_error,
     refresh_materialized_public_write_explain, BoundStatementInstance, CompilePolicy,
-    CompiledExecution, InsertOnConflictAction, PublicWriteExecutionPartition,
-    PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan, SqlCompilerMetadata,
-    SqlPreparationMetadataReader, UpdateValidationPlan, WriteOperationKind,
+    CompiledExecution, InsertOnConflictAction, PreparedBatch, PreparedExplainMode,
+    PreparedInsertOnConflictAction, PreparedWriteOperationKind, PreparedWriteStatementKind,
+    PublicWriteExecutionPartition, PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan,
+    SqlCompilerMetadata, SqlPreparationMetadataReader, UpdateValidationPlan,
+    WriteDiagnosticContext, WriteOperationKind,
 };
 use crate::transaction::ensure_runtime_sequence_initialized_in_transaction;
 use crate::transaction::overlay::PendingOverlay;
@@ -49,7 +40,14 @@ use crate::transaction::pipeline::validation::{
     validate_batch_local_write, validate_inserts, validate_update_inputs,
 };
 use crate::transaction::{
-    PendingWriteOverlay, SessionCompilerState, WriteCommand, WriteExecutionContext,
+    PendingWriteOverlay, PlannedStateRow, PreparedDirectWriteArtifact,
+    PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
+    PreparedPublicWrite, PreparedPublicWriteContract, PreparedPublicWriteExecutionPartition,
+    PreparedPublicWriteMaterialization, PreparedPublicWritePlanArtifact,
+    PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
+    PreparedUntrackedWriteExecution, PreparedWriteArtifact, PreparedWriteFunctionBindings,
+    PreparedWriteStatement, SessionCompilerState, UpdateValidationInput, UpdateValidationInputRow,
+    WriteCommand, WriteExecutionContext,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
@@ -852,7 +850,7 @@ fn prepared_insert_on_conflict_action_from_sql(
 }
 
 fn planned_row_optional_json_text_value<'a>(
-    row: &'a crate::contracts::PlannedStateRow,
+    row: &'a PlannedStateRow,
     key: &str,
 ) -> Option<Cow<'a, str>> {
     match row.values.get(key) {

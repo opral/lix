@@ -9,9 +9,9 @@ use std::time::Duration;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::{
-    ChangeBatch, PreparedExplainMode, PreparedExplainTemplate, StateCommitStreamFilter,
-};
+use crate::sql::{PreparedExplainMode, PreparedExplainTemplate};
+use crate::streams::StateCommitStreamFilter;
+use crate::transaction::ChangeBatch;
 use crate::{LixError, SqlDialect, Value};
 
 #[cfg(test)]
@@ -44,7 +44,6 @@ pub(crate) use super::prepare::{
     prepare_public_read_artifact, public_authoritative_write_error, public_write_preparation_error,
     BoundStatementInstance, CommittedReadContext, CompilePolicy, CompiledExecution, PublicPlan,
     PublicReadPlan, PublicWritePlan, SqlCompilerMetadata, SqlCompilerSeed, StatementBatch,
-    UpdateValidationPlan,
 };
 pub(crate) use super::semantic_ir::semantics::changes::{
     build_change_batches, derive_commit_preconditions,

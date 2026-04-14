@@ -1,11 +1,9 @@
-use crate::contracts::SessionStateDelta;
-use crate::contracts::{
+use crate::sql::prepare::contracts::planner_error::PlannerError;
+use crate::sql::PlannedStatementSet;
+use crate::streams::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
-
-use crate::sql::prepare::contracts::effects::PlanEffects;
-use crate::sql::prepare::contracts::planned_statement::PlannedStatementSet;
-use crate::sql::prepare::contracts::planner_error::PlannerError;
+use crate::transaction::PlanEffects;
 use std::collections::BTreeSet;
 
 pub(crate) fn derive_effects_from_state_resolution(
@@ -20,17 +18,13 @@ pub(crate) fn derive_effects_from_state_resolution(
 
     Ok(PlanEffects {
         state_commit_stream_changes,
-        session_delta: SessionStateDelta {
-            next_active_version_id: None,
-            next_active_account_ids: None,
-            persist_workspace: false,
-        },
         file_cache_refresh_targets,
+        ..PlanEffects::default()
     })
 }
 
 fn direct_state_file_cache_refresh_targets(
-    mutations: &[crate::contracts::MutationRow],
+    mutations: &[crate::sql::MutationRow],
 ) -> BTreeSet<(String, String)> {
     mutations
         .iter()
@@ -45,10 +39,8 @@ fn direct_state_file_cache_refresh_targets(
 #[cfg(test)]
 mod tests {
     use super::derive_effects_from_state_resolution;
-    use crate::contracts::PreparedStatement;
-    use crate::sql::prepare::contracts::planned_statement::{
-        MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan,
-    };
+    use crate::sql::PreparedStatement;
+    use crate::sql::{MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan};
     use serde_json::json;
 
     #[test]

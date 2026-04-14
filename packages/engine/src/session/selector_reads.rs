@@ -82,7 +82,7 @@ impl ReadExecutionHost for SessionWriteSelectorResolver<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::contracts::ReadTimeProjectionPlan,
+        artifact: &crate::sql::ReadTimeProjectionPlan,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
         crate::session::public_read_execution::derive_read_time_projection_rows_with_registry(
             self.projection_registry,

@@ -12,7 +12,9 @@ pub(crate) mod observe;
 pub(crate) mod plugin;
 pub(crate) mod public_read_execution;
 pub(crate) mod public_read_preparation;
+mod runtime;
 mod selector_reads;
+mod state;
 pub(crate) mod state_write_target_resolver;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
@@ -28,11 +30,7 @@ use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::ExecuteOptions;
-use crate::contracts::TransactionCommitOutcome;
-use crate::contracts::{
-    FunctionBindings, SessionDependency, SessionExecutionMode, SessionStateSnapshot,
-};
+use crate::contracts::FunctionBindings;
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
 use crate::image::ImageChunkWriter;
@@ -54,20 +52,26 @@ use crate::transaction::{
     execute_statement_batch_with_write_transaction, prepared_write_function_bindings_for_execution,
 };
 use crate::transaction::{stage_prepared_write_statement, BufferedWriteTransaction};
-use crate::transaction::{SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState};
+use crate::transaction::{
+    PendingCommitState, SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
+    TransactionCommitOutcome,
+};
 use crate::{ExecuteResult, LixError, Value};
 pub(crate) use host::{
-    prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
-    SessionHost,
+    opened_workspace_session, prepare_function_bindings_with_host, require_workspace_session,
+    sql_compiler_seed_from_host, SessionExecutionContext, SessionHost,
 };
 
 pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
+pub use runtime::ExecuteOptions;
+pub(crate) use runtime::{SessionDependency, SessionExecutionMode};
+pub(crate) use state::{SessionStateDelta, SessionStateSnapshot};
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
     projection_registry: &crate::catalog::CatalogProjectionRegistry,
     transaction: &mut dyn crate::LixBackendTransaction,
     pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,
-    public_read: &crate::contracts::PreparedPublicRead,
+    public_read: &crate::sql::PreparedPublicRead,
 ) -> Result<crate::QueryResult, LixError> {
     write_execution_context::execute_prepared_public_read_with_registry(
         projection_registry,
@@ -103,8 +107,8 @@ pub(crate) async fn persist_runtime_sequence_in_transaction(
 pub(crate) async fn execute_public_tracked_append_txn_with_transaction(
     transaction: &mut dyn crate::LixBackendTransaction,
     unit: &crate::transaction::TrackedTxnUnit,
-    pending_commit_state: Option<&mut Option<crate::contracts::PendingCommitState>>,
-) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
+    pending_commit_state: Option<&mut Option<PendingCommitState>>,
+) -> Result<crate::transaction::TrackedCommitExecutionOutcome, LixError> {
     write_execution_context::execute_public_tracked_append(transaction, unit, pending_commit_state)
         .await
 }
@@ -896,7 +900,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_state_commit_stream_changes(
         &mut self,
-        changes: Vec<crate::contracts::StateCommitStreamChange>,
+        changes: Vec<crate::streams::StateCommitStreamChange>,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()
@@ -1308,8 +1312,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let result = session
                 .execute("SELECT 1", &[])
@@ -1325,8 +1332,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
             let parsed_statements =
                 parse_sql("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
             let runtime_bindings = session
@@ -1354,8 +1364,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let _ = session.execute("BEGIN; SELECT 1; COMMIT;", &[]).await;
             assert_eq!(backend.modes(), vec![crate::TransactionBeginMode::Write]);
@@ -1369,8 +1382,7 @@ mod tests {
             let lix = test_lix(backend.clone());
             lix.initialize().await.expect("lix init should succeed");
             backend.clear_modes();
-            let session = lix
-                .open_workspace_session()
+            let session = crate::session::host::open_workspace_session(lix.engine().session_host())
                 .await
                 .expect("workspace session should open");
 
@@ -1390,8 +1402,7 @@ mod tests {
             let lix = test_lix(backend.clone());
             lix.initialize().await.expect("lix init should succeed");
             backend.clear_modes();
-            let session = lix
-                .open_workspace_session()
+            let session = crate::session::host::open_workspace_session(lix.engine().session_host())
                 .await
                 .expect("workspace session should open");
 
@@ -1410,8 +1421,7 @@ mod tests {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
             lix.initialize().await.expect("lix init should succeed");
-            let session = lix
-                .open_workspace_session()
+            let session = crate::session::host::open_workspace_session(lix.engine().session_host())
                 .await
                 .expect("workspace session should open");
 
@@ -1440,8 +1450,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let error = session
                 .execute(
@@ -1468,8 +1481,11 @@ mod tests {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
             let lix = test_lix(backend.clone());
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let error = session
                 .execute("CREATE TABLE user_data (id TEXT)", &[])

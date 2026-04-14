@@ -6,7 +6,7 @@ use crate::catalog::{
     RelationBindContext, RelationBinding, ResolvedRelation, SchemaRelationBinding, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant, VersionRelationBinding,
 };
-use crate::contracts::SessionDependency;
+use crate::session::SessionDependency;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -202,7 +202,7 @@ mod tests {
 
     use super::{dependency_metadata_for_surface_name, CatalogSurfaceDependencyMetadata};
     use crate::catalog::{build_builtin_surface_registry, builtin_catalog_projection_registry};
-    use crate::contracts::SessionDependency;
+    use crate::session::SessionDependency;
 
     #[test]
     fn lix_version_dependency_metadata_comes_from_catalog_declaration() {

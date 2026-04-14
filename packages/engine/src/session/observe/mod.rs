@@ -1,6 +1,6 @@
 use crate::common::{unexpected_statement_count_error, WireValue};
-use crate::contracts::SessionDependency;
 use crate::session::Session;
+use crate::session::SessionDependency;
 use crate::sql::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec, parse_sql_statements,
 };
@@ -1089,8 +1089,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1127,8 +1130,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
             let mut observed_a = session
@@ -1230,8 +1236,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let mut state = build_observe_state(
                 &session,
@@ -1274,8 +1283,11 @@ mod tests {
                 }),
                 Arc::new(NoopWasmRuntime),
             )));
-            let session =
-                Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
 
             let mut state = build_observe_state(
                 &session,

@@ -134,7 +134,7 @@ mod tests {
         CatalogProjectionInputSpec, CatalogProjectionLifecycle, CatalogProjectionRegistration,
         CatalogProjectionSourceRow, CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
     };
-    use crate::contracts::RowIdentity;
+    use crate::live_state::RowIdentity;
     use crate::Value;
 
     #[test]

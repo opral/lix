@@ -2,17 +2,18 @@ use async_trait::async_trait;
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::TrackedCommitExecutionOutcome;
 use crate::contracts::{
     DynFunctionProvider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
-use crate::contracts::{PendingCommitState, PreparedPublicRead};
 #[cfg(test)]
-use crate::contracts::{
+use crate::live_state::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::session::SessionStateDelta;
+use crate::sql::PreparedPublicRead;
 use crate::sql::SqlCompilerSeed;
 use crate::transaction::overlay::PendingOverlay;
+use crate::transaction::PendingCommitState;
 use crate::LixError;
 use crate::{LixBackend, LixBackendTransaction, QueryResult};
 
@@ -21,6 +22,112 @@ use crate::transaction::buffered::TrackedTxnUnit;
 #[cfg(test)]
 use crate::transaction::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal};
 use crate::transaction::filesystem::runtime::BinaryBlobWrite;
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
+pub struct TransactionCommitOutcome {
+    #[serde(default, skip_serializing_if = "SessionStateDelta::is_empty")]
+    pub session_delta: SessionStateDelta,
+    #[serde(default)]
+    pub invalidate_deterministic_settings_cache: bool,
+    #[serde(default)]
+    pub invalidate_installed_plugins_cache: bool,
+    #[serde(default)]
+    pub refresh_public_surface_registry: bool,
+    #[serde(default)]
+    pub state_commit_stream_changes: Vec<crate::streams::StateCommitStreamChange>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TrackedCommitExecutionOutcome {
+    pub receipt: Option<crate::transaction::CanonicalCommitReceipt>,
+    pub applied_changes: Vec<crate::transaction::PublicChange>,
+    pub plugin_changes_committed: bool,
+    pub next_active_version_id: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct PreparedWriteFunctionBindings {
+    deterministic_enabled: bool,
+    provider: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+}
+
+impl std::fmt::Debug for PreparedWriteFunctionBindings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedWriteFunctionBindings")
+            .field("deterministic_enabled", &self.deterministic_enabled)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedWriteFunctionBindings {
+    pub fn new(
+        deterministic_enabled: bool,
+        provider: SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+    ) -> Self {
+        Self {
+            deterministic_enabled,
+            provider,
+        }
+    }
+
+    pub fn provider(&self) -> &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>> {
+        &self.provider
+    }
+}
+
+impl TransactionCommitOutcome {
+    pub fn merge(&mut self, other: TransactionCommitOutcome) {
+        self.session_delta.merge(other.session_delta);
+        self.invalidate_deterministic_settings_cache |=
+            other.invalidate_deterministic_settings_cache;
+        self.invalidate_installed_plugins_cache |= other.invalidate_installed_plugins_cache;
+        self.refresh_public_surface_registry |= other.refresh_public_surface_registry;
+        self.state_commit_stream_changes
+            .extend(other.state_commit_stream_changes);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BufferedWriteExecutionInput {
+    writer_key: Option<String>,
+    active_version_id: String,
+    active_account_ids: Vec<String>,
+}
+
+impl BufferedWriteExecutionInput {
+    pub fn new(
+        writer_key: Option<String>,
+        active_version_id: impl Into<String>,
+        active_account_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            writer_key,
+            active_version_id: active_version_id.into(),
+            active_account_ids,
+        }
+    }
+
+    pub fn writer_key(&self) -> Option<&str> {
+        self.writer_key.as_deref()
+    }
+
+    pub fn active_version_id(&self) -> &str {
+        &self.active_version_id
+    }
+
+    pub fn active_account_ids(&self) -> &[String] {
+        &self.active_account_ids
+    }
+
+    pub fn apply_session_delta(&mut self, delta: &SessionStateDelta) {
+        if let Some(version_id) = &delta.next_active_version_id {
+            self.active_version_id = version_id.clone();
+        }
+        if let Some(active_account_ids) = &delta.next_active_account_ids {
+            self.active_account_ids = active_account_ids.clone();
+        }
+    }
+}
 
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]

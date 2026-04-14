@@ -7,13 +7,13 @@ use crate::canonical::{
 };
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
 use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
+use crate::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::context::{

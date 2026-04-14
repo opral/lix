@@ -1,12 +1,7 @@
 //! Compiler-owned public surface source SQL builders.
 
 use crate::catalog::{RelationBinding, ResolvedRelation, SurfaceVariant};
-use crate::contracts::EffectiveStateRequest;
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{
-    version_descriptor_schema_key, version_ref_file_id, version_ref_plugin_key,
-    version_ref_schema_key, version_ref_schema_version,
-};
 use crate::live_state::tracked_relation_name;
 use crate::live_state::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
@@ -20,6 +15,11 @@ use crate::sql::physical_plan::public_surface_sql_support::{
     expr_contains_string_literal, json_array_text_join_sql, quote_ident, render_identifier,
     render_qualified_where_clause_sql, render_where_clause_sql,
     split_effective_state_pushdown_predicates,
+};
+use crate::sql::EffectiveStateRequest;
+use crate::version::{
+    version_descriptor_schema_key, version_ref_file_id, version_ref_plugin_key,
+    version_ref_schema_key, version_ref_schema_version,
 };
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;

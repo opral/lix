@@ -29,12 +29,12 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "backend",
-        reason: "backend is a lower persistence owner; shared SQL helpers must move to neutral foundation and services must stay above it",
-        forbidden_scopes: &["services", "sql"],
+        reason: "backend is a lower persistence owner; it may use sql-owned prepared statement DTOs but must not grow dependencies on higher workflow or sidecar roots",
+        forbidden_scopes: &["services"],
     },
     ForbiddenDependencyRule {
         from_scope: "contracts",
-        reason: "contracts is a downward-only seam and must stay neutral relative to engine owners",
+        reason: "contracts is a downward seam and may reference sql-owned prepared artifact DTOs, but must stay neutral relative to runtime owners",
         forbidden_scopes: &[
             "backend",
             "canonical",
@@ -43,7 +43,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
             "live_state",
             "services",
             "session",
-            "sql",
         ],
     },
     ForbiddenDependencyRule {
@@ -75,14 +74,13 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "execution",
-        reason: "execution should consume contracts, live_state, and backend; compiler and transaction access must come through prepared artifacts and transaction-owned callers rather than direct owner imports",
+        reason: "execution is a runner leaf; it may consume sql-owned prepared artifacts but must not depend on higher orchestration owners or transaction internals directly",
         forbidden_scopes: &[
             "canonical",
             "api",
             "init",
             "services",
             "session",
-            "sql",
             "transaction",
         ],
     },
@@ -1238,6 +1236,35 @@ fn render_target_core_graph(graph: &BTreeMap<String, BTreeSet<String>>) -> Strin
     rendered
 }
 
+fn owner_root_cycles(graph: &BTreeMap<String, BTreeSet<String>>) -> Vec<Vec<String>> {
+    let nodes = graph.keys().cloned().collect::<Vec<_>>();
+    let mut cycles = tarjan(&nodes, graph)
+        .into_iter()
+        .filter(|component| {
+            component.len() > 1
+                || component.first().is_some_and(|node| {
+                    graph
+                        .get(node)
+                        .is_some_and(|neighbors| neighbors.contains(node))
+                })
+        })
+        .map(|mut component| {
+            component.sort();
+            component
+        })
+        .collect::<Vec<_>>();
+    cycles.sort();
+    cycles
+}
+
+fn render_owner_root_cycles(cycles: &[Vec<String>]) -> String {
+    let mut rendered = String::new();
+    for cycle in cycles {
+        let _ = writeln!(&mut rendered, "  - {}", cycle.join(" -> "));
+    }
+    rendered
+}
+
 fn render_forbidden_dependency_violations(
     violations: &[&DependencyEdge],
     forbidden_lookup: &BTreeMap<&'static str, &'static ForbiddenDependencyRule>,
@@ -1907,6 +1934,20 @@ fn forbidden_dependency_rules_have_no_current_violations() {
         "forbidden owner-root dependencies are present.\n\nTarget core graph:\n{}\nCurrent violations:\n{}",
         render_target_core_graph(&target_core_graph(&graph)),
         render_forbidden_dependency_violations(&violations, &forbidden_lookup),
+    );
+}
+
+#[test]
+fn target_core_owner_graph_has_no_cycles() {
+    let graph = analyze_engine_dependency_graph();
+    let core_graph = target_core_graph(&graph);
+    let cycles = owner_root_cycles(&core_graph);
+
+    assert!(
+        cycles.is_empty(),
+        "target core owner-root graph has cycles.\n\nTarget core graph:\n{}\nCycles:\n{}",
+        render_target_core_graph(&core_graph),
+        render_owner_root_cycles(&cycles),
     );
 }
 

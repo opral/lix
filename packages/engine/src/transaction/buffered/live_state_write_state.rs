@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::contracts::{entity_id_in_constraint, EffectiveRowsRequest};
-use crate::live_state::EffectiveRowsResolver;
+use crate::common::Value;
+use crate::live_state::{
+    EffectiveRowsRequest, EffectiveRowsResolver, ScanConstraint, ScanField, ScanOperator,
+};
 use crate::transaction::{CommitOutcome, OverlayReadContext, TransactionDelta, TransactionJournal};
 use crate::LixError;
 
@@ -119,4 +121,11 @@ fn grouped_entities(delta: &TransactionDelta) -> BTreeMap<(String, String), BTre
             .insert(row.entity_id.clone());
     }
     grouped
+}
+
+fn entity_id_in_constraint(entity_ids: Vec<String>) -> ScanConstraint {
+    ScanConstraint {
+        field: ScanField::EntityId,
+        operator: ScanOperator::In(entity_ids.into_iter().map(Value::Text).collect()),
+    }
 }

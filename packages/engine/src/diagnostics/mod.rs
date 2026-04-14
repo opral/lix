@@ -2,7 +2,7 @@ use std::ops::ControlFlow;
 
 use crate::catalog::SurfaceRegistry;
 use crate::catalog::{builtin_public_surface_columns, builtin_public_surface_names};
-use crate::contracts::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
+use crate::sql::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
 use crate::LixBackend;
 use crate::LixError;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};

@@ -6,7 +6,7 @@ use crate::{CanonicalJson, LixError};
 use serde_json::json;
 
 use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
-use super::UpdatedVersionRef;
+use crate::transaction::UpdatedVersionRef;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";

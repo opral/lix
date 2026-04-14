@@ -1,4 +1,4 @@
-use crate::contracts::{
+use crate::sql::{
     PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection,
     ReadTimeProjectionPlan,
 };
@@ -251,23 +251,24 @@ mod tests {
 
     use super::{execute_read_time_projection_read, execute_read_time_projection_rows};
     use crate::catalog::{bind_named_relation, RelationBindContext};
-    use crate::contracts::{
-        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-        version_descriptor_schema_version, version_descriptor_snapshot_content,
-        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-        version_ref_schema_version, version_ref_snapshot_content,
-    };
-    use crate::contracts::{
-        PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection, ProjectionQuery,
-        ReadTimeProjectionPlan, RowIdentity,
-    };
+    use crate::contracts::ReadTimeProjectionIdentity;
     use crate::execution::read::ReadTimeProjectionRow;
     use crate::live_state;
     use crate::schema::LixCommit;
     use crate::sql::lower_catalog_relation_binding_to_source_sql;
+    use crate::sql::{
+        PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection, ProjectionQuery,
+        ReadTimeProjectionPlan,
+    };
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, BuiltinReadExecutionHost,
         CanonicalChangeSeed, TestSqliteBackend,
+    };
+    use crate::version::{
+        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+        version_descriptor_schema_version, version_descriptor_snapshot_content,
+        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+        version_ref_schema_version, version_ref_snapshot_content,
     };
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, TransactionBeginMode, Value};
 
@@ -525,7 +526,7 @@ mod tests {
     ) -> ReadTimeProjectionRow {
         ReadTimeProjectionRow {
             surface_name: "lix_version".into(),
-            identity: Some(RowIdentity {
+            identity: Some(ReadTimeProjectionIdentity {
                 schema_key: "lix_version_descriptor".into(),
                 version_id: "global".into(),
                 entity_id: id.into(),

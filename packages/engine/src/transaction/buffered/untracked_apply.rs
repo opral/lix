@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::PlannedStateRow;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::transaction::pipeline::WriteExecutionOutcome;
+use crate::transaction::PlannedStateRow;
 use crate::transaction::{
     compile_filesystem_finalization_from_state_in_transaction, PlannedPublicUntrackedWriteUnit,
     WriteExecutionContext,

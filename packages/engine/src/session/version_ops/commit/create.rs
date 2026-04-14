@@ -2,18 +2,18 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
 use crate::canonical::{append_changes, CanonicalChangeWrite, CanonicalStateIdentity};
-use crate::contracts::version_ref_snapshot_content;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{MutationRow, OptionalTextPatch};
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
     VersionSnapshot,
 };
+use crate::sql::MutationRow;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
+    CanonicalCommitReceipt, OptionalTextPatch, UpdatedVersionRef,
 };
 use crate::transaction::{
     compile_filesystem_transaction_state_from_state,
@@ -22,6 +22,7 @@ use crate::transaction::{
     FilesystemSemanticChange, FilesystemTransactionState, WriteBatch,
     FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
 };
+use crate::version::version_ref_snapshot_content;
 use crate::SqlDialect;
 use crate::{
     CanonicalJson, CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value,
@@ -35,7 +36,7 @@ use super::preflight::{
 };
 use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
-use super::{CanonicalCommitReceipt, UpdatedVersionRef, COMMIT_IDEMPOTENCY_TABLE};
+use super::COMMIT_IDEMPOTENCY_TABLE;
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
@@ -1294,13 +1295,13 @@ mod tests {
     };
     use crate::canonical::CanonicalChangeWrite;
     use crate::contracts::LixFunctionProvider;
-    use crate::contracts::OptionalTextPatch;
     use crate::contracts::GLOBAL_VERSION_ID;
     use crate::session::version_ops::commit::UpdatedVersionRef;
     use crate::test_support::{
         init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::transaction::OptionalTextPatch;
     use crate::transaction::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
@@ -1449,18 +1450,18 @@ mod tests {
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
             file_id: Some(
-                crate::contracts::version_descriptor_file_id()
+                crate::version::version_descriptor_file_id()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
             plugin_key: Some(
-                crate::contracts::version_descriptor_plugin_key()
+                crate::version::version_descriptor_plugin_key()
                     .to_string()
                     .try_into()
                     .unwrap(),
             ),
-            snapshot_content: Some(crate::contracts::version_descriptor_snapshot_content(
+            snapshot_content: Some(crate::version::version_descriptor_snapshot_content(
                 "version-a",
                 "Version A",
                 false,
@@ -1752,7 +1753,7 @@ mod tests {
             .to_string(),
             "current_head_fingerprint",
             "fp-1",
-            &crate::contracts::version_ref_snapshot_content("version-a", "commit-456"),
+            &crate::version::version_ref_snapshot_content("version-a", "commit-456"),
             "commit-456",
         )
         .await;

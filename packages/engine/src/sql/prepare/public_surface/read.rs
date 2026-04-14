@@ -3,12 +3,10 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
     ResolvedRelation, SurfaceFamily, SurfaceRegistry,
 };
-use crate::contracts::{
+use crate::history::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
-    FileHistoryRootScope, FileHistoryVersionScope, PendingOverlayLane, PendingOverlayQuery,
-    PreparedPublicReadContract, PublicReadResultColumn, PublicReadResultColumns,
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
+    FileHistoryRootScope, FileHistoryVersionScope, StateHistoryContentMode,
+    StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
 };
 use crate::sql::binder::{bind_public_read_statement, RuntimeBindingValues};
 use crate::sql::explain::{
@@ -42,6 +40,10 @@ use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_
 use crate::sql::semantic_ir::{
     augment_dependency_spec_for_broad_public_read, prepare_structured_public_read_analysis,
     unknown_public_state_schema_error, PublicReadSemantics, StructuredPublicReadDecision,
+};
+use crate::sql::{
+    PendingOverlayLane, PendingOverlayQuery, PreparedPublicReadContract, PublicReadResultColumn,
+    PublicReadResultColumns,
 };
 use crate::SqlDialect;
 use sqlparser::ast::{
@@ -227,7 +229,7 @@ fn build_state_history_read_plan(
 
     let mut request = StateHistoryRequest {
         lineage_scope: StateHistoryLineageScope::ActiveVersion,
-        active_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
+        lineage_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
         content_mode: StateHistoryContentMode::MetadataOnly,
         ..StateHistoryRequest::default()
     };
@@ -296,7 +298,7 @@ fn build_entity_history_read_plan(
 
     let mut request = StateHistoryRequest {
         lineage_scope: StateHistoryLineageScope::ActiveVersion,
-        active_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
+        lineage_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
         content_mode: StateHistoryContentMode::IncludeSnapshotContent,
         schema_keys: vec![schema_key],
         ..StateHistoryRequest::default()
@@ -715,7 +717,7 @@ fn build_file_history_read_plan(
         } else {
             FileHistoryLineageScope::Standard
         },
-        active_version_id: active_version_lineage
+        lineage_version_id: active_version_lineage
             .then(|| required_requested_version_id(structured_read).map(str::to_string))
             .transpose()?,
         ..FileHistoryRequest::default()
@@ -779,7 +781,7 @@ fn build_directory_history_read_plan(
 
     let mut request = DirectoryHistoryRequest {
         lineage_scope: FileHistoryLineageScope::ActiveVersion,
-        active_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
+        lineage_version_id: Some(required_requested_version_id(structured_read)?.to_string()),
         ..DirectoryHistoryRequest::default()
     };
     let predicates = build_directory_history_predicates_and_request(structured_read, &mut request)?;

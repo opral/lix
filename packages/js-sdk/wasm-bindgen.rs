@@ -12,8 +12,7 @@ mod wasm {
         ObserveEvent as EngineObserveEvent, ObserveEventsOwned as EngineObserveEvents,
         ObserveQuery as EngineObserveQuery, QueryResult as EngineQueryResult, RedoOptions,
         RedoResult, Session as CoreSession, SqlDialect, TransactionMode, UndoOptions, UndoResult,
-        Value as EngineValue,
-        WireQueryResult, WireValue,
+        Value as EngineValue, WireQueryResult, WireValue,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -381,7 +380,10 @@ export type LixObserveEvents = {
 
         #[wasm_bindgen(js_name = switchVersion)]
         pub async fn switch_version(&self, version_id: String) -> Result<(), JsValue> {
-            self.session.switch_version(version_id).await.map_err(js_error)
+            self.session
+                .switch_version(version_id)
+                .await
+                .map_err(js_error)
         }
 
         #[wasm_bindgen(js_name = openAdditionalSession)]

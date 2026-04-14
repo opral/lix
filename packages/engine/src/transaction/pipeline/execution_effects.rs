@@ -2,19 +2,17 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedRelation,
 };
-use crate::contracts::should_invalidate_deterministic_settings_cache;
-use crate::contracts::{
-    BufferedWriteExecutionInput, PlannedFilesystemState, PreparedPublicWriteExecutionPartition,
-    PreparedWriteStatement,
-};
+use crate::sql::PreparedWriteStatementKind;
+use crate::streams::should_invalidate_deterministic_settings_cache;
 use crate::transaction::{
     binary_blob_writes_from_filesystem_state,
     compile_filesystem_finalization_from_state_in_transaction,
     filesystem_transaction_state_from_planned, merge_filesystem_transaction_state,
     persist_filesystem_payload_changes_in_transaction, BufferedWriteCommandMetadata,
-    BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    DeferredCommitEffects, TransactionCommitOutcome, WriteCommand, WriteExecutionContext,
-    WritePath,
+    BufferedWriteExecutionInput, BufferedWriteExecutionResult, BufferedWriteFlushClass,
+    BufferedWriteSessionEffects, DeferredCommitEffects, PlannedFilesystemState,
+    PreparedPublicWriteExecutionPartition, PreparedWriteStatement, TransactionCommitOutcome,
+    WriteCommand, WriteExecutionContext, WritePath,
 };
 use crate::{LixBackendTransaction, LixError};
 
@@ -56,8 +54,7 @@ pub(crate) async fn complete_sql_command_execution(
     let clear_pending_commit_state = write_outcome.plan_effects_override.is_none()
         && !matches!(
             step.statement_kind(),
-            crate::contracts::PreparedWriteStatementKind::Query
-                | crate::contracts::PreparedWriteStatementKind::Explain
+            PreparedWriteStatementKind::Query | PreparedWriteStatementKind::Explain
         );
 
     let default_effects = step

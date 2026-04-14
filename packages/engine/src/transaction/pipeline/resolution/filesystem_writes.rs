@@ -27,6 +27,7 @@ use crate::transaction::pipeline::resolution::prepared_artifacts::{
     resolve_placeholder_index, DirectoryInsertAssignments, DirectoryUpdateAssignments,
     FileInsertAssignments, FileUpdateAssignments, FilesystemWriteIntent, PlaceholderState,
 };
+use crate::transaction::OptionalTextPatch;
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};
@@ -970,7 +971,7 @@ fn ensure_file_state_entry<'a>(
             version_id: version_id.to_string(),
             untracked,
             descriptor: None,
-            metadata_patch: crate::contracts::OptionalTextPatch::Unchanged,
+            metadata_patch: OptionalTextPatch::Unchanged,
             data: None,
             deleted: false,
         })
@@ -987,7 +988,7 @@ fn set_filesystem_descriptor_state(
     entry.untracked = untracked;
     entry.deleted = false;
     entry.descriptor = Some(descriptor);
-    entry.metadata_patch = crate::contracts::OptionalTextPatch::Unchanged;
+    entry.metadata_patch = OptionalTextPatch::Unchanged;
 }
 
 fn set_filesystem_data_state(
@@ -1014,7 +1015,7 @@ fn set_filesystem_deleted_state(
     entry.deleted = true;
     entry.descriptor = None;
     entry.data = None;
-    entry.metadata_patch = crate::contracts::OptionalTextPatch::Unchanged;
+    entry.metadata_patch = OptionalTextPatch::Unchanged;
 }
 
 async fn resolve_missing_directory_rows(

@@ -30,12 +30,15 @@ mod api;
 pub(crate) mod ast;
 pub(crate) mod binder;
 pub(crate) mod common;
+pub(crate) mod effective_state_request;
 pub(crate) mod explain;
 pub(crate) mod logical_plan;
 pub(crate) mod optimizer;
 pub(crate) mod parser;
 pub(crate) mod physical_plan;
+pub(crate) mod planned_statement;
 pub(crate) mod prepare;
+pub(crate) mod prepared_artifacts;
 mod relation_policy;
 pub(crate) mod semantic_ir;
 pub(crate) mod support;
@@ -76,9 +79,17 @@ pub(crate) use api::{
     PublicWriteExecutionPartition, PublicWritePhysicalPlan, PublicWritePlan, ResolvedRowRef,
     ResolvedWritePartition, ResolvedWritePlan, RowLineage, RuntimeBindingValues, SchemaProof,
     ScopeProof, SqlCompilerMetadata, SqlCompilerSeed, StateAssignmentsError, StatementBatch,
-    TargetSetProof, UpdateValidationPlan, WriteModeRequest, WriteOperationKind,
+    TargetSetProof, WriteModeRequest, WriteOperationKind,
+};
+pub(crate) use effective_state_request::{EffectiveStateRequest, EffectiveStateVersionScope};
+pub(crate) use logical_plan::ResultContract;
+pub(crate) use planned_statement::{
+    coalesce_live_table_requirements, is_untracked_live_table, MutationOperation, MutationRow,
+    PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 pub(crate) use prepare::SqlPreparationMetadataReader;
+pub(crate) use prepared_artifacts::*;
+pub use prepared_artifacts::{PreparedBatch, PreparedStatement};
 
 // Existing root helpers used outside the compiler stages.
 pub(crate) use physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;

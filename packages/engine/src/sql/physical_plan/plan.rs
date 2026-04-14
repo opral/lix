@@ -1,4 +1,3 @@
-use crate::contracts::{ChangeBatch, CommitPreconditions, ReadTimeProjectionPlan};
 use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};
@@ -6,8 +5,9 @@ use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::PlannedStateRow;
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::sql::prepare::contracts::effects::PlanEffects;
-use crate::sql::prepare::contracts::planned_statement::SchemaLiveTableRequirement;
+use crate::sql::ReadTimeProjectionPlan;
+use crate::sql::SchemaLiveTableRequirement;
+use crate::transaction::{ChangeBatch, CommitPreconditions, PlanEffects};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Statement, TableAlias, TableFactor};
 use std::collections::BTreeMap;

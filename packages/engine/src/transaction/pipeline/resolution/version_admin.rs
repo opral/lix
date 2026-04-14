@@ -2,7 +2,7 @@ use crate::canonical::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{
+use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,
 };

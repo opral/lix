@@ -2,28 +2,24 @@ use crate::canonical::{
     load_history, CanonicalHistoryContentMode, CanonicalHistoryRequest,
     CanonicalHistoryRootSelection, CanonicalRootCommit,
 };
-use crate::contracts::{
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
-    StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
-};
+use crate::{LixBackend, LixError};
 
-use super::context::resolve_target_version_with_backend;
-use super::history_roots::{
+use super::roots::{
     resolve_history_root_facts_with_backend, HistoryRootFacts, HistoryRootTraversal,
     RootCommitResolutionRequest, RootCommitScope, RootLineageScope, RootVersionScope,
 };
-use crate::{LixBackend, LixError};
+use super::{
+    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest,
+    StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
+};
 
 pub(crate) async fn load_state_history_rows(
     backend: &dyn LixBackend,
     request: &StateHistoryRequest,
 ) -> Result<Vec<StateHistoryRow>, LixError> {
-    let resolved_active_version_id = resolve_active_version_id(backend, request).await?;
-    let root_facts = resolve_history_root_facts_with_backend(
-        backend,
-        root_commit_resolution_request(request, resolved_active_version_id.as_deref()),
-    )
-    .await?;
+    let root_facts =
+        resolve_history_root_facts_with_backend(backend, root_commit_resolution_request(request))
+            .await?;
     let mut rows = load_history(backend, &canonical_history_request(request, root_facts)).await?;
 
     match request.order {
@@ -56,35 +52,15 @@ pub(crate) async fn load_state_history_rows(
         .collect())
 }
 
-async fn resolve_active_version_id(
-    backend: &dyn LixBackend,
-    request: &StateHistoryRequest,
-) -> Result<Option<String>, LixError> {
-    match request.lineage_scope {
-        StateHistoryLineageScope::Standard => Ok(None),
-        StateHistoryLineageScope::ActiveVersion => {
-            if let Some(active_version_id) = request.active_version_id.clone() {
-                return Ok(Some(active_version_id));
-            }
-            Ok(Some(
-                resolve_target_version_with_backend(backend, None, "active_version_id")
-                    .await?
-                    .version_id,
-            ))
-        }
-    }
-}
-
 fn root_commit_resolution_request<'a>(
     request: &'a StateHistoryRequest,
-    active_version_id: Option<&'a str>,
 ) -> RootCommitResolutionRequest<'a> {
     RootCommitResolutionRequest {
         lineage_scope: match request.lineage_scope {
             StateHistoryLineageScope::Standard => RootLineageScope::Standard,
             StateHistoryLineageScope::ActiveVersion => RootLineageScope::ActiveVersion,
         },
-        active_version_id,
+        lineage_version_id: request.lineage_version_id.as_deref(),
         root_scope: match &request.root_scope {
             StateHistoryRootScope::AllRoots => RootCommitScope::AllRoots,
             StateHistoryRootScope::RequestedRoots(root_commit_ids) => {

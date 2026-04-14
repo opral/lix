@@ -5,11 +5,12 @@ use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, CanonicalChange, CanonicalStateIdentity,
     CanonicalStateRow,
 };
+use crate::contracts::FunctionBindings;
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::{FunctionBindings, StateCommitStreamChange, StateCommitStreamOperation};
 use crate::session::version_ops::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };
+use crate::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
 
 use super::super::context::{

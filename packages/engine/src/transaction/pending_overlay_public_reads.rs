@@ -5,15 +5,16 @@
 
 use std::collections::BTreeMap;
 
-use crate::contracts::{
-    DynFunctionProvider, PendingOverlayFilter, PendingOverlayLane, PendingOverlayOrderClause,
-    PendingOverlayProjection, PendingOverlayQuery, PreparedPublicRead, PublicReadResultColumn,
-    PublicReadResultColumns, PublicReadSource,
-};
+use crate::contracts::DynFunctionProvider;
 use crate::live_state::{
     compile_live_row_shape_from_registered_snapshots, live_row_shape_from_definition,
     scan_visible_live_rows, LiveReadRow, LiveRowShape, LiveStorageLane, ScanConstraint, ScanField,
     ScanOperator,
+};
+use crate::sql::{
+    PendingOverlayFilter, PendingOverlayLane, PendingOverlayOrderClause, PendingOverlayProjection,
+    PendingOverlayQuery, PreparedPublicRead, PublicReadResultColumn, PublicReadResultColumns,
+    PublicReadSource,
 };
 use crate::transaction::{
     PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,

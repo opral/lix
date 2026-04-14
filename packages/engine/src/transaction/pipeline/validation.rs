@@ -19,22 +19,23 @@ use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LA
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceFamily};
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::{
-    is_untracked_live_table, LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow,
-    LiveSnapshotStorage, MutationOperation, MutationRow, PlannedStateRow,
-    PreparedInsertOnConflictAction, PreparedPublicWrite, PreparedResolvedWritePlan,
-    PreparedWriteOperationKind, UpdateValidationInput, UpdateValidationPlan, WriteMode,
-};
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,
-    LiveRowQuery, LiveRowSource,
+    LiveFilter, LiveFilterField, LiveFilterOp, LiveRowQuery, LiveRowSource, LiveSnapshotRow,
+    LiveSnapshotStorage,
 };
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
     schema_key_from_definition, validate_lix_schema_definition, SchemaKey,
 };
+use crate::sql::{is_untracked_live_table, MutationOperation, MutationRow, UpdateValidationPlan};
+use crate::sql::{PreparedInsertOnConflictAction, PreparedWriteOperationKind};
 use crate::transaction::overlay::PendingOverlay;
+use crate::transaction::UpdateValidationInput;
+use crate::transaction::{
+    PlannedStateRow, PreparedPublicWrite, PreparedResolvedWritePlan, WriteMode,
+};
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -2090,7 +2091,7 @@ fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixE
     match value {
         Value::Null => Ok(None),
         Value::Json(json) => Ok(Some(json.clone())),
-        Value::Text(text) => serde_json::from_str::<JsonValue>(text)
+        Value::Text(text) => serde_json::from_str::<JsonValue>(&text)
             .map(Some)
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),

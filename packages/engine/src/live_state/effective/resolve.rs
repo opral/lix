@@ -2,21 +2,21 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-#[cfg(test)]
-use crate::contracts::{exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest};
-use crate::contracts::{
-    EffectiveRow, EffectiveRowIdentity, EffectiveRowSet, EffectiveRowState, EffectiveRowsRequest,
-    LaneResult, OverlayLane,
-};
 use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
-use crate::live_state::EffectiveRowsResolver;
-use crate::live_state::LiveReadContext;
-use crate::live_state::WriterKeyReadView;
+#[cfg(test)]
+use crate::live_state::{exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest};
+use crate::live_state::{
+    EffectiveRowsRequest, EffectiveRowsResolver, LiveReadContext, WriterKeyReadView,
+};
 use crate::{LixError, Value};
+
+use super::{
+    EffectiveRow, EffectiveRowIdentity, EffectiveRowSet, EffectiveRowState, LaneResult, OverlayLane,
+};
 
 pub fn overlay_lanes(include_global: bool, include_untracked: bool) -> Vec<OverlayLane> {
     let mut lanes = vec![OverlayLane::LocalTracked];
@@ -86,7 +86,7 @@ pub(crate) async fn resolve_effective_row(
                             schema_key: request.schema_key.clone(),
                             version_id: storage_version_id,
                             constraints: exact_row_constraints(
-                                &crate::contracts::ExactRowRequest {
+                                &crate::live_state::ExactRowRequest {
                                     schema_key: request.schema_key.clone(),
                                     version_id: request.version_id.clone(),
                                     entity_id: request.entity_id.clone(),

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-use crate::contracts::{
+use crate::live_state::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
     LiveStateProjectionStatus,
 };

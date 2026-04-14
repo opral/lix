@@ -8,13 +8,14 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
-use crate::contracts::StateCommitStreamFilter;
-use crate::contracts::{is_untracked_live_table, SessionDependency};
+use crate::session::SessionDependency;
 use crate::sql::binder::bind_sql_with_state;
+use crate::sql::is_untracked_live_table;
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::{classify_builtin_relation_name, RelationPolicy};
+use crate::streams::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};
 
 pub(crate) fn derive_dependency_spec_from_statements(
@@ -479,7 +480,7 @@ mod tests {
         dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
         parse_sql_statements,
     };
-    use crate::contracts::SessionDependency;
+    use crate::session::SessionDependency;
     use crate::sql::logical_plan::DependencyPrecision;
     use crate::Value;
 

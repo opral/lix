@@ -35,32 +35,32 @@ pub(crate) async fn apply_write_plan(
 }
 
 #[allow(dead_code)]
-fn tracked_writes_summary(writes: &[crate::contracts::TrackedWriteRow]) -> (usize, usize) {
+fn tracked_writes_summary(writes: &[crate::live_state::TrackedWriteRow]) -> (usize, usize) {
     let mut upserts = 0;
     let mut tombstones = 0;
     for write in writes {
         match write.operation {
-            crate::contracts::TrackedWriteOperation::Upsert => upserts += 1,
-            crate::contracts::TrackedWriteOperation::Tombstone => tombstones += 1,
+            crate::live_state::TrackedWriteOperation::Upsert => upserts += 1,
+            crate::live_state::TrackedWriteOperation::Tombstone => tombstones += 1,
         }
     }
     (upserts, tombstones)
 }
 
 #[allow(dead_code)]
-fn untracked_writes_summary(writes: &[crate::contracts::UntrackedWriteRow]) -> (usize, usize) {
+fn untracked_writes_summary(writes: &[crate::live_state::UntrackedWriteRow]) -> (usize, usize) {
     let mut upserts = 0;
     let mut deletes = 0;
     for write in writes {
         match write.operation {
-            crate::contracts::UntrackedWriteOperation::Upsert => upserts += 1,
-            crate::contracts::UntrackedWriteOperation::Delete => deletes += 1,
+            crate::live_state::UntrackedWriteOperation::Upsert => upserts += 1,
+            crate::live_state::UntrackedWriteOperation::Delete => deletes += 1,
         }
     }
     (upserts, deletes)
 }
 
-fn live_row_from_tracked_write(write: &crate::contracts::TrackedWriteRow) -> LiveRow {
+fn live_row_from_tracked_write(write: &crate::live_state::TrackedWriteRow) -> LiveRow {
     LiveRow {
         entity_id: write.entity_id.clone(),
         file_id: write.file_id.clone(),
@@ -79,7 +79,7 @@ fn live_row_from_tracked_write(write: &crate::contracts::TrackedWriteRow) -> Liv
     }
 }
 
-fn live_row_from_untracked_write(write: &crate::contracts::UntrackedWriteRow) -> LiveRow {
+fn live_row_from_untracked_write(write: &crate::live_state::UntrackedWriteRow) -> LiveRow {
     LiveRow {
         entity_id: write.entity_id.clone(),
         file_id: write.file_id.clone(),

@@ -1,8 +1,7 @@
-//! Non-root home for built-in version row helpers used by engine runtime code.
+//! Engine-wide version runtime helpers.
 //!
-//! Descriptor/ref/active-version row metadata and codec helpers live here so
-//! they stay reusable across owners without turning `schema/*` into a runtime
-//! helper bucket.
+//! This subsystem owns built-in version row metadata and snapshot codecs used
+//! across catalog, SQL, live-state, init, and session version workflows.
 
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;

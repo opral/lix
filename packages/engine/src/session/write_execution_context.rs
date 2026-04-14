@@ -6,16 +6,11 @@ use jsonschema::JSONSchema;
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::common::escape_sql_string;
-use crate::contracts::parse_active_version_snapshot;
 use crate::contracts::CompiledSchemaCache;
 use crate::contracts::TrackedChangeView;
-use crate::contracts::TrackedCommitExecutionOutcome;
-use crate::contracts::{
-    ChangeBatch, CommitPreconditions, ExpectedHead, PendingCommitState, PreparedPublicRead,
-    PreparedPublicWrite, PublicChange, SchemaKey, WriteLane,
-};
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
+use crate::schema::SchemaKey;
 use crate::session::host::{
     prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
 };
@@ -26,10 +21,14 @@ use crate::session::version_ops::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
     CreateCommitPreconditions, CreateCommitWriteLane, StagedChange,
 };
+use crate::sql::{PreparedPublicRead, PublicReadSource};
 use crate::transaction::{
     resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
-    PendingOverlay, TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionContext,
+    ChangeBatch, CommitPreconditions, ExpectedHead, PendingCommitState, PendingOverlay,
+    PreparedPublicWrite, PublicChange, TrackedCommitExecutionOutcome, TrackedTxnUnit,
+    TransactionExecutionBackend, WriteExecutionContext, WriteLane, WriteMode,
 };
+use crate::version::parse_active_version_snapshot;
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
@@ -178,7 +177,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
     match public_read.contract.source() {
-        crate::contracts::PublicReadSource::PendingOverlay => {
+        PublicReadSource::PendingOverlay => {
             crate::transaction::execute_pending_overlay_public_read_in_transaction(
                 transaction,
                 pending_overlay,
@@ -186,7 +185,7 @@ pub(crate) async fn execute_prepared_public_read_with_registry(
             )
             .await
         }
-        crate::contracts::PublicReadSource::Committed(_) => {
+        PublicReadSource::Committed(_) => {
             let host = ProjectionReadExecutionHost::new(projection_registry);
             crate::execution::execute_prepared_public_read_artifact_in_transaction(
                 transaction,
@@ -493,7 +492,7 @@ fn tracked_writer_key_updates_for_unit(
             continue;
         };
         for partition in &resolved.partitions {
-            if partition.execution_mode != crate::contracts::WriteMode::Tracked {
+            if partition.execution_mode != WriteMode::Tracked {
                 continue;
             }
             updates.extend(partition.writer_key_updates.iter().map(

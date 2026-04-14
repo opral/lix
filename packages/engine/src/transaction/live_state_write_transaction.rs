@@ -1,4 +1,4 @@
-use crate::contracts::SchemaRegistration;
+use crate::live_state::SchemaRegistration;
 use crate::transaction::buffered::{LiveStateWriteState, TransactionCoordinator};
 use crate::{LixBackendTransaction, LixError};
 

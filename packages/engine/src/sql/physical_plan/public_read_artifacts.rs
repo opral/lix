@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::time::Instant;
 
 use crate::catalog::SurfaceFamily;
-use crate::contracts::ReadTimeProjectionPlan;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::explain::{ExplainStage, ExplainTimingCollector};
 use crate::sql::logical_plan::public_ir::StructuredPublicRead;
 use crate::sql::logical_plan::SurfaceReadPlan;
+use crate::sql::ReadTimeProjectionPlan;
 use crate::{LixError, SqlDialect};
 
 use super::lowerer::lower_read_for_execution_with_layouts;

@@ -11,28 +11,31 @@ use serde_json::{json, Value as JsonValue};
 use crate::catalog::{ResolvedRelation, SurfaceRegistry};
 use crate::common::stable_content_fingerprint_hex;
 use crate::common::{NormalizedDirectoryPath, ParsedFilePath};
-use crate::contracts::{
-    state_commit_stream_changes_from_changes, StateCommitStreamRuntimeMetadata,
-};
-use crate::contracts::{
-    ChangeBatch, CommitPreconditions, IdempotencyKey, OptionalTextPatch, PlanEffects,
-    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
-    PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
-    PreparedPublicWrite, PreparedPublicWriteContract, PreparedPublicWriteExecutionPartition,
-    PreparedPublicWriteMaterialization, PreparedPublicWritePlanArtifact,
-    PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
-    PreparedWriteArtifact, PreparedWriteOperationKind, PreparedWriteStatement,
-    PreparedWriteStatementKind, PublicChange, ResultContract, SchemaLiveTableRequirement,
-    SemanticEffect, StateCommitStreamOperation, WriteDiagnosticContext, WriteLane, WriteMode,
-};
 use crate::plugin::{
     parse_plugin_archive_for_install, plugin_storage_archive_file_id, plugin_storage_archive_path,
     ParsedPluginArchive, PLUGIN_STORAGE_ROOT_DIRECTORY_PATH,
 };
 use crate::schema::{schema_key_from_definition, validate_lix_schema_definition};
+use crate::sql::{
+    PreparedWriteOperationKind, PreparedWriteStatementKind, ResultContract,
+    SchemaLiveTableRequirement, WriteDiagnosticContext,
+};
+use crate::streams::{
+    state_commit_stream_changes_from_changes, StateCommitStreamOperation,
+    StateCommitStreamRuntimeMetadata,
+};
+use crate::transaction::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch, PlanEffects,
+    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
+    PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
+    PreparedPublicWrite, PreparedPublicWriteContract, PreparedPublicWriteExecutionPartition,
+    PreparedPublicWriteMaterialization, PreparedPublicWritePlanArtifact,
+    PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
+    PreparedWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement, PublicChange,
+    SemanticEffect, WriteLane, WriteMode,
+};
 use crate::{LixError, Value};
 
-use crate::contracts::PreparedWriteFunctionBindings;
 use crate::transaction::WriteCommand;
 
 const GLOBAL_VERSION_ID: &str = "global";
@@ -467,7 +470,7 @@ fn prepare_public_tracked_write_statement(
                                 }),
                                 create_preconditions: CommitPreconditions {
                                     write_lane: WriteLane::GlobalAdmin,
-                                    expected_head: crate::contracts::ExpectedHead::CurrentHead,
+                                    expected_head: ExpectedHead::CurrentHead,
                                     idempotency_key: semantic_idempotency_key(
                                         idempotency_purpose,
                                         &write_payload,

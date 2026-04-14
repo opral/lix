@@ -1,12 +1,12 @@
 use crate::catalog::SurfaceReadFreshness;
 use crate::contracts::PendingPublicReadTransaction;
 use crate::contracts::ReadExecutionHost;
-use crate::contracts::{
+use crate::diagnostics::sanitize_lowered_public_sql_error_description;
+use crate::live_state::LiveStateQueryBackend;
+use crate::sql::{
     PreparedPublicRead, PreparedPublicReadPlanArtifact, PublicReadResultColumn,
     PublicReadResultColumns,
 };
-use crate::diagnostics::sanitize_lowered_public_sql_error_description;
-use crate::live_state::LiveStateQueryBackend;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
@@ -164,7 +164,7 @@ async fn ensure_surface_read_freshness(
     let status = backend.load_live_state_projection_status().await?;
     if matches!(
         status.mode,
-        crate::contracts::LiveStateMode::Ready | crate::contracts::LiveStateMode::Bootstrapping
+        crate::live_state::LiveStateMode::Ready | crate::live_state::LiveStateMode::Bootstrapping
     ) {
         return Ok(());
     }
@@ -191,7 +191,7 @@ async fn ensure_surface_read_freshness_in_transaction(
     let status = (&backend as &dyn crate::LixBackend)
         .load_live_state_projection_status()
         .await?;
-    if status.mode == crate::contracts::LiveStateMode::Bootstrapping {
+    if status.mode == crate::live_state::LiveStateMode::Bootstrapping {
         return Ok(());
     }
     Err(public_read_projection_stale_error(
@@ -202,7 +202,7 @@ async fn ensure_surface_read_freshness_in_transaction(
 
 fn public_read_projection_stale_error(
     surface_names: &[String],
-    status: &crate::contracts::LiveStateProjectionStatus,
+    status: &crate::live_state::LiveStateProjectionStatus,
 ) -> LixError {
     let surfaces = if surface_names.is_empty() {
         "this public read".to_string()
@@ -243,7 +243,7 @@ fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> Stri
 
 async fn execute_prepared_batch_with_backend(
     backend: &dyn LixBackend,
-    batch: &crate::contracts::PreparedBatch,
+    batch: &crate::sql::PreparedBatch,
 ) -> Result<QueryResult, LixError> {
     let mut result = QueryResult {
         rows: Vec::new(),

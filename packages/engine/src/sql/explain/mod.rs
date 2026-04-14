@@ -8,14 +8,13 @@ use crate::catalog::{
     RelationBindContext, RelationBinding, ResolvedRelation, SurfaceCapability, SurfaceFamily,
     SurfaceReadFreshness, SurfaceReadSemantics, SurfaceVariant,
 };
-use crate::contracts::{
-    ChangeBatch, CommitPreconditions, DirectoryHistoryRequest, EffectiveStateRequest,
-    EffectiveStateVersionScope, ExpectedHead, FileHistoryContentMode, FileHistoryLineageScope,
-    FileHistoryRequest, FileHistoryRootScope, FileHistoryVersionScope, PreparedExplainTemplate,
-    PreparedStatement, PublicChange, ReadTimeProjectionPlan, SemanticEffect, SessionDependency,
-    SessionStateDelta, StateCommitStreamChange, StateHistoryContentMode, StateHistoryLineageScope,
-    StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
+use crate::history::{
+    DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
+    FileHistoryRootScope, FileHistoryVersionScope, StateHistoryContentMode,
+    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
+    StateHistoryVersionScope,
 };
+use crate::session::SessionDependency;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
 use crate::sql::logical_plan::direct_reads::{
@@ -59,10 +58,6 @@ use crate::sql::physical_plan::{
     PublicReadPhysicalPlan, PublicWriteExecutionPartition, PublicWriteMaterialization,
     PublicWritePhysicalPlan, TerminalRelationRenderNode, TrackedWritePlan, UntrackedWritePlan,
 };
-use crate::sql::prepare::contracts::effects::PlanEffects;
-use crate::sql::prepare::contracts::planned_statement::{
-    MutationOperation, MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
-};
 use crate::sql::prepare::public_surface::routing::RoutingPassTrace;
 use crate::sql::semantic_ir::direct::NormalizedDirectStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
@@ -72,6 +67,15 @@ use crate::sql::semantic_ir::semantics::surface_semantics::OverlayLane;
 use crate::sql::semantic_ir::{
     BoundPublicLeaf, PublicReadSemantics, PublicWriteInvariantTrace, PublicWriteSemantics,
     SemanticStatement,
+};
+use crate::sql::{
+    EffectiveStateRequest, EffectiveStateVersionScope, MutationOperation, MutationRow,
+    PreparedExplainTemplate, PreparedStatement, ReadTimeProjectionPlan, SchemaLiveTableRequirement,
+    UpdateValidationPlan,
+};
+use crate::streams::StateCommitStreamChange;
+use crate::transaction::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, PlanEffects, PublicChange, SemanticEffect,
 };
 use crate::{LixError, SqlDialect, Value};
 use serde::Serialize;
@@ -839,8 +843,15 @@ pub(crate) struct ChangeBatchSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct PlanEffectsSnapshot {
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) session_delta: SessionStateDelta,
+    pub(crate) session_delta: SessionStateDeltaSnapshot,
     pub(crate) file_cache_refresh_targets: Vec<FileCacheRefreshTargetSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct SessionStateDeltaSnapshot {
+    pub(crate) next_active_version_id: Option<String>,
+    pub(crate) next_active_account_ids: Option<Vec<String>>,
+    pub(crate) persist_workspace: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -936,7 +947,7 @@ pub(crate) struct StateHistoryRequestSnapshot {
     pub(crate) root_scope: ExplainHistoryRootScopeKind,
     pub(crate) requested_roots: Vec<String>,
     pub(crate) lineage_scope: ExplainHistoryLineageScope,
-    pub(crate) active_version_id: Option<String>,
+    pub(crate) lineage_version_id: Option<String>,
     pub(crate) version_scope: ExplainHistoryVersionScopeKind,
     pub(crate) requested_versions: Vec<String>,
     pub(crate) entity_ids: Vec<String>,
@@ -952,7 +963,7 @@ pub(crate) struct StateHistoryRequestSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct FileHistoryRequestSnapshot {
     pub(crate) lineage_scope: ExplainHistoryLineageScope,
-    pub(crate) active_version_id: Option<String>,
+    pub(crate) lineage_version_id: Option<String>,
     pub(crate) root_scope: ExplainHistoryRootScopeKind,
     pub(crate) requested_roots: Vec<String>,
     pub(crate) version_scope: ExplainHistoryVersionScopeKind,
@@ -964,7 +975,7 @@ pub(crate) struct FileHistoryRequestSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct DirectoryHistoryRequestSnapshot {
     pub(crate) lineage_scope: ExplainHistoryLineageScope,
-    pub(crate) active_version_id: Option<String>,
+    pub(crate) lineage_version_id: Option<String>,
     pub(crate) root_scope: ExplainHistoryRootScopeKind,
     pub(crate) requested_roots: Vec<String>,
     pub(crate) version_scope: ExplainHistoryVersionScopeKind,
@@ -5294,7 +5305,11 @@ fn semantic_effect_snapshot(effect: &SemanticEffect) -> SemanticEffectSnapshot {
 fn plan_effects_snapshot(effects: &PlanEffects) -> PlanEffectsSnapshot {
     PlanEffectsSnapshot {
         state_commit_stream_changes: effects.state_commit_stream_changes.clone(),
-        session_delta: effects.session_delta.clone(),
+        session_delta: SessionStateDeltaSnapshot {
+            next_active_version_id: effects.session_delta.next_active_version_id.clone(),
+            next_active_account_ids: effects.session_delta.next_active_account_ids.clone(),
+            persist_workspace: effects.session_delta.persist_workspace,
+        },
         file_cache_refresh_targets: effects
             .file_cache_refresh_targets
             .iter()
@@ -5548,7 +5563,7 @@ fn state_history_request_snapshot(request: &StateHistoryRequest) -> StateHistory
         root_scope: state_history_root_scope_snapshot(&request.root_scope),
         requested_roots: state_history_requested_roots(&request.root_scope),
         lineage_scope: state_history_lineage_scope_snapshot(request.lineage_scope),
-        active_version_id: request.active_version_id.clone(),
+        lineage_version_id: request.lineage_version_id.clone(),
         version_scope: state_history_version_scope_snapshot(&request.version_scope),
         requested_versions: state_history_requested_versions(&request.version_scope),
         entity_ids: request.entity_ids.clone(),
@@ -5565,7 +5580,7 @@ fn state_history_request_snapshot(request: &StateHistoryRequest) -> StateHistory
 fn file_history_request_snapshot(request: &FileHistoryRequest) -> FileHistoryRequestSnapshot {
     FileHistoryRequestSnapshot {
         lineage_scope: file_history_lineage_scope_snapshot(request.lineage_scope),
-        active_version_id: request.active_version_id.clone(),
+        lineage_version_id: request.lineage_version_id.clone(),
         root_scope: file_history_root_scope_snapshot(&request.root_scope),
         requested_roots: file_history_requested_roots(&request.root_scope),
         version_scope: file_history_version_scope_snapshot(&request.version_scope),
@@ -5580,7 +5595,7 @@ fn directory_history_request_snapshot(
 ) -> DirectoryHistoryRequestSnapshot {
     DirectoryHistoryRequestSnapshot {
         lineage_scope: file_history_lineage_scope_snapshot(request.lineage_scope),
-        active_version_id: request.active_version_id.clone(),
+        lineage_version_id: request.lineage_version_id.clone(),
         root_scope: file_history_root_scope_snapshot(&request.root_scope),
         requested_roots: file_history_requested_roots(&request.root_scope),
         version_scope: file_history_version_scope_snapshot(&request.version_scope),

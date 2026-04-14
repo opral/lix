@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
@@ -11,6 +11,8 @@ use crate::image::ImageChunkWriter;
 use crate::sql::SqlCompilerSeed;
 use crate::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode};
+
+use super::Session;
 
 #[async_trait(?Send)]
 pub(crate) trait SessionHost: Send + Sync {
@@ -89,4 +91,31 @@ pub(crate) async fn prepare_function_bindings_with_host(
         functions.deterministic_sequence_enabled(),
         &functions,
     ))
+}
+
+pub(crate) async fn open_workspace_session(
+    session_host: Arc<dyn SessionHost>,
+) -> Result<Session, LixError> {
+    Session::open_workspace(session_host).await
+}
+
+pub(crate) async fn opened_workspace_session(
+    session_host: &Arc<dyn SessionHost>,
+    workspace_session: &OnceLock<Arc<Session>>,
+) -> Result<Arc<Session>, LixError> {
+    if let Some(session) = workspace_session.get() {
+        return Ok(Arc::clone(session));
+    }
+
+    let session = Arc::new(open_workspace_session(Arc::clone(session_host)).await?);
+    let _ = workspace_session.set(Arc::clone(&session));
+    Ok(workspace_session.get().map(Arc::clone).unwrap_or(session))
+}
+
+pub(crate) fn require_workspace_session<'a>(
+    workspace_session: &'a OnceLock<Arc<Session>>,
+) -> Result<&'a Arc<Session>, LixError> {
+    workspace_session
+        .get()
+        .ok_or_else(crate::common::not_initialized_error)
 }

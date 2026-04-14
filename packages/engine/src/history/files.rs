@@ -1,16 +1,103 @@
 use crate::contracts::BlobDataReader;
-use crate::contracts::CommittedStateHistoryReader;
-use crate::contracts::{
-    DirectoryHistoryRequest, DirectoryHistoryRow, FileHistoryContentMode, FileHistoryLineageScope,
-    FileHistoryRequest, FileHistoryRootScope, FileHistoryRow, FileHistoryVersionScope,
-    StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
-};
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
+
+use super::{
+    CommittedStateHistoryReader, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryRequest, StateHistoryRootScope, StateHistoryVersionScope,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileHistoryContentMode {
+    #[default]
+    MetadataOnly,
+    IncludeData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileHistoryLineageScope {
+    #[default]
+    ActiveVersion,
+    Standard,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FileHistoryRootScope {
+    #[default]
+    AllRoots,
+    RequestedRoots(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum FileHistoryVersionScope {
+    #[default]
+    Any,
+    RequestedVersions(Vec<String>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FileHistoryRequest {
+    pub lineage_scope: FileHistoryLineageScope,
+    pub lineage_version_id: Option<String>,
+    pub root_scope: FileHistoryRootScope,
+    pub version_scope: FileHistoryVersionScope,
+    pub file_ids: Vec<String>,
+    pub content_mode: FileHistoryContentMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileHistoryRow {
+    pub id: String,
+    pub path: Option<String>,
+    pub data: Option<Vec<u8>>,
+    pub metadata: Option<String>,
+    pub hidden: Option<bool>,
+    pub lixcol_entity_id: String,
+    pub lixcol_schema_key: String,
+    pub lixcol_file_id: String,
+    pub lixcol_version_id: String,
+    pub lixcol_plugin_key: String,
+    pub lixcol_schema_version: String,
+    pub lixcol_change_id: String,
+    pub lixcol_metadata: Option<String>,
+    pub lixcol_commit_id: String,
+    pub lixcol_commit_created_at: String,
+    pub lixcol_root_commit_id: String,
+    pub lixcol_depth: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DirectoryHistoryRequest {
+    pub lineage_scope: FileHistoryLineageScope,
+    pub lineage_version_id: Option<String>,
+    pub root_scope: FileHistoryRootScope,
+    pub version_scope: FileHistoryVersionScope,
+    pub directory_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryHistoryRow {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub name: String,
+    pub path: Option<String>,
+    pub hidden: Option<bool>,
+    pub lixcol_entity_id: String,
+    pub lixcol_schema_key: String,
+    pub lixcol_file_id: String,
+    pub lixcol_version_id: String,
+    pub lixcol_plugin_key: String,
+    pub lixcol_schema_version: String,
+    pub lixcol_change_id: String,
+    pub lixcol_metadata: Option<String>,
+    pub lixcol_commit_id: String,
+    pub lixcol_commit_created_at: String,
+    pub lixcol_root_commit_id: String,
+    pub lixcol_depth: i64,
+}
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
@@ -122,7 +209,7 @@ pub(crate) async fn load_file_history_rows(
                 FileHistoryLineageScope::ActiveVersion => StateHistoryLineageScope::ActiveVersion,
                 FileHistoryLineageScope::Standard => StateHistoryLineageScope::Standard,
             },
-            active_version_id: request.active_version_id.clone(),
+            lineage_version_id: request.lineage_version_id.clone(),
             root_scope: match &request.root_scope {
                 FileHistoryRootScope::AllRoots => StateHistoryRootScope::AllRoots,
                 FileHistoryRootScope::RequestedRoots(root_commit_ids) => {
@@ -580,7 +667,7 @@ pub(crate) async fn load_directory_history_rows(
                 FileHistoryLineageScope::ActiveVersion => StateHistoryLineageScope::ActiveVersion,
                 FileHistoryLineageScope::Standard => StateHistoryLineageScope::Standard,
             },
-            active_version_id: request.active_version_id.clone(),
+            lineage_version_id: request.lineage_version_id.clone(),
             root_scope: match &request.root_scope {
                 FileHistoryRootScope::AllRoots => StateHistoryRootScope::AllRoots,
                 FileHistoryRootScope::RequestedRoots(root_commit_ids) => {

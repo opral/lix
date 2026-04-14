@@ -1,8 +1,8 @@
 use crate::backend::QueryExecutor;
-#[cfg(test)]
-use crate::contracts::batch_row_constraints;
-use crate::contracts::exact_row_constraints;
 use crate::diagnostics::is_missing_relation_error;
+#[cfg(test)]
+use crate::live_state::batch_row_constraints;
+use crate::live_state::exact_row_constraints;
 use crate::live_state::storage::{
     build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
     required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,

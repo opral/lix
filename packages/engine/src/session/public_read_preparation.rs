@@ -11,9 +11,10 @@ use sqlparser::ast::Statement;
 
 use crate::backend::QueryExecutor;
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::{DynFunctionProvider, PreparedPublicRead};
+use crate::contracts::DynFunctionProvider;
+use crate::history::load_history_root_commit_id_for_lineage_version_with_executor;
 use crate::live_state::load_version_head_commit_map_with_executor;
-use crate::session::version_ops::context::load_target_version_history_root_commit_id_with_executor;
+use crate::sql::PreparedPublicRead;
 use crate::sql::{
     load_sql_compiler_metadata, prepare_public_read, prepare_public_read_artifact,
     SqlCompilerMetadata, SqlPreparationMetadataReader,
@@ -204,12 +205,8 @@ async fn load_active_history_root_commit_id_for_preparation_with_executor(
     executor: &mut dyn QueryExecutor,
     active_version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    match load_target_version_history_root_commit_id_with_executor(
-        executor,
-        Some(active_version_id),
-        "active_version_id",
-    )
-    .await
+    match load_history_root_commit_id_for_lineage_version_with_executor(executor, active_version_id)
+        .await
     {
         Ok(commit_id) => Ok(commit_id),
         Err(error)

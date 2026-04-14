@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::SessionDependency;
+use crate::session::SessionDependency;
 
 /// Dependency precision communicates whether literal dependency filters are fully
 /// representable by the planner.

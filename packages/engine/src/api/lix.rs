@@ -8,24 +8,20 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use super::engine::Engine;
-use super::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::{
-    CompiledSchemaCache, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
-    SharedFunctionProvider,
-};
+use crate::contracts::DynFunctionProvider;
 use crate::live_state::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
     ProjectionStatus,
 };
-use crate::streams::StateCommitStream as PublicStateCommitStream;
+use crate::streams::{StateCommitStream as PublicStateCommitStream, StateCommitStreamFilter};
 use crate::wasm::WasmRuntime;
 use crate::{
     AdditionalSessionOptions, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
-    ExecuteOptions, ExecuteResult, LixBackend, LixBackendTransaction, LixError,
-    MergeVersionOptions, MergeVersionResult, ObserveEventsOwned, ObserveQuery, RedoOptions,
-    RedoResult, Session, SessionTransaction, TransactionBeginMode, UndoOptions, UndoResult, Value,
+    ExecuteOptions, ExecuteResult, LixBackend, LixError, MergeVersionOptions, MergeVersionResult,
+    ObserveEventsOwned, ObserveQuery, RedoOptions, RedoResult, Session, SessionTransaction,
+    UndoOptions, UndoResult, Value,
 };
 
 use super::deterministic_settings::{
@@ -215,32 +211,9 @@ impl Lix {
             .await
     }
 
-    pub(crate) fn session_host(&self) -> Arc<dyn crate::session::SessionHost> {
-        Arc::new(LixEngineSessionHost::new(Arc::clone(&self.engine)))
-    }
-
-    pub(crate) async fn open_workspace_session(&self) -> Result<Session, LixError> {
-        Session::open_workspace(self.session_host()).await
-    }
-
     pub(crate) async fn opened_workspace_session(&self) -> Result<Arc<Session>, LixError> {
-        if let Some(session) = self.workspace_session.get() {
-            return Ok(Arc::clone(session));
-        }
-
-        let session = Arc::new(self.open_workspace_session().await?);
-        let _ = self.workspace_session.set(Arc::clone(&session));
-        Ok(self
-            .workspace_session
-            .get()
-            .map(Arc::clone)
-            .unwrap_or(session))
-    }
-
-    pub(crate) fn workspace_session(&self) -> Result<&Arc<Session>, LixError> {
-        self.workspace_session
-            .get()
-            .ok_or_else(crate::common::not_initialized_error)
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session).await
     }
 
     /// Opens the repository and eagerly initializes the workspace session used
@@ -272,23 +245,36 @@ impl Lix {
             return Err(crate::common::not_initialized_error());
         }
         self.refresh_public_surface_registry().await?;
-        let _ = self.opened_workspace_session().await?;
+        let session_host = self.engine.session_host();
+        let _ = crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+            .await?;
         Ok(())
     }
 
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .execute(sql, params)
             .await
     }
 
     pub async fn active_version_id(&self) -> Result<String, LixError> {
-        Ok(self.opened_workspace_session().await?.active_version_id())
+        let session_host = self.engine.session_host();
+        Ok(
+            crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+                .await?
+                .active_version_id(),
+        )
     }
 
     pub async fn active_account_ids(&self) -> Result<Vec<String>, LixError> {
-        Ok(self.opened_workspace_session().await?.active_account_ids())
+        let session_host = self.engine.session_host();
+        Ok(
+            crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+                .await?
+                .active_account_ids(),
+        )
     }
 
     pub async fn execute_with_options(
@@ -297,14 +283,20 @@ impl Lix {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .execute_with_options(sql, params, options)
             .await
     }
 
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEventsOwned, LixError> {
-        Session::observe_owned(Arc::clone(self.workspace_session()?), query)
+        Session::observe_owned(
+            Arc::clone(crate::session::require_workspace_session(
+                &self.workspace_session,
+            )?),
+            query,
+        )
     }
 
     /// Opens an additional scoped [`Session`].
@@ -341,7 +333,8 @@ impl Lix {
         &self,
         options: AdditionalSessionOptions,
     ) -> Result<Session, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .open_additional_session(options)
             .await
@@ -351,14 +344,16 @@ impl Lix {
         &self,
         options: CreateVersionOptions,
     ) -> Result<CreateVersionResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .create_version(options)
             .await
     }
 
     pub async fn switch_version(&self, version_id: String) -> Result<(), LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .switch_version(version_id)
             .await
@@ -368,7 +363,8 @@ impl Lix {
         &self,
         active_account_ids: Vec<String>,
     ) -> Result<(), LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .set_active_account_ids(active_account_ids)
             .await
@@ -378,50 +374,64 @@ impl Lix {
         &self,
         options: MergeVersionOptions,
     ) -> Result<MergeVersionResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .merge_version(options)
             .await
     }
 
     pub async fn create_checkpoint(&self) -> Result<CreateCheckpointResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .create_checkpoint()
             .await
     }
 
     pub async fn undo(&self) -> Result<UndoResult, LixError> {
-        self.opened_workspace_session().await?.undo().await
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+            .await?
+            .undo()
+            .await
     }
 
     pub async fn undo_with_options(&self, options: UndoOptions) -> Result<UndoResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .undo_with_options(options)
             .await
     }
 
     pub async fn redo(&self) -> Result<RedoResult, LixError> {
-        self.opened_workspace_session().await?.redo().await
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+            .await?
+            .redo()
+            .await
     }
 
     pub async fn redo_with_options(&self, options: RedoOptions) -> Result<RedoResult, LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .redo_with_options(options)
             .await
     }
 
     pub async fn install_plugin(&self, archive_bytes: &[u8]) -> Result<(), LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .install_plugin(archive_bytes)
             .await
     }
 
     pub async fn register_schema(&self, schema: &JsonValue) -> Result<(), LixError> {
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .register_schema(schema)
             .await
@@ -429,7 +439,8 @@ impl Lix {
 
     pub async fn export_image(&self) -> Result<Vec<u8>, LixError> {
         let mut writer = VecImageWriter::default();
-        self.opened_workspace_session()
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?
             .export_image(&mut writer)
             .await?;
@@ -455,7 +466,10 @@ impl Lix {
         if let Some(session) = self.workspace_session.get() {
             session.reload_workspace_state_from_backend().await?;
         } else {
-            let _ = self.opened_workspace_session().await?;
+            let session_host = self.engine.session_host();
+            let _ =
+                crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+                    .await?;
         }
         Ok(())
     }
@@ -494,8 +508,10 @@ impl Lix {
         &self,
         options: ExecuteOptions,
     ) -> Result<SessionTransaction<'_>, LixError> {
-        let _ = self.opened_workspace_session().await?;
-        self.workspace_session()?
+        let session_host = self.engine.session_host();
+        let _ = crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+            .await?;
+        crate::session::require_workspace_session(&self.workspace_session)?
             .begin_transaction_with_options(options)
             .await
     }
@@ -506,185 +522,12 @@ impl Lix {
             &'tx mut SessionTransaction<'_>,
         ) -> Pin<Box<dyn Future<Output = Result<T, LixError>> + 'tx>>,
     {
-        let _ = self.opened_workspace_session().await?;
-        self.workspace_session()?.transaction(options, f).await
-    }
-}
-
-#[async_trait(?Send)]
-impl crate::transaction::WriteExecutionContext for Lix {
-    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
-        self.catalog_projection_registry().as_ref()
-    }
-
-    fn compiled_schema_cache(&self) -> &dyn crate::contracts::CompiledSchemaCache {
-        self.engine().schema_cache()
-    }
-
-    fn sql_compiler_seed<'a>(
-        &'a self,
-        functions: &'a crate::contracts::DynFunctionProvider,
-        surface_registry: &'a SurfaceRegistry,
-    ) -> crate::sql::SqlCompilerSeed<'a> {
-        crate::sql::SqlCompilerSeed {
-            dialect: self.backend().dialect(),
-            functions: crate::contracts::clone_boxed_function_provider(functions),
-            surface_registry,
-        }
-    }
-
-    async fn prepare_function_bindings(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<FunctionBindings, LixError> {
-        let functions = self.prepare_runtime_functions_with_backend(backend).await?;
-        Ok(FunctionBindings::from_prepared_parts(
-            functions.deterministic_sequence_enabled(),
-            &functions,
-        ))
-    }
-    async fn execute_pending_overlay_public_read(
-        &self,
-        transaction: &mut dyn crate::LixBackendTransaction,
-        pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,
-        public_read: &crate::contracts::PreparedPublicRead,
-    ) -> Result<crate::QueryResult, LixError> {
-        crate::session::execute_prepared_public_read_with_registry(
-            self.catalog_projection_registry().as_ref(),
-            transaction,
-            pending_overlay,
-            public_read,
-        )
-        .await
-    }
-
-    async fn persist_binary_blob_writes_in_transaction(
-        &self,
-        transaction: &mut dyn crate::LixBackendTransaction,
-        writes: &[crate::transaction::BinaryBlobWrite],
-    ) -> Result<(), LixError> {
-        crate::session::persist_binary_blob_writes_in_transaction(transaction, writes).await
-    }
-
-    async fn garbage_collect_unreachable_binary_cas_in_transaction(
-        &self,
-        transaction: &mut dyn crate::LixBackendTransaction,
-    ) -> Result<(), LixError> {
-        crate::session::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
-    }
-
-    async fn persist_runtime_sequence_in_transaction(
-        &self,
-        transaction: &mut dyn crate::LixBackendTransaction,
-        functions: &SharedFunctionProvider<Box<dyn crate::contracts::LixFunctionProvider + Send>>,
-    ) -> Result<(), LixError> {
-        crate::session::persist_runtime_sequence_in_transaction(transaction, functions).await
-    }
-
-    async fn execute_public_tracked_append_txn_with_transaction(
-        &self,
-        transaction: &mut dyn crate::LixBackendTransaction,
-        unit: &crate::transaction::TrackedTxnUnit,
-        pending_commit_state: Option<&mut Option<crate::contracts::PendingCommitState>>,
-    ) -> Result<crate::contracts::TrackedCommitExecutionOutcome, LixError> {
-        crate::session::execute_public_tracked_append_txn_with_transaction(
-            transaction,
-            unit,
-            pending_commit_state,
-        )
-        .await
-    }
-}
-
-pub(crate) struct LixEngineSessionHost {
-    engine: Arc<Engine>,
-}
-
-impl LixEngineSessionHost {
-    pub(crate) fn new(engine: Arc<Engine>) -> Self {
-        Self { engine }
-    }
-}
-
-#[async_trait(?Send)]
-impl crate::session::SessionHost for LixEngineSessionHost {
-    async fn ensure_initialized(&self) -> Result<(), LixError> {
-        if crate::live_state::load_mode_with_backend(self.engine.backend().as_ref()).await?
-            == crate::live_state::LiveStateMode::Uninitialized
-        {
-            return Err(crate::common::not_initialized_error());
-        }
-        Ok(())
-    }
-
-    fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
-        self.engine.backend()
-    }
-
-    fn access_to_internal(&self) -> bool {
-        self.engine.access_to_internal()
-    }
-
-    async fn begin_write_unit(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.engine.begin_write_unit().await
-    }
-
-    async fn begin_read_unit(
-        &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-        self.engine.begin_read_unit(mode).await
-    }
-
-    fn public_surface_registry(&self) -> SurfaceRegistry {
-        self.engine.public_surface_registry()
-    }
-
-    fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
-        self.engine.install_public_surface_registry(registry);
-    }
-
-    async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
-        self.engine
-            .load_public_surface_registry_from_backend()
+        let session_host = self.engine.session_host();
+        let _ = crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+            .await?;
+        crate::session::require_workspace_session(&self.workspace_session)?
+            .transaction(options, f)
             .await
-    }
-
-    async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        self.engine.backend().export_image(writer).await
-    }
-
-    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
-        self.engine.catalog_projection_registry().as_ref()
-    }
-
-    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
-        self.engine.schema_cache()
-    }
-
-    async fn prepare_runtime_functions_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<DynFunctionProvider, LixError> {
-        self.engine
-            .prepare_runtime_functions_with_backend(backend)
-            .await
-    }
-
-    fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
-        self.engine.state_commit_stream(filter)
-    }
-
-    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.engine.emit_state_commit_stream_changes(changes);
-    }
-
-    fn invalidate_deterministic_settings_cache(&self) {
-        self.engine.invalidate_deterministic_settings_cache();
-    }
-
-    fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        self.engine.invalidate_installed_plugins_cache()
     }
 }
 
@@ -877,7 +720,7 @@ mod tests {
                         Arc::new(NoopWasmRuntime),
                     )));
                     let session = Session::new_for_test(
-                        lix.session_host(),
+                        lix.engine().session_host(),
                         "version-test".to_string(),
                         Vec::new(),
                     );
@@ -922,8 +765,11 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session =
-            Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+        let session = Session::new_for_test(
+            lix.engine().session_host(),
+            "version-test".to_string(),
+            Vec::new(),
+        );
 
         {
             let mut cache = lix
@@ -974,8 +820,11 @@ mod tests {
             }),
             Arc::new(NoopWasmRuntime),
         )));
-        let session =
-            Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new());
+        let session = Session::new_for_test(
+            lix.engine().session_host(),
+            "version-test".to_string(),
+            Vec::new(),
+        );
 
         {
             let mut cache = lix
