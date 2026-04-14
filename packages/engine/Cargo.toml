@@ -33,15 +33,51 @@ wasmtime = { version = "30", features = ["component-model"] }
 wasmtime-wasi = "30"
 
 [[bench]]
-name = "lix_file_recursive_update"
+name = "file_update_history"
 harness = false
 
 [[bench]]
-name = "lix_file_update"
+name = "file_update_hot"
 harness = false
 
 [[bench]]
-name = "lix_file_insert_history"
+name = "file_insert_history"
+harness = false
+
+[[bench]]
+name = "state_insert_bulk"
+harness = false
+
+[[bench]]
+name = "state_commit_bulk"
+harness = false
+
+[[bench]]
+name = "state_update_large_doc"
+harness = false
+
+[[bench]]
+name = "state_insert_history"
+harness = false
+
+[[bench]]
+name = "version_create"
+harness = false
+
+[[bench]]
+name = "version_storage"
+harness = false
+
+[[bench]]
+name = "version_diff"
+harness = false
+
+[[bench]]
+name = "version_merge"
+harness = false
+
+[[bench]]
+name = "commit_graph_walk"
 harness = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
