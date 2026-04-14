@@ -54,6 +54,7 @@ mod types;
 pub(crate) mod untracked;
 mod visible_rows;
 pub(crate) mod writer_key;
+use crate::catalog::SurfaceReadFreshness;
 use crate::contracts::ReplayCursor;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 use async_trait::async_trait;
@@ -166,6 +167,50 @@ pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionSta
     projection::projection_status(backend).await
 }
 
+pub(crate) async fn ensure_projection_read_freshness_with_backend(
+    backend: &dyn LixBackend,
+    freshness_contract: SurfaceReadFreshness,
+    resolved_relations: &[String],
+) -> Result<(), LixError> {
+    if freshness_contract == SurfaceReadFreshness::AllowsStaleProjection {
+        return Ok(());
+    }
+
+    let status =
+        projection::status::load_live_state_projection_status_with_backend(backend).await?;
+    if matches!(
+        status.mode,
+        LiveStateMode::Ready | LiveStateMode::Bootstrapping
+    ) {
+        return Ok(());
+    }
+
+    Err(projection_stale_error(resolved_relations, &status))
+}
+
+pub(crate) async fn ensure_projection_read_freshness_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    freshness_contract: SurfaceReadFreshness,
+    resolved_relations: &[String],
+) -> Result<(), LixError> {
+    if freshness_contract == SurfaceReadFreshness::AllowsStaleProjection {
+        return Ok(());
+    }
+
+    if require_ready_in_transaction(transaction).await.is_ok() {
+        return Ok(());
+    }
+
+    let backend = crate::backend::transaction_backend_view(transaction);
+    let status =
+        projection::status::load_live_state_projection_status_with_backend(&backend).await?;
+    if status.mode == LiveStateMode::Bootstrapping {
+        return Ok(());
+    }
+
+    Err(projection_stale_error(resolved_relations, &status))
+}
+
 pub(crate) async fn list_installed_plugin_archive_refs(
     backend: &dyn LixBackend,
 ) -> Result<Vec<PluginArchiveRef>, LixError> {
@@ -175,9 +220,9 @@ pub(crate) async fn list_installed_plugin_archive_refs(
 pub(crate) async fn derive_read_time_surface_rows(
     backend: &dyn LixBackend,
     registry: &crate::catalog::CatalogProjectionRegistry,
-    artifact: &crate::sql::ReadTimeProjectionPlan,
+    request: &crate::catalog::CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<crate::catalog::CatalogDerivedRow>, LixError> {
-    projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry, artifact)
+    projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry, request)
         .await
 }
 
@@ -235,6 +280,47 @@ pub(crate) async fn require_ready_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
     lifecycle::require_ready_in_transaction(transaction).await
+}
+
+fn projection_stale_error(
+    surface_names: &[String],
+    status: &LiveStateProjectionStatus,
+) -> LixError {
+    let surfaces = if surface_names.is_empty() {
+        "this public read".to_string()
+    } else {
+        format!("surface(s) {}", surface_names.join(", "))
+    };
+    let applied = format_optional_replay_cursor(status.applied_cursor.as_ref());
+    let latest = format_optional_replay_cursor(status.latest_cursor.as_ref());
+    let applied_frontier =
+        format_optional_committed_frontier(status.applied_committed_frontier.as_ref());
+    let current_frontier = format_committed_frontier(&status.current_committed_frontier);
+    LixError::new(
+        crate::common::ErrorCode::LiveStateNotReady.as_str(),
+        format!(
+            "Public read for {surfaces} requires fresh live-state projections, but live_state is {:?}. Applied committed frontier: {applied_frontier}. Current committed frontier: {current_frontier}. Applied replay cursor: {applied}. Latest replay cursor: {latest}. Canonical history/change reads may proceed while stale, but current-state projection reads must wait for replay or rebuild.",
+            status.mode
+        ),
+    )
+}
+
+fn format_optional_replay_cursor(cursor: Option<&ReplayCursor>) -> String {
+    cursor
+        .map(|cursor| format!("{}@{}", cursor.change_id, cursor.created_at))
+        .unwrap_or_else(|| "(none)".to_string())
+}
+
+fn format_optional_committed_frontier(
+    frontier: Option<&crate::CommittedVersionFrontier>,
+) -> String {
+    frontier
+        .map(format_committed_frontier)
+        .unwrap_or_else(|| "(none)".to_string())
+}
+
+fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> String {
+    frontier.describe()
 }
 
 pub(crate) async fn register_schema_in_transaction(

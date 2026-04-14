@@ -12,7 +12,6 @@ use crate::live_state::{
     load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
     write_live_rows, LiveRow,
 };
-use crate::session::ExecuteOptions;
 use crate::sql::parse_sql;
 use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedBufferedWriteTransaction,
@@ -42,7 +41,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             lix,
             write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
             context: SessionCompilerState::new(
-                ExecuteOptions::default(),
+                None,
                 lix.public_surface_registry(),
                 SessionCompilerCache::new(),
                 GLOBAL_VERSION_ID.to_string(),

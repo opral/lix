@@ -11,11 +11,8 @@ mod init;
 pub(crate) mod observe;
 pub(crate) mod plugin;
 pub(crate) mod public_read_execution;
-pub(crate) mod public_read_preparation;
 mod runtime;
-mod selector_reads;
 mod state;
-pub(crate) mod state_write_target_resolver;
 pub(crate) mod version_ops;
 pub(crate) mod workspace;
 pub(crate) mod write_execution_context;
@@ -35,7 +32,6 @@ use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
 use crate::image::ImageChunkWriter;
 use crate::plugin::{prepare_registered_schema_write_statement, PluginInstallWriteContext};
-pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,
     require_workspace_active_version_id,
@@ -393,7 +389,7 @@ impl Session {
 
     pub(crate) fn new_compiler_state(&self, options: ExecuteOptions) -> SessionCompilerState {
         SessionCompilerState::new(
-            options,
+            options.writer_key,
             self.public_surface_registry(),
             Arc::clone(&self.compiler_cache),
             self.active_version_id(),
@@ -846,7 +842,7 @@ fn committed_read_context<'a>(
     CommittedReadContext {
         active_version_id: context.active_version_id.as_str(),
         active_account_ids: &context.active_account_ids,
-        writer_key: context.options.writer_key.as_deref(),
+        writer_key: context.writer_key.as_deref(),
         compiler_seed: sql_compiler_seed_from_host(
             session_host,
             function_bindings.provider(),
@@ -940,7 +936,7 @@ impl<'a> SessionTransaction<'a> {
             ),
             self.context.public_surface_registry.clone(),
             self.context.active_account_ids.clone(),
-            self.context.options.writer_key.clone(),
+            self.context.writer_key.clone(),
         );
         let statement = prepare_registered_schema_write_statement(schema, &plugin_install_context)?;
         let write_transaction = self

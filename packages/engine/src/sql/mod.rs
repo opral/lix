@@ -91,6 +91,9 @@ pub(crate) use planned_statement::{
     PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 pub(crate) use prepare::SqlPreparationMetadataReader;
+pub(crate) use prepare::{
+    SqlPreparationPendingOverlay, SqlPreparationPendingRow, SqlPreparationPendingStorage,
+};
 pub(crate) use prepared_artifacts::*;
 pub(crate) use write_artifacts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch, PlanEffects,
@@ -99,7 +102,6 @@ pub(crate) use write_artifacts::{
 };
 
 // Existing root helpers used outside the compiler stages.
-pub(crate) use physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 pub(crate) use physical_plan::source_sql::lower_catalog_relation_binding_to_source_sql;
 pub(crate) use relation_policy::{
     builtin_relation_inventory, classify_builtin_relation_name, classify_relation_name,

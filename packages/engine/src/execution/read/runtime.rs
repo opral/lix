@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use crate::sql::ReadTimeProjectionPlan;
-use crate::{LixBackend, LixError, Value};
+use crate::catalog::{CatalogReadTimeProjectionRequest, SurfaceReadFreshness};
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct ReadTimeProjectionIdentity {
@@ -25,11 +25,20 @@ pub(crate) trait ReadExecutionHost {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &ReadTimeProjectionPlan,
+        request: &CatalogReadTimeProjectionRequest,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError>;
-}
 
-#[async_trait(?Send)]
-pub(crate) trait PendingPublicReadTransaction {
-    async fn require_live_state_ready(&mut self) -> Result<(), LixError>;
+    async fn ensure_projection_freshness_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError>;
+
+    async fn ensure_projection_freshness_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError>;
 }

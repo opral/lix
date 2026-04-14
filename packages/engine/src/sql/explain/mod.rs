@@ -4793,7 +4793,7 @@ fn read_time_projection_read_snapshot(
     read: &ReadTimeProjectionPlan,
 ) -> ExplainReadTimeProjectionPlanSnapshot {
     ExplainReadTimeProjectionPlanSnapshot {
-        surface_name: read.surface_name.clone(),
+        surface_name: read.surface_name().to_string(),
         projection_count: read.query.projections.len(),
         filter_count: read.query.filters.len(),
         order_by_count: read.query.order_by.len(),

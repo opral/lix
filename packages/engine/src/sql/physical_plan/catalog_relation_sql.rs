@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use crate::binary_cas::binary_blob_store_relation_name;
+use crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::catalog::{
     FilesystemProjectionScope, FilesystemRelationBinding, FilesystemRelationKind,
     StoredVersionHeadSourceBinding, VersionHeadSourceBinding, VersionRelationBinding,
@@ -8,7 +9,6 @@ use crate::catalog::{
 use crate::common::escape_sql_string;
 use crate::live_state::tracked_relation_name;
 use crate::live_state::{payload_column_name_for_schema, WRITER_KEY_TABLE};
-use crate::sql::physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::{LixError, SqlDialect};
 
 pub(crate) fn build_version_relation_sql(

@@ -1,3 +1,6 @@
+use crate::sql::{
+    SqlPreparationPendingOverlay, SqlPreparationPendingRow, SqlPreparationPendingStorage,
+};
 use crate::transaction::buffered::{
     PendingFilesystemOverlay, PendingRegisteredSchemaOverlay, PendingSemanticOverlay,
     PendingWriterKeyOverlay,
@@ -126,5 +129,29 @@ impl PendingOverlay for PendingWriteOverlay {
                 overlay.annotation_for_state_row(version_id, schema_key, entity_id, file_id)
             })
             .cloned()
+    }
+}
+
+impl SqlPreparationPendingOverlay for PendingWriteOverlay {
+    fn visible_registered_schema_entries(&self) -> Vec<(String, Option<String>)> {
+        PendingOverlay::visible_registered_schema_entries(self)
+    }
+
+    fn visible_registered_schema_rows(
+        &self,
+        storage: SqlPreparationPendingStorage,
+    ) -> Vec<SqlPreparationPendingRow> {
+        let storage = match storage {
+            SqlPreparationPendingStorage::Tracked => PendingSemanticStorage::Tracked,
+            SqlPreparationPendingStorage::Untracked => PendingSemanticStorage::Untracked,
+        };
+
+        PendingOverlay::visible_semantic_rows(self, storage, "lix_registered_schema")
+            .into_iter()
+            .map(|row| SqlPreparationPendingRow {
+                snapshot_content: row.snapshot_content,
+                tombstone: row.tombstone,
+            })
+            .collect()
     }
 }

@@ -8,8 +8,9 @@ use crate::schema::{
     schema_from_registered_snapshot, SchemaKey,
 };
 use crate::sql::common::text::escape_sql_string;
-use crate::sql::SqlPreparationMetadataReader;
-use crate::transaction::{PendingOverlay, PendingSemanticStorage};
+use crate::sql::{
+    SqlPreparationMetadataReader, SqlPreparationPendingOverlay, SqlPreparationPendingStorage,
+};
 use crate::{LixBackend, LixError, Value};
 use serde_json::Value as JsonValue;
 
@@ -39,7 +40,7 @@ pub(crate) async fn load_sql_compiler_metadata_with_reader(
 pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_overlay(
     reader: &mut dyn SqlPreparationMetadataReader,
     registry: &SurfaceRegistry,
-    pending_overlay: Option<&dyn PendingOverlay>,
+    pending_overlay: Option<&dyn SqlPreparationPendingOverlay>,
 ) -> Result<SqlCompilerMetadata, LixError> {
     let pending_schemas = collect_pending_latest_schema_entries(pending_overlay)?;
     let mut known_live_schema_definitions = BTreeMap::new();
@@ -152,7 +153,7 @@ fn schema_from_registered_value_json(raw: &str) -> Result<JsonValue, LixError> {
 }
 
 fn collect_pending_latest_schema_entries(
-    pending_overlay: Option<&dyn PendingOverlay>,
+    pending_overlay: Option<&dyn SqlPreparationPendingOverlay>,
 ) -> Result<BTreeMap<String, PendingLatestSchemaEntry>, LixError> {
     let mut entries = BTreeMap::new();
     let Some(pending_overlay) = pending_overlay else {
@@ -167,10 +168,10 @@ fn collect_pending_latest_schema_entries(
     }
 
     for storage in [
-        PendingSemanticStorage::Tracked,
-        PendingSemanticStorage::Untracked,
+        SqlPreparationPendingStorage::Tracked,
+        SqlPreparationPendingStorage::Untracked,
     ] {
-        for row in pending_overlay.visible_semantic_rows(storage, "lix_registered_schema") {
+        for row in pending_overlay.visible_registered_schema_rows(storage) {
             if row.tombstone {
                 continue;
             }

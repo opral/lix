@@ -3,10 +3,8 @@
 use crate::backend::add_column_if_missing;
 use crate::diagnostics::is_missing_relation_error;
 use crate::live_state::{LiveStateMode, LiveStateProjectionStatus};
-use crate::{
-    CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, QueryResult,
-    ReplayCursor, Value,
-};
+use crate::version::CommittedVersionFrontier;
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, ReplayCursor, Value};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";

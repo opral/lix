@@ -13,7 +13,6 @@ use std::sync::Mutex;
 
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::FunctionBindings;
-use crate::session::ExecuteOptions;
 use crate::sql::{RuntimeBindingValues, SessionStateDelta};
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
@@ -73,7 +72,7 @@ impl SessionCompilerCache {
 }
 
 pub(crate) struct SessionCompilerState {
-    pub(crate) options: ExecuteOptions,
+    pub(crate) writer_key: Option<String>,
     pub(crate) public_surface_registry: SurfaceRegistry,
     compiler_cache: SessionCompilerCacheHandle,
     pub(crate) active_version_id: String,
@@ -83,14 +82,14 @@ pub(crate) struct SessionCompilerState {
 
 impl SessionCompilerState {
     pub(crate) fn new(
-        options: ExecuteOptions,
+        writer_key: Option<String>,
         public_surface_registry: SurfaceRegistry,
         compiler_cache: SessionCompilerCacheHandle,
         active_version_id: String,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
-            options,
+            writer_key,
             public_surface_registry,
             compiler_cache,
             active_version_id,
@@ -158,7 +157,7 @@ impl SessionCompilerState {
 
     pub(crate) fn buffered_write_execution_input(&self) -> BufferedWriteExecutionInput {
         BufferedWriteExecutionInput::new(
-            self.options.writer_key.clone(),
+            self.writer_key.clone(),
             self.active_version_id.clone(),
             self.active_account_ids.clone(),
         )

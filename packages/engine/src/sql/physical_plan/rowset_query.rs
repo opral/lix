@@ -1,4 +1,6 @@
-use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogReadTimeProjectionRequest,
+};
 use crate::sql::logical_plan::SurfaceReadPlan;
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::{
@@ -96,8 +98,10 @@ pub(crate) fn try_compile_read_time_projection_read(
     }
 
     Some(ReadTimeProjectionPlan {
-        surface_name,
-        requested_version_id: structured_read.requested_version_id.clone(),
+        request: CatalogReadTimeProjectionRequest {
+            surface_name,
+            requested_version_id: structured_read.requested_version_id.clone(),
+        },
         query: ProjectionQuery {
             projections: query.projections,
             filters: query.filters,

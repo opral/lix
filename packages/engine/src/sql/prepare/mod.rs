@@ -14,6 +14,7 @@ pub(crate) mod execution_program;
 pub(crate) mod filesystem_insert_ids;
 pub(crate) mod intent;
 mod metadata_reader;
+mod pending_overlay;
 pub(crate) mod prepared_batch;
 mod prepared_read;
 pub(crate) mod preprocess;
@@ -31,6 +32,9 @@ pub(crate) use compiler_metadata::{
 };
 pub(crate) use execution_program::{BoundStatementInstance, StatementBatch};
 pub(crate) use metadata_reader::SqlPreparationMetadataReader;
+pub(crate) use pending_overlay::{
+    SqlPreparationPendingOverlay, SqlPreparationPendingRow, SqlPreparationPendingStorage,
+};
 pub(crate) use prepared_read::{
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
     prepare_public_read_artifact, CommittedReadContext,

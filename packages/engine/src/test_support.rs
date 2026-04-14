@@ -4,14 +4,17 @@ use std::time::Duration;
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
 
-use crate::catalog::CatalogProjectionRegistry;
+use crate::catalog::{
+    CatalogProjectionRegistry, CatalogReadTimeProjectionRequest, SurfaceReadFreshness,
+};
 use crate::contracts::SharedFunctionProvider;
 use crate::functions::SystemFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
-use crate::session::SessionWriteSelectorResolver;
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
 use crate::transaction::overlay::PendingOverlay;
-use crate::transaction::{resolve_write_plan_with_functions, WriteResolveError};
+use crate::transaction::{
+    resolve_write_plan_with_functions, TransactionWriteSelectorResolver, WriteResolveError,
+};
 use crate::wasm::NoopWasmRuntime;
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
@@ -252,12 +255,12 @@ impl crate::execution::read::ReadExecutionHost for BuiltinReadExecutionHost {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::sql::ReadTimeProjectionPlan,
+        request: &CatalogReadTimeProjectionRequest,
     ) -> Result<Vec<crate::execution::read::ReadTimeProjectionRow>, LixError> {
         Ok(crate::live_state::derive_read_time_surface_rows(
             backend,
             crate::catalog::builtin_catalog_projection_registry(),
-            artifact,
+            request,
         )
         .await?
         .into_iter()
@@ -275,6 +278,34 @@ impl crate::execution::read::ReadExecutionHost for BuiltinReadExecutionHost {
         })
         .collect())
     }
+
+    async fn ensure_projection_freshness_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_with_backend(
+            backend,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
+    }
+
+    async fn ensure_projection_freshness_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_in_transaction(
+            transaction,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
+    }
 }
 
 pub(crate) async fn resolve_write_plan_for_test(
@@ -286,7 +317,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     let selector_functions = crate::contracts::clone_boxed_function_provider(
         &SharedFunctionProvider::new(SystemFunctionProvider),
     );
-    let selector_resolver = SessionWriteSelectorResolver::new(
+    let selector_resolver = TransactionWriteSelectorResolver::new(
         backend,
         projection_registry,
         pending_write_overlay,

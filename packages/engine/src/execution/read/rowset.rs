@@ -16,7 +16,7 @@ pub(crate) async fn execute_read_time_projection_read(
     artifact: &ReadTimeProjectionPlan,
 ) -> Result<QueryResult, LixError> {
     let rows = host
-        .derive_read_time_projection_rows(backend, artifact)
+        .derive_read_time_projection_rows(backend, artifact.request())
         .await?;
     execute_read_time_projection_rows(rows, artifact)
 }
@@ -27,7 +27,7 @@ fn execute_read_time_projection_rows(
 ) -> Result<QueryResult, LixError> {
     let mut rows = rows
         .into_iter()
-        .filter(|row| row.surface_name == artifact.surface_name)
+        .filter(|row| row.surface_name == artifact.surface_name())
         .filter(|row| {
             artifact
                 .query
@@ -250,7 +250,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{execute_read_time_projection_read, execute_read_time_projection_rows};
-    use crate::catalog::{bind_named_relation, RelationBindContext};
+    use crate::catalog::{
+        bind_named_relation, CatalogReadTimeProjectionRequest, RelationBindContext,
+    };
     use crate::execution::read::{ReadTimeProjectionIdentity, ReadTimeProjectionRow};
     use crate::live_state;
     use crate::schema::LixCommit;
@@ -282,8 +284,10 @@ mod tests {
     #[test]
     fn executes_projection_filter_order_and_limit_over_supplied_rows() {
         let artifact = ReadTimeProjectionPlan {
-            surface_name: "lix_version".into(),
-            requested_version_id: None,
+            request: CatalogReadTimeProjectionRequest {
+                surface_name: "lix_version".into(),
+                requested_version_id: None,
+            },
             query: ProjectionQuery {
                 projections: vec![
                     PendingOverlayProjection::Column {
@@ -347,8 +351,10 @@ mod tests {
     #[test]
     fn counts_rows_after_filters_in_bounded_rowset_runtime() {
         let artifact = ReadTimeProjectionPlan {
-            surface_name: "lix_version".into(),
-            requested_version_id: None,
+            request: CatalogReadTimeProjectionRequest {
+                surface_name: "lix_version".into(),
+                requested_version_id: None,
+            },
             query: ProjectionQuery {
                 projections: vec![PendingOverlayProjection::CountAll {
                     output_column: "count".into(),
@@ -405,8 +411,10 @@ mod tests {
         .expect("version projection case should seed");
 
         let artifact = ReadTimeProjectionPlan {
-            surface_name: "lix_version".into(),
-            requested_version_id: None,
+            request: CatalogReadTimeProjectionRequest {
+                surface_name: "lix_version".into(),
+                requested_version_id: None,
+            },
             query: ProjectionQuery {
                 projections: vec![
                     PendingOverlayProjection::Column {
@@ -488,8 +496,10 @@ mod tests {
         .expect("version projection case should seed");
 
         let artifact = ReadTimeProjectionPlan {
-            surface_name: "lix_version".into(),
-            requested_version_id: None,
+            request: CatalogReadTimeProjectionRequest {
+                surface_name: "lix_version".into(),
+                requested_version_id: None,
+            },
             query: ProjectionQuery {
                 projections: vec![PendingOverlayProjection::CountAll {
                     output_column: "count".into(),

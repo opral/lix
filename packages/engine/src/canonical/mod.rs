@@ -37,14 +37,18 @@
 //! does not own the meaning of those facts.
 //!
 mod api;
+mod change_commit_sql;
 mod checkpoint_labels;
 mod graph;
 mod init;
 mod journal;
 pub(crate) mod json;
 mod read;
+mod receipt;
 
+pub(crate) use change_commit_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 pub use json::CanonicalJson;
+pub(crate) use receipt::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 #[allow(unused_imports)]
 pub(crate) use api::{

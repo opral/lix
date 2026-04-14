@@ -1,15 +1,14 @@
 use crate::catalog::{
     CatalogDerivedRow, CatalogProjectionLifecycle, CatalogProjectionRegistry,
-    RegisteredCatalogProjection,
+    CatalogReadTimeProjectionRequest, RegisteredCatalogProjection,
 };
 use crate::live_state::projection::hydration::hydrate_projection_input_with_backend;
-use crate::sql::ReadTimeProjectionPlan;
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn derive_read_time_projection_rows_with_backend(
     backend: &dyn LixBackend,
     registry: &CatalogProjectionRegistry,
-    artifact: &ReadTimeProjectionPlan,
+    request: &CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<CatalogDerivedRow>, LixError> {
     let mut rows = Vec::new();
     for registration in registry.registrations() {
@@ -20,13 +19,12 @@ pub(crate) async fn derive_read_time_projection_rows_with_backend(
             .projection()
             .surfaces()
             .iter()
-            .any(|surface| surface.public_name == artifact.surface_name)
+            .any(|surface| surface.public_name == request.surface_name)
         {
             continue;
         }
         rows.extend(
-            derive_registered_projection_rows_with_backend(backend, &registration, artifact)
-                .await?,
+            derive_registered_projection_rows_with_backend(backend, &registration, request).await?,
         );
     }
     Ok(rows)
@@ -35,13 +33,13 @@ pub(crate) async fn derive_read_time_projection_rows_with_backend(
 async fn derive_registered_projection_rows_with_backend(
     backend: &dyn LixBackend,
     registration: &RegisteredCatalogProjection,
-    artifact: &ReadTimeProjectionPlan,
+    request: &CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<CatalogDerivedRow>, LixError> {
     let projection = registration.projection();
     let input = hydrate_projection_input_with_backend(
         backend,
         projection,
-        artifact.requested_version_id.as_deref(),
+        request.requested_version_id.as_deref(),
     )
     .await?;
     projection.derive(&input)

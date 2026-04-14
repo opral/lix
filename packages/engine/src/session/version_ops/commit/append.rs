@@ -18,7 +18,7 @@ use super::types::{
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
     StagedChange,
 };
-use crate::transaction::CanonicalCommitReceipt;
+use crate::canonical::CanonicalCommitReceipt;
 
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,

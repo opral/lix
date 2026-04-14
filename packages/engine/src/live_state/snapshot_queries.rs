@@ -5,7 +5,6 @@ use serde_json::Value as JsonValue;
 
 use crate::live_state::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
-    LiveStateProjectionStatus,
 };
 use crate::{LixBackend, LixError, Value};
 
@@ -45,10 +44,6 @@ pub(crate) trait LiveStateQueryBackend {
         schema_key: &str,
         snapshot_content: Option<&str>,
     ) -> Result<BTreeMap<String, Value>, LixError>;
-
-    async fn load_live_state_projection_status(
-        &self,
-    ) -> Result<LiveStateProjectionStatus, LixError>;
 }
 
 #[derive(Debug, Clone)]
@@ -241,11 +236,5 @@ impl LiveStateQueryBackend for dyn LixBackend + '_ {
         snapshot_content: Option<&str>,
     ) -> Result<BTreeMap<String, Value>, LixError> {
         normalize_live_snapshot_values_with_backend(self, schema_key, snapshot_content).await
-    }
-
-    async fn load_live_state_projection_status(
-        &self,
-    ) -> Result<LiveStateProjectionStatus, LixError> {
-        super::projection::status::load_live_state_projection_status_with_backend(self).await
     }
 }

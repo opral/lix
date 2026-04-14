@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
-use crate::canonical::append_changes;
+use crate::canonical::{append_changes, CanonicalCommitReceipt, UpdatedVersionRef};
 use crate::contracts::LixFunctionProvider;
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
 use crate::transaction::{
-    execute_write_batch_with_transaction, BinaryBlobWrite, CanonicalCommitReceipt,
-    PendingCommitLane, PendingCommitState, UpdatedVersionRef, WriteBatch,
+    execute_write_batch_with_transaction, BinaryBlobWrite, PendingCommitLane, PendingCommitState,
+    WriteBatch,
 };
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
