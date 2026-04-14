@@ -3,7 +3,7 @@
 //! This module owns buffered write commit orchestration, rollback, and staged
 //! journal flushing over a single backend transaction.
 
-use crate::canonical::CanonicalCommitReceipt;
+use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::streams::{should_invalidate_deterministic_settings_cache, StateCommitStreamChange};
 use crate::transaction::buffered::{
     apply_schema_registrations_in_transaction, BufferedWriteState, TransactionCoordinator,
@@ -21,7 +21,7 @@ pub(crate) struct BufferedWriteTransaction<'a> {
     coordinator: TransactionCoordinator<'a>,
     buffered_write_state: BufferedWriteState,
     pending_commit_state: Option<PendingCommitState>,
-    latest_canonical_commit_receipt: Option<CanonicalCommitReceipt>,
+    latest_canonical_commit_receipt: Option<CanonicalCommitProjectionReceipt>,
 }
 
 pub(crate) struct BorrowedBufferedWriteTransaction<'tx> {
@@ -178,7 +178,10 @@ impl<'a> BufferedWriteTransaction<'a> {
             .record_state_commit_stream_changes(changes);
     }
 
-    pub(crate) fn record_canonical_commit_receipt(&mut self, receipt: CanonicalCommitReceipt) {
+    pub(crate) fn record_canonical_commit_receipt(
+        &mut self,
+        receipt: CanonicalCommitProjectionReceipt,
+    ) {
         record_latest_canonical_commit_receipt(&mut self.latest_canonical_commit_receipt, receipt);
     }
 
@@ -306,8 +309,8 @@ impl PreparedWriteStatementStager for BorrowedBufferedWriteTransaction<'_> {
 }
 
 fn record_latest_canonical_commit_receipt(
-    slot: &mut Option<CanonicalCommitReceipt>,
-    receipt: CanonicalCommitReceipt,
+    slot: &mut Option<CanonicalCommitProjectionReceipt>,
+    receipt: CanonicalCommitProjectionReceipt,
 ) {
     let should_replace = slot
         .as_ref()
@@ -319,7 +322,7 @@ fn record_latest_canonical_commit_receipt(
 
 fn apply_buffered_write_execution_outcome(
     state: &mut BufferedWriteState,
-    latest_canonical_commit_receipt: &mut Option<CanonicalCommitReceipt>,
+    latest_canonical_commit_receipt: &mut Option<CanonicalCommitProjectionReceipt>,
     execution_input: &mut BufferedWriteExecutionInput,
     write_outcome: WriteExecutionOutcome,
 ) {

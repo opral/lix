@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 
 use crate::backend::PreparedBatch;
-use crate::canonical::CanonicalCommitReceipt;
+use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::sql::{PlanEffects, ResultContract};
 use crate::streams::StateCommitStreamChange;
 use crate::transaction::PreparedDirectWriteArtifact;
@@ -11,7 +11,7 @@ pub(crate) struct WriteExecutionOutcome {
     pub(crate) public_result: QueryResult,
     pub(crate) direct_write_file_cache_targets: BTreeSet<(String, String)>,
     pub(crate) plugin_changes_committed: bool,
-    pub(crate) canonical_commit_receipt: Option<CanonicalCommitReceipt>,
+    pub(crate) canonical_commit_receipt: Option<CanonicalCommitProjectionReceipt>,
     pub(crate) plan_effects_override: Option<PlanEffects>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
     pub(crate) observe_tick_emitted: bool,

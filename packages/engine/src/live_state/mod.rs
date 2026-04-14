@@ -38,6 +38,7 @@ pub(crate) mod naming;
 mod plugin_archives;
 #[allow(dead_code)]
 pub(crate) mod projection;
+mod projection_receipt;
 #[cfg(test)]
 mod read_context;
 mod replay_cursor;
@@ -88,6 +89,7 @@ pub(crate) use plugin_archives::PluginArchiveRef;
 pub use projection::{
     DerivedProjectionId, DerivedProjectionStatus, ProjectionReplayMode, ProjectionStatus,
 };
+pub(crate) use projection_receipt::CanonicalCommitProjectionReceipt;
 #[cfg(test)]
 pub(crate) use read_context::LiveReadContext;
 pub use replay_cursor::ReplayCursor;

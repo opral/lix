@@ -28,7 +28,6 @@ use sqlparser::ast::Statement;
 
 use crate::backend::TransactionBeginMode;
 use crate::catalog::SurfaceRegistry;
-use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
 use crate::functions::FunctionBindings;
 use crate::image::ImageChunkWriter;
@@ -42,8 +41,9 @@ use crate::sql::parse_sql;
 use crate::sql::{
     extract_explicit_transaction_script, parse_sql_with_timing,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
-    reject_internal_table_writes, reject_public_create_table, CommittedReadContext,
-    QueryDependency, StatementBatch,
+    reject_internal_table_writes, reject_public_create_table,
+    transaction_control_statement_denied_error, CommittedReadContext, QueryDependency,
+    StatementBatch,
 };
 use crate::transaction::{
     ensure_function_bindings_for_write_scope, execute_parsed_statements_in_write_transaction,
@@ -64,6 +64,7 @@ pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
 pub use runtime::ExecuteOptions;
 pub(crate) use runtime::SessionExecutionMode;
 pub(crate) use state::SessionStateSnapshot;
+pub(crate) use workspace::DEFAULT_ACTIVE_VERSION_NAME;
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
     projection_registry: &crate::catalog::CatalogProjectionRegistry,
@@ -907,7 +908,7 @@ impl<'a> SessionTransaction<'a> {
 
     pub(crate) fn record_canonical_commit_receipt(
         &mut self,
-        receipt: crate::session::version_ops::commit::CanonicalCommitReceipt,
+        receipt: crate::session::version_ops::commit::CanonicalCommitProjectionReceipt,
     ) -> Result<(), LixError> {
         self.write_transaction
             .as_mut()

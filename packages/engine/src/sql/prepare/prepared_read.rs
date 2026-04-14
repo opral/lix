@@ -1,6 +1,6 @@
 use crate::backend::TransactionBeginMode;
 use crate::backend::{PreparedBatch, PreparedStatement};
-use crate::diagnostics::{
+use crate::sql::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};

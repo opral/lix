@@ -1,4 +1,5 @@
 use crate::functions::LixFunctionProvider;
+use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::transaction::PendingCommitState;
 use crate::transaction::{binary_blob_writes_from_filesystem_state, FilesystemTransactionState};
 use crate::{LixBackendTransaction, LixError};
@@ -18,8 +19,6 @@ use super::types::{
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
     StagedChange,
 };
-use crate::canonical::CanonicalCommitReceipt;
-
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,
     pub(crate) changes: Vec<StagedChange>,
@@ -33,7 +32,7 @@ pub(crate) struct BufferedTrackedAppendArgs {
 #[derive(Debug)]
 pub(crate) struct BufferedTrackedAppendOutcome {
     pub(crate) disposition: CreateCommitDisposition,
-    pub(crate) receipt: Option<CanonicalCommitReceipt>,
+    pub(crate) receipt: Option<CanonicalCommitProjectionReceipt>,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
     pub(crate) applied_changes: Vec<StagedChange>,
     pub(crate) merged_into_pending_session: bool,
@@ -68,8 +67,9 @@ async fn append_tracked_unchecked(
             &result.applied_changes,
             execution_writer_key.as_deref(),
         )?;
-        let untracked_live_rows =
-            untracked_live_rows_from_updated_version_refs(&receipt.updated_version_refs);
+        let untracked_live_rows = untracked_live_rows_from_updated_version_refs(
+            &receipt.canonical_receipt.updated_version_refs,
+        );
 
         let mut live_rows = tracked_live_rows;
         live_rows.extend(untracked_live_rows);

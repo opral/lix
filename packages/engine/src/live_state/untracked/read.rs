@@ -1,5 +1,5 @@
 use crate::backend::QueryExecutor;
-use crate::diagnostics::is_missing_relation_error;
+use crate::common::is_missing_relation_error;
 #[cfg(test)]
 use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;

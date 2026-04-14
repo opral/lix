@@ -16,11 +16,10 @@ pub(crate) mod status;
 use std::collections::BTreeSet;
 
 use crate::backend::TransactionBeginMode;
-use crate::canonical::CanonicalCommitReceipt;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::live_state::{
-    LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
-    LiveStateRebuildScope, ReplayCursor,
+    CanonicalCommitProjectionReceipt, LiveStateMode, LiveStateProjectionStatus,
+    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope, ReplayCursor,
 };
 use crate::schema::LixVersionRef;
 use crate::version::CommittedVersionFrontier;
@@ -143,7 +142,7 @@ pub(crate) async fn projection_status(
 
 pub(crate) async fn apply_canonical_receipt_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    receipt: &CanonicalCommitReceipt,
+    receipt: &CanonicalCommitProjectionReceipt,
 ) -> Result<(), LixError> {
     replay::advance_live_state_projection_replay_boundary_to_cursor_in_transaction(
         transaction,
@@ -366,12 +365,12 @@ async fn apply_live_state_replay_scope_to_cursor(
 mod tests {
     use super::{
         apply_canonical_receipt_in_transaction, catch_up_live_state_to_current_frontier,
-        projection_status, replay, status, CanonicalCommitReceipt, DerivedProjectionId,
-        ProjectionCatchUpOutcome, ProjectionReplayMode,
+        projection_status, replay, status, DerivedProjectionId, ProjectionCatchUpOutcome,
+        ProjectionReplayMode,
     };
     use crate::backend::TransactionBeginMode;
-    use crate::live_state::LiveStateMode;
-    use crate::live_state::ReplayCursor;
+    use crate::canonical::CanonicalCommitReceipt;
+    use crate::live_state::{CanonicalCommitProjectionReceipt, LiveStateMode, ReplayCursor};
     use crate::test_support::{
         boot_test_engine, init_test_backend_core, seed_canonical_change_row,
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
@@ -490,12 +489,14 @@ mod tests {
             .begin_transaction(TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
-        let receipt = CanonicalCommitReceipt {
-            commit_id: "commit-2".to_string(),
-            replay_cursor: ReplayCursor::new("change-2", "2026-03-15T01:02:03Z"),
-            updated_version_refs: Vec::new(),
-            affected_versions: vec!["main".to_string()],
-        };
+        let receipt = CanonicalCommitProjectionReceipt::new(
+            CanonicalCommitReceipt {
+                commit_id: "commit-2".to_string(),
+                updated_version_refs: Vec::new(),
+                affected_versions: vec!["main".to_string()],
+            },
+            ReplayCursor::new("change-2", "2026-03-15T01:02:03Z"),
+        );
 
         apply_canonical_receipt_in_transaction(transaction.as_mut(), &receipt)
             .await

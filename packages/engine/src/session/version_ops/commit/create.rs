@@ -6,6 +6,7 @@ use crate::canonical::{
     UpdatedVersionRef,
 };
 use crate::functions::LixFunctionProvider;
+use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
@@ -97,7 +98,7 @@ pub(crate) enum CreateCommitDisposition {
 pub(crate) struct CreateCommitResult {
     pub(crate) disposition: CreateCommitDisposition,
     pub(crate) committed_head: String,
-    pub(crate) receipt: Option<CanonicalCommitReceipt>,
+    pub(crate) receipt: Option<CanonicalCommitProjectionReceipt>,
     pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
     pub(crate) applied_changes: Vec<StagedChange>,
 }
@@ -1216,7 +1217,7 @@ fn build_canonical_commit_receipt(
     canonical_changes: &[CanonicalChangeWrite],
     updated_version_refs: &[UpdatedVersionRef],
     affected_versions: &[String],
-) -> Result<CanonicalCommitReceipt, CreateCommitError> {
+) -> Result<CanonicalCommitProjectionReceipt, CreateCommitError> {
     let replay_cursor =
         latest_replay_cursor_from_change_rows(canonical_changes).ok_or_else(|| {
             CreateCommitError {
@@ -1225,12 +1226,14 @@ fn build_canonical_commit_receipt(
                     .to_string(),
             }
         })?;
-    Ok(CanonicalCommitReceipt {
-        commit_id,
+    Ok(CanonicalCommitProjectionReceipt::new(
+        CanonicalCommitReceipt {
+            commit_id,
+            updated_version_refs: updated_version_refs.to_vec(),
+            affected_versions: affected_versions.to_vec(),
+        },
         replay_cursor,
-        updated_version_refs: updated_version_refs.to_vec(),
-        affected_versions: affected_versions.to_vec(),
-    })
+    ))
 }
 
 fn insert_idempotency_row_sql(idempotency: &CommitIdempotencyWrite) -> String {
@@ -1613,6 +1616,7 @@ mod tests {
         let receipt = result.receipt.expect("canonical receipt should be present");
         assert!(
             receipt
+                .canonical_receipt
                 .updated_version_refs
                 .iter()
                 .any(|update| update.version_id.as_str() == "version-a"),
@@ -2102,10 +2106,16 @@ mod tests {
         )
         .expect("receipt should build");
 
-        assert_eq!(receipt.commit_id, "commit-123");
+        assert_eq!(receipt.canonical_receipt.commit_id, "commit-123");
         assert_eq!(receipt.replay_cursor.change_id, "change-2");
         assert_eq!(receipt.replay_cursor.created_at, "2026-03-06T14:22:01.000Z");
-        assert_eq!(receipt.updated_version_refs, updated_version_refs);
-        assert_eq!(receipt.affected_versions, affected_versions);
+        assert_eq!(
+            receipt.canonical_receipt.updated_version_refs,
+            updated_version_refs
+        );
+        assert_eq!(
+            receipt.canonical_receipt.affected_versions,
+            affected_versions
+        );
     }
 }

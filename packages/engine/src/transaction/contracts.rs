@@ -37,7 +37,7 @@ pub struct TransactionCommitOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TrackedCommitExecutionOutcome {
-    pub receipt: Option<crate::canonical::CanonicalCommitReceipt>,
+    pub receipt: Option<crate::live_state::CanonicalCommitProjectionReceipt>,
     pub applied_changes: Vec<PublicChange>,
     pub plugin_changes_committed: bool,
     pub next_active_version_id: Option<String>,

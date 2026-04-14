@@ -9,7 +9,7 @@ use crate::backend::TransactionBeginMode;
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
 use crate::catalog::{lookup_directory_id_by_path, FilesystemProjectionScope};
 use crate::common::NormalizedDirectoryPath;
-use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
+use crate::sql::normalize_sql_error_with_backend_and_relation_names;
 use crate::{LixError, QueryResult, SqlDialect, Value};
 
 pub(crate) async fn lookup_directory_id_by_path_in_transaction(
@@ -99,6 +99,8 @@ pub(crate) async fn normalize_sql_error_with_transaction_and_relation_names(
     error: LixError,
     relation_names: &[String],
 ) -> LixError {
+    // Transaction code adapts SQL-owned normalization to a transaction-backed
+    // backend view; it does not own the diagnostic shaping rules.
     let backend = TransactionExecutionBackend::new(transaction);
     normalize_sql_error_with_backend_and_relation_names(&backend, error, relation_names).await
 }

@@ -7,13 +7,13 @@ use crate::catalog::{
     CatalogWriteVersionSemantics, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness,
     SurfaceRegistry, SurfaceVariant,
 };
-use crate::diagnostics::{
-    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
-    sql_unknown_table_error,
-};
 use crate::schema::builtin_schema_definition;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
+use crate::sql::diagnostics::{
+    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
+    sql_unknown_table_error,
+};
 use crate::sql::explain::{
     build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts,
     ExplainRequest, ExplainStage, ExplainStageTiming, ExplainTimingCollector,

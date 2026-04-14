@@ -1178,7 +1178,7 @@ fn directory_history_field_from_column_name(
         }
         "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectDirectoryHistoryField::RootCommitId),
         "depth" | "lixcol_depth" => Ok(DirectDirectoryHistoryField::Depth),
-        _ => Err(crate::diagnostics::sql_unknown_column_error(
+        _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
             Some(&resolved_relation.descriptor.public_name),
             &resolved_relation
@@ -1668,7 +1668,7 @@ fn file_history_field_from_column_name(
         }
         "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectFileHistoryField::RootCommitId),
         "depth" | "lixcol_depth" => Ok(DirectFileHistoryField::Depth),
-        _ => Err(crate::diagnostics::sql_unknown_column_error(
+        _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
             Some(&resolved_relation.descriptor.public_name),
             &resolved_relation
@@ -2350,7 +2350,7 @@ fn state_history_field_from_column_name(
         "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectStateHistoryField::RootCommitId),
         "depth" | "lixcol_depth" => Ok(DirectStateHistoryField::Depth),
         "version_id" | "lixcol_version_id" => Ok(DirectStateHistoryField::VersionId),
-        _ => Err(crate::diagnostics::sql_unknown_column_error(
+        _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
             Some(&resolved_relation.descriptor.public_name),
             &resolved_relation
@@ -2379,7 +2379,7 @@ fn entity_history_field_from_column_name(
     {
         return Ok(DirectEntityHistoryField::Property(lowercase));
     }
-    Err(crate::diagnostics::sql_unknown_column_error(
+    Err(crate::sql::diagnostics::sql_unknown_column_error(
         column,
         Some(&resolved_relation.descriptor.public_name),
         &resolved_relation
@@ -3042,7 +3042,7 @@ fn public_read_preparation_error(bindings: &[ResolvedRelation], message: &str) -
         .chain(binding.descriptor.hidden_columns.iter())
         .map(String::as_str)
         .collect::<Vec<_>>();
-    Some(crate::diagnostics::sql_unknown_column_error(
+    Some(crate::sql::diagnostics::sql_unknown_column_error(
         &missing_column,
         Some(&binding.descriptor.public_name),
         available_columns.as_slice(),

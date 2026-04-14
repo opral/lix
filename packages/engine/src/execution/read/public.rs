@@ -1,7 +1,6 @@
-use crate::diagnostics::sanitize_lowered_public_sql_error_description;
 use crate::sql::{
-    PreparedPublicRead, PreparedPublicReadPlanArtifact, PublicReadResultColumn,
-    PublicReadResultColumns,
+    sanitize_lowered_public_sql_error_description, PreparedPublicRead,
+    PreparedPublicReadPlanArtifact, PublicReadResultColumn, PublicReadResultColumns,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -169,6 +168,8 @@ async fn execute_prepared_batch_with_backend(
 }
 
 fn translate_lowered_public_read_error(error: LixError, public_surfaces: &[String]) -> LixError {
+    // Read execution only sanitizes the already-SQL-shaped message for the
+    // current public surfaces; the shaping rules remain owned by `sql/*`.
     let description =
         sanitize_lowered_public_sql_error_description(&error.description, public_surfaces);
     LixError::new(&error.code, description)

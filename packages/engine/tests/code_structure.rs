@@ -33,21 +33,8 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
         forbidden_scopes: &["services"],
     },
     ForbiddenDependencyRule {
-        from_scope: "contracts",
-        reason: "contracts is a downward seam and may reference compiler-owned DTOs, but must stay neutral relative to runtime owners",
-        forbidden_scopes: &[
-            "backend",
-            "canonical",
-            "execution",
-            "api",
-            "live_state",
-            "services",
-            "session",
-        ],
-    },
-    ForbiddenDependencyRule {
         from_scope: "services",
-        reason: "services are leaf sidecar capabilities and may depend only on neutral foundations like common/contracts, not on engine composition or semantic owner roots",
+        reason: "services are leaf sidecar capabilities and may depend only on neutral foundations like common, not on engine composition or semantic owner roots",
         forbidden_scopes: &[
             "api",
             "backend",
@@ -94,7 +81,6 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
 const TARGET_CORE_MODULES: &[&str] = &[
     "backend",
     "canonical",
-    "contracts",
     "execution",
     "live_state",
     "session",
@@ -153,7 +139,7 @@ enum UseToken {
     Ident(String),
 }
 
-const ALLOWED_SERVICE_FOUNDATION_ROOTS: &[&str] = &["common", "contracts"];
+const ALLOWED_SERVICE_FOUNDATION_ROOTS: &[&str] = &["common"];
 
 fn engine_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1968,7 +1954,7 @@ fn services_imports_are_limited_to_direct_child_namespaces() {
 }
 
 // Leaf `services/*` modules are standalone capabilities. They may depend on
-// neutral foundations like `common` and `contracts`, but not on engine
+// neutral foundations like `common`, but not on engine
 // composition, semantic owners, or other top-level roots.
 #[test]
 fn services_has_no_external_root_dependencies() {
@@ -1979,7 +1965,7 @@ fn services_has_no_external_root_dependencies() {
 
     assert!(
         violations.is_empty(),
-        "`services/*` leaf modules may only import neutral foundation roots (`common`, `contracts`) outside `services`.\n\nCurrent violations:\n{}",
+        "`services/*` leaf modules may only import neutral foundation roots (`common`) outside `services`.\n\nCurrent violations:\n{}",
         render_grouped_import_path_violations(&violations),
     );
 }
