@@ -9,6 +9,7 @@ use std::time::Duration;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
+use crate::functions::{DynFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::sql::{ChangeBatch, DependencySpec, PreparedExplainMode, PreparedExplainTemplate};
 use crate::streams::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};
@@ -74,6 +75,7 @@ pub(crate) use super::support::{
 #[allow(dead_code)]
 pub(crate) async fn prepare_public_plan(
     dialect: SqlDialect,
+    functions: DynFunctionProvider,
     registry: &SurfaceRegistry,
     compiler_metadata: &SqlCompilerMetadata,
     parsed_statements: &[Statement],
@@ -87,6 +89,7 @@ pub(crate) async fn prepare_public_plan(
 ) -> Result<Option<PublicPlan>, LixError> {
     super::prepare::public_surface::prepare_public_plan_with_registry_context_and_functions(
         dialect,
+        functions,
         registry,
         compiler_metadata,
         parsed_statements,
@@ -148,6 +151,7 @@ pub(crate) async fn prepare_public_write(
 ) -> Result<Option<PublicWritePlan>, LixError> {
     super::prepare::public_surface::try_prepare_public_write_with_registry_and_functions(
         dialect,
+        SharedFunctionProvider::new(Box::new(SystemFunctionProvider)),
         registry,
         parsed_statements,
         params,
