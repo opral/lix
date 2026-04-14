@@ -9,12 +9,14 @@ use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
+use crate::schema::{apply_schema_defaults_with_shared_runtime, builtin_schema_definition};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     DirectoryInsertAssignments, FileInsertAssignments,
 };
-use crate::version::GLOBAL_VERSION_ID;
 use crate::LixBackend;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,11 +180,17 @@ pub(super) fn plan_directory_insert_batch(
     snapshot: &FilesystemInsertSnapshot,
     assignments: &[DirectoryInsertAssignments],
     version_id: &str,
+    functions: SharedFunctionProvider<impl LixFunctionProvider + Send + 'static>,
 ) -> Result<PlannedDirectoryInsertBatch, FilesystemPlanningError> {
     let mut batch = PendingFilesystemInsertBatch::default();
     for assignments in assignments {
-        let computed =
-            resolve_directory_insert_target(snapshot, assignments, version_id, &mut batch)?;
+        let computed = resolve_directory_insert_target(
+            snapshot,
+            assignments,
+            version_id,
+            &mut batch,
+            functions.clone(),
+        )?;
         batch.register_directory_target(computed)?;
     }
     Ok(PlannedDirectoryInsertBatch {
@@ -194,10 +202,17 @@ pub(super) fn plan_file_insert_batch(
     snapshot: &FilesystemInsertSnapshot,
     assignments: &[FileInsertAssignments],
     version_id: &str,
+    functions: SharedFunctionProvider<impl LixFunctionProvider + Send + 'static>,
 ) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
     let mut batch = PendingFilesystemInsertBatch::default();
     for assignments in assignments {
-        let computed = resolve_file_insert_target(snapshot, assignments, version_id, &mut batch)?;
+        let computed = resolve_file_insert_target(
+            snapshot,
+            assignments,
+            version_id,
+            &mut batch,
+            functions.clone(),
+        )?;
         batch.register_file_target(computed, assignments.data.clone())?;
     }
     finalize_pending_file_insert_batch(snapshot, &batch)
@@ -228,16 +243,19 @@ impl PendingFilesystemInsertBatch {
             .is_some_and(|pending| pending.explicit)
     }
 
-    fn register_implicit_directory(
+    fn register_implicit_directory<P>(
         &mut self,
-        version_id: &str,
         path: &str,
-    ) -> Result<(), FilesystemPlanningError> {
+        functions: SharedFunctionProvider<P>,
+    ) -> Result<(), FilesystemPlanningError>
+    where
+        P: LixFunctionProvider + Send + 'static,
+    {
         if self.directories_by_path.contains_key(path) {
             return Ok(());
         }
         let target = ResolvedDirectoryInsertTarget {
-            id: auto_directory_id(version_id, path),
+            id: generated_directory_insert_id(functions)?,
             path: path.to_string(),
             parent_path: parent_directory_path(path),
             name: directory_name_from_path(path).unwrap_or_default(),
@@ -595,20 +613,24 @@ async fn merge_visible_file_ids_by_path(
     Ok(resolved)
 }
 
-fn resolve_file_insert_target(
+fn resolve_file_insert_target<P>(
     snapshot: &FilesystemInsertSnapshot,
     assignments: &FileInsertAssignments,
     version_id: &str,
     batch: &mut PendingFilesystemInsertBatch,
-) -> Result<ResolvedFileInsertTarget, FilesystemPlanningError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedFileInsertTarget, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let parsed = &assignments.path;
     let explicit_id = assignments.id.as_deref();
     ensure_no_directory_at_file_path_in_snapshot(parsed.normalized_path.as_str(), snapshot, batch)?;
     let directory_path = ensure_parent_directories_for_file_insert_batch(
-        version_id,
         parsed.directory_path.as_ref(),
         snapshot,
         batch,
+        functions.clone(),
     )?;
 
     if let Some(existing_id) = batch.pending_file_id_by_path(parsed.normalized_path.as_str()) {
@@ -639,7 +661,7 @@ fn resolve_file_insert_target(
         id: assignments
             .id
             .clone()
-            .unwrap_or_else(|| auto_file_id(version_id, parsed.normalized_path.as_str())),
+            .unwrap_or(generated_file_insert_id(functions)?),
         path: parsed.normalized_path.as_str().to_string(),
         directory_path: directory_path.map(|path| path.as_str().to_string()),
         name: parsed.name.clone(),
@@ -649,12 +671,16 @@ fn resolve_file_insert_target(
     })
 }
 
-fn resolve_directory_insert_target(
+fn resolve_directory_insert_target<P>(
     snapshot: &FilesystemInsertSnapshot,
     assignments: &DirectoryInsertAssignments,
     version_id: &str,
     batch: &mut PendingFilesystemInsertBatch,
-) -> Result<ResolvedDirectoryInsertTarget, FilesystemPlanningError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedDirectoryInsertTarget, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let explicit_id = assignments.id.as_deref();
     let explicit_parent_id = assignments.parent_id.as_deref();
     let explicit_name = assignments.name.as_deref();
@@ -667,17 +693,16 @@ fn resolve_directory_insert_target(
                 message: "Directory name must be provided".to_string(),
             })?;
         let derived_parent_path = ensure_parent_directories_for_insert_batch(
-            version_id,
             parent_directory_path(&normalized_path)
                 .map(NormalizedDirectoryPath::from_normalized)
                 .as_ref(),
             snapshot,
             batch,
+            functions.clone(),
         )?;
         let derived_parent_id = match derived_parent_path.as_deref() {
             Some(parent_path) => {
                 lookup_directory_id_by_path_in_snapshot(parent_path, snapshot, batch)
-                    .or_else(|| Some(auto_directory_id(version_id, parent_path)))
             }
             None => None,
         };
@@ -749,7 +774,7 @@ fn resolve_directory_insert_target(
         id: assignments
             .id
             .clone()
-            .unwrap_or_else(|| auto_directory_id(version_id, &normalized_path)),
+            .unwrap_or(generated_directory_insert_id(functions)?),
         path: normalized_path,
         parent_path,
         name,
@@ -758,12 +783,15 @@ fn resolve_directory_insert_target(
     })
 }
 
-fn ensure_parent_directories_for_insert_batch(
-    version_id: &str,
+fn ensure_parent_directories_for_insert_batch<P>(
     directory_path: Option<&NormalizedDirectoryPath>,
     snapshot: &FilesystemInsertSnapshot,
     batch: &mut PendingFilesystemInsertBatch,
-) -> Result<Option<String>, FilesystemPlanningError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<Option<String>, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let Some(directory_path) = directory_path else {
         return Ok(None);
     };
@@ -782,7 +810,7 @@ fn ensure_parent_directories_for_insert_batch(
             continue;
         }
         ensure_no_file_at_directory_path_in_snapshot(&candidate_path, snapshot, batch)?;
-        batch.register_implicit_directory(version_id, &candidate_path)?;
+        batch.register_implicit_directory(&candidate_path, functions.clone())?;
     }
 
     Ok(Some(directory_path.as_str().to_string()))
@@ -815,12 +843,15 @@ fn finalize_pending_directory_insert_batch(
     directories
 }
 
-fn ensure_parent_directories_for_file_insert_batch(
-    version_id: &str,
+fn ensure_parent_directories_for_file_insert_batch<P>(
     directory_path: Option<&NormalizedDirectoryPath>,
     snapshot: &FilesystemInsertSnapshot,
     batch: &mut PendingFilesystemInsertBatch,
-) -> Result<Option<String>, FilesystemPlanningError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<Option<String>, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let Some(directory_path) = directory_path else {
         return Ok(None);
     };
@@ -839,7 +870,7 @@ fn ensure_parent_directories_for_file_insert_batch(
             continue;
         }
         ensure_no_file_at_directory_path_in_snapshot(&candidate_path, snapshot, batch)?;
-        batch.register_implicit_directory(version_id, &candidate_path)?;
+        batch.register_implicit_directory(&candidate_path, functions.clone())?;
     }
 
     Ok(Some(directory_path.as_str().to_string()))
@@ -1110,20 +1141,60 @@ fn pending_directory_insert_sort_key(path: &str) -> (usize, String) {
     (path.matches('/').count(), path.to_string())
 }
 
-fn auto_directory_id(version_id: &str, path: &str) -> String {
-    if version_id == GLOBAL_VERSION_ID {
-        format!("dir:auto::{path}")
-    } else {
-        format!("dir:auto::{version_id}::{path}")
-    }
+fn generated_directory_insert_id<P>(
+    functions: SharedFunctionProvider<P>,
+) -> Result<String, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    generated_schema_default_id(functions, "lix_directory_descriptor")
 }
 
-fn auto_file_id(version_id: &str, path: &str) -> String {
-    if version_id == GLOBAL_VERSION_ID {
-        format!("file:auto::{path}")
-    } else {
-        format!("file:auto::{version_id}::{path}")
-    }
+fn generated_file_insert_id<P>(
+    functions: SharedFunctionProvider<P>,
+) -> Result<String, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    generated_schema_default_id(functions, "lix_file_descriptor")
+}
+
+fn generated_schema_default_id<P>(
+    functions: SharedFunctionProvider<P>,
+    schema_key: &str,
+) -> Result<String, FilesystemPlanningError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
+    let schema = builtin_schema_definition(schema_key).ok_or_else(|| FilesystemPlanningError {
+        message: format!("public filesystem insert missing builtin schema '{schema_key}'"),
+    })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| FilesystemPlanningError {
+            message: format!(
+                "public filesystem insert requires string x-lix-version for '{schema_key}'"
+            ),
+        })?;
+    let mut snapshot = JsonMap::new();
+    apply_schema_defaults_with_shared_runtime(
+        &mut snapshot,
+        schema,
+        functions,
+        schema_key,
+        schema_version,
+    )
+    .map_err(filesystem_path_error)?;
+    snapshot
+        .get("id")
+        .and_then(JsonValue::as_str)
+        .map(ToString::to_string)
+        .ok_or_else(|| FilesystemPlanningError {
+            message: format!(
+                "public filesystem insert default id for '{schema_key}' must resolve to text"
+            ),
+        })
 }
 
 fn filesystem_path_error(error: crate::LixError) -> FilesystemPlanningError {

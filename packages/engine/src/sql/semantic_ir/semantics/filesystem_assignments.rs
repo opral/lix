@@ -1,5 +1,8 @@
 use crate::common::{normalize_path_segment, NormalizedDirectoryPath, ParsedFilePath};
+use crate::functions::DynFunctionProvider;
+use crate::schema::{apply_schema_defaults_with_shared_runtime, builtin_schema_definition};
 use crate::Value;
+use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,11 +148,19 @@ pub(crate) fn parse_file_update_assignments(
     })
 }
 
+const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
+const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
+
 pub(crate) fn parse_directory_insert_assignments(
     payload: &BTreeMap<String, Value>,
+    functions: &DynFunctionProvider,
 ) -> Result<DirectoryInsertAssignments, FilesystemAssignmentsError> {
+    let defaults = filesystem_insert_defaults(FILESYSTEM_DIRECTORY_SCHEMA_KEY, functions)?;
     Ok(DirectoryInsertAssignments {
-        id: payload.get("id").and_then(text_from_value),
+        id: payload
+            .get("id")
+            .and_then(text_from_value)
+            .or_else(|| defaults.get("id").and_then(text_from_value)),
         parent_id: payload.get("parent_id").and_then(text_from_value),
         name: payload
             .get("name")
@@ -168,6 +179,7 @@ pub(crate) fn parse_directory_insert_assignments(
         hidden: payload
             .get("hidden")
             .and_then(value_as_bool)
+            .or_else(|| defaults.get("hidden").and_then(value_as_bool))
             .unwrap_or(false),
         metadata: optional_insert_text(payload, "metadata", "public filesystem directory")?,
     })
@@ -175,6 +187,7 @@ pub(crate) fn parse_directory_insert_assignments(
 
 pub(crate) fn parse_file_insert_assignments(
     payload: &BTreeMap<String, Value>,
+    functions: &DynFunctionProvider,
 ) -> Result<FileInsertAssignments, FilesystemAssignmentsError> {
     if !payload
         .keys()
@@ -193,12 +206,18 @@ pub(crate) fn parse_file_insert_assignments(
             message: "public filesystem file insert requires column 'path'".to_string(),
         })?;
 
+    let defaults = filesystem_insert_defaults(FILESYSTEM_FILE_SCHEMA_KEY, functions)?;
+
     Ok(FileInsertAssignments {
-        id: payload.get("id").and_then(text_from_value),
+        id: payload
+            .get("id")
+            .and_then(text_from_value)
+            .or_else(|| defaults.get("id").and_then(text_from_value)),
         path: ParsedFilePath::try_from_path(&raw_path).map_err(filesystem_path_error)?,
         hidden: payload
             .get("hidden")
             .and_then(value_as_bool)
+            .or_else(|| defaults.get("hidden").and_then(value_as_bool))
             .unwrap_or(false),
         metadata: optional_insert_text(payload, "metadata", "public filesystem file")?,
         data: insert_blob_value(payload, "data")?,
@@ -217,6 +236,59 @@ fn optional_text_assignment(
         Some(other) => Err(FilesystemAssignmentsError {
             message: format!("{context} expected text/null {key}, got {other:?}"),
         }),
+    }
+}
+
+fn filesystem_insert_defaults(
+    schema_key: &str,
+    functions: &DynFunctionProvider,
+) -> Result<BTreeMap<String, Value>, FilesystemAssignmentsError> {
+    let schema =
+        builtin_schema_definition(schema_key).ok_or_else(|| FilesystemAssignmentsError {
+            message: format!("public filesystem resolver missing builtin schema '{schema_key}'"),
+        })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(JsonValue::as_str)
+        .ok_or_else(|| FilesystemAssignmentsError {
+            message: format!(
+                "public filesystem resolver requires string x-lix-version for '{schema_key}'"
+            ),
+        })?;
+    let mut snapshot = JsonMap::new();
+    apply_schema_defaults_with_shared_runtime(
+        &mut snapshot,
+        schema,
+        functions.clone(),
+        schema_key,
+        schema_version,
+    )
+    .map_err(filesystem_path_error)?;
+    snapshot
+        .into_iter()
+        .map(|(key, value)| {
+            json_value_to_engine_value(value)
+                .map(|value| (key, value))
+                .map_err(|message| FilesystemAssignmentsError { message })
+        })
+        .collect()
+}
+
+fn json_value_to_engine_value(value: JsonValue) -> Result<Value, String> {
+    match value {
+        JsonValue::Null => Ok(Value::Null),
+        JsonValue::Bool(value) => Ok(Value::Boolean(value)),
+        JsonValue::String(value) => Ok(Value::Text(value)),
+        JsonValue::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(Value::Integer(value))
+            } else if let Some(value) = value.as_f64() {
+                Ok(Value::Real(value))
+            } else {
+                Err("public filesystem resolver cannot represent JSON number".to_string())
+            }
+        }
+        JsonValue::Array(_) | JsonValue::Object(_) => Ok(Value::Json(value)),
     }
 }
 
@@ -312,8 +384,13 @@ mod tests {
         parse_directory_insert_assignments, parse_directory_update_assignments,
         parse_file_insert_assignments, parse_file_update_assignments,
     };
+    use crate::functions::{DynFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
     use crate::Value;
     use std::collections::BTreeMap;
+
+    fn system_functions() -> DynFunctionProvider {
+        SharedFunctionProvider::new(Box::new(SystemFunctionProvider))
+    }
 
     #[test]
     fn file_insert_and_update_share_path_normalization() {
@@ -323,7 +400,8 @@ mod tests {
             Value::Text("/docs/readme.md".to_string()),
         );
 
-        let insert = parse_file_insert_assignments(&payload).expect("insert parse should succeed");
+        let insert = parse_file_insert_assignments(&payload, &system_functions())
+            .expect("insert parse should succeed");
         let update = parse_file_update_assignments(&payload).expect("update parse should succeed");
 
         assert_eq!(
@@ -341,8 +419,8 @@ mod tests {
         payload.insert("path".to_string(), Value::Text("/docs/guides/".to_string()));
         payload.insert("name".to_string(), Value::Text("guides".to_string()));
 
-        let insert =
-            parse_directory_insert_assignments(&payload).expect("insert parse should succeed");
+        let insert = parse_directory_insert_assignments(&payload, &system_functions())
+            .expect("insert parse should succeed");
         let update =
             parse_directory_update_assignments(&payload).expect("update parse should succeed");
 

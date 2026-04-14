@@ -116,11 +116,7 @@ async fn compile_execution_with_context(
     let dialect = compiler_context.dialect();
     let functions = compiler_context.functions().clone();
 
-    let mut statements = parsed_statements.to_vec();
-    crate::sql::prepare::filesystem_insert_ids::ensure_generated_filesystem_insert_ids(
-        &mut statements,
-        &functions,
-    )?;
+    let statements = parsed_statements.to_vec();
     let explained = if statements.len() == 1 {
         Some(unwrap_explain_statement(&statements[0])?)
     } else {
@@ -137,6 +133,7 @@ async fn compile_execution_with_context(
 
     let public_plan = prepare_public_plan_for_compile(
         dialect,
+        functions.clone(),
         compiler_context.surface_registry(),
         compiler_context.compiler_metadata(),
         &statements,
@@ -315,6 +312,7 @@ async fn compile_execution_with_context(
 
 async fn prepare_public_plan_for_compile(
     dialect: SqlDialect,
+    functions: DynFunctionProvider,
     registry: &crate::catalog::SurfaceRegistry,
     compiler_metadata: &SqlCompilerMetadata,
     statements: &[Statement],
@@ -328,6 +326,7 @@ async fn prepare_public_plan_for_compile(
 ) -> Result<Option<PublicPlan>, LixError> {
     prepare_public_plan_with_registry_context_and_functions(
         dialect,
+        functions,
         registry,
         compiler_metadata,
         statements,

@@ -7,6 +7,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
     ResolvedRelation, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
+use crate::functions::DynFunctionProvider;
 use crate::sql::diagnostics::schema_not_registered_error;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadPlan,
@@ -237,8 +238,9 @@ impl PublicWriteAnalysis {
 
 pub(crate) fn analyze_public_write_semantics(
     semantics: &PublicWriteSemantics,
+    functions: &DynFunctionProvider,
 ) -> Result<PublicWriteAnalysis, WriteAnalysisError> {
-    analyze_write(&semantics.canonicalized).map(|planned_write| PublicWriteAnalysis {
+    analyze_write(&semantics.canonicalized, functions).map(|planned_write| PublicWriteAnalysis {
         semantics: semantics.clone(),
         planned_write,
     })

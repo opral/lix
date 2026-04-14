@@ -21,6 +21,7 @@ use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
 use crate::sql::OptionalTextPatch;
 use crate::transaction::overlay::PendingOverlay;
@@ -49,15 +50,19 @@ fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> Wr
     }
 }
 
-pub(super) async fn resolve_filesystem_write(
+pub(super) async fn resolve_filesystem_write<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
+    functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     match filesystem_write_kind(planned_write)? {
         FilesystemRelationKind::File => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_file_insert_write_plan(hydrator, planned_write).await
+                resolve_file_insert_write_plan(hydrator, planned_write, functions).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
                 resolve_existing_file_write(
@@ -71,7 +76,7 @@ pub(super) async fn resolve_filesystem_write(
         },
         FilesystemRelationKind::Directory => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
-                resolve_directory_insert_write_plan(hydrator, planned_write).await
+                resolve_directory_insert_write_plan(hydrator, planned_write, functions).await
             }
             WriteOperationKind::Update | WriteOperationKind::Delete => {
                 resolve_existing_directory_write(
@@ -179,10 +184,14 @@ fn file_update_assignments(
     }
 }
 
-async fn resolve_directory_insert_write_plan(
+async fn resolve_directory_insert_write_plan<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     let payloads = payload_maps(planned_write)?;
     let assignments_rows = directory_insert_assignments_batch(planned_write)?;
@@ -237,8 +246,13 @@ async fn resolve_directory_insert_write_plan(
         )
         .await
         .map_err(write_resolve_filesystem_planning_error)?;
-        let planned_batch = plan_directory_insert_batch(&snapshot, &assignments_batch, &version_id)
-            .map_err(write_resolve_filesystem_planning_error)?;
+        let planned_batch = plan_directory_insert_batch(
+            &snapshot,
+            &assignments_batch,
+            &version_id,
+            functions.clone(),
+        )
+        .map_err(write_resolve_filesystem_planning_error)?;
         let target_write_lane = target_write_lane_for_version(
             planned_write,
             execution_mode,
@@ -510,10 +524,14 @@ async fn resolve_existing_directory_write(
     }
 }
 
-async fn resolve_file_insert_write_plan(
+async fn resolve_file_insert_write_plan<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+    functions: SharedFunctionProvider<P>,
+) -> Result<ResolvedWritePlan, WriteResolveError>
+where
+    P: LixFunctionProvider + Send + 'static,
+{
     let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     let payloads = payload_maps(planned_write)?;
     let assignments_rows = file_insert_assignments_batch(planned_write)?;
@@ -567,8 +585,13 @@ async fn resolve_file_insert_write_plan(
         )
         .await
         .map_err(write_resolve_filesystem_planning_error)?;
-        let planned_batch = plan_file_insert_batch(&snapshot, &assignments_batch, &version_id)
-            .map_err(write_resolve_filesystem_planning_error)?;
+        let planned_batch = plan_file_insert_batch(
+            &snapshot,
+            &assignments_batch,
+            &version_id,
+            functions.clone(),
+        )
+        .map_err(write_resolve_filesystem_planning_error)?;
         let target_write_lane = target_write_lane_for_version(
             planned_write,
             execution_mode,

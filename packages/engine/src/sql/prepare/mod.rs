@@ -11,7 +11,6 @@ pub(crate) mod dependency_spec;
 pub(crate) mod derive_effects;
 pub(crate) mod derive_requirements;
 pub(crate) mod execution_program;
-pub(crate) mod filesystem_insert_ids;
 pub(crate) mod intent;
 mod metadata_reader;
 mod pending_overlay;

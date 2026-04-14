@@ -3,6 +3,7 @@ use crate::catalog::{
     FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedRelation,
     SurfaceOverrideValue,
 };
+use crate::functions::DynFunctionProvider;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedWrite, SchemaProof, ScopeProof, StateSourceKind, TargetSetProof,
     WriteModeRequest, WriteOperationKind,
@@ -27,6 +28,7 @@ pub(crate) struct WriteAnalysisError {
 
 pub(crate) fn analyze_write(
     canonicalized: &CanonicalizedWrite,
+    functions: &DynFunctionProvider,
 ) -> Result<PlannedWrite, WriteAnalysisError> {
     let scope_proof = analyze_write_scope(canonicalized)?;
     if !matches!(
@@ -41,7 +43,7 @@ pub(crate) fn analyze_write(
 
     let schema_proof = derive_write_schema_facts(canonicalized);
     let target_set_proof = derive_write_target_facts(canonicalized);
-    let filesystem_write_intent = analyze_filesystem_write_intent(canonicalized)?;
+    let filesystem_write_intent = analyze_filesystem_write_intent(canonicalized, functions)?;
 
     Ok(PlannedWrite {
         command: canonicalized.write_command.clone(),
@@ -70,6 +72,7 @@ pub(crate) fn analyze_write(
 
 fn analyze_filesystem_write_intent(
     canonicalized: &CanonicalizedWrite,
+    functions: &DynFunctionProvider,
 ) -> Result<Option<FilesystemWriteIntent>, WriteAnalysisError> {
     let filesystem_kind = filesystem_surface_kind(&canonicalized.resolved_relation)?;
     match (
@@ -84,7 +87,7 @@ fn analyze_filesystem_write_intent(
         ) => rows
             .iter()
             .map(|row| {
-                parse_directory_insert_assignments(row)
+                parse_directory_insert_assignments(row, functions)
                     .map_err(write_analysis_filesystem_assignments_error)
             })
             .collect::<Result<Vec<_>, _>>()
@@ -110,7 +113,7 @@ fn analyze_filesystem_write_intent(
         ) => rows
             .iter()
             .map(|row| {
-                parse_file_insert_assignments(row)
+                parse_file_insert_assignments(row, functions)
                     .map_err(write_analysis_filesystem_assignments_error)
             })
             .collect::<Result<Vec<_>, _>>()
@@ -650,12 +653,17 @@ fn write_analysis_filesystem_assignments_error(
 #[cfg(test)]
 mod tests {
     use super::analyze_write;
+    use crate::functions::{DynFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::{SchemaProof, ScopeProof, TargetSetProof};
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
     use crate::sql::semantic_ir::StatementContext;
     use std::collections::BTreeSet;
+
+    fn system_functions() -> DynFunctionProvider {
+        SharedFunctionProvider::new(Box::new(SystemFunctionProvider))
+    }
 
     fn canonicalized_write(
         sql: &str,
@@ -681,7 +689,7 @@ mod tests {
             "INSERT INTO lix_state (entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'lix', '{\"key\":\"hello\"}', '1')",
             "main",
-        ))
+        ), &system_functions())
         .expect("write analysis should succeed");
 
         assert_eq!(planned.scope_proof, ScopeProof::ActiveVersion);
@@ -703,7 +711,7 @@ mod tests {
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
              VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
             "main",
-        ))
+        ), &system_functions())
         .expect("write analysis should succeed");
 
         assert_eq!(
@@ -720,7 +728,7 @@ mod tests {
              ('entity-tracked', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"tracked\"}', '1', false), \
              ('entity-untracked', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"untracked\"}', '1', true)",
             "main",
-        ))
+        ), &system_functions())
         .expect("write analysis should succeed");
 
         assert_eq!(
@@ -740,7 +748,7 @@ mod tests {
              ('entity-local', 'lix_key_value', 'lix', 'lix', '{\"key\":\"local\"}', '1', false), \
              ('entity-global', 'lix_key_value', 'lix', 'lix', '{\"key\":\"global\"}', '1', true)",
             "version-active",
-        ))
+        ), &system_functions())
         .expect("write analysis should succeed");
 
         assert_eq!(
@@ -754,14 +762,17 @@ mod tests {
 
     #[test]
     fn analyzes_scope_and_target_from_lix_state_by_version_update_predicate() {
-        let planned = analyze_write(&canonicalized_write(
-            "UPDATE lix_state_by_version \
+        let planned = analyze_write(
+            &canonicalized_write(
+                "UPDATE lix_state_by_version \
              SET snapshot_content = '{\"value\":\"after\"}' \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'entity-1' \
                AND version_id = 'version-a'",
-            "main",
-        ))
+                "main",
+            ),
+            &system_functions(),
+        )
         .expect("write analysis should succeed");
 
         assert_eq!(
@@ -782,14 +793,17 @@ mod tests {
 
     #[test]
     fn explicit_version_surfaces_keep_bounded_scope_without_exact_version_literal() {
-        let planned = analyze_write(&canonicalized_write(
-            "UPDATE lix_state_by_version \
+        let planned = analyze_write(
+            &canonicalized_write(
+                "UPDATE lix_state_by_version \
              SET snapshot_content = '{\"value\":\"after\"}' \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'entity-1' \
                AND version_id IN ('version-a', 'version-b')",
-            "main",
-        ))
+                "main",
+            ),
+            &system_functions(),
+        )
         .expect("write analysis should succeed");
 
         assert_eq!(
@@ -803,13 +817,16 @@ mod tests {
 
     #[test]
     fn explicit_version_surfaces_union_or_version_predicates() {
-        let planned = analyze_write(&canonicalized_write(
-            "DELETE FROM lix_state_by_version \
+        let planned = analyze_write(
+            &canonicalized_write(
+                "DELETE FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND ((version_id = 'version-a' AND entity_id = 'entity-a') \
                  OR (version_id = 'version-b' AND entity_id = 'entity-b'))",
-            "main",
-        ))
+                "main",
+            ),
+            &system_functions(),
+        )
         .expect("write analysis should succeed");
 
         assert_eq!(
@@ -826,7 +843,7 @@ mod tests {
         let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_file (path, metadata) VALUES ('/docs/readme.md', '{\"kind\":\"doc\"}')",
             "main",
-        ))
+        ), &system_functions())
         .expect("write analysis should succeed");
 
         let Some(FilesystemWriteIntent::FileInsert(rows)) = planned.filesystem_write_intent else {
@@ -844,7 +861,7 @@ mod tests {
         let planned = analyze_write(&canonicalized_write(
             "UPDATE lix_directory SET path = '/docs/archive/', hidden = true WHERE id = 'dir-1'",
             "main",
-        ))
+        ), &system_functions())
         .expect("write analysis should succeed");
 
         let Some(FilesystemWriteIntent::DirectoryUpdate(assignments)) =
@@ -861,10 +878,10 @@ mod tests {
 
     #[test]
     fn builds_directory_delete_intent_during_write_analysis() {
-        let planned = analyze_write(&canonicalized_write(
-            "DELETE FROM lix_directory WHERE id = 'dir-1'",
-            "main",
-        ))
+        let planned = analyze_write(
+            &canonicalized_write("DELETE FROM lix_directory WHERE id = 'dir-1'", "main"),
+            &system_functions(),
+        )
         .expect("write analysis should succeed");
 
         assert!(matches!(
