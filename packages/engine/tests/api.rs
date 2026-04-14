@@ -10,10 +10,14 @@ mod active_version;
 mod checkpoint;
 #[path = "api/commit.rs"]
 mod commit;
+#[path = "api/create_version.rs"]
+mod create_version;
 #[path = "api/deterministic_mode.rs"]
 mod deterministic_mode;
 #[path = "api/execute.rs"]
 mod execute;
+#[path = "api/merge_version.rs"]
+mod merge_version;
 #[path = "api/noop_updates.rs"]
 mod noop_updates;
 #[path = "api/observe.rs"]
@@ -30,5 +34,3 @@ mod state_commit_stream;
 mod transaction_execution;
 #[path = "api/undo_redo.rs"]
 mod undo_redo;
-#[path = "api/version_api.rs"]
-mod version_api;
