@@ -1,7 +1,7 @@
 use cel::Context;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
 use super::value::json_to_cel;
@@ -33,7 +33,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::build_context_with_functions;
-    use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
     use cel::Program;
     use serde_json::Map as JsonMap;
 

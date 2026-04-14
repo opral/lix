@@ -4,7 +4,7 @@
 //! parse/bind but before later planning and execution-specific wrapping.
 
 use crate::backend::PreparedStatement;
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::ast::lowering::lower_statement;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::semantic_ir::inline_functions::inline_lix_functions_with_provider;

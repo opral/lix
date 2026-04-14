@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::FunctionBindings;
+use crate::functions::FunctionBindings;
 use crate::sql::{RuntimeBindingValues, SessionStateDelta};
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};

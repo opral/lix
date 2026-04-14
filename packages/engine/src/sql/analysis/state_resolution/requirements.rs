@@ -1,6 +1,6 @@
-use crate::contracts::derive_statement_effects;
 use crate::sql::optimizer::optimize_state_resolution;
 use crate::sql::prepare::contracts::requirements::PlanRequirements;
+use crate::sql::prepare::derive_statement_effects;
 use sqlparser::ast::Statement;
 
 use super::canonical::canonicalize_state_resolution;

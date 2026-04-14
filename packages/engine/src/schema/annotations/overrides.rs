@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
+use crate::contracts::SchemaAnnotationEvaluator;
+use crate::functions::DynFunctionProvider;
 use crate::LixError;
 use crate::Value;
 
@@ -227,11 +228,11 @@ mod tests {
         collect_dynamic_entity_surface_overrides, DynamicEntitySurfaceOverride, LixcolOverrideValue,
     };
     use crate::cel::shared_runtime;
-    use crate::contracts::{clone_boxed_function_provider, SharedFunctionProvider};
     use crate::functions::SystemFunctionProvider;
+    use crate::functions::{clone_boxed_function_provider, SharedFunctionProvider};
     use serde_json::json;
 
-    fn system_functions() -> crate::contracts::DynFunctionProvider {
+    fn system_functions() -> crate::functions::DynFunctionProvider {
         clone_boxed_function_provider(&SharedFunctionProvider::new(SystemFunctionProvider))
     }
 

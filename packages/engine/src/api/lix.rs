@@ -9,8 +9,6 @@ use serde_json::Value as JsonValue;
 
 use super::engine::Engine;
 use crate::backend::{ImageChunkReader, ImageChunkWriter};
-use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::DynFunctionProvider;
 use crate::live_state::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
     ProjectionStatus,
@@ -140,80 +138,8 @@ impl Lix {
         &self.engine
     }
 
-    pub(crate) fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
-        self.engine.backend()
-    }
-
     pub(crate) fn boot_key_values(&self) -> &[BootKeyValue] {
         &self.boot_key_values
-    }
-
-    pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
-        self.engine.public_surface_registry()
-    }
-
-    pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
-        self.engine.install_public_surface_registry(registry);
-    }
-
-    pub(crate) fn clear_public_surface_registry(&self) {
-        self.engine.clear_public_surface_registry();
-    }
-
-    pub(crate) async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
-        self.engine
-            .load_public_surface_registry_from_backend()
-            .await
-    }
-
-    pub(crate) async fn refresh_public_surface_registry(
-        &self,
-    ) -> Result<SurfaceRegistry, LixError> {
-        let registry = self.load_public_surface_registry().await?;
-        self.install_public_surface_registry(registry.clone());
-        Ok(registry)
-    }
-
-    pub(crate) fn catalog_projection_registry(&self) -> &Arc<CatalogProjectionRegistry> {
-        self.engine.catalog_projection_registry()
-    }
-
-    pub(crate) fn try_mark_init_in_progress(&self) -> Result<(), LixError> {
-        self.engine.try_mark_init_in_progress()
-    }
-
-    pub(crate) fn deterministic_boot_pending(&self) -> bool {
-        self.engine.deterministic_boot_pending()
-    }
-
-    pub(crate) fn clear_deterministic_boot_pending(&self) {
-        self.engine.clear_deterministic_boot_pending();
-    }
-
-    pub(crate) fn mark_init_completed(&self) {
-        self.engine.mark_init_completed();
-    }
-
-    pub(crate) fn reset_init_state(&self) {
-        self.engine.reset_init_state();
-    }
-
-    pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        self.engine.invalidate_installed_plugins_cache()
-    }
-
-    pub(crate) async fn prepare_runtime_functions_with_backend(
-        &self,
-        backend: &dyn LixBackend,
-    ) -> Result<DynFunctionProvider, LixError> {
-        self.engine
-            .prepare_runtime_functions_with_backend(backend)
-            .await
-    }
-
-    pub(crate) async fn opened_workspace_session(&self) -> Result<Arc<Session>, LixError> {
-        let session_host = self.engine.session_host();
-        crate::session::opened_workspace_session(&session_host, &self.workspace_session).await
     }
 
     /// Opens the repository and eagerly initializes the workspace session used
@@ -239,12 +165,16 @@ impl Lix {
 
     #[doc(hidden)]
     pub async fn open_existing(&self) -> Result<(), LixError> {
-        if crate::live_state::load_mode_with_backend(self.backend().as_ref()).await?
+        if crate::live_state::load_mode_with_backend(self.engine.backend().as_ref()).await?
             == crate::live_state::LiveStateMode::Uninitialized
         {
             return Err(crate::common::not_initialized_error());
         }
-        self.refresh_public_surface_registry().await?;
+        let registry = self
+            .engine
+            .load_public_surface_registry_from_backend()
+            .await?;
+        self.engine.install_public_surface_registry(registry);
         let session_host = self.engine.session_host();
         let _ = crate::session::opened_workspace_session(&session_host, &self.workspace_session)
             .await?;
@@ -452,17 +382,21 @@ impl Lix {
         &self,
         writer: &mut dyn ImageChunkWriter,
     ) -> Result<(), LixError> {
-        self.backend().export_image(writer).await
+        self.engine.backend().export_image(writer).await
     }
 
     pub async fn restore_from_image(
         &self,
         reader: &mut dyn ImageChunkReader,
     ) -> Result<(), LixError> {
-        self.backend().restore_from_image(reader).await?;
-        self.clear_public_surface_registry();
-        self.refresh_public_surface_registry().await?;
-        self.invalidate_installed_plugins_cache()?;
+        self.engine.backend().restore_from_image(reader).await?;
+        self.engine.clear_public_surface_registry();
+        let registry = self
+            .engine
+            .load_public_surface_registry_from_backend()
+            .await?;
+        self.engine.install_public_surface_registry(registry);
+        self.engine.invalidate_installed_plugins_cache()?;
         if let Some(session) = self.workspace_session.get() {
             session.reload_workspace_state_from_backend().await?;
         } else {
@@ -475,33 +409,37 @@ impl Lix {
     }
 
     pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> PublicStateCommitStream {
-        self.engine().state_commit_stream(filter)
+        self.engine.state_commit_stream(filter)
     }
 
     pub async fn live_state_projection_status(&self) -> Result<ProjectionStatus, LixError> {
-        crate::live_state::projection_status(self.backend().as_ref()).await
+        crate::live_state::projection_status(self.engine.backend().as_ref()).await
     }
 
     pub async fn live_state_rebuild_plan(
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildPlan, LixError> {
-        crate::live_state::rebuild_plan(self.backend().as_ref(), req).await
+        crate::live_state::rebuild_plan(self.engine.backend().as_ref(), req).await
     }
 
     pub async fn apply_live_state_rebuild_plan(
         &self,
         plan: &LiveStateRebuildPlan,
     ) -> Result<LiveStateApplyReport, LixError> {
-        crate::live_state::apply_rebuild_plan(self.backend().as_ref(), plan).await
+        crate::live_state::apply_rebuild_plan(self.engine.backend().as_ref(), plan).await
     }
 
     pub async fn rebuild_live_state(
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildReport, LixError> {
-        crate::live_state::rebuild_projection(self.backend().as_ref(), self.engine().as_ref(), req)
-            .await
+        crate::live_state::rebuild_projection(
+            self.engine.backend().as_ref(),
+            self.engine.as_ref(),
+            req,
+        )
+        .await
     }
 
     pub async fn begin_transaction_with_options(

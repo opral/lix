@@ -8,7 +8,7 @@ use crate::catalog::CatalogProjectionRegistry;
 use crate::common::escape_sql_string;
 use crate::contracts::CompiledSchemaCache;
 use crate::contracts::TrackedChangeView;
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
 use crate::schema::SchemaKey;
 use crate::session::host::{
@@ -111,7 +111,7 @@ impl WriteExecutionContext for SessionExecutionContext<'_> {
 
     fn sql_compiler_seed<'a>(
         &'a self,
-        functions: &'a crate::contracts::DynFunctionProvider,
+        functions: &'a crate::functions::DynFunctionProvider,
         surface_registry: &'a crate::catalog::SurfaceRegistry,
     ) -> crate::sql::SqlCompilerSeed<'a> {
         sql_compiler_seed_from_host(self.session_host(), functions, surface_registry)
@@ -120,7 +120,7 @@ impl WriteExecutionContext for SessionExecutionContext<'_> {
     async fn prepare_function_bindings(
         &self,
         backend: &dyn crate::LixBackend,
-    ) -> Result<crate::contracts::FunctionBindings, LixError> {
+    ) -> Result<crate::functions::FunctionBindings, LixError> {
         prepare_function_bindings_with_host(self.session_host(), backend).await
     }
 

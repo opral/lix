@@ -1,12 +1,12 @@
 use std::time::Duration;
 
-use crate::contracts::StatementEffects;
 use crate::sql::binder::{
     bind_statement_binding_template, compile_statement_binding_template_with_state,
     RuntimeBindingValues, StatementBindingTemplate,
 };
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::script::coalesce_state_surface_inserts_in_transactions;
+use crate::sql::prepare::StatementEffects;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 

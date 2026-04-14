@@ -20,7 +20,8 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
+use crate::contracts::SchemaAnnotationEvaluator;
+use crate::functions::DynFunctionProvider;
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, collect_dynamic_entity_surface_overrides,
     decode_lixcol_literal, DynamicEntitySurfaceOverride, LixcolOverrideValue,

@@ -1,4 +1,4 @@
-use crate::contracts::LixFunctionProvider;
+use crate::functions::LixFunctionProvider;
 
 use super::SystemFunctionProvider;
 

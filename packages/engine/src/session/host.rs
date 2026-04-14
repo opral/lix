@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::{
+use crate::functions::{
     clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
 };
 use crate::image::ImageChunkWriter;

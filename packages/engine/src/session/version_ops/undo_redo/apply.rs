@@ -5,8 +5,8 @@ use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, CanonicalChange, CanonicalStateIdentity,
     CanonicalStateRow,
 };
-use crate::contracts::FunctionBindings;
-use crate::contracts::LixFunctionProvider;
+use crate::functions::FunctionBindings;
+use crate::functions::LixFunctionProvider;
 use crate::session::version_ops::commit::{
     append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
 };

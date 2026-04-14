@@ -1,6 +1,6 @@
 use super::statement_references_public_surface;
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::logical_plan::{
     result_contract_for_statements, verify_direct_logical_plan, DirectLogicalPlan,
 };

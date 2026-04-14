@@ -10,11 +10,11 @@ use crate::catalog::{
     CatalogProjectionRegistry, CatalogReadTimeProjectionRequest, SurfaceReadFreshness,
     SurfaceRegistry,
 };
-use crate::contracts::DynFunctionProvider;
 use crate::execution::{
     execute_prepared_public_read_artifact_with_backend, ReadExecutionHost,
     ReadTimeProjectionIdentity, ReadTimeProjectionRow,
 };
+use crate::functions::DynFunctionProvider;
 use crate::sql::load_sql_compiler_metadata;
 use crate::sql::{
     prepare_public_read, prepare_public_read_artifact, public_selector_column_name,

@@ -1,6 +1,6 @@
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use super::DynFunctionProvider;
+use crate::functions::DynFunctionProvider;
 use crate::LixError;
 
 pub(crate) trait SchemaAnnotationEvaluator {

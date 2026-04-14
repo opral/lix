@@ -4,9 +4,9 @@ use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
-use crate::contracts::FunctionBindings;
-use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::functions::FunctionBindings;
+use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
@@ -42,7 +42,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
             context: SessionCompilerState::new(
                 None,
-                lix.public_surface_registry(),
+                lix.engine().public_surface_registry(),
                 SessionCompilerCache::new(),
                 GLOBAL_VERSION_ID.to_string(),
                 Vec::new(),
@@ -61,7 +61,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
         let result = execute_parsed_statements_in_borrowed_write_transaction(
-            self.lix,
+            self.lix.engine().as_ref(),
             &mut self.write_transaction,
             parsed_statements,
             params,
@@ -72,7 +72,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         let mut execution_input = self.context.buffered_write_execution_input();
         self.write_transaction
-            .flush_journal(self.lix, &mut execution_input)
+            .flush_journal(self.lix.engine().as_ref(), &mut execution_input)
             .await?;
         self.context
             .apply_buffered_write_execution_input(&execution_input);
@@ -138,6 +138,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         );
         let functions = self
             .lix
+            .engine()
             .prepare_runtime_functions_with_backend(&backend)
             .await?;
         let function_bindings = FunctionBindings::from_prepared_parts(

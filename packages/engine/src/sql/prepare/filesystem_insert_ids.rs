@@ -2,7 +2,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind,
 };
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::binder::insert_values_rows_mut;
 use crate::LixError;
 use sqlparser::ast::{Expr, Statement, TableObject, Value as AstValue, ValueWithSpan};
@@ -82,7 +82,7 @@ fn string_literal_expr(value: String) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::ensure_generated_filesystem_insert_ids;
-    use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
     use crate::sql::parse_sql;
     use sqlparser::ast::Statement;
 

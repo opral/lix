@@ -5,8 +5,8 @@ use crate::canonical::{
     load_change, load_commit, load_exact_row_at_commit, resolve_merge_base, CanonicalStateIdentity,
     CanonicalStateRow,
 };
-use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     mark_live_state_projection_ready_without_replay_cursor_in_transaction,
     rebuild_scope_in_transaction, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
