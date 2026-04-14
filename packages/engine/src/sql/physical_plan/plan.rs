@@ -5,9 +5,10 @@ use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::PlannedStateRow;
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::sql::ReadTimeProjectionPlan;
-use crate::sql::SchemaLiveTableRequirement;
-use crate::transaction::{ChangeBatch, CommitPreconditions, PlanEffects};
+use crate::sql::{
+    ChangeBatch, CommitPreconditions, PlanEffects, ReadTimeProjectionPlan,
+    SchemaLiveTableRequirement,
+};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Statement, TableAlias, TableFactor};
 use std::collections::BTreeMap;

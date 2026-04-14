@@ -1,4 +1,5 @@
-use crate::transaction::{PendingCommitState, PlanEffects, WriteExecutionContext};
+use crate::sql::PlanEffects;
+use crate::transaction::{PendingCommitState, WriteExecutionContext};
 use crate::{LixBackendTransaction, LixError};
 
 use super::{

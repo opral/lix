@@ -2,7 +2,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedRelation,
 };
-use crate::sql::PreparedWriteStatementKind;
+use crate::sql::{PlannedFilesystemState, PreparedWriteStatementKind};
 use crate::streams::should_invalidate_deterministic_settings_cache;
 use crate::transaction::{
     binary_blob_writes_from_filesystem_state,
@@ -10,9 +10,9 @@ use crate::transaction::{
     filesystem_transaction_state_from_planned, merge_filesystem_transaction_state,
     persist_filesystem_payload_changes_in_transaction, BufferedWriteCommandMetadata,
     BufferedWriteExecutionInput, BufferedWriteExecutionResult, BufferedWriteFlushClass,
-    BufferedWriteSessionEffects, DeferredCommitEffects, PlannedFilesystemState,
-    PreparedPublicWriteExecutionPartition, PreparedWriteStatement, TransactionCommitOutcome,
-    WriteCommand, WriteExecutionContext, WritePath,
+    BufferedWriteSessionEffects, DeferredCommitEffects, PreparedPublicWriteExecutionPartition,
+    PreparedWriteStatement, TransactionCommitOutcome, WriteCommand, WriteExecutionContext,
+    WritePath,
 };
 use crate::{LixBackendTransaction, LixError};
 

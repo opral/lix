@@ -1,9 +1,9 @@
 use std::collections::BTreeSet;
 
 use crate::backend::PreparedBatch;
-use crate::sql::ResultContract;
+use crate::sql::{PlanEffects, ResultContract};
 use crate::streams::StateCommitStreamChange;
-use crate::transaction::{CanonicalCommitReceipt, PlanEffects, PreparedDirectWriteArtifact};
+use crate::transaction::{CanonicalCommitReceipt, PreparedDirectWriteArtifact};
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 pub(crate) struct WriteExecutionOutcome {

@@ -5,8 +5,9 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
 };
 use crate::common::escape_sql_string;
+use crate::sql::ChangeBatch;
 use crate::sql::PreparedWriteOperationKind;
-use crate::transaction::{ChangeBatch, PreparedPublicWrite};
+use crate::transaction::PreparedPublicWrite;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
 const HISTORY_INIT_STATEMENTS: &[&str] = &[

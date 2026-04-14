@@ -1,9 +1,9 @@
 use crate::sql::prepare::contracts::planner_error::PlannerError;
+use crate::sql::PlanEffects;
 use crate::sql::PlannedStatementSet;
 use crate::streams::{
     state_commit_stream_changes_from_mutations, StateCommitStreamRuntimeMetadata,
 };
-use crate::transaction::PlanEffects;
 use std::collections::BTreeSet;
 
 pub(crate) fn derive_effects_from_state_resolution(

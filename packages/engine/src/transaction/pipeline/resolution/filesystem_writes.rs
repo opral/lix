@@ -22,12 +22,12 @@ use crate::common::{
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
+use crate::sql::OptionalTextPatch;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     resolve_placeholder_index, DirectoryInsertAssignments, DirectoryUpdateAssignments,
     FileInsertAssignments, FileUpdateAssignments, FilesystemWriteIntent, PlaceholderState,
 };
-use crate::transaction::OptionalTextPatch;
 use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};

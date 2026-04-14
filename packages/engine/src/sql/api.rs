@@ -9,9 +9,8 @@ use std::time::Duration;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::sql::{DependencySpec, PreparedExplainMode, PreparedExplainTemplate};
+use crate::sql::{ChangeBatch, DependencySpec, PreparedExplainMode, PreparedExplainTemplate};
 use crate::streams::StateCommitStreamFilter;
-use crate::transaction::ChangeBatch;
 use crate::{LixError, SqlDialect, Value};
 
 #[cfg(test)]

@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 
 use crate::contracts::TrackedChangeView;
-use crate::session::SessionStateDelta;
+use crate::sql::PlanEffects;
+use crate::sql::SessionStateDelta;
 use crate::streams::{
     state_commit_stream_changes_from_changes, StateCommitStreamOperation,
     StateCommitStreamRuntimeMetadata,
 };
 use crate::transaction::pipeline::WriteExecutionOutcome;
-use crate::transaction::{PendingCommitState, PlanEffects, TrackedTxnUnit, WriteExecutionContext};
+use crate::transaction::{PendingCommitState, TrackedTxnUnit, WriteExecutionContext};
 use crate::{LixBackendTransaction, LixError, QueryResult};
 
 pub(crate) async fn execute_public_tracked_transaction_write_unit_with_transaction(

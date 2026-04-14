@@ -1,8 +1,6 @@
+use crate::sql::{PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState};
 use crate::transaction::filesystem::runtime::{
     FilesystemDescriptorState, FilesystemTransactionFileState, FilesystemTransactionState,
-};
-use crate::transaction::{
-    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
 };
 
 pub(crate) fn filesystem_transaction_state_from_planned(

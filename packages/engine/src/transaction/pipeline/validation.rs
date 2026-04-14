@@ -29,13 +29,13 @@ use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
     schema_key_from_definition, validate_lix_schema_definition, SchemaKey,
 };
-use crate::sql::{is_untracked_live_table, MutationOperation, MutationRow, UpdateValidationPlan};
-use crate::sql::{PreparedInsertOnConflictAction, PreparedWriteOperationKind};
+use crate::sql::{
+    is_untracked_live_table, MutationOperation, MutationRow, PlannedStateRow,
+    PreparedInsertOnConflictAction, PreparedWriteOperationKind, UpdateValidationPlan, WriteMode,
+};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::UpdateValidationInput;
-use crate::transaction::{
-    PlannedStateRow, PreparedPublicWrite, PreparedResolvedWritePlan, WriteMode,
-};
+use crate::transaction::{PreparedPublicWrite, PreparedResolvedWritePlan};
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";

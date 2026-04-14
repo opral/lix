@@ -4,7 +4,7 @@ use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,
 };
-use crate::transaction::{
+use crate::sql::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,
 };
 use crate::LixError;
@@ -378,7 +378,7 @@ mod tests {
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
     use crate::sql::semantic_ir::StatementContext;
-    use crate::transaction::ExpectedHead;
+    use crate::sql::ExpectedHead;
     use crate::{CreateVersionOptions, Value};
 
     async fn planned_write_with_params(

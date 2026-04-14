@@ -10,7 +10,7 @@ pub(crate) use crate::sql::{
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteModeRequest, WriteOperationKind,
 };
-pub(crate) use crate::transaction::{
+pub(crate) use crate::sql::{
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
     PlannedStateRow, WriteLane, WriteMode,
 };

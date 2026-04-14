@@ -9,9 +9,7 @@ use crate::contracts::{
 use crate::live_state::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
-use crate::session::SessionStateDelta;
-use crate::sql::PreparedPublicRead;
-use crate::sql::SqlCompilerSeed;
+use crate::sql::{PreparedPublicRead, PublicChange, SessionStateDelta, SqlCompilerSeed};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::PendingCommitState;
 use crate::LixError;
@@ -40,7 +38,7 @@ pub struct TransactionCommitOutcome {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TrackedCommitExecutionOutcome {
     pub receipt: Option<crate::transaction::CanonicalCommitReceipt>,
-    pub applied_changes: Vec<crate::transaction::PublicChange>,
+    pub applied_changes: Vec<PublicChange>,
     pub plugin_changes_committed: bool,
     pub next_active_version_id: Option<String>,
 }

@@ -14,7 +14,7 @@ use sqlparser::ast::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
-pub(crate) use crate::transaction::{
+pub(crate) use crate::sql::{
     CommitPreconditions, OptionalTextPatch, PlannedFilesystemDescriptor, PlannedFilesystemFile,
     PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, WriteLane, WriteMode,
 };

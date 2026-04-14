@@ -10,10 +10,11 @@ use crate::session::version_ops::{
     VersionSnapshot,
 };
 use crate::sql::MutationRow;
+use crate::sql::OptionalTextPatch;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
-    CanonicalCommitReceipt, OptionalTextPatch, UpdatedVersionRef,
+    CanonicalCommitReceipt, UpdatedVersionRef,
 };
 use crate::transaction::{
     compile_filesystem_transaction_state_from_state,
@@ -1297,11 +1298,11 @@ mod tests {
     use crate::contracts::LixFunctionProvider;
     use crate::contracts::GLOBAL_VERSION_ID;
     use crate::session::version_ops::commit::UpdatedVersionRef;
+    use crate::sql::OptionalTextPatch;
     use crate::test_support::{
         init_test_backend_with_binary_cas, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::transaction::OptionalTextPatch;
     use crate::transaction::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,

@@ -66,7 +66,7 @@ pub(crate) use host::{
 pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
 pub use runtime::ExecuteOptions;
 pub(crate) use runtime::SessionExecutionMode;
-pub(crate) use state::{SessionStateDelta, SessionStateSnapshot};
+pub(crate) use state::SessionStateSnapshot;
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
     projection_registry: &crate::catalog::CatalogProjectionRegistry,

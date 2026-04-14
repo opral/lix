@@ -48,11 +48,11 @@ use crate::sql::{
     classify_relation_name, protected_builtin_public_surface_names, RelationPolicy,
     SchemaLiveTableRequirement,
 };
+use crate::sql::{ChangeBatch, CommitPreconditions};
 use crate::streams::{
     state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
-use crate::transaction::{ChangeBatch, CommitPreconditions};
 use crate::version::{
     active_version_file_id, active_version_schema_key, active_version_storage_version_id,
     parse_active_version_snapshot,

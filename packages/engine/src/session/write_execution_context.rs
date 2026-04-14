@@ -21,12 +21,14 @@ use crate::session::version_ops::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
     CreateCommitPreconditions, CreateCommitWriteLane, StagedChange,
 };
-use crate::sql::{PreparedPublicRead, PublicReadSource};
+use crate::sql::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, PreparedPublicRead, PublicChange,
+    PublicReadSource, WriteLane, WriteMode,
+};
 use crate::transaction::{
     resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
-    ChangeBatch, CommitPreconditions, ExpectedHead, PendingCommitState, PendingOverlay,
-    PreparedPublicWrite, PublicChange, TrackedCommitExecutionOutcome, TrackedTxnUnit,
-    TransactionExecutionBackend, WriteExecutionContext, WriteLane, WriteMode,
+    PendingCommitState, PendingOverlay, PreparedPublicWrite, TrackedCommitExecutionOutcome,
+    TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionContext,
 };
 use crate::version::parse_active_version_snapshot;
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
