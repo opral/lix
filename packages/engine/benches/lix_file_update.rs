@@ -3,7 +3,7 @@ use criterion::{criterion_group, criterion_main, BatchSize, Criterion, Throughpu
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
     BootKeyValue, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
-    SqlDialect, TransactionMode, Value,
+    SqlDialect, TransactionBeginMode, Value,
 };
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -423,16 +423,16 @@ impl LixBackend for TracingBenchBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = std::time::Instant::now();
         let tx = self.inner.begin_transaction(mode).await?;
         self.collector.push(
             "begin_transaction",
             Some(match mode {
-                TransactionMode::Read => "read",
-                TransactionMode::Write => "write",
-                TransactionMode::Deferred => "deferred",
+                TransactionBeginMode::Read => "read",
+                TransactionBeginMode::Write => "write",
+                TransactionBeginMode::Deferred => "deferred",
             }),
             started.elapsed().as_secs_f64() * 1000.0,
         );
@@ -466,7 +466,7 @@ impl LixBackendTransaction for TracingBenchTransaction<'_> {
         self.inner.dialect()
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.inner.mode()
     }
 
