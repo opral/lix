@@ -1,5 +1,6 @@
 mod annotations;
 mod builtin;
+mod compiled_cache;
 mod definition;
 mod key;
 #[cfg(test)]
@@ -10,11 +11,13 @@ pub(crate) use annotations::overrides::{
     collect_dynamic_entity_surface_overrides, collect_state_column_overrides_with_shared_runtime,
     DynamicEntitySurfaceOverride, LixcolOverrideValue,
 };
+pub(crate) use annotations::SchemaAnnotationEvaluator;
 pub(crate) use builtin::{
     builtin_schema_definition, builtin_schema_keys, decode_lixcol_literal,
     lix_state_surface_schema_definition, LixActiveVersion, LixCommit, LixVersionDescriptor,
     LixVersionRef,
 };
+pub use compiled_cache::CompiledSchemaCache;
 pub use definition::{
     lix_schema_definition, lix_schema_definition_json, validate_lix_schema,
     validate_lix_schema_definition,

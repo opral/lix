@@ -75,7 +75,7 @@ impl ProjectionHydrationContext {
     ) -> Result<Vec<String>, LixError> {
         match spec.version_scope {
             CatalogProjectionInputVersionScope::Global => {
-                Ok(vec![crate::contracts::GLOBAL_VERSION_ID.to_string()])
+                Ok(vec![crate::version::GLOBAL_VERSION_ID.to_string()])
             }
             CatalogProjectionInputVersionScope::RequestedVersion => self
                 .requested_version_id
@@ -309,7 +309,7 @@ fn schema_default_version_ids(
 ) -> Vec<String> {
     match builtin_schema_storage_metadata(&spec.schema_key).map(|metadata| metadata.storage_lane) {
         Some(BuiltinSchemaStorageLane::Global) | None => {
-            vec![crate::contracts::GLOBAL_VERSION_ID.to_string()]
+            vec![crate::version::GLOBAL_VERSION_ID.to_string()]
         }
         Some(BuiltinSchemaStorageLane::Local) => current_committed_version_ids.to_vec(),
     }
@@ -317,6 +317,7 @@ fn schema_default_version_ids(
 #[cfg(test)]
 mod tests {
     use super::hydrate_projection_input_with_backend;
+    use crate::backend::TransactionBeginMode;
     use crate::catalog::{
         CatalogDerivedRow, CatalogProjectionDefinition, CatalogProjectionInput,
         CatalogProjectionInputSpec, CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
@@ -325,7 +326,7 @@ mod tests {
     use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
     use crate::schema::{LixVersionDescriptor, LixVersionRef};
     use crate::test_support::{init_test_backend_core, TestSqliteBackend};
-    use crate::{LixBackend, TransactionBeginMode};
+    use crate::LixBackend;
 
     #[derive(Debug, Clone, Copy)]
     struct TestLixVersionProjection;
@@ -504,7 +505,7 @@ mod tests {
             metadata: None,
             change_id: Some(change_id.to_string()),
             writer_key: None,
-            global: version_id == crate::contracts::GLOBAL_VERSION_ID,
+            global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: false,
             created_at: Some(timestamp.to_string()),
             updated_at: Some(timestamp.to_string()),
@@ -532,7 +533,7 @@ mod tests {
             metadata: None,
             change_id: None,
             writer_key: None,
-            global: version_id == crate::contracts::GLOBAL_VERSION_ID,
+            global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: true,
             created_at: Some(timestamp.to_string()),
             updated_at: Some(timestamp.to_string()),
@@ -559,16 +560,16 @@ mod tests {
         live_state::write_live_rows(
             transaction.as_mut(),
             &[tracked_live_row(
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
                 &version_descriptor_file_id(),
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_descriptor_plugin_key(),
                 "change-global",
                 &version_descriptor_snapshot_content(
-                    crate::contracts::GLOBAL_VERSION_ID,
-                    crate::contracts::GLOBAL_VERSION_ID,
+                    crate::version::GLOBAL_VERSION_ID,
+                    crate::version::GLOBAL_VERSION_ID,
                     true,
                 ),
                 "2026-04-01T00:00:00Z",
@@ -583,12 +584,12 @@ mod tests {
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
                 &version_descriptor_file_id(),
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_descriptor_plugin_key(),
                 "change-main",
                 &version_descriptor_snapshot_content(
                     "version-main",
-                    crate::contracts::DEFAULT_ACTIVE_VERSION_NAME,
+                    crate::session::workspace::DEFAULT_ACTIVE_VERSION_NAME,
                     false,
                 ),
                 "2026-04-01T00:00:01Z",
@@ -599,13 +600,13 @@ mod tests {
         live_state::write_live_rows(
             transaction.as_mut(),
             &[untracked_live_row(
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
-                &version_ref_snapshot_content(crate::contracts::GLOBAL_VERSION_ID, "commit-global"),
+                &version_ref_snapshot_content(crate::version::GLOBAL_VERSION_ID, "commit-global"),
                 "2026-04-01T00:00:02Z",
             )],
         )
@@ -618,7 +619,7 @@ mod tests {
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
                 &version_ref_snapshot_content("version-main", "commit-main"),
                 "2026-04-01T00:00:03Z",
@@ -661,7 +662,7 @@ mod tests {
         assert!(
             descriptor_ids
                 .iter()
-                .any(|id| id == crate::contracts::GLOBAL_VERSION_ID),
+                .any(|id| id == crate::version::GLOBAL_VERSION_ID),
             "tracked descriptor hydration should include global"
         );
 
@@ -670,7 +671,7 @@ mod tests {
             .find_map(|row| {
                 row.values().get("name").and_then(|value| match value {
                     crate::Value::Text(name)
-                        if name == crate::contracts::DEFAULT_ACTIVE_VERSION_NAME =>
+                        if name == crate::session::workspace::DEFAULT_ACTIVE_VERSION_NAME =>
                     {
                         Some(row.identity().entity_id.clone())
                     }
@@ -686,7 +687,7 @@ mod tests {
         assert!(
             ref_ids
                 .iter()
-                .any(|id| id == crate::contracts::GLOBAL_VERSION_ID),
+                .any(|id| id == crate::version::GLOBAL_VERSION_ID),
             "untracked ref hydration should include global"
         );
         assert!(
@@ -718,7 +719,7 @@ mod tests {
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
                 &version_ref_snapshot_content("version-main", "commit-main"),
                 "2026-04-02T00:00:00Z",
@@ -733,7 +734,7 @@ mod tests {
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
                 &version_ref_file_id(),
-                crate::contracts::GLOBAL_VERSION_ID,
+                crate::version::GLOBAL_VERSION_ID,
                 &version_ref_plugin_key(),
                 &version_ref_snapshot_content("version-dev", "commit-dev"),
                 "2026-04-02T00:00:01Z",

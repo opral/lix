@@ -17,6 +17,7 @@ pub(crate) struct BinaryBlobWrite<'a> {
 }
 
 pub(crate) use init::init;
+pub(crate) use read::BlobDataReader;
 
 pub(crate) async fn load_blob_data_by_hash(
     backend: &dyn LixBackend,

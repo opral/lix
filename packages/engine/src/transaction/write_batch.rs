@@ -1,7 +1,5 @@
-use crate::backend::{PreparedBatch, PreparedStatement};
-use crate::{
-    LixBackend, LixBackendTransaction, LixError, QueryResult, TransactionBeginMode, Value,
-};
+use crate::backend::{PreparedBatch, PreparedStatement, TransactionBeginMode};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WriteStep {
@@ -107,7 +105,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionBeginMode,
+            _mode: crate::backend::TransactionBeginMode,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
             self.log.lock().unwrap().push("begin".to_string());
             Ok(Box::new(FakeTransaction {
@@ -120,7 +118,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionBeginMode::Write)
+            self.begin_transaction(crate::backend::TransactionBeginMode::Write)
                 .await
         }
     }
@@ -131,8 +129,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionBeginMode {
-            crate::TransactionBeginMode::Write
+        fn mode(&self) -> crate::backend::TransactionBeginMode {
+            crate::backend::TransactionBeginMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

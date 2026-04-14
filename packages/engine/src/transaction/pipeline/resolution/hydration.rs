@@ -1,10 +1,10 @@
 use super::effective_state::resolve_exact_effective_state_row_with_pending_overlay;
 use super::version_admin::load_version_admin_state_with_backend;
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError};
 use std::collections::{BTreeMap, BTreeSet};
 

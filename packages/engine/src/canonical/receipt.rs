@@ -1,4 +1,4 @@
-use crate::contracts::ReplayCursor;
+use crate::live_state::ReplayCursor;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UpdatedVersionRef {

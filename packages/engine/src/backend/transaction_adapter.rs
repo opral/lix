@@ -3,8 +3,9 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::backend::TransactionBeginMode;
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor, SqlDialect};
-use crate::{LixError, QueryResult, TransactionBeginMode, Value};
+use crate::{LixError, QueryResult, Value};
 
 pub(crate) struct TransactionBackendAdapter<'a> {
     dialect: SqlDialect,

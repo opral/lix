@@ -28,8 +28,8 @@ use super::{
     load_exact_untracked_row_with_executor, scan_tracked_rows_with_backend,
     scan_tracked_tombstones_with_executor, RowIdentity,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::schema::{schema_key_from_definition, SchemaKey};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -971,15 +971,17 @@ mod tests {
         partition_live_rows_for_write, tracked_write_from_live_row, untracked_write_from_live_row,
         ExactLiveRowQuery, LiveRow, LiveRowSource,
     };
+    use crate::backend::TransactionBeginMode;
     use crate::live_state::tracked::TrackedWriteOperation;
     use crate::live_state::untracked::UntrackedWriteOperation;
+    use crate::live_state::ReplayCursor;
     use crate::live_state::{write_live_rows, LiveStateMode};
     use crate::schema::SchemaKey;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_live_state_status_row,
         seed_local_version_head, CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::{CommittedVersionFrontier, LixBackend, ReplayCursor, TransactionBeginMode};
+    use crate::{CommittedVersionFrontier, LixBackend};
     use serde_json::Value as JsonValue;
 
     fn registered_schema_row(snapshot_content: Option<&str>) -> LiveRow {

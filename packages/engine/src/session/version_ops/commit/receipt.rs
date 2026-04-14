@@ -1,5 +1,5 @@
 use crate::canonical::CanonicalChangeWrite;
-use crate::ReplayCursor;
+use crate::live_state::ReplayCursor;
 
 pub(crate) fn latest_replay_cursor_from_change_rows(
     changes: &[CanonicalChangeWrite],

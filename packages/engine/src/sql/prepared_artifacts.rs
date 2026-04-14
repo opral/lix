@@ -5,9 +5,9 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
 
 use crate::backend::PreparedBatch;
+use crate::backend::TransactionBeginMode;
 use crate::catalog::{CatalogReadTimeProjectionRequest, ResolvedRelation, SurfaceReadFreshness};
 use crate::common::Value;
-use crate::contracts::TransactionBeginMode;
 use crate::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::logical_plan::ResultContract;
 use crate::streams::StateCommitStreamOperation;

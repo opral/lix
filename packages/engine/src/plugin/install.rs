@@ -33,11 +33,10 @@ use crate::transaction::{
     PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
     PreparedWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
 
 use crate::transaction::WriteCommand;
-
-const GLOBAL_VERSION_ID: &str = "global";
 const REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION: &str = "1";
 const REGISTERED_SCHEMA_STORAGE_FILE_ID: &str = "lix";

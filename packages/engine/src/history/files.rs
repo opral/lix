@@ -1,4 +1,4 @@
-use crate::contracts::BlobDataReader;
+use crate::binary_cas::BlobDataReader;
 use crate::{LixBackend, LixError};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;

@@ -18,13 +18,13 @@ use serde_json::Value as JsonValue;
 use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceFamily};
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
-use crate::contracts::CompiledSchemaCache;
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,
     LiveFilter, LiveFilterField, LiveFilterOp, LiveRowQuery, LiveRowSource, LiveSnapshotRow,
     LiveSnapshotStorage,
 };
+use crate::schema::CompiledSchemaCache;
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
     schema_key_from_definition, validate_lix_schema_definition, SchemaKey,

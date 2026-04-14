@@ -3,8 +3,8 @@ use crate::canonical::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
     CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::functions::FunctionBindings;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::super::version_ops::context::require_target_version_context_in_transaction;

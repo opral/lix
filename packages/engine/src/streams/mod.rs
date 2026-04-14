@@ -1,10 +1,12 @@
-use crate::contracts::TrackedChangeView;
+mod state_change_record;
+
 use crate::sql::PlannedStateRow;
 use crate::sql::{MutationOperation, MutationRow};
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
 use serde_json::Value as JsonValue;
+pub(crate) use state_change_record::StateChangeRecord;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -98,7 +100,7 @@ pub fn state_commit_stream_changes_from_mutations(
         .collect()
 }
 
-pub fn state_commit_stream_changes_from_changes<Change: TrackedChangeView>(
+pub(crate) fn state_commit_stream_changes_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
     operation: StateCommitStreamOperation,
     runtime_metadata: StateCommitStreamRuntimeMetadata,

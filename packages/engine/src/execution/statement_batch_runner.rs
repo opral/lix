@@ -264,8 +264,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionBeginMode {
-            crate::TransactionBeginMode::Write
+        fn mode(&self) -> crate::backend::TransactionBeginMode {
+            crate::backend::TransactionBeginMode::Write
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {

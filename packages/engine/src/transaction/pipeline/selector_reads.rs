@@ -22,11 +22,10 @@ use crate::sql::{
     PublicReadSource, ScopeProof, SqlCompilerMetadata, SqlPreparationMetadataReader,
 };
 use crate::transaction::{PendingOverlay, WriteResolveError, WriteSelectorResolver};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::state_write_target_resolver::try_resolve_state_write_targets_with_backend;
-
-const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) struct TransactionWriteSelectorResolver<'a> {
     backend: &'a dyn LixBackend,

@@ -7,7 +7,6 @@ use crate::catalog::{
     CatalogWriteVersionSemantics, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness,
     SurfaceRegistry, SurfaceVariant,
 };
-use crate::contracts::TrackedChangeView;
 use crate::diagnostics::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
     sql_unknown_table_error,
@@ -49,6 +48,7 @@ use crate::sql::{
     SchemaLiveTableRequirement,
 };
 use crate::sql::{ChangeBatch, CommitPreconditions};
+use crate::streams::StateChangeRecord;
 use crate::streams::{
     state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
     StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
@@ -1453,7 +1453,7 @@ fn semantic_plan_effects_from_untracked_public_write(
     Ok(effects)
 }
 
-pub(crate) fn semantic_plan_effects_from_changes<Change: TrackedChangeView>(
+pub(crate) fn semantic_plan_effects_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
     writer_key: Option<&str>,
@@ -1471,7 +1471,7 @@ pub(crate) fn semantic_plan_effects_from_changes<Change: TrackedChangeView>(
     Ok(effects)
 }
 
-fn next_active_version_id_from_changes<Change: TrackedChangeView>(
+fn next_active_version_id_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {
@@ -1491,7 +1491,7 @@ fn next_active_version_id_from_changes<Change: TrackedChangeView>(
     Ok(None)
 }
 
-fn file_cache_refresh_targets_from_changes<Change: TrackedChangeView>(
+fn file_cache_refresh_targets_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
 ) -> BTreeSet<(String, String)> {
     changes
@@ -1777,7 +1777,6 @@ mod tests {
         PublicReadPhysicalPlan,
     };
     use crate::catalog::SurfaceReadFreshness;
-    use crate::contracts::GLOBAL_VERSION_ID;
     use crate::execution::execute_prepared_public_read_artifact_with_backend;
     use crate::history::{FileHistoryRootScope, FileHistoryVersionScope, StateHistoryRootScope};
     use crate::live_state::{self, mark_mode_with_backend, LiveStateMode};
@@ -1798,6 +1797,7 @@ mod tests {
     use crate::test_support::{
         seed_canonical_change_row, BuiltinReadExecutionHost, CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::version::GLOBAL_VERSION_ID;
     use crate::version::{
         version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
         version_descriptor_schema_version, version_descriptor_snapshot_content,
@@ -1987,7 +1987,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionBeginMode,
+            _mode: crate::backend::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -4152,7 +4152,7 @@ mod tests {
         live_state::register_schema(backend, version_ref_schema_key()).await?;
 
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await?;
         for (index, descriptor) in descriptors.iter().enumerate() {
             let timestamp = format!("2026-04-02T00:00:0{}Z", index);

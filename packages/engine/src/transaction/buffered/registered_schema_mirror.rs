@@ -1,11 +1,11 @@
 use crate::common::escape_sql_string;
 use crate::sql::MutationRow;
 use crate::sql::PlannedStateRow;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, Value};
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const GLOBAL_VERSION_ID: &str = "global";
 const PENDING_BOOTSTRAP_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 pub(crate) async fn mirror_registered_schema_planned_rows_in_transaction(

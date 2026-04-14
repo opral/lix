@@ -1,4 +1,3 @@
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRow, LiveRowSource};
 use crate::transaction::overlay::{PendingOverlay, PendingSemanticRow, PendingSemanticStorage};
@@ -6,6 +5,7 @@ use crate::transaction::pipeline::resolution::prepared_artifacts::{
     overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,
     ExactEffectiveStateRowRequest, OverlayLane,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) async fn resolve_exact_effective_state_row_with_pending_overlay(

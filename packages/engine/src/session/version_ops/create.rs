@@ -1,5 +1,5 @@
 use crate::common::unexpected_statement_count_error;
-use crate::contracts::GLOBAL_VERSION_ID;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
 use super::context::require_target_version_context_in_transaction;

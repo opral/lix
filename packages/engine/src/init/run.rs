@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::backend::TransactionBeginMode;
 use crate::binary_cas;
 use crate::canonical;
 use crate::live_state;
@@ -10,7 +11,7 @@ use crate::live_state::{
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
 use crate::session;
-use crate::{Lix, LixBackend, LixError, SqlDialect, TransactionBeginMode};
+use crate::{Lix, LixBackend, LixError, SqlDialect};
 
 use super::filesystem;
 use super::seed::InitExecutor;

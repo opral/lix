@@ -8,12 +8,13 @@ mod frontier;
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::schema::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::LixError;
 
 pub use frontier::CommittedVersionFrontier;
+
+pub const GLOBAL_VERSION_ID: &str = "global";
 
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<VersionRowSchemaMetadata> = OnceLock::new();
 static VERSION_REF_SCHEMA_METADATA: OnceLock<VersionRowSchemaMetadata> = OnceLock::new();

@@ -5,7 +5,8 @@
 
 use crate::live_state::lifecycle;
 use crate::live_state::LiveStateMode;
-use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor};
+use crate::live_state::ReplayCursor;
+use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub(crate) async fn load_latest_live_state_replay_cursor_with_backend(
     backend: &dyn LixBackend,

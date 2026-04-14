@@ -5,11 +5,12 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
+use crate::backend::TransactionBeginMode;
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
 use crate::catalog::{lookup_directory_id_by_path, FilesystemProjectionScope};
 use crate::common::NormalizedDirectoryPath;
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
-use crate::{LixError, QueryResult, SqlDialect, TransactionBeginMode, Value};
+use crate::{LixError, QueryResult, SqlDialect, Value};
 
 pub(crate) async fn lookup_directory_id_by_path_in_transaction(
     transaction: &mut dyn LixBackendTransaction,

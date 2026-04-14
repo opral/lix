@@ -6,7 +6,7 @@ use crate::catalog::{
     DefaultScopeSemantics, ResolvedRelation, SurfaceColumnType, SurfaceFamily,
     SurfaceOverridePredicate, SurfaceRegistry, SurfaceVariant,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_ref_file_id, version_ref_plugin_key,

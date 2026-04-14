@@ -5,6 +5,7 @@ use crate::live_state::tracked_relation_name;
 use crate::transaction::{
     PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
@@ -12,7 +13,6 @@ use std::collections::BTreeSet;
 const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
-const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemQueryError {
@@ -1503,7 +1503,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionBeginMode,
+            _mode: crate::backend::TransactionBeginMode,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
             Ok(Box::new(UnusedTransaction))
         }
@@ -1512,7 +1512,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn LixBackendTransaction + '_>, crate::LixError> {
-            self.begin_transaction(crate::TransactionBeginMode::Write)
+            self.begin_transaction(crate::backend::TransactionBeginMode::Write)
                 .await
         }
     }
@@ -1523,8 +1523,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionBeginMode {
-            crate::TransactionBeginMode::Write
+        fn mode(&self) -> crate::backend::TransactionBeginMode {
+            crate::backend::TransactionBeginMode::Write
         }
 
         async fn execute(

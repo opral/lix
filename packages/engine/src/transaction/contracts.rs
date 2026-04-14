@@ -1,7 +1,6 @@
 use async_trait::async_trait;
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::CompiledSchemaCache;
 use crate::functions::{
     DynFunctionProvider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
@@ -9,6 +8,7 @@ use crate::functions::{
 use crate::live_state::{
     TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
 };
+use crate::schema::CompiledSchemaCache;
 use crate::sql::{PreparedPublicRead, PublicChange, SessionStateDelta, SqlCompilerSeed};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::PendingCommitState;

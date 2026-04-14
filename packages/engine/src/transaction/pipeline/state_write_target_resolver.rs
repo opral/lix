@@ -18,9 +18,8 @@ use crate::sql::{
     resolve_placeholder_index, CanonicalStateRowKey, PlaceholderState, PlannedWrite, ScopeProof,
 };
 use crate::transaction::{PendingOverlay, PendingSemanticStorage};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
-
-const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WriteTargetOverlayLane {

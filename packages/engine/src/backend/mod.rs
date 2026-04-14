@@ -2,11 +2,11 @@ mod ddl;
 mod image;
 mod prepared;
 mod transaction_adapter;
+mod transaction_mode;
 
 use async_trait::async_trait;
 
 use crate::common::SqlDialect;
-pub use crate::contracts::TransactionBeginMode;
 use crate::{LixError, QueryResult, Value};
 #[allow(unused_imports)]
 pub(crate) use ddl::{add_column_if_missing, execute_ddl_batch};
@@ -14,6 +14,7 @@ pub use image::{ImageChunkReader, ImageChunkWriter};
 #[allow(unused_imports)]
 pub use prepared::{PreparedBatch, PreparedStatement};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
+pub use transaction_mode::TransactionBeginMode;
 
 #[async_trait(?Send)]
 pub trait LixBackend: Send + Sync {

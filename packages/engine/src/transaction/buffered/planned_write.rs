@@ -22,10 +22,10 @@ use crate::transaction::{
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings,
     PreparedWriteStatement,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Clone)]
 pub(crate) struct TrackedTxnUnit {

@@ -3,9 +3,9 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use crate::common::escape_sql_string;
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::diagnostics::is_missing_relation_error;
 use crate::live_state::{key_value_schema_key, tracked_relation_name};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const DETERMINISTIC_MODE_KEY: &str = "lix_deterministic_mode";

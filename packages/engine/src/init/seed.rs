@@ -4,7 +4,6 @@ use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
@@ -17,6 +16,7 @@ use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedBufferedWriteTransaction,
     SessionCompilerCache, SessionCompilerState,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,
@@ -283,7 +283,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .await?;
 
         let main_version_id = match self
-            .find_version_id_by_name(crate::contracts::DEFAULT_ACTIVE_VERSION_NAME)
+            .find_version_id_by_name(crate::session::workspace::DEFAULT_ACTIVE_VERSION_NAME)
             .await?
         {
             Some(version_id) => version_id,
@@ -292,7 +292,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 self.seed_canonical_version_descriptor(
                     &initial_commit_id,
                     &generated_main_id,
-                    crate::contracts::DEFAULT_ACTIVE_VERSION_NAME,
+                    crate::session::workspace::DEFAULT_ACTIVE_VERSION_NAME,
                 )
                 .await?;
                 generated_main_id
@@ -301,11 +301,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
         self.seed_canonical_version_descriptor(
             &initial_commit_id,
-            crate::contracts::GLOBAL_VERSION_ID,
-            crate::contracts::GLOBAL_VERSION_ID,
+            crate::version::GLOBAL_VERSION_ID,
+            crate::version::GLOBAL_VERSION_ID,
         )
         .await?;
-        self.seed_local_version_head(crate::contracts::GLOBAL_VERSION_ID, &initial_commit_id)
+        self.seed_local_version_head(crate::version::GLOBAL_VERSION_ID, &initial_commit_id)
             .await?;
         self.seed_local_version_head(&main_version_id, &initial_commit_id)
             .await?;

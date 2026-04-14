@@ -15,15 +15,16 @@ pub(crate) mod status;
 
 use std::collections::BTreeSet;
 
+use crate::backend::TransactionBeginMode;
 use crate::canonical::CanonicalCommitReceipt;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
-    LiveStateRebuildScope,
+    LiveStateRebuildScope, ReplayCursor,
 };
 use crate::schema::LixVersionRef;
 use crate::version::CommittedVersionFrontier;
-use crate::{LixBackend, LixBackendTransaction, LixError, ReplayCursor, TransactionBeginMode};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
 
@@ -45,7 +46,7 @@ fn version_ref_plugin_key() -> String {
 
 fn version_ref_storage_version_id() -> String {
     match version_ref_storage_metadata().storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::contracts::GLOBAL_VERSION_ID.to_string(),
+        BuiltinSchemaStorageLane::Global => crate::version::GLOBAL_VERSION_ID.to_string(),
         BuiltinSchemaStorageLane::Local => {
             panic!("lix_version_ref must use the global storage lane")
         }
@@ -368,15 +369,16 @@ mod tests {
         projection_status, replay, status, CanonicalCommitReceipt, DerivedProjectionId,
         ProjectionCatchUpOutcome, ProjectionReplayMode,
     };
+    use crate::backend::TransactionBeginMode;
     use crate::live_state::LiveStateMode;
+    use crate::live_state::ReplayCursor;
     use crate::test_support::{
         boot_test_engine, init_test_backend_core, seed_canonical_change_row,
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
     use crate::CreateVersionOptions;
-    use crate::ReplayCursor;
-    use crate::{CommittedVersionFrontier, LixBackend, TransactionBeginMode};
+    use crate::{CommittedVersionFrontier, LixBackend};
     use std::collections::BTreeMap;
 
     async fn init_projection_backend() -> TestSqliteBackend {

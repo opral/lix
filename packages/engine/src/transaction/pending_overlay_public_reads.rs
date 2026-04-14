@@ -19,12 +19,12 @@ use crate::sql::{
 use crate::transaction::{
     PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const GLOBAL_VERSION_ID: &str = "global";
 
 struct PendingOverlayReadModel<'a> {
     base: &'a dyn LixBackend,

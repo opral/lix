@@ -1,3 +1,4 @@
+use crate::backend::TransactionBeginMode;
 use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
@@ -34,7 +35,7 @@ use crate::sql::{
     PreparedStateHistorySortValue, PublicReadResultColumn, PublicReadResultColumns,
     ReadDiagnosticContext,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use std::ops::ControlFlow;
 

@@ -1,5 +1,4 @@
 use crate::common::stable_content_fingerprint_hex;
-use crate::contracts::TrackedChangeView;
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,
@@ -7,10 +6,11 @@ use crate::sql::logical_plan::public_ir::{
 use crate::sql::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,
 };
+use crate::streams::StateChangeRecord;
 use crate::LixError;
 use serde_json::{json, Map, Value as JsonValue};
 
-impl TrackedChangeView for PublicChange {
+impl StateChangeRecord for PublicChange {
     fn entity_id(&self) -> &str {
         &self.entity_id
     }
