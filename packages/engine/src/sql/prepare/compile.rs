@@ -4,7 +4,7 @@ use crate::sql::explain::{
     build_direct_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     DirectExplainBuildInput, ExplainRequest, ExplainStage, ExplainTimingCollector,
 };
-use crate::transaction::PlanEffects;
+use crate::sql::PlanEffects;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::time::Duration;

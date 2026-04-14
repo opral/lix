@@ -1,6 +1,6 @@
 use crate::contracts::TrackedChangeView;
+use crate::sql::PlannedStateRow;
 use crate::sql::{MutationOperation, MutationRow};
-use crate::transaction::PlannedStateRow;
 use crate::{LixError, Value};
 use futures_util::future::poll_fn;
 use futures_util::task::AtomicWaker;
@@ -663,7 +663,7 @@ mod tests {
         StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
     use crate::session::version_ops::commit::StagedChange;
-    use crate::transaction::PlannedStateRow;
+    use crate::sql::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
 

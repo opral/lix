@@ -96,14 +96,12 @@ pub(crate) use pipeline::{
     WriteSelectorResolver,
 };
 pub(crate) use prepared_artifacts::{
-    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch, PlanEffects,
-    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
-    PlannedStateRow, PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
+    PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
     PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
     PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
     PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteArtifact,
-    PreparedWriteStatement, PublicChange, SemanticEffect, WriteLane, WriteMode,
+    PreparedWriteStatement,
 };
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};

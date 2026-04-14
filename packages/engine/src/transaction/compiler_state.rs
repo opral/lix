@@ -14,8 +14,7 @@ use std::sync::Mutex;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::FunctionBindings;
 use crate::session::ExecuteOptions;
-use crate::session::SessionStateDelta;
-use crate::sql::RuntimeBindingValues;
+use crate::sql::{RuntimeBindingValues, SessionStateDelta};
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
 use crate::transaction::BufferedWriteExecutionInput;

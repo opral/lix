@@ -1,4 +1,4 @@
-use crate::session::SessionStateDelta;
+use crate::sql::SessionStateDelta;
 use crate::transaction::{PreparedPublicSurfaceRegistryEffect, TransactionCommitOutcome};
 use crate::QueryResult;
 

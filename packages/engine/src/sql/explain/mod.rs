@@ -68,14 +68,14 @@ use crate::sql::semantic_ir::{
     SemanticStatement,
 };
 use crate::sql::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, PlanEffects, PublicChange, SemanticEffect,
+};
+use crate::sql::{
     DependencyPrecision, DependencySpec, EffectiveStateRequest, EffectiveStateVersionScope,
     MutationOperation, MutationRow, PreparedExplainTemplate, QueryDependency,
     ReadTimeProjectionPlan, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 use crate::streams::StateCommitStreamChange;
-use crate::transaction::{
-    ChangeBatch, CommitPreconditions, ExpectedHead, PlanEffects, PublicChange, SemanticEffect,
-};
 use crate::{LixError, SqlDialect, Value};
 use serde::Serialize;
 use serde_json::Value as JsonValue;

@@ -8,6 +8,7 @@ use crate::catalog::{
 };
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::sql::OptionalTextPatch;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
@@ -16,7 +17,6 @@ use crate::transaction::pipeline::resolution::prepared_artifacts::{
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
-use crate::transaction::OptionalTextPatch;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,
@@ -1162,7 +1162,7 @@ fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteR
 #[cfg(test)]
 mod tests {
     use super::ResolvedWritePartitionBuilder;
-    use crate::transaction::PlannedStateRow;
+    use crate::sql::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
 
