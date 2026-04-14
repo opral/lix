@@ -19,7 +19,6 @@ use crate::contracts::{
 };
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
-use crate::session::SessionWriteSelectorResolver;
 use crate::sql::bind_sql;
 use crate::sql::{
     build_change_batches, build_public_write_execution,
@@ -31,8 +30,8 @@ use crate::sql::{
     CompiledExecution, InsertOnConflictAction, PlannedStateRow, PreparedExplainMode,
     PreparedInsertOnConflictAction, PreparedWriteOperationKind, PreparedWriteStatementKind,
     PublicWriteExecutionPartition, PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan,
-    SqlCompilerMetadata, SqlPreparationMetadataReader, UpdateValidationPlan,
-    WriteDiagnosticContext, WriteOperationKind,
+    SqlCompilerMetadata, SqlPreparationMetadataReader, SqlPreparationPendingOverlay,
+    UpdateValidationPlan, WriteDiagnosticContext, WriteOperationKind,
 };
 use crate::transaction::ensure_runtime_sequence_initialized_in_transaction;
 use crate::transaction::overlay::PendingOverlay;
@@ -47,7 +46,8 @@ use crate::transaction::{
     PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteArtifact,
     PreparedWriteFunctionBindings, PreparedWriteStatement, SessionCompilerState,
-    UpdateValidationInput, UpdateValidationInputRow, WriteCommand, WriteExecutionContext,
+    TransactionWriteSelectorResolver, UpdateValidationInput, UpdateValidationInputRow,
+    WriteCommand, WriteExecutionContext,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 
@@ -147,7 +147,7 @@ pub(crate) async fn build_write_preparation_context(
         load_sql_compiler_metadata_with_reader_and_pending_overlay(
             metadata_reader,
             &context.public_surface_registry,
-            pending_write_overlay.map(|view| view as &dyn PendingOverlay),
+            pending_write_overlay.map(|view| view as &dyn SqlPreparationPendingOverlay),
         )
         .await?
     };
@@ -158,7 +158,7 @@ pub(crate) async fn build_write_preparation_context(
         active_history_root_commit_id,
         active_version_id: context.active_version_id.clone(),
         active_account_ids: context.active_account_ids.clone(),
-        writer_key: context.options.writer_key.clone(),
+        writer_key: context.writer_key.clone(),
     })
 }
 
@@ -873,7 +873,7 @@ where
     let physical_started = Instant::now();
     let mut public_write = public_write.clone();
     let selector_functions = clone_boxed_function_provider(&functions);
-    let selector_resolver = SessionWriteSelectorResolver::new(
+    let selector_resolver = TransactionWriteSelectorResolver::new(
         backend,
         projection_registry,
         pending_write_overlay.map(|view| view as &dyn PendingOverlay),

@@ -15,9 +15,9 @@ pub(crate) mod types;
 
 pub(crate) const COMMIT_IDEMPOTENCY_TABLE: &str = "lix_internal_commit_idempotency";
 
-pub(crate) use crate::transaction::CanonicalCommitReceipt;
+pub(crate) use crate::canonical::CanonicalCommitReceipt;
 #[cfg(test)]
-pub(crate) use crate::transaction::UpdatedVersionRef;
+pub(crate) use crate::canonical::UpdatedVersionRef;
 pub(crate) use append::{
     append_tracked, append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
     CreateCommitAppliedOutput, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,

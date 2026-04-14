@@ -12,7 +12,7 @@ use crate::live_state::tracked::TrackedWriteRow;
 use crate::live_state::untracked::UntrackedRow;
 #[cfg(test)]
 use crate::live_state::untracked::UntrackedWriteRow;
-use crate::transaction::CommittedVersionFrontier;
+use crate::version::CommittedVersionFrontier;
 
 use super::constraints::{ScanConstraint, ScanField, ScanOperator};
 

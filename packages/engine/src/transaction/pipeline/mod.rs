@@ -3,6 +3,8 @@ mod execution;
 mod execution_effects;
 mod preparation;
 pub(crate) mod resolution;
+mod selector_reads;
+mod state_write_target_resolver;
 mod validation;
 
 pub(crate) use direct_execution::{
@@ -19,4 +21,5 @@ pub(crate) use preparation::{
     prepare_buffered_write_execution_step, prepared_write_function_bindings_for_execution,
 };
 pub(crate) use resolution::{WriteResolveError, WriteSelectorResolver};
+pub(crate) use selector_reads::TransactionWriteSelectorResolver;
 pub(crate) use validation::validate_commit_time_write;

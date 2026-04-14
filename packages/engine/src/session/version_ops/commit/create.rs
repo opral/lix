@@ -1,7 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
-use crate::canonical::{append_changes, CanonicalChangeWrite, CanonicalStateIdentity};
+use crate::canonical::{
+    append_changes, CanonicalChangeWrite, CanonicalCommitReceipt, CanonicalStateIdentity,
+    UpdatedVersionRef,
+};
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
 use crate::session::version_ops::{
@@ -14,7 +17,6 @@ use crate::sql::OptionalTextPatch;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
-    CanonicalCommitReceipt, UpdatedVersionRef,
 };
 use crate::transaction::{
     compile_filesystem_transaction_state_from_state,

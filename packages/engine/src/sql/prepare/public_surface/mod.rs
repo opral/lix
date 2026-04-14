@@ -2150,7 +2150,7 @@ mod tests {
         );
         match &admin_read.execution {
             PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface_name, "lix_version");
+                assert_eq!(artifact.surface_name(), "lix_version");
                 assert!(admin_read.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {
@@ -2184,7 +2184,7 @@ mod tests {
 
                     match &prepared.execution {
                         PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
-                            assert_eq!(artifact.surface_name, "lix_version");
+                            assert_eq!(artifact.surface_name(), "lix_version");
                         }
                         PublicReadPhysicalPlan::LoweredSql(_) => {
                             panic!("plain lix_version read should not lower canonical admin SQL")
@@ -3136,7 +3136,7 @@ mod tests {
         );
         match &prepared.execution {
             PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface_name, "lix_file");
+                assert_eq!(artifact.surface_name(), "lix_file");
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {
@@ -3186,7 +3186,7 @@ mod tests {
         );
         match &prepared.execution {
             PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface_name, "lix_directory_by_version");
+                assert_eq!(artifact.surface_name(), "lix_directory_by_version");
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {

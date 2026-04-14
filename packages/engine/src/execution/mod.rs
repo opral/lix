@@ -4,7 +4,6 @@ mod statement_batch;
 mod statement_batch_runner;
 #[cfg(test)]
 mod transaction_tests;
-mod write;
 
 pub(crate) use explain::{render_analyzed_explain_result, render_plain_explain_result};
 pub(crate) use read::{
@@ -13,5 +12,3 @@ pub(crate) use read::{
     execute_prepared_read_batch_in_committed_read_transaction, ReadExecutionHost,
     ReadTimeProjectionIdentity, ReadTimeProjectionRow,
 };
-pub(crate) use statement_batch::WriteBatch;
-pub(crate) use write::execute as execute_write;

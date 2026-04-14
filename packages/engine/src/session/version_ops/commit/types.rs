@@ -10,7 +10,7 @@ use crate::{
     VersionId,
 };
 
-use crate::transaction::UpdatedVersionRef;
+use crate::canonical::UpdatedVersionRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedChange {

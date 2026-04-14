@@ -27,7 +27,6 @@ mod prepared_write;
 mod validation_input;
 mod write_batch;
 
-pub(crate) use crate::execution::WriteBatch;
 pub(crate) use backend::{
     lookup_directory_id_by_path_in_transaction,
     normalize_sql_error_with_transaction_and_relation_names, TransactionExecutionBackend,
@@ -40,10 +39,7 @@ pub(crate) use buffered::{
 pub(crate) use buffered_write_transaction::{
     BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
 };
-pub use commit_artifacts::CommittedVersionFrontier;
-pub(crate) use commit_artifacts::{
-    CanonicalCommitReceipt, PendingCommitLane, PendingCommitState, UpdatedVersionRef,
-};
+pub(crate) use commit_artifacts::{PendingCommitLane, PendingCommitState};
 pub(crate) use compiler_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
 };
@@ -92,8 +88,8 @@ pub(crate) use pipeline::{
     ensure_function_bindings_for_write_scope,
     execute_parsed_statements_in_borrowed_write_transaction,
     execute_parsed_statements_in_write_transaction, execute_statement_batch_with_write_transaction,
-    prepared_write_function_bindings_for_execution, validate_commit_time_write, WriteResolveError,
-    WriteSelectorResolver,
+    prepared_write_function_bindings_for_execution, validate_commit_time_write,
+    TransactionWriteSelectorResolver, WriteResolveError, WriteSelectorResolver,
 };
 pub(crate) use prepared_artifacts::{
     PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
@@ -106,4 +102,4 @@ pub(crate) use prepared_artifacts::{
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};
 pub(crate) use validation_input::{UpdateValidationInput, UpdateValidationInputRow};
-pub(crate) use write_batch::execute_write_batch_with_transaction;
+pub(crate) use write_batch::{execute_write_batch_with_transaction, WriteBatch};

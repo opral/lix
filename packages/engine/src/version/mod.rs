@@ -3,6 +3,8 @@
 //! This subsystem owns built-in version row metadata and snapshot codecs used
 //! across catalog, SQL, live-state, init, and session version workflows.
 
+mod frontier;
+
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
@@ -10,6 +12,8 @@ use crate::contracts::GLOBAL_VERSION_ID;
 use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::schema::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::LixError;
+
+pub use frontier::CommittedVersionFrontier;
 
 static VERSION_DESCRIPTOR_SCHEMA_METADATA: OnceLock<VersionRowSchemaMetadata> = OnceLock::new();
 static VERSION_REF_SCHEMA_METADATA: OnceLock<VersionRowSchemaMetadata> = OnceLock::new();

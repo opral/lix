@@ -5,7 +5,7 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
 
 use crate::backend::PreparedBatch;
-use crate::catalog::{ResolvedRelation, SurfaceReadFreshness};
+use crate::catalog::{CatalogReadTimeProjectionRequest, ResolvedRelation, SurfaceReadFreshness};
 use crate::common::Value;
 use crate::contracts::TransactionBeginMode;
 use crate::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
@@ -95,9 +95,18 @@ pub struct ProjectionQuery {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub(crate) struct ReadTimeProjectionPlan {
-    pub(crate) surface_name: String,
-    pub(crate) requested_version_id: Option<String>,
+    pub(crate) request: CatalogReadTimeProjectionRequest,
     pub(crate) query: ProjectionQuery,
+}
+
+impl ReadTimeProjectionPlan {
+    pub(crate) fn request(&self) -> &CatalogReadTimeProjectionRequest {
+        &self.request
+    }
+
+    pub(crate) fn surface_name(&self) -> &str {
+        &self.request.surface_name
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

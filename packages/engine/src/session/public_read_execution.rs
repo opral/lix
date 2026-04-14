@@ -6,13 +6,12 @@
 
 use async_trait::async_trait;
 
-use crate::catalog::CatalogProjectionRegistry;
-use crate::execution::execute_prepared_public_read_artifact_with_backend;
+use crate::catalog::{
+    CatalogProjectionRegistry, CatalogReadTimeProjectionRequest, SurfaceReadFreshness,
+};
 use crate::execution::{ReadExecutionHost, ReadTimeProjectionIdentity, ReadTimeProjectionRow};
 use crate::session::host::SessionExecutionContext;
-use crate::sql::{PreparedPublicRead, PublicReadSource, ReadTimeProjectionPlan};
-use crate::transaction::PendingOverlay;
-use crate::{LixBackend, LixError, QueryResult};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub(crate) struct ProjectionReadExecutionHost<'a> {
     projection_registry: &'a CatalogProjectionRegistry,
@@ -29,10 +28,10 @@ impl<'a> ProjectionReadExecutionHost<'a> {
 pub(crate) async fn derive_read_time_projection_rows_with_registry(
     projection_registry: &CatalogProjectionRegistry,
     backend: &dyn LixBackend,
-    artifact: &ReadTimeProjectionPlan,
+    request: &CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
     Ok(
-        crate::live_state::derive_read_time_surface_rows(backend, projection_registry, artifact)
+        crate::live_state::derive_read_time_surface_rows(backend, projection_registry, request)
             .await?
             .into_iter()
             .map(|row| ReadTimeProjectionRow {
@@ -54,10 +53,38 @@ impl ReadExecutionHost for ProjectionReadExecutionHost<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &ReadTimeProjectionPlan,
+        request: &CatalogReadTimeProjectionRequest,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        derive_read_time_projection_rows_with_registry(self.projection_registry, backend, artifact)
+        derive_read_time_projection_rows_with_registry(self.projection_registry, backend, request)
             .await
+    }
+
+    async fn ensure_projection_freshness_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_with_backend(
+            backend,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
+    }
+
+    async fn ensure_projection_freshness_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_in_transaction(
+            transaction,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
     }
 }
 
@@ -66,34 +93,41 @@ impl ReadExecutionHost for SessionExecutionContext<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &ReadTimeProjectionPlan,
+        request: &CatalogReadTimeProjectionRequest,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
         derive_read_time_projection_rows_with_registry(
             self.session_host().catalog_projection_registry(),
             backend,
-            artifact,
+            request,
         )
         .await
     }
-}
 
-pub(crate) async fn execute_pending_overlay_public_read_with_backend(
-    backend: &dyn LixBackend,
-    host: &dyn ReadExecutionHost,
-    pending_overlay: Option<&dyn PendingOverlay>,
-    public_read: &PreparedPublicRead,
-) -> Result<QueryResult, LixError> {
-    match public_read.contract.source() {
-        PublicReadSource::PendingOverlay => {
-            crate::transaction::execute_pending_overlay_public_read(
-                backend,
-                pending_overlay,
-                public_read,
-            )
-            .await
-        }
-        PublicReadSource::Committed(_) => {
-            execute_prepared_public_read_artifact_with_backend(backend, host, public_read).await
-        }
+    async fn ensure_projection_freshness_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_with_backend(
+            backend,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
+    }
+
+    async fn ensure_projection_freshness_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_in_transaction(
+            transaction,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
     }
 }

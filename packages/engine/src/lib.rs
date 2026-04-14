@@ -65,4 +65,4 @@ pub use sql::prepare::prepared_batch::collapse_prepared_batch_for_dialect;
 pub use sql::prepare::public_surface::routing::{
     delay_broad_routing_for_test, BroadRoutingDelayForTestGuard,
 };
-pub use transaction::CommittedVersionFrontier;
+pub use version::CommittedVersionFrontier;

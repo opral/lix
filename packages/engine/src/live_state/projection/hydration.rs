@@ -272,7 +272,7 @@ async fn load_change_commit_ids_with_backend(
          FROM change_commit_by_change_id \
          WHERE change_id IN ({in_list})",
         change_commit_cte =
-            crate::sql::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
+            crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
         in_list = in_list,
     );
     let result = backend.execute(&sql, &[]).await?;

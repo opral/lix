@@ -8,6 +8,7 @@ mod file;
 mod filesystem_query;
 mod public_surface_registry;
 mod read_surface;
+mod read_time_projection;
 mod registry;
 mod scan;
 mod state;
@@ -88,6 +89,8 @@ pub(crate) use read_surface::{
     explicit_version_counterpart_surface_name, read_preparation_semantics,
     CatalogReadPreparationSemantics,
 };
+#[allow(unused_imports)]
+pub(crate) use read_time_projection::CatalogReadTimeProjectionRequest;
 #[allow(unused_imports)]
 pub(crate) use scan::{
     admin_scan_kind, filesystem_scan_semantics, is_working_changes_surface, CatalogAdminScanKind,

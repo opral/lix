@@ -6,32 +6,36 @@ use sqlparser::ast::{
     ValueWithSpan,
 };
 
-use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::DynFunctionProvider;
-use crate::execution::{ReadExecutionHost, ReadTimeProjectionRow};
-use crate::session::public_read_execution::execute_pending_overlay_public_read_with_backend;
-use crate::session::public_read_preparation::{
-    build_read_preparation_context, prepare_required_active_public_read_artifact_with_backend,
-    ReadPreparationContext,
+use crate::catalog::{
+    CatalogProjectionRegistry, CatalogReadTimeProjectionRequest, SurfaceReadFreshness,
+    SurfaceRegistry,
 };
-use crate::session::state_write_target_resolver::try_resolve_state_write_targets_with_backend;
+use crate::contracts::DynFunctionProvider;
+use crate::execution::{
+    execute_prepared_public_read_artifact_with_backend, ReadExecutionHost,
+    ReadTimeProjectionIdentity, ReadTimeProjectionRow,
+};
+use crate::sql::load_sql_compiler_metadata;
 use crate::sql::{
-    public_selector_column_name, public_selector_version_column, CanonicalStateRowKey,
-    PlannedWrite, ScopeProof,
+    prepare_public_read, prepare_public_read_artifact, public_selector_column_name,
+    public_selector_version_column, CanonicalStateRowKey, PlannedWrite, PreparedPublicRead,
+    PublicReadSource, ScopeProof, SqlCompilerMetadata, SqlPreparationMetadataReader,
 };
 use crate::transaction::{PendingOverlay, WriteResolveError, WriteSelectorResolver};
-use crate::{LixBackend, LixError, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+
+use super::state_write_target_resolver::try_resolve_state_write_targets_with_backend;
 
 const GLOBAL_VERSION_ID: &str = "global";
 
-pub(crate) struct SessionWriteSelectorResolver<'a> {
+pub(crate) struct TransactionWriteSelectorResolver<'a> {
     backend: &'a dyn LixBackend,
     projection_registry: &'a CatalogProjectionRegistry,
     pending_overlay: Option<&'a dyn PendingOverlay>,
     preparation_context: ReadPreparationContext,
 }
 
-impl<'a> SessionWriteSelectorResolver<'a> {
+impl<'a> TransactionWriteSelectorResolver<'a> {
     pub(crate) async fn new(
         backend: &'a dyn LixBackend,
         projection_registry: &'a CatalogProjectionRegistry,
@@ -82,16 +86,40 @@ impl<'a> SessionWriteSelectorResolver<'a> {
 }
 
 #[async_trait(?Send)]
-impl ReadExecutionHost for SessionWriteSelectorResolver<'_> {
+impl ReadExecutionHost for TransactionWriteSelectorResolver<'_> {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::sql::ReadTimeProjectionPlan,
+        request: &CatalogReadTimeProjectionRequest,
     ) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
-        crate::session::public_read_execution::derive_read_time_projection_rows_with_registry(
-            self.projection_registry,
+        derive_read_time_projection_rows_with_registry(self.projection_registry, backend, request)
+            .await
+    }
+
+    async fn ensure_projection_freshness_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_with_backend(
             backend,
-            artifact,
+            freshness_contract,
+            resolved_relations,
+        )
+        .await
+    }
+
+    async fn ensure_projection_freshness_in_transaction(
+        &self,
+        transaction: &mut dyn LixBackendTransaction,
+        freshness_contract: SurfaceReadFreshness,
+        resolved_relations: &[String],
+    ) -> Result<(), LixError> {
+        crate::live_state::ensure_projection_read_freshness_in_transaction(
+            transaction,
+            freshness_contract,
+            resolved_relations,
         )
         .await
     }
@@ -118,7 +146,7 @@ fn selector_read_preparation_version_id(planned_write: &PlannedWrite) -> &str {
 }
 
 #[async_trait(?Send)]
-impl WriteSelectorResolver for SessionWriteSelectorResolver<'_> {
+impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
     async fn load_text_selector_values(
         &self,
         planned_write: &PlannedWrite,
@@ -243,6 +271,128 @@ impl WriteSelectorResolver for SessionWriteSelectorResolver<'_> {
             }
         }
         Ok(selector_rows)
+    }
+}
+
+struct ReadPreparationContext {
+    registry: SurfaceRegistry,
+    compiler_metadata: SqlCompilerMetadata,
+}
+
+async fn build_read_preparation_context(
+    backend: &dyn LixBackend,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    functions: &DynFunctionProvider,
+) -> Result<ReadPreparationContext, LixError> {
+    let registry = crate::transaction::build_public_read_surface_registry_with_pending_overlay(
+        backend,
+        pending_overlay,
+        functions,
+    )
+    .await?;
+    let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
+    Ok(ReadPreparationContext {
+        registry,
+        compiler_metadata,
+    })
+}
+
+async fn prepare_required_active_public_read_artifact_with_backend(
+    backend: &dyn LixBackend,
+    preparation_context: &ReadPreparationContext,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Result<PreparedPublicRead, LixError> {
+    let mut metadata_reader = backend;
+    prepare_required_active_public_read_artifact_with_reader(
+        &mut metadata_reader,
+        backend.dialect(),
+        preparation_context,
+        parsed_statements,
+        params,
+        active_version_id,
+        writer_key,
+    )
+    .await
+}
+
+async fn prepare_required_active_public_read_artifact_with_reader(
+    metadata_reader: &mut dyn SqlPreparationMetadataReader,
+    dialect: crate::SqlDialect,
+    preparation_context: &ReadPreparationContext,
+    parsed_statements: &[Statement],
+    params: &[Value],
+    active_version_id: &str,
+    writer_key: Option<&str>,
+) -> Result<PreparedPublicRead, LixError> {
+    let active_history_root_commit_id = metadata_reader
+        .load_active_history_root_commit_id_for_preparation(active_version_id)
+        .await?;
+    let prepared = prepare_public_read(
+        dialect,
+        &preparation_context.registry,
+        &preparation_context.compiler_metadata,
+        parsed_statements,
+        params,
+        active_version_id,
+        active_history_root_commit_id.as_deref(),
+        writer_key,
+        false,
+        None,
+    )
+    .await?;
+    let Some(public_read) = prepared else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "public write selector resolver expected a public read plan",
+        ));
+    };
+    prepare_public_read_artifact(&public_read, dialect)
+}
+
+async fn derive_read_time_projection_rows_with_registry(
+    projection_registry: &CatalogProjectionRegistry,
+    backend: &dyn LixBackend,
+    request: &CatalogReadTimeProjectionRequest,
+) -> Result<Vec<ReadTimeProjectionRow>, LixError> {
+    Ok(
+        crate::live_state::derive_read_time_surface_rows(backend, projection_registry, request)
+            .await?
+            .into_iter()
+            .map(|row| ReadTimeProjectionRow {
+                surface_name: row.surface_name,
+                identity: row.identity.map(|identity| ReadTimeProjectionIdentity {
+                    schema_key: identity.schema_key,
+                    version_id: identity.version_id,
+                    entity_id: identity.entity_id,
+                    file_id: identity.file_id,
+                }),
+                values: row.values,
+            })
+            .collect(),
+    )
+}
+
+async fn execute_pending_overlay_public_read_with_backend(
+    backend: &dyn LixBackend,
+    host: &dyn ReadExecutionHost,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    public_read: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
+    match public_read.contract.source() {
+        PublicReadSource::PendingOverlay => {
+            crate::transaction::execute_pending_overlay_public_read(
+                backend,
+                pending_overlay,
+                public_read,
+            )
+            .await
+        }
+        PublicReadSource::Committed(_) => {
+            execute_prepared_public_read_artifact_with_backend(backend, host, public_read).await
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 
 mod sql;
 
-use crate::common::Value;
+use crate::Value;
 
 /// Which indexed field a live-state scan constraint applies to.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -36,17 +36,6 @@ pub enum ScanOperator {
         lower: Option<Bound>,
         upper: Option<Bound>,
     },
-}
-
-#[cfg(test)]
-pub fn entity_id_in_constraint<I>(entity_ids: I) -> ScanConstraint
-where
-    I: IntoIterator<Item = String>,
-{
-    ScanConstraint {
-        field: ScanField::EntityId,
-        operator: ScanOperator::In(entity_ids.into_iter().map(Value::Text).collect()),
-    }
 }
 
 pub(crate) use sql::{
