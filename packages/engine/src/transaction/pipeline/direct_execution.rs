@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::sql::PreparedBatch;
+use crate::backend::PreparedBatch;
 use crate::sql::ResultContract;
 use crate::streams::StateCommitStreamChange;
 use crate::transaction::{CanonicalCommitReceipt, PlanEffects, PreparedDirectWriteArtifact};

@@ -243,7 +243,7 @@ fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> Stri
 
 async fn execute_prepared_batch_with_backend(
     backend: &dyn LixBackend,
-    batch: &crate::sql::PreparedBatch,
+    batch: &crate::backend::PreparedBatch,
 ) -> Result<QueryResult, LixError> {
     let mut result = QueryResult {
         rows: Vec::new(),

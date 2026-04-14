@@ -1,9 +1,8 @@
 use super::public_surface::{PublicReadPlan, PublicWritePlan};
+use crate::backend::PreparedStatement;
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
-use crate::sql::{
-    MutationRow, PreparedStatement, SchemaLiveTableRequirement, UpdateValidationPlan,
-};
+use crate::sql::{MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan};
 use crate::transaction::PlanEffects;
 
 #[derive(Clone)]

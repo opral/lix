@@ -1,3 +1,4 @@
+use crate::backend::PreparedBatch;
 use crate::common::escape_sql_string;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
@@ -7,7 +8,6 @@ use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     tracked_relation_name,
 };
-use crate::sql::PreparedBatch;
 use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
 
 const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";

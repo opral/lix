@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Expr;
 
-use crate::sql::PreparedStatement;
+use crate::backend::PreparedStatement;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SchemaLiveTableRequirement {
