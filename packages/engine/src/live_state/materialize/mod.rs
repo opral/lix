@@ -21,7 +21,8 @@ pub use types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 
-use crate::contracts::{FilesystemPluginMaterializer, LiveStateMode};
+use crate::contracts::LiveStateMode;
+use crate::plugin::FilesystemPluginMaterializer;
 use crate::{LixBackend, LixBackendTransaction, LixError};
 
 pub async fn rebuild_plan(

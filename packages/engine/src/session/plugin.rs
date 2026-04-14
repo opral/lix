@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::catalog::FilesystemProjectionScope;
 use crate::common::NormalizedDirectoryPath;
-use crate::session::plugin_install_writes::{
+use crate::plugin::{
     install_plugin_archive_with_writer, PluginInstallWriteContext, PluginInstallWriteExecutor,
 };
 use crate::transaction::{

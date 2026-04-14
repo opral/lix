@@ -11,6 +11,7 @@ pub(crate) mod execution;
 pub(crate) mod functions;
 mod init;
 pub mod live_state;
+pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql;

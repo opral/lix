@@ -1,7 +1,9 @@
 use crate::catalog::{load_file_row_by_id, FilesystemProjectionScope};
-use crate::contracts::{select_best_glob_match, InstalledPlugin, PluginContentType};
-use crate::contracts::{BlobDataReader, FilesystemPluginMaterializer};
+use crate::contracts::BlobDataReader;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
+use crate::plugin::{
+    select_best_glob_match, FilesystemPluginMaterializer, InstalledPlugin, PluginContentType,
+};
 use crate::{LixBackend, LixError};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -312,8 +314,8 @@ async fn load_file_descriptors(
 #[cfg(test)]
 mod tests {
     use super::select_plugin_for_path;
-    use crate::contracts::glob_matches_path;
-    use crate::contracts::{InstalledPlugin, PluginContentType, PluginRuntime};
+    use crate::plugin::glob_matches_path;
+    use crate::plugin::{InstalledPlugin, PluginContentType, PluginRuntime};
 
     fn test_plugin(
         key: &str,
