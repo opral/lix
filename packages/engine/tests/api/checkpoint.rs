@@ -1,6 +1,6 @@
 use crate::support;
 
-use lix_engine::Value;
+use lix_engine::{CreateVersionOptions, Value};
 
 fn as_text(value: &Value) -> String {
     match value {
@@ -258,3 +258,26 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(create_version_switch_then_checkpoint, |sim| async move {
+    let engine = sim
+        .boot_simulated_lix(None)
+        .await
+        .expect("boot_simulated_lix should succeed");
+    engine.initialize().await.expect("init should succeed");
+
+    let created = engine
+        .create_version(CreateVersionOptions::default())
+        .await
+        .expect("create_version should succeed");
+
+    engine
+        .switch_version(created.id)
+        .await
+        .expect("switch_version should succeed");
+
+    engine
+        .create_checkpoint()
+        .await
+        .expect("create_checkpoint should succeed after switching to created version");
+});
