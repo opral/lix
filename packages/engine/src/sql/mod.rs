@@ -91,7 +91,6 @@ pub(crate) use planned_statement::{
 };
 pub(crate) use prepare::SqlPreparationMetadataReader;
 pub(crate) use prepared_artifacts::*;
-pub use prepared_artifacts::{PreparedBatch, PreparedStatement};
 
 // Existing root helpers used outside the compiler stages.
 pub(crate) use physical_plan::source_sql::build_lazy_change_commit_by_change_id_ctes_sql;

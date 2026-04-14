@@ -29,12 +29,12 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "backend",
-        reason: "backend is a lower persistence owner; it may use sql-owned prepared statement DTOs but must not grow dependencies on higher workflow or sidecar roots",
+        reason: "backend is a lower persistence owner; it owns raw prepared statement DTOs but must not grow dependencies on higher workflow or sidecar roots",
         forbidden_scopes: &["services"],
     },
     ForbiddenDependencyRule {
         from_scope: "contracts",
-        reason: "contracts is a downward seam and may reference sql-owned prepared artifact DTOs, but must stay neutral relative to runtime owners",
+        reason: "contracts is a downward seam and may reference compiler-owned DTOs, but must stay neutral relative to runtime owners",
         forbidden_scopes: &[
             "backend",
             "canonical",
@@ -69,8 +69,8 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "sql",
-        reason: "sql is the compiler and should not depend on backend, storage, execution, workflow, or session/services owners directly; sealed owner-root query-contract APIs plus acyclic internal-relation inventory roots are allowed",
-        forbidden_scopes: &["backend", "execution", "services", "session"],
+        reason: "sql is the compiler and should not depend on execution, workflow, or session/services owners directly; backend-owned raw prepared SQL runtime DTOs are allowed as a lower execution seam",
+        forbidden_scopes: &["execution", "services", "session"],
     },
     ForbiddenDependencyRule {
         from_scope: "execution",

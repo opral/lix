@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::backend::PreparedBatch;
 use crate::catalog::ResolvedRelation;
 use crate::common::Value;
 use crate::session::SessionStateDelta;
 use crate::sql::{
-    MutationRow, PreparedBatch, PreparedInsertOnConflictAction, PreparedPublicRead,
-    PreparedWriteOperationKind, PreparedWriteStatementKind, ResultContract,
-    SchemaLiveTableRequirement, WriteDiagnosticContext,
+    MutationRow, PreparedInsertOnConflictAction, PreparedPublicRead, PreparedWriteOperationKind,
+    PreparedWriteStatementKind, ResultContract, SchemaLiveTableRequirement, WriteDiagnosticContext,
 };
 use crate::streams::StateCommitStreamChange;
 

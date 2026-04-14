@@ -39,7 +39,7 @@ fn direct_state_file_cache_refresh_targets(
 #[cfg(test)]
 mod tests {
     use super::derive_effects_from_state_resolution;
-    use crate::sql::PreparedStatement;
+    use crate::backend::PreparedStatement;
     use crate::sql::{MutationOperation, MutationRow, PlannedStatementSet, UpdateValidationPlan};
     use serde_json::json;
 

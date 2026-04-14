@@ -1,5 +1,5 @@
+use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::sql::support::{parse_sql_statements, resolve_placeholder_index, PlaceholderState};
-use crate::sql::{PreparedBatch, PreparedStatement};
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::{Expr, Value as SqlValue, VisitMut, VisitorMut};
 use sqlparser::dialect::GenericDialect;

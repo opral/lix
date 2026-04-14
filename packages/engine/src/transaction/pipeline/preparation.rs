@@ -10,6 +10,7 @@ use std::time::Instant;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
+use crate::backend::PreparedBatch;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::CompiledSchemaCache;
@@ -27,11 +28,10 @@ use crate::sql::{
     load_sql_compiler_metadata_with_reader_and_pending_overlay, prepare_public_read_artifact,
     public_authoritative_write_error, public_write_preparation_error,
     refresh_materialized_public_write_explain, BoundStatementInstance, CompilePolicy,
-    CompiledExecution, InsertOnConflictAction, PreparedBatch, PreparedExplainMode,
-    PreparedInsertOnConflictAction, PreparedWriteOperationKind, PreparedWriteStatementKind,
-    PublicWriteExecutionPartition, PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan,
-    SqlCompilerMetadata, SqlPreparationMetadataReader, UpdateValidationPlan,
-    WriteDiagnosticContext, WriteOperationKind,
+    CompiledExecution, InsertOnConflictAction, PreparedExplainMode, PreparedInsertOnConflictAction,
+    PreparedWriteOperationKind, PreparedWriteStatementKind, PublicWriteExecutionPartition,
+    PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan, SqlCompilerMetadata,
+    SqlPreparationMetadataReader, UpdateValidationPlan, WriteDiagnosticContext, WriteOperationKind,
 };
 use crate::transaction::ensure_runtime_sequence_initialized_in_transaction;
 use crate::transaction::overlay::PendingOverlay;

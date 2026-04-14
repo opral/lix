@@ -1,4 +1,15 @@
-pub use crate::sql::{PreparedBatch, PreparedStatement};
+use crate::common::Value;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedStatement {
+    pub sql: String,
+    pub params: Vec<Value>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PreparedBatch {
+    pub steps: Vec<PreparedStatement>,
+}
 
 impl PreparedBatch {
     pub fn append_sql(&mut self, sql: impl AsRef<str>) {

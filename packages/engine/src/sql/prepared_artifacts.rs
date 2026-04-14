@@ -4,23 +4,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;
 
+use crate::backend::PreparedBatch;
 use crate::catalog::{ResolvedRelation, SurfaceReadFreshness};
 use crate::common::Value;
 use crate::contracts::TransactionBeginMode;
 use crate::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::logical_plan::ResultContract;
 use crate::streams::StateCommitStreamOperation;
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedStatement {
-    pub sql: String,
-    pub params: Vec<Value>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct PreparedBatch {
-    pub steps: Vec<PreparedStatement>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommittedReadMode {

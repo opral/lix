@@ -3,6 +3,7 @@
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
 //! and compiler-owned explain payload/template generation.
 
+use crate::backend::PreparedStatement;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationKind,
     RelationBindContext, RelationBinding, ResolvedRelation, SurfaceCapability, SurfaceFamily,
@@ -68,7 +69,7 @@ use crate::sql::semantic_ir::{
 };
 use crate::sql::{
     DependencyPrecision, DependencySpec, EffectiveStateRequest, EffectiveStateVersionScope,
-    MutationOperation, MutationRow, PreparedExplainTemplate, PreparedStatement, QueryDependency,
+    MutationOperation, MutationRow, PreparedExplainTemplate, QueryDependency,
     ReadTimeProjectionPlan, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 use crate::streams::StateCommitStreamChange;
