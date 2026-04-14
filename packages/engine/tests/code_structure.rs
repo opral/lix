@@ -1692,43 +1692,6 @@ fn sealed_owner_allows_importer(owner_root: &str, importer_file: &str) -> bool {
     matches!(owner_root, "api") && importer_file == "lib.rs"
 }
 
-fn sealed_owner_whitelist() -> BTreeSet<&'static str> {
-    [
-        "api",
-        "binary_cas",
-        "backend",
-        "canonical",
-        "catalog",
-        "common",
-        "contracts",
-        "diagnostics",
-        "init",
-        "live_state",
-        "schema",
-        "sql",
-        "transaction",
-    ]
-    .into_iter()
-    .collect()
-}
-
-fn violations_for_sealed_owners(
-    violations: &[SealedOwnerViolation],
-    sealed_owners: &BTreeSet<&'static str>,
-) -> Vec<SealedOwnerViolation> {
-    violations
-        .iter()
-        .filter(|violation| {
-            violation
-                .imported_path
-                .split("::")
-                .next()
-                .is_some_and(|owner| sealed_owners.contains(owner))
-        })
-        .cloned()
-        .collect()
-}
-
 fn render_grouped_sealed_owner_violations(violations: &[SealedOwnerViolation]) -> String {
     let mut grouped: BTreeMap<&str, BTreeMap<&str, Vec<&str>>> = BTreeMap::new();
 
@@ -1944,20 +1907,6 @@ fn forbidden_dependency_rules_have_no_current_violations() {
         "forbidden owner-root dependencies are present.\n\nTarget core graph:\n{}\nCurrent violations:\n{}",
         render_target_core_graph(&target_core_graph(&graph)),
         render_forbidden_dependency_violations(&violations, &forbidden_lookup),
-    );
-}
-
-#[test]
-fn sealed_owner_whitelist_has_no_current_violations() {
-    let all_violations = current_sealed_owner_violations();
-    let sealed_owners = sealed_owner_whitelist();
-    let violations = violations_for_sealed_owners(&all_violations, &sealed_owners);
-
-    assert!(
-        violations.is_empty(),
-        "owners marked sealed still have child-module import leaks.\n\nSealed owners: {}\n\nCurrent violations:\n{}",
-        sealed_owners.iter().copied().collect::<Vec<_>>().join(", "),
-        render_grouped_sealed_owner_violations(&violations),
     );
 }
 

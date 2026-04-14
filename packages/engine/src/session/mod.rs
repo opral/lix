@@ -10,7 +10,6 @@ pub(crate) mod host;
 mod init;
 pub(crate) mod observe;
 pub(crate) mod plugin;
-pub(crate) mod plugin_install_writes;
 pub(crate) mod public_read_execution;
 pub(crate) mod public_read_preparation;
 mod selector_reads;
@@ -37,9 +36,7 @@ use crate::contracts::{
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
 use crate::image::ImageChunkWriter;
-use crate::session::plugin_install_writes::{
-    prepare_registered_schema_write_statement, PluginInstallWriteContext,
-};
+use crate::plugin::{prepare_registered_schema_write_statement, PluginInstallWriteContext};
 pub(crate) use crate::session::selector_reads::SessionWriteSelectorResolver;
 use crate::session::workspace::{
     load_workspace_active_account_ids, persist_workspace_selectors,

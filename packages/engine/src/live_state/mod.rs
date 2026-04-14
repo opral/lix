@@ -211,7 +211,7 @@ pub async fn rebuild(
 
 pub(crate) async fn rebuild_projection(
     backend: &dyn LixBackend,
-    plugin_materializer: &dyn crate::contracts::FilesystemPluginMaterializer,
+    plugin_materializer: &dyn crate::plugin::FilesystemPluginMaterializer,
     request: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildReport, LixError> {
     materialize::rebuild_projection(backend, plugin_materializer, request).await

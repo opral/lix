@@ -1,38 +1,27 @@
 use std::collections::{BTreeMap, HashMap};
-use std::io::{Cursor, Read};
-use std::path::{Component, Path};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
-use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
+use super::deterministic_settings::{load_global_runtime_settings, DeterministicSettings};
 use super::streams::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
-use crate::binary_cas::load_blob_data_by_hash;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::{
-    clone_boxed_function_provider, parse_plugin_manifest_json, CompiledSchemaCache,
-    DynFunctionProvider, FilesystemPluginMaterializer, InstalledPlugin,
-};
+use crate::contracts::{clone_boxed_function_provider, CompiledSchemaCache, DynFunctionProvider};
 use crate::functions::RuntimeFunctionProvider;
-use crate::live_state::{list_installed_plugin_archive_refs, PluginArchiveRef};
+use crate::plugin::{
+    invalidate_installed_plugins_cache, CachedPluginComponent, InstalledPlugin,
+    PluginComponentHost, PluginMaterializationHost,
+};
 use crate::schema::SchemaKey;
-use crate::wasm::{WasmComponentInstance, WasmLimits, WasmRuntime};
+use crate::wasm::WasmRuntime;
 use crate::{LixBackend, LixError, TransactionBeginMode};
-use zip::read::ZipArchive;
-
-use super::deterministic_settings::{load_global_runtime_settings, DeterministicSettings};
 
 const INIT_STATE_NOT_STARTED: u8 = 0;
 const INIT_STATE_IN_PROGRESS: u8 = 1;
 const INIT_STATE_COMPLETED: u8 = 2;
-
-struct CachedPluginComponent {
-    wasm: Vec<u8>,
-    instance: Arc<dyn WasmComponentInstance>,
-}
 
 pub(crate) struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
@@ -243,137 +232,8 @@ impl Engine {
         self.backend.begin_transaction(mode).await
     }
 
-    async fn load_or_init_plugin_component(
-        &self,
-        plugin: &InstalledPlugin,
-    ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-        {
-            let guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "plugin component cache lock poisoned".to_string(),
-            })?;
-            if let Some(cached) = guard.get(&plugin.key) {
-                if cached.wasm == plugin.wasm {
-                    return Ok(cached.instance.clone());
-                }
-            }
-        }
-
-        let initialized = self
-            .wasm_runtime
-            .init_component(plugin.wasm.clone(), WasmLimits::default())
-            .await?;
-        let mut guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin component cache lock poisoned".to_string(),
-        })?;
-        if let Some(cached) = guard.get(&plugin.key) {
-            if cached.wasm == plugin.wasm {
-                return Ok(cached.instance.clone());
-            }
-        }
-        guard.insert(
-            plugin.key.clone(),
-            CachedPluginComponent {
-                wasm: plugin.wasm.clone(),
-                instance: initialized.clone(),
-            },
-        );
-        Ok(initialized)
-    }
-
-    async fn apply_changes_with_plugin(
-        &self,
-        plugin: &InstalledPlugin,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, LixError> {
-        let instance = self.load_or_init_plugin_component(plugin).await?;
-        invoke_apply_changes_export(instance.as_ref(), payload).await
-    }
-
-    async fn load_installed_plugins_with_runtime_cache(
-        &self,
-    ) -> Result<Vec<InstalledPlugin>, LixError> {
-        if let Some(cached) = self
-            .installed_plugins_cache
-            .read()
-            .map_err(|_| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: "installed plugin cache lock poisoned".to_string(),
-            })?
-            .clone()
-        {
-            return Ok(cached);
-        }
-
-        let plugins = self.load_installed_plugins_from_backend().await?;
-        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
-        })?;
-        *guard = Some(plugins.clone());
-        Ok(plugins)
-    }
-
-    async fn load_installed_plugins_from_backend(&self) -> Result<Vec<InstalledPlugin>, LixError> {
-        let archive_refs = list_installed_plugin_archive_refs(self.backend().as_ref()).await?;
-        let mut plugins = Vec::with_capacity(archive_refs.len());
-        for archive_ref in archive_refs {
-            plugins.push(
-                self.load_installed_plugin_from_archive_ref(&archive_ref)
-                    .await?,
-            );
-        }
-        Ok(plugins)
-    }
-
-    async fn load_installed_plugin_from_archive_ref(
-        &self,
-        archive_ref: &PluginArchiveRef,
-    ) -> Result<InstalledPlugin, LixError> {
-        let Some(plugin_key) = crate::contracts::plugin_key_from_archive_path(&archive_ref.path)
-        else {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "plugin materialization: unsupported plugin archive path '{}'",
-                    archive_ref.path
-                ),
-            });
-        };
-        let archive_bytes = load_blob_data_by_hash(self.backend().as_ref(), &archive_ref.blob_hash)
-            .await?
-            .ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
-                    archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
-                ),
-            })?;
-        if archive_bytes.is_empty() {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "plugin materialization: archive '{}' is empty",
-                    archive_ref.path
-                ),
-            });
-        }
-        load_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
-    }
-
     pub(crate) fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
-        let mut guard = self.installed_plugins_cache.write().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "installed plugin cache lock poisoned".to_string(),
-        })?;
-        *guard = None;
-        let mut component_guard = self.plugin_component_cache.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin component cache lock poisoned".to_string(),
-        })?;
-        component_guard.clear();
-        Ok(())
+        invalidate_installed_plugins_cache(self)
     }
 
     #[cfg(test)]
@@ -382,18 +242,23 @@ impl Engine {
     }
 }
 
-#[async_trait(?Send)]
-impl FilesystemPluginMaterializer for Engine {
-    async fn load_installed_plugins(&self) -> Result<Vec<InstalledPlugin>, LixError> {
-        self.load_installed_plugins_with_runtime_cache().await
+impl PluginComponentHost for Engine {
+    fn plugin_component_cache(&self) -> &Mutex<BTreeMap<String, CachedPluginComponent>> {
+        &self.plugin_component_cache
     }
 
-    async fn apply_plugin_changes(
-        &self,
-        plugin: &InstalledPlugin,
-        payload: &[u8],
-    ) -> Result<Vec<u8>, LixError> {
-        self.apply_changes_with_plugin(plugin, payload).await
+    fn wasm_runtime(&self) -> &Arc<dyn WasmRuntime> {
+        &self.wasm_runtime
+    }
+}
+
+impl PluginMaterializationHost for Engine {
+    fn plugin_backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
+        &self.backend
+    }
+
+    fn installed_plugins_cache(&self) -> &RwLock<Option<Vec<InstalledPlugin>>> {
+        &self.installed_plugins_cache
     }
 }
 
@@ -436,194 +301,11 @@ impl CompiledSchemaCache for SchemaCache {
     }
 }
 
-const APPLY_CHANGES_EXPORTS: &[&str] = &["apply-changes", "api#apply-changes"];
-
-async fn invoke_apply_changes_export(
-    instance: &dyn WasmComponentInstance,
-    payload: &[u8],
-) -> Result<Vec<u8>, LixError> {
-    let mut errors = Vec::new();
-    for export in APPLY_CHANGES_EXPORTS {
-        match instance.call(export, payload).await {
-            Ok(output) => return Ok(output),
-            Err(error) => errors.push(format!("{export}: {}", error.description)),
-        }
-    }
-
-    Err(LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin materialization: failed to call apply-changes export ({})",
-            errors.join("; ")
-        ),
-    })
-}
-
-fn load_installed_plugin_from_archive_bytes(
-    plugin_key: &str,
-    archive_path: &str,
-    archive_bytes: &[u8],
-) -> Result<InstalledPlugin, LixError> {
-    let files = read_plugin_archive_files(archive_path, archive_bytes)?;
-    let manifest_bytes = files.get("manifest.json").ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin materialization: archive '{}' is missing manifest.json",
-            archive_path
-        ),
-    })?;
-    let manifest_raw = std::str::from_utf8(manifest_bytes).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin materialization: archive '{}' manifest.json must be UTF-8: {error}",
-            archive_path
-        ),
-    })?;
-    let validated_manifest = parse_plugin_manifest_json(manifest_raw)?;
-    if validated_manifest.manifest.key != plugin_key {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: archive '{}' key mismatch: path key '{}' vs manifest key '{}'",
-                archive_path, plugin_key, validated_manifest.manifest.key
-            ),
-        });
-    }
-
-    let entry_path = normalize_plugin_archive_path(&validated_manifest.manifest.entry)?;
-    let wasm = files.get(&entry_path).ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin materialization: archive '{}' is missing entry file '{}'",
-            archive_path, validated_manifest.manifest.entry
-        ),
-    })?;
-    ensure_valid_plugin_wasm(wasm)?;
-
-    let manifest = validated_manifest.manifest;
-    let content_type = manifest.file_match.content_type;
-
-    Ok(InstalledPlugin {
-        key: manifest.key,
-        runtime: manifest.runtime,
-        api_version: manifest.api_version,
-        path_glob: manifest.file_match.path_glob,
-        content_type,
-        entry: manifest.entry,
-        manifest_json: validated_manifest.normalized_json,
-        wasm: wasm.clone(),
-    })
-}
-
-fn read_plugin_archive_files(
-    archive_path: &str,
-    archive_bytes: &[u8],
-) -> Result<std::collections::BTreeMap<String, Vec<u8>>, LixError> {
-    if archive_bytes.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: archive '{}' is empty",
-                archive_path
-            ),
-        });
-    }
-
-    let mut archive = ZipArchive::new(Cursor::new(archive_bytes)).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "plugin materialization: archive '{}' is not a valid zip file: {error}",
-            archive_path
-        ),
-    })?;
-    let mut files = std::collections::BTreeMap::<String, Vec<u8>>::new();
-
-    for index in 0..archive.len() {
-        let mut entry = archive.by_index(index).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: failed to read archive '{}' entry index {}: {error}",
-                archive_path, index
-            ),
-        })?;
-
-        let entry_name = entry.name().to_string();
-        let normalized_path = normalize_plugin_archive_path(&entry_name)?;
-        if normalized_path.ends_with('/') {
-            continue;
-        }
-
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes).map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: failed to read archive '{}' entry '{}': {error}",
-                archive_path, entry_name
-            ),
-        })?;
-        files.insert(normalized_path, bytes);
-    }
-
-    Ok(files)
-}
-
-fn normalize_plugin_archive_path(path: &str) -> Result<String, LixError> {
-    let raw_path = Path::new(path);
-    if raw_path.is_absolute() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "plugin materialization: archive path '{}' must be relative",
-                path
-            ),
-        });
-    }
-
-    let mut normalized = Vec::new();
-    for component in raw_path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part.to_string_lossy().to_string()),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "plugin materialization: archive path '{}' must not escape the archive root",
-                        path
-                    ),
-                });
-            }
-        }
-    }
-
-    if normalized.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin materialization: archive path must not be empty".to_string(),
-        });
-    }
-
-    Ok(normalized.join("/"))
-}
-
-fn ensure_valid_plugin_wasm(bytes: &[u8]) -> Result<(), LixError> {
-    const WASM_MAGIC: &[u8; 4] = b"\0asm";
-    if bytes.len() < WASM_MAGIC.len() || &bytes[..WASM_MAGIC.len()] != WASM_MAGIC {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "plugin materialization: entry file must be a valid WebAssembly module"
-                .to_string(),
-        });
-    }
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::{InstalledPlugin, LixFunctionProvider, PluginRuntime};
-    use crate::wasm::{NoopWasmRuntime, WasmLimits};
+    use crate::contracts::LixFunctionProvider;
+    use crate::wasm::NoopWasmRuntime;
     use crate::{Lix, LixConfig, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use std::sync::{
@@ -710,73 +392,5 @@ mod tests {
             2,
             "cache invalidation should force a backend refresh"
         );
-    }
-
-    #[derive(Default)]
-    struct CountingRuntime {
-        init_calls: Arc<AtomicUsize>,
-    }
-
-    struct NoopComponent;
-
-    #[async_trait(?Send)]
-    impl WasmRuntime for CountingRuntime {
-        async fn init_component(
-            &self,
-            _bytes: Vec<u8>,
-            _limits: WasmLimits,
-        ) -> Result<Arc<dyn WasmComponentInstance>, LixError> {
-            self.init_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(Arc::new(NoopComponent))
-        }
-    }
-
-    #[async_trait(?Send)]
-    impl WasmComponentInstance for NoopComponent {
-        async fn call(&self, _export: &str, _input: &[u8]) -> Result<Vec<u8>, LixError> {
-            Ok(Vec::new())
-        }
-    }
-
-    #[tokio::test]
-    async fn component_cache_reinitializes_when_same_key_wasm_changes() {
-        let runtime = Arc::new(CountingRuntime::default());
-        let engine = Engine::new(
-            Box::new(CountingBackend {
-                execute_calls: Arc::new(AtomicUsize::new(0)),
-            }),
-            runtime.clone(),
-            false,
-            None,
-            crate::catalog::build_builtin_surface_registry(),
-            Arc::new(crate::catalog::builtin_catalog_projection_registry().clone()),
-        );
-        let mut plugin = InstalledPlugin {
-            key: "k".to_string(),
-            runtime: PluginRuntime::WasmComponentV1,
-            api_version: "0.1.0".to_string(),
-            path_glob: "*.json".to_string(),
-            content_type: None,
-            entry: "plugin.wasm".to_string(),
-            manifest_json: "{}".to_string(),
-            wasm: vec![1],
-        };
-
-        engine
-            .load_or_init_plugin_component(&plugin)
-            .await
-            .expect("first init should succeed");
-        engine
-            .load_or_init_plugin_component(&plugin)
-            .await
-            .expect("second lookup should reuse cache");
-        assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 1);
-
-        plugin.wasm = vec![2];
-        engine
-            .load_or_init_plugin_component(&plugin)
-            .await
-            .expect("changed wasm should reinitialize instance");
-        assert_eq!(runtime.init_calls.load(Ordering::SeqCst), 2);
     }
 }
