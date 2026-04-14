@@ -1,5 +1,5 @@
 use super::*;
-use crate::contracts::{
+use crate::functions::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
 use crate::live_state::{

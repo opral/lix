@@ -5,12 +5,12 @@ use sqlparser::ast::{
 };
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct StatementEffects {
-    pub requires_deterministic_sequence_persistence: bool,
+pub(crate) struct StatementEffects {
+    pub(crate) requires_deterministic_sequence_persistence: bool,
 }
 
 impl StatementEffects {
-    pub fn merge(self, other: Self) -> Self {
+    pub(crate) fn merge(self, other: Self) -> Self {
         Self {
             requires_deterministic_sequence_persistence: self
                 .requires_deterministic_sequence_persistence
@@ -19,7 +19,7 @@ impl StatementEffects {
     }
 }
 
-pub fn derive_statement_effects(statements: &[Statement]) -> StatementEffects {
+pub(crate) fn derive_statement_effects(statements: &[Statement]) -> StatementEffects {
     statements
         .iter()
         .fold(StatementEffects::default(), |effects, statement| {

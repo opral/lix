@@ -11,8 +11,8 @@ fn build_error(code: &str, description: impl Into<String>) -> LixError {
     LixError::new(code, description.into())
 }
 
-fn system_functions() -> crate::contracts::DynFunctionProvider {
-    crate::contracts::clone_boxed_function_provider(&crate::contracts::SharedFunctionProvider::new(
+fn system_functions() -> crate::functions::DynFunctionProvider {
+    crate::functions::clone_boxed_function_provider(&crate::functions::SharedFunctionProvider::new(
         crate::functions::SystemFunctionProvider,
     ))
 }

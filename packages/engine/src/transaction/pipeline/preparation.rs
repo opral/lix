@@ -14,10 +14,10 @@ use crate::backend::PreparedBatch;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::{
+use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
+use crate::functions::{
     clone_boxed_function_provider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
-use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
 use crate::sql::bind_sql;
 use crate::sql::{

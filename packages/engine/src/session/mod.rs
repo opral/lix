@@ -27,9 +27,9 @@ use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::FunctionBindings;
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
+use crate::functions::FunctionBindings;
 use crate::image::ImageChunkWriter;
 use crate::plugin::{prepare_registered_schema_write_statement, PluginInstallWriteContext};
 use crate::session::workspace::{
@@ -94,8 +94,8 @@ pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
 
 pub(crate) async fn persist_runtime_sequence_in_transaction(
     transaction: &mut dyn crate::LixBackendTransaction,
-    functions: &crate::contracts::SharedFunctionProvider<
-        Box<dyn crate::contracts::LixFunctionProvider + Send>,
+    functions: &crate::functions::SharedFunctionProvider<
+        Box<dyn crate::functions::LixFunctionProvider + Send>,
     >,
 ) -> Result<(), LixError> {
     write_execution_context::persist_runtime_sequence(transaction, functions).await

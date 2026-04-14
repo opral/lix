@@ -4,9 +4,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::contracts::{
-    DynFunctionProvider, LixFunctionProvider, SchemaAnnotationEvaluator, SharedFunctionProvider,
-};
+use crate::contracts::SchemaAnnotationEvaluator;
+use crate::functions::{DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
 use super::context::build_context_with_functions;
@@ -83,7 +82,7 @@ pub(crate) fn shared_runtime() -> &'static CelEvaluator {
 #[cfg(test)]
 mod tests {
     use super::CelEvaluator;
-    use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+    use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
     use serde_json::{json, Map as JsonMap, Value as JsonValue};
 
     struct FixedFunctions;

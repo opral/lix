@@ -7,7 +7,7 @@ use rusqlite::types::{Value as SqliteValue, ValueRef};
 use crate::catalog::{
     CatalogProjectionRegistry, CatalogReadTimeProjectionRequest, SurfaceReadFreshness,
 };
-use crate::contracts::SharedFunctionProvider;
+use crate::functions::SharedFunctionProvider;
 use crate::functions::SystemFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
@@ -314,7 +314,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     planned_write: &PlannedWrite,
     pending_write_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
-    let selector_functions = crate::contracts::clone_boxed_function_provider(
+    let selector_functions = crate::functions::clone_boxed_function_provider(
         &SharedFunctionProvider::new(SystemFunctionProvider),
     );
     let selector_resolver = TransactionWriteSelectorResolver::new(

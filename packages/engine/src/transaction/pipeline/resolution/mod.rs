@@ -7,7 +7,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::OptionalTextPatch;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{

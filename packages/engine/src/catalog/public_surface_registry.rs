@@ -7,7 +7,8 @@ use crate::catalog::{
     register_dynamic_entity_surface_spec, remove_dynamic_entity_surfaces_for_schema_key,
     SurfaceRegistry,
 };
-use crate::contracts::{DynFunctionProvider, SchemaAnnotationEvaluator};
+use crate::contracts::SchemaAnnotationEvaluator;
+use crate::functions::DynFunctionProvider;
 use crate::live_state::{
     decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
 };
@@ -88,14 +89,14 @@ mod tests {
         dynamic_entity_surface_spec_from_schema, SurfaceFamily, SurfaceOverrideValue,
     };
     use crate::cel::shared_runtime;
-    use crate::contracts::{clone_boxed_function_provider, SharedFunctionProvider};
     use crate::functions::SystemFunctionProvider;
+    use crate::functions::{clone_boxed_function_provider, SharedFunctionProvider};
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn system_functions() -> crate::contracts::DynFunctionProvider {
+    fn system_functions() -> crate::functions::DynFunctionProvider {
         clone_boxed_function_provider(&SharedFunctionProvider::new(SystemFunctionProvider))
     }
 

@@ -1,4 +1,4 @@
-use crate::contracts::StatementEffects;
+use crate::sql::prepare::StatementEffects;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlanRequirements {

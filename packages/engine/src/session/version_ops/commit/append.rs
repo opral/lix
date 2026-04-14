@@ -1,4 +1,4 @@
-use crate::contracts::LixFunctionProvider;
+use crate::functions::LixFunctionProvider;
 use crate::transaction::PendingCommitState;
 use crate::transaction::{binary_blob_writes_from_filesystem_state, FilesystemTransactionState};
 use crate::{LixBackendTransaction, LixError};
@@ -180,7 +180,7 @@ mod tests {
         CreateCommitArgs, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
         CreateCommitPreconditions, CreateCommitWriteLane, PendingCommitState,
     };
-    use crate::contracts::LixFunctionProvider;
+    use crate::functions::LixFunctionProvider;
     use crate::transaction::PendingCommitLane;
     use crate::{
         LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode, Value,

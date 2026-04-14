@@ -25,14 +25,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 }
 
 pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
-    lix.try_mark_init_in_progress()?;
+    lix.engine().try_mark_init_in_progress()?;
 
-    if load_mode_with_backend(lix.backend().as_ref()).await? != LiveStateMode::Uninitialized {
-        lix.reset_init_state();
+    if load_mode_with_backend(lix.engine().backend().as_ref()).await?
+        != LiveStateMode::Uninitialized
+    {
+        lix.engine().reset_init_state();
         return Err(crate::common::already_initialized_error());
     }
 
     let mut transaction = lix
+        .engine()
         .backend()
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
@@ -144,15 +147,14 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
 
     if result.is_ok() {
         transaction.commit().await?;
-        if lix.deterministic_boot_pending() {
-            lix.clear_deterministic_boot_pending();
+        if lix.engine().deterministic_boot_pending() {
+            lix.engine().clear_deterministic_boot_pending();
         }
-        lix.mark_init_completed();
-        lix.refresh_public_surface_registry().await?;
-        let _ = lix.opened_workspace_session().await?;
+        lix.engine().mark_init_completed();
+        lix.open_existing().await?;
     } else {
         let _ = transaction.rollback().await;
-        lix.reset_init_state();
+        lix.engine().reset_init_state();
     }
 
     result
@@ -163,8 +165,7 @@ pub(crate) async fn init_if_needed(lix: &Lix) -> Result<bool, LixError> {
         Ok(()) => Ok(true),
         Err(error) if error.code == crate::common::ErrorCode::AlreadyInitialized.as_str() => {
             lix.wait_for_concurrent_init_ready().await?;
-            lix.refresh_public_surface_registry().await?;
-            let _ = lix.opened_workspace_session().await?;
+            lix.open_existing().await?;
             Ok(false)
         }
         Err(error) => Err(error),
@@ -187,7 +188,10 @@ impl Lix {
     }
 
     async fn backend_has_been_initialized(&self) -> Result<bool, LixError> {
-        Ok(load_mode_with_backend(self.backend().as_ref()).await? != LiveStateMode::Uninitialized)
+        Ok(
+            load_mode_with_backend(self.engine().backend().as_ref()).await?
+                != LiveStateMode::Uninitialized,
+        )
     }
 
     async fn normalize_init_error(&self, error: LixError) -> LixError {
@@ -208,7 +212,7 @@ impl Lix {
         const DELAY_MS: u64 = 50;
 
         for attempt in 0..ATTEMPTS {
-            match load_mode_with_backend(self.backend().as_ref()).await? {
+            match load_mode_with_backend(self.engine().backend().as_ref()).await? {
                 LiveStateMode::Ready => return Ok(()),
                 LiveStateMode::Bootstrapping => {
                     if attempt + 1 == ATTEMPTS {

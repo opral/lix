@@ -286,8 +286,8 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     writer_key: Option<&str>,
     allow_internal_relations: bool,
 ) -> Result<Option<PublicPlan>, LixError> {
-    let functions = crate::contracts::clone_boxed_function_provider(
-        &crate::contracts::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
+    let functions = crate::functions::clone_boxed_function_provider(
+        &crate::functions::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
     );
     let registry = crate::catalog::load_public_surface_registry_with_backend(
         backend,

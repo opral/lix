@@ -1,6 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::LixFunctionProvider;
+use crate::functions::LixFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::sql::PlannedStateRow;
 use crate::transaction::pipeline::WriteExecutionOutcome;

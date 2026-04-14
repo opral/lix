@@ -6,13 +6,12 @@ use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
 use super::deterministic_settings::{load_global_runtime_settings, DeterministicSettings};
-use super::lix::Lix;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::{
-    clone_boxed_function_provider, CompiledSchemaCache, DynFunctionProvider, FunctionBindings,
-    LixFunctionProvider, SharedFunctionProvider,
+use crate::contracts::CompiledSchemaCache;
+use crate::functions::{
+    clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
+    RuntimeFunctionProvider, SharedFunctionProvider,
 };
-use crate::functions::RuntimeFunctionProvider;
 use crate::plugin::{
     invalidate_installed_plugins_cache, CachedPluginComponent, InstalledPlugin,
     PluginComponentHost, PluginMaterializationHost,
@@ -190,7 +189,7 @@ impl Engine {
             settings
         };
 
-        Ok(crate::contracts::SharedFunctionProvider::new(Box::new(
+        Ok(SharedFunctionProvider::new(Box::new(
             RuntimeFunctionProvider::new(
                 settings.enabled,
                 settings.uuid_v7_enabled,
@@ -345,13 +344,13 @@ impl crate::session::SessionHost for EngineSessionHost {
 }
 
 #[async_trait(?Send)]
-impl crate::transaction::WriteExecutionContext for Lix {
+impl crate::transaction::WriteExecutionContext for Engine {
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
         self.catalog_projection_registry().as_ref()
     }
 
     fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
-        self.engine().schema_cache()
+        self.schema_cache()
     }
 
     fn sql_compiler_seed<'a>(
@@ -492,7 +491,7 @@ impl CompiledSchemaCache for SchemaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::LixFunctionProvider;
+    use crate::functions::LixFunctionProvider;
     use crate::wasm::NoopWasmRuntime;
     use crate::{Lix, LixConfig, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
@@ -549,7 +548,8 @@ mod tests {
         let lix = Lix::boot(LixConfig::new(Box::new(backend), Arc::new(NoopWasmRuntime)));
 
         let functions = lix
-            .prepare_runtime_functions_with_backend(lix.backend().as_ref())
+            .engine()
+            .prepare_runtime_functions_with_backend(lix.engine().backend().as_ref())
             .await
             .expect("first runtime preparation should succeed");
         assert!(!functions.deterministic_sequence_enabled());
@@ -560,7 +560,8 @@ mod tests {
         );
 
         let _functions = lix
-            .prepare_runtime_functions_with_backend(lix.backend().as_ref())
+            .engine()
+            .prepare_runtime_functions_with_backend(lix.engine().backend().as_ref())
             .await
             .expect("second runtime preparation should succeed");
         assert_eq!(
@@ -572,7 +573,8 @@ mod tests {
         lix.engine().invalidate_deterministic_settings_cache();
 
         let _functions = lix
-            .prepare_runtime_functions_with_backend(lix.backend().as_ref())
+            .engine()
+            .prepare_runtime_functions_with_backend(lix.engine().backend().as_ref())
             .await
             .expect("runtime preparation after invalidation should succeed");
         assert_eq!(

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::contracts::DynFunctionProvider;
+use crate::functions::DynFunctionProvider;
 use crate::live_state::{
     compile_live_row_shape_from_registered_snapshots, live_row_shape_from_definition,
     scan_visible_live_rows, LiveReadRow, LiveRowShape, LiveStorageLane, ScanConstraint, ScanField,

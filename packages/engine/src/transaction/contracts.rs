@@ -2,7 +2,7 @@ use async_trait::async_trait;
 
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
 use crate::contracts::CompiledSchemaCache;
-use crate::contracts::{
+use crate::functions::{
     DynFunctionProvider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
 #[cfg(test)]

@@ -20,6 +20,7 @@ mod prepared_read;
 pub(crate) mod preprocess;
 pub(crate) mod public_surface;
 pub(crate) mod script;
+pub(crate) mod statement_effects;
 
 pub(crate) use compile::{
     compile_execution_from_bound_statement_with_context, CompilePolicy, SqlCompilerContext,
@@ -46,3 +47,4 @@ pub(crate) use public_surface::{
     try_prepare_public_read_with_registry_and_internal_access, PublicPlan, PublicReadPlan,
     PublicWritePlan,
 };
+pub(crate) use statement_effects::{derive_statement_effects, StatementEffects};

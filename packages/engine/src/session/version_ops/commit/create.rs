@@ -5,8 +5,8 @@ use crate::canonical::{
     append_changes, CanonicalChangeWrite, CanonicalCommitReceipt, CanonicalStateIdentity,
     UpdatedVersionRef,
 };
-use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
+use crate::functions::LixFunctionProvider;
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
@@ -1297,8 +1297,8 @@ mod tests {
         CreateCommitWriteLane,
     };
     use crate::canonical::CanonicalChangeWrite;
-    use crate::contracts::LixFunctionProvider;
     use crate::contracts::GLOBAL_VERSION_ID;
+    use crate::functions::LixFunctionProvider;
     use crate::session::version_ops::commit::UpdatedVersionRef;
     use crate::sql::OptionalTextPatch;
     use crate::test_support::{

@@ -3566,8 +3566,8 @@ pub(super) async fn try_prepare_public_read(
     active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
-    let functions = crate::contracts::clone_boxed_function_provider(
-        &crate::contracts::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
+    let functions = crate::functions::clone_boxed_function_provider(
+        &crate::functions::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
     );
     let registry = crate::catalog::load_public_surface_registry_with_backend(
         backend,

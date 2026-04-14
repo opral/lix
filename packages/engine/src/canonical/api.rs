@@ -17,7 +17,7 @@ use crate::canonical::read::{
     ExactCommittedStateRowRequest,
 };
 use crate::common::escape_sql_string;
-use crate::contracts::LixFunctionProvider;
+use crate::functions::LixFunctionProvider;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 pub(crate) type CanonicalChangeWrite = ChangeRow;
