@@ -251,8 +251,7 @@ mod tests {
 
     use super::{execute_read_time_projection_read, execute_read_time_projection_rows};
     use crate::catalog::{bind_named_relation, RelationBindContext};
-    use crate::contracts::ReadTimeProjectionIdentity;
-    use crate::execution::read::ReadTimeProjectionRow;
+    use crate::execution::read::{ReadTimeProjectionIdentity, ReadTimeProjectionRow};
     use crate::live_state;
     use crate::schema::LixCommit;
     use crate::sql::lower_catalog_relation_binding_to_source_sql;

@@ -3,7 +3,7 @@ use std::time::Duration;
 use crate::sql::{PreparedAnalyzedRuntime, PreparedExplainTemplate};
 use crate::{LixError, QueryResult, Value};
 
-pub fn render_plain_explain_result(
+pub(crate) fn render_plain_explain_result(
     template: &PreparedExplainTemplate,
 ) -> Result<QueryResult, LixError> {
     match template {
@@ -12,7 +12,7 @@ pub fn render_plain_explain_result(
     }
 }
 
-pub fn render_analyzed_explain_result(
+pub(crate) fn render_analyzed_explain_result(
     template: &PreparedExplainTemplate,
     result: &QueryResult,
     execution_duration: Duration,
