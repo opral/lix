@@ -245,7 +245,13 @@ where
             resolve_admin_write(&mut hydrator, planned_write, selector_resolver).await
         }
         SurfaceFamily::Filesystem => {
-            resolve_filesystem_write(&mut hydrator, planned_write, selector_resolver).await
+            resolve_filesystem_write(
+                &mut hydrator,
+                planned_write,
+                functions.clone(),
+                selector_resolver,
+            )
+            .await
         }
         SurfaceFamily::Change => Err(WriteResolveError {
             message: format!(

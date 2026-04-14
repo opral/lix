@@ -434,17 +434,6 @@ pub(crate) async fn validate_update_inputs(
             }
 
             let key = SchemaKey::new(row.schema_key.clone(), row.schema_version.clone());
-            let schema = schema_provider.load_schema(&key).await?;
-
-            if schema.get("x-lix-immutable").and_then(|v| v.as_bool()) == Some(true) {
-                return Err(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "Schema '{}' is immutable and cannot be updated.",
-                        row.schema_key
-                    ),
-                });
-            }
 
             if let Some(snapshot) = snapshot.as_ref() {
                 validate_snapshot_content(&mut schema_provider, cache, &key, snapshot).await?;
@@ -567,15 +556,6 @@ async fn validate_prepared_public_write(
         }
         let snapshot = planned_row_snapshot(row)?;
         validate_checkpoint_label_mutation(&row.schema_key, snapshot.as_ref(), None)?;
-    }
-
-    if public_write.contract.operation_kind == PreparedWriteOperationKind::Update {
-        for row in resolved.intended_post_state() {
-            if row.tombstone {
-                continue;
-            }
-            validate_update_is_mutable(&mut schema_provider, row).await?;
-        }
     }
 
     for row in resolved.intended_post_state() {
@@ -812,29 +792,6 @@ async fn validate_snapshot_content(
             description: format!(
                 "snapshot_content does not match schema '{}' ({}): {details}",
                 key.schema_key, key.schema_version
-            ),
-        });
-    }
-
-    Ok(())
-}
-
-async fn validate_update_is_mutable(
-    provider: &mut WriteValidationSchemaLookup<'_>,
-    row: &PlannedStateRow,
-) -> Result<(), LixError> {
-    let key = SchemaKey::new(
-        row.schema_key.clone(),
-        planned_row_required_text(row, "schema_version")?,
-    );
-    let schema = provider.load_schema(&key).await?;
-
-    if schema.get("x-lix-immutable").and_then(|v| v.as_bool()) == Some(true) {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "Schema '{}' is immutable and cannot be updated.",
-                row.schema_key
             ),
         });
     }

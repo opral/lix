@@ -35,7 +35,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_primary_key_pointers(schema)?;
     assert_unique_pointers(schema)?;
     assert_non_aliased_lix_foreign_key_references(schema)?;
-    assert_removed_entity_views_absent(schema)?;
+    assert_known_x_lix_top_level_fields(schema)?;
     assert_removed_lixcol_version_override_absent(schema)?;
 
     Ok(())
@@ -231,14 +231,35 @@ fn assert_removed_lixcol_version_override_absent(schema: &JsonValue) -> Result<(
     Ok(())
 }
 
-fn assert_removed_entity_views_absent(schema: &JsonValue) -> Result<(), LixError> {
-    if schema.get("x-lix-entity-views").is_some() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "Invalid Lix schema definition: x-lix-entity-views is no longer supported."
-                    .to_string(),
-        });
+fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixError> {
+    let Some(object) = schema.as_object() else {
+        return Ok(());
+    };
+
+    for key in object.keys() {
+        if !key.starts_with("x-lix-") {
+            continue;
+        }
+
+        let known = matches!(
+            key.as_str(),
+            "x-lix-key"
+                | "x-lix-version"
+                | "x-lix-primary-key"
+                | "x-lix-unique"
+                | "x-lix-foreign-keys"
+                | "x-lix-override-lixcols"
+        );
+
+        if !known {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "Invalid Lix schema definition: unknown x-lix field '{}'.",
+                    key
+                ),
+            });
+        }
     }
 
     Ok(())

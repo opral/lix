@@ -2,9 +2,7 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{
-    Expr, FunctionArguments, Insert, SetExpr, Statement, Value as SqlValue, VisitMut, VisitorMut,
-};
+use sqlparser::ast::{Expr, FunctionArguments, Statement, Value as SqlValue, VisitMut, VisitorMut};
 
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::parser::placeholders::{parse_placeholder_ref, resolve_placeholder_ref};
@@ -133,14 +131,6 @@ pub(crate) fn advance_placeholder_state_for_statement_ast(
         return Err(error);
     }
     Ok(())
-}
-
-pub(crate) fn insert_values_rows_mut(insert: &mut Insert) -> Option<&mut [Vec<Expr>]> {
-    let source = insert.source.as_mut()?;
-    let SetExpr::Values(values) = source.body.as_mut() else {
-        return None;
-    };
-    Some(values.rows.as_mut_slice())
 }
 
 struct PlaceholderBinder<'a> {

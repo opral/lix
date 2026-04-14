@@ -413,8 +413,12 @@ mod tests {
         );
         let canonicalized =
             canonicalize_write(bound, &registry).expect("write should canonicalize");
+        let functions: crate::functions::DynFunctionProvider =
+            crate::functions::SharedFunctionProvider::new(Box::new(
+                crate::functions::SystemFunctionProvider,
+            ));
         let mut planned_write =
-            analyze_write(&canonicalized).expect("write analysis should succeed");
+            analyze_write(&canonicalized, &functions).expect("write analysis should succeed");
         let resolved_write_plan = crate::test_support::resolve_write_plan_for_test(
             &backend,
             crate::catalog::builtin_catalog_projection_registry(),
