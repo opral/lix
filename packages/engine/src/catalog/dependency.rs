@@ -6,14 +6,12 @@ use crate::catalog::{
     RelationBindContext, RelationBinding, ResolvedRelation, SchemaRelationBinding, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant, VersionRelationBinding,
 };
-use crate::session::SessionDependency;
 use crate::LixError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(crate) struct CatalogSurfaceDependencyMetadata {
     pub(crate) relation_names: BTreeSet<String>,
     pub(crate) compiled_schema_keys: BTreeSet<String>,
-    pub(crate) session_dependencies: BTreeSet<SessionDependency>,
     pub(crate) uses_dynamic_state_relations: bool,
     pub(crate) depends_on_active_version: bool,
     pub(crate) depends_on_public_surface_registry: bool,
@@ -22,14 +20,10 @@ pub(crate) struct CatalogSurfaceDependencyMetadata {
 impl CatalogSurfaceDependencyMetadata {
     fn note_active_version(&mut self) {
         self.depends_on_active_version = true;
-        self.session_dependencies
-            .insert(SessionDependency::ActiveVersion);
     }
 
     fn note_public_surface_registry(&mut self) {
         self.depends_on_public_surface_registry = true;
-        self.session_dependencies
-            .insert(SessionDependency::PublicSurfaceRegistryGeneration);
     }
 
     fn merge_schema_key(&mut self, schema_key: impl Into<String>) {
@@ -202,8 +196,6 @@ mod tests {
 
     use super::{dependency_metadata_for_surface_name, CatalogSurfaceDependencyMetadata};
     use crate::catalog::{build_builtin_surface_registry, builtin_catalog_projection_registry};
-    use crate::session::SessionDependency;
-
     #[test]
     fn lix_version_dependency_metadata_comes_from_catalog_declaration() {
         let metadata = dependency_metadata_for_surface_name(
@@ -226,9 +218,7 @@ mod tests {
             ])
         );
         assert!(!metadata.depends_on_active_version);
-        assert!(metadata
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+        assert!(metadata.depends_on_public_surface_registry);
     }
 
     #[test]
@@ -291,9 +281,7 @@ mod tests {
         );
         assert!(metadata.uses_dynamic_state_relations);
         assert!(metadata.depends_on_active_version);
-        assert!(metadata
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+        assert!(metadata.depends_on_public_surface_registry);
     }
 
     #[test]

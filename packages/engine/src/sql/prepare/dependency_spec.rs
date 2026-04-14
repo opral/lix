@@ -8,13 +8,14 @@ use sqlparser::ast::{
 use sqlparser::ast::{Visit, Visitor};
 
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
-use crate::session::SessionDependency;
 use crate::sql::binder::bind_sql_with_state;
 use crate::sql::is_untracked_live_table;
-use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::PlaceholderState;
-use crate::sql::{classify_builtin_relation_name, RelationPolicy};
+use crate::sql::{
+    classify_builtin_relation_name, DependencyPrecision, DependencySpec, QueryDependency,
+    RelationPolicy,
+};
 use crate::streams::StateCommitStreamFilter;
 use crate::{LixError, SqlDialect, Value};
 
@@ -50,7 +51,7 @@ pub(crate) fn derive_dependency_spec_from_statements(
         };
 
         collect_relation_names_from_query(&query, &mut spec.relations);
-        collect_session_dependencies_from_query(&query, &mut spec.session_dependencies);
+        collect_query_dependencies_from_query(&query, &mut spec.query_dependencies);
         if allow_literal_filters {
             let representable = collect_literal_filters_from_query(
                 &query,
@@ -101,8 +102,14 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> Result<DependencySpec, 
             uses_dynamic_state_relations |= metadata.uses_dynamic_state_relations;
             depends_on_active_version |= metadata.depends_on_active_version;
             depends_on_public_surface_registry |= metadata.depends_on_public_surface_registry;
-            spec.session_dependencies
-                .extend(metadata.session_dependencies);
+            if metadata.depends_on_active_version {
+                spec.query_dependencies
+                    .insert(QueryDependency::ActiveVersion);
+            }
+            if metadata.depends_on_public_surface_registry {
+                spec.query_dependencies
+                    .insert(QueryDependency::PublicSurfaceRegistryGeneration);
+            }
             continue;
         }
 
@@ -123,22 +130,22 @@ fn finalize_dependency_spec(mut spec: DependencySpec) -> Result<DependencySpec, 
         compiled_schema_keys.extend(spec.schema_keys.iter().cloned());
     }
     if depends_on_active_version {
-        spec.session_dependencies
-            .insert(SessionDependency::ActiveVersion);
+        spec.query_dependencies
+            .insert(QueryDependency::ActiveVersion);
         spec.entity_ids.clear();
         spec.file_ids.clear();
         spec.version_ids.clear();
     }
     if depends_on_public_surface_registry {
-        spec.session_dependencies
-            .insert(SessionDependency::PublicSurfaceRegistryGeneration);
+        spec.query_dependencies
+            .insert(QueryDependency::PublicSurfaceRegistryGeneration);
     }
 
     spec.schema_keys = compiled_schema_keys;
     spec.depends_on_active_version = depends_on_active_version
         || spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion);
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion);
     Ok(spec)
 }
 
@@ -177,12 +184,12 @@ fn collect_relation_names_from_query(query: &Query, relation_names: &mut BTreeSe
     let _ = query.visit(&mut collector);
 }
 
-fn collect_session_dependencies_from_query(
+fn collect_query_dependencies_from_query(
     query: &Query,
-    session_dependencies: &mut BTreeSet<SessionDependency>,
+    query_dependencies: &mut BTreeSet<QueryDependency>,
 ) {
     struct Collector<'a> {
-        session_dependencies: &'a mut BTreeSet<SessionDependency>,
+        query_dependencies: &'a mut BTreeSet<QueryDependency>,
     }
 
     impl Visitor for Collector<'_> {
@@ -204,12 +211,12 @@ fn collect_session_dependencies_from_query(
 
             match function_name.as_str() {
                 "lix_active_version_id" => {
-                    self.session_dependencies
-                        .insert(SessionDependency::ActiveVersion);
+                    self.query_dependencies
+                        .insert(QueryDependency::ActiveVersion);
                 }
                 "lix_active_account_ids" => {
-                    self.session_dependencies
-                        .insert(SessionDependency::ActiveAccounts);
+                    self.query_dependencies
+                        .insert(QueryDependency::ActiveAccounts);
                 }
                 _ => {}
             }
@@ -217,9 +224,7 @@ fn collect_session_dependencies_from_query(
         }
     }
 
-    let mut collector = Collector {
-        session_dependencies,
-    };
+    let mut collector = Collector { query_dependencies };
     let _ = query.visit(&mut collector);
 }
 
@@ -480,8 +485,7 @@ mod tests {
         dependency_spec_to_state_commit_stream_filter, derive_dependency_spec_from_statements,
         parse_sql_statements,
     };
-    use crate::session::SessionDependency;
-    use crate::sql::logical_plan::DependencyPrecision;
+    use crate::sql::{DependencyPrecision, QueryDependency};
     use crate::Value;
 
     #[test]
@@ -495,8 +499,8 @@ mod tests {
         assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert!(spec.depends_on_active_version);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert_eq!(
             spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
             vec!["lix_key_value".to_string()]
@@ -514,8 +518,8 @@ mod tests {
 
         assert_eq!(spec.precision, DependencyPrecision::Conservative);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert!(spec.schema_keys.is_empty());
         assert!(spec.entity_ids.is_empty());
         assert!(spec.file_ids.is_empty());
@@ -581,8 +585,8 @@ mod tests {
         );
         assert!(spec.depends_on_active_version);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+            .query_dependencies
+            .contains(&QueryDependency::PublicSurfaceRegistryGeneration));
     }
 
     #[test]
@@ -603,8 +607,8 @@ mod tests {
         );
         assert!(spec.depends_on_active_version);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
     }
 
     #[test]
@@ -638,8 +642,8 @@ mod tests {
         let spec = derive_dependency_spec_from_statements(&statements, &[]).expect("derive spec");
 
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert_eq!(
             spec.schema_keys.iter().cloned().collect::<Vec<_>>(),
             vec!["lix_key_value".to_string()]
@@ -698,8 +702,8 @@ mod tests {
         assert!(spec.schema_keys.contains("lix_key_value"));
         assert!(spec.depends_on_active_version);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
     }
 
     #[test]

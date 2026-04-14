@@ -1,11 +1,10 @@
 use crate::sql::logical_plan::public_ir::{
     CanonicalStateRowKey, CanonicalStateScan, ReadPlan, StructuredPublicRead, VersionScope,
 };
-use crate::sql::logical_plan::DependencySpec;
 use crate::sql::semantic_ir::semantics::surface_semantics::{
     canonical_filter_column_name, effective_state_pushdown_predicates, overlay_lanes, OverlayLane,
 };
-use crate::sql::{EffectiveStateRequest, EffectiveStateVersionScope};
+use crate::sql::{DependencySpec, EffectiveStateRequest, EffectiveStateVersionScope};
 use crate::Value;
 use sqlparser::ast::{Expr, OrderBy, OrderByKind, SelectItem, Visit, Visitor};
 use std::collections::{BTreeMap, BTreeSet};

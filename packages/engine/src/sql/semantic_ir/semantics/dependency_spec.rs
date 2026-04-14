@@ -2,10 +2,9 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogSurfaceDependencyMetadata,
     ResolvedRelation, SurfaceFamily,
 };
-use crate::session::SessionDependency;
 use crate::sql::logical_plan::public_ir::{ReadPlan, StructuredPublicRead};
-use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::{DependencyPrecision, DependencySpec, QueryDependency};
 use crate::Value;
 use sqlparser::ast::{
     BinaryOperator, Expr, OrderByKind, SelectItem, UnaryOperator, Value as SqlValue, Visit, Visitor,
@@ -148,8 +147,8 @@ pub(crate) fn derive_dependency_spec_from_bound_public_surface_bindings(
 }
 
 fn with_public_surface_registry_dependency(mut spec: DependencySpec) -> DependencySpec {
-    spec.session_dependencies
-        .insert(SessionDependency::PublicSurfaceRegistryGeneration);
+    spec.query_dependencies
+        .insert(QueryDependency::PublicSurfaceRegistryGeneration);
     spec
 }
 
@@ -195,13 +194,27 @@ fn dependency_spec_from_catalog_metadata(binding: &ResolvedRelation) -> Dependen
 fn dependency_spec_from_catalog_surface_metadata(
     metadata: CatalogSurfaceDependencyMetadata,
 ) -> DependencySpec {
+    let query_dependencies = dependency_set_from_catalog_metadata(&metadata);
     DependencySpec {
         relations: metadata.relation_names,
         schema_keys: metadata.compiled_schema_keys,
-        session_dependencies: metadata.session_dependencies,
+        query_dependencies,
         depends_on_active_version: metadata.depends_on_active_version,
         ..DependencySpec::default()
     }
+}
+
+fn dependency_set_from_catalog_metadata(
+    metadata: &CatalogSurfaceDependencyMetadata,
+) -> std::collections::BTreeSet<QueryDependency> {
+    let mut dependencies = std::collections::BTreeSet::new();
+    if metadata.depends_on_active_version {
+        dependencies.insert(QueryDependency::ActiveVersion);
+    }
+    if metadata.depends_on_public_surface_registry {
+        dependencies.insert(QueryDependency::PublicSurfaceRegistryGeneration);
+    }
+    dependencies
 }
 
 fn merge_dependency_specs(mut left: DependencySpec, right: DependencySpec) -> DependencySpec {
@@ -210,7 +223,7 @@ fn merge_dependency_specs(mut left: DependencySpec, right: DependencySpec) -> De
     left.entity_ids.extend(right.entity_ids);
     left.file_ids.extend(right.file_ids);
     left.version_ids.extend(right.version_ids);
-    left.session_dependencies.extend(right.session_dependencies);
+    left.query_dependencies.extend(right.query_dependencies);
     left.writer_filter
         .include
         .extend(right.writer_filter.include);
@@ -474,12 +487,11 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
     use crate::catalog::SurfaceRegistry;
-    use crate::session::SessionDependency;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
-    use crate::sql::logical_plan::DependencyPrecision;
     use crate::sql::semantic_ir::canonicalize::canonicalize_read;
     use crate::sql::semantic_ir::StatementContext;
+    use crate::sql::{DependencyPrecision, QueryDependency};
     use crate::{SqlDialect, Value};
     use std::collections::BTreeSet;
 
@@ -515,11 +527,11 @@ mod tests {
         assert_eq!(spec.precision, DependencyPrecision::Precise);
         assert!(spec.depends_on_active_version);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+            .query_dependencies
+            .contains(&QueryDependency::PublicSurfaceRegistryGeneration));
         assert_eq!(
             spec.schema_keys.into_iter().collect::<Vec<_>>(),
             vec!["lix_key_value".to_string()]
@@ -567,8 +579,8 @@ mod tests {
 
         assert_eq!(spec.precision, DependencyPrecision::Conservative);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert!(spec.schema_keys.is_empty());
         assert!(spec.entity_ids.is_empty());
     }
@@ -588,8 +600,8 @@ mod tests {
         assert_eq!(spec.precision, DependencyPrecision::Conservative);
         assert!(!spec.depends_on_active_version);
         assert!(!spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert_eq!(
             spec.schema_keys,
             BTreeSet::from([
@@ -622,8 +634,8 @@ mod tests {
             ])
         );
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+            .query_dependencies
+            .contains(&QueryDependency::PublicSurfaceRegistryGeneration));
     }
 
     #[test]
@@ -645,10 +657,10 @@ mod tests {
         );
         assert!(spec.depends_on_active_version);
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&QueryDependency::ActiveVersion));
         assert!(spec
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+            .query_dependencies
+            .contains(&QueryDependency::PublicSurfaceRegistryGeneration));
     }
 }

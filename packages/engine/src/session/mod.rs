@@ -45,7 +45,8 @@ use crate::sql::parse_sql;
 use crate::sql::{
     extract_explicit_transaction_script, parse_sql_with_timing,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
-    reject_internal_table_writes, reject_public_create_table, CommittedReadContext, StatementBatch,
+    reject_internal_table_writes, reject_public_create_table, CommittedReadContext,
+    QueryDependency, StatementBatch,
 };
 use crate::transaction::{
     ensure_function_bindings_for_write_scope, execute_parsed_statements_in_write_transaction,
@@ -64,7 +65,7 @@ pub(crate) use host::{
 
 pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
 pub use runtime::ExecuteOptions;
-pub(crate) use runtime::{SessionDependency, SessionExecutionMode};
+pub(crate) use runtime::SessionExecutionMode;
 pub(crate) use state::{SessionStateDelta, SessionStateSnapshot};
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
@@ -290,15 +291,13 @@ impl Session {
         self.runtime_generation.load(Ordering::SeqCst)
     }
 
-    pub(crate) fn dependency_generation(&self, dependency: SessionDependency) -> u64 {
+    pub(crate) fn dependency_generation(&self, dependency: QueryDependency) -> u64 {
         match dependency {
-            SessionDependency::ActiveVersion => {
-                self.active_version_generation.load(Ordering::SeqCst)
-            }
-            SessionDependency::ActiveAccounts => {
+            QueryDependency::ActiveVersion => self.active_version_generation.load(Ordering::SeqCst),
+            QueryDependency::ActiveAccounts => {
                 self.active_account_generation.load(Ordering::SeqCst)
             }
-            SessionDependency::PublicSurfaceRegistryGeneration => {
+            QueryDependency::PublicSurfaceRegistryGeneration => {
                 self.public_surface_registry_generation()
             }
         }
@@ -306,8 +305,8 @@ impl Session {
 
     pub(crate) fn dependency_generations(
         &self,
-        dependencies: &BTreeSet<SessionDependency>,
-    ) -> BTreeMap<SessionDependency, u64> {
+        dependencies: &BTreeSet<QueryDependency>,
+    ) -> BTreeMap<QueryDependency, u64> {
         dependencies
             .iter()
             .copied()

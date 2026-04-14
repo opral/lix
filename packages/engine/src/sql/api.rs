@@ -9,7 +9,7 @@ use std::time::Duration;
 use sqlparser::ast::Statement;
 
 use crate::catalog::SurfaceRegistry;
-use crate::sql::{PreparedExplainMode, PreparedExplainTemplate};
+use crate::sql::{DependencySpec, PreparedExplainMode, PreparedExplainTemplate};
 use crate::streams::StateCommitStreamFilter;
 use crate::transaction::ChangeBatch;
 use crate::{LixError, SqlDialect, Value};
@@ -28,7 +28,6 @@ pub(crate) use super::logical_plan::public_ir::{
     PlannedWrite, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan, RowLineage,
     SchemaProof, ScopeProof, TargetSetProof, WriteModeRequest, WriteOperationKind,
 };
-pub(crate) use super::logical_plan::DependencySpec;
 #[cfg(test)]
 pub(crate) use super::optimizer::optimize_state_resolution;
 pub(crate) use super::parser::{parse_sql, parse_sql_statements, parse_sql_with_timing};
