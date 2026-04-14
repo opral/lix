@@ -94,10 +94,6 @@
             "csv_plugin_cell"
           ]
         },
-        "x-lix-immutable": {
-          "type": "boolean",
-          "description": "When true, entities for this schema cannot be updated after creation."
-        },
         "x-lix-override-lixcols": {
           "type": "object",
           "description": "Default metadata column values (such as lixcol_file_id). Does not affect JSON property defaults. lixcol_version_id is intentionally unsupported.",
