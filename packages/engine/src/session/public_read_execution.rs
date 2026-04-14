@@ -7,10 +7,8 @@
 use async_trait::async_trait;
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::{
-    PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionIdentity, ReadTimeProjectionRow,
-};
 use crate::execution::execute_prepared_public_read_artifact_with_backend;
+use crate::execution::{ReadExecutionHost, ReadTimeProjectionIdentity, ReadTimeProjectionRow};
 use crate::session::host::SessionExecutionContext;
 use crate::sql::{PreparedPublicRead, PublicReadSource, ReadTimeProjectionPlan};
 use crate::transaction::PendingOverlay;
@@ -79,26 +77,23 @@ impl ReadExecutionHost for SessionExecutionContext<'_> {
     }
 }
 
-#[async_trait(?Send)]
-impl PendingPublicReadHost for dyn LixBackend + '_ {
-    async fn execute_pending_overlay_public_read(
-        &self,
-        host: &dyn ReadExecutionHost,
-        pending_overlay: Option<&dyn PendingOverlay>,
-        public_read: &PreparedPublicRead,
-    ) -> Result<QueryResult, LixError> {
-        match public_read.contract.source() {
-            PublicReadSource::PendingOverlay => {
-                crate::transaction::execute_pending_overlay_public_read(
-                    self,
-                    pending_overlay,
-                    public_read,
-                )
-                .await
-            }
-            PublicReadSource::Committed(_) => {
-                execute_prepared_public_read_artifact_with_backend(self, host, public_read).await
-            }
+pub(crate) async fn execute_pending_overlay_public_read_with_backend(
+    backend: &dyn LixBackend,
+    host: &dyn ReadExecutionHost,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    public_read: &PreparedPublicRead,
+) -> Result<QueryResult, LixError> {
+    match public_read.contract.source() {
+        PublicReadSource::PendingOverlay => {
+            crate::transaction::execute_pending_overlay_public_read(
+                backend,
+                pending_overlay,
+                public_read,
+            )
+            .await
+        }
+        PublicReadSource::Committed(_) => {
+            execute_prepared_public_read_artifact_with_backend(backend, host, public_read).await
         }
     }
 }

@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use sqlparser::ast::Statement;
 
-use crate::contracts::{render_analyzed_explain_result, render_plain_explain_result};
+use crate::execution::{render_analyzed_explain_result, render_plain_explain_result};
 use crate::session::SessionStateDelta;
 #[cfg(test)]
 use crate::sql::parse_sql_with_timing;

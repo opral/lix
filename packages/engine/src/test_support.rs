@@ -248,12 +248,12 @@ pub(crate) struct BuiltinReadExecutionHost;
 
 #[cfg(test)]
 #[async_trait(?Send)]
-impl crate::contracts::ReadExecutionHost for BuiltinReadExecutionHost {
+impl crate::execution::read::ReadExecutionHost for BuiltinReadExecutionHost {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
         artifact: &crate::sql::ReadTimeProjectionPlan,
-    ) -> Result<Vec<crate::contracts::ReadTimeProjectionRow>, LixError> {
+    ) -> Result<Vec<crate::execution::read::ReadTimeProjectionRow>, LixError> {
         Ok(crate::live_state::derive_read_time_surface_rows(
             backend,
             crate::catalog::builtin_catalog_projection_registry(),
@@ -261,16 +261,16 @@ impl crate::contracts::ReadExecutionHost for BuiltinReadExecutionHost {
         )
         .await?
         .into_iter()
-        .map(|row| crate::contracts::ReadTimeProjectionRow {
+        .map(|row| crate::execution::read::ReadTimeProjectionRow {
             surface_name: row.surface_name,
-            identity: row
-                .identity
-                .map(|identity| crate::contracts::ReadTimeProjectionIdentity {
+            identity: row.identity.map(|identity| {
+                crate::execution::read::ReadTimeProjectionIdentity {
                     schema_key: identity.schema_key,
                     version_id: identity.version_id,
                     entity_id: identity.entity_id,
                     file_id: identity.file_id,
-                }),
+                }
+            }),
             values: row.values,
         })
         .collect())

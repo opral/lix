@@ -7,9 +7,9 @@ use sqlparser::ast::{
 };
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::{
-    DynFunctionProvider, PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionRow,
-};
+use crate::contracts::DynFunctionProvider;
+use crate::execution::{ReadExecutionHost, ReadTimeProjectionRow};
+use crate::session::public_read_execution::execute_pending_overlay_public_read_with_backend;
 use crate::session::public_read_preparation::{
     build_read_preparation_context, prepare_required_active_public_read_artifact_with_backend,
     ReadPreparationContext,
@@ -71,9 +71,13 @@ impl<'a> SessionWriteSelectorResolver<'a> {
                 .as_deref(),
         )
         .await?;
-        self.backend
-            .execute_pending_overlay_public_read(self, self.pending_overlay, &artifact)
-            .await
+        execute_pending_overlay_public_read_with_backend(
+            self.backend,
+            self,
+            self.pending_overlay,
+            &artifact,
+        )
+        .await
     }
 }
 

@@ -1,6 +1,4 @@
 use crate::catalog::SurfaceReadFreshness;
-use crate::contracts::PendingPublicReadTransaction;
-use crate::contracts::ReadExecutionHost;
 use crate::diagnostics::sanitize_lowered_public_sql_error_description;
 use crate::live_state::LiveStateQueryBackend;
 use crate::sql::{
@@ -10,7 +8,10 @@ use crate::sql::{
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use async_trait::async_trait;
 
-use super::{direct::execute_history_read_plan_with_backend, execute_read_time_projection_read};
+use super::{
+    direct::execute_history_read_plan_with_backend, execute_read_time_projection_read,
+    PendingPublicReadTransaction, ReadExecutionHost,
+};
 
 pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
