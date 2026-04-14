@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use super::SessionDependency;
+use crate::sql::QueryDependency;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct SessionStateSnapshot {
@@ -43,13 +43,13 @@ impl SessionStateDelta {
     }
 
     #[allow(dead_code)]
-    pub fn dependencies(&self) -> BTreeSet<SessionDependency> {
+    pub fn dependencies(&self) -> BTreeSet<QueryDependency> {
         let mut dependencies = BTreeSet::new();
         if self.next_active_version_id.is_some() {
-            dependencies.insert(SessionDependency::ActiveVersion);
+            dependencies.insert(QueryDependency::ActiveVersion);
         }
         if self.next_active_account_ids.is_some() {
-            dependencies.insert(SessionDependency::ActiveAccounts);
+            dependencies.insert(QueryDependency::ActiveAccounts);
         }
         dependencies
     }

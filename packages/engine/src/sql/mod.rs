@@ -30,6 +30,7 @@ mod api;
 pub(crate) mod ast;
 pub(crate) mod binder;
 pub(crate) mod common;
+pub(crate) mod dependency;
 pub(crate) mod effective_state_request;
 pub(crate) mod explain;
 pub(crate) mod logical_plan;
@@ -71,7 +72,7 @@ pub(crate) use api::{
     reject_public_create_table, resolve_placeholder_index,
     should_invalidate_installed_plugins_cache_for_statements, BoundSql, BoundStatementInstance,
     CanonicalStateAssignments, CanonicalStateRowKey, CommittedReadContext, CompilePolicy,
-    CompiledExecution, CompiledExplainDiagnostics, DependencySpec, DirectoryInsertAssignments,
+    CompiledExecution, CompiledExplainDiagnostics, DirectoryInsertAssignments,
     DirectoryUpdateAssignments, EntityAssignmentsSemantics, EntityInsertSemantics,
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest, FileInsertAssignments,
     FileUpdateAssignments, FilesystemWriteIntent, InsertOnConflictAction, MutationPayload,
@@ -81,6 +82,7 @@ pub(crate) use api::{
     ScopeProof, SqlCompilerMetadata, SqlCompilerSeed, StateAssignmentsError, StatementBatch,
     TargetSetProof, WriteModeRequest, WriteOperationKind,
 };
+pub(crate) use dependency::{DependencyPrecision, DependencySpec, QueryDependency};
 pub(crate) use effective_state_request::{EffectiveStateRequest, EffectiveStateVersionScope};
 pub(crate) use logical_plan::ResultContract;
 pub(crate) use planned_statement::{

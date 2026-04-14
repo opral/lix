@@ -329,8 +329,6 @@ mod tests {
         FilesystemProjectionScope, FilesystemRelationKind, RelationBindContext, RelationBinding,
         SurfaceFamily,
     };
-    use crate::session::SessionDependency;
-
     #[test]
     fn builtin_facade_resolves_surface_descriptors_and_columns() {
         let facade = builtin_catalog_compiler_facade();
@@ -393,9 +391,7 @@ mod tests {
             .compiled_schema_keys
             .contains("lix_version_descriptor"));
         assert!(version.compiled_schema_keys.contains("lix_version_ref"));
-        assert!(version
-            .session_dependencies
-            .contains(&SessionDependency::PublicSurfaceRegistryGeneration));
+        assert!(version.depends_on_public_surface_registry);
 
         let state = facade
             .dependency_metadata("lix_state")
@@ -403,9 +399,7 @@ mod tests {
             .expect("lix_state dependency metadata should resolve");
         assert!(state.relation_names.contains("lix_state"));
         assert!(state.uses_dynamic_state_relations);
-        assert!(state
-            .session_dependencies
-            .contains(&SessionDependency::ActiveVersion));
+        assert!(state.depends_on_active_version);
 
         let working_changes = facade
             .dependency_metadata("lix_working_changes")

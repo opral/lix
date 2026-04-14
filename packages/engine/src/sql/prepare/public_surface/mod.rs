@@ -22,8 +22,6 @@ use crate::sql::explain::{
 };
 use crate::sql::logical_plan::public_ir::PlannedFilesystemState;
 use crate::sql::logical_plan::public_ir::{PlannedWrite, StructuredPublicRead, WriteOperationKind};
-#[cfg(test)]
-use crate::sql::logical_plan::DependencySpec;
 use crate::sql::logical_plan::{verify_logical_plan, LogicalPlan, PublicReadLogicalPlan};
 use crate::sql::physical_plan::{
     LoweredReadBatch, PublicReadPhysicalPlan, PublicWriteExecutionPartition,
@@ -43,6 +41,8 @@ use crate::sql::semantic_ir::{
     PublicWriteSemantics, StatementContext,
 };
 use crate::sql::CommittedReadMode;
+#[cfg(test)]
+use crate::sql::DependencySpec;
 use crate::sql::EffectiveStateRequest;
 use crate::sql::{
     classify_relation_name, protected_builtin_public_surface_names, RelationPolicy,
@@ -1791,8 +1791,9 @@ mod tests {
         explain::{
             ExplainPhysicalPlanSnapshot, ExplainPublicReadExecution, ExplainTimingCollector,
         },
-        logical_plan::{DependencyPrecision, HistoryReadPlan},
+        logical_plan::HistoryReadPlan,
         semantic_ir::StatementContext,
+        DependencyPrecision,
     };
     use crate::test_support::{
         seed_canonical_change_row, BuiltinReadExecutionHost, CanonicalChangeSeed, TestSqliteBackend,
@@ -2557,8 +2558,8 @@ mod tests {
         assert!(prepared
             .dependency_spec()
             .expect("dependency spec should be derived")
-            .session_dependencies
-            .contains(&crate::session::SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&crate::sql::QueryDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -3120,8 +3121,8 @@ mod tests {
         assert!(prepared
             .dependency_spec()
             .expect("filesystem dependency spec should be recorded")
-            .session_dependencies
-            .contains(&crate::session::SessionDependency::ActiveVersion));
+            .query_dependencies
+            .contains(&crate::sql::QueryDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .explain

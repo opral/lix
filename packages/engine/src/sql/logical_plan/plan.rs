@@ -1,5 +1,4 @@
 use crate::catalog::ResolvedRelation;
-use crate::sql::logical_plan::dependency_spec::DependencySpec;
 use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, PlannedWrite, StructuredPublicRead,
@@ -7,7 +6,7 @@ use crate::sql::logical_plan::public_ir::{
 use crate::sql::logical_plan::result_contract::ResultContract;
 use crate::sql::semantic_ir::direct::NormalizedDirectStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
-use crate::sql::EffectiveStateRequest;
+use crate::sql::{DependencySpec, EffectiveStateRequest};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SurfaceReadPlan {

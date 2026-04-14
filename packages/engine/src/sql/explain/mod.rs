@@ -14,7 +14,6 @@ use crate::history::{
     StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
     StateHistoryVersionScope,
 };
-use crate::session::SessionDependency;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
 use crate::sql::logical_plan::direct_reads::{
@@ -47,8 +46,7 @@ use crate::sql::logical_plan::public_ir::{
     WriteSelector,
 };
 use crate::sql::logical_plan::{
-    DependencyPrecision, DependencySpec, DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan,
-    PublicWriteLogicalPlan, ResultContract,
+    DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan, ResultContract,
 };
 use crate::sql::physical_plan::plan::{
     LoweredReadStatement, LoweredReadStatementShape, LoweredStatementBindings,
@@ -69,9 +67,9 @@ use crate::sql::semantic_ir::{
     SemanticStatement,
 };
 use crate::sql::{
-    EffectiveStateRequest, EffectiveStateVersionScope, MutationOperation, MutationRow,
-    PreparedExplainTemplate, PreparedStatement, ReadTimeProjectionPlan, SchemaLiveTableRequirement,
-    UpdateValidationPlan,
+    DependencyPrecision, DependencySpec, EffectiveStateRequest, EffectiveStateVersionScope,
+    MutationOperation, MutationRow, PreparedExplainTemplate, PreparedStatement, QueryDependency,
+    ReadTimeProjectionPlan, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
 use crate::streams::StateCommitStreamChange;
 use crate::transaction::{
@@ -488,7 +486,7 @@ pub(crate) struct DependencySpecSnapshot {
     pub(crate) entity_ids: Vec<String>,
     pub(crate) file_ids: Vec<String>,
     pub(crate) version_ids: Vec<String>,
-    pub(crate) session_dependencies: Vec<SessionDependency>,
+    pub(crate) query_dependencies: Vec<QueryDependency>,
     pub(crate) writer_filter: DependencyWriterFilterSnapshot,
     pub(crate) include_untracked: bool,
     pub(crate) depends_on_active_version: bool,
@@ -5701,7 +5699,7 @@ fn dependency_spec_snapshot(spec: &DependencySpec) -> DependencySpecSnapshot {
         entity_ids: spec.entity_ids.iter().cloned().collect(),
         file_ids: spec.file_ids.iter().cloned().collect(),
         version_ids: spec.version_ids.iter().cloned().collect(),
-        session_dependencies: spec.session_dependencies.iter().cloned().collect(),
+        query_dependencies: spec.query_dependencies.iter().cloned().collect(),
         writer_filter: DependencyWriterFilterSnapshot {
             include: spec.writer_filter.include.iter().cloned().collect(),
             exclude: spec.writer_filter.exclude.iter().cloned().collect(),

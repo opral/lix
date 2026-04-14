@@ -1,8 +1,8 @@
 use crate::common::{unexpected_statement_count_error, WireValue};
 use crate::session::Session;
-use crate::session::SessionDependency;
 use crate::sql::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec, parse_sql_statements,
+    QueryDependency,
 };
 use crate::streams::StateCommitStream;
 use crate::{LixError, QueryResult, Value};
@@ -93,9 +93,9 @@ pub(crate) struct SharedObserveSource {
     query: ObserveQuery,
     state_commits: StateCommitStream,
     writer_key_filter: ObserveWriterKeyFilter,
-    session_dependencies: BTreeSet<SessionDependency>,
+    query_dependencies: BTreeSet<QueryDependency>,
     last_seen_tick_seq: Option<i64>,
-    last_seen_session_dependency_generations: BTreeMap<SessionDependency, u64>,
+    last_seen_query_dependency_generations: BTreeMap<QueryDependency, u64>,
     last_result: Option<QueryResult>,
     latest_event: Option<SharedObserveEvent>,
     events: VecDeque<SharedObserveEvent>,
@@ -110,29 +110,29 @@ pub(crate) struct SharedObserveSource {
 enum PollWork {
     Initial {
         query: ObserveQuery,
-        session_dependency_generations: BTreeMap<SessionDependency, u64>,
+        query_dependency_generations: BTreeMap<QueryDependency, u64>,
     },
     SessionState {
         query: ObserveQuery,
-        session_dependency_generations: BTreeMap<SessionDependency, u64>,
+        query_dependency_generations: BTreeMap<QueryDependency, u64>,
     },
     StateCommit {
         query: ObserveQuery,
         state_commit_sequence: u64,
-        session_dependency_generations: BTreeMap<SessionDependency, u64>,
+        query_dependency_generations: BTreeMap<QueryDependency, u64>,
     },
     External {
         query: ObserveQuery,
         last_seen_tick_seq: Option<i64>,
         writer_key_filter: ObserveWriterKeyFilter,
-        session_dependency_generations: BTreeMap<SessionDependency, u64>,
+        query_dependency_generations: BTreeMap<QueryDependency, u64>,
     },
 }
 
 struct PollOutcome {
     maybe_rows: Option<(QueryResult, Option<u64>)>,
     update_last_seen_tick_seq: Option<Option<i64>>,
-    update_last_seen_session_dependency_generations: Option<BTreeMap<SessionDependency, u64>>,
+    update_last_seen_query_dependency_generations: Option<BTreeMap<QueryDependency, u64>>,
     mark_initialized: bool,
 }
 
@@ -141,15 +141,15 @@ impl SharedObserveSource {
         query: ObserveQuery,
         state_commits: StateCommitStream,
         writer_key_filter: ObserveWriterKeyFilter,
-        session_dependencies: BTreeSet<SessionDependency>,
+        query_dependencies: BTreeSet<QueryDependency>,
     ) -> Self {
         Self {
             query,
             state_commits,
             writer_key_filter,
-            session_dependencies,
+            query_dependencies,
             last_seen_tick_seq: None,
-            last_seen_session_dependency_generations: BTreeMap::new(),
+            last_seen_query_dependency_generations: BTreeMap::new(),
             last_result: None,
             latest_event: None,
             events: VecDeque::new(),
@@ -162,16 +162,16 @@ impl SharedObserveSource {
         }
     }
 
-    fn session_dependency_generations_changed(
+    fn query_dependency_generations_changed(
         &self,
-        session_dependency_generations: &BTreeMap<SessionDependency, u64>,
+        query_dependency_generations: &BTreeMap<QueryDependency, u64>,
     ) -> bool {
-        self.session_dependencies.iter().any(|dependency| {
-            self.last_seen_session_dependency_generations
+        self.query_dependencies.iter().any(|dependency| {
+            self.last_seen_query_dependency_generations
                 .get(dependency)
                 .copied()
                 .unwrap_or_default()
-                != session_dependency_generations
+                != query_dependency_generations
                     .get(dependency)
                     .copied()
                     .unwrap_or_default()
@@ -387,8 +387,8 @@ impl ObserveState {
     async fn poll_shared_source_once(&mut self, session: &Session) -> Result<(), LixError> {
         let work = {
             let source = lock_shared_source(&self.source)?;
-            let session_dependency_generations =
-                session.dependency_generations(&source.session_dependencies);
+            let query_dependency_generations =
+                session.dependency_generations(&source.query_dependencies);
             if source.closed {
                 return Ok(());
             }
@@ -396,26 +396,25 @@ impl ObserveState {
             if !source.initialized {
                 PollWork::Initial {
                     query: source.query.clone(),
-                    session_dependency_generations,
+                    query_dependency_generations,
                 }
-            } else if source.session_dependency_generations_changed(&session_dependency_generations)
-            {
+            } else if source.query_dependency_generations_changed(&query_dependency_generations) {
                 PollWork::SessionState {
                     query: source.query.clone(),
-                    session_dependency_generations,
+                    query_dependency_generations,
                 }
             } else if let Some(batch) = source.state_commits.try_next() {
                 PollWork::StateCommit {
                     query: source.query.clone(),
                     state_commit_sequence: batch.sequence,
-                    session_dependency_generations,
+                    query_dependency_generations,
                 }
             } else {
                 PollWork::External {
                     query: source.query.clone(),
                     last_seen_tick_seq: source.last_seen_tick_seq,
                     writer_key_filter: source.writer_key_filter.clone(),
-                    session_dependency_generations,
+                    query_dependency_generations,
                 }
             }
         };
@@ -423,7 +422,7 @@ impl ObserveState {
         let outcome = match work {
             PollWork::Initial {
                 query,
-                session_dependency_generations,
+                query_dependency_generations,
             } => {
                 let latest_tick_seq =
                     latest_observe_tick_seq(session.session_host().backend().as_ref()).await?;
@@ -431,22 +430,22 @@ impl ObserveState {
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: Some(latest_tick_seq),
-                    update_last_seen_session_dependency_generations: Some(
-                        session_dependency_generations,
+                    update_last_seen_query_dependency_generations: Some(
+                        query_dependency_generations,
                     ),
                     mark_initialized: true,
                 }
             }
             PollWork::SessionState {
                 query,
-                session_dependency_generations,
+                query_dependency_generations,
             } => {
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: None,
-                    update_last_seen_session_dependency_generations: Some(
-                        session_dependency_generations,
+                    update_last_seen_query_dependency_generations: Some(
+                        query_dependency_generations,
                     ),
                     mark_initialized: true,
                 }
@@ -454,14 +453,14 @@ impl ObserveState {
             PollWork::StateCommit {
                 query,
                 state_commit_sequence,
-                session_dependency_generations,
+                query_dependency_generations,
             } => {
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, Some(state_commit_sequence))),
                     update_last_seen_tick_seq: None,
-                    update_last_seen_session_dependency_generations: Some(
-                        session_dependency_generations,
+                    update_last_seen_query_dependency_generations: Some(
+                        query_dependency_generations,
                     ),
                     mark_initialized: true,
                 }
@@ -470,7 +469,7 @@ impl ObserveState {
                 query,
                 last_seen_tick_seq,
                 writer_key_filter,
-                session_dependency_generations,
+                query_dependency_generations,
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
                 let observed_ticks = observe_ticks_since(
@@ -482,8 +481,8 @@ impl ObserveState {
                     PollOutcome {
                         maybe_rows: None,
                         update_last_seen_tick_seq: None,
-                        update_last_seen_session_dependency_generations: Some(
-                            session_dependency_generations,
+                        update_last_seen_query_dependency_generations: Some(
+                            query_dependency_generations,
                         ),
                         mark_initialized: true,
                     }
@@ -501,8 +500,8 @@ impl ObserveState {
                         PollOutcome {
                             maybe_rows: None,
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
-                            update_last_seen_session_dependency_generations: Some(
-                                session_dependency_generations,
+                            update_last_seen_query_dependency_generations: Some(
+                                query_dependency_generations,
                             ),
                             mark_initialized: true,
                         }
@@ -511,8 +510,8 @@ impl ObserveState {
                         PollOutcome {
                             maybe_rows: Some((rows, None)),
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
-                            update_last_seen_session_dependency_generations: Some(
-                                session_dependency_generations,
+                            update_last_seen_query_dependency_generations: Some(
+                                query_dependency_generations,
                             ),
                             mark_initialized: true,
                         }
@@ -536,11 +535,10 @@ impl ObserveState {
         if let Some(last_seen_tick_seq) = outcome.update_last_seen_tick_seq {
             source.last_seen_tick_seq = last_seen_tick_seq;
         }
-        if let Some(last_seen_session_dependency_generations) =
-            outcome.update_last_seen_session_dependency_generations
+        if let Some(last_seen_query_dependency_generations) =
+            outcome.update_last_seen_query_dependency_generations
         {
-            source.last_seen_session_dependency_generations =
-                last_seen_session_dependency_generations;
+            source.last_seen_query_dependency_generations = last_seen_query_dependency_generations;
         }
 
         if let Some((rows, state_commit_sequence)) = outcome.maybe_rows {
@@ -775,7 +773,7 @@ fn build_shared_observe_source(
         query,
         state_commits,
         writer_key_filter,
-        dependency_spec.session_dependencies,
+        dependency_spec.query_dependencies,
     ))
 }
 
