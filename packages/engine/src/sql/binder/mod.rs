@@ -29,8 +29,7 @@ pub(crate) use runtime::{
 };
 pub(crate) use runtime::{
     bind_sql_with_state, bind_sql_with_state_and_appended_params, bind_statement_binding_template,
-    compile_statement_binding_template_with_state, insert_values_rows_mut, RuntimeBindingValues,
-    StatementBindingTemplate,
+    compile_statement_binding_template_with_state, RuntimeBindingValues, StatementBindingTemplate,
 };
 
 pub(crate) fn bind_statement(

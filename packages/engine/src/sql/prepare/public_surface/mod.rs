@@ -7,6 +7,7 @@ use crate::catalog::{
     CatalogWriteVersionSemantics, SurfaceCapability, SurfaceFamily, SurfaceReadFreshness,
     SurfaceRegistry, SurfaceVariant,
 };
+use crate::functions::DynFunctionProvider;
 use crate::schema::builtin_schema_definition;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
@@ -195,6 +196,7 @@ pub(crate) async fn prepare_public_plan(
 
 pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
     dialect: SqlDialect,
+    functions: DynFunctionProvider,
     registry: &SurfaceRegistry,
     compiler_metadata: &super::SqlCompilerMetadata,
     parsed_statements: &[Statement],
@@ -221,6 +223,7 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
                 .expect("public write plan kind must expose a target name");
             let prepared = try_prepare_public_write_with_registry_and_functions(
                 dialect,
+                functions.clone(),
                 registry,
                 parsed_statements,
                 params,
@@ -300,6 +303,7 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
         crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
     prepare_public_plan_with_registry_context_and_functions(
         backend.dialect(),
+        functions,
         &registry,
         &compiler_metadata,
         parsed_statements,
@@ -1124,6 +1128,7 @@ fn expr_string_literal(expr: &Expr) -> Option<&str> {
 
 pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     dialect: SqlDialect,
+    functions: DynFunctionProvider,
     registry: &SurfaceRegistry,
     parsed_statements: &[Statement],
     params: &[Value],
@@ -1182,7 +1187,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     };
     stage_timings.record(ExplainStage::SemanticAnalysis, semantic_started.elapsed());
     let logical_started = Instant::now();
-    let mut write_analysis = match analyze_public_write_semantics(&semantics) {
+    let mut write_analysis = match analyze_public_write_semantics(&semantics, &functions) {
         Ok(write_analysis) => write_analysis,
         Err(error) => {
             if let Some(error) =
