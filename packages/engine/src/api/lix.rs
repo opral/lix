@@ -494,13 +494,13 @@ fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
 mod tests {
     use super::should_invalidate_installed_plugins_cache_for_sql;
     use super::*;
+    use crate::backend::TransactionBeginMode;
     use crate::sql::{
         advance_placeholder_state_for_statement_ast, bind_sql_with_state,
         extract_explicit_transaction_script, is_query_only_statements, optimize_state_resolution,
         parse_sql_statements, PlaceholderState,
     };
     use crate::wasm::NoopWasmRuntime;
-    use crate::TransactionBeginMode;
     use crate::{
         ExecuteOptions, LixBackend, LixBackendTransaction, LixConfig, LixError, QueryResult,
         Session, SqlDialect, Value,

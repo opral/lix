@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use crate::backend::QueryExecutor;
 use crate::schema::{LixCommit, LixVersionDescriptor};
 
-use crate::{CanonicalJson, LixError, ReplayCursor, Value};
+use crate::live_state::ReplayCursor;
+use crate::{CanonicalJson, LixError, Value};
 
 #[derive(Debug, Clone)]
 pub(crate) struct ChangeRecord {

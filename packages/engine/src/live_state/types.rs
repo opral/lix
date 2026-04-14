@@ -3,7 +3,6 @@ use std::collections::BTreeMap;
 use serde_json::Value as JsonValue;
 
 use crate::common::Value;
-use crate::contracts::ReplayCursor;
 use crate::live_state::tracked::TrackedRow;
 #[cfg(test)]
 use crate::live_state::tracked::TrackedTombstoneMarker;
@@ -15,6 +14,7 @@ use crate::live_state::untracked::UntrackedWriteRow;
 use crate::version::CommittedVersionFrontier;
 
 use super::constraints::{ScanConstraint, ScanField, ScanOperator};
+use super::ReplayCursor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveStateMode {

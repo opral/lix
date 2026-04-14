@@ -14,8 +14,9 @@ use crate::canonical::{
     load_visible_state, CanonicalContentMode, CanonicalTombstoneMode, CanonicalVisibleStateFilter,
     CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
+use crate::live_state::ReplayCursor;
 use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
-use crate::{CanonicalJson, LixBackend, LixError, ReplayCursor};
+use crate::{CanonicalJson, LixBackend, LixError};
 
 type VersionHeadMap = BTreeMap<String, Vec<String>>;
 
@@ -231,14 +232,14 @@ fn build_global_projection_rows(
             .get(&descriptor.entity_id)
             .and_then(|tips| tips.first())
             .cloned()
-            .unwrap_or_else(|| crate::contracts::GLOBAL_VERSION_ID.to_string());
+            .unwrap_or_else(|| crate::version::GLOBAL_VERSION_ID.to_string());
         let depth = commit_depths
             .get(&effective_commit_id)
             .copied()
             .unwrap_or(usize::MAX / 4);
 
         let row = VisibleRow {
-            version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
             commit_id: effective_commit_id,
             replay_cursor: descriptor.replay_cursor.clone(),
             change_id: descriptor.id.clone(),
@@ -271,15 +272,15 @@ fn build_global_projection_rows(
             continue;
         }
         let key = (
-            crate::contracts::GLOBAL_VERSION_ID.to_string(),
+            crate::version::GLOBAL_VERSION_ID.to_string(),
             change.entity_id.clone(),
             version_descriptor_schema.schema_key.clone(),
             change.file_id.clone(),
         );
         let depth = usize::MAX / 4;
         let row = VisibleRow {
-            version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
-            commit_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+            commit_id: crate::version::GLOBAL_VERSION_ID.to_string(),
             replay_cursor: change.replay_cursor.clone(),
             change_id: change.id.clone(),
             entity_id: change.entity_id.clone(),
@@ -314,7 +315,7 @@ fn build_global_projection_rows(
         };
 
         let commit_row = VisibleRow {
-            version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
             commit_id: commit.entity_id.clone(),
             replay_cursor: commit_change.replay_cursor.clone(),
             change_id: commit_change.id.clone(),
@@ -349,7 +350,7 @@ fn build_global_projection_rows(
             .filter(|value| !value.is_empty())
         {
             let change_set_row = VisibleRow {
-                version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+                version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                 commit_id: commit.entity_id.clone(),
                 replay_cursor: commit_change.replay_cursor.clone(),
                 change_id: commit_change.id.clone(),
@@ -392,7 +393,7 @@ fn build_global_projection_rows(
                 };
 
                 let cse_row = VisibleRow {
-                    version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+                    version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                     commit_id: commit.entity_id.clone(),
                     replay_cursor: change.replay_cursor.clone(),
                     change_id: change.id.clone(),
@@ -431,7 +432,7 @@ fn build_global_projection_rows(
                         continue;
                     }
                     let author_row = VisibleRow {
-                        version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+                        version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                         commit_id: commit.entity_id.clone(),
                         replay_cursor: commit_change.replay_cursor.clone(),
                         change_id: commit_change.id.clone(),
@@ -470,7 +471,7 @@ fn build_global_projection_rows(
                 continue;
             }
             let edge_row = VisibleRow {
-                version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+                version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                 commit_id: commit.entity_id.clone(),
                 replay_cursor: commit_change.replay_cursor.clone(),
                 change_id: commit_change.id.clone(),
@@ -581,7 +582,7 @@ fn resolve_projection_candidates(
 }
 
 fn uses_global_version_descriptor_replay_ordering(candidate: &ProjectionCandidate) -> bool {
-    candidate.row.version_id == crate::contracts::GLOBAL_VERSION_ID
+    candidate.row.version_id == crate::version::GLOBAL_VERSION_ID
         && candidate.row.schema_key == "lix_version_descriptor"
 }
 
@@ -648,7 +649,7 @@ fn resolve_target_versions(
     match &req.scope {
         LiveStateRebuildScope::Versions(versions) => {
             let mut resolved = versions.clone();
-            resolved.insert(crate::contracts::GLOBAL_VERSION_ID.to_string());
+            resolved.insert(crate::version::GLOBAL_VERSION_ID.to_string());
             resolved
         }
         LiveStateRebuildScope::Full => {
@@ -751,7 +752,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
             )?,
             file_id: require_identity(row.source.file_id.clone(), "live-state write file_id")?,
             version_id: require_identity(row.version_id.clone(), "live-state write version_id")?,
-            global: row.version_id == crate::contracts::GLOBAL_VERSION_ID,
+            global: row.version_id == crate::version::GLOBAL_VERSION_ID,
             op,
             snapshot_content: row.source.snapshot_content.clone(),
             metadata: row.source.metadata.clone(),
@@ -908,7 +909,7 @@ fn build_debug_trace(
                         "debug scope schema_key",
                     )?,
                     file_id: require_identity(row.source.file_id.clone(), "debug scope file_id")?,
-                    global: row.version_id == crate::contracts::GLOBAL_VERSION_ID,
+                    global: row.version_id == crate::version::GLOBAL_VERSION_ID,
                     change_id: row.source.change_id.clone(),
                 })
             })
@@ -1086,7 +1087,7 @@ mod tests {
     #[test]
     fn resolve_projection_candidates_prefers_newer_global_version_descriptor_tombstone() {
         let key = (
-            crate::contracts::GLOBAL_VERSION_ID.to_string(),
+            crate::version::GLOBAL_VERSION_ID.to_string(),
             "version-deleted".to_string(),
             "lix_version_descriptor".to_string(),
             "lix".to_string(),
@@ -1094,8 +1095,8 @@ mod tests {
         let older_descriptor = ProjectionCandidate {
             depth: usize::MAX / 4,
             row: VisibleRow {
-                version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
-                commit_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+                version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+                commit_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                 replay_cursor: ReplayCursor::new("change-old", "2026-04-01T00:00:00Z"),
                 change_id: "change-old".to_string(),
                 entity_id: "version-deleted".to_string(),
@@ -1117,8 +1118,8 @@ mod tests {
         let newer_tombstone = ProjectionCandidate {
             depth: usize::MAX / 4,
             row: VisibleRow {
-                version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
-                commit_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+                version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+                commit_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                 replay_cursor: ReplayCursor::new("change-new", "2026-04-01T00:00:01Z"),
                 change_id: "change-new".to_string(),
                 entity_id: "version-deleted".to_string(),

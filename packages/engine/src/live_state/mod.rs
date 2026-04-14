@@ -40,6 +40,7 @@ mod plugin_archives;
 pub(crate) mod projection;
 #[cfg(test)]
 mod read_context;
+mod replay_cursor;
 mod row_queries;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
@@ -55,7 +56,6 @@ pub(crate) mod untracked;
 mod visible_rows;
 pub(crate) mod writer_key;
 use crate::catalog::SurfaceReadFreshness;
-use crate::contracts::ReplayCursor;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -90,6 +90,7 @@ pub use projection::{
 };
 #[cfg(test)]
 pub(crate) use read_context::LiveReadContext;
+pub use replay_cursor::ReplayCursor;
 pub use row_queries::{
     decode_registered_schema_row, load_exact_live_row, scan_live_rows, write_live_rows,
     ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSource,

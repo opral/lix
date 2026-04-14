@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::common::LixError;
-use crate::contracts::ReplayCursor;
 
+use super::ReplayCursor;
 use super::SchemaRegistration;
 
 #[async_trait(?Send)]

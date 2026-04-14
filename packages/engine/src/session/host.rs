@@ -2,15 +2,16 @@ use async_trait::async_trait;
 
 use std::sync::{Arc, OnceLock};
 
+use crate::backend::TransactionBeginMode;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::CompiledSchemaCache;
 use crate::functions::{
     clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
 };
 use crate::image::ImageChunkWriter;
+use crate::schema::CompiledSchemaCache;
 use crate::sql::SqlCompilerSeed;
 use crate::streams::{StateCommitStream, StateCommitStreamChange, StateCommitStreamFilter};
-use crate::{LixBackend, LixBackendTransaction, LixError, TransactionBeginMode};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 
 use super::Session;
 

@@ -15,7 +15,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
-use crate::contracts::TrackedChangeView;
 use crate::live_state::RowIdentity;
 #[cfg(test)]
 #[async_trait(?Send)]
@@ -30,6 +29,7 @@ pub trait WriterKeyReadView {
     ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError>;
 }
 use crate::live_state::LiveRow;
+use crate::streams::StateChangeRecord;
 use crate::{LixBackend, LixError, Value};
 
 pub(crate) const WRITER_KEY_TABLE: &str = "lix_internal_writer_key";
@@ -55,7 +55,7 @@ where
     }
 }
 
-pub(crate) fn tracked_writer_key_annotations_from_changes<Change: TrackedChangeView>(
+pub(crate) fn tracked_writer_key_annotations_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
     execution_writer_key: Option<&str>,
 ) -> BTreeMap<RowIdentity, Option<String>> {
@@ -341,7 +341,7 @@ async fn clear_writer_key_annotation_with_executor(
     Ok(())
 }
 
-fn tracked_change_row_identity<Change: TrackedChangeView>(change: &Change) -> Option<RowIdentity> {
+fn tracked_change_row_identity<Change: StateChangeRecord>(change: &Change) -> Option<RowIdentity> {
     let file_id = change.file_id()?;
     Some(RowIdentity {
         version_id: change.version_id().to_string(),

@@ -10,14 +10,13 @@ use crate::live_state::untracked::{
 };
 use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{
     LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
     Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
-
-const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Clone)]
 struct SqliteBackend {

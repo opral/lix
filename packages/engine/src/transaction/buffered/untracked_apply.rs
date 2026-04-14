@@ -8,11 +8,10 @@ use crate::transaction::{
     compile_filesystem_finalization_from_state_in_transaction, PlannedPublicUntrackedWriteUnit,
     WriteExecutionContext,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::registered_schema_mirror::mirror_registered_schema_planned_rows_in_transaction;
-
-const GLOBAL_VERSION_ID: &str = "global";
 
 pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transaction(
     execution_context: &dyn WriteExecutionContext,

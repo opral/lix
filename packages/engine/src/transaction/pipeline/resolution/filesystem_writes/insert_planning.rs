@@ -9,11 +9,11 @@ use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     parent_directory_path, NormalizedDirectoryPath, ParsedFilePath,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     DirectoryInsertAssignments, FileInsertAssignments,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::LixBackend;
 use std::collections::{BTreeMap, BTreeSet};
 

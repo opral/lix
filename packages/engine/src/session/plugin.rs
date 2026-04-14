@@ -10,9 +10,8 @@ use crate::transaction::{
     prepared_write_function_bindings_for_execution, stage_prepared_write_statement,
     BufferedWriteTransaction, WriteCommand,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session};
-
-const GLOBAL_VERSION_ID: &str = "global";
 
 struct SessionPluginInstallWriter<'a, 'tx> {
     transaction: &'a mut BufferedWriteTransaction<'tx>,

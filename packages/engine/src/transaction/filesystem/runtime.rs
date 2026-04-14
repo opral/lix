@@ -8,6 +8,7 @@ use crate::sql::OptionalTextPatch;
 use crate::transaction::overlay::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
 use crate::transaction::FilesystemPayloadChange;
 use crate::transaction::TransactionExecutionBackend;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -18,7 +19,6 @@ pub(crate) const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
-const GLOBAL_VERSION_ID: &str = "global";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct BinaryBlobWriteInput<'a> {
     pub(crate) file_id: &'a str,

@@ -1,10 +1,9 @@
 use std::collections::BTreeSet;
 
-use crate::contracts::TrackedChangeView;
 use crate::sql::PlanEffects;
 use crate::sql::SessionStateDelta;
 use crate::streams::{
-    state_commit_stream_changes_from_changes, StateCommitStreamOperation,
+    state_commit_stream_changes_from_changes, StateChangeRecord, StateCommitStreamOperation,
     StateCommitStreamRuntimeMetadata,
 };
 use crate::transaction::pipeline::WriteExecutionOutcome;
@@ -54,7 +53,7 @@ pub(crate) async fn execute_public_tracked_transaction_write_unit_with_transacti
     }))
 }
 
-fn plan_effects_from_tracked_changes<Change: TrackedChangeView>(
+fn plan_effects_from_tracked_changes<Change: StateChangeRecord>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
     writer_key: Option<&str>,
@@ -75,7 +74,7 @@ fn plan_effects_from_tracked_changes<Change: TrackedChangeView>(
     })
 }
 
-fn file_cache_refresh_targets_from_changes<Change: TrackedChangeView>(
+fn file_cache_refresh_targets_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
 ) -> BTreeSet<(String, String)> {
     changes

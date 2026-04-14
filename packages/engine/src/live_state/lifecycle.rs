@@ -2,9 +2,10 @@
 
 use crate::backend::add_column_if_missing;
 use crate::diagnostics::is_missing_relation_error;
+use crate::live_state::ReplayCursor;
 use crate::live_state::{LiveStateMode, LiveStateProjectionStatus};
 use crate::version::CommittedVersionFrontier;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, ReplayCursor, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
@@ -916,7 +917,7 @@ mod tests {
         .await
         .expect("status row should seed");
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 
@@ -969,7 +970,7 @@ mod tests {
         .await
         .expect("status row should seed");
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 
@@ -1003,7 +1004,7 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 
@@ -1045,7 +1046,7 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
 

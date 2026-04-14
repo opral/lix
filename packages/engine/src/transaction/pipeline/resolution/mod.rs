@@ -6,7 +6,6 @@ use crate::catalog::SurfaceFamily;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::OptionalTextPatch;
 use crate::transaction::overlay::PendingOverlay;
@@ -17,6 +16,7 @@ use crate::transaction::pipeline::resolution::prepared_artifacts::{
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_descriptor_snapshot_content, version_ref_file_id,

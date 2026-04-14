@@ -6,9 +6,9 @@ use crate::canonical::{
 };
 use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::common::escape_sql_string;
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::load_version_head_commit_map_with_executor;
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,

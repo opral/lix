@@ -6,10 +6,9 @@ use jsonschema::JSONSchema;
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::common::escape_sql_string;
-use crate::contracts::CompiledSchemaCache;
-use crate::contracts::TrackedChangeView;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
+use crate::schema::CompiledSchemaCache;
 use crate::schema::SchemaKey;
 use crate::session::host::{
     prepare_function_bindings_with_host, sql_compiler_seed_from_host, SessionExecutionContext,
@@ -25,18 +24,18 @@ use crate::sql::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PreparedPublicRead, PublicChange,
     PublicReadSource, WriteLane, WriteMode,
 };
+use crate::streams::StateChangeRecord;
 use crate::transaction::{
     resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
     PendingCommitState, PendingOverlay, PreparedPublicWrite, TrackedCommitExecutionOutcome,
     TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionContext,
 };
-use crate::version::parse_active_version_snapshot;
+use crate::version::{parse_active_version_snapshot, GLOBAL_VERSION_ID};
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
 use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
 const ACTIVE_VERSION_SCHEMA_KEY: &str = "lix_active_version";
 const ACTIVE_VERSION_FILE_ID: &str = "lix";
-const GLOBAL_VERSION_ID: &str = "global";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 
@@ -599,7 +598,7 @@ fn public_changes_from_staged(changes: &[StagedChange]) -> Vec<PublicChange> {
         .collect()
 }
 
-fn next_active_version_id_from_changes<Change: TrackedChangeView>(
+fn next_active_version_id_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {

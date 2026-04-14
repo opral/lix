@@ -191,7 +191,7 @@ fn active_version_helper_live_row(entity_id: &str, version_id: &str, timestamp: 
         schema_key: metadata.schema_key,
         schema_version: metadata.schema_version,
         file_id: metadata.file_id,
-        version_id: crate::contracts::GLOBAL_VERSION_ID.to_string(),
+        version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
         global: true,
         plugin_key: metadata.plugin_key,
         metadata: None,
@@ -223,7 +223,7 @@ fn active_version_file_id() -> String {
 }
 
 fn active_version_storage_version_id() -> String {
-    crate::contracts::GLOBAL_VERSION_ID.to_string()
+    crate::version::GLOBAL_VERSION_ID.to_string()
 }
 
 #[tokio::test]

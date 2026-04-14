@@ -1,5 +1,5 @@
 use crate::common::escape_sql_string;
-use crate::contracts::GLOBAL_VERSION_ID;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, SqlDialect};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

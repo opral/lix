@@ -784,7 +784,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionBeginMode,
+            _mode: crate::backend::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -796,7 +796,7 @@ mod tests {
             &self,
             _name: &str,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
-            self.begin_transaction(crate::TransactionBeginMode::Write)
+            self.begin_transaction(crate::backend::TransactionBeginMode::Write)
                 .await
         }
     }
@@ -807,8 +807,8 @@ mod tests {
             SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionBeginMode {
-            crate::TransactionBeginMode::Write
+        fn mode(&self) -> crate::backend::TransactionBeginMode {
+            crate::backend::TransactionBeginMode::Write
         }
 
         async fn execute(

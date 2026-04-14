@@ -1,5 +1,5 @@
 use crate::catalog::{ResolvedRelation, SurfaceFamily, SurfaceVariant};
-use crate::contracts::GLOBAL_VERSION_ID;
+use crate::version::GLOBAL_VERSION_ID;
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

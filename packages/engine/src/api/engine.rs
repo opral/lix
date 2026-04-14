@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
 use super::deterministic_settings::{load_global_runtime_settings, DeterministicSettings};
+use crate::backend::TransactionBeginMode;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::CompiledSchemaCache;
 use crate::functions::{
     clone_boxed_function_provider, DynFunctionProvider, FunctionBindings, LixFunctionProvider,
     RuntimeFunctionProvider, SharedFunctionProvider,
@@ -16,12 +16,13 @@ use crate::plugin::{
     invalidate_installed_plugins_cache, CachedPluginComponent, InstalledPlugin,
     PluginComponentHost, PluginMaterializationHost,
 };
+use crate::schema::CompiledSchemaCache;
 use crate::schema::SchemaKey;
 use crate::streams::{
     StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
 };
 use crate::wasm::WasmRuntime;
-use crate::{LixBackend, LixError, TransactionBeginMode};
+use crate::{LixBackend, LixError};
 
 const INIT_STATE_NOT_STARTED: u8 = 0;
 const INIT_STATE_IN_PROGRESS: u8 = 1;
@@ -520,7 +521,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionBeginMode,
+            _mode: crate::backend::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",

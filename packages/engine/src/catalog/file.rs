@@ -90,7 +90,7 @@ impl CatalogProjectionDefinition for LixFileByVersionProjection {
 
     fn derive(&self, input: &CatalogProjectionInput) -> Result<Vec<CatalogDerivedRow>, LixError> {
         let mut target_versions = input.context().current_committed_version_ids().to_vec();
-        target_versions.push(crate::contracts::GLOBAL_VERSION_ID.to_string());
+        target_versions.push(crate::version::GLOBAL_VERSION_ID.to_string());
         target_versions.sort();
         target_versions.dedup();
         let rows = derive_file_rows_for_versions(input, &target_versions)?;
@@ -422,7 +422,7 @@ fn select_effective_row_for_entity<'a>(
             .filter(|row| row.version_id == version_id && row.entity_id() == entity_id)
             .map(|row| (1, row)),
     );
-    if version_id != crate::contracts::GLOBAL_VERSION_ID {
+    if version_id != crate::version::GLOBAL_VERSION_ID {
         candidates.extend(
             global_untracked
                 .iter()

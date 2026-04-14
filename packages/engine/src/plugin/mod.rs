@@ -1,8 +1,8 @@
 //! Plugin subsystem root.
 //!
 //! Phase 1 establishes `crate::plugin::*` as the owner path for plugin-domain
-//! code under concrete plugin-owned modules instead of sealed `contracts/*`
-//! children.
+//! code under concrete plugin-owned modules instead of legacy ownership-neutral
+//! buckets.
 
 mod archive;
 pub(crate) mod component;

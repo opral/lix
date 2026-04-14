@@ -4,8 +4,8 @@ use std::sync::{Arc, OnceLock, RwLock};
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::contracts::SchemaAnnotationEvaluator;
 use crate::functions::{DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider};
+use crate::schema::SchemaAnnotationEvaluator;
 use crate::LixError;
 
 use super::context::build_context_with_functions;

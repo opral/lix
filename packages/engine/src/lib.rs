@@ -5,7 +5,6 @@ pub(crate) mod canonical;
 pub(crate) mod catalog;
 pub(crate) mod cel;
 mod common;
-pub(crate) mod contracts;
 mod diagnostics;
 pub(crate) mod execution;
 pub(crate) mod functions;
@@ -34,6 +33,7 @@ pub use schema::{
 
 pub use api::BootKeyValue;
 pub use api::{InitResult, Lix, LixConfig};
+pub use backend::TransactionBeginMode;
 pub use backend::{LixBackend, LixBackendTransaction, PreparedBatch, PreparedStatement};
 pub use canonical::CanonicalJson;
 pub use common::LixError;
@@ -43,12 +43,11 @@ pub use common::{
 };
 pub use common::{ExecuteResult, QueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
-pub use contracts::{ReplayCursor, TransactionBeginMode};
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
-    LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
+    LiveStateWriteOp, ReplayCursor, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 pub use session::checkpoint_ops::CreateCheckpointResult;

@@ -13,12 +13,12 @@ use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use crate::backend::PreparedBatch;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::CompiledSchemaCache;
 use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::functions::{
     clone_boxed_function_provider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
 use crate::live_state::{LiveRowShapeContract, LiveStateQueryBackend};
+use crate::schema::CompiledSchemaCache;
 use crate::sql::bind_sql;
 use crate::sql::{
     build_change_batches, build_public_write_execution,
@@ -49,9 +49,8 @@ use crate::transaction::{
     TransactionWriteSelectorResolver, UpdateValidationInput, UpdateValidationInputRow,
     WriteCommand, WriteExecutionContext,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
-
-const GLOBAL_VERSION_ID: &str = "global";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WritePreparationStamp {

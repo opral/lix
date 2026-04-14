@@ -5,7 +5,6 @@ use crate::canonical::{
     append_changes, CanonicalChangeWrite, CanonicalCommitReceipt, CanonicalStateIdentity,
     UpdatedVersionRef,
 };
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::functions::LixFunctionProvider;
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
@@ -26,6 +25,7 @@ use crate::transaction::{
     FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::version::version_ref_snapshot_content;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::SqlDialect;
 use crate::{
     CanonicalJson, CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value,
@@ -1297,7 +1297,6 @@ mod tests {
         CreateCommitWriteLane,
     };
     use crate::canonical::CanonicalChangeWrite;
-    use crate::contracts::GLOBAL_VERSION_ID;
     use crate::functions::LixFunctionProvider;
     use crate::session::version_ops::commit::UpdatedVersionRef;
     use crate::sql::OptionalTextPatch;
@@ -1306,6 +1305,7 @@ mod tests {
         CanonicalChangeSeed, TestSqliteBackend,
     };
     use crate::transaction::{FilesystemTransactionFileState, FilesystemTransactionState};
+    use crate::version::GLOBAL_VERSION_ID;
     use crate::{
         CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
         LixBackend, LixBackendTransaction, LixError, Value, VersionId,
@@ -1505,7 +1505,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1583,7 +1583,7 @@ mod tests {
             ),
         );
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1644,7 +1644,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1707,7 +1707,7 @@ mod tests {
         .await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1762,7 +1762,7 @@ mod tests {
         .await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1803,7 +1803,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1839,7 +1839,7 @@ mod tests {
         let backend = init_create_commit_backend().await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1873,7 +1873,7 @@ mod tests {
         let backend = init_create_commit_backend().await;
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1916,7 +1916,7 @@ mod tests {
         .expect("global local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -1957,7 +1957,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();
@@ -2017,7 +2017,7 @@ mod tests {
             .expect("local version head should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::TransactionBeginMode::Write)
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
             .await
             .expect("transaction should begin");
         let mut functions = CountingFunctionProvider::default();

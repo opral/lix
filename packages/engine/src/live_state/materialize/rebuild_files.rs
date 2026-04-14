@@ -1,5 +1,5 @@
+use crate::binary_cas::BlobDataReader;
 use crate::catalog::{load_file_row_by_id, FilesystemProjectionScope};
-use crate::contracts::BlobDataReader;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::plugin::{
     select_best_glob_match, FilesystemPluginMaterializer, InstalledPlugin, PluginContentType,

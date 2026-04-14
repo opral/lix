@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::CanonicalChangeWrite;
-use crate::contracts::TrackedChangeView;
-use crate::contracts::GLOBAL_VERSION_ID;
 use crate::live_state::LiveRow;
 use crate::session::version_ops::VersionInfo;
+use crate::streams::StateChangeRecord;
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, LixError,
     VersionId,
@@ -27,7 +27,7 @@ pub(crate) struct StagedChange {
     pub(crate) created_at: Option<String>,
 }
 
-impl TrackedChangeView for StagedChange {
+impl StateChangeRecord for StagedChange {
     fn entity_id(&self) -> &str {
         self.entity_id.as_str()
     }

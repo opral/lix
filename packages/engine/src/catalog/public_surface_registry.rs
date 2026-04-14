@@ -7,12 +7,12 @@ use crate::catalog::{
     register_dynamic_entity_surface_spec, remove_dynamic_entity_surfaces_for_schema_key,
     SurfaceRegistry,
 };
-use crate::contracts::SchemaAnnotationEvaluator;
 use crate::functions::DynFunctionProvider;
 use crate::live_state::{
     decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::schema_from_registered_snapshot;
+use crate::schema::SchemaAnnotationEvaluator;
 use crate::schema::SchemaKey;
 use crate::{LixBackend, LixError};
 
@@ -287,7 +287,7 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            _mode: crate::TransactionBeginMode,
+            _mode: crate::backend::TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
             Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",

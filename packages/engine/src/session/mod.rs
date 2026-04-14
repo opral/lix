@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
 
+use crate::backend::TransactionBeginMode;
 use crate::catalog::SurfaceRegistry;
 use crate::diagnostics::transaction_control_statement_denied_error;
 use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
@@ -577,7 +578,7 @@ impl Session {
                 } else {
                     let mut transaction = self
                         .session_host
-                        .begin_read_unit(crate::TransactionBeginMode::Write)
+                        .begin_read_unit(TransactionBeginMode::Write)
                         .await?;
                     let mut runtime_functions = function_bindings.provider().clone();
                     crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
@@ -819,17 +820,17 @@ impl Session {
 fn baseline_committed_read_transaction_mode(
     execution_mode: SessionExecutionMode,
     function_bindings: &FunctionBindings,
-) -> crate::TransactionBeginMode {
+) -> TransactionBeginMode {
     match execution_mode {
-        SessionExecutionMode::CommittedRead => crate::TransactionBeginMode::Read,
+        SessionExecutionMode::CommittedRead => TransactionBeginMode::Read,
         SessionExecutionMode::CommittedRuntimeMutation => {
             if function_bindings.deterministic_enabled() {
-                crate::TransactionBeginMode::Write
+                TransactionBeginMode::Write
             } else {
-                crate::TransactionBeginMode::Read
+                TransactionBeginMode::Read
             }
         }
-        SessionExecutionMode::WriteTransaction => crate::TransactionBeginMode::Write,
+        SessionExecutionMode::WriteTransaction => TransactionBeginMode::Write,
     }
 }
 
@@ -1077,13 +1078,13 @@ mod tests {
     #[derive(Clone)]
     struct RecordingBackend {
         connection: Arc<Mutex<rusqlite::Connection>>,
-        modes: Arc<Mutex<Vec<crate::TransactionBeginMode>>>,
+        modes: Arc<Mutex<Vec<TransactionBeginMode>>>,
         executed_sql: Arc<Mutex<Vec<String>>>,
     }
 
     struct RecordingTransaction {
         connection: Arc<Mutex<rusqlite::Connection>>,
-        mode: crate::TransactionBeginMode,
+        mode: TransactionBeginMode,
         executed_sql: Arc<Mutex<Vec<String>>>,
     }
 
@@ -1098,7 +1099,7 @@ mod tests {
             }
         }
 
-        fn modes(&self) -> Vec<crate::TransactionBeginMode> {
+        fn modes(&self) -> Vec<TransactionBeginMode> {
             self.modes.lock().expect("recorded modes lock").clone()
         }
 
@@ -1152,16 +1153,15 @@ mod tests {
 
         async fn begin_transaction(
             &self,
-            mode: crate::TransactionBeginMode,
+            mode: TransactionBeginMode,
         ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, crate::LixError> {
             self.modes.lock().expect("recorded modes lock").push(mode);
             {
                 let connection = self.connection.lock().expect("sqlite connection lock");
                 connection
                     .execute_batch(match mode {
-                        crate::TransactionBeginMode::Read
-                        | crate::TransactionBeginMode::Deferred => "BEGIN",
-                        crate::TransactionBeginMode::Write => "BEGIN IMMEDIATE",
+                        TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN",
+                        TransactionBeginMode::Write => "BEGIN IMMEDIATE",
                     })
                     .map_err(sqlite_error)?;
             }
@@ -1185,10 +1185,10 @@ mod tests {
             self.modes
                 .lock()
                 .expect("recorded modes lock")
-                .push(crate::TransactionBeginMode::Write);
+                .push(TransactionBeginMode::Write);
             Ok(Box::new(RecordingTransaction {
                 connection: Arc::clone(&self.connection),
-                mode: crate::TransactionBeginMode::Write,
+                mode: TransactionBeginMode::Write,
                 executed_sql: Arc::clone(&self.executed_sql),
             }))
         }
@@ -1200,7 +1200,7 @@ mod tests {
             crate::SqlDialect::Sqlite
         }
 
-        fn mode(&self) -> crate::TransactionBeginMode {
+        fn mode(&self) -> TransactionBeginMode {
             self.mode
         }
 
@@ -1318,7 +1318,7 @@ mod tests {
                 .await
                 .expect("plain read should succeed");
             assert_eq!(result.statements[0].rows[0][0], crate::Value::Integer(1));
-            assert_eq!(backend.modes(), vec![crate::TransactionBeginMode::Read]);
+            assert_eq!(backend.modes(), vec![TransactionBeginMode::Read]);
         });
     }
 
@@ -1366,7 +1366,7 @@ mod tests {
             );
 
             let _ = session.execute("BEGIN; SELECT 1; COMMIT;", &[]).await;
-            assert_eq!(backend.modes(), vec![crate::TransactionBeginMode::Write]);
+            assert_eq!(backend.modes(), vec![TransactionBeginMode::Write]);
         });
     }
 
@@ -1386,7 +1386,7 @@ mod tests {
                 .await
                 .expect("direct public history read should succeed");
             assert_eq!(result.statements[0].rows.len(), 1);
-            assert_eq!(backend.modes(), vec![crate::TransactionBeginMode::Deferred]);
+            assert_eq!(backend.modes(), vec![TransactionBeginMode::Deferred]);
         });
     }
 
@@ -1406,7 +1406,7 @@ mod tests {
                 .await
                 .expect("materialized public read should succeed");
             assert_eq!(result.statements[0].rows.len(), 1);
-            assert_eq!(backend.modes(), vec![crate::TransactionBeginMode::Read]);
+            assert_eq!(backend.modes(), vec![TransactionBeginMode::Read]);
         });
     }
 
@@ -1433,7 +1433,7 @@ mod tests {
                     .unwrap_or_else(|error| panic!("lowered committed-only read should succeed for `{sql}`: {error:?}"));
                 assert_eq!(
                     backend.modes(),
-                    vec![crate::TransactionBeginMode::Read],
+                    vec![TransactionBeginMode::Read],
                     "lowered committed-only read should stay on TransactionBeginMode::Read for `{sql}`",
                 );
             }
