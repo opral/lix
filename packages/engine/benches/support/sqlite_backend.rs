@@ -1,6 +1,6 @@
 use lix_engine::{
     LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect,
-    TransactionMode, Value,
+    TransactionBeginMode, Value,
 };
 use rusqlite::{params_from_iter, Connection, Row};
 use std::path::Path;
@@ -14,7 +14,7 @@ struct BenchSqliteTransaction<'a> {
     conn: MutexGuard<'a, Connection>,
     finalized: bool,
     savepoint_name: Option<String>,
-    mode: TransactionMode,
+    mode: TransactionBeginMode,
 }
 
 impl BenchSqliteBackend {
@@ -64,25 +64,25 @@ impl LixBackend for BenchSqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let conn = self.lock_conn()?;
         let savepoint_name = if conn.is_autocommit() {
             conn.execute_batch(match mode {
-                TransactionMode::Read | TransactionMode::Deferred => "BEGIN TRANSACTION",
-                TransactionMode::Write => "BEGIN IMMEDIATE",
+                TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN TRANSACTION",
+                TransactionBeginMode::Write => "BEGIN IMMEDIATE",
             })
             .map_err(sqlite_error)?;
             None
         } else {
             match mode {
-                TransactionMode::Write => {
+                TransactionBeginMode::Write => {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         "sqlite benchmark backend cannot open a nested write transaction inside an active transaction; use begin_savepoint(...) for nested write scopes",
                     ));
                 }
-                TransactionMode::Read | TransactionMode::Deferred => {
+                TransactionBeginMode::Read | TransactionBeginMode::Deferred => {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         "sqlite benchmark backend cannot open a nested read/deferred transaction inside an active transaction",
@@ -111,7 +111,7 @@ impl LixBackend for BenchSqliteBackend {
             conn,
             finalized: false,
             savepoint_name: Some(name.to_string()),
-            mode: TransactionMode::Write,
+            mode: TransactionBeginMode::Write,
         }))
     }
 }
@@ -122,7 +122,7 @@ impl LixBackendTransaction for BenchSqliteTransaction<'_> {
         SqlDialect::Sqlite
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
 
