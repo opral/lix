@@ -289,7 +289,7 @@ simulation_test!(
             Some(new_commit_id.as_str())
         );
 
-        // Verify snapshot FK integrity for generated tracked+meta changes.
+        // Verify snapshot FK integrity for generated changes.
         let snapshot_fks = engine
             .execute(
                 "SELECT snapshot_id \
