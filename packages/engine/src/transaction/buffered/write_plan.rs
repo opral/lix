@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
-use crate::contracts::{RowIdentity, TrackedWriteRow, UntrackedWriteRow};
+use crate::live_state::RowIdentity;
+use crate::live_state::{TrackedWriteRow, UntrackedWriteRow};
 use crate::transaction::overlay::PendingRowOverlay;
 use crate::transaction::TransactionDelta;
 use crate::LixError;

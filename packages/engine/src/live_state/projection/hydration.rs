@@ -123,7 +123,7 @@ async fn hydrate_input_rows_with_backend(
                         .map(|row| {
                             CatalogProjectionSourceRow::new(
                                 CatalogProjectionStorageKind::Tracked,
-                                crate::contracts::RowIdentity::from_tracked_row(&row),
+                                crate::live_state::RowIdentity::from_tracked_row(&row),
                                 row.schema_key.clone(),
                                 row.version_id.clone(),
                                 row.values,
@@ -148,7 +148,7 @@ async fn hydrate_input_rows_with_backend(
                         .map(|row| {
                             CatalogProjectionSourceRow::new(
                                 CatalogProjectionStorageKind::Tracked,
-                                crate::contracts::RowIdentity {
+                                crate::live_state::RowIdentity {
                                     entity_id: row.entity_id.clone(),
                                     schema_key: row.schema_key.clone(),
                                     version_id: row.version_id.clone(),
@@ -187,7 +187,7 @@ async fn hydrate_input_rows_with_backend(
                 .map(|row| {
                     CatalogProjectionSourceRow::new(
                         CatalogProjectionStorageKind::Untracked,
-                        crate::contracts::RowIdentity::from_untracked_row(&row),
+                        crate::live_state::RowIdentity::from_untracked_row(&row),
                         row.schema_key.clone(),
                         row.version_id.clone(),
                         row.values,

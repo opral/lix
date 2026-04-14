@@ -1,10 +1,10 @@
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
-use crate::contracts::{
+use crate::sql::logical_plan::SurfaceReadPlan;
+use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
+use crate::sql::{
     PendingOverlayFilter, PendingOverlayOrderClause, PendingOverlayProjection, ProjectionQuery,
     ReadTimeProjectionPlan,
 };
-use crate::sql::logical_plan::SurfaceReadPlan;
-use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::Value;
 use sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, GroupByExpr,

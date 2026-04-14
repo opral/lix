@@ -239,7 +239,7 @@ pub(crate) async fn boot_test_engine() -> Result<(TestSqliteBackend, Arc<Lix>, S
         Arc::new(NoopWasmRuntime),
     )));
     lix.initialize().await?;
-    let session = lix.open_workspace_session().await?;
+    let session = crate::session::host::open_workspace_session(lix.engine().session_host()).await?;
     Ok((backend, lix, session))
 }
 
@@ -252,7 +252,7 @@ impl crate::contracts::ReadExecutionHost for BuiltinReadExecutionHost {
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
-        artifact: &crate::contracts::ReadTimeProjectionPlan,
+        artifact: &crate::sql::ReadTimeProjectionPlan,
     ) -> Result<Vec<crate::contracts::ReadTimeProjectionRow>, LixError> {
         Ok(crate::live_state::derive_read_time_surface_rows(
             backend,
@@ -263,7 +263,14 @@ impl crate::contracts::ReadExecutionHost for BuiltinReadExecutionHost {
         .into_iter()
         .map(|row| crate::contracts::ReadTimeProjectionRow {
             surface_name: row.surface_name,
-            identity: row.identity,
+            identity: row
+                .identity
+                .map(|identity| crate::contracts::ReadTimeProjectionIdentity {
+                    schema_key: identity.schema_key,
+                    version_id: identity.version_id,
+                    entity_id: identity.entity_id,
+                    file_id: identity.file_id,
+                }),
             values: row.values,
         })
         .collect())

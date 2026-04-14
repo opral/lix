@@ -1,4 +1,4 @@
-pub use crate::contracts::{PreparedBatch, PreparedStatement};
+pub use crate::sql::{PreparedBatch, PreparedStatement};
 
 impl PreparedBatch {
     pub fn append_sql(&mut self, sql: impl AsRef<str>) {

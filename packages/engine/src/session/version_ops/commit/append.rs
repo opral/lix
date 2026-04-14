@@ -1,5 +1,5 @@
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::PendingCommitState;
+use crate::transaction::PendingCommitState;
 use crate::transaction::{binary_blob_writes_from_filesystem_state, FilesystemTransactionState};
 use crate::{LixBackendTransaction, LixError};
 
@@ -18,7 +18,7 @@ use super::types::{
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
     StagedChange,
 };
-use super::CanonicalCommitReceipt;
+use crate::transaction::CanonicalCommitReceipt;
 
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,
@@ -181,7 +181,7 @@ mod tests {
         CreateCommitPreconditions, CreateCommitWriteLane, PendingCommitState,
     };
     use crate::contracts::LixFunctionProvider;
-    use crate::contracts::PendingCommitLane;
+    use crate::transaction::PendingCommitLane;
     use crate::{
         LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode, Value,
     };
@@ -245,7 +245,7 @@ mod tests {
 
         async fn execute_batch(
             &mut self,
-            _batch: &crate::contracts::PreparedBatch,
+            _batch: &crate::sql::PreparedBatch,
         ) -> Result<QueryResult, LixError> {
             Ok(QueryResult {
                 rows: Vec::new(),

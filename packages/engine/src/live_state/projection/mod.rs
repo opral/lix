@@ -15,13 +15,13 @@ pub(crate) mod status;
 
 use std::collections::BTreeSet;
 
-use crate::contracts::CanonicalCommitReceipt;
 use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::live_state::{
     LiveStateMode, LiveStateProjectionStatus, LiveStateRebuildDebugMode, LiveStateRebuildRequest,
     LiveStateRebuildScope,
 };
 use crate::schema::LixVersionRef;
+use crate::transaction::CanonicalCommitReceipt;
 use crate::{
     CommittedVersionFrontier, LixBackend, LixBackendTransaction, LixError, ReplayCursor,
     TransactionBeginMode,

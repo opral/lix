@@ -27,6 +27,7 @@
 //! Replay-specific implementation lives under `live_state::projection::*`.
 //! Callers outside `live_state/*` should use the root-level entrypoints here.
 
+mod bridge;
 pub(crate) mod constraints;
 pub(crate) mod effective;
 mod frontier;
@@ -49,6 +50,7 @@ pub(crate) mod stored_rows;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tracked;
+mod types;
 pub(crate) mod untracked;
 mod visible_rows;
 pub(crate) mod writer_key;
@@ -57,12 +59,7 @@ use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-#[allow(unused_imports)]
-pub(crate) use crate::contracts::{
-    LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
-    LiveStateProjectionStatus, SchemaRegistrationSet,
-};
-pub use crate::contracts::{LiveStateMode, SchemaRegistration};
+pub(crate) use bridge::LiveStateTransactionBridge;
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 #[cfg(test)]
 pub(crate) use effective::EffectiveRowsResolver;
@@ -97,7 +94,6 @@ pub use row_queries::{
     ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSource,
 };
 pub(crate) use schema_access::LiveRowShape;
-pub use shared::identity::RowIdentity;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
 pub(crate) use storage_metadata::{
     builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,
@@ -115,10 +111,28 @@ pub(crate) use tracked::{
 };
 #[cfg(test)]
 pub(crate) use tracked::{TrackedReadView, TrackedTombstoneView};
+#[allow(unused_imports)]
+pub(crate) use tracked::{TrackedWriteOperation, TrackedWriteRow};
+#[cfg(test)]
+pub(crate) use types::values_from_snapshot_content;
+#[cfg(test)]
+pub(crate) use types::{batch_row_constraints, BatchRowRequest};
+pub(crate) use types::{
+    exact_row_constraints, matches_constraints, ExactRowRequest, RowIdentity, ScanRequest,
+};
+#[allow(unused_imports)]
+pub(crate) use types::{
+    LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
+    LiveStateProjectionStatus, SchemaRegistrationSet,
+};
+pub use types::{LiveStateMode, SchemaRegistration};
 pub(crate) use untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
 #[cfg(test)]
 pub(crate) use untracked::UntrackedReadView;
-pub(crate) use untracked::{ExactUntrackedRowRequest, UntrackedRow};
+#[allow(unused_imports)]
+pub(crate) use untracked::{
+    ExactUntrackedRowRequest, UntrackedRow, UntrackedWriteOperation, UntrackedWriteRow,
+};
 pub(crate) use visible_rows::{
     scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
 };
@@ -161,7 +175,7 @@ pub(crate) async fn list_installed_plugin_archive_refs(
 pub(crate) async fn derive_read_time_surface_rows(
     backend: &dyn LixBackend,
     registry: &crate::catalog::CatalogProjectionRegistry,
-    artifact: &crate::contracts::ReadTimeProjectionPlan,
+    artifact: &crate::sql::ReadTimeProjectionPlan,
 ) -> Result<Vec<crate::catalog::CatalogDerivedRow>, LixError> {
     projection::dispatch::derive_read_time_projection_rows_with_backend(backend, registry, artifact)
         .await
@@ -377,10 +391,10 @@ pub(crate) async fn rebuild_scope_in_transaction(
 }
 
 #[async_trait(?Send)]
-impl crate::contracts::LiveStateTransactionBridge for dyn LixBackendTransaction + '_ {
+impl crate::live_state::LiveStateTransactionBridge for dyn LixBackendTransaction + '_ {
     async fn register_live_state_schema(
         &mut self,
-        registration: &crate::contracts::SchemaRegistration,
+        registration: &crate::live_state::SchemaRegistration,
     ) -> Result<(), LixError> {
         register_schema_in_transaction(self, registration.clone()).await
     }

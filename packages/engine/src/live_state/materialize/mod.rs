@@ -21,9 +21,10 @@ pub use types::{
     TraversedEdgeDebugRow, VersionHeadDebugRow,
 };
 
-use crate::contracts::LiveStateMode;
 use crate::plugin::FilesystemPluginMaterializer;
 use crate::{LixBackend, LixBackendTransaction, LixError};
+
+use super::LiveStateMode;
 
 pub async fn rebuild_plan(
     backend: &dyn LixBackend,

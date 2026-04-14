@@ -1,7 +1,3 @@
-pub(crate) use crate::contracts::{
-    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
-    PlannedStateRow, WriteLane, WriteMode,
-};
 pub(crate) use crate::sql::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
     build_entity_insert_rows_with_functions, build_state_insert_row,
@@ -13,4 +9,8 @@ pub(crate) use crate::sql::{
     OverlayLane, PlaceholderState, PlannedWrite, ResolvedRowRef, ResolvedWritePartition,
     ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
     WriteModeRequest, WriteOperationKind,
+};
+pub(crate) use crate::transaction::{
+    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
+    PlannedStateRow, WriteLane, WriteMode,
 };

@@ -1,11 +1,11 @@
 use crate::common::stable_content_fingerprint_hex;
 use crate::contracts::TrackedChangeView;
-use crate::contracts::{
-    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,
-};
 use crate::sql::logical_plan::public_ir::{
     MutationPayload, PlannedStateRow, PlannedWrite, ResolvedWritePartition, WriteLane, WriteMode,
     WriteOperationKind,
+};
+use crate::transaction::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, PublicChange, SemanticEffect,
 };
 use crate::LixError;
 use serde_json::{json, Map, Value as JsonValue};
@@ -373,12 +373,12 @@ fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{build_change_batches, derive_commit_preconditions};
-    use crate::contracts::ExpectedHead;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::WriteLane;
     use crate::sql::semantic_ir::canonicalize::canonicalize_write;
     use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
     use crate::sql::semantic_ir::StatementContext;
+    use crate::transaction::ExpectedHead;
     use crate::{CreateVersionOptions, Value};
 
     async fn planned_write_with_params(

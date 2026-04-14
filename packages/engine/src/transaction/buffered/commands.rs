@@ -1,5 +1,5 @@
-use crate::contracts::{PreparedPublicSurfaceRegistryEffect, SessionStateDelta};
-use crate::transaction::TransactionCommitOutcome;
+use crate::session::SessionStateDelta;
+use crate::transaction::{PreparedPublicSurfaceRegistryEffect, TransactionCommitOutcome};
 use crate::QueryResult;
 
 use super::TransactionWriteDelta;

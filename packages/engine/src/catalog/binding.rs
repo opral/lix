@@ -7,7 +7,7 @@ use crate::catalog::{
     SurfaceOverridePredicate, SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{
+use crate::version::{
     version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
     version_descriptor_schema_version, version_ref_file_id, version_ref_plugin_key,
     version_ref_schema_key, version_ref_schema_version, version_ref_storage_version_id,

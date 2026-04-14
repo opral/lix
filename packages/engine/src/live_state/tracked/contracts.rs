@@ -1,8 +1,10 @@
 #[cfg(test)]
 use async_trait::async_trait;
 
+use std::collections::BTreeMap;
+
 #[cfg(test)]
-pub use crate::contracts::BatchRowRequest as BatchTrackedRowRequest;
+pub(crate) use crate::live_state::BatchRowRequest as BatchTrackedRowRequest;
 #[cfg(test)]
 #[async_trait(?Send)]
 pub trait TrackedReadView {
@@ -24,14 +26,91 @@ pub trait TrackedTombstoneView {
         request: &TrackedScanRequest,
     ) -> Result<Vec<TrackedTombstoneMarker>, crate::LixError>;
 }
-pub use crate::contracts::{
-    ExactRowRequest as ExactTrackedRowRequest, ScanRequest as TrackedScanRequest, TrackedRow,
-    TrackedTombstoneMarker, TrackedWriteOperation, TrackedWriteRow,
+pub(crate) use crate::live_state::{
+    ExactRowRequest as ExactTrackedRowRequest, ScanRequest as TrackedScanRequest,
 };
 #[cfg(test)]
 use crate::LixBackend;
 #[cfg(test)]
 use crate::LixError;
+use crate::Value;
+
+/// Decoded tracked live row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub change_id: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub values: BTreeMap<String, Value>,
+}
+
+#[cfg(test)]
+impl TrackedRow {
+    pub fn property_text(&self, property_name: &str) -> Option<String> {
+        self.values
+            .get(property_name)
+            .and_then(value_as_text)
+            .map(ToString::to_string)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedTombstoneMarker {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub schema_version: Option<String>,
+    pub plugin_key: Option<String>,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+    pub change_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TrackedWriteOperation {
+    Upsert,
+    Tombstone,
+}
+
+/// Single tracked live-state write operation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct TrackedWriteRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub change_id: String,
+    pub writer_key: Option<String>,
+    pub snapshot_content: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: String,
+    pub operation: TrackedWriteOperation,
+}
+
+#[cfg(test)]
+fn value_as_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 #[async_trait(?Send)]

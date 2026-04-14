@@ -2,7 +2,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogSurfaceDependencyMetadata,
     ResolvedRelation, SurfaceFamily,
 };
-use crate::contracts::SessionDependency;
+use crate::session::SessionDependency;
 use crate::sql::logical_plan::public_ir::{ReadPlan, StructuredPublicRead};
 use crate::sql::logical_plan::{DependencyPrecision, DependencySpec};
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
@@ -474,7 +474,7 @@ fn add_filter_literal(column: FilterColumn, value: String, spec: &mut Dependency
 mod tests {
     use super::derive_dependency_spec_from_structured_public_read;
     use crate::catalog::SurfaceRegistry;
-    use crate::contracts::SessionDependency;
+    use crate::session::SessionDependency;
     use crate::sql::binder::bind_statement;
     use crate::sql::logical_plan::public_ir::StructuredPublicRead;
     use crate::sql::logical_plan::DependencyPrecision;

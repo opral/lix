@@ -1,4 +1,4 @@
-use crate::contracts::OptionalTextPatch;
+use crate::transaction::OptionalTextPatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PendingSemanticStorage {

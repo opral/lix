@@ -2,14 +2,22 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use crate::contracts::{PreparedPublicRead, ReadTimeProjectionPlan, RowIdentity};
+use crate::sql::{PreparedPublicRead, ReadTimeProjectionPlan};
 use crate::transaction::PendingOverlay;
 use crate::{LixBackend, LixError, QueryResult, Value};
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct ReadTimeProjectionIdentity {
+    pub schema_key: String,
+    pub version_id: String,
+    pub entity_id: String,
+    pub file_id: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct ReadTimeProjectionRow {
     pub surface_name: String,
-    pub identity: Option<RowIdentity>,
+    pub identity: Option<ReadTimeProjectionIdentity>,
     pub values: BTreeMap<String, Value>,
 }
 

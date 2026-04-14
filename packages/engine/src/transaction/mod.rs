@@ -8,6 +8,7 @@
 mod backend;
 pub(crate) mod buffered;
 mod buffered_write_transaction;
+mod commit_artifacts;
 mod compiler_state;
 mod contracts;
 mod deterministic_sequence;
@@ -20,11 +21,12 @@ pub(crate) mod overlay;
 mod overlay_read_context;
 mod pending_overlay_public_reads;
 pub(crate) mod pipeline;
+mod prepared_artifacts;
 mod prepared_step;
 mod prepared_write;
+mod validation_input;
 mod write_batch;
 
-pub(crate) use crate::contracts::TransactionCommitOutcome;
 pub(crate) use crate::execution::WriteBatch;
 pub(crate) use backend::{
     lookup_directory_id_by_path_in_transaction,
@@ -38,17 +40,25 @@ pub(crate) use buffered::{
 pub(crate) use buffered_write_transaction::{
     BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
 };
+pub use commit_artifacts::CommittedVersionFrontier;
+pub(crate) use commit_artifacts::{
+    CanonicalCommitReceipt, PendingCommitLane, PendingCommitState, UpdatedVersionRef,
+};
 pub(crate) use compiler_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
 };
+pub(crate) use contracts::{
+    BufferedWriteExecutionInput, DeferredCommitEffects, PreparedWriteFunctionBindings,
+    TrackedCommitExecutionOutcome, TransactionCommitOutcome, WriteExecutionContext,
+};
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
-pub(crate) use contracts::{DeferredCommitEffects, WriteExecutionContext};
 pub(crate) use deterministic_sequence::{
     build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
     deterministic_sequence_key, ensure_runtime_sequence_initialized_in_transaction,
     persist_runtime_sequence_in_transaction,
 };
+pub(crate) use filesystem::payload_change::FilesystemPayloadChange;
 #[cfg(test)]
 pub(crate) use filesystem::runtime::FilesystemTransactionFileState;
 pub(crate) use filesystem::runtime::{
@@ -85,6 +95,17 @@ pub(crate) use pipeline::{
     prepared_write_function_bindings_for_execution, validate_commit_time_write, WriteResolveError,
     WriteSelectorResolver,
 };
+pub(crate) use prepared_artifacts::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch, PlanEffects,
+    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
+    PlannedStateRow, PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
+    PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
+    PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
+    PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
+    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteArtifact,
+    PreparedWriteStatement, PublicChange, SemanticEffect, WriteLane, WriteMode,
+};
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};
+pub(crate) use validation_input::{UpdateValidationInput, UpdateValidationInputRow};
 pub(crate) use write_batch::execute_write_batch_with_transaction;

@@ -3,8 +3,10 @@ use crate::catalog::{
     state_by_version_relation_name, FilesystemProjectionScope,
 };
 use crate::common::stable_content_fingerprint_hex;
-use crate::contracts::{FilesystemPayloadChange, MutationRow, OptionalTextPatch};
+use crate::sql::MutationRow;
 use crate::transaction::overlay::{PendingFilesystemDescriptorView, PendingFilesystemFileView};
+use crate::transaction::FilesystemPayloadChange;
+use crate::transaction::OptionalTextPatch;
 use crate::transaction::TransactionExecutionBackend;
 use crate::{LixBackendTransaction, LixError, Value};
 use std::collections::{BTreeMap, BTreeSet};

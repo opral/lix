@@ -9,9 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use sqlparser::ast::{BinaryOperator, Expr, UnaryOperator, Value as SqlValue, ValueWithSpan};
 
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind};
-use crate::contracts::{PendingOverlayFilter, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::LiveStateQueryBackend;
-use crate::live_state::{scan_live_rows, LiveRow, LiveRowQuery, LiveRowSource};
+use crate::live_state::{
+    scan_live_rows, LiveRow, LiveRowQuery, LiveRowSource, ScanConstraint, ScanField, ScanOperator,
+};
+use crate::sql::PendingOverlayFilter;
 use crate::sql::{
     resolve_placeholder_index, CanonicalStateRowKey, PlaceholderState, PlannedWrite, ScopeProof,
 };
@@ -241,7 +243,7 @@ async fn scan_selector_lane(
 
     for pending in pending_overlay.visible_semantic_rows(pending_storage, schema_key) {
         if pending.version_id != storage_version_id
-            || !crate::contracts::matches_constraints(
+            || !crate::live_state::matches_constraints(
                 &pending.entity_id,
                 &pending.file_id,
                 &pending.plugin_key,

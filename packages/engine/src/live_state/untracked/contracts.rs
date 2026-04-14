@@ -1,8 +1,10 @@
 #[cfg(test)]
 use async_trait::async_trait;
 
+use std::collections::BTreeMap;
+
 #[cfg(test)]
-pub use crate::contracts::BatchRowRequest as BatchUntrackedRowRequest;
+pub(crate) use crate::live_state::BatchRowRequest as BatchUntrackedRowRequest;
 #[cfg(test)]
 #[async_trait(?Send)]
 pub trait UntrackedReadView {
@@ -16,14 +18,71 @@ pub trait UntrackedReadView {
         request: &UntrackedScanRequest,
     ) -> Result<Vec<UntrackedRow>, crate::LixError>;
 }
-pub use crate::contracts::{
-    ExactRowRequest as ExactUntrackedRowRequest, ScanRequest as UntrackedScanRequest, UntrackedRow,
-    UntrackedWriteOperation, UntrackedWriteRow,
+pub(crate) use crate::live_state::{
+    ExactRowRequest as ExactUntrackedRowRequest, ScanRequest as UntrackedScanRequest,
 };
 #[cfg(test)]
 use crate::LixBackend;
 #[cfg(test)]
 use crate::LixError;
+use crate::Value;
+
+/// Decoded untracked/helper live row.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UntrackedRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub values: BTreeMap<String, Value>,
+}
+
+impl UntrackedRow {
+    pub fn property_text(&self, property_name: &str) -> Option<String> {
+        self.values
+            .get(property_name)
+            .and_then(value_as_text)
+            .map(ToString::to_string)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum UntrackedWriteOperation {
+    Upsert,
+    Delete,
+}
+
+/// Single untracked/helper write operation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UntrackedWriteRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub writer_key: Option<String>,
+    pub snapshot_content: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: String,
+    pub operation: UntrackedWriteOperation,
+}
+
+fn value_as_text(value: &Value) -> Option<&str> {
+    match value {
+        Value::Text(value) => Some(value.as_str()),
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 #[async_trait(?Send)]

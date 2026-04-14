@@ -2,7 +2,6 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, ResolvedRelation, SurfaceFamily,
     SurfaceRegistry, SurfaceVariant,
 };
-use crate::contracts::ReadTimeProjectionPlan;
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::logical_plan::public_ir::{
@@ -24,6 +23,7 @@ use crate::sql::prepare::public_surface::routing::registry::{
     run_fallible_pass, run_infallible_pass, RoutingPassMetadata, RoutingPassOutcome,
     RoutingPassRegistry, RoutingPassSettings, RoutingPassTrace,
 };
+use crate::sql::ReadTimeProjectionPlan;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use std::cell::Cell;

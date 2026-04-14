@@ -12,11 +12,13 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use crate::catalog::SurfaceRegistry;
-use crate::contracts::BufferedWriteExecutionInput;
-use crate::contracts::{ExecuteOptions, FunctionBindings, SessionStateDelta};
+use crate::contracts::FunctionBindings;
+use crate::session::ExecuteOptions;
+use crate::session::SessionStateDelta;
 use crate::sql::RuntimeBindingValues;
 #[cfg(test)]
 use crate::sql::{StatementTemplate, StatementTemplateCacheKey};
+use crate::transaction::BufferedWriteExecutionInput;
 use crate::LixError;
 
 pub(crate) type SessionCompilerCacheHandle = Arc<SessionCompilerCache>;

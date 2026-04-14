@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use crate::contracts::{PreparedAnalyzedRuntime, PreparedExplainTemplate};
+use crate::sql::{PreparedAnalyzedRuntime, PreparedExplainTemplate};
 use crate::{LixError, QueryResult, Value};
 
 pub fn render_plain_explain_result(

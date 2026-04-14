@@ -101,7 +101,7 @@ impl CatalogProjectionDefinition for LixDirectoryByVersionProjection {
 
 #[derive(Debug, Clone)]
 struct DerivedDirectoryRow {
-    identity: crate::contracts::RowIdentity,
+    identity: crate::live_state::RowIdentity,
     version_id: String,
     id: String,
     parent_id: Option<String>,
@@ -446,7 +446,7 @@ fn global_untracked(schema_key: &str) -> CatalogProjectionInputSpec {
 mod tests {
     use super::*;
     use crate::catalog::{CatalogProjectionContext, CatalogProjectionInputRows};
-    use crate::contracts::RowIdentity;
+    use crate::live_state::RowIdentity;
 
     #[test]
     fn default_directory_projection_derives_paths_and_active_commit_id() {

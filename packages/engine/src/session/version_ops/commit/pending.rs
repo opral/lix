@@ -3,9 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::backend::QueryExecutor;
 use crate::canonical::append_changes;
 use crate::contracts::LixFunctionProvider;
-use crate::contracts::{PendingCommitLane, PendingCommitState};
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
-use crate::transaction::{execute_write_batch_with_transaction, BinaryBlobWrite, WriteBatch};
+use crate::transaction::{
+    execute_write_batch_with_transaction, BinaryBlobWrite, CanonicalCommitReceipt,
+    PendingCommitLane, PendingCommitState, UpdatedVersionRef, WriteBatch,
+};
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
     FileId, LixBackendTransaction, LixError, QueryResult, Value, VersionId,
@@ -22,8 +24,6 @@ use super::types::{
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
     GenerateCommitArgs, GenerateCommitResult, StagedChange,
 };
-use super::{CanonicalCommitReceipt, UpdatedVersionRef};
-
 struct TransactionCommitExecutor<'a> {
     transaction: &'a mut dyn LixBackendTransaction,
 }

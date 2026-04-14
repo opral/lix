@@ -10,7 +10,7 @@ use crate::{
     VersionId,
 };
 
-use super::UpdatedVersionRef;
+use crate::transaction::UpdatedVersionRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedChange {
@@ -144,11 +144,11 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
         .iter()
         .map(|update| LiveRow {
             entity_id: update.version_id.to_string(),
-            file_id: crate::contracts::version_ref_file_id().to_string(),
-            schema_key: crate::contracts::version_ref_schema_key().to_string(),
-            schema_version: crate::contracts::version_ref_schema_version().to_string(),
-            version_id: crate::contracts::version_ref_storage_version_id().to_string(),
-            plugin_key: crate::contracts::version_ref_plugin_key().to_string(),
+            file_id: crate::version::version_ref_file_id().to_string(),
+            schema_key: crate::version::version_ref_schema_key().to_string(),
+            schema_version: crate::version::version_ref_schema_version().to_string(),
+            version_id: crate::version::version_ref_storage_version_id().to_string(),
+            plugin_key: crate::version::version_ref_plugin_key().to_string(),
             metadata: None,
             change_id: None,
             writer_key: None,
@@ -156,7 +156,7 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
             untracked: true,
             created_at: Some(update.created_at.clone()),
             updated_at: Some(update.created_at.clone()),
-            snapshot_content: Some(crate::contracts::version_ref_snapshot_content(
+            snapshot_content: Some(crate::version::version_ref_snapshot_content(
                 update.version_id.as_str(),
                 &update.commit_id,
             )),

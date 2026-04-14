@@ -7,10 +7,12 @@
 use async_trait::async_trait;
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::contracts::{PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionRow};
-use crate::contracts::{PreparedPublicRead, ReadTimeProjectionPlan};
+use crate::contracts::{
+    PendingPublicReadHost, ReadExecutionHost, ReadTimeProjectionIdentity, ReadTimeProjectionRow,
+};
 use crate::execution::execute_prepared_public_read_artifact_with_backend;
 use crate::session::host::SessionExecutionContext;
+use crate::sql::{PreparedPublicRead, PublicReadSource, ReadTimeProjectionPlan};
 use crate::transaction::PendingOverlay;
 use crate::{LixBackend, LixError, QueryResult};
 
@@ -37,7 +39,12 @@ pub(crate) async fn derive_read_time_projection_rows_with_registry(
             .into_iter()
             .map(|row| ReadTimeProjectionRow {
                 surface_name: row.surface_name,
-                identity: row.identity,
+                identity: row.identity.map(|identity| ReadTimeProjectionIdentity {
+                    schema_key: identity.schema_key,
+                    version_id: identity.version_id,
+                    entity_id: identity.entity_id,
+                    file_id: identity.file_id,
+                }),
                 values: row.values,
             })
             .collect(),
@@ -81,7 +88,7 @@ impl PendingPublicReadHost for dyn LixBackend + '_ {
         public_read: &PreparedPublicRead,
     ) -> Result<QueryResult, LixError> {
         match public_read.contract.source() {
-            crate::contracts::PublicReadSource::PendingOverlay => {
+            PublicReadSource::PendingOverlay => {
                 crate::transaction::execute_pending_overlay_public_read(
                     self,
                     pending_overlay,
@@ -89,7 +96,7 @@ impl PendingPublicReadHost for dyn LixBackend + '_ {
                 )
                 .await
             }
-            crate::contracts::PublicReadSource::Committed(_) => {
+            PublicReadSource::Committed(_) => {
                 execute_prepared_public_read_artifact_with_backend(self, host, public_read).await
             }
         }

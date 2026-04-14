@@ -4,23 +4,23 @@ use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
 };
-use crate::contracts::ExecuteOptions;
 use crate::contracts::FunctionBindings;
 use crate::contracts::LixFunctionProvider;
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{
-    parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
-    version_descriptor_schema_key, version_descriptor_schema_version,
-};
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
     load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
     write_live_rows, LiveRow,
 };
+use crate::session::ExecuteOptions;
 use crate::sql::parse_sql;
 use crate::transaction::{
     execute_parsed_statements_in_borrowed_write_transaction, BorrowedBufferedWriteTransaction,
     SessionCompilerCache, SessionCompilerState,
+};
+use crate::version::{
+    parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
+    version_descriptor_schema_key, version_descriptor_schema_version,
 };
 use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -416,11 +416,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = LiveRow {
             entity_id: version_id.to_string(),
-            schema_key: crate::contracts::version_ref_schema_key().to_string(),
-            schema_version: crate::contracts::version_ref_schema_version().to_string(),
-            file_id: crate::contracts::version_ref_file_id().to_string(),
-            version_id: crate::contracts::version_ref_storage_version_id().to_string(),
-            plugin_key: crate::contracts::version_ref_plugin_key().to_string(),
+            schema_key: crate::version::version_ref_schema_key().to_string(),
+            schema_version: crate::version::version_ref_schema_version().to_string(),
+            file_id: crate::version::version_ref_file_id().to_string(),
+            version_id: crate::version::version_ref_storage_version_id().to_string(),
+            plugin_key: crate::version::version_ref_plugin_key().to_string(),
             metadata: None,
             change_id: None,
             writer_key: None,
@@ -428,7 +428,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             untracked: true,
             created_at: Some(timestamp.clone()),
             updated_at: Some(timestamp),
-            snapshot_content: Some(crate::contracts::version_ref_snapshot_content(
+            snapshot_content: Some(crate::version::version_ref_snapshot_content(
                 version_id, commit_id,
             )),
         };
@@ -483,7 +483,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         entity_id: &str,
         name: &str,
     ) -> Result<String, LixError> {
-        let snapshot_content = crate::contracts::version_descriptor_snapshot_content(
+        let snapshot_content = crate::version::version_descriptor_snapshot_content(
             entity_id,
             name,
             entity_id == GLOBAL_VERSION_ID,
@@ -492,10 +492,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let timestamp = self.generate_runtime_timestamp().await?;
         self.insert_change_row_for_snapshot(
             entity_id,
-            crate::contracts::version_descriptor_schema_key(),
-            crate::contracts::version_descriptor_schema_version(),
-            crate::contracts::version_descriptor_file_id(),
-            crate::contracts::version_descriptor_plugin_key(),
+            crate::version::version_descriptor_schema_key(),
+            crate::version::version_descriptor_schema_version(),
+            crate::version::version_descriptor_file_id(),
+            crate::version::version_descriptor_plugin_key(),
             &snapshot_content,
             &change_id,
             &timestamp,

@@ -2,20 +2,25 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
+use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
 use super::deterministic_settings::{load_global_runtime_settings, DeterministicSettings};
-use super::streams::{
-    StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
-};
+use super::lix::Lix;
 use crate::catalog::{CatalogProjectionRegistry, SurfaceRegistry};
-use crate::contracts::{clone_boxed_function_provider, CompiledSchemaCache, DynFunctionProvider};
+use crate::contracts::{
+    clone_boxed_function_provider, CompiledSchemaCache, DynFunctionProvider, FunctionBindings,
+    LixFunctionProvider, SharedFunctionProvider,
+};
 use crate::functions::RuntimeFunctionProvider;
 use crate::plugin::{
     invalidate_installed_plugins_cache, CachedPluginComponent, InstalledPlugin,
     PluginComponentHost, PluginMaterializationHost,
 };
 use crate::schema::SchemaKey;
+use crate::streams::{
+    StateCommitStream, StateCommitStreamBus, StateCommitStreamChange, StateCommitStreamFilter,
+};
 use crate::wasm::WasmRuntime;
 use crate::{LixBackend, LixError, TransactionBeginMode};
 
@@ -93,6 +98,12 @@ impl Engine {
 
     pub(crate) fn catalog_projection_registry(&self) -> &Arc<CatalogProjectionRegistry> {
         &self.catalog_projection_registry
+    }
+
+    pub(crate) fn session_host(self: &Arc<Self>) -> Arc<dyn crate::session::SessionHost> {
+        Arc::new(EngineSessionHost {
+            engine: Arc::clone(self),
+        })
     }
 
     pub(crate) fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
@@ -239,6 +250,183 @@ impl Engine {
     #[cfg(test)]
     pub(crate) fn installed_plugins_cache(&self) -> &RwLock<Option<Vec<InstalledPlugin>>> {
         &self.installed_plugins_cache
+    }
+}
+
+pub(crate) struct EngineSessionHost {
+    engine: Arc<Engine>,
+}
+
+#[async_trait(?Send)]
+impl crate::session::SessionHost for EngineSessionHost {
+    async fn ensure_initialized(&self) -> Result<(), LixError> {
+        if crate::live_state::load_mode_with_backend(self.engine.backend().as_ref()).await?
+            == crate::live_state::LiveStateMode::Uninitialized
+        {
+            return Err(crate::common::not_initialized_error());
+        }
+        Ok(())
+    }
+
+    fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
+        self.engine.backend()
+    }
+
+    fn access_to_internal(&self) -> bool {
+        self.engine.access_to_internal()
+    }
+
+    async fn begin_write_unit(
+        &self,
+    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+        self.engine.begin_write_unit().await
+    }
+
+    async fn begin_read_unit(
+        &self,
+        mode: TransactionBeginMode,
+    ) -> Result<Box<dyn crate::LixBackendTransaction + '_>, LixError> {
+        self.engine.begin_read_unit(mode).await
+    }
+
+    fn public_surface_registry(&self) -> SurfaceRegistry {
+        self.engine.public_surface_registry()
+    }
+
+    fn install_public_surface_registry(&self, registry: SurfaceRegistry) {
+        self.engine.install_public_surface_registry(registry);
+    }
+
+    async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
+        self.engine
+            .load_public_surface_registry_from_backend()
+            .await
+    }
+
+    async fn export_image(
+        &self,
+        writer: &mut dyn crate::image::ImageChunkWriter,
+    ) -> Result<(), LixError> {
+        self.engine.backend().export_image(writer).await
+    }
+
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        self.engine.catalog_projection_registry().as_ref()
+    }
+
+    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
+        self.engine.schema_cache()
+    }
+
+    async fn prepare_runtime_functions_with_backend(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<DynFunctionProvider, LixError> {
+        self.engine
+            .prepare_runtime_functions_with_backend(backend)
+            .await
+    }
+
+    fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
+        self.engine.state_commit_stream(filter)
+    }
+
+    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
+        self.engine.emit_state_commit_stream_changes(changes);
+    }
+
+    fn invalidate_deterministic_settings_cache(&self) {
+        self.engine.invalidate_deterministic_settings_cache();
+    }
+
+    fn invalidate_installed_plugins_cache(&self) -> Result<(), LixError> {
+        self.engine.invalidate_installed_plugins_cache()
+    }
+}
+
+#[async_trait(?Send)]
+impl crate::transaction::WriteExecutionContext for Lix {
+    fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry {
+        self.catalog_projection_registry().as_ref()
+    }
+
+    fn compiled_schema_cache(&self) -> &dyn CompiledSchemaCache {
+        self.engine().schema_cache()
+    }
+
+    fn sql_compiler_seed<'a>(
+        &'a self,
+        functions: &'a DynFunctionProvider,
+        surface_registry: &'a SurfaceRegistry,
+    ) -> crate::sql::SqlCompilerSeed<'a> {
+        crate::sql::SqlCompilerSeed {
+            dialect: self.backend().dialect(),
+            functions: clone_boxed_function_provider(functions),
+            surface_registry,
+        }
+    }
+
+    async fn prepare_function_bindings(
+        &self,
+        backend: &dyn LixBackend,
+    ) -> Result<FunctionBindings, LixError> {
+        let functions = self.prepare_runtime_functions_with_backend(backend).await?;
+        Ok(FunctionBindings::from_prepared_parts(
+            functions.deterministic_sequence_enabled(),
+            &functions,
+        ))
+    }
+
+    async fn execute_pending_overlay_public_read(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        pending_overlay: Option<&dyn crate::transaction::PendingOverlay>,
+        public_read: &crate::sql::PreparedPublicRead,
+    ) -> Result<crate::QueryResult, LixError> {
+        crate::session::execute_prepared_public_read_with_registry(
+            self.catalog_projection_registry().as_ref(),
+            transaction,
+            pending_overlay,
+            public_read,
+        )
+        .await
+    }
+
+    async fn persist_binary_blob_writes_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        writes: &[crate::transaction::BinaryBlobWrite],
+    ) -> Result<(), LixError> {
+        crate::session::persist_binary_blob_writes_in_transaction(transaction, writes).await
+    }
+
+    async fn garbage_collect_unreachable_binary_cas_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+    ) -> Result<(), LixError> {
+        crate::session::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
+    }
+
+    async fn persist_runtime_sequence_in_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        functions: &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
+    ) -> Result<(), LixError> {
+        crate::session::persist_runtime_sequence_in_transaction(transaction, functions).await
+    }
+
+    async fn execute_public_tracked_append_txn_with_transaction(
+        &self,
+        transaction: &mut dyn crate::LixBackendTransaction,
+        unit: &crate::transaction::TrackedTxnUnit,
+        pending_commit_state: Option<&mut Option<crate::transaction::PendingCommitState>>,
+    ) -> Result<crate::transaction::TrackedCommitExecutionOutcome, LixError> {
+        crate::session::execute_public_tracked_append_txn_with_transaction(
+            transaction,
+            unit,
+            pending_commit_state,
+        )
+        .await
     }
 }
 

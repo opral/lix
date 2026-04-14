@@ -1,5 +1,5 @@
 use crate::catalog::ResolvedRelation;
-use crate::contracts::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
+use crate::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
 use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
 

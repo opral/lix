@@ -1,7 +1,10 @@
-use crate::contracts::{
-    coalesce_live_table_requirements, PreparedDirectWriteArtifact, PreparedPublicRead,
-    PreparedWriteFunctionBindings, PreparedWriteStatement, PreparedWriteStatementKind,
-    SchemaRegistration, SchemaRegistrationSet, WriteDiagnosticContext,
+use crate::live_state::{SchemaRegistration, SchemaRegistrationSet};
+use crate::sql::{
+    coalesce_live_table_requirements, PreparedPublicRead, PreparedWriteStatementKind,
+    PublicReadSource, WriteDiagnosticContext,
+};
+use crate::transaction::{
+    PreparedDirectWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement,
 };
 use crate::{LixError, QueryResult};
 
@@ -83,7 +86,7 @@ impl WriteCommand {
             && self.transaction_write_delta.is_some()
             && !matches!(
                 self.prepared.result_contract,
-                crate::contracts::ResultContract::DmlReturning
+                crate::sql::ResultContract::DmlReturning
             )
             && !matches!(
                 self.prepared.statement_kind,
@@ -102,12 +105,8 @@ impl WriteCommand {
         }
         if let Some(public_read) = self.prepared.public_read() {
             return match public_read.contract.source() {
-                crate::contracts::PublicReadSource::PendingOverlay => {
-                    WritePath::PendingRead(public_read)
-                }
-                crate::contracts::PublicReadSource::Committed(_) => {
-                    WritePath::CommittedRead(public_read)
-                }
+                PublicReadSource::PendingOverlay => WritePath::PendingRead(public_read),
+                PublicReadSource::Committed(_) => WritePath::CommittedRead(public_read),
             };
         }
         if let Some(delta) = self.transaction_write_delta.as_ref() {

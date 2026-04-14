@@ -4,6 +4,7 @@ use crate::sql::explain::{
     build_direct_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
     DirectExplainBuildInput, ExplainRequest, ExplainStage, ExplainTimingCollector,
 };
+use crate::transaction::PlanEffects;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 use std::time::Duration;
@@ -11,8 +12,6 @@ use std::time::Instant;
 
 use super::compiled::{CompiledDirectExecution, CompiledExecution, CompiledExecutionBody};
 use super::compiler_metadata::SqlCompilerMetadata;
-use super::contracts::effects::PlanEffects;
-use super::contracts::planned_statement::PlannedStatementSet;
 use super::contracts::requirements::PlanRequirements;
 use super::derive_effects::derive_plan_effects;
 use super::derive_requirements::derive_plan_requirements;
@@ -24,6 +23,7 @@ use super::public_surface::{
     PublicPlan, PublicWritePlan,
 };
 use crate::sql::logical_plan::{result_contract_for_statements, ResultContract};
+use crate::sql::PlannedStatementSet;
 
 pub(crate) struct CompilePolicy {
     pub(crate) skip_side_effect_collection: bool,

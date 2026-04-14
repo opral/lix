@@ -1,7 +1,7 @@
-use crate::contracts::FilesystemPayloadChange;
 use crate::transaction::pipeline::{
     execute_direct_execution_with_transaction, WriteExecutionOutcome,
 };
+use crate::transaction::FilesystemPayloadChange;
 use crate::transaction::{
     build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,

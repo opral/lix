@@ -8,12 +8,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 
-use crate::contracts::{
-    matches_constraints, BatchRowRequest, RowIdentity, ScanRequest, TrackedRow,
-    TrackedTombstoneMarker, UntrackedRow,
-};
 use crate::live_state::{
-    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
+    matches_constraints, BatchRowRequest, LiveReadContext, RowIdentity, ScanRequest,
+    TrackedReadView, TrackedRow, TrackedTombstoneMarker, TrackedTombstoneView, UntrackedReadView,
+    UntrackedRow, WriterKeyReadView,
 };
 use crate::LixError;
 
@@ -170,7 +168,7 @@ impl TrackedReadView for PendingTrackedReadView<'_> {
                 .tracked_rows()
                 .iter()
                 .filter(|(identity, _)| matches_tracked_batch_request(identity, request))
-                .map(|(_, row)| row.clone()),
+                .map(|(_, row): (&RowIdentity, &TrackedRow)| row.clone()),
         );
         sort_tracked_rows(&mut rows);
         rows.dedup_by(|left, right| {
@@ -200,7 +198,7 @@ impl TrackedReadView for PendingTrackedReadView<'_> {
                 .tracked_rows()
                 .iter()
                 .filter(|(identity, row)| matches_tracked_scan_request(identity, row, request))
-                .map(|(_, row)| row.clone()),
+                .map(|(_, row): (&RowIdentity, &TrackedRow)| row.clone()),
         );
         sort_tracked_rows(&mut rows);
         Ok(rows)
@@ -233,7 +231,7 @@ impl UntrackedReadView for PendingUntrackedReadView<'_> {
                 .untracked_rows()
                 .iter()
                 .filter(|(identity, _)| matches_untracked_batch_request(identity, request))
-                .map(|(_, row)| row.clone()),
+                .map(|(_, row): (&RowIdentity, &UntrackedRow)| row.clone()),
         );
         sort_untracked_rows(&mut rows);
         rows.dedup_by(|left, right| {
@@ -266,7 +264,7 @@ impl UntrackedReadView for PendingUntrackedReadView<'_> {
                 .untracked_rows()
                 .iter()
                 .filter(|(identity, row)| matches_untracked_scan_request(identity, row, request))
-                .map(|(_, row)| row.clone()),
+                .map(|(_, row): (&RowIdentity, &UntrackedRow)| row.clone()),
         );
         sort_untracked_rows(&mut rows);
         Ok(rows)
@@ -302,7 +300,7 @@ impl TrackedTombstoneView for PendingTrackedTombstoneView<'_> {
                 .tracked_tombstones()
                 .iter()
                 .filter(|(identity, _)| matches_tracked_scan_identity(identity, request))
-                .map(|(_, row)| row.clone()),
+                .map(|(_, row): (&RowIdentity, &TrackedTombstoneMarker)| row.clone()),
         );
         rows.sort_by_key(RowIdentity::from_tombstone);
         Ok(rows)

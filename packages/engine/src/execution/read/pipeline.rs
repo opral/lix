@@ -1,11 +1,11 @@
 use std::time::Instant;
 
 use crate::contracts::{render_analyzed_explain_result, render_plain_explain_result};
-use crate::contracts::{
-    PreparedDirectReadArtifact, PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
-    ResultContract,
-};
 use crate::diagnostics::normalize_sql_error_with_read_diagnostic_context;
+use crate::sql::ResultContract;
+use crate::sql::{
+    PreparedDirectReadArtifact, PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
+};
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult};
 
 use super::{public::execute_prepared_public_read_artifact_in_transaction, ReadExecutionHost};

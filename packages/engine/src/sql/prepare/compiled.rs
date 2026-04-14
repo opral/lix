@@ -1,12 +1,10 @@
-use crate::contracts::PreparedStatement;
+use super::public_surface::{PublicReadPlan, PublicWritePlan};
 use crate::sql::explain::ExplainArtifacts;
 use crate::sql::logical_plan::ResultContract;
-
-use super::contracts::effects::PlanEffects;
-use super::contracts::planned_statement::{
-    MutationRow, SchemaLiveTableRequirement, UpdateValidationPlan,
+use crate::sql::{
+    MutationRow, PreparedStatement, SchemaLiveTableRequirement, UpdateValidationPlan,
 };
-use super::public_surface::{PublicReadPlan, PublicWritePlan};
+use crate::transaction::PlanEffects;
 
 #[derive(Clone)]
 pub(crate) struct CompiledDirectExecution {

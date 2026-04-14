@@ -1,14 +1,10 @@
-use async_trait::async_trait;
-
 mod bootstrap;
 pub(crate) mod commit;
 pub(crate) mod committed_state;
 pub(crate) mod context;
 mod create;
 pub(crate) mod descriptors;
-mod history_roots;
 mod merge;
-mod state_history;
 pub(crate) mod undo_redo;
 
 pub(crate) use bootstrap::init;
@@ -22,13 +18,3 @@ pub use create::{CreateVersionOptions, CreateVersionResult};
 pub(crate) use merge::merge_version_in_session;
 pub use merge::{ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, MergeVersionResult};
 pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};
-
-#[async_trait(?Send)]
-impl crate::contracts::CommittedStateHistoryReader for dyn crate::LixBackend + '_ {
-    async fn load_committed_state_history_rows(
-        &self,
-        request: &crate::contracts::StateHistoryRequest,
-    ) -> Result<Vec<crate::contracts::StateHistoryRow>, crate::LixError> {
-        state_history::load_state_history_rows(self, request).await
-    }
-}

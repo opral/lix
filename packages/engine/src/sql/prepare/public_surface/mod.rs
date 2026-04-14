@@ -8,18 +8,6 @@ use crate::catalog::{
     SurfaceRegistry, SurfaceVariant,
 };
 use crate::contracts::TrackedChangeView;
-use crate::contracts::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
-};
-use crate::contracts::{
-    state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
-    StateCommitStreamRuntimeMetadata,
-};
-use crate::contracts::{
-    ChangeBatch, CommitPreconditions, CommittedReadMode, EffectiveStateRequest, SessionStateDelta,
-    StateCommitStreamOperation,
-};
 use crate::diagnostics::{
     file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
     sql_unknown_table_error,
@@ -42,7 +30,6 @@ use crate::sql::physical_plan::{
     PublicWriteMaterialization, PublicWritePhysicalPlan, TrackedWritePlan, UntrackedWritePlan,
 };
 use crate::sql::prepare::contracts::effects::PlanEffects;
-use crate::sql::prepare::contracts::planned_statement::SchemaLiveTableRequirement;
 use crate::sql::prepare::intent::{
     authoritative_binary_blob_write_targets_from_planned_state,
     delete_targets_from_planned_filesystem_state,
@@ -55,7 +42,21 @@ use crate::sql::semantic_ir::{
     analyze_public_write_semantics, BoundStatement, PublicWriteInvariantTrace,
     PublicWriteSemantics, StatementContext,
 };
-use crate::sql::{classify_relation_name, protected_builtin_public_surface_names, RelationPolicy};
+use crate::sql::CommittedReadMode;
+use crate::sql::EffectiveStateRequest;
+use crate::sql::{
+    classify_relation_name, protected_builtin_public_surface_names, RelationPolicy,
+    SchemaLiveTableRequirement,
+};
+use crate::streams::{
+    state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
+    StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
+};
+use crate::transaction::{ChangeBatch, CommitPreconditions};
+use crate::version::{
+    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
+    parse_active_version_snapshot,
+};
 #[cfg(test)]
 use crate::LixBackend;
 use crate::{LixError, SqlDialect, Value};
@@ -1457,19 +1458,17 @@ pub(crate) fn semantic_plan_effects_from_changes<Change: TrackedChangeView>(
     stream_operation: StateCommitStreamOperation,
     writer_key: Option<&str>,
 ) -> Result<PlanEffects, LixError> {
-    Ok(PlanEffects {
+    let mut effects = PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             stream_operation,
             StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
         )?,
-        session_delta: SessionStateDelta {
-            next_active_version_id: next_active_version_id_from_changes(changes)?,
-            next_active_account_ids: None,
-            persist_workspace: false,
-        },
         file_cache_refresh_targets: file_cache_refresh_targets_from_changes(changes),
-    })
+        ..PlanEffects::default()
+    };
+    effects.session_delta.next_active_version_id = next_active_version_id_from_changes(changes)?;
+    Ok(effects)
 }
 
 fn next_active_version_id_from_changes<Change: TrackedChangeView>(
@@ -1779,17 +1778,9 @@ mod tests {
     };
     use crate::catalog::SurfaceReadFreshness;
     use crate::contracts::GLOBAL_VERSION_ID;
-    use crate::contracts::{
-        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
-        version_descriptor_schema_version, version_descriptor_snapshot_content,
-        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-        version_ref_schema_version, version_ref_snapshot_content,
-    };
-    use crate::contracts::{
-        FileHistoryRootScope, FileHistoryVersionScope, LiveStateMode, StateHistoryRootScope,
-    };
     use crate::execution::execute_prepared_public_read_artifact_with_backend;
-    use crate::live_state::{self, mark_mode_with_backend};
+    use crate::history::{FileHistoryRootScope, FileHistoryVersionScope, StateHistoryRootScope};
+    use crate::live_state::{self, mark_mode_with_backend, LiveStateMode};
     use crate::schema::LixCommit;
     use crate::sql::prepare::prepare_public_read_artifact;
     use crate::sql::prepare::public_surface::routing::delay_broad_routing_for_test;
@@ -1805,6 +1796,12 @@ mod tests {
     };
     use crate::test_support::{
         seed_canonical_change_row, BuiltinReadExecutionHost, CanonicalChangeSeed, TestSqliteBackend,
+    };
+    use crate::version::{
+        version_descriptor_file_id, version_descriptor_plugin_key, version_descriptor_schema_key,
+        version_descriptor_schema_version, version_descriptor_snapshot_content,
+        version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+        version_ref_schema_version, version_ref_snapshot_content,
     };
     use crate::{LixBackend, LixError, Session, SqlDialect, Value};
     use async_trait::async_trait;
@@ -2561,7 +2558,7 @@ mod tests {
             .dependency_spec()
             .expect("dependency spec should be derived")
             .session_dependencies
-            .contains(&crate::contracts::SessionDependency::ActiveVersion));
+            .contains(&crate::session::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .effective_state_request()
@@ -3124,7 +3121,7 @@ mod tests {
             .dependency_spec()
             .expect("filesystem dependency spec should be recorded")
             .session_dependencies
-            .contains(&crate::contracts::SessionDependency::ActiveVersion));
+            .contains(&crate::session::SessionDependency::ActiveVersion));
         assert_eq!(
             prepared
                 .explain

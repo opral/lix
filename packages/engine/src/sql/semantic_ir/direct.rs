@@ -3,15 +3,15 @@
 //! This stage owns the front-end normalization output for direct SQL after
 //! parse/bind but before later planning and execution-specific wrapping.
 
-use crate::contracts::PreparedStatement;
 use crate::contracts::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::ast::lowering::lower_statement;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
-use crate::sql::prepare::contracts::planned_statement::{
-    MutationRow, PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
-};
 use crate::sql::semantic_ir::inline_functions::inline_lix_functions_with_provider;
 use crate::sql::semantic_ir::param_context::normalize_statement_placeholders_in_batch;
+use crate::sql::PreparedStatement;
+use crate::sql::{
+    MutationRow, PlannedStatementSet, SchemaLiveTableRequirement, UpdateValidationPlan,
+};
 use crate::{LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::Statement;

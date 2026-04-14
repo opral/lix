@@ -29,10 +29,8 @@ use super::{
     scan_tracked_tombstones_with_executor, RowIdentity,
 };
 use crate::contracts::GLOBAL_VERSION_ID;
-use crate::contracts::{
-    version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id,
-};
 use crate::schema::{schema_key_from_definition, SchemaKey};
+use crate::version::{version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiveRowSource {

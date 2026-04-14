@@ -2,10 +2,8 @@ use std::time::Duration;
 
 use sqlparser::ast::Statement;
 
-use crate::contracts::{
-    render_analyzed_explain_result, render_plain_explain_result, PendingCommitState,
-    PreparedPublicWriteExecutionPartition, PreparedWriteStatement, SessionStateDelta,
-};
+use crate::contracts::{render_analyzed_explain_result, render_plain_explain_result};
+use crate::session::SessionStateDelta;
 #[cfg(test)]
 use crate::sql::parse_sql_with_timing;
 #[cfg(test)]
@@ -22,8 +20,10 @@ use crate::transaction::{
     apply_schema_registrations_in_transaction,
     normalize_sql_error_with_transaction_and_relation_names, BorrowedBufferedWriteTransaction,
     BufferedWriteCommandMetadata, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    BufferedWriteTransaction, DeferredCommitEffects, PendingWriteOverlay, SessionCompilerState,
-    TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath, WriteResult,
+    BufferedWriteTransaction, DeferredCommitEffects, PendingCommitState, PendingWriteOverlay,
+    PreparedDirectWriteArtifact, PreparedPublicWriteExecutionPartition, PreparedWriteStatement,
+    SessionCompilerState, TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath,
+    WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -364,7 +364,7 @@ async fn execute_read_query_write_command(
     transaction: &mut dyn LixBackendTransaction,
     command: &WriteCommand,
     pending_write_overlay: Option<&PendingWriteOverlay>,
-    public_read: &crate::contracts::PreparedPublicRead,
+    public_read: &crate::sql::PreparedPublicRead,
 ) -> Result<WriteResult, LixError> {
     let execution_started = std::time::Instant::now();
     let public_result = match execution_context
@@ -403,7 +403,7 @@ async fn execute_read_query_write_command(
 async fn execute_direct_write_command(
     transaction: &mut dyn LixBackendTransaction,
     command: &WriteCommand,
-    direct: &crate::contracts::PreparedDirectWriteArtifact,
+    direct: &PreparedDirectWriteArtifact,
 ) -> Result<WriteResult, LixError> {
     apply_schema_registrations_in_transaction(transaction, command.schema_registrations()).await?;
     let execution_started = std::time::Instant::now();
@@ -704,7 +704,7 @@ impl SqlBufferedWriteScope<'_, '_> {
 
     fn buffered_write_commit_outcome_mut(
         &mut self,
-    ) -> &mut crate::contracts::TransactionCommitOutcome {
+    ) -> &mut crate::transaction::TransactionCommitOutcome {
         match self {
             Self::Owned(write_transaction) => write_transaction.buffered_write_commit_outcome_mut(),
             Self::Borrowed(write_transaction) => {
@@ -840,7 +840,11 @@ mod tests {
     }
 
     fn test_session(lix: &Arc<Lix>) -> Session {
-        Session::new_for_test(lix.session_host(), "version-test".to_string(), Vec::new())
+        Session::new_for_test(
+            lix.engine().session_host(),
+            "version-test".to_string(),
+            Vec::new(),
+        )
     }
 
     #[test]

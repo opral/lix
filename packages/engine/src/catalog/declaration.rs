@@ -3,7 +3,7 @@ use std::sync::{Arc, OnceLock};
 use crate::catalog::{SurfaceFamily, SurfaceVariant};
 use crate::common::LixError;
 use crate::common::Value;
-use crate::contracts::RowIdentity;
+use crate::live_state::RowIdentity;
 
 /// Catalog-owned declaration contracts for derived public surfaces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -473,7 +473,7 @@ mod tests {
         CatalogProjectionSurfaceSpec, RegisteredCatalogProjection,
     };
     use crate::catalog::{SurfaceFamily, SurfaceVariant};
-    use crate::contracts::RowIdentity;
+    use crate::live_state::RowIdentity;
     use crate::Value;
 
     #[test]

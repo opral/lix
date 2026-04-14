@@ -15,8 +15,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use async_trait::async_trait;
 
 use crate::backend::QueryExecutor;
-use crate::contracts::RowIdentity;
 use crate::contracts::TrackedChangeView;
+use crate::live_state::RowIdentity;
 #[cfg(test)]
 #[async_trait(?Send)]
 pub trait WriterKeyReadView {

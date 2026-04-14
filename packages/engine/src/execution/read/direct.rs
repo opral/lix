@@ -1,18 +1,17 @@
-use crate::contracts::CommittedStateHistoryReader;
-use crate::contracts::{
-    DirectoryHistoryRow, FileHistoryRow, PreparedDirectoryHistoryAggregate,
-    PreparedDirectoryHistoryField, PreparedDirectoryHistoryPredicate,
-    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedEntityHistoryField,
-    PreparedEntityHistoryPredicate, PreparedEntityHistoryReadPlan, PreparedEntityHistorySortKey,
-    PreparedFileHistoryAggregate, PreparedFileHistoryField, PreparedFileHistoryPredicate,
-    PreparedFileHistoryReadPlan, PreparedFileHistorySortKey, PreparedHistoryReadPlan,
-    PreparedStateHistoryAggregate, PreparedStateHistoryAggregatePredicate,
-    PreparedStateHistoryField, PreparedStateHistoryPredicate, PreparedStateHistoryProjectionValue,
-    PreparedStateHistoryReadPlan, PreparedStateHistorySortKey, PreparedStateHistorySortValue,
-    StateHistoryRow,
+use crate::history::{
+    load_directory_history_rows, load_file_history_rows, CommittedStateHistoryReader,
+    DirectoryHistoryRow, FileHistoryRow, StateHistoryRow,
 };
-use crate::execution::read::filesystem::history::{
-    load_directory_history_rows, load_file_history_rows,
+use crate::sql::{
+    PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryField,
+    PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryReadPlan,
+    PreparedDirectoryHistorySortKey, PreparedEntityHistoryField, PreparedEntityHistoryPredicate,
+    PreparedEntityHistoryReadPlan, PreparedEntityHistorySortKey, PreparedFileHistoryAggregate,
+    PreparedFileHistoryField, PreparedFileHistoryPredicate, PreparedFileHistoryReadPlan,
+    PreparedFileHistorySortKey, PreparedHistoryReadPlan, PreparedStateHistoryAggregate,
+    PreparedStateHistoryAggregatePredicate, PreparedStateHistoryField,
+    PreparedStateHistoryPredicate, PreparedStateHistoryProjectionValue,
+    PreparedStateHistoryReadPlan, PreparedStateHistorySortKey, PreparedStateHistorySortValue,
 };
 use crate::{LixBackend, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;

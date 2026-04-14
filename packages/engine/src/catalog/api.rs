@@ -329,7 +329,7 @@ mod tests {
         FilesystemProjectionScope, FilesystemRelationKind, RelationBindContext, RelationBinding,
         SurfaceFamily,
     };
-    use crate::contracts::SessionDependency;
+    use crate::session::SessionDependency;
 
     #[test]
     fn builtin_facade_resolves_surface_descriptors_and_columns() {

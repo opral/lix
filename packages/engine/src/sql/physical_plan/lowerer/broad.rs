@@ -68,13 +68,11 @@ fn with_current_broad_render_substitution_collector<T>(
 
 fn effective_state_version_scope(
     version_scope: VersionScope,
-) -> crate::contracts::EffectiveStateVersionScope {
+) -> crate::sql::EffectiveStateVersionScope {
     match version_scope {
-        VersionScope::ActiveVersion => crate::contracts::EffectiveStateVersionScope::ActiveVersion,
-        VersionScope::ExplicitVersion => {
-            crate::contracts::EffectiveStateVersionScope::ExplicitVersion
-        }
-        VersionScope::History => crate::contracts::EffectiveStateVersionScope::History,
+        VersionScope::ActiveVersion => crate::sql::EffectiveStateVersionScope::ActiveVersion,
+        VersionScope::ExplicitVersion => crate::sql::EffectiveStateVersionScope::ExplicitVersion,
+        VersionScope::History => crate::sql::EffectiveStateVersionScope::History,
     }
 }
 

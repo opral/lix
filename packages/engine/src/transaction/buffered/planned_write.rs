@@ -4,21 +4,21 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedRelation,
 };
-use crate::contracts::{
-    coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
-    IdempotencyKey, MutationRow, OptionalTextPatch, PlanEffects, PlannedStateRow,
-    PreparedDirectWriteArtifact, PreparedPublicWrite, PreparedPublicWriteExecutionPartition,
-    PreparedPublicWritePlanArtifact, PreparedTrackedWriteExecution,
-    PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings, PreparedWriteStatement,
-    ResultContract, RowIdentity, SchemaRegistration, SchemaRegistrationSet, WriteLane, WriteMode,
-};
+use crate::live_state::{RowIdentity, SchemaRegistration, SchemaRegistrationSet};
+use crate::sql::{coalesce_live_table_requirements, MutationRow, ResultContract};
 use crate::transaction::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
 use crate::transaction::filesystem::state::filesystem_transaction_state_from_planned;
 use crate::transaction::overlay::{PendingSemanticRow, PendingSemanticStorage};
-use crate::transaction::PendingWriteOverlay;
+use crate::transaction::{
+    ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch,
+    PendingWriteOverlay, PlanEffects, PlannedStateRow, PreparedDirectWriteArtifact,
+    PreparedPublicWrite, PreparedPublicWriteExecutionPartition, PreparedPublicWritePlanArtifact,
+    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings,
+    PreparedWriteStatement, WriteLane, WriteMode,
+};
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";

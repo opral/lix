@@ -4,7 +4,6 @@ use crate::catalog::{
     ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
-use crate::contracts::EffectiveStateRequest;
 use crate::diagnostics::sql_unknown_column_error;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::logical_plan::public_ir::{
@@ -25,6 +24,7 @@ use crate::sql::physical_plan::source_sql::{
     lower_catalog_relation_binding_to_source_sql,
 };
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
+use crate::sql::EffectiveStateRequest;
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
 use sqlparser::ast::helpers::attached_token::AttachedToken;
