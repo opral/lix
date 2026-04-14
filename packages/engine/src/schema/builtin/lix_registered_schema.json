@@ -5,7 +5,6 @@
     "/value/x-lix-key",
     "/value/x-lix-version"
   ],
-  "x-lix-immutable": true,
   "x-lix-override-lixcols": {
     "lixcol_file_id": "\"lix\"",
     "lixcol_plugin_key": "\"lix\"",

@@ -66,14 +66,6 @@ async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     .await;
 }
 
-async fn register_immutable_schema(engine: &support::simulation_test::SimulatedLix) {
-    register_registered_schema_snapshot(
-        engine,
-        "{\"value\":{\"x-lix-key\":\"immutable_state_schema\",\"x-lix-version\":\"1\",\"x-lix-immutable\":true,\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}",
-    )
-    .await;
-}
-
 async fn register_registered_schema_snapshot(
     engine: &support::simulation_test::SimulatedLix,
     snapshot_content: &str,
@@ -905,48 +897,6 @@ simulation_test!(
         assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"A-updated\"}");
         assert_text(&rows.statements[0].rows[1][0], "version-b");
         assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"B\"}");
-    }
-);
-
-simulation_test!(
-    lix_state_by_version_update_rejects_immutable_schema,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-
-        register_immutable_schema(&engine).await;
-        engine.create_named_version("version-a").await.unwrap();
-        insert_state_row_for_schema(
-            &engine,
-            "entity-upd-immutable",
-            "immutable_state_schema",
-            "version-a",
-            "{\"value\":\"before\"}",
-        )
-        .await;
-
-        let err = engine
-            .execute(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'immutable_state_schema' \
-                   AND entity_id = 'entity-upd-immutable' \
-                   AND file_id = 'test-file' \
-                   AND version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .expect_err("immutable schema update should fail on public path");
-
-        assert!(
-            err.description
-                .contains("Schema 'immutable_state_schema' is immutable and cannot be updated."),
-            "unexpected error: {}",
-            err.description
-        );
     }
 );
 

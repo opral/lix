@@ -190,40 +190,6 @@ fn validate_lix_schema_definition_rejects_missing_unique_constraint_properties()
 }
 
 #[test]
-fn valid_schema() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-immutable": true,
-        "properties": {
-            "name": { "type": "string" }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
-fn x_lix_immutable_accepts_boolean_values() {
-    let schema = json!({
-        "type": "object",
-        "x-lix-key": "mock",
-        "x-lix-version": "1",
-        "x-lix-immutable": false,
-        "properties": {
-            "name": { "type": "string" }
-        },
-        "required": ["name"],
-        "additionalProperties": false
-    });
-
-    assert!(validate_lix_schema_definition(&schema).is_ok());
-}
-
-#[test]
 fn x_key_is_required() {
     let schema = json!({
         "type": "object",
