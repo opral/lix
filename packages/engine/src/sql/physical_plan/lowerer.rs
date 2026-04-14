@@ -4,8 +4,8 @@ use crate::catalog::{
     ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
     SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
 };
-use crate::diagnostics::sql_unknown_column_error;
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
+use crate::sql::diagnostics::sql_unknown_column_error;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalAdminScan, CanonicalChangeScan, CanonicalStateScan,
     CanonicalWorkingChangesScan, FilesystemKind, ReadPlan, StructuredPublicRead, VersionScope,

@@ -11,6 +11,8 @@ pub(crate) mod wire;
 #[allow(unused_imports)]
 pub use dialect::SqlDialect;
 #[allow(unused_imports)]
+pub(crate) use error::is_missing_relation_error;
+#[allow(unused_imports)]
 pub use error::LixError;
 #[allow(unused_imports)]
 pub(crate) use errors::{

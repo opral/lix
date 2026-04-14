@@ -283,7 +283,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             .await?;
 
         let main_version_id = match self
-            .find_version_id_by_name(crate::session::workspace::DEFAULT_ACTIVE_VERSION_NAME)
+            .find_version_id_by_name(crate::session::DEFAULT_ACTIVE_VERSION_NAME)
             .await?
         {
             Some(version_id) => version_id,
@@ -292,7 +292,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 self.seed_canonical_version_descriptor(
                     &initial_commit_id,
                     &generated_main_id,
-                    crate::session::workspace::DEFAULT_ACTIVE_VERSION_NAME,
+                    crate::session::DEFAULT_ACTIVE_VERSION_NAME,
                 )
                 .await?;
                 generated_main_id

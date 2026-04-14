@@ -5,7 +5,6 @@ pub(crate) mod canonical;
 pub(crate) mod catalog;
 pub(crate) mod cel;
 mod common;
-mod diagnostics;
 pub(crate) mod execution;
 pub(crate) mod functions;
 pub(crate) mod history;

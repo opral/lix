@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::backend::QueryExecutor;
 use crate::canonical::{append_changes, CanonicalCommitReceipt, UpdatedVersionRef};
 use crate::functions::LixFunctionProvider;
+use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
 use crate::transaction::{
     execute_write_batch_with_transaction, BinaryBlobWrite, PendingCommitLane, PendingCommitState,
@@ -140,7 +141,7 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
     writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
-) -> Result<CanonicalCommitReceipt, LixError> {
+) -> Result<CanonicalCommitProjectionReceipt, LixError> {
     let staged_changes = changes
         .iter()
         .map(|change| {
@@ -367,7 +368,7 @@ async fn execute_generated_commit_result(
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
     tracked_live_rows: &[crate::live_state::LiveRow],
-) -> Result<CanonicalCommitReceipt, LixError> {
+) -> Result<CanonicalCommitProjectionReceipt, LixError> {
     append_changes(transaction, &result.canonical_changes, functions).await?;
     let mut write_batch = WriteBatch::new();
     if !binary_blob_writes.is_empty() {
@@ -388,8 +389,9 @@ async fn execute_generated_commit_result(
     }
     execute_write_batch_with_transaction(transaction, write_batch).await?;
     let receipt = canonical_commit_receipt_from_generated_result(&result)?;
-    let untracked_live_rows =
-        untracked_live_rows_from_updated_version_refs(&receipt.updated_version_refs);
+    let untracked_live_rows = untracked_live_rows_from_updated_version_refs(
+        &receipt.canonical_receipt.updated_version_refs,
+    );
 
     let mut live_rows = tracked_live_rows.to_vec();
     live_rows.extend(untracked_live_rows);
@@ -402,7 +404,7 @@ async fn execute_generated_commit_result(
 
 fn canonical_commit_receipt_from_generated_result(
     result: &GenerateCommitResult,
-) -> Result<CanonicalCommitReceipt, LixError> {
+) -> Result<CanonicalCommitProjectionReceipt, LixError> {
     let replay_cursor = latest_replay_cursor_from_change_rows(&result.canonical_changes)
         .ok_or_else(|| {
             LixError::new(
@@ -420,12 +422,14 @@ fn canonical_commit_receipt_from_generated_result(
                 "pending public commit execution requires at least one committed version ref update",
             )
         })?;
-    Ok(CanonicalCommitReceipt {
-        commit_id,
+    Ok(CanonicalCommitProjectionReceipt::new(
+        CanonicalCommitReceipt {
+            commit_id,
+            updated_version_refs: result.updated_version_refs.clone(),
+            affected_versions: result.affected_versions.clone(),
+        },
         replay_cursor,
-        updated_version_refs: result.updated_version_refs.clone(),
-        affected_versions: result.affected_versions.clone(),
-    })
+    ))
 }
 
 pub(crate) fn create_commit_error_to_lix_error(error: CreateCommitError) -> LixError {

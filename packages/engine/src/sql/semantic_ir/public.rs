@@ -7,7 +7,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
     ResolvedRelation, SurfaceCapability, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
-use crate::diagnostics::schema_not_registered_error;
+use crate::sql::diagnostics::schema_not_registered_error;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, CanonicalStateScan, PlannedWrite, ReadCommand, ReadPlan,
     ReadVisibility, StructuredPublicRead,

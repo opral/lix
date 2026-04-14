@@ -2,10 +2,12 @@ use std::ops::ControlFlow;
 
 use crate::catalog::SurfaceRegistry;
 use crate::catalog::{builtin_public_surface_columns, builtin_public_surface_names};
-use crate::sql::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
+use crate::common::is_missing_relation_error;
 use crate::LixBackend;
 use crate::LixError;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
+
+use super::{ReadDiagnosticCatalogSnapshot, ReadDiagnosticContext};
 
 fn build_error(code: &str, description: impl Into<String>) -> LixError {
     LixError::new(code, description.into())
@@ -417,18 +419,6 @@ fn builtin_public_surfaces_in_statements(statements: &[Statement]) -> Vec<String
                 .any(|surface| surface.eq_ignore_ascii_case(name))
         })
         .collect()
-}
-
-pub(crate) fn is_missing_relation_error(err: &LixError) -> bool {
-    if err.code == "LIX_ERROR_SQL_UNKNOWN_TABLE" || err.code == "LIX_ERROR_TABLE_NOT_FOUND" {
-        return true;
-    }
-    let lower = err.description.to_lowercase();
-    lower.contains("no such table")
-        || lower.contains("relation")
-            && (lower.contains("does not exist")
-                || lower.contains("undefined table")
-                || lower.contains("unknown"))
 }
 
 fn relation_names_from_statements(statements: &[Statement]) -> Vec<String> {

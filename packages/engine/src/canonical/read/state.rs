@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::diagnostics::is_missing_relation_error;
+use crate::common::is_missing_relation_error;
 use crate::schema::LixCommit;
 use crate::{LixError, Value};
 

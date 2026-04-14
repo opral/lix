@@ -1,5 +1,5 @@
 use crate::backend::QueryExecutor;
-use crate::diagnostics::is_missing_relation_error;
+use crate::common::is_missing_relation_error;
 use crate::version::CommittedVersionFrontier;
 use crate::version::{version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id};
 use crate::{LixBackend, LixError, Value};

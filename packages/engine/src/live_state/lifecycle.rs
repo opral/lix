@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
 use crate::backend::add_column_if_missing;
-use crate::diagnostics::is_missing_relation_error;
+use crate::common::is_missing_relation_error;
 use crate::live_state::ReplayCursor;
 use crate::live_state::{LiveStateMode, LiveStateProjectionStatus};
 use crate::version::CommittedVersionFrontier;

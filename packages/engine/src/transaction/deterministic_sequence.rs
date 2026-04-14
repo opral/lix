@@ -1,6 +1,6 @@
 use crate::backend::PreparedBatch;
 use crate::common::escape_sql_string;
-use crate::diagnostics::is_missing_relation_error;
+use crate::common::is_missing_relation_error;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::payload_column_name_for_schema;
 use crate::live_state::{

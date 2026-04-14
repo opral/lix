@@ -13,7 +13,6 @@ use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use crate::backend::PreparedBatch;
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
-use crate::diagnostics::normalize_sql_error_with_backend_and_relation_names;
 use crate::functions::{
     clone_boxed_function_provider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
@@ -24,7 +23,8 @@ use crate::sql::{
     build_change_batches, build_public_write_execution,
     compile_execution_from_bound_statement_with_context, compiled_explain_diagnostics,
     derive_commit_preconditions, finalize_public_write_execution,
-    load_sql_compiler_metadata_with_reader_and_pending_overlay, prepare_public_read_artifact,
+    load_sql_compiler_metadata_with_reader_and_pending_overlay,
+    normalize_sql_error_with_backend_and_relation_names, prepare_public_read_artifact,
     public_authoritative_write_error, public_write_preparation_error,
     refresh_materialized_public_write_explain, BoundStatementInstance, CompilePolicy,
     CompiledExecution, InsertOnConflictAction, PlannedStateRow, PreparedExplainMode,

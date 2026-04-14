@@ -1,5 +1,7 @@
-use crate::canonical::CanonicalCommitReceipt;
-use crate::live_state::{LiveStateTransactionBridge, SchemaRegistration, SchemaRegistrationSet};
+use crate::live_state::{
+    CanonicalCommitProjectionReceipt, LiveStateTransactionBridge, SchemaRegistration,
+    SchemaRegistrationSet,
+};
 use crate::{LixBackendTransaction, LixError};
 
 pub(crate) struct TransactionCoordinator<'a> {
@@ -36,7 +38,7 @@ impl<'a> TransactionCoordinator<'a> {
 
     pub(crate) async fn advance_live_state_replay_boundary_for_commit(
         &mut self,
-        receipt: Option<&CanonicalCommitReceipt>,
+        receipt: Option<&CanonicalCommitProjectionReceipt>,
     ) -> Result<(), LixError> {
         let Some(receipt) = receipt else {
             return Ok(());

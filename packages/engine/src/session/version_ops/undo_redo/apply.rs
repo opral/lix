@@ -7,9 +7,8 @@ use crate::canonical::{
 };
 use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
-use crate::session::version_ops::commit::{
-    append_tracked, CanonicalCommitReceipt, CreateCommitArgs, StagedChange,
-};
+use crate::live_state::CanonicalCommitProjectionReceipt;
+use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
 use crate::streams::{StateCommitStreamChange, StateCommitStreamOperation};
 use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
 
@@ -67,7 +66,7 @@ struct TargetCommitChangeEffect {
 
 struct AppliedUndoRedoCommit {
     committed_head: String,
-    canonical_commit_receipt: Option<CanonicalCommitReceipt>,
+    canonical_commit_receipt: Option<CanonicalCommitProjectionReceipt>,
 }
 
 pub(super) async fn undo_in_session_transaction(

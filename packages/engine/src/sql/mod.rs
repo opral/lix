@@ -31,6 +31,7 @@ pub(crate) mod ast;
 pub(crate) mod binder;
 pub(crate) mod common;
 pub(crate) mod dependency;
+pub(crate) mod diagnostics;
 pub(crate) mod effective_state_request;
 pub(crate) mod explain;
 pub(crate) mod logical_plan;
@@ -84,6 +85,11 @@ pub(crate) use api::{
     TargetSetProof, WriteModeRequest, WriteOperationKind,
 };
 pub(crate) use dependency::{DependencyPrecision, DependencySpec, QueryDependency};
+pub(crate) use diagnostics::{
+    normalize_sql_error_with_backend_and_relation_names,
+    normalize_sql_error_with_read_diagnostic_context,
+    sanitize_lowered_public_sql_error_description, transaction_control_statement_denied_error,
+};
 pub(crate) use effective_state_request::{EffectiveStateRequest, EffectiveStateVersionScope};
 pub(crate) use logical_plan::ResultContract;
 pub(crate) use planned_statement::{

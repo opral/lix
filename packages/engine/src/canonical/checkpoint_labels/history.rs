@@ -13,7 +13,7 @@ use crate::backend::QueryExecutor;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
 use crate::common::escape_sql_string;
-use crate::diagnostics::is_missing_relation_error;
+use crate::common::is_missing_relation_error;
 use crate::{LixError, Value};
 
 use super::checkpoint_commit_label_entity_id;
