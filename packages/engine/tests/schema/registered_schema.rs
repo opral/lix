@@ -22,13 +22,14 @@ simulation_test!(
             .await
             .unwrap();
 
+        let active_version_id = engine.active_version_id().await.unwrap();
         let stored = engine
         .execute(
             "SELECT entity_id, schema_key, schema_version, version_id, file_id, change_id, snapshot_content, untracked \
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_registered_schema' \
                AND entity_id = 'test_schema~1' \
-               AND version_id = 'global'",
+               AND version_id = lix_active_version_id()",
             &[],
         )
         .await
@@ -40,7 +41,7 @@ simulation_test!(
         assert_eq!(row[0], Value::Text("test_schema~1".to_string()));
         assert_eq!(row[1], Value::Text("lix_registered_schema".to_string()));
         assert_eq!(row[2], Value::Text("1".to_string()));
-        assert_eq!(row[3], Value::Text("global".to_string()));
+        assert_eq!(row[3], Value::Text(active_version_id));
         assert_eq!(row[4], Value::Text("lix".to_string()));
         assert!(matches!(&row[5], Value::Text(change_id) if !change_id.is_empty()));
         assert_boolean_like(&row[7], false);
@@ -93,7 +94,7 @@ simulation_test!(
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_registered_schema' \
                AND entity_id = 'param_schema~1' \
-               AND version_id = 'global'",
+               AND version_id = lix_active_version_id()",
                 &[],
             )
             .await
@@ -380,12 +381,13 @@ simulation_test!(
         let result = engine
             .execute(
                 "UPDATE lix_state_by_version SET snapshot_content = '{\"value\":{\"x-lix-version\":\"1\"}}' \
-             WHERE schema_key = 'lix_registered_schema' AND entity_id = 'test_schema~1' AND file_id = 'lix' AND version_id = 'global'", &[])
+             WHERE schema_key = 'lix_registered_schema' AND entity_id = 'test_schema~1' AND file_id = 'lix' AND version_id = lix_active_version_id()", &[])
             .await;
 
         let err = result.expect_err("expected registered schema validation error");
         assert!(
-            err.to_string().contains("Invalid Lix schema definition"),
+            err.to_string()
+                .contains("\"x-lix-key\" is a required property"),
             "unexpected error: {err}"
         );
     }

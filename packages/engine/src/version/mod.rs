@@ -139,6 +139,35 @@ fn active_version_schema_metadata() -> &'static ActiveVersionSchemaMetadata {
 }
 
 fn parse_version_row_schema_metadata(schema_key: &str) -> VersionRowSchemaMetadata {
+    let metadata = parse_builtin_row_schema_metadata(schema_key);
+
+    VersionRowSchemaMetadata {
+        schema_key: metadata.schema_key,
+        schema_version: metadata.schema_version,
+        file_id: metadata.file_id,
+        plugin_key: metadata.plugin_key,
+        storage_version_id: GLOBAL_VERSION_ID.to_string(),
+    }
+}
+
+fn parse_active_version_schema_metadata() -> ActiveVersionSchemaMetadata {
+    let metadata = parse_builtin_row_schema_metadata("lix_active_version");
+
+    ActiveVersionSchemaMetadata {
+        schema_key: metadata.schema_key,
+        file_id: metadata.file_id,
+        storage_version_id: GLOBAL_VERSION_ID.to_string(),
+    }
+}
+
+struct ParsedBuiltinRowSchemaMetadata {
+    schema_key: String,
+    schema_version: String,
+    file_id: String,
+    plugin_key: String,
+}
+
+fn parse_builtin_row_schema_metadata(schema_key: &str) -> ParsedBuiltinRowSchemaMetadata {
     let schema = builtin_schema_definition(schema_key).unwrap_or_else(|| {
         panic!("builtin schema '{schema_key}' must exist");
     });
@@ -170,55 +199,11 @@ fn parse_version_row_schema_metadata(schema_key: &str) -> VersionRowSchemaMetada
         .unwrap_or_else(|| {
             panic!("builtin schema '{schema_key}' must define string lixcol_plugin_key")
         });
-    let storage_version_id =
-        if overrides.get("lixcol_global").and_then(JsonValue::as_str) == Some("true") {
-            GLOBAL_VERSION_ID.to_string()
-        } else {
-            GLOBAL_VERSION_ID.to_string()
-        };
 
-    VersionRowSchemaMetadata {
+    ParsedBuiltinRowSchemaMetadata {
         schema_key: parsed_schema_key,
         schema_version,
         file_id: decode_lixcol_literal(file_id_raw),
         plugin_key: decode_lixcol_literal(plugin_key_raw),
-        storage_version_id,
-    }
-}
-
-fn parse_active_version_schema_metadata() -> ActiveVersionSchemaMetadata {
-    let schema = builtin_schema_definition("lix_active_version").unwrap_or_else(|| {
-        panic!("builtin schema 'lix_active_version' must exist");
-    });
-    let parsed_schema_key = schema
-        .get("x-lix-key")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_else(|| {
-            panic!("builtin schema 'lix_active_version' must define string x-lix-key")
-        })
-        .to_string();
-    let overrides = schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)
-        .unwrap_or_else(|| {
-            panic!("builtin schema 'lix_active_version' must define object x-lix-override-lixcols")
-        });
-    let file_id_raw = overrides
-        .get("lixcol_file_id")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_else(|| {
-            panic!("builtin schema 'lix_active_version' must define string lixcol_file_id")
-        });
-    let storage_version_id =
-        if overrides.get("lixcol_global").and_then(JsonValue::as_str) == Some("true") {
-            GLOBAL_VERSION_ID.to_string()
-        } else {
-            GLOBAL_VERSION_ID.to_string()
-        };
-
-    ActiveVersionSchemaMetadata {
-        schema_key: parsed_schema_key,
-        file_id: decode_lixcol_literal(file_id_raw),
-        storage_version_id,
     }
 }

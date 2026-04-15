@@ -53,7 +53,6 @@ pub(crate) enum CatalogProjectionStorageKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub(crate) enum CatalogProjectionInputVersionScope {
-    SchemaDefault,
     Global,
     RequestedVersion,
     CurrentCommittedFrontier,
@@ -69,28 +68,26 @@ pub(crate) struct CatalogProjectionInputSpec {
 
 #[allow(dead_code)]
 impl CatalogProjectionInputSpec {
-    pub(crate) fn tracked(schema_key: impl Into<String>) -> Self {
+    pub(crate) fn tracked(
+        schema_key: impl Into<String>,
+        version_scope: CatalogProjectionInputVersionScope,
+    ) -> Self {
         Self {
             schema_key: schema_key.into(),
             storage: CatalogProjectionStorageKind::Tracked,
-            version_scope: CatalogProjectionInputVersionScope::SchemaDefault,
+            version_scope,
         }
     }
 
-    pub(crate) fn untracked(schema_key: impl Into<String>) -> Self {
+    pub(crate) fn untracked(
+        schema_key: impl Into<String>,
+        version_scope: CatalogProjectionInputVersionScope,
+    ) -> Self {
         Self {
             schema_key: schema_key.into(),
             storage: CatalogProjectionStorageKind::Untracked,
-            version_scope: CatalogProjectionInputVersionScope::SchemaDefault,
+            version_scope,
         }
-    }
-
-    pub(crate) fn with_version_scope(
-        mut self,
-        version_scope: CatalogProjectionInputVersionScope,
-    ) -> Self {
-        self.version_scope = version_scope;
-        self
     }
 }
 
@@ -490,8 +487,10 @@ mod tests {
 
     #[test]
     fn catalog_input_spec_preserves_version_scope_override() {
-        let spec = CatalogProjectionInputSpec::tracked("lix_version_descriptor")
-            .with_version_scope(CatalogProjectionInputVersionScope::CurrentCommittedFrontier);
+        let spec = CatalogProjectionInputSpec::tracked(
+            "lix_version_descriptor",
+            CatalogProjectionInputVersionScope::CurrentCommittedFrontier,
+        );
 
         assert_eq!(
             spec,
@@ -509,7 +508,10 @@ mod tests {
 
         assert_eq!(
             definition.inputs(),
-            vec![CatalogProjectionInputSpec::untracked("lix_version_ref")]
+            vec![CatalogProjectionInputSpec::untracked(
+                "lix_version_ref",
+                CatalogProjectionInputVersionScope::Global,
+            )]
         );
         assert_eq!(
             definition.surfaces(),
@@ -580,8 +582,14 @@ mod tests {
 
     #[test]
     fn catalog_projection_input_groups_rows_by_declared_spec() {
-        let tracked_spec = CatalogProjectionInputSpec::tracked("lix_version_descriptor");
-        let untracked_spec = CatalogProjectionInputSpec::untracked("lix_version_ref");
+        let tracked_spec = CatalogProjectionInputSpec::tracked(
+            "lix_version_descriptor",
+            CatalogProjectionInputVersionScope::Global,
+        );
+        let untracked_spec = CatalogProjectionInputSpec::untracked(
+            "lix_version_ref",
+            CatalogProjectionInputVersionScope::Global,
+        );
 
         let input = CatalogProjectionInput::new(vec![
             CatalogProjectionInputRows::new(tracked_spec.clone(), vec![sample_tracked_row()]),
@@ -638,7 +646,10 @@ mod tests {
         }
 
         fn inputs(&self) -> Vec<CatalogProjectionInputSpec> {
-            vec![CatalogProjectionInputSpec::untracked("lix_version_ref")]
+            vec![CatalogProjectionInputSpec::untracked(
+                "lix_version_ref",
+                CatalogProjectionInputVersionScope::Global,
+            )]
         }
 
         fn surfaces(&self) -> Vec<CatalogProjectionSurfaceSpec> {

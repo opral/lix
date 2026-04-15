@@ -1,11 +1,13 @@
 use crate::backend::QueryExecutor;
 use crate::common::is_missing_relation_error;
 use crate::version::CommittedVersionFrontier;
-use crate::version::{version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id};
+use crate::version::{
+    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
+    version_ref_schema_version, version_ref_storage_version_id,
+};
 use crate::{LixBackend, LixError, Value};
 
 use super::naming::tracked_relation_name;
-use super::storage_metadata::builtin_schema_storage_metadata;
 use super::untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
 use super::ExactUntrackedRowRequest;
 
@@ -89,7 +91,6 @@ pub(crate) async fn load_current_committed_version_frontier_with_executor(
 async fn load_all_version_head_refs_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Option<Vec<VersionHeadRef>>, LixError> {
-    let metadata = version_ref_storage_metadata();
     let result = match executor
         .execute(
             &format!(
@@ -105,14 +106,14 @@ async fn load_all_version_head_refs_with_executor(
                    AND commit_id IS NOT NULL \
                    AND commit_id <> '' \
                  ORDER BY entity_id ASC, updated_at DESC",
-                table = tracked_relation_name(&metadata.schema_key),
+                table = tracked_relation_name(version_ref_schema_key()),
             ),
             &[
-                Value::Text(metadata.schema_key.clone()),
-                Value::Text(metadata.schema_version.clone()),
-                Value::Text(metadata.file_id.clone()),
+                Value::Text(version_ref_schema_key().to_string()),
+                Value::Text(version_ref_schema_version().to_string()),
+                Value::Text(version_ref_file_id().to_string()),
                 Value::Text(version_ref_storage_version_id().to_string()),
-                Value::Text(metadata.plugin_key.clone()),
+                Value::Text(version_ref_plugin_key().to_string()),
             ],
         )
         .await
@@ -140,11 +141,6 @@ async fn load_all_version_head_refs_with_executor(
         rows.push(parsed);
     }
     Ok(Some(rows))
-}
-
-fn version_ref_storage_metadata() -> super::BuiltinSchemaStorageMetadata {
-    builtin_schema_storage_metadata("lix_version_ref")
-        .expect("lix_version_ref builtin storage metadata should exist")
 }
 
 fn parse_version_head_ref_row(row: &[Value]) -> Result<VersionHeadRef, LixError> {

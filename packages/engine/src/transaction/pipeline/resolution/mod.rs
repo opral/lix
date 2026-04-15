@@ -929,26 +929,11 @@ pub(super) fn write_mode_request_for_insert_payload(
     }
 }
 
-fn surface_forces_global_write_scope(planned_write: &PlannedWrite) -> bool {
-    planned_write
-        .command
-        .target
-        .implicit_overrides
-        .predicate_overrides
-        .iter()
-        .any(|predicate| {
-            predicate.column == "global"
-                && predicate.value == crate::catalog::SurfaceOverrideValue::Boolean(true)
-        })
-}
-
 pub(super) fn resolved_version_id_for_insert_payload(
     planned_write: &PlannedWrite,
     payload: &BTreeMap<String, Value>,
 ) -> Result<Option<String>, WriteResolveError> {
-    if surface_forces_global_write_scope(planned_write)
-        || payload.get("global").and_then(bool_from_value) == Some(true)
-    {
+    if payload.get("global").and_then(bool_from_value) == Some(true) {
         return Ok(Some(GLOBAL_VERSION_ID.to_string()));
     }
 

@@ -9,7 +9,8 @@ use crate::catalog::{
 };
 use crate::functions::DynFunctionProvider;
 use crate::live_state::{
-    decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
+    decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
+    scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::schema_from_registered_snapshot;
 use crate::schema::SchemaAnnotationEvaluator;
@@ -18,11 +19,14 @@ use crate::{LixBackend, LixError};
 
 pub(crate) async fn load_public_surface_registry_with_backend(
     backend: &dyn LixBackend,
+    requested_version_id: Option<&str>,
     evaluator: &dyn SchemaAnnotationEvaluator,
     functions: &DynFunctionProvider,
 ) -> Result<SurfaceRegistry, LixError> {
     let mut registry = build_builtin_surface_registry();
-    for (_, schema) in load_latest_registered_schemas(backend).await? {
+    let visible_version_ids =
+        visible_registered_schema_version_ids(backend, requested_version_id).await?;
+    for (_, schema) in load_latest_registered_schemas(backend, &visible_version_ids).await? {
         let spec = dynamic_entity_surface_spec_from_schema(&schema, evaluator, functions)?;
         register_dynamic_entity_surface_spec(&mut registry, spec);
     }
@@ -44,50 +48,66 @@ pub(crate) fn apply_registered_schema_snapshot_to_surface_registry(
 
 async fn load_latest_registered_schemas(
     backend: &dyn LixBackend,
+    visible_version_ids: &[String],
 ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
-    let rows = scan_live_rows(
-        backend,
-        &LiveRowQuery {
-            schema_key: "lix_registered_schema".to_string(),
-            version_id: "global".to_string(),
-            source: LiveRowSource::Tracked,
-            constraints: Vec::new(),
-            include_tombstones: false,
-        },
-    )
-    .await?;
-
     let mut latest_by_schema_key = BTreeMap::<String, (SchemaKey, JsonValue)>::new();
-    for row in &rows {
-        let Some((key, schema)) = decode_registered_schema_row(row)? else {
-            continue;
-        };
+    for version_id in visible_version_ids {
+        let rows = scan_live_rows(
+            backend,
+            &LiveRowQuery {
+                schema_key: "lix_registered_schema".to_string(),
+                version_id: version_id.clone(),
+                source: LiveRowSource::Tracked,
+                constraints: Vec::new(),
+                include_tombstones: false,
+            },
+        )
+        .await?;
 
-        let should_replace = latest_by_schema_key
-            .get(&key.schema_key)
-            .map(|(existing, _)| schema_key_is_newer(&key, existing))
-            .unwrap_or(true);
-        if should_replace {
-            latest_by_schema_key.insert(key.schema_key.clone(), (key, schema));
+        for row in &rows {
+            let Some((key, schema)) = decode_registered_schema_row(row)? else {
+                continue;
+            };
+
+            let should_replace = latest_by_schema_key
+                .get(&key.schema_key)
+                .map(|(existing, _)| !schema_key_is_older(&key, existing))
+                .unwrap_or(true);
+            if should_replace {
+                latest_by_schema_key.insert(key.schema_key.clone(), (key, schema));
+            }
         }
     }
 
     Ok(latest_by_schema_key.into_values().collect())
 }
 
-fn schema_key_is_newer(candidate: &SchemaKey, existing: &SchemaKey) -> bool {
+async fn visible_registered_schema_version_ids(
+    backend: &dyn LixBackend,
+    requested_version_id: Option<&str>,
+) -> Result<Vec<String>, LixError> {
+    let mut version_ids =
+        std::collections::BTreeSet::from([crate::version::GLOBAL_VERSION_ID.to_string()]);
+    if let Some(requested_version_id) = requested_version_id {
+        version_ids.insert(requested_version_id.to_string());
+    } else {
+        let frontier = load_current_committed_version_frontier_with_backend(backend).await?;
+        version_ids.extend(frontier.version_heads.into_keys());
+    }
+    Ok(version_ids.into_iter().collect())
+}
+
+fn schema_key_is_older(candidate: &SchemaKey, existing: &SchemaKey) -> bool {
     match (candidate.version_number(), existing.version_number()) {
-        (Some(candidate_version), Some(existing_version)) => candidate_version > existing_version,
-        _ => candidate.schema_version > existing.schema_version,
+        (Some(candidate_version), Some(existing_version)) => candidate_version < existing_version,
+        _ => candidate.schema_version < existing.schema_version,
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::load_public_surface_registry_with_backend;
-    use crate::catalog::{
-        dynamic_entity_surface_spec_from_schema, SurfaceFamily, SurfaceOverrideValue,
-    };
+    use crate::catalog::{dynamic_entity_surface_spec_from_schema, SurfaceFamily};
     use crate::cel::shared_runtime;
     use crate::functions::SystemFunctionProvider;
     use crate::functions::{clone_boxed_function_provider, SharedFunctionProvider};
@@ -132,8 +152,7 @@ mod tests {
                 "x-lix-version": "1",
                 "x-lix-override-lixcols": {
                     "lixcol_file_id": "\"lix\"",
-                    "lixcol_plugin_key": "\"lix\"",
-                    "lixcol_global": "true"
+                    "lixcol_plugin_key": "\"lix\""
                 },
                 "properties": {
                     "body": { "type": "string" },
@@ -145,10 +164,14 @@ mod tests {
         )
         .expect("schema spec should derive");
 
-        assert_eq!(spec.predicate_overrides.len(), 3);
-        assert!(spec.predicate_overrides.iter().any(|predicate| {
-            predicate.column == "global" && predicate.value == SurfaceOverrideValue::Boolean(true)
-        }));
+        assert_eq!(spec.predicate_overrides.len(), 2);
+        assert!(
+            !spec
+                .predicate_overrides
+                .iter()
+                .any(|predicate| predicate.column == "global"),
+            "dynamic entity surfaces should not derive hidden global predicates"
+        );
     }
 
     #[test]
@@ -326,10 +349,14 @@ mod tests {
         };
 
         let functions = system_functions();
-        let registry =
-            load_public_surface_registry_with_backend(&backend, shared_runtime(), &functions)
-                .await
-                .expect("load surface registry");
+        let registry = load_public_surface_registry_with_backend(
+            &backend,
+            Some(crate::version::GLOBAL_VERSION_ID),
+            shared_runtime(),
+            &functions,
+        )
+        .await
+        .expect("load surface registry");
 
         let descriptor = registry
             .bind_relation_name("message")

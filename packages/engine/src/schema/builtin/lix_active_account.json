@@ -6,9 +6,7 @@
   ],
   "x-lix-override-lixcols": {
     "lixcol_file_id": "\"lix\"",
-    "lixcol_plugin_key": "\"lix\"",
-    "lixcol_untracked": "true",
-    "lixcol_global": "true"
+    "lixcol_plugin_key": "\"lix\""
   },
   "x-lix-foreign-keys": [
     {

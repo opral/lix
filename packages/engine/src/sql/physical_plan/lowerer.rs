@@ -2907,7 +2907,6 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_registered_schema"));
         assert!(lowered_sql.contains("file_id = 'lix'"));
         assert!(lowered_sql.contains("plugin_key = 'lix'"));
-        assert!(lowered_sql.contains("global = true"));
         assert!(!lowered_sql.contains("FROM lix_registered_schema"));
         assert_eq!(
             lowered.pushdown_decision.residual_predicate_sql(),

@@ -60,8 +60,7 @@ async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
             "x-lix-primary-key": ["/key"],
             "x-lix-override-lixcols": {
                 "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\"",
-                "lixcol_global": "true"
+                "lixcol_plugin_key": "\"lix\""
             },
             "type": "object",
             "properties": {
@@ -82,8 +81,7 @@ async fn register_defaults_schema(engine: &support::simulation_test::SimulatedLi
             "x-lix-primary-key": ["/id"],
             "x-lix-override-lixcols": {
                 "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\"",
-                "lixcol_global": "true"
+                "lixcol_plugin_key": "\"lix\""
             },
             "type": "object",
             "properties": {
@@ -398,6 +396,7 @@ simulation_test!(
         engine.initialize().await.unwrap();
 
         register_defaults_schema(&engine).await;
+        let active_version_id = engine.active_version_id().await.unwrap();
         engine
             .execute(
                 &insert_key_value_sql("lix_deterministic_mode", "{\"enabled\":true}"),
@@ -413,12 +412,14 @@ simulation_test!(
 
         let row = engine
             .execute(
-                "SELECT snapshot_content \
-             FROM lix_state_by_version \
-             WHERE schema_key = 'defaults_schema' \
-               AND version_id = 'global' \
-               AND snapshot_content IS NOT NULL \
-             LIMIT 1",
+                &format!(
+                    "SELECT snapshot_content \
+                     FROM lix_state_by_version \
+                     WHERE schema_key = 'defaults_schema' \
+                       AND version_id = '{active_version_id}' \
+                       AND snapshot_content IS NOT NULL \
+                     LIMIT 1"
+                ),
                 &[],
             )
             .await
