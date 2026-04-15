@@ -13,7 +13,6 @@ use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
 use crate::live_state::writer_key::load_writer_key_annotations;
-use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::{LixBackend, LixError, Value};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
@@ -93,10 +92,6 @@ impl ProjectionHydrationContext {
             CatalogProjectionInputVersionScope::CurrentCommittedFrontier => {
                 Ok(self.current_committed_version_ids.clone())
             }
-            CatalogProjectionInputVersionScope::SchemaDefault => Ok(schema_default_version_ids(
-                spec,
-                &self.current_committed_version_ids,
-            )),
         }
     }
 }
@@ -303,24 +298,14 @@ async fn load_blob_data_by_hash_with_backend(
     Ok(rows)
 }
 
-fn schema_default_version_ids(
-    spec: &CatalogProjectionInputSpec,
-    current_committed_version_ids: &[String],
-) -> Vec<String> {
-    match builtin_schema_storage_metadata(&spec.schema_key).map(|metadata| metadata.storage_lane) {
-        Some(BuiltinSchemaStorageLane::Global) | None => {
-            vec![crate::version::GLOBAL_VERSION_ID.to_string()]
-        }
-        Some(BuiltinSchemaStorageLane::Local) => current_committed_version_ids.to_vec(),
-    }
-}
 #[cfg(test)]
 mod tests {
     use super::hydrate_projection_input_with_backend;
     use crate::backend::TransactionBeginMode;
     use crate::catalog::{
         CatalogDerivedRow, CatalogProjectionDefinition, CatalogProjectionInput,
-        CatalogProjectionInputSpec, CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
+        CatalogProjectionInputSpec, CatalogProjectionInputVersionScope,
+        CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
     };
     use crate::live_state;
     use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
@@ -341,8 +326,14 @@ mod tests {
 
         fn inputs(&self) -> Vec<CatalogProjectionInputSpec> {
             vec![
-                CatalogProjectionInputSpec::tracked("lix_version_descriptor"),
-                CatalogProjectionInputSpec::untracked("lix_version_ref"),
+                CatalogProjectionInputSpec::tracked(
+                    "lix_version_descriptor",
+                    CatalogProjectionInputVersionScope::Global,
+                ),
+                CatalogProjectionInputSpec::untracked(
+                    "lix_version_ref",
+                    CatalogProjectionInputVersionScope::Global,
+                ),
             ]
         }
 
@@ -368,7 +359,10 @@ mod tests {
         }
 
         fn inputs(&self) -> Vec<CatalogProjectionInputSpec> {
-            vec![CatalogProjectionInputSpec::tracked("lix_key_value")]
+            vec![CatalogProjectionInputSpec::tracked(
+                "lix_key_value",
+                CatalogProjectionInputVersionScope::CurrentCommittedFrontier,
+            )]
         }
 
         fn surfaces(&self) -> Vec<CatalogProjectionSurfaceSpec> {
@@ -640,10 +634,14 @@ mod tests {
         let descriptor_rows = input
             .rows_for(&CatalogProjectionInputSpec::tracked(
                 "lix_version_descriptor",
+                CatalogProjectionInputVersionScope::Global,
             ))
             .expect("tracked descriptor rows should be present");
         let version_ref_rows = input
-            .rows_for(&CatalogProjectionInputSpec::untracked("lix_version_ref"))
+            .rows_for(&CatalogProjectionInputSpec::untracked(
+                "lix_version_ref",
+                CatalogProjectionInputVersionScope::Global,
+            ))
             .expect("untracked version ref rows should be present");
 
         assert!(
@@ -787,7 +785,10 @@ mod tests {
                 .await
                 .expect("hydration should succeed");
         let rows = input
-            .rows_for(&CatalogProjectionInputSpec::tracked("lix_key_value"))
+            .rows_for(&CatalogProjectionInputSpec::tracked(
+                "lix_key_value",
+                CatalogProjectionInputVersionScope::CurrentCommittedFrontier,
+            ))
             .expect("tracked key value rows should be present");
 
         assert_eq!(

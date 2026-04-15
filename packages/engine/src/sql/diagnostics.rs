@@ -357,6 +357,7 @@ async fn resolve_available_columns(
 
     let registry = match crate::catalog::load_public_surface_registry_with_backend(
         backend,
+        None,
         crate::cel::shared_runtime(),
         &system_functions(),
     )
@@ -373,6 +374,7 @@ async fn resolve_available_columns(
 async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
     match crate::catalog::load_public_surface_registry_with_backend(
         backend,
+        None,
         crate::cel::shared_runtime(),
         &system_functions(),
     )
@@ -390,6 +392,7 @@ async fn public_surfaces_in_relation_names_with_backend(
 ) -> Vec<String> {
     let registry = match crate::catalog::load_public_surface_registry_with_backend(
         backend,
+        None,
         crate::cel::shared_runtime(),
         &system_functions(),
     )

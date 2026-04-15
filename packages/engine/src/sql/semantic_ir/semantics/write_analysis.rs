@@ -1,7 +1,6 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationBinding,
     FilesystemRelationKind, RelationBindContext, RelationBinding, ResolvedRelation,
-    SurfaceOverrideValue,
 };
 use crate::functions::DynFunctionProvider;
 use crate::sql::logical_plan::public_ir::{
@@ -191,10 +190,6 @@ fn insert_scope_for_active_version_surface(
     canonicalized: &CanonicalizedWrite,
     rows: &[std::collections::BTreeMap<String, Value>],
 ) -> ScopeProof {
-    if surface_forces_global_scope(canonicalized) {
-        return ScopeProof::SingleVersion(GLOBAL_VERSION_ID.to_string());
-    }
-
     let Some(active_version_id) = canonicalized
         .write_command
         .statement_context
@@ -475,24 +470,11 @@ fn combine_version_constraints_with_or(
 }
 
 fn forced_write_version_id(canonicalized: &CanonicalizedWrite) -> Option<String> {
-    if surface_forces_global_scope(canonicalized)
-        || write_bool_value(canonicalized, "global") == Some(true)
-    {
+    if write_bool_value(canonicalized, "global") == Some(true) {
         Some(GLOBAL_VERSION_ID.to_string())
     } else {
         None
     }
-}
-
-fn surface_forces_global_scope(canonicalized: &CanonicalizedWrite) -> bool {
-    canonicalized
-        .resolved_relation
-        .implicit_overrides
-        .predicate_overrides
-        .iter()
-        .any(|predicate| {
-            predicate.column == "global" && predicate.value == SurfaceOverrideValue::Boolean(true)
-        })
 }
 
 fn derive_write_schema_facts(canonicalized: &CanonicalizedWrite) -> SchemaProof {

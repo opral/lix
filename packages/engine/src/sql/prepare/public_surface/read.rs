@@ -3571,6 +3571,7 @@ pub(super) async fn try_prepare_public_read(
     );
     let registry = crate::catalog::load_public_surface_registry_with_backend(
         backend,
+        Some(active_version_id),
         crate::cel::shared_runtime(),
         &functions,
     )

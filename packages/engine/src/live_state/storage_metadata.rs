@@ -2,7 +2,6 @@ use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
 use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
-use crate::version::GLOBAL_VERSION_ID;
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,18 +39,23 @@ pub(crate) fn builtin_schema_storage_metadata(
         .get("lixcol_plugin_key")
         .and_then(JsonValue::as_str)?;
 
-    let storage_lane = match overrides.get("lixcol_global").and_then(JsonValue::as_str) {
-        Some("true") if GLOBAL_VERSION_ID == "global" => BuiltinSchemaStorageLane::Global,
-        _ => BuiltinSchemaStorageLane::Local,
-    };
-
     Some(BuiltinSchemaStorageMetadata {
         schema_key: parsed_schema_key.to_string(),
         schema_version: schema_version.to_string(),
         file_id: decode_lixcol_literal(file_id_raw),
         plugin_key: decode_lixcol_literal(plugin_key_raw),
-        storage_lane,
+        storage_lane: builtin_storage_lane(schema_key),
     })
+}
+
+fn builtin_storage_lane(schema_key: &str) -> BuiltinSchemaStorageLane {
+    match schema_key {
+        "lix_version_ref"
+        | "lix_version_descriptor"
+        | "lix_active_version"
+        | "lix_active_account" => BuiltinSchemaStorageLane::Global,
+        _ => BuiltinSchemaStorageLane::Local,
+    }
 }
 
 pub(crate) fn key_value_storage_metadata() -> &'static BuiltinSchemaStorageMetadata {

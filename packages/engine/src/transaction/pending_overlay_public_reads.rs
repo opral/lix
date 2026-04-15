@@ -59,6 +59,7 @@ impl<'a> PendingOverlayReadModel<'a> {
         if !self.has_pending_visibility() {
             return crate::catalog::load_public_surface_registry_with_backend(
                 self.base,
+                None,
                 crate::cel::shared_runtime(),
                 functions,
             )
@@ -149,9 +150,6 @@ impl<'a> PendingOverlayReadModel<'a> {
             for row in pending_overlay
                 .visible_semantic_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY)
             {
-                if row.version_id != GLOBAL_VERSION_ID {
-                    continue;
-                }
                 match row.snapshot_content.as_ref().filter(|_| !row.tombstone) {
                     Some(snapshot_content) => {
                         rows.insert(row.entity_id.clone(), snapshot_content.clone());

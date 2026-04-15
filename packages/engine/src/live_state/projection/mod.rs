@@ -16,7 +16,6 @@ pub(crate) mod status;
 use std::collections::BTreeSet;
 
 use crate::backend::TransactionBeginMode;
-use crate::live_state::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 use crate::live_state::{
     CanonicalCommitProjectionReceipt, LiveStateMode, LiveStateProjectionStatus,
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope, ReplayCursor,
@@ -28,28 +27,23 @@ use crate::{LixBackend, LixBackendTransaction, LixError};
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
 
 fn version_ref_schema_key() -> String {
-    version_ref_storage_metadata().schema_key
+    crate::version::version_ref_schema_key().to_string()
 }
 
 fn version_ref_schema_version() -> String {
-    version_ref_storage_metadata().schema_version
+    crate::version::version_ref_schema_version().to_string()
 }
 
 fn version_ref_file_id() -> String {
-    version_ref_storage_metadata().file_id
+    crate::version::version_ref_file_id().to_string()
 }
 
 fn version_ref_plugin_key() -> String {
-    version_ref_storage_metadata().plugin_key
+    crate::version::version_ref_plugin_key().to_string()
 }
 
 fn version_ref_storage_version_id() -> String {
-    match version_ref_storage_metadata().storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::version::GLOBAL_VERSION_ID.to_string(),
-        BuiltinSchemaStorageLane::Local => {
-            panic!("lix_version_ref must use the global storage lane")
-        }
-    }
+    crate::version::version_ref_storage_version_id().to_string()
 }
 
 fn version_ref_snapshot_content(version_id: &str, commit_id: &str) -> String {
@@ -58,11 +52,6 @@ fn version_ref_snapshot_content(version_id: &str, commit_id: &str) -> String {
         commit_id: commit_id.to_string(),
     })
     .expect("lix_version_ref snapshot serialization must succeed")
-}
-
-fn version_ref_storage_metadata() -> crate::live_state::BuiltinSchemaStorageMetadata {
-    builtin_schema_storage_metadata("lix_version_ref")
-        .expect("lix_version_ref builtin storage metadata should exist")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

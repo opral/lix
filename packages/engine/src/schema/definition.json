@@ -96,12 +96,7 @@
         },
         "x-lix-override-lixcols": {
           "type": "object",
-          "description": "Default metadata column values (such as lixcol_file_id). Does not affect JSON property defaults. lixcol_version_id is intentionally unsupported.",
-          "propertyNames": {
-            "not": {
-              "const": "lixcol_version_id"
-            }
-          },
+          "description": "Default metadata column values (such as lixcol_file_id and lixcol_plugin_key). Does not affect JSON property defaults. Legacy scope/storage overrides such as lixcol_version_id, lixcol_global, and lixcol_untracked are intentionally unsupported.",
           "additionalProperties": {
             "type": "string",
             "format": "cel"

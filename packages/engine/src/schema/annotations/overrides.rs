@@ -41,9 +41,7 @@ pub(crate) fn collect_lixcol_overrides(
         "lixcol_schema_key",
         "lixcol_file_id",
         "lixcol_plugin_key",
-        "lixcol_global",
         "lixcol_metadata",
-        "lixcol_untracked",
         "lixcol_writer_key",
     ] {
         let Some(value) =
@@ -121,7 +119,7 @@ fn reject_removed_lixcol_version_override(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
+                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support",
                 schema_key
             ),
         });
@@ -189,9 +187,7 @@ fn entity_state_column_name(column: &str) -> Option<&'static str> {
         "lixcol_file_id" => Some("file_id"),
         "lixcol_plugin_key" => Some("plugin_key"),
         "lixcol_schema_version" => Some("schema_version"),
-        "lixcol_global" => Some("global"),
         "lixcol_writer_key" => Some("writer_key"),
-        "lixcol_untracked" => Some("untracked"),
         "lixcol_metadata" => Some("metadata"),
         _ => None,
     }
@@ -202,9 +198,7 @@ fn dynamic_entity_surface_column_name(column: &str) -> Option<&'static str> {
         "lixcol_entity_id" => Some("entity_id"),
         "lixcol_file_id" => Some("file_id"),
         "lixcol_plugin_key" => Some("plugin_key"),
-        "lixcol_global" => Some("global"),
         "lixcol_metadata" => Some("metadata"),
-        "lixcol_untracked" => Some("untracked"),
         _ => None,
     }
 }
@@ -245,7 +239,6 @@ mod tests {
                 "x-lix-override-lixcols": {
                     "lixcol_file_id": "\"lix\"",
                     "lixcol_plugin_key": "\"plugin\"",
-                    "lixcol_global": "true",
                     "lixcol_writer_key": "\"ignored\""
                 }
             }),
@@ -265,10 +258,6 @@ mod tests {
                 DynamicEntitySurfaceOverride {
                     column: "plugin_key".to_string(),
                     value: LixcolOverrideValue::String("plugin".to_string()),
-                },
-                DynamicEntitySurfaceOverride {
-                    column: "global".to_string(),
-                    value: LixcolOverrideValue::Boolean(true),
                 },
             ]
         );
