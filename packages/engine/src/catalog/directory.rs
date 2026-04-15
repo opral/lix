@@ -409,33 +409,39 @@ fn bool_value(value: Option<&Value>) -> Option<bool> {
 }
 
 fn local_requested_tracked(schema_key: &str) -> CatalogProjectionInputSpec {
-    CatalogProjectionInputSpec::tracked(schema_key)
-        .with_version_scope(CatalogProjectionInputVersionScope::RequestedVersion)
+    CatalogProjectionInputSpec::tracked(
+        schema_key,
+        CatalogProjectionInputVersionScope::RequestedVersion,
+    )
 }
 
 fn local_requested_untracked(schema_key: &str) -> CatalogProjectionInputSpec {
-    CatalogProjectionInputSpec::untracked(schema_key)
-        .with_version_scope(CatalogProjectionInputVersionScope::RequestedVersion)
+    CatalogProjectionInputSpec::untracked(
+        schema_key,
+        CatalogProjectionInputVersionScope::RequestedVersion,
+    )
 }
 
 fn local_frontier_tracked(schema_key: &str) -> CatalogProjectionInputSpec {
-    CatalogProjectionInputSpec::tracked(schema_key)
-        .with_version_scope(CatalogProjectionInputVersionScope::CurrentCommittedFrontier)
+    CatalogProjectionInputSpec::tracked(
+        schema_key,
+        CatalogProjectionInputVersionScope::CurrentCommittedFrontier,
+    )
 }
 
 fn local_frontier_untracked(schema_key: &str) -> CatalogProjectionInputSpec {
-    CatalogProjectionInputSpec::untracked(schema_key)
-        .with_version_scope(CatalogProjectionInputVersionScope::CurrentCommittedFrontier)
+    CatalogProjectionInputSpec::untracked(
+        schema_key,
+        CatalogProjectionInputVersionScope::CurrentCommittedFrontier,
+    )
 }
 
 fn global_tracked(schema_key: &str) -> CatalogProjectionInputSpec {
-    CatalogProjectionInputSpec::tracked(schema_key)
-        .with_version_scope(CatalogProjectionInputVersionScope::Global)
+    CatalogProjectionInputSpec::tracked(schema_key, CatalogProjectionInputVersionScope::Global)
 }
 
 fn global_untracked(schema_key: &str) -> CatalogProjectionInputSpec {
-    CatalogProjectionInputSpec::untracked(schema_key)
-        .with_version_scope(CatalogProjectionInputVersionScope::Global)
+    CatalogProjectionInputSpec::untracked(schema_key, CatalogProjectionInputVersionScope::Global)
 }
 
 #[cfg(test)]

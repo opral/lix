@@ -294,6 +294,7 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     );
     let registry = crate::catalog::load_public_surface_registry_with_backend(
         backend,
+        Some(active_version_id),
         crate::cel::shared_runtime(),
         &functions,
     )

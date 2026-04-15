@@ -8,6 +8,7 @@
 
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -20,9 +21,9 @@ use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, Surfac
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{
-    decode_registered_schema_row, load_exact_live_row, scan_live_rows, ExactLiveRowQuery,
-    LiveFilter, LiveFilterField, LiveFilterOp, LiveRowQuery, LiveRowSource, LiveSnapshotRow,
-    LiveSnapshotStorage,
+    decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
+    scan_live_rows, LiveFilter, LiveFilterField, LiveFilterOp, LiveRowQuery, LiveRowSource,
+    LiveSnapshotRow, LiveSnapshotStorage,
 };
 use crate::schema::CompiledSchemaCache;
 use crate::schema::{
@@ -42,7 +43,6 @@ const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_FILE_ID: &str = "lix";
 const REGISTERED_SCHEMA_PLUGIN_KEY: &str = "lix";
-const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConstraintStorageKind {
@@ -117,7 +117,8 @@ struct ConstraintRowView<'a> {
 struct WriteValidationSchemaLookup<'a> {
     backend: &'a dyn LixBackend,
     pending: HashMap<SchemaKey, JsonValue>,
-    visible_entries: Option<Vec<(SchemaKey, JsonValue)>>,
+    visible_entries: Option<(String, Vec<(SchemaKey, JsonValue)>)>,
+    current_version_heads: Option<BTreeSet<String>>,
 }
 
 impl<'a> WriteValidationSchemaLookup<'a> {
@@ -126,6 +127,7 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             backend,
             pending: HashMap::new(),
             visible_entries: None,
+            current_version_heads: None,
         }
     }
 
@@ -184,7 +186,11 @@ impl<'a> WriteValidationSchemaLookup<'a> {
         Ok(())
     }
 
-    async fn load_schema(&mut self, key: &SchemaKey) -> Result<JsonValue, LixError> {
+    async fn load_schema(
+        &mut self,
+        key: &SchemaKey,
+        requested_version_id: &str,
+    ) -> Result<JsonValue, LixError> {
         if let Some(schema) = self.pending.get(key) {
             return Ok(schema.clone());
         }
@@ -193,27 +199,15 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             return Ok(schema);
         }
 
-        let row = load_exact_live_row(
-            self.backend,
-            &ExactLiveRowQuery {
-                source: LiveRowSource::Tracked,
-                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-                version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
-                entity_id: key.entity_id(),
-                file_id: Some(REGISTERED_SCHEMA_FILE_ID.to_string()),
-                schema_version: Some(key.schema_version.clone()),
-                plugin_key: Some(REGISTERED_SCHEMA_PLUGIN_KEY.to_string()),
-                writer_key: None,
-                global: Some(true),
-                untracked: Some(false),
-                include_tombstones: false,
-                include_global_overlay: true,
-                include_untracked_overlay: true,
-            },
-        )
-        .await?;
-
-        let Some(row) = row else {
+        let visible_entries = self
+            .load_visible_schema_entries(requested_version_id)
+            .await?;
+        let Some(schema) = visible_entries
+            .into_iter()
+            .filter(|(visible_key, _)| visible_key == key)
+            .max_by(|(left, _), (right, _)| compare_schema_keys(left, right))
+            .map(|(_, schema)| schema)
+        else {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
@@ -223,30 +217,14 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             ));
         };
 
-        let Some((decoded_key, schema)) = decode_registered_schema_row(&row)? else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "schema '{}' ({}) is not stored",
-                    key.schema_key, key.schema_version
-                ),
-            ));
-        };
-        if &decoded_key != key {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "schema row '{}' decoded to unexpected key '{}~{}'",
-                    key.entity_id(),
-                    decoded_key.schema_key,
-                    decoded_key.schema_version
-                ),
-            ));
-        }
         Ok(schema)
     }
 
-    async fn load_latest_schema(&mut self, schema_key: &str) -> Result<JsonValue, LixError> {
+    async fn load_latest_schema(
+        &mut self,
+        schema_key: &str,
+        requested_version_id: &str,
+    ) -> Result<JsonValue, LixError> {
         if let Some(schema) = whitelisted_internal_schema(schema_key) {
             return Ok(schema);
         }
@@ -255,7 +233,9 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             return Ok(schema.clone());
         }
 
-        let visible_entries = self.load_visible_schema_entries().await?;
+        let visible_entries = self
+            .load_visible_schema_entries(requested_version_id)
+            .await?;
         visible_entries
             .into_iter()
             .filter(|(key, _)| key.schema_key == schema_key)
@@ -271,9 +251,12 @@ impl<'a> WriteValidationSchemaLookup<'a> {
 
     async fn load_visible_schema_entries(
         &mut self,
+        requested_version_id: &str,
     ) -> Result<Vec<(SchemaKey, JsonValue)>, LixError> {
-        if let Some(entries) = &self.visible_entries {
-            return Ok(entries.clone());
+        if let Some((cached_version_id, entries)) = &self.visible_entries {
+            if cached_version_id == requested_version_id {
+                return Ok(entries.clone());
+            }
         }
 
         let mut entries_by_key = HashMap::<SchemaKey, JsonValue>::new();
@@ -295,23 +278,34 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             entries_by_key.insert(key, schema.clone());
         }
 
-        let rows = scan_live_rows(
-            self.backend,
-            &LiveRowQuery {
-                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-                version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
-                source: LiveRowSource::Tracked,
-                constraints: Vec::new(),
-                include_tombstones: false,
-            },
-        )
-        .await?;
+        for version_id in self
+            .visible_registered_schema_version_ids(requested_version_id)
+            .await?
+        {
+            let rows = scan_live_rows(
+                self.backend,
+                &LiveRowQuery {
+                    schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                    version_id,
+                    source: LiveRowSource::Tracked,
+                    constraints: Vec::new(),
+                    include_tombstones: false,
+                },
+            )
+            .await?;
 
-        for row in &rows {
-            let Some((key, schema)) = decode_registered_schema_row(row)? else {
-                continue;
-            };
-            entries_by_key.insert(key, schema);
+            for row in &rows {
+                if row.file_id != REGISTERED_SCHEMA_FILE_ID
+                    || row.plugin_key != REGISTERED_SCHEMA_PLUGIN_KEY
+                    || row.untracked
+                {
+                    continue;
+                }
+                let Some((key, schema)) = decode_registered_schema_row(row)? else {
+                    continue;
+                };
+                entries_by_key.insert(key, schema);
+            }
         }
 
         for (key, schema) in &self.pending {
@@ -319,8 +313,27 @@ impl<'a> WriteValidationSchemaLookup<'a> {
         }
 
         let entries = entries_by_key.into_iter().collect::<Vec<_>>();
-        self.visible_entries = Some(entries.clone());
+        self.visible_entries = Some((requested_version_id.to_string(), entries.clone()));
         Ok(entries)
+    }
+
+    async fn visible_registered_schema_version_ids(
+        &mut self,
+        requested_version_id: &str,
+    ) -> Result<Vec<String>, LixError> {
+        if self.current_version_heads.is_none() {
+            let frontier =
+                load_current_committed_version_frontier_with_backend(self.backend).await?;
+            self.current_version_heads = Some(frontier.version_heads.into_keys().collect());
+        }
+
+        let mut version_ids = BTreeSet::new();
+        version_ids.insert(crate::version::GLOBAL_VERSION_ID.to_string());
+        version_ids.insert(requested_version_id.to_string());
+        if let Some(current_version_heads) = &self.current_version_heads {
+            version_ids.extend(current_version_heads.iter().cloned());
+        }
+        Ok(version_ids.into_iter().collect())
     }
 }
 
@@ -355,10 +368,12 @@ pub async fn validate_inserts(
         };
 
         let key = SchemaKey::new(row.schema_key.clone(), row.schema_version.clone());
-        validate_snapshot_content(&mut schema_provider, cache, &key, snapshot).await?;
+        validate_snapshot_content(&mut schema_provider, cache, &key, &row.version_id, snapshot)
+            .await?;
         validate_entity_id_matches_primary_key(
             &mut schema_provider,
             &key,
+            &row.version_id,
             &row.entity_id,
             snapshot,
         )
@@ -410,7 +425,12 @@ pub(crate) async fn validate_update_inputs(
 
             if row.schema_key == REGISTERED_SCHEMA_KEY {
                 if let Some(snapshot) = snapshot.as_ref() {
-                    validate_registered_schema_snapshot(&mut schema_provider, snapshot).await?;
+                    validate_registered_schema_snapshot(
+                        &mut schema_provider,
+                        snapshot,
+                        &row.version_id,
+                    )
+                    .await?;
                 }
                 continue;
             }
@@ -433,10 +453,18 @@ pub(crate) async fn validate_update_inputs(
             let key = SchemaKey::new(row.schema_key.clone(), row.schema_version.clone());
 
             if let Some(snapshot) = snapshot.as_ref() {
-                validate_snapshot_content(&mut schema_provider, cache, &key, snapshot).await?;
+                validate_snapshot_content(
+                    &mut schema_provider,
+                    cache,
+                    &key,
+                    &row.version_id,
+                    snapshot,
+                )
+                .await?;
                 validate_entity_id_matches_primary_key(
                     &mut schema_provider,
                     &key,
+                    &row.version_id,
                     &row.entity_id,
                     snapshot,
                 )
@@ -615,7 +643,8 @@ async fn remember_pending_registered_schemas(
         let Some(snapshot) = planned_row_snapshot(row)? else {
             continue;
         };
-        validate_registered_schema_snapshot(provider, &snapshot).await?;
+        let requested_version_id = planned_row_required_text(row, "version_id")?;
+        validate_registered_schema_snapshot(provider, &snapshot, &requested_version_id).await?;
         provider.remember_pending_schema_from_snapshot(&snapshot)?;
     }
     Ok(())
@@ -763,9 +792,10 @@ async fn validate_snapshot_content(
     provider: &mut WriteValidationSchemaLookup<'_>,
     cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
+    requested_version_id: &str,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
-    let compiled = load_compiled_schema(provider, cache, key).await?;
+    let compiled = load_compiled_schema(provider, cache, key, requested_version_id).await?;
     let details = match compiled.validate(snapshot) {
         Ok(()) => None,
         Err(errors) => {
@@ -814,10 +844,10 @@ async fn validate_planned_row(
     };
 
     if row.schema_key == REGISTERED_SCHEMA_KEY {
-        validate_registered_schema_snapshot(provider, &snapshot).await?;
+        let actual_version_id = planned_row_required_text(row, "version_id")?;
+        validate_registered_schema_snapshot(provider, &snapshot, &actual_version_id).await?;
         let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
         let expected_entity_id = key.entity_id();
-        let actual_version_id = planned_row_required_text(row, "version_id")?;
         let actual_file_id = planned_row_required_text(row, "file_id")?;
         let actual_plugin_key = planned_row_required_text(row, "plugin_key")?;
         let actual_schema_version = planned_row_required_text(row, "schema_version")?;
@@ -828,15 +858,6 @@ async fn validate_planned_row(
                 description: format!(
                     "registered schema entity_id '{}' must match '{}'",
                     row.entity_id, expected_entity_id
-                ),
-            });
-        }
-        if actual_version_id != REGISTERED_SCHEMA_VERSION_ID {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "registered schema version_id '{}' must be '{}'",
-                    actual_version_id, REGISTERED_SCHEMA_VERSION_ID
                 ),
             });
         }
@@ -876,8 +897,16 @@ async fn validate_planned_row(
         planned_row_required_text(row, "schema_version")?,
     );
     validate_checkpoint_label_mutation(&row.schema_key, None, Some(&snapshot))?;
-    validate_snapshot_content(provider, cache, &key, &snapshot).await?;
-    validate_entity_id_matches_primary_key(provider, &key, &row.entity_id, &snapshot).await?;
+    let actual_version_id = planned_row_required_text(row, "version_id")?;
+    validate_snapshot_content(provider, cache, &key, &actual_version_id, &snapshot).await?;
+    validate_entity_id_matches_primary_key(
+        provider,
+        &key,
+        &actual_version_id,
+        &row.entity_id,
+        &snapshot,
+    )
+    .await?;
 
     let _ = operation_kind;
     validate_filesystem_snapshot_integrity(
@@ -942,10 +971,11 @@ fn validate_checkpoint_label_mutation(
 async fn validate_registered_schema_snapshot(
     provider: &mut WriteValidationSchemaLookup<'_>,
     snapshot: &JsonValue,
+    requested_version_id: &str,
 ) -> Result<(), LixError> {
     let schema_value = extract_registered_schema_value(snapshot)?;
     validate_lix_schema_definition(schema_value)?;
-    validate_foreign_key_reference_targets(provider, schema_value).await?;
+    validate_foreign_key_reference_targets(provider, schema_value, requested_version_id).await?;
     Ok(())
 }
 
@@ -1014,7 +1044,7 @@ async fn validate_registered_schema_insert(
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "registered schema insert requires snapshot_content".to_string(),
     })?;
-    validate_registered_schema_snapshot(provider, snapshot).await?;
+    validate_registered_schema_snapshot(provider, snapshot, &row.version_id).await?;
 
     Ok(())
 }
@@ -1022,6 +1052,7 @@ async fn validate_registered_schema_insert(
 async fn validate_foreign_key_reference_targets(
     provider: &mut WriteValidationSchemaLookup<'_>,
     schema: &JsonValue,
+    requested_version_id: &str,
 ) -> Result<(), LixError> {
     let Some(foreign_keys) = schema.get("x-lix-foreign-keys").and_then(|v| v.as_array()) else {
         return Ok(());
@@ -1062,7 +1093,9 @@ async fn validate_foreign_key_reference_targets(
             .map(|value| value.to_string())
             .collect();
 
-        let referenced_schema = provider.load_latest_schema(referenced_key).await?;
+        let referenced_schema = provider
+            .load_latest_schema(referenced_key, requested_version_id)
+            .await?;
         let allowed_keys = collect_unique_key_groups(&referenced_schema);
         if !allowed_keys
             .iter()
@@ -1124,7 +1157,7 @@ async fn validate_row_constraints(
     row: &ConstraintCandidateRow,
 ) -> Result<(), LixError> {
     let key = SchemaKey::new(row.identity.schema_key.clone(), row.schema_version.clone());
-    let schema = provider.load_schema(&key).await?;
+    let schema = provider.load_schema(&key, &row.identity.version_id).await?;
 
     validate_primary_and_unique_constraints(backend, context, row, &schema).await?;
     validate_foreign_key_constraints(backend, context, row, &schema).await?;
@@ -1407,9 +1440,10 @@ async fn validate_delete_constraints(
     context: &mut ConstraintContext,
     deleted_rows: &[ConstraintDeletedRow],
 ) -> Result<(), LixError> {
-    let source_schemas = provider.load_visible_schema_entries().await?;
-
     for deleted_row in deleted_rows {
+        let source_schemas = provider
+            .load_visible_schema_entries(&deleted_row.identity.version_id)
+            .await?;
         validate_delete_constraints_for_row(backend, context, deleted_row, &source_schemas).await?;
     }
 
@@ -1964,12 +1998,13 @@ async fn load_compiled_schema(
     provider: &mut WriteValidationSchemaLookup<'_>,
     cache: &dyn CompiledSchemaCache,
     key: &SchemaKey,
+    requested_version_id: &str,
 ) -> Result<Arc<JSONSchema>, LixError> {
     if let Some(existing) = cache.get_compiled_schema(key) {
         return Ok(existing);
     }
 
-    let schema = provider.load_schema(key).await?;
+    let schema = provider.load_schema(key, requested_version_id).await?;
     let compiled = JSONSchema::compile(&schema).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
@@ -2111,10 +2146,11 @@ fn apply_snapshot_patch(
 async fn validate_entity_id_matches_primary_key(
     provider: &mut WriteValidationSchemaLookup<'_>,
     key: &SchemaKey,
+    requested_version_id: &str,
     entity_id: &str,
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
-    let schema = provider.load_schema(key).await?;
+    let schema = provider.load_schema(key, requested_version_id).await?;
     let Some(primary_key) = schema
         .get("x-lix-primary-key")
         .and_then(JsonValue::as_array)

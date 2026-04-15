@@ -127,6 +127,7 @@ impl Engine {
         let functions = clone_boxed_function_provider(&functions);
         crate::catalog::load_public_surface_registry_with_backend(
             self.backend().as_ref(),
+            None,
             crate::cel::shared_runtime(),
             &functions,
         )

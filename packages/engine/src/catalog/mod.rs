@@ -290,7 +290,7 @@ fn collect_builtin_override_predicates(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support; use lixcol_global for global write scope",
+                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support",
                 schema_key
             ),
         });
@@ -301,9 +301,7 @@ fn collect_builtin_override_predicates(
         "lixcol_entity_id",
         "lixcol_file_id",
         "lixcol_plugin_key",
-        "lixcol_global",
         "lixcol_metadata",
-        "lixcol_untracked",
     ] {
         let Some(raw_value) = overrides.get(key).and_then(JsonValue::as_str) else {
             continue;
@@ -312,9 +310,7 @@ fn collect_builtin_override_predicates(
             "lixcol_entity_id" => Some("entity_id"),
             "lixcol_file_id" => Some("file_id"),
             "lixcol_plugin_key" => Some("plugin_key"),
-            "lixcol_global" => Some("global"),
             "lixcol_metadata" => Some("metadata"),
-            "lixcol_untracked" => Some("untracked"),
             _ => None,
         }) else {
             continue;

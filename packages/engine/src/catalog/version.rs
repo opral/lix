@@ -6,8 +6,9 @@ use std::collections::BTreeMap;
 
 use crate::catalog::{
     CatalogDerivedRow, CatalogProjectionDefinition, CatalogProjectionInput,
-    CatalogProjectionInputSpec, CatalogProjectionLifecycle, CatalogProjectionRegistration,
-    CatalogProjectionSourceRow, CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
+    CatalogProjectionInputSpec, CatalogProjectionInputVersionScope, CatalogProjectionLifecycle,
+    CatalogProjectionRegistration, CatalogProjectionSourceRow, CatalogProjectionSurfaceSpec,
+    SurfaceFamily, SurfaceVariant,
 };
 use crate::{LixError, Value};
 
@@ -29,10 +30,7 @@ impl CatalogProjectionDefinition for LixVersionProjection {
     }
 
     fn inputs(&self) -> Vec<CatalogProjectionInputSpec> {
-        vec![
-            CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
-            CatalogProjectionInputSpec::untracked(VERSION_REF_SCHEMA_KEY),
-        ]
+        vec![version_descriptor_input_spec(), version_ref_input_spec()]
     }
 
     fn surfaces(&self) -> Vec<CatalogProjectionSurfaceSpec> {
@@ -54,9 +52,7 @@ fn derive_lix_version_rows(
     let ref_commit_ids = version_ref_commit_ids(input);
 
     Ok(input
-        .rows_for(&CatalogProjectionInputSpec::tracked(
-            VERSION_DESCRIPTOR_SCHEMA_KEY,
-        ))
+        .rows_for(&version_descriptor_input_spec())
         .unwrap_or(&[])
         .iter()
         .filter(|row| {
@@ -93,9 +89,7 @@ fn derive_lix_version_rows(
 
 fn version_ref_commit_ids(input: &CatalogProjectionInput) -> BTreeMap<String, String> {
     input
-        .rows_for(&CatalogProjectionInputSpec::untracked(
-            VERSION_REF_SCHEMA_KEY,
-        ))
+        .rows_for(&version_ref_input_spec())
         .unwrap_or(&[])
         .iter()
         .filter(|row| {
@@ -104,6 +98,20 @@ fn version_ref_commit_ids(input: &CatalogProjectionInput) -> BTreeMap<String, St
         })
         .map(version_ref_entry)
         .collect()
+}
+
+fn version_descriptor_input_spec() -> CatalogProjectionInputSpec {
+    CatalogProjectionInputSpec::tracked(
+        VERSION_DESCRIPTOR_SCHEMA_KEY,
+        CatalogProjectionInputVersionScope::Global,
+    )
+}
+
+fn version_ref_input_spec() -> CatalogProjectionInputSpec {
+    CatalogProjectionInputSpec::untracked(
+        VERSION_REF_SCHEMA_KEY,
+        CatalogProjectionInputVersionScope::Global,
+    )
 }
 
 fn version_ref_entry(row: &CatalogProjectionSourceRow) -> (String, String) {
@@ -126,13 +134,13 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        LixVersionProjection, VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY,
-        VERSION_SURFACE_NAME,
+        version_descriptor_input_spec, version_ref_input_spec, LixVersionProjection,
+        VERSION_DESCRIPTOR_SCHEMA_KEY, VERSION_REF_SCHEMA_KEY, VERSION_SURFACE_NAME,
     };
     use crate::catalog::{
         CatalogProjectionDefinition, CatalogProjectionInput, CatalogProjectionInputRows,
-        CatalogProjectionInputSpec, CatalogProjectionLifecycle, CatalogProjectionRegistration,
-        CatalogProjectionSourceRow, CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
+        CatalogProjectionLifecycle, CatalogProjectionRegistration, CatalogProjectionSourceRow,
+        CatalogProjectionSurfaceSpec, SurfaceFamily, SurfaceVariant,
     };
     use crate::live_state::RowIdentity;
     use crate::Value;
@@ -141,7 +149,7 @@ mod tests {
     fn derives_descriptor_only_rows_with_empty_commit_id() {
         let projection = LixVersionProjection;
         let input = CatalogProjectionInput::new(vec![CatalogProjectionInputRows::new(
-            CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
+            version_descriptor_input_spec(),
             vec![sample_descriptor_row("main", "Main", true)],
         )]);
 
@@ -174,11 +182,11 @@ mod tests {
         let projection = LixVersionProjection;
         let input = CatalogProjectionInput::new(vec![
             CatalogProjectionInputRows::new(
-                CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
+                version_descriptor_input_spec(),
                 vec![sample_descriptor_row("main", "Main", false)],
             ),
             CatalogProjectionInputRows::new(
-                CatalogProjectionInputSpec::untracked(VERSION_REF_SCHEMA_KEY),
+                version_ref_input_spec(),
                 vec![sample_version_ref_row("main", "commit-123")],
             ),
         ]);
@@ -201,7 +209,7 @@ mod tests {
     fn tombstoned_descriptor_rows_do_not_derive_visible_versions() {
         let projection = LixVersionProjection;
         let input = CatalogProjectionInput::new(vec![CatalogProjectionInputRows::new(
-            CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
+            version_descriptor_input_spec(),
             vec![sample_descriptor_row("main", "Main", false).with_tombstone(true)],
         )]);
 
@@ -216,14 +224,14 @@ mod tests {
         let projection = LixVersionProjection;
         let input = CatalogProjectionInput::new(vec![
             CatalogProjectionInputRows::new(
-                CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
+                version_descriptor_input_spec(),
                 vec![
                     sample_descriptor_row("main", "Main", false),
                     sample_descriptor_row("dev", "Dev", false),
                 ],
             ),
             CatalogProjectionInputRows::new(
-                CatalogProjectionInputSpec::untracked(VERSION_REF_SCHEMA_KEY),
+                version_ref_input_spec(),
                 vec![sample_version_ref_row("main", "commit-main")],
             ),
         ]);
@@ -271,11 +279,11 @@ mod tests {
         );
         let input = CatalogProjectionInput::new(vec![
             CatalogProjectionInputRows::new(
-                CatalogProjectionInputSpec::tracked(VERSION_DESCRIPTOR_SCHEMA_KEY),
+                version_descriptor_input_spec(),
                 vec![sample_descriptor_row("main", "Main", false)],
             ),
             CatalogProjectionInputRows::new(
-                CatalogProjectionInputSpec::untracked(VERSION_REF_SCHEMA_KEY),
+                version_ref_input_spec(),
                 vec![sample_version_ref_row("main", "commit-main")],
             ),
         ]);

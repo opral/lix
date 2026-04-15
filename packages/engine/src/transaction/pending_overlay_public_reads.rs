@@ -57,6 +57,7 @@ impl<'a> PendingOverlayReadModel<'a> {
         if !self.has_pending_visibility() {
             return crate::catalog::load_public_surface_registry_with_backend(
                 self.base,
+                None,
                 crate::cel::shared_runtime(),
                 functions,
             )
