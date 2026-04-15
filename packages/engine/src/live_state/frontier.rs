@@ -54,17 +54,6 @@ pub(crate) async fn load_version_head_commit_id_with_executor(
     Ok(Some(commit_id))
 }
 
-pub(crate) async fn load_all_version_head_commit_ids_with_executor(
-    executor: &mut dyn QueryExecutor,
-) -> Result<Vec<(String, String)>, LixError> {
-    Ok(load_all_version_head_refs_with_executor(executor)
-        .await?
-        .unwrap_or_default()
-        .into_iter()
-        .map(|row| (row.version_id, row.commit_id))
-        .collect())
-}
-
 pub(crate) async fn load_version_head_commit_map_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Option<std::collections::BTreeMap<String, String>>, LixError> {

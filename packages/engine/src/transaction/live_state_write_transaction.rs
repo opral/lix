@@ -94,15 +94,15 @@ mod tests {
 
     use crate::live_state::tracked::{
         BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
-        TrackedWriteOperation, TrackedWriteRow,
     };
     use crate::live_state::untracked::{
-        BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
-        UntrackedWriteRow,
+        BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
     };
     use crate::live_state::RowIdentity;
     use crate::live_state::WriterKeyReadView;
-    use crate::live_state::{TrackedReadView, TrackedTombstoneView, UntrackedReadView};
+    use crate::live_state::{
+        LiveWriteOperation, LiveWriteRow, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
+    };
     use crate::transaction::buffered::prepare_materialization_plan;
 
     use super::*;
@@ -119,6 +119,38 @@ mod tests {
 
     struct EmptyTombstones;
     struct EmptyWriterKeys;
+
+    fn live_write_row(
+        schema_key: &str,
+        entity_id: &str,
+        version_id: &str,
+        change_id: &str,
+        snapshot_content: Option<&str>,
+        untracked: bool,
+        operation: LiveWriteOperation,
+    ) -> LiveWriteRow {
+        LiveWriteRow {
+            entity_id: entity_id.to_string(),
+            schema_key: schema_key.to_string(),
+            schema_version: "1".to_string(),
+            file_id: "lix".to_string(),
+            version_id: version_id.to_string(),
+            global: version_id == "global",
+            untracked,
+            plugin_key: "lix".to_string(),
+            metadata: None,
+            change_id: change_id.to_string(),
+            writer_key: None,
+            snapshot_content: snapshot_content.map(ToString::to_string),
+            created_at: Some("2026-03-24T00:00:00Z".to_string()),
+            updated_at: if matches!(operation, LiveWriteOperation::Tombstone) {
+                "2026-03-24T01:00:00Z".to_string()
+            } else {
+                "2026-03-24T00:00:00Z".to_string()
+            },
+            operation,
+        }
+    }
 
     #[async_trait(?Send)]
     impl TrackedReadView for CountingTrackedView {
@@ -198,55 +230,35 @@ mod tests {
         let mut journal = TransactionJournal::default();
         journal
             .stage(TransactionDelta {
-                tracked_writes: vec![
-                    TrackedWriteRow {
-                        entity_id: "edge-1".to_string(),
-                        schema_key: "lix_commit_edge".to_string(),
-                        schema_version: "1".to_string(),
-                        file_id: "lix".to_string(),
-                        version_id: "main".to_string(),
-                        global: false,
-                        plugin_key: "lix".to_string(),
-                        metadata: None,
-                        change_id: "change-1".to_string(),
-                        writer_key: None,
-                        snapshot_content: Some("{\"child_id\":\"c1\"}".to_string()),
-                        created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                        updated_at: "2026-03-24T00:00:00Z".to_string(),
-                        operation: TrackedWriteOperation::Upsert,
-                    },
-                    TrackedWriteRow {
-                        entity_id: "edge-2".to_string(),
-                        schema_key: "lix_commit_edge".to_string(),
-                        schema_version: "1".to_string(),
-                        file_id: "lix".to_string(),
-                        version_id: "main".to_string(),
-                        global: false,
-                        plugin_key: "lix".to_string(),
-                        metadata: None,
-                        change_id: "change-2".to_string(),
-                        writer_key: None,
-                        snapshot_content: Some("{\"child_id\":\"c2\"}".to_string()),
-                        created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                        updated_at: "2026-03-24T00:00:00Z".to_string(),
-                        operation: TrackedWriteOperation::Upsert,
-                    },
+                writes: vec![
+                    live_write_row(
+                        "lix_commit_edge",
+                        "edge-1",
+                        "main",
+                        "change-1",
+                        Some("{\"child_id\":\"c1\"}"),
+                        false,
+                        LiveWriteOperation::Upsert,
+                    ),
+                    live_write_row(
+                        "lix_commit_edge",
+                        "edge-2",
+                        "main",
+                        "change-2",
+                        Some("{\"child_id\":\"c2\"}"),
+                        false,
+                        LiveWriteOperation::Upsert,
+                    ),
+                    live_write_row(
+                        "lix_version_ref",
+                        "main",
+                        "global",
+                        "change-untracked-1",
+                        Some("{\"commit_id\":\"commit-1\"}"),
+                        true,
+                        LiveWriteOperation::Upsert,
+                    ),
                 ],
-                untracked_writes: vec![UntrackedWriteRow {
-                    entity_id: "main".to_string(),
-                    schema_key: "lix_version_ref".to_string(),
-                    schema_version: "1".to_string(),
-                    file_id: "lix".to_string(),
-                    version_id: "global".to_string(),
-                    global: true,
-                    plugin_key: "lix".to_string(),
-                    metadata: None,
-                    writer_key: None,
-                    snapshot_content: Some("{\"commit_id\":\"commit-1\"}".to_string()),
-                    created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                    updated_at: "2026-03-24T00:00:00Z".to_string(),
-                    operation: UntrackedWriteOperation::Upsert,
-                }],
             })
             .expect("journal stage should succeed");
 
@@ -256,7 +268,14 @@ mod tests {
 
         assert_eq!(tracked.scans.get(), 3);
         assert_eq!(untracked.scans.get(), 3);
-        assert_eq!(plan.units.len(), 2);
+        assert_eq!(
+            plan.writes.iter().filter(|write| !write.untracked).count(),
+            2
+        );
+        assert_eq!(
+            plan.writes.iter().filter(|write| write.untracked).count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -264,44 +283,29 @@ mod tests {
         let mut journal = TransactionJournal::default();
         journal
             .stage(TransactionDelta {
-                tracked_writes: vec![TrackedWriteRow {
-                    entity_id: "row-1".to_string(),
-                    schema_key: "lix_commit_edge".to_string(),
-                    schema_version: "1".to_string(),
-                    file_id: "lix".to_string(),
-                    version_id: "main".to_string(),
-                    global: false,
-                    plugin_key: "lix".to_string(),
-                    metadata: None,
-                    change_id: "change-1".to_string(),
-                    writer_key: None,
-                    snapshot_content: Some("{\"child_id\":\"c1\"}".to_string()),
-                    created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                    updated_at: "2026-03-24T00:00:00Z".to_string(),
-                    operation: TrackedWriteOperation::Upsert,
-                }],
-                untracked_writes: Vec::new(),
+                writes: vec![live_write_row(
+                    "lix_commit_edge",
+                    "row-1",
+                    "main",
+                    "change-1",
+                    Some("{\"child_id\":\"c1\"}"),
+                    false,
+                    LiveWriteOperation::Upsert,
+                )],
             })
             .expect("first stage should succeed");
 
         let error = journal
             .stage(TransactionDelta {
-                tracked_writes: Vec::new(),
-                untracked_writes: vec![UntrackedWriteRow {
-                    entity_id: "row-1".to_string(),
-                    schema_key: "lix_commit_edge".to_string(),
-                    schema_version: "1".to_string(),
-                    file_id: "lix".to_string(),
-                    version_id: "main".to_string(),
-                    global: false,
-                    plugin_key: "lix".to_string(),
-                    metadata: None,
-                    writer_key: None,
-                    snapshot_content: Some("{}".to_string()),
-                    created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                    updated_at: "2026-03-24T00:00:00Z".to_string(),
-                    operation: UntrackedWriteOperation::Upsert,
-                }],
+                writes: vec![live_write_row(
+                    "lix_commit_edge",
+                    "row-1",
+                    "main",
+                    "change-untracked-conflict",
+                    Some("{}"),
+                    true,
+                    LiveWriteOperation::Upsert,
+                )],
             })
             .expect_err("cross-storage conflict should be rejected");
 
@@ -315,49 +319,34 @@ mod tests {
         let mut journal = TransactionJournal::default();
         journal
             .stage(TransactionDelta {
-                tracked_writes: vec![
-                    TrackedWriteRow {
-                        entity_id: "edge-1".to_string(),
-                        schema_key: "lix_commit_edge".to_string(),
-                        schema_version: "1".to_string(),
-                        file_id: "lix".to_string(),
-                        version_id: "main".to_string(),
-                        global: false,
-                        plugin_key: "lix".to_string(),
-                        metadata: None,
-                        change_id: "change-1".to_string(),
-                        writer_key: None,
-                        snapshot_content: Some("{\"child_id\":\"c1\"}".to_string()),
-                        created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                        updated_at: "2026-03-24T00:00:00Z".to_string(),
-                        operation: TrackedWriteOperation::Upsert,
-                    },
-                    TrackedWriteRow {
-                        entity_id: "edge-1".to_string(),
-                        schema_key: "lix_commit_edge".to_string(),
-                        schema_version: "1".to_string(),
-                        file_id: "lix".to_string(),
-                        version_id: "main".to_string(),
-                        global: false,
-                        plugin_key: "lix".to_string(),
-                        metadata: None,
-                        change_id: "change-2".to_string(),
-                        writer_key: None,
-                        snapshot_content: None,
-                        created_at: Some("2026-03-24T00:00:00Z".to_string()),
-                        updated_at: "2026-03-24T01:00:00Z".to_string(),
-                        operation: TrackedWriteOperation::Tombstone,
-                    },
+                writes: vec![
+                    live_write_row(
+                        "lix_commit_edge",
+                        "edge-1",
+                        "main",
+                        "change-1",
+                        Some("{\"child_id\":\"c1\"}"),
+                        false,
+                        LiveWriteOperation::Upsert,
+                    ),
+                    live_write_row(
+                        "lix_commit_edge",
+                        "edge-1",
+                        "main",
+                        "change-2",
+                        None,
+                        false,
+                        LiveWriteOperation::Tombstone,
+                    ),
                 ],
-                untracked_writes: Vec::new(),
             })
             .expect("journal stage should succeed");
 
         let aggregated = journal.aggregated_delta();
-        assert_eq!(aggregated.tracked_writes.len(), 1);
+        assert_eq!(aggregated.writes.len(), 1);
         assert_eq!(
-            aggregated.tracked_writes[0].operation,
-            TrackedWriteOperation::Tombstone
+            aggregated.writes[0].operation,
+            LiveWriteOperation::Tombstone
         );
     }
 }

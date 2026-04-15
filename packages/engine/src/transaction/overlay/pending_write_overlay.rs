@@ -6,9 +6,7 @@ use crate::transaction::buffered::{
     PendingWriterKeyOverlay,
 };
 
-use super::{
-    PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
-};
+use super::{PendingFilesystemFileView, PendingOverlay, PendingSemanticRow};
 
 #[derive(Clone, Default)]
 pub(crate) struct PendingWriteOverlay {
@@ -76,30 +74,22 @@ impl PendingOverlay for PendingWriteOverlay {
             .unwrap_or_default()
     }
 
-    fn visible_semantic_rows(
-        &self,
-        storage: PendingSemanticStorage,
-        schema_key: &str,
-    ) -> Vec<PendingSemanticRow> {
+    fn visible_semantic_rows(&self, untracked: bool, schema_key: &str) -> Vec<PendingSemanticRow> {
         self.semantic_overlay()
             .map(|overlay| {
                 overlay
-                    .visible_rows(storage, schema_key)
+                    .visible_rows(untracked, schema_key)
                     .cloned()
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default()
     }
 
-    fn visible_directory_rows(
-        &self,
-        storage: PendingSemanticStorage,
-        schema_key: &str,
-    ) -> Vec<PendingSemanticRow> {
+    fn visible_directory_rows(&self, untracked: bool, schema_key: &str) -> Vec<PendingSemanticRow> {
         self.filesystem_overlay()
             .map(|overlay| {
                 overlay
-                    .visible_directory_rows(storage, schema_key)
+                    .visible_directory_rows(untracked, schema_key)
                     .cloned()
                     .collect::<Vec<_>>()
             })
@@ -141,12 +131,12 @@ impl SqlPreparationPendingOverlay for PendingWriteOverlay {
         &self,
         storage: SqlPreparationPendingStorage,
     ) -> Vec<SqlPreparationPendingRow> {
-        let storage = match storage {
-            SqlPreparationPendingStorage::Tracked => PendingSemanticStorage::Tracked,
-            SqlPreparationPendingStorage::Untracked => PendingSemanticStorage::Untracked,
+        let untracked = match storage {
+            SqlPreparationPendingStorage::Tracked => false,
+            SqlPreparationPendingStorage::Untracked => true,
         };
 
-        PendingOverlay::visible_semantic_rows(self, storage, "lix_registered_schema")
+        PendingOverlay::visible_semantic_rows(self, untracked, "lix_registered_schema")
             .into_iter()
             .map(|row| SqlPreparationPendingRow {
                 snapshot_content: row.snapshot_content,

@@ -1,9 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::live_state::{
-    values_from_snapshot_content, RowIdentity, TrackedRow, TrackedTombstoneMarker,
-    TrackedWriteOperation, TrackedWriteRow, UntrackedRow, UntrackedWriteOperation,
-    UntrackedWriteRow,
+    values_from_snapshot_content, LiveWriteOperation, LiveWriteRow, RowIdentity, TrackedRow,
+    TrackedTombstoneMarker, UntrackedRow,
 };
 use crate::transaction::TransactionDelta;
 use crate::LixError;
@@ -24,11 +23,8 @@ pub(crate) struct PendingRowOverlay {
 impl PendingRowOverlay {
     pub(crate) fn from_delta(delta: &TransactionDelta) -> Result<Self, LixError> {
         let mut participants = Self::default();
-        for row in &delta.tracked_writes {
-            participants.apply_tracked_write(row)?;
-        }
-        for row in &delta.untracked_writes {
-            participants.apply_untracked_write(row)?;
+        for row in &delta.writes {
+            participants.apply_write(row)?;
         }
         Ok(participants)
     }
@@ -88,41 +84,57 @@ impl PendingRowOverlay {
         !self.tracked_tombstones.is_empty()
     }
 
-    fn apply_tracked_write(&mut self, row: &TrackedWriteRow) -> Result<(), LixError> {
-        let identity = RowIdentity::from_tracked_write(row);
-        match row.operation {
-            TrackedWriteOperation::Upsert => {
-                self.tracked_tombstones.remove(&identity);
-                self.tracked_rows
-                    .insert(identity, tracked_row_from_write(row)?);
+    fn apply_write(&mut self, row: &LiveWriteRow) -> Result<(), LixError> {
+        let identity = RowIdentity::from_live_write(row);
+        if row.untracked {
+            match row.operation {
+                LiveWriteOperation::Upsert => {
+                    self.untracked_deletes.remove(&identity);
+                    self.untracked_rows
+                        .insert(identity, untracked_row_from_write(row)?);
+                }
+                LiveWriteOperation::Delete => {
+                    self.untracked_rows.remove(&identity);
+                    self.untracked_deletes.insert(identity);
+                }
+                LiveWriteOperation::Tombstone => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "pending row overlay cannot apply untracked tombstone for '{}' '{}'",
+                            row.schema_key, row.entity_id
+                        ),
+                    ));
+                }
             }
-            TrackedWriteOperation::Tombstone => {
-                self.tracked_rows.remove(&identity);
-                self.tracked_tombstones
-                    .insert(identity, tracked_tombstone_from_write(row));
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_untracked_write(&mut self, row: &UntrackedWriteRow) -> Result<(), LixError> {
-        let identity = RowIdentity::from_untracked_write(row);
-        match row.operation {
-            UntrackedWriteOperation::Upsert => {
-                self.untracked_deletes.remove(&identity);
-                self.untracked_rows
-                    .insert(identity, untracked_row_from_write(row)?);
-            }
-            UntrackedWriteOperation::Delete => {
-                self.untracked_rows.remove(&identity);
-                self.untracked_deletes.insert(identity);
+        } else {
+            match row.operation {
+                LiveWriteOperation::Upsert => {
+                    self.tracked_tombstones.remove(&identity);
+                    self.tracked_rows
+                        .insert(identity, tracked_row_from_write(row)?);
+                }
+                LiveWriteOperation::Tombstone => {
+                    self.tracked_rows.remove(&identity);
+                    self.tracked_tombstones
+                        .insert(identity, tracked_tombstone_from_write(row));
+                }
+                LiveWriteOperation::Delete => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "pending row overlay cannot apply tracked delete for '{}' '{}'",
+                            row.schema_key, row.entity_id
+                        ),
+                    ));
+                }
             }
         }
         Ok(())
     }
 }
 
-fn tracked_row_from_write(row: &TrackedWriteRow) -> Result<TrackedRow, LixError> {
+fn tracked_row_from_write(row: &LiveWriteRow) -> Result<TrackedRow, LixError> {
     Ok(TrackedRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -143,7 +155,7 @@ fn tracked_row_from_write(row: &TrackedWriteRow) -> Result<TrackedRow, LixError>
     })
 }
 
-fn tracked_tombstone_from_write(row: &TrackedWriteRow) -> TrackedTombstoneMarker {
+fn tracked_tombstone_from_write(row: &LiveWriteRow) -> TrackedTombstoneMarker {
     TrackedTombstoneMarker {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -160,7 +172,7 @@ fn tracked_tombstone_from_write(row: &TrackedWriteRow) -> TrackedTombstoneMarker
     }
 }
 
-fn untracked_row_from_write(row: &UntrackedWriteRow) -> Result<UntrackedRow, LixError> {
+fn untracked_row_from_write(row: &LiveWriteRow) -> Result<UntrackedRow, LixError> {
     Ok(UntrackedRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -170,6 +182,7 @@ fn untracked_row_from_write(row: &UntrackedWriteRow) -> Result<UntrackedRow, Lix
         global: row.global,
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
+        change_id: row.change_id.clone(),
         writer_key: row.writer_key.clone(),
         created_at: row
             .created_at

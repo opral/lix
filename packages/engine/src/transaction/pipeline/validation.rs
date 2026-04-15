@@ -165,11 +165,8 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             self.remember_pending_schema_from_snapshot(&snapshot)?;
         }
 
-        for storage in [
-            crate::transaction::overlay::PendingSemanticStorage::Tracked,
-            crate::transaction::overlay::PendingSemanticStorage::Untracked,
-        ] {
-            for row in pending_overlay.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+        for untracked in [false, true] {
+            for row in pending_overlay.visible_semantic_rows(untracked, REGISTERED_SCHEMA_KEY) {
                 let Some(snapshot_content) = row.snapshot_content else {
                     continue;
                 };

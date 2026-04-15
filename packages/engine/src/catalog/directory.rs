@@ -153,14 +153,10 @@ fn derive_directory_rows_for_versions(
                 continue;
             };
             let hidden = bool_value(descriptor.values().get("hidden")).unwrap_or(false);
-            let commit_id = if descriptor.storage() == CatalogProjectionStorageKind::Untracked {
-                Some("untracked".to_string())
-            } else {
-                descriptor
-                    .change_id()
-                    .and_then(|change_id| input.context().commit_id_for_change(change_id))
-                    .map(str::to_string)
-            };
+            let commit_id = descriptor
+                .change_id()
+                .and_then(|change_id| input.context().commit_id_for_change(change_id))
+                .map(str::to_string);
             rows.push(DerivedDirectoryRow {
                 identity: descriptor.identity().clone(),
                 version_id: version_id.clone(),
@@ -324,10 +320,7 @@ fn directory_row_to_surface(
     active_commit_id: Option<&str>,
 ) -> CatalogDerivedRow {
     let identity = row.identity.clone();
-    let commit_id = active_commit_id
-        .map(str::to_string)
-        .or(row.commit_id)
-        .unwrap_or_default();
+    let commit_id = active_commit_id.map(str::to_string).or(row.commit_id);
     CatalogDerivedRow::new(
         surface_name,
         BTreeMap::from([
@@ -365,7 +358,10 @@ fn directory_row_to_surface(
                 "lixcol_updated_at".to_string(),
                 row.updated_at.map(Value::Text).unwrap_or(Value::Null),
             ),
-            ("lixcol_commit_id".to_string(), Value::Text(commit_id)),
+            (
+                "lixcol_commit_id".to_string(),
+                commit_id.map(Value::Text).unwrap_or(Value::Null),
+            ),
             (
                 "lixcol_untracked".to_string(),
                 Value::Boolean(row.untracked),
@@ -520,13 +516,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn by_version_directory_projection_leaves_untracked_commit_id_null() {
+        let projection = LixDirectoryByVersionProjection;
+        let input = CatalogProjectionInput::with_context(
+            vec![
+                CatalogProjectionInputRows::new(
+                    local_frontier_tracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    local_frontier_untracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![sample_row_with_storage(
+                        CatalogProjectionStorageKind::Untracked,
+                        "main",
+                        "dir-untracked",
+                        BTreeMap::from([
+                            ("id".to_string(), Value::Text("dir-untracked".to_string())),
+                            ("parent_id".to_string(), Value::Null),
+                            ("name".to_string(), Value::Text("scratch".to_string())),
+                            ("hidden".to_string(), Value::Boolean(false)),
+                        ]),
+                    )
+                    .with_live_metadata(
+                        "1",
+                        "lix",
+                        None,
+                        Some("change-untracked-dir".to_string()),
+                        None,
+                        false,
+                        Some("2026-04-10T00:00:00Z".to_string()),
+                        Some("2026-04-10T00:00:00Z".to_string()),
+                    )],
+                ),
+                CatalogProjectionInputRows::new(
+                    global_tracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    global_untracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+            ],
+            CatalogProjectionContext {
+                requested_version_id: None,
+                current_committed_version_ids: vec!["main".to_string()],
+                current_version_heads: BTreeMap::new(),
+                change_commit_ids: BTreeMap::new(),
+                blob_data_by_hash: BTreeMap::new(),
+            },
+        );
+
+        let derived = projection.derive(&input).expect("derive should succeed");
+
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            derived[0].values.get("lixcol_commit_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            derived[0].values.get("lixcol_untracked"),
+            Some(&Value::Boolean(true))
+        );
+    }
+
     fn sample_row(
         version_id: &str,
         entity_id: &str,
         values: BTreeMap<String, Value>,
     ) -> CatalogProjectionSourceRow {
-        CatalogProjectionSourceRow::new(
+        sample_row_with_storage(
             CatalogProjectionStorageKind::Tracked,
+            version_id,
+            entity_id,
+            values,
+        )
+    }
+
+    fn sample_row_with_storage(
+        storage: CatalogProjectionStorageKind,
+        version_id: &str,
+        entity_id: &str,
+        values: BTreeMap<String, Value>,
+    ) -> CatalogProjectionSourceRow {
+        CatalogProjectionSourceRow::new(
+            storage,
             RowIdentity {
                 schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 version_id: version_id.to_string(),

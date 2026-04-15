@@ -116,7 +116,7 @@ impl From<UntrackedRow> for LiveReadRow {
             plugin_key: row.plugin_key,
             metadata: row.metadata,
             writer_key: row.writer_key,
-            change_id: None,
+            change_id: Some(row.change_id),
             values: row.values,
         }
     }

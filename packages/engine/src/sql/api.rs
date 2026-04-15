@@ -30,7 +30,7 @@ pub(crate) use super::logical_plan::public_ir::{
 };
 #[cfg(test)]
 pub(crate) use super::optimizer::optimize_state_resolution;
-pub(crate) use super::parser::{parse_sql, parse_sql_statements, parse_sql_with_timing};
+pub(crate) use super::parser::{parse_sql_statements, parse_sql_with_timing};
 pub(crate) use super::physical_plan::{PublicWriteExecutionPartition, PublicWritePhysicalPlan};
 #[cfg(test)]
 pub(crate) use super::prepare::execution_program::{StatementTemplate, StatementTemplateCacheKey};

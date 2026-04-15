@@ -1,67 +1,29 @@
 use std::collections::BTreeMap;
 
-use crate::live_state::RowIdentity;
-use crate::live_state::{TrackedWriteRow, UntrackedWriteRow};
+use crate::live_state::{LiveWriteRow, RowIdentity};
 use crate::transaction::overlay::PendingRowOverlay;
 use crate::transaction::TransactionDelta;
 use crate::LixError;
 
-#[derive(Debug, Clone)]
-pub(crate) enum WriteUnit {
-    ApplyTracked { writes: Vec<TrackedWriteRow> },
-    ApplyUntracked { writes: Vec<UntrackedWriteRow> },
-}
-
 #[derive(Debug, Clone, Default)]
 pub(crate) struct WritePlan {
-    pub(crate) units: Vec<WriteUnit>,
+    pub(crate) writes: Vec<LiveWriteRow>,
 }
 
 impl WritePlan {
     pub(crate) fn from_public_delta(delta: &TransactionDelta) -> Self {
-        let mut units = Vec::new();
-        if !delta.tracked_writes.is_empty() {
-            units.push(WriteUnit::ApplyTracked {
-                writes: delta.tracked_writes.clone(),
-            });
+        Self {
+            writes: delta.writes.clone(),
         }
-        if !delta.untracked_writes.is_empty() {
-            units.push(WriteUnit::ApplyUntracked {
-                writes: delta.untracked_writes.clone(),
-            });
-        }
-        Self { units }
     }
 
     pub(crate) fn extend(&mut self, other: WritePlan) {
-        self.units.extend(other.units);
-        self.coalesce_units();
+        self.writes.extend(other.writes);
+        self.coalesce_writes();
     }
 
-    fn coalesce_units(&mut self) {
-        let mut coalesced = Vec::with_capacity(self.units.len());
-        for unit in std::mem::take(&mut self.units) {
-            match unit {
-                WriteUnit::ApplyTracked { writes } => {
-                    if let Some(WriteUnit::ApplyTracked { writes: current }) = coalesced.last_mut()
-                    {
-                        current.extend(writes);
-                    } else {
-                        coalesced.push(WriteUnit::ApplyTracked { writes });
-                    }
-                }
-                WriteUnit::ApplyUntracked { writes } => {
-                    if let Some(WriteUnit::ApplyUntracked { writes: current }) =
-                        coalesced.last_mut()
-                    {
-                        current.extend(writes);
-                    } else {
-                        coalesced.push(WriteUnit::ApplyUntracked { writes });
-                    }
-                }
-            }
-        }
-        self.units = coalesced;
+    fn coalesce_writes(&mut self) {
+        self.writes = coalesce_by_identity(std::mem::take(&mut self.writes));
     }
 }
 
@@ -176,29 +138,32 @@ impl WriteJournal {
 
 fn merge_public_deltas(current: TransactionDelta, incoming: TransactionDelta) -> TransactionDelta {
     let mut merged = current;
-    merged.tracked_writes.extend(incoming.tracked_writes);
-    merged.untracked_writes.extend(incoming.untracked_writes);
+    merged.writes.extend(incoming.writes);
     merged
 }
 
 fn coalesce_public_delta(delta: TransactionDelta) -> TransactionDelta {
     TransactionDelta {
-        tracked_writes: coalesce_by_identity(delta.tracked_writes, RowIdentity::from_tracked_write),
-        untracked_writes: coalesce_by_identity(
-            delta.untracked_writes,
-            RowIdentity::from_untracked_write,
-        ),
+        writes: coalesce_by_identity(delta.writes),
     }
 }
 
-fn coalesce_by_identity<T, F>(writes: Vec<T>, identity: F) -> Vec<T>
-where
-    T: Clone,
-    F: Fn(&T) -> RowIdentity,
-{
-    let mut latest = BTreeMap::<RowIdentity, T>::new();
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct WriteIdentity {
+    row: RowIdentity,
+    untracked: bool,
+}
+
+fn coalesce_by_identity(writes: Vec<LiveWriteRow>) -> Vec<LiveWriteRow> {
+    let mut latest = BTreeMap::<WriteIdentity, LiveWriteRow>::new();
     for write in writes {
-        latest.insert(identity(&write), write);
+        latest.insert(
+            WriteIdentity {
+                row: RowIdentity::from_live_write(&write),
+                untracked: write.untracked,
+            },
+            write,
+        );
     }
     latest.into_values().collect()
 }

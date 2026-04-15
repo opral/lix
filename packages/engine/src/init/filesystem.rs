@@ -1,3 +1,4 @@
+use crate::live_state::tracked_relation_name;
 use crate::LixError;
 use crate::Value;
 
@@ -40,44 +41,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         parent_id: Option<&str>,
     ) -> Result<String, LixError> {
         let name = system_directory_name(path);
-        let existing = match parent_id {
-            Some(parent_id) => {
-                self.execute_internal(
-                    "SELECT id \
-                     FROM lix_directory_by_version \
-                     WHERE lixcol_version_id = 'global' \
-                       AND name = $1 \
-                       AND parent_id = $2 \
-                     LIMIT 1",
-                    &[
-                        Value::Text(name.clone()),
-                        Value::Text(parent_id.to_string()),
-                    ],
-                )
-                .await?
-            }
-            None => {
-                self.execute_internal(
-                    "SELECT id \
-                     FROM lix_directory_by_version \
-                     WHERE lixcol_version_id = 'global' \
-                       AND name = $1 \
-                       AND parent_id IS NULL \
-                     LIMIT 1",
-                    &[Value::Text(name.clone())],
-                )
-                .await?
-            }
-        };
-        let [statement] = existing.statements.as_slice() else {
-            return Err(crate::common::unexpected_statement_count_error(
-                "system directory existence query",
-                1,
-                existing.statements.len(),
-            ));
-        };
-        if let Some(row) = statement.rows.first() {
-            return text_value(row.first(), "system directory entity_id");
+        if let Some(entity_id) = self
+            .load_seeded_system_directory_id(&name, parent_id)
+            .await?
+        {
+            return Ok(entity_id);
         }
 
         let entity_id = self.generate_runtime_uuid().await?;
@@ -102,5 +70,61 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
 
         Ok(entity_id)
+    }
+
+    async fn load_seeded_system_directory_id(
+        &mut self,
+        name: &str,
+        parent_id: Option<&str>,
+    ) -> Result<Option<String>, LixError> {
+        let directory_table = tracked_relation_name("lix_directory_descriptor");
+        let existing = match parent_id {
+            Some(parent_id) => {
+                self.execute_backend(
+                    &format!(
+                        "SELECT entity_id \
+                         FROM {directory_table} \
+                         WHERE schema_key = 'lix_directory_descriptor' \
+                           AND file_id = 'lix' \
+                           AND version_id = 'global' \
+                           AND untracked = false \
+                           AND is_tombstone = 0 \
+                           AND name = $1 \
+                           AND parent_id = $2 \
+                         ORDER BY updated_at DESC, created_at DESC, entity_id DESC \
+                         LIMIT 1"
+                    ),
+                    &[
+                        Value::Text(name.to_string()),
+                        Value::Text(parent_id.to_string()),
+                    ],
+                )
+                .await?
+            }
+            None => {
+                self.execute_backend(
+                    &format!(
+                        "SELECT entity_id \
+                         FROM {directory_table} \
+                         WHERE schema_key = 'lix_directory_descriptor' \
+                           AND file_id = 'lix' \
+                           AND version_id = 'global' \
+                           AND untracked = false \
+                           AND is_tombstone = 0 \
+                           AND name = $1 \
+                           AND parent_id IS NULL \
+                         ORDER BY updated_at DESC, created_at DESC, entity_id DESC \
+                         LIMIT 1"
+                    ),
+                    &[Value::Text(name.to_string())],
+                )
+                .await?
+            }
+        };
+        Ok(existing
+            .rows
+            .first()
+            .map(|row| text_value(row.first(), "system directory entity_id"))
+            .transpose()?)
     }
 }

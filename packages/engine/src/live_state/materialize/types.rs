@@ -48,6 +48,7 @@ pub struct LiveStateWrite {
     pub file_id: FileId,
     pub version_id: VersionId,
     pub global: bool,
+    pub untracked: bool,
     pub op: LiveStateWriteOp,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,

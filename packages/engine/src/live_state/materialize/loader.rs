@@ -16,6 +16,7 @@ pub(crate) struct ChangeRecord {
     pub plugin_key: String,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
+    pub untracked: bool,
     pub created_at: String,
     pub replay_cursor: ReplayCursor,
 }
@@ -51,7 +52,7 @@ pub(crate) struct LoadedData {
 pub(crate) async fn load_data_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<LoadedData, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.untracked, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
     let result = executor.execute(sql, &[]).await?;
@@ -77,7 +78,8 @@ pub(crate) async fn load_data_with_executor(
             .as_ref()
             .map(|s| CanonicalJson::from_text(s))
             .transpose()?;
-        let created_at = text_required(&row, 8, "created_at")?;
+        let untracked = bool_required(&row, 8, "untracked")?;
+        let created_at = text_required(&row, 9, "created_at")?;
         let replay_cursor = ReplayCursor::new(id.clone(), created_at.clone());
 
         let change = ChangeRecord {
@@ -89,6 +91,7 @@ pub(crate) async fn load_data_with_executor(
             plugin_key: plugin_key.clone(),
             snapshot_content: snapshot_content.clone(),
             metadata: metadata.clone(),
+            untracked,
             created_at: created_at.clone(),
             replay_cursor: replay_cursor.clone(),
         };
@@ -113,6 +116,9 @@ pub(crate) async fn load_data_with_executor(
         }
 
         if schema_key == "lix_version_ref" {
+            if untracked {
+                continue;
+            }
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!(
@@ -257,6 +263,25 @@ fn text_optional(row: &[Value], index: usize, label: &str) -> Result<Option<Stri
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
                 "materialization: expected nullable text for column '{label}' at index {index}"
+            ),
+        }),
+    }
+}
+
+fn bool_required(row: &[Value], index: usize, label: &str) -> Result<bool, LixError> {
+    let Some(value) = row.get(index) else {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("materialization: missing column '{label}' at index {index}"),
+        });
+    };
+    match value {
+        Value::Boolean(value) => Ok(*value),
+        Value::Integer(value) => Ok(*value != 0),
+        _ => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "materialization: expected boolean-compatible value for column '{label}' at index {index}"
             ),
         }),
     }

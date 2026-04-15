@@ -5,9 +5,7 @@ use crate::functions::{
     DynFunctionProvider, FunctionBindings, LixFunctionProvider, SharedFunctionProvider,
 };
 #[cfg(test)]
-use crate::live_state::{
-    TrackedWriteOperation, TrackedWriteRow, UntrackedWriteOperation, UntrackedWriteRow,
-};
+use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::schema::CompiledSchemaCache;
 use crate::sql::{PreparedPublicRead, PublicChange, SessionStateDelta, SqlCompilerSeed};
 use crate::transaction::overlay::PendingOverlay;
@@ -18,7 +16,7 @@ use crate::{LixBackend, LixBackendTransaction, QueryResult};
 #[cfg(not(test))]
 use crate::transaction::buffered::TrackedTxnUnit;
 #[cfg(test)]
-use crate::transaction::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal};
+use crate::transaction::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal, WritePlan};
 use crate::transaction::filesystem::runtime::BinaryBlobWrite;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
@@ -131,9 +129,7 @@ impl BufferedWriteExecutionInput {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct TransactionDelta {
     #[serde(default)]
-    pub tracked_writes: Vec<TrackedWriteRow>,
-    #[serde(default)]
-    pub untracked_writes: Vec<UntrackedWriteRow>,
+    pub writes: Vec<LiveWriteRow>,
 }
 
 #[cfg(test)]
@@ -156,7 +152,7 @@ impl std::fmt::Debug for TransactionJournal {
 #[cfg(test)]
 impl TransactionJournal {
     pub fn stage(&mut self, delta: TransactionDelta) -> Result<(), LixError> {
-        if delta.tracked_writes.is_empty() && delta.untracked_writes.is_empty() {
+        if delta.writes.is_empty() {
             return Ok(());
         }
         self.inner
@@ -198,23 +194,14 @@ impl CommitOutcome {
         self.untracked_deletes += other.untracked_deletes;
     }
 
-    pub(crate) fn from_tracked_writes(writes: &[TrackedWriteRow]) -> Self {
+    pub(crate) fn from_write_plan(plan: &WritePlan) -> Self {
         let mut outcome = Self::default();
-        for write in writes {
+        for write in &plan.writes {
             match write.operation {
-                TrackedWriteOperation::Upsert => outcome.tracked_upserts += 1,
-                TrackedWriteOperation::Tombstone => outcome.tracked_tombstones += 1,
-            }
-        }
-        outcome
-    }
-
-    pub(crate) fn from_untracked_writes(writes: &[UntrackedWriteRow]) -> Self {
-        let mut outcome = Self::default();
-        for write in writes {
-            match write.operation {
-                UntrackedWriteOperation::Upsert => outcome.untracked_upserts += 1,
-                UntrackedWriteOperation::Delete => outcome.untracked_deletes += 1,
+                LiveWriteOperation::Upsert if write.untracked => outcome.untracked_upserts += 1,
+                LiveWriteOperation::Upsert => outcome.tracked_upserts += 1,
+                LiveWriteOperation::Tombstone => outcome.tracked_tombstones += 1,
+                LiveWriteOperation::Delete => outcome.untracked_deletes += 1,
             }
         }
         outcome

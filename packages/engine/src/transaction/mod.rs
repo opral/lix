@@ -32,13 +32,12 @@ pub(crate) use backend::{
     normalize_sql_error_with_transaction_and_relation_names, TransactionExecutionBackend,
 };
 pub(crate) use buffered::{
-    apply_schema_registrations_in_transaction, BufferedWriteCommandMetadata,
-    BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit, TrackedTxnUnit, TransactionWriteDelta,
+    apply_schema_registrations_in_transaction, upsert_registered_schema_mirror_row_in_transaction,
+    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteFlushClass,
+    BufferedWriteSessionEffects, PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit,
+    RegisteredSchemaMirrorRow, TrackedTxnUnit, TransactionWriteDelta,
 };
-pub(crate) use buffered_write_transaction::{
-    BorrowedBufferedWriteTransaction, BufferedWriteTransaction,
-};
+pub(crate) use buffered_write_transaction::BufferedWriteTransaction;
 pub(crate) use commit_artifacts::{PendingCommitLane, PendingCommitState};
 pub(crate) use compiler_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
@@ -50,9 +49,8 @@ pub(crate) use contracts::{
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
 pub(crate) use deterministic_sequence::{
-    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
     deterministic_sequence_key, ensure_runtime_sequence_initialized_in_transaction,
-    persist_runtime_sequence_in_transaction,
+    persist_runtime_sequence_highest_seen_in_transaction, persist_runtime_sequence_in_transaction,
 };
 pub(crate) use filesystem::payload_change::FilesystemPayloadChange;
 #[cfg(test)]
@@ -72,8 +70,7 @@ pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
 pub(crate) use live_state_write_transaction::LiveStateWriteTransaction;
 pub(crate) use observe_tick::append_observe_tick_in_transaction;
 pub(crate) use overlay::{
-    PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
-    PendingWriteOverlay,
+    PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingWriteOverlay,
 };
 #[cfg(test)]
 pub(crate) use overlay_read_context::OverlayReadContext;
@@ -85,11 +82,10 @@ pub(crate) use pipeline::resolution::prepared_artifacts::SchemaProof;
 #[cfg(test)]
 pub(crate) use pipeline::resolution::resolve_write_plan_with_functions;
 pub(crate) use pipeline::{
-    ensure_function_bindings_for_write_scope,
-    execute_parsed_statements_in_borrowed_write_transaction,
-    execute_parsed_statements_in_write_transaction, execute_statement_batch_with_write_transaction,
-    prepared_write_function_bindings_for_execution, validate_commit_time_write,
-    TransactionWriteSelectorResolver, WriteResolveError, WriteSelectorResolver,
+    ensure_function_bindings_for_write_scope, execute_parsed_statements_in_write_transaction,
+    execute_statement_batch_with_write_transaction, prepared_write_function_bindings_for_execution,
+    validate_commit_time_write, TransactionWriteSelectorResolver, WriteResolveError,
+    WriteSelectorResolver,
 };
 pub(crate) use prepared_artifacts::{
     PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,

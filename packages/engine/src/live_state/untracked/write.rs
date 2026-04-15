@@ -3,25 +3,38 @@ use crate::live_state::storage::{
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
     quoted_live_table_name,
 };
+use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::{LixBackendTransaction, LixError};
-
-use super::contracts::{UntrackedWriteOperation, UntrackedWriteRow};
 
 pub(crate) async fn apply_write_batch_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    batch: &[UntrackedWriteRow],
+    batch: &[LiveWriteRow],
 ) -> Result<(), LixError> {
     if batch.is_empty() {
         return Ok(());
     }
 
     for row in batch {
+        if !row.untracked {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "untracked live-state writer received tracked row '{}' '{}'",
+                    row.schema_key, row.entity_id
+                ),
+            ));
+        }
         match row.operation {
-            UntrackedWriteOperation::Upsert => {
-                apply_upsert_in_transaction(transaction, row).await?
-            }
-            UntrackedWriteOperation::Delete => {
-                apply_delete_in_transaction(transaction, row).await?
+            LiveWriteOperation::Upsert => apply_upsert_in_transaction(transaction, row).await?,
+            LiveWriteOperation::Delete => apply_delete_in_transaction(transaction, row).await?,
+            LiveWriteOperation::Tombstone => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "untracked live-state writer cannot apply tombstone for '{}' '{}'",
+                        row.schema_key, row.entity_id
+                    ),
+                ));
             }
         }
     }
@@ -31,7 +44,7 @@ pub(crate) async fn apply_write_batch_in_transaction(
 
 async fn apply_upsert_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    row: &UntrackedWriteRow,
+    row: &LiveWriteRow,
 ) -> Result<(), LixError> {
     let layout = {
         let mut executor = &mut *transaction;
@@ -50,16 +63,18 @@ async fn apply_upsert_in_transaction(
         .as_deref()
         .map(crate::live_state::constraints::sql_literal_text)
         .unwrap_or_else(|| "NULL".to_string());
+    let change_id_sql = crate::live_state::constraints::sql_literal_text(&row.change_id);
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, untracked, created_at, updated_at{normalized_columns}\
+         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, untracked, created_at, updated_at{normalized_columns}\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {metadata}, true, '{created_at}', '{updated_at}'{normalized_values}\
+         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {change_id}, {metadata}, true, '{created_at}', '{updated_at}'{normalized_values}\
          ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
          schema_key = excluded.schema_key, \
          schema_version = excluded.schema_version, \
          global = excluded.global, \
          plugin_key = excluded.plugin_key, \
+         change_id = excluded.change_id, \
          metadata = excluded.metadata, \
          updated_at = excluded.updated_at{normalized_updates}",
         table = quoted_live_table_name(&row.schema_key),
@@ -70,6 +85,7 @@ async fn apply_upsert_in_transaction(
         version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),
         global = if row.global { "true" } else { "false" },
         plugin_key = crate::live_state::constraints::escape_sql_string(&row.plugin_key),
+        change_id = change_id_sql,
         metadata = metadata_sql,
         created_at = crate::live_state::constraints::escape_sql_string(created_at),
         updated_at = crate::live_state::constraints::escape_sql_string(&row.updated_at),
@@ -83,7 +99,7 @@ async fn apply_upsert_in_transaction(
 
 async fn apply_delete_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    row: &UntrackedWriteRow,
+    row: &LiveWriteRow,
 ) -> Result<(), LixError> {
     let sql = format!(
         "DELETE FROM {table} \

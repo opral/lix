@@ -8,7 +8,6 @@ mod write;
 pub(crate) use contracts::BatchTrackedRowRequest;
 pub(crate) use contracts::{
     ExactTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
-    TrackedWriteOperation, TrackedWriteRow,
 };
 #[cfg(test)]
 pub(crate) use contracts::{TrackedReadView, TrackedTombstoneView};

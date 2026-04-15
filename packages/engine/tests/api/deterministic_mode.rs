@@ -121,6 +121,25 @@ async fn read_sequence_value(engine: &support::simulation_test::SimulatedLix) ->
         .expect("sequence value must be integer")
 }
 
+async fn read_sequence_change_id(engine: &support::simulation_test::SimulatedLix) -> String {
+    let sequence = engine
+        .execute(
+            "SELECT lixcol_change_id \
+             FROM lix_key_value \
+             WHERE key = 'lix_deterministic_sequence_number' \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(sequence.statements[0].rows.len(), 1);
+    match &sequence.statements[0].rows[0][0] {
+        Value::Text(value) => value.clone(),
+        other => panic!("expected text lixcol_change_id, got {other:?}"),
+    }
+}
+
 simulation_test!(
     deterministic_boot_key_values_apply_during_init,
     |sim| async move {
@@ -423,6 +442,46 @@ simulation_test!(
             read_sequence_value(&engine).await,
             read_highest_deterministic_canonical_counter(&engine).await
         );
+    }
+);
+
+simulation_test!(
+    deterministic_sequence_row_is_journaled_with_real_change_id,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_key_value_sql("lix_deterministic_mode", "{\"enabled\":true}"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine.execute("SELECT lix_uuid_v7()", &[]).await.unwrap();
+
+        let change_id = read_sequence_change_id(&engine).await;
+        assert!(!change_id.is_empty());
+
+        let rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_change \
+                 WHERE id = $1 \
+                   AND schema_key = 'lix_key_value' \
+                   AND entity_id = 'lix_deterministic_sequence_number' \
+                   AND untracked = true",
+                &[Value::Text(change_id)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_eq!(rows.statements[0].rows[0][0], Value::Integer(1));
     }
 );
 

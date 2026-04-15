@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
@@ -59,23 +59,33 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
 ) -> Result<(usize, BTreeSet<String>), LixError> {
     let mut tables_touched = BTreeSet::new();
 
-    let mut schema_keys = BTreeSet::new();
+    let mut schema_lanes = BTreeMap::<String, BTreeSet<bool>>::new();
     for write in &plan.writes {
-        schema_keys.insert(write.schema_key.to_string());
+        schema_lanes
+            .entry(write.schema_key.to_string())
+            .or_default()
+            .insert(write.untracked);
     }
 
     let rows_deleted =
-        clear_scope_rows(transaction, &schema_keys, &plan.scope, &mut tables_touched).await?;
+        clear_scope_rows(transaction, &schema_lanes, &plan.scope, &mut tables_touched).await?;
 
     for write in &plan.writes {
         let table_name = quoted_live_table_name(&write.schema_key);
         tables_touched.insert(table_name.clone());
+
+        if write.untracked && matches!(write.op, LiveStateWriteOp::Tombstone) {
+            // Untracked live tables model deletion as absence, not as persisted
+            // tombstone rows. Scope clearing has already removed the stale row.
+            continue;
+        }
 
         let is_tombstone = match write.op {
             LiveStateWriteOp::Upsert => 0,
             LiveStateWriteOp::Tombstone => 1,
         };
         let global_sql = if write.global { "true" } else { "false" };
+        let untracked_sql = if write.untracked { "true" } else { "false" };
         let metadata_sql = write
             .metadata
             .as_ref()
@@ -94,9 +104,9 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, created_at, updated_at{normalized_columns}\
+             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, untracked, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
+             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'{normalized_values}\
              ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
@@ -119,6 +129,7 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
             change_id = crate::live_state::constraints::escape_sql_string(&write.change_id),
             metadata = metadata_sql,
             is_tombstone = is_tombstone,
+            untracked = untracked_sql,
             created_at = crate::live_state::constraints::escape_sql_string(&write.created_at),
             updated_at = crate::live_state::constraints::escape_sql_string(&write.updated_at),
             normalized_columns = normalized_insert_columns_sql(&normalized_values),
@@ -134,11 +145,11 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
 
 async fn clear_scope_rows(
     transaction: &mut dyn LixBackendTransaction,
-    schema_keys: &BTreeSet<String>,
+    schema_lanes: &BTreeMap<String, BTreeSet<bool>>,
     scope: &LiveStateRebuildScope,
     tables_touched: &mut BTreeSet<String>,
 ) -> Result<usize, LixError> {
-    if schema_keys.is_empty() {
+    if schema_lanes.is_empty() {
         return Ok(0);
     }
 
@@ -149,37 +160,45 @@ async fn clear_scope_rows(
     };
     let mut rows_deleted = 0usize;
 
-    for schema_key in schema_keys {
+    for (schema_key, lanes) in schema_lanes {
         register_schema_in_transaction(transaction, schema_key.as_str()).await?;
         let table_name = quoted_live_table_name(schema_key);
         tables_touched.insert(table_name.clone());
+        let lane_predicate = match (lanes.contains(&false), lanes.contains(&true)) {
+            (true, true) => String::new(),
+            (true, false) => " AND untracked = false".to_string(),
+            (false, true) => " AND untracked = true".to_string(),
+            (false, false) => continue,
+        };
 
         let (count_sql, delete_sql) = if let Some(in_list) = version_filter.as_ref() {
             (
                 format!(
                     "SELECT COUNT(*) FROM {table_name} \
-                     WHERE version_id IN ({in_list}) \
-                       AND untracked = false",
+                     WHERE version_id IN ({in_list}){lane_predicate}",
                     table_name = table_name,
                     in_list = in_list,
+                    lane_predicate = lane_predicate,
                 ),
                 format!(
                     "DELETE FROM {table_name} \
-                     WHERE version_id IN ({in_list}) \
-                       AND untracked = false",
+                     WHERE version_id IN ({in_list}){lane_predicate}",
                     table_name = table_name,
                     in_list = in_list,
+                    lane_predicate = lane_predicate,
                 ),
             )
         } else {
             (
                 format!(
-                    "SELECT COUNT(*) FROM {table_name} WHERE untracked = false",
+                    "SELECT COUNT(*) FROM {table_name} WHERE 1 = 1{lane_predicate}",
                     table_name = table_name,
+                    lane_predicate = lane_predicate,
                 ),
                 format!(
-                    "DELETE FROM {table_name} WHERE untracked = false",
+                    "DELETE FROM {table_name} WHERE 1 = 1{lane_predicate}",
                     table_name = table_name,
+                    lane_predicate = lane_predicate,
                 ),
             )
         };

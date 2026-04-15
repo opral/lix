@@ -221,6 +221,118 @@ simulation_test!(
 );
 
 simulation_test!(
+    rebuild_restores_untracked_version_ref_from_journal_with_real_change_id,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix_deterministic()
+            .await
+            .expect("boot_simulated_lix_deterministic should succeed");
+        engine.initialize().await.unwrap();
+
+        register_test_schema(&engine).await;
+        let main_version_id = main_version_id(&engine).await;
+
+        engine
+            .execute(
+                &format!(
+                    "INSERT INTO lix_state_by_version (\
+                     entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                     ) VALUES (\
+                     'entity-version-ref', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"tracked\"}}', '1'\
+                     )",
+                    main_version_id
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let journal_rows = engine
+            .execute(
+                "SELECT id \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true \
+                 ORDER BY created_at DESC, id DESC \
+                 LIMIT 1",
+                &[Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(journal_rows.statements[0].rows.len(), 1);
+        let journal_change_id = match &journal_rows.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected lix_change id text, got {other:?}"),
+        };
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_live_v1_lix_version_ref \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true",
+                &[Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+
+        let missing_rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_live_v1_lix_version_ref \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true",
+                &[Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(missing_rows.statements[0].rows[0][0], Value::Integer(0));
+
+        let report = engine
+            .rebuild_live_state(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Summary,
+                debug_row_limit: 128,
+            })
+            .await
+            .unwrap();
+        assert!(
+            report
+                .plan
+                .writes
+                .iter()
+                .any(|write| write.schema_key.to_string() == "lix_version_ref" && write.untracked),
+            "expected rebuild plan to include untracked version-ref writes"
+        );
+
+        let restored_rows = engine
+            .execute(
+                "SELECT change_id, commit_id \
+                 FROM lix_internal_live_v1_lix_version_ref \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true \
+                 LIMIT 1",
+                &[Value::Text(main_version_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(restored_rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            restored_rows.statements[0].rows[0][0],
+            Value::Text(journal_change_id)
+        );
+        match &restored_rows.statements[0].rows[0][1] {
+            Value::Text(value) => assert!(!value.is_empty()),
+            other => panic!("expected restored commit_id text, got {other:?}"),
+        }
+    }
+);
+
+simulation_test!(
     apply_materialization_plan_full_scope_clears_existing_rows_in_schema_tables,
     simulations = [sqlite, postgres, timestamp_shuffle],
     |sim| async move {
@@ -244,6 +356,7 @@ simulation_test!(
                 file_id: "file-1".try_into().unwrap(),
                 version_id: main_version_id.clone().try_into().unwrap(),
                 global: false,
+                untracked: false,
                 op: LiveStateWriteOp::Upsert,
                 snapshot_content: Some(
                     CanonicalJson::from_text("{\"value\":\"old\"}")
@@ -274,6 +387,7 @@ simulation_test!(
                 file_id: "file-1".try_into().unwrap(),
                 version_id: main_version_id.clone().try_into().unwrap(),
                 global: false,
+                untracked: false,
                 op: LiveStateWriteOp::Upsert,
                 snapshot_content: Some(
                     CanonicalJson::from_text("{\"value\":\"new\"}")

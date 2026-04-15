@@ -718,12 +718,24 @@ fn change_columns() -> Vec<String> {
         "plugin_key".to_string(),
         "metadata".to_string(),
         "created_at".to_string(),
+        "untracked".to_string(),
         "snapshot_content".to_string(),
     ]
 }
 
 fn change_column_types() -> BTreeMap<String, SurfaceColumnType> {
-    BTreeMap::new()
+    BTreeMap::from([
+        ("id".to_string(), SurfaceColumnType::String),
+        ("entity_id".to_string(), SurfaceColumnType::String),
+        ("schema_key".to_string(), SurfaceColumnType::String),
+        ("schema_version".to_string(), SurfaceColumnType::String),
+        ("file_id".to_string(), SurfaceColumnType::String),
+        ("plugin_key".to_string(), SurfaceColumnType::String),
+        ("metadata".to_string(), SurfaceColumnType::Json),
+        ("created_at".to_string(), SurfaceColumnType::String),
+        ("untracked".to_string(), SurfaceColumnType::Boolean),
+        ("snapshot_content".to_string(), SurfaceColumnType::Json),
+    ])
 }
 
 fn working_changes_columns() -> Vec<String> {

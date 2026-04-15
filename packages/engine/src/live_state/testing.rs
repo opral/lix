@@ -2,6 +2,10 @@ use crate::live_state::LiveRow;
 
 pub(crate) use crate::live_state::lifecycle::LIVE_STATE_SCHEMA_EPOCH;
 
+fn local_version_head_change_id(version_id: &str, commit_id: &str, timestamp: &str) -> String {
+    format!("change-version-ref::{version_id}::{commit_id}::{timestamp}")
+}
+
 pub(crate) fn local_version_head_live_row(
     version_id: &str,
     commit_id: &str,
@@ -15,7 +19,9 @@ pub(crate) fn local_version_head_live_row(
         version_id: crate::version::version_ref_storage_version_id().to_string(),
         plugin_key: crate::version::version_ref_plugin_key().to_string(),
         metadata: None,
-        change_id: None,
+        change_id: Some(local_version_head_change_id(
+            version_id, commit_id, timestamp,
+        )),
         writer_key: None,
         global: true,
         untracked: true,

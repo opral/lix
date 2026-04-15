@@ -108,13 +108,7 @@ pub(crate) async fn prepare_materialization_plan(
 
 fn grouped_entities(delta: &TransactionDelta) -> BTreeMap<(String, String), BTreeSet<String>> {
     let mut grouped = BTreeMap::<(String, String), BTreeSet<String>>::new();
-    for row in &delta.tracked_writes {
-        grouped
-            .entry((row.schema_key.clone(), row.version_id.clone()))
-            .or_default()
-            .insert(row.entity_id.clone());
-    }
-    for row in &delta.untracked_writes {
+    for row in &delta.writes {
         grouped
             .entry((row.schema_key.clone(), row.version_id.clone()))
             .or_default()

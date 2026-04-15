@@ -5,7 +5,10 @@ use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
 
-use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
+use super::types::{
+    canonical_changes_from_updated_version_refs, GenerateCommitArgs, GenerateCommitResult,
+    StagedChange,
+};
 use crate::canonical::UpdatedVersionRef;
 
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
@@ -128,6 +131,7 @@ where
                 "id": meta.change_set_id,
             }))?),
             metadata: None,
+            untracked: false,
             created_at: args.timestamp.clone(),
         });
 
@@ -149,6 +153,7 @@ where
                 "change_set_id": meta.change_set_id,
             }))?),
             metadata: None,
+            untracked: false,
             created_at: args.timestamp.clone(),
         });
     }
@@ -232,11 +237,14 @@ where
         updated_version_refs.push(UpdatedVersionRef {
             version_id: expect_identity(version_id.clone(), "version_ref version_id"),
             commit_id: meta.commit_id.clone(),
+            change_id: generate_uuid(),
             created_at: args.timestamp.clone(),
         });
     }
 
+    let version_ref_changes = canonical_changes_from_updated_version_refs(&updated_version_refs)?;
     output_changes.extend(meta_changes);
+    output_changes.extend(version_ref_changes);
 
     let affected_versions = effective_changes
         .iter()
@@ -277,6 +285,7 @@ fn sanitize_staged_change(change: &StagedChange) -> CanonicalChangeWrite {
             .map(CanonicalJson::from_text)
             .transpose()
             .unwrap(),
+        untracked: false,
         created_at: require_staged_change_created_at(change)
             .unwrap()
             .to_string(),
@@ -574,6 +583,7 @@ mod tests {
         assert_eq!(counts.get("lix_key_value"), Some(&1));
         assert_eq!(counts.get("lix_change_set"), Some(&1));
         assert_eq!(counts.get("lix_commit"), Some(&1));
+        assert_eq!(counts.get("lix_version_ref"), Some(&1));
         let commit_row = result
             .canonical_changes
             .iter()
@@ -599,6 +609,7 @@ mod tests {
             result.updated_version_refs[0].version_id.as_str(),
             "version-main"
         );
+        assert!(!result.updated_version_refs[0].change_id.is_empty());
         assert_eq!(result.affected_versions, vec!["version-main".to_string()]);
     }
 
@@ -633,8 +644,10 @@ mod tests {
         assert_eq!(counts.get("lix_key_value"), Some(&1));
         assert_eq!(counts.get("lix_change_set"), Some(&1));
         assert_eq!(counts.get("lix_commit"), Some(&1));
+        assert_eq!(counts.get("lix_version_ref"), Some(&1));
         assert_eq!(result.updated_version_refs.len(), 1);
         assert_eq!(result.updated_version_refs[0].version_id.as_str(), "global");
+        assert!(!result.updated_version_refs[0].change_id.is_empty());
         assert_eq!(result.affected_versions, vec!["global".to_string()]);
 
         let commit_row = result
@@ -690,6 +703,7 @@ mod tests {
         assert_eq!(counts.get("lix_key_value"), Some(&2));
         assert_eq!(counts.get("lix_change_set"), Some(&2));
         assert_eq!(counts.get("lix_commit"), Some(&2));
+        assert_eq!(counts.get("lix_version_ref"), Some(&2));
         assert_eq!(result.updated_version_refs.len(), 2);
 
         let commit_rows: Vec<_> = result
@@ -712,6 +726,10 @@ mod tests {
             .iter()
             .map(|update| update.version_id.to_string())
             .collect::<BTreeSet<_>>();
+        assert!(result
+            .updated_version_refs
+            .iter()
+            .all(|update| !update.change_id.is_empty()));
         assert_eq!(
             updated_versions,
             BTreeSet::from(["global".to_string(), "version-main".to_string()])

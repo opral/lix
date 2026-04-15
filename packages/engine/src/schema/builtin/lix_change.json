@@ -38,6 +38,9 @@
     "created_at": {
       "type": "string"
     },
+    "untracked": {
+      "type": "boolean"
+    },
     "snapshot_content": {
       "type": [
         "object",
@@ -52,7 +55,8 @@
     "schema_version",
     "file_id",
     "plugin_key",
-    "created_at"
+    "created_at",
+    "untracked"
   ],
   "additionalProperties": false
 }

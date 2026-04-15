@@ -749,8 +749,8 @@ fn effective_state_candidates_sql(
            u.created_at AS created_at, \
            u.updated_at AS updated_at, \
            CASE WHEN tv.version_id = '{global_version}' THEN true ELSE false END AS global, \
-           NULL AS change_id, \
-           'untracked' AS commit_id, \
+           u.change_id AS change_id, \
+           NULL AS commit_id, \
            true AS untracked, \
            uwk.writer_key AS writer_key, \
            u.metadata AS metadata, \
@@ -772,8 +772,8 @@ fn effective_state_candidates_sql(
            u.created_at AS created_at, \
            u.updated_at AS updated_at, \
            true AS global, \
-           NULL AS change_id, \
-           'untracked' AS commit_id, \
+           u.change_id AS change_id, \
+           NULL AS commit_id, \
            true AS untracked, \
            uwk_global.writer_key AS writer_key, \
            u.metadata AS metadata, \

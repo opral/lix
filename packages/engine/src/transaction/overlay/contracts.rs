@@ -1,20 +1,15 @@
 use crate::sql::OptionalTextPatch;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum PendingSemanticStorage {
-    Tracked,
-    Untracked,
-}
-
 #[derive(Debug, Clone)]
 pub struct PendingSemanticRow {
-    pub storage: PendingSemanticStorage,
+    pub untracked: bool,
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
     pub file_id: String,
     pub version_id: String,
     pub plugin_key: String,
+    pub change_id: Option<String>,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
     pub tombstone: bool,
@@ -46,17 +41,9 @@ pub trait PendingOverlay {
 
     fn visible_registered_schema_entries(&self) -> Vec<(String, Option<String>)>;
 
-    fn visible_semantic_rows(
-        &self,
-        storage: PendingSemanticStorage,
-        schema_key: &str,
-    ) -> Vec<PendingSemanticRow>;
+    fn visible_semantic_rows(&self, untracked: bool, schema_key: &str) -> Vec<PendingSemanticRow>;
 
-    fn visible_directory_rows(
-        &self,
-        storage: PendingSemanticStorage,
-        schema_key: &str,
-    ) -> Vec<PendingSemanticRow>;
+    fn visible_directory_rows(&self, untracked: bool, schema_key: &str) -> Vec<PendingSemanticRow>;
 
     fn visible_files(&self) -> Vec<PendingFilesystemFileView>;
 

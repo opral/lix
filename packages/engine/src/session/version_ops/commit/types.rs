@@ -1,16 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::CanonicalChangeWrite;
+use crate::canonical::{CanonicalChangeWrite, UpdatedVersionRef};
 use crate::live_state::LiveRow;
 use crate::session::version_ops::VersionInfo;
 use crate::streams::StateChangeRecord;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
-    CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, LixError,
-    VersionId,
+    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
+    FileId, LixError, VersionId,
 };
-
-use crate::canonical::UpdatedVersionRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StagedChange {
@@ -150,7 +148,7 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
             version_id: crate::version::version_ref_storage_version_id().to_string(),
             plugin_key: crate::version::version_ref_plugin_key().to_string(),
             metadata: None,
-            change_id: None,
+            change_id: Some(update.change_id.clone()),
             writer_key: None,
             global: true,
             untracked: true,
@@ -160,6 +158,82 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
                 update.version_id.as_str(),
                 &update.commit_id,
             )),
+        })
+        .collect()
+}
+
+pub(crate) fn canonical_changes_from_updated_version_refs(
+    updates: &[UpdatedVersionRef],
+) -> Result<Vec<CanonicalChangeWrite>, LixError> {
+    updates
+        .iter()
+        .map(|update| {
+            let snapshot_content = crate::version::version_ref_snapshot_content(
+                update.version_id.as_str(),
+                &update.commit_id,
+            );
+            Ok(CanonicalChangeWrite {
+                id: update.change_id.clone(),
+                entity_id: update.version_id.to_string().try_into().map_err(|_| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "updated version ref '{}' is not a valid canonical entity id",
+                            update.version_id
+                        ),
+                    )
+                })?,
+                schema_key: crate::version::version_ref_schema_key()
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            "builtin lix_version_ref schema key is invalid",
+                        )
+                    })?,
+                schema_version: crate::version::version_ref_schema_version()
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            "builtin lix_version_ref schema version is invalid",
+                        )
+                    })?,
+                file_id: crate::version::version_ref_file_id()
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            "builtin lix_version_ref file id is invalid",
+                        )
+                    })?,
+                plugin_key: crate::version::version_ref_plugin_key()
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            "builtin lix_version_ref plugin key is invalid",
+                        )
+                    })?,
+                snapshot_content: Some(CanonicalJson::from_text(snapshot_content).map_err(
+                    |error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "generated lix_version_ref snapshot is invalid canonical JSON: {}",
+                                error.description
+                            ),
+                        )
+                    },
+                )?),
+                metadata: None,
+                untracked: true,
+                created_at: update.created_at.clone(),
+            })
         })
         .collect()
 }

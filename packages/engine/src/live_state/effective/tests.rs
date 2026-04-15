@@ -177,6 +177,7 @@ fn untracked_row(entity_id: &str, version_id: &str, global: bool, child_id: &str
         global,
         plugin_key: "lix".to_string(),
         metadata: Some("{\"kind\":\"untracked\"}".to_string()),
+        change_id: format!("change-{entity_id}"),
         writer_key: Some("writer-b".to_string()),
         created_at: "2026-03-24T00:00:00Z".to_string(),
         updated_at: "2026-03-24T00:00:00Z".to_string(),

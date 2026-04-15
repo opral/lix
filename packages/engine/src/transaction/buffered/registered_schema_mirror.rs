@@ -1,3 +1,4 @@
+use crate::canonical::CanonicalChangeWrite;
 use crate::common::escape_sql_string;
 use crate::sql::MutationRow;
 use crate::sql::PlannedStateRow;
@@ -8,12 +9,44 @@ const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const PENDING_BOOTSTRAP_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
+pub(crate) struct RegisteredSchemaMirrorRow<'a> {
+    pub(crate) entity_id: &'a str,
+    pub(crate) schema_version: &'a str,
+    pub(crate) file_id: &'a str,
+    pub(crate) version_id: &'a str,
+    pub(crate) plugin_key: &'a str,
+    pub(crate) snapshot_content: Option<&'a str>,
+    pub(crate) metadata: Option<&'a str>,
+    pub(crate) change_id: &'a str,
+    pub(crate) untracked: bool,
+    pub(crate) created_at: &'a str,
+}
+
+pub(crate) async fn upsert_registered_schema_mirror_row_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    row: RegisteredSchemaMirrorRow<'_>,
+) -> Result<(), LixError> {
+    upsert_registered_schema_mirror_row(transaction, row).await
+}
+
 pub(crate) async fn mirror_registered_schema_planned_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[PlannedStateRow],
+    canonical_changes: &[CanonicalChangeWrite],
     untracked: bool,
 ) -> Result<(), LixError> {
-    for row in rows {
+    if rows.len() != canonical_changes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "registered schema mirror expected {} canonical changes for {} planned rows",
+                rows.len(),
+                canonical_changes.len()
+            ),
+        ));
+    }
+
+    for (row, change) in rows.iter().zip(canonical_changes.iter()) {
         if row.schema_key != REGISTERED_SCHEMA_KEY {
             continue;
         }
@@ -38,7 +71,9 @@ pub(crate) async fn mirror_registered_schema_planned_rows_in_transaction(
                 plugin_key: plugin_key.as_str(),
                 snapshot_content: snapshot_content.as_deref(),
                 metadata,
+                change_id: change.id.as_str(),
                 untracked,
+                created_at: change.created_at.as_str(),
             },
         )
         .await?;
@@ -78,7 +113,9 @@ pub(crate) async fn mirror_registered_schema_mutations_in_transaction(
                 plugin_key: row.plugin_key.as_str(),
                 snapshot_content: snapshot_content.as_deref(),
                 metadata: None,
+                change_id: "bootstrap~mutation",
                 untracked: row.untracked,
+                created_at: PENDING_BOOTSTRAP_TIMESTAMP,
             },
         )
         .await?;
@@ -87,18 +124,7 @@ pub(crate) async fn mirror_registered_schema_mutations_in_transaction(
     Ok(())
 }
 
-struct RegisteredSchemaMirrorRow<'a> {
-    entity_id: &'a str,
-    schema_version: &'a str,
-    file_id: &'a str,
-    version_id: &'a str,
-    plugin_key: &'a str,
-    snapshot_content: Option<&'a str>,
-    metadata: Option<&'a str>,
-    untracked: bool,
-}
-
-async fn upsert_registered_schema_mirror_row_in_transaction(
+async fn upsert_registered_schema_mirror_row(
     transaction: &mut dyn LixBackendTransaction,
     row: RegisteredSchemaMirrorRow<'_>,
 ) -> Result<(), LixError> {
@@ -110,7 +136,6 @@ async fn upsert_registered_schema_mirror_row_in_transaction(
         .metadata
         .map(|value| format!("'{}'", escape_sql_string(value)))
         .unwrap_or_else(|| "NULL".to_string());
-    let synthetic_change_id = format!("bootstrap~{}", row.entity_id);
     let sql = format!(
         "INSERT INTO {table} (\
          entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, untracked, created_at, updated_at\
@@ -139,12 +164,12 @@ async fn upsert_registered_schema_mirror_row_in_transaction(
         },
         plugin_key = escape_sql_string(row.plugin_key),
         snapshot_content = snapshot_sql,
-        change_id = escape_sql_string(&synthetic_change_id),
+        change_id = escape_sql_string(row.change_id),
         metadata = metadata_sql,
         is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 },
         untracked = if row.untracked { "true" } else { "false" },
-        created_at = PENDING_BOOTSTRAP_TIMESTAMP,
-        updated_at = PENDING_BOOTSTRAP_TIMESTAMP,
+        created_at = escape_sql_string(row.created_at),
+        updated_at = escape_sql_string(row.created_at),
     );
     transaction.execute(&sql, &[]).await?;
     Ok(())

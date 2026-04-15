@@ -1,44 +1,21 @@
-use crate::backend::PreparedBatch;
-use crate::common::escape_sql_string;
-use crate::common::is_missing_relation_error;
-use crate::functions::LixFunctionProvider;
-use crate::live_state::payload_column_name_for_schema;
+use crate::backend::QueryExecutor;
+use crate::canonical::{
+    append_changes, load_exact_row_at_commit, CanonicalChangeWrite, CanonicalJson,
+    CanonicalStateIdentity,
+};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-    tracked_relation_name,
+    load_exact_untracked_row_with_executor, load_version_head_commit_id_with_executor,
+    write_live_rows, ExactUntrackedRowRequest, LiveRow,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
+use crate::{LixBackendTransaction, LixError};
 
 const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 
 pub(crate) fn deterministic_sequence_key() -> &'static str {
     DETERMINISTIC_SEQUENCE_KEY
-}
-
-pub(crate) async fn load_runtime_sequence_start_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<i64, LixError> {
-    let visible_sequence_start =
-        load_visible_runtime_sequence_start_in_transaction(transaction).await?;
-    let ensure_sql =
-        build_ensure_runtime_sequence_row_sql(visible_sequence_start - 1, transaction.dialect());
-    transaction.execute(&ensure_sql, &[]).await?;
-
-    let load_sql = build_lock_runtime_sequence_row_sql(transaction.dialect());
-    let result = transaction.execute(&load_sql, &[]).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(0);
-    };
-    let Some(value_json) = row.first() else {
-        return Ok(0);
-    };
-    let raw = value_to_string(value_json, "value_json")?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("deterministic sequence value_json invalid JSON: {err}"),
-    })?;
-    Ok(parsed.as_i64().unwrap_or(-1) + 1)
 }
 
 pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
@@ -49,172 +26,293 @@ pub(crate) async fn ensure_runtime_sequence_initialized_in_transaction(
     {
         return Ok(());
     }
-    let sequence_start = load_runtime_sequence_start_in_transaction(transaction).await?;
-    functions.initialize_deterministic_sequence(sequence_start);
+    let untracked_row = {
+        let mut executor = &mut *transaction;
+        load_runtime_sequence_untracked_row_with_executor(&mut executor).await?
+    };
+
+    let highest_seen = if let Some(row) = untracked_row {
+        parse_runtime_sequence_highest_seen_from_text(row.property_text("value").as_deref())?
+    } else {
+        let tracked_highest_seen = {
+            let mut executor = &mut *transaction;
+            load_runtime_sequence_tracked_highest_seen_with_executor(&mut executor).await?
+        }
+        .unwrap_or(-1);
+        append_runtime_sequence_row_in_transaction(transaction, tracked_highest_seen).await?;
+        tracked_highest_seen
+    };
+
+    functions.initialize_deterministic_sequence(highest_seen + 1);
     Ok(())
-}
-
-pub(crate) fn build_ensure_runtime_sequence_row_sql(
-    highest_seen: i64,
-    _dialect: SqlDialect,
-) -> String {
-    let sequence_key = deterministic_sequence_key();
-    let key_column = payload_column_name_for_schema(key_value_schema_key(), None, "key")
-        .expect("key-value live schema should include key");
-    let value_column = payload_column_name_for_schema(key_value_schema_key(), None, "value")
-        .expect("key-value live schema should include value");
-    let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
-        .expect("deterministic highest-seen JSON serialization should succeed");
-
-    format!(
-        "INSERT INTO {table_name} \
-         (entity_id, schema_key, file_id, version_id, global, plugin_key, metadata, schema_version, untracked, created_at, updated_at, {key_column}, {value_column}) \
-         VALUES ('{entity_id}', '{schema_key}', '{file_id}', '{version_id}', FALSE, '{plugin_key}', NULL, '{schema_version}', true, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '{key_value}', '{value_json}') \
-         ON CONFLICT (entity_id, file_id, version_id, untracked) DO NOTHING",
-        table_name = tracked_relation_name(key_value_schema_key()),
-        key_column = key_column,
-        value_column = value_column,
-        entity_id = escape_sql_string(sequence_key),
-        key_value = escape_sql_string(sequence_key),
-        value_json = escape_sql_string(&value_json),
-        schema_key = escape_sql_string(key_value_schema_key()),
-        file_id = escape_sql_string(key_value_file_id()),
-        version_id = escape_sql_string(GLOBAL_VERSION_ID),
-        plugin_key = escape_sql_string(key_value_plugin_key()),
-        schema_version = escape_sql_string(key_value_schema_version()),
-    )
 }
 
 pub(crate) async fn persist_runtime_sequence_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    functions: &dyn LixFunctionProvider,
+    functions: &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
 ) -> Result<(), LixError> {
     let Some(highest_seen) = functions.deterministic_sequence_persist_highest_seen() else {
         return Ok(());
     };
-    let batch = build_persist_sequence_highest_batch(highest_seen, transaction.dialect())?;
-    transaction.execute_batch(&batch).await?;
-    Ok(())
+    persist_runtime_sequence_highest_seen_in_transaction(transaction, highest_seen).await
 }
 
-pub(crate) fn build_persist_sequence_highest_batch(
-    highest_seen: i64,
-    dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
-    let mut batch = PreparedBatch { steps: Vec::new() };
-    batch.append_sql(build_update_runtime_sequence_highest_sql(
-        highest_seen,
-        dialect,
-    ));
-    Ok(batch)
-}
-
-pub(crate) fn build_update_runtime_sequence_highest_sql(
-    highest_seen: i64,
-    _dialect: SqlDialect,
-) -> String {
-    let value_column = payload_column_name_for_schema(key_value_schema_key(), None, "value")
-        .expect("key-value live schema should include value");
-    let value_json = serde_json::to_string(&serde_json::Value::from(highest_seen))
-        .expect("deterministic highest-seen JSON serialization should succeed");
-
-    format!(
-        "UPDATE {table_name} \
-         SET {value_column} = '{value_json}', updated_at = CURRENT_TIMESTAMP \
-         WHERE entity_id = '{entity_id}' \
-           AND schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{version_id}' \
-           AND untracked = true",
-        table_name = tracked_relation_name(key_value_schema_key()),
-        value_column = value_column,
-        value_json = escape_sql_string(&value_json),
-        entity_id = escape_sql_string(deterministic_sequence_key()),
-        schema_key = escape_sql_string(key_value_schema_key()),
-        file_id = escape_sql_string(key_value_file_id()),
-        version_id = escape_sql_string(GLOBAL_VERSION_ID),
-    )
-}
-
-async fn load_visible_runtime_sequence_start_in_transaction(
+pub(crate) async fn persist_runtime_sequence_highest_seen_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-) -> Result<i64, LixError> {
-    let sql = format!(
-        "SELECT value_json \
-         FROM (\
-           SELECT u.value_json AS value_json, 0 AS precedence \
-           FROM {table_name} u \
-           WHERE u.entity_id = '{entity_id}' \
-             AND u.version_id = '{version_id}' \
-             AND u.untracked = true \
-             AND u.value_json IS NOT NULL \
-           UNION ALL \
-           SELECT t.value_json AS value_json, 1 AS precedence \
-           FROM {table_name} t \
-           WHERE t.entity_id = '{entity_id}' \
-             AND t.version_id = '{version_id}' \
-             AND t.untracked = false \
-             AND t.value_json IS NOT NULL \
-             AND t.is_tombstone = 0\
-         ) visible_key_values \
-         ORDER BY precedence ASC \
-         LIMIT 1",
-        table_name = tracked_relation_name(key_value_schema_key()),
-        entity_id = escape_sql_string(deterministic_sequence_key()),
-        version_id = escape_sql_string(GLOBAL_VERSION_ID),
-    );
-    let result = match transaction.execute(&sql, &[]).await {
-        Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(0),
-        Err(error) => return Err(error),
+    highest_seen: i64,
+) -> Result<(), LixError> {
+    let existing_highest_seen = {
+        let mut executor = &mut *transaction;
+        load_runtime_sequence_untracked_row_with_executor(&mut executor)
+            .await?
+            .map(|row| {
+                parse_runtime_sequence_highest_seen_from_text(row.property_text("value").as_deref())
+            })
+            .transpose()?
     };
-    let Some(row) = result.rows.first() else {
-        return Ok(0);
-    };
-    let Some(value_json) = row.first() else {
-        return Ok(0);
-    };
-    let raw = value_to_string(value_json, "value_json")?;
-    let parsed: serde_json::Value = serde_json::from_str(&raw).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("deterministic sequence value_json invalid JSON: {err}"),
-    })?;
-    Ok(parsed.as_i64().unwrap_or(-1) + 1)
+
+    if existing_highest_seen == Some(highest_seen) {
+        return Ok(());
+    }
+
+    append_runtime_sequence_row_in_transaction(transaction, highest_seen).await
 }
 
-fn build_lock_runtime_sequence_row_sql(dialect: SqlDialect) -> String {
-    let value_column = payload_column_name_for_schema(key_value_schema_key(), None, "value")
-        .expect("key-value live schema should include value");
-    let for_update = match dialect {
-        SqlDialect::Postgres => " FOR UPDATE",
-        SqlDialect::Sqlite => "",
+async fn load_runtime_sequence_untracked_row_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<crate::live_state::UntrackedRow>, LixError> {
+    load_exact_untracked_row_with_executor(
+        executor,
+        &ExactUntrackedRowRequest {
+            schema_key: key_value_schema_key().to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            entity_id: deterministic_sequence_key().to_string(),
+            file_id: Some(key_value_file_id().to_string()),
+        },
+    )
+    .await
+}
+
+async fn load_runtime_sequence_tracked_highest_seen_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<i64>, LixError> {
+    let Some(commit_id) =
+        load_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
+    else {
+        return Ok(None);
+    };
+    let Some(row) = load_exact_row_at_commit(
+        executor,
+        &commit_id,
+        &CanonicalStateIdentity {
+            entity_id: deterministic_sequence_key().to_string(),
+            schema_key: key_value_schema_key().to_string(),
+            file_id: key_value_file_id().to_string(),
+        },
+    )
+    .await?
+    else {
+        return Ok(None);
     };
 
+    Ok(Some(parse_runtime_sequence_highest_seen_from_snapshot(
+        &row.snapshot_content,
+    )?))
+}
+
+async fn append_runtime_sequence_row_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    highest_seen: i64,
+) -> Result<(), LixError> {
+    let snapshot_content = deterministic_sequence_snapshot_content(highest_seen);
+    let change_id = deterministic_sequence_change_id(highest_seen);
+    let created_at = deterministic_sequence_created_at(highest_seen);
+    let change = deterministic_sequence_change_row(&change_id, &created_at, &snapshot_content)?;
+    let mut persistence_functions = DeterministicSequencePersistenceFunctions::new(highest_seen);
+
+    append_changes(transaction, &[change], &mut persistence_functions).await?;
+    write_live_rows(
+        transaction,
+        &[LiveRow {
+            entity_id: deterministic_sequence_key().to_string(),
+            file_id: key_value_file_id().to_string(),
+            schema_key: key_value_schema_key().to_string(),
+            schema_version: key_value_schema_version().to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            plugin_key: key_value_plugin_key().to_string(),
+            metadata: None,
+            change_id: Some(change_id),
+            writer_key: None,
+            global: true,
+            untracked: true,
+            created_at: Some(created_at.clone()),
+            updated_at: Some(created_at),
+            snapshot_content: Some(snapshot_content),
+        }],
+    )
+    .await
+}
+
+fn deterministic_sequence_snapshot_content(highest_seen: i64) -> String {
+    serde_json::json!({
+        "key": deterministic_sequence_key(),
+        "value": highest_seen,
+    })
+    .to_string()
+}
+
+fn deterministic_sequence_change_id(highest_seen: i64) -> String {
     format!(
-        "SELECT {value_column} AS value_json \
-         FROM {table_name} \
-         WHERE entity_id = '{entity_id}' \
-           AND schema_key = '{schema_key}' \
-           AND file_id = '{file_id}' \
-           AND version_id = '{version_id}' \
-           AND untracked = true \
-         LIMIT 1{for_update}",
-        value_column = value_column,
-        table_name = tracked_relation_name(key_value_schema_key()),
-        entity_id = escape_sql_string(deterministic_sequence_key()),
-        schema_key = escape_sql_string(key_value_schema_key()),
-        file_id = escape_sql_string(key_value_file_id()),
-        version_id = escape_sql_string(GLOBAL_VERSION_ID),
-        for_update = for_update,
+        "det-seq-change-{value:020}",
+        value = deterministic_sequence_journal_ordinal(highest_seen)
     )
 }
 
-fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
-    match value {
-        Value::Text(text) => Ok(text.clone()),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("expected text value for {name}"),
-        }),
+fn deterministic_sequence_created_at(highest_seen: i64) -> String {
+    format!(
+        "1970-01-01T00:00:00.{value:020}Z",
+        value = deterministic_sequence_journal_ordinal(highest_seen)
+    )
+}
+
+fn deterministic_sequence_journal_ordinal(highest_seen: i64) -> u64 {
+    if highest_seen < 0 {
+        0
+    } else {
+        highest_seen as u64 + 1
+    }
+}
+
+fn deterministic_sequence_change_row(
+    change_id: &str,
+    created_at: &str,
+    snapshot_content: &str,
+) -> Result<CanonicalChangeWrite, LixError> {
+    Ok(CanonicalChangeWrite {
+        id: change_id.to_string(),
+        entity_id: deterministic_sequence_key()
+            .to_string()
+            .try_into()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "invalid deterministic sequence entity_id '{}'",
+                        deterministic_sequence_key()
+                    ),
+                )
+            })?,
+        schema_key: key_value_schema_key().to_string().try_into().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "invalid deterministic sequence schema_key '{}'",
+                    key_value_schema_key()
+                ),
+            )
+        })?,
+        schema_version: key_value_schema_version()
+            .to_string()
+            .try_into()
+            .map_err(|_| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "invalid deterministic sequence schema_version '{}'",
+                        key_value_schema_version()
+                    ),
+                )
+            })?,
+        file_id: key_value_file_id().to_string().try_into().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "invalid deterministic sequence file_id '{}'",
+                    key_value_file_id()
+                ),
+            )
+        })?,
+        plugin_key: key_value_plugin_key().to_string().try_into().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "invalid deterministic sequence plugin_key '{}'",
+                    key_value_plugin_key()
+                ),
+            )
+        })?,
+        snapshot_content: Some(
+            CanonicalJson::from_text(snapshot_content.to_string()).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "invalid deterministic sequence snapshot_content: {}",
+                        error.description
+                    ),
+                )
+            })?,
+        ),
+        metadata: None,
+        untracked: true,
+        created_at: created_at.to_string(),
+    })
+}
+
+fn parse_runtime_sequence_highest_seen_from_text(raw_value: Option<&str>) -> Result<i64, LixError> {
+    let Some(raw_value) = raw_value else {
+        return Ok(-1);
+    };
+    raw_value.parse::<i64>().map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "deterministic sequence row contained non-integer value '{raw_value}': {error}"
+            ),
+        )
+    })
+}
+
+fn parse_runtime_sequence_highest_seen_from_snapshot(
+    snapshot_content: &str,
+) -> Result<i64, LixError> {
+    let parsed: serde_json::Value = serde_json::from_str(snapshot_content).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("deterministic sequence snapshot invalid JSON: {error}"),
+        )
+    })?;
+    Ok(parsed
+        .get("value")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1))
+}
+
+struct DeterministicSequencePersistenceFunctions {
+    counter_value: u64,
+    next_snapshot_ordinal: u32,
+}
+
+impl DeterministicSequencePersistenceFunctions {
+    fn new(highest_seen: i64) -> Self {
+        Self {
+            counter_value: deterministic_sequence_journal_ordinal(highest_seen),
+            next_snapshot_ordinal: 0,
+        }
+    }
+}
+
+impl LixFunctionProvider for DeterministicSequencePersistenceFunctions {
+    fn uuid_v7(&mut self) -> String {
+        let id = format!(
+            "det-seq-snapshot-{counter:020}-{ordinal:04}",
+            counter = self.counter_value,
+            ordinal = self.next_snapshot_ordinal
+        );
+        self.next_snapshot_ordinal += 1;
+        id
+    }
+
+    fn timestamp(&mut self) -> String {
+        deterministic_sequence_created_at(self.counter_value as i64)
     }
 }

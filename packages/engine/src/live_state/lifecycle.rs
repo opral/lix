@@ -785,6 +785,7 @@ mod tests {
         backend: &TestSqliteBackend,
         change_id: &str,
         created_at: &str,
+        untracked: bool,
     ) {
         seed_canonical_change_row(
             backend,
@@ -798,6 +799,7 @@ mod tests {
                 snapshot_id: "no-content",
                 snapshot_content: None,
                 metadata: None,
+                untracked,
                 created_at,
             },
         )
@@ -842,7 +844,7 @@ mod tests {
         seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
             .await
             .expect("local version head should seed");
-        seed_latest_replay_cursor(&backend, "change-3", "2026-03-15T01:02:04Z").await;
+        seed_latest_replay_cursor(&backend, "change-3", "2026-03-15T01:02:04Z", false).await;
         seed_live_state_status_row(
             &backend,
             LiveStateMode::Ready,
@@ -868,7 +870,7 @@ mod tests {
         seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
             .await
             .expect("local version head should seed");
-        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
         seed_live_state_status_row(
             &backend,
             LiveStateMode::Ready,
@@ -941,7 +943,7 @@ mod tests {
         seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
             .await
             .expect("local version head should seed");
-        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
 
         let snapshot = load_live_state_snapshot(&backend).await.unwrap();
         assert_eq!(
@@ -951,12 +953,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn latest_replay_cursor_includes_untracked_journal_rows() {
+        let backend = init_lifecycle_backend().await;
+        seed_latest_replay_cursor(&backend, "change-tracked", "2026-03-15T01:02:02Z", false).await;
+        seed_latest_replay_cursor(&backend, "change-untracked", "2026-03-15T01:02:03Z", true).await;
+
+        let latest = load_latest_replay_cursor(&backend)
+            .await
+            .expect("latest replay cursor should load")
+            .expect("latest replay cursor should exist");
+
+        assert_eq!(
+            latest,
+            ReplayCursor::new("change-untracked", "2026-03-15T01:02:03Z")
+        );
+    }
+
+    #[tokio::test]
     async fn transaction_ready_check_allows_inflight_cursor_drift() {
         let backend = init_lifecycle_backend().await;
         seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
             .await
             .expect("local version head should seed");
-        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
         seed_live_state_status_row(
             &backend,
             LiveStateMode::Ready,
@@ -989,7 +1008,7 @@ mod tests {
         seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
             .await
             .expect("local version head should seed");
-        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
         seed_live_state_status_row(
             &backend,
             LiveStateMode::Ready,
@@ -1031,7 +1050,7 @@ mod tests {
         seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
             .await
             .expect("local version head should seed");
-        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z").await;
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
         seed_live_state_status_row(
             &backend,
             LiveStateMode::NeedsRebuild,

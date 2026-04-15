@@ -205,7 +205,9 @@ fn active_version_helper_live_row(entity_id: &str, version_id: &str, timestamp: 
         ),
         created_at: Some(timestamp.to_string()),
         updated_at: Some(timestamp.to_string()),
-        change_id: None,
+        change_id: Some(format!(
+            "change-active-version::{entity_id}::{version_id}::{timestamp}"
+        )),
         untracked: true,
     }
 }
@@ -372,7 +374,7 @@ async fn live_untracked_state_delete_removes_rows() {
             global: true,
             plugin_key: "lix".to_string(),
             metadata: None,
-            change_id: None,
+            change_id: Some("change-delete-version-ref-main".to_string()),
             writer_key: None,
             untracked: true,
             snapshot_content: None,

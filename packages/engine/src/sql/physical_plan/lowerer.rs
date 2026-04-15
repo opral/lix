@@ -1150,6 +1150,7 @@ fn build_change_source_sql() -> String {
         ch.plugin_key AS plugin_key, \
         ch.metadata AS metadata, \
         ch.created_at AS created_at, \
+        ch.untracked AS untracked, \
         CASE \
             WHEN ch.snapshot_id = 'no-content' THEN NULL \
             ELSE s.content \

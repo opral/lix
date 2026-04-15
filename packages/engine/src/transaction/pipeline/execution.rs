@@ -17,12 +17,11 @@ use crate::transaction::pipeline::{
 };
 use crate::transaction::{
     apply_schema_registrations_in_transaction,
-    normalize_sql_error_with_transaction_and_relation_names, BorrowedBufferedWriteTransaction,
-    BufferedWriteCommandMetadata, BufferedWriteFlushClass, BufferedWriteSessionEffects,
-    BufferedWriteTransaction, DeferredCommitEffects, PendingCommitState, PendingWriteOverlay,
-    PreparedDirectWriteArtifact, PreparedPublicWriteExecutionPartition, PreparedWriteStatement,
-    SessionCompilerState, TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath,
-    WriteResult,
+    normalize_sql_error_with_transaction_and_relation_names, BufferedWriteCommandMetadata,
+    BufferedWriteFlushClass, BufferedWriteSessionEffects, BufferedWriteTransaction,
+    DeferredCommitEffects, PendingCommitState, PendingWriteOverlay, PreparedDirectWriteArtifact,
+    PreparedPublicWriteExecutionPartition, PreparedWriteStatement, SessionCompilerState,
+    TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -69,41 +68,6 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
     )
     .await?;
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
-    execute_statement_batch_with_buffered_write_scope(
-        execution_context,
-        &mut scope,
-        &statement_batch,
-        allow_internal_relations,
-        context,
-    )
-    .await
-}
-
-pub(crate) async fn execute_parsed_statements_in_borrowed_write_transaction(
-    execution_context: &dyn WriteExecutionContext,
-    write_transaction: &mut BorrowedBufferedWriteTransaction<'_>,
-    parsed_statements: Vec<Statement>,
-    params: &[Value],
-    allow_internal_relations: bool,
-    context: &mut SessionCompilerState,
-    parse_duration: Option<Duration>,
-) -> Result<ExecuteResult, LixError> {
-    let dialect = write_transaction.backend_transaction_mut().dialect();
-    let runtime_bindings = context.runtime_binding_values()?;
-    let statement_batch = StatementBatch::compile(
-        parsed_statements,
-        params,
-        dialect,
-        &runtime_bindings,
-        parse_duration,
-    )?;
-    ensure_function_bindings_for_write_scope(
-        execution_context,
-        write_transaction.backend_transaction_mut(),
-        context,
-    )
-    .await?;
-    let mut scope = SqlBufferedWriteScope::Borrowed(write_transaction);
     execute_statement_batch_with_buffered_write_scope(
         execution_context,
         &mut scope,
@@ -611,23 +575,18 @@ fn should_flush_before_command(
 
 enum SqlBufferedWriteScope<'scope, 'txn> {
     Owned(&'scope mut BufferedWriteTransaction<'txn>),
-    Borrowed(&'scope mut BorrowedBufferedWriteTransaction<'txn>),
 }
 
 impl SqlBufferedWriteScope<'_, '_> {
     fn backend_transaction_mut(&mut self) -> Result<&mut dyn LixBackendTransaction, LixError> {
         match self {
             Self::Owned(write_transaction) => write_transaction.backend_transaction_mut(),
-            Self::Borrowed(write_transaction) => Ok(write_transaction.backend_transaction_mut()),
         }
     }
 
     fn buffered_write_journal_is_empty(&self) -> bool {
         match self {
             Self::Owned(write_transaction) => write_transaction.buffered_write_journal_is_empty(),
-            Self::Borrowed(write_transaction) => {
-                write_transaction.buffered_write_journal_is_empty()
-            }
         }
     }
 
@@ -636,9 +595,6 @@ impl SqlBufferedWriteScope<'_, '_> {
     ) -> Result<Option<PendingWriteOverlay>, LixError> {
         match self {
             Self::Owned(write_transaction) => {
-                write_transaction.buffered_write_pending_write_overlay()
-            }
-            Self::Borrowed(write_transaction) => {
                 write_transaction.buffered_write_pending_write_overlay()
             }
         }
@@ -652,9 +608,6 @@ impl SqlBufferedWriteScope<'_, '_> {
             Self::Owned(write_transaction) => {
                 write_transaction.can_stage_transaction_write_delta(delta)
             }
-            Self::Borrowed(write_transaction) => {
-                write_transaction.can_stage_transaction_write_delta(delta)
-            }
         }
     }
 
@@ -666,25 +619,18 @@ impl SqlBufferedWriteScope<'_, '_> {
             Self::Owned(write_transaction) => {
                 write_transaction.stage_transaction_write_delta(delta)
             }
-            Self::Borrowed(write_transaction) => {
-                write_transaction.stage_transaction_write_delta(delta)
-            }
         }
     }
 
     fn clear_pending_commit_state(&mut self) {
         match self {
             Self::Owned(write_transaction) => write_transaction.clear_pending_commit_state(),
-            Self::Borrowed(write_transaction) => write_transaction.clear_pending_commit_state(),
         }
     }
 
     fn take_pending_commit_state(&mut self) -> Option<PendingCommitState> {
         match self {
             Self::Owned(write_transaction) => {
-                std::mem::take(write_transaction.pending_commit_state_mut())
-            }
-            Self::Borrowed(write_transaction) => {
                 std::mem::take(write_transaction.pending_commit_state_mut())
             }
         }
@@ -695,9 +641,6 @@ impl SqlBufferedWriteScope<'_, '_> {
             Self::Owned(write_transaction) => {
                 *write_transaction.pending_commit_state_mut() = session;
             }
-            Self::Borrowed(write_transaction) => {
-                *write_transaction.pending_commit_state_mut() = session;
-            }
         }
     }
 
@@ -706,18 +649,12 @@ impl SqlBufferedWriteScope<'_, '_> {
     ) -> &mut crate::transaction::TransactionCommitOutcome {
         match self {
             Self::Owned(write_transaction) => write_transaction.buffered_write_commit_outcome_mut(),
-            Self::Borrowed(write_transaction) => {
-                write_transaction.buffered_write_commit_outcome_mut()
-            }
         }
     }
 
     fn mark_public_surface_registry_refresh_pending(&mut self) {
         match self {
             Self::Owned(write_transaction) => {
-                write_transaction.mark_public_surface_registry_refresh_pending()
-            }
-            Self::Borrowed(write_transaction) => {
                 write_transaction.mark_public_surface_registry_refresh_pending()
             }
         }
@@ -735,11 +672,6 @@ impl SqlBufferedWriteScope<'_, '_> {
                     .flush_journal(execution_context, &mut execution_input)
                     .await
             }
-            Self::Borrowed(write_transaction) => {
-                write_transaction
-                    .flush_journal(execution_context, &mut execution_input)
-                    .await
-            }
         }?;
         context.apply_buffered_write_execution_input(&execution_input);
         Ok(())
@@ -748,9 +680,6 @@ impl SqlBufferedWriteScope<'_, '_> {
     fn mark_installed_plugins_cache_invalidation_pending(&mut self) {
         match self {
             Self::Owned(write_transaction) => {
-                write_transaction.mark_installed_plugins_cache_invalidation_pending()
-            }
-            Self::Borrowed(write_transaction) => {
                 write_transaction.mark_installed_plugins_cache_invalidation_pending()
             }
         }

@@ -8,10 +8,7 @@ mod write;
 pub(crate) use contracts::BatchUntrackedRowRequest;
 #[cfg(test)]
 pub(crate) use contracts::UntrackedReadView;
-pub(crate) use contracts::{
-    ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest, UntrackedWriteOperation,
-    UntrackedWriteRow,
-};
+pub(crate) use contracts::{ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 #[cfg(test)]
 pub(crate) use read::load_exact_rows_with_backend;
 pub(crate) use read::{load_exact_row_with_backend, scan_rows_with_backend};
