@@ -664,6 +664,10 @@ fn prepared_public_surface_registry_effect_for_artifact(
     match artifact {
         PreparedWriteArtifact::PublicRead(_) => Ok(PreparedPublicSurfaceRegistryEffect::None),
         PreparedWriteArtifact::PublicWrite(public_write) => {
+            if public_write_mutates_registered_schema(public_write) {
+                return Ok(PreparedPublicSurfaceRegistryEffect::ReloadFromStorage);
+            }
+
             let mutations =
                 prepared_public_surface_registry_mutations_from_public_write(public_write)?;
             if mutations.is_empty() {
@@ -675,17 +679,29 @@ fn prepared_public_surface_registry_effect_for_artifact(
             }
         }
         PreparedWriteArtifact::Direct(internal) => {
-            if internal.mutations.iter().any(|row| {
-                row.schema_key == "lix_registered_schema"
-                    && row.version_id == GLOBAL_VERSION_ID
-                    && !row.untracked
-            }) {
+            if internal
+                .mutations
+                .iter()
+                .any(|row| row.schema_key == "lix_registered_schema" && !row.untracked)
+            {
                 Ok(PreparedPublicSurfaceRegistryEffect::ReloadFromStorage)
             } else {
                 Ok(PreparedPublicSurfaceRegistryEffect::None)
             }
         }
     }
+}
+
+fn public_write_mutates_registered_schema(public_write: &PreparedPublicWrite) -> bool {
+    public_write
+        .contract
+        .resolved_write_plan
+        .as_ref()
+        .is_some_and(|resolved| {
+            resolved
+                .intended_post_state()
+                .any(|row| row.schema_key == "lix_registered_schema")
+        })
 }
 
 fn prepared_public_surface_registry_mutations_from_public_write(

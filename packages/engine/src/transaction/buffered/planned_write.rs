@@ -22,7 +22,6 @@ use crate::transaction::{
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings,
     PreparedWriteStatement,
 };
-use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -402,9 +401,6 @@ impl PendingSemanticOverlay {
     pub(crate) fn registered_schema_overlay(&self) -> Option<PendingRegisteredSchemaOverlay> {
         let mut overlay = PendingRegisteredSchemaOverlay::default();
         for row in self.visible_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY) {
-            if row.version_id != GLOBAL_VERSION_ID {
-                continue;
-            }
             overlay.entries.insert(
                 row.entity_id.clone(),
                 PendingRegisteredSchemaEntry {

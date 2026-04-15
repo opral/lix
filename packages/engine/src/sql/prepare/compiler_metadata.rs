@@ -43,6 +43,7 @@ pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_overlay(
     pending_overlay: Option<&dyn SqlPreparationPendingOverlay>,
 ) -> Result<SqlCompilerMetadata, LixError> {
     let pending_schemas = collect_pending_latest_schema_entries(pending_overlay)?;
+    let current_version_heads = reader.load_current_version_heads_for_preparation().await?;
     let mut known_live_schema_definitions = BTreeMap::new();
     for schema_key in registry.registered_state_surface_schema_keys() {
         known_live_schema_definitions.insert(
@@ -50,6 +51,7 @@ pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_overlay(
             load_latest_schema_for_preparation_with_pending(
                 reader,
                 &schema_key,
+                current_version_heads.as_ref(),
                 pending_schemas.get(&schema_key),
             )
             .await?,
@@ -58,7 +60,7 @@ pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_overlay(
 
     Ok(SqlCompilerMetadata {
         known_live_schema_definitions,
-        current_version_heads: reader.load_current_version_heads_for_preparation().await?,
+        current_version_heads,
     })
 }
 
@@ -71,6 +73,7 @@ struct PendingLatestSchemaEntry {
 async fn load_latest_schema_for_preparation_with_pending(
     reader: &mut dyn SqlPreparationMetadataReader,
     schema_key: &str,
+    current_version_heads: Option<&BTreeMap<String, String>>,
     pending_entry: Option<&PendingLatestSchemaEntry>,
 ) -> Result<JsonValue, LixError> {
     if schema_key == LIX_STATE_SURFACE_SCHEMA_KEY {
@@ -81,7 +84,8 @@ async fn load_latest_schema_for_preparation_with_pending(
         return Ok(schema.clone());
     }
 
-    let stored_entry = load_latest_schema_entry_for_preparation(reader, schema_key).await?;
+    let stored_entry =
+        load_latest_schema_entry_for_preparation(reader, schema_key, current_version_heads).await?;
     match (pending_entry, stored_entry) {
         (Some(pending), Some((stored_key, stored_schema))) => {
             if compare_schema_keys(&pending.key, &stored_key) != Ordering::Less {
@@ -102,24 +106,29 @@ async fn load_latest_schema_for_preparation_with_pending(
 async fn load_latest_schema_entry_for_preparation(
     reader: &mut dyn SqlPreparationMetadataReader,
     schema_key: &str,
+    current_version_heads: Option<&BTreeMap<String, String>>,
 ) -> Result<Option<(SchemaKey, JsonValue)>, LixError> {
     let registered_schema_table = tracked_relation_name("lix_registered_schema");
     let prefix = format!("{schema_key}~");
     let prefix_escaped = escape_sql_string(&prefix);
     let prefix_len = prefix.len();
+    let visible_version_filter = registered_schema_visible_version_filter(current_version_heads);
     let sql = format!(
         "SELECT schema_version, value_json \
          FROM {table} \
          WHERE substr(entity_id, 1, {prefix_len}) = '{prefix_escaped}' \
-           AND version_id = '{global_version}' \
+           AND ({visible_version_filter}) \
            AND is_tombstone = 0 \
            AND value_json IS NOT NULL \
-         ORDER BY CAST(schema_version AS INTEGER) DESC \
+         ORDER BY CAST(schema_version AS INTEGER) DESC, \
+                  CASE WHEN version_id = '{global_version}' THEN 0 ELSE 1 END DESC, \
+                  version_id ASC \
          LIMIT 1",
         table = registered_schema_table,
         prefix_len = prefix_len,
         prefix_escaped = prefix_escaped,
         global_version = GLOBAL_VERSION,
+        visible_version_filter = visible_version_filter,
     );
     let result = reader.execute_preparation_query(&sql, &[]).await?;
     let Some(row) = result.rows.first() else {
@@ -132,6 +141,27 @@ async fn load_latest_schema_entry_for_preparation(
         SchemaKey::new(schema_key.to_string(), schema_version),
         schema_from_registered_value_json(&value_json)?,
     )))
+}
+
+fn registered_schema_visible_version_filter(
+    current_version_heads: Option<&BTreeMap<String, String>>,
+) -> String {
+    let mut version_ids = current_version_heads
+        .map(|heads| heads.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    version_ids.sort();
+    version_ids.dedup();
+
+    let mut clauses = vec![format!("version_id = '{}'", GLOBAL_VERSION)];
+    if !version_ids.is_empty() {
+        let quoted = version_ids
+            .into_iter()
+            .map(|version_id| format!("'{}'", escape_sql_string(&version_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        clauses.push(format!("version_id IN ({quoted})"));
+    }
+    clauses.join(" OR ")
 }
 
 fn schema_from_registered_value_json(raw: &str) -> Result<JsonValue, LixError> {

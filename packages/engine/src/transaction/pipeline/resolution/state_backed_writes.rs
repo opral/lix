@@ -3,7 +3,8 @@ use crate::functions::{
     clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
 };
 use crate::live_state::{
-    decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
+    decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
+    scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
@@ -19,6 +20,7 @@ use crate::transaction::pipeline::resolution::prepared_artifacts::{
 };
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 
 fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateRow) -> String {
     match current_row.overlay_lane {
@@ -28,36 +30,38 @@ fn authoritative_version_id_for_effective_row(current_row: &ExactEffectiveStateR
 }
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const REGISTERED_SCHEMA_VERSION_ID: &str = "global";
 
 async fn load_latest_registered_schema(
     backend: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
     schema_key: &str,
+    requested_version_id: &str,
 ) -> Result<Option<JsonValue>, crate::LixError> {
     let mut latest = None::<(SchemaKey, JsonValue)>;
 
-    let rows = scan_live_rows(
-        backend,
-        &LiveRowQuery {
-            schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            version_id: REGISTERED_SCHEMA_VERSION_ID.to_string(),
-            source: LiveRowSource::Tracked,
-            constraints: Vec::new(),
-            include_tombstones: false,
-        },
-    )
-    .await?;
+    for version_id in visible_registered_schema_version_ids(backend, requested_version_id).await? {
+        let rows = scan_live_rows(
+            backend,
+            &LiveRowQuery {
+                schema_key: REGISTERED_SCHEMA_KEY.to_string(),
+                version_id,
+                source: LiveRowSource::Tracked,
+                constraints: Vec::new(),
+                include_tombstones: false,
+            },
+        )
+        .await?;
 
-    for row in &rows {
-        let Some((key, schema)) = decode_registered_schema_row(row)? else {
-            continue;
-        };
-        if key.schema_key != schema_key {
-            continue;
-        }
-        if should_replace_latest_schema(latest.as_ref().map(|(key, _)| key), &key) {
-            latest = Some((key, schema));
+        for row in &rows {
+            let Some((key, schema)) = decode_registered_schema_row(row)? else {
+                continue;
+            };
+            if key.schema_key != schema_key {
+                continue;
+            }
+            if should_replace_latest_schema(latest.as_ref().map(|(key, _)| key), &key) {
+                latest = Some((key, schema));
+            }
         }
     }
 
@@ -91,6 +95,19 @@ async fn load_latest_registered_schema(
     }
 
     Ok(latest.map(|(_, schema)| schema))
+}
+
+async fn visible_registered_schema_version_ids(
+    backend: &dyn LixBackend,
+    requested_version_id: &str,
+) -> Result<Vec<String>, crate::LixError> {
+    let frontier = load_current_committed_version_frontier_with_backend(backend).await?;
+    let mut version_ids = BTreeSet::from([
+        GLOBAL_VERSION_ID.to_string(),
+        requested_version_id.to_string(),
+    ]);
+    version_ids.extend(frontier.version_heads.into_keys());
+    Ok(version_ids.into_iter().collect())
 }
 
 fn remember_latest_registered_schema_from_snapshot_content(
@@ -186,6 +203,15 @@ fn assign_state_row_key_value(
     Ok(())
 }
 
+fn requested_registered_schema_version_id(planned_write: &PlannedWrite) -> &str {
+    planned_write
+        .command
+        .statement_context
+        .requested_version_id
+        .as_deref()
+        .unwrap_or(GLOBAL_VERSION_ID)
+}
+
 fn exact_filter_text(
     filters: &std::collections::BTreeMap<String, Value>,
     key: &str,
@@ -277,7 +303,6 @@ where
     )
     .await
     .map_err(write_resolve_backend_error)?;
-    reject_unsupported_entity_overrides(planned_write, &entity_schema)?;
     resolve_state_backed_write(
         hydrator,
         planned_write,
@@ -1058,10 +1083,18 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
+    let requested_version_id = requested_registered_schema_version_id(planned_write);
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        match load_latest_registered_schema(backend, pending_overlay, &schema_key).await? {
+        match load_latest_registered_schema(
+            backend,
+            pending_overlay,
+            &schema_key,
+            requested_version_id,
+        )
+        .await?
+        {
             Some(schema) => schema,
             None => {
                 return Ok(None);
@@ -1081,10 +1114,11 @@ where
     P: LixFunctionProvider + Send + 'static,
 {
     let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
+    let requested_version_id = requested_registered_schema_version_id(planned_write);
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
     } else {
-        load_latest_registered_schema(backend, pending_overlay, &schema_key)
+        load_latest_registered_schema(backend, pending_overlay, &schema_key, requested_version_id)
             .await?
             .ok_or_else(|| {
                 crate::LixError::new(
@@ -1171,42 +1205,6 @@ where
         schema_version,
         state_defaults,
     })
-}
-
-fn reject_unsupported_entity_overrides(
-    planned_write: &PlannedWrite,
-    entity_schema: &EntityWriteSchema,
-) -> Result<(), WriteResolveError> {
-    if entity_schema
-        .annotations
-        .state_defaults
-        .get("global")
-        .and_then(bool_from_value)
-        == Some(true)
-    {
-        let version_id = resolved_version_id(planned_write)?;
-        if version_id.as_deref() != Some(GLOBAL_VERSION_ID) {
-            return Err(WriteResolveError {
-                message:
-                    "public entity write resolver requires a concrete global version_id for lixcol_global write overrides"
-                        .to_string(),
-            });
-        }
-    }
-    if entity_schema
-        .annotations
-        .state_defaults
-        .get("untracked")
-        .and_then(bool_from_value)
-        == Some(true)
-    {
-        return Err(WriteResolveError {
-            message:
-                "public entity live slice does not yet support lixcol_untracked write overrides"
-                    .to_string(),
-        });
-    }
-    Ok(())
 }
 
 fn entity_state_row_key(

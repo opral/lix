@@ -241,7 +241,7 @@ fn x_lix_key_must_be_snake_case() {
 }
 
 #[test]
-fn builtin_storage_metadata_parses_lix_account_from_schema_owner() {
+fn builtin_storage_metadata_treats_lix_account_as_local_under_owner_policy() {
     let metadata = builtin_schema_storage_metadata("lix_account")
         .expect("lix_account builtin storage metadata should exist");
 
@@ -249,7 +249,7 @@ fn builtin_storage_metadata_parses_lix_account_from_schema_owner() {
     assert_eq!(metadata.schema_version, "1");
     assert_eq!(metadata.file_id, "lix");
     assert_eq!(metadata.plugin_key, "lix");
-    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Global);
+    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
 }
 
 #[test]
@@ -260,6 +260,32 @@ fn builtin_storage_metadata_marks_non_global_builtins_as_local() {
     assert_eq!(metadata.schema_key, "lix_key_value");
     assert_eq!(metadata.file_id, "lix");
     assert_eq!(metadata.plugin_key, "lix");
+    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
+}
+
+#[test]
+fn builtin_storage_metadata_keeps_version_runtime_builtins_global() {
+    for schema_key in [
+        "lix_version_ref",
+        "lix_version_descriptor",
+        "lix_active_version",
+        "lix_active_account",
+    ] {
+        let metadata = builtin_schema_storage_metadata(schema_key)
+            .unwrap_or_else(|| panic!("{schema_key} builtin storage metadata should exist"));
+        assert_eq!(
+            metadata.storage_lane,
+            BuiltinSchemaStorageLane::Global,
+            "{schema_key} should stay owner-global"
+        );
+    }
+}
+
+#[test]
+fn builtin_storage_metadata_treats_registered_schema_as_local() {
+    let metadata = builtin_schema_storage_metadata("lix_registered_schema")
+        .expect("lix_registered_schema builtin storage metadata should exist");
+
     assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
 }
 
@@ -775,7 +801,7 @@ fn x_lix_override_lixcols_accepts_valid_cel_expression() {
         "x-lix-version": "1",
         "x-lix-override-lixcols": {
             "lixcol_file_id": "'lix'",
-            "lixcol_global": "true"
+            "lixcol_plugin_key": "'plugin'"
         },
         "properties": {
             "id": { "type": "string" }
@@ -828,6 +854,56 @@ fn x_lix_override_lixcols_rejects_lixcol_version_id() {
         .expect_err("lixcol_version_id override should be rejected");
     assert!(
         err.description.contains("lixcol_version_id")
+            && err.description.contains("x-lix-override-lixcols"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn x_lix_override_lixcols_rejects_lixcol_global() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_global": "true"
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("lixcol_global override should be rejected");
+    assert!(
+        err.description.contains("lixcol_global")
+            && err.description.contains("x-lix-override-lixcols"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn x_lix_override_lixcols_rejects_lixcol_untracked() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_untracked": "true"
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("lixcol_untracked override should be rejected");
+    assert!(
+        err.description.contains("lixcol_untracked")
             && err.description.contains("x-lix-override-lixcols"),
         "unexpected error: {err:?}"
     );

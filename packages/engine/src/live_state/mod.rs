@@ -99,9 +99,10 @@ pub use row_queries::{
 };
 pub(crate) use schema_access::LiveRowShape;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
+#[cfg(test)]
+pub(crate) use storage_metadata::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 pub(crate) use storage_metadata::{
-    builtin_schema_storage_metadata, key_value_file_id, key_value_plugin_key, key_value_schema_key,
-    key_value_schema_version, BuiltinSchemaStorageLane, BuiltinSchemaStorageMetadata,
+    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
 };
 #[cfg(test)]
 pub(crate) use testing::LIVE_STATE_SCHEMA_EPOCH;

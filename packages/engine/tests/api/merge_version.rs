@@ -129,33 +129,35 @@ simulation_test!(merge_version_fast_forwards_target, |sim| async move {
     );
 });
 
-simulation_test!(merge_version_reports_already_up_to_date_after_target_catches_up, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix(None)
-        .await
-        .expect("boot_simulated_lix should succeed");
-    engine.initialize().await.expect("init should succeed");
+simulation_test!(
+    merge_version_reports_already_up_to_date_after_target_catches_up,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.expect("init should succeed");
 
-    engine
-        .create_version(CreateVersionOptions {
-            id: Some("merge-source-up-to-date".to_string()),
-            ..Default::default()
-        })
-        .await
-        .expect("source version should be created");
-    engine
-        .create_version(CreateVersionOptions {
-            id: Some("merge-target-up-to-date".to_string()),
-            ..Default::default()
-        })
-        .await
-        .expect("target version should be created");
+        engine
+            .create_version(CreateVersionOptions {
+                id: Some("merge-source-up-to-date".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("source version should be created");
+        engine
+            .create_version(CreateVersionOptions {
+                id: Some("merge-target-up-to-date".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("target version should be created");
 
-    engine
-        .switch_version("merge-source-up-to-date".to_string())
-        .await
-        .expect("switch to source should succeed");
-    engine
+        engine
+            .switch_version("merge-source-up-to-date".to_string())
+            .await
+            .expect("switch to source should succeed");
+        engine
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('merge-version-up-to-date', 'source')",
             &[],
@@ -163,37 +165,41 @@ simulation_test!(merge_version_reports_already_up_to_date_after_target_catches_u
         .await
         .expect("source branch write should succeed");
 
-    let first_merge = engine
-        .merge_version(MergeVersionOptions {
-            source_version_id: "merge-source-up-to-date".to_string(),
-            target_version_id: "merge-target-up-to-date".to_string(),
-            expected_heads: None,
-        })
-        .await
-        .expect("first merge_version should succeed");
-    assert_eq!(first_merge.outcome, MergeOutcome::FastForwarded);
+        let first_merge = engine
+            .merge_version(MergeVersionOptions {
+                source_version_id: "merge-source-up-to-date".to_string(),
+                target_version_id: "merge-target-up-to-date".to_string(),
+                expected_heads: None,
+            })
+            .await
+            .expect("first merge_version should succeed");
+        assert_eq!(first_merge.outcome, MergeOutcome::FastForwarded);
 
-    let source_head = version_commit_id(&engine, "merge-source-up-to-date").await;
-    let target_head = version_commit_id(&engine, "merge-target-up-to-date").await;
-    assert_eq!(target_head, source_head);
+        let source_head = version_commit_id(&engine, "merge-source-up-to-date").await;
+        let target_head = version_commit_id(&engine, "merge-target-up-to-date").await;
+        assert_eq!(target_head, source_head);
 
-    let second_merge = engine
-        .merge_version(MergeVersionOptions {
-            source_version_id: "merge-source-up-to-date".to_string(),
-            target_version_id: "merge-target-up-to-date".to_string(),
-            expected_heads: None,
-        })
-        .await
-        .expect("second merge_version should report already up to date");
+        let second_merge = engine
+            .merge_version(MergeVersionOptions {
+                source_version_id: "merge-source-up-to-date".to_string(),
+                target_version_id: "merge-target-up-to-date".to_string(),
+                expected_heads: None,
+            })
+            .await
+            .expect("second merge_version should report already up to date");
 
-    assert_eq!(second_merge.outcome, MergeOutcome::AlreadyUpToDate);
-    assert_eq!(second_merge.source_head_before_commit_id, source_head);
-    assert_eq!(second_merge.target_head_before_commit_id, target_head.clone());
-    assert_eq!(second_merge.target_head_after_commit_id, target_head);
-    assert_eq!(second_merge.created_merge_commit_id, None);
-    assert_eq!(second_merge.applied_change_count, 0);
-    assert_eq!(second_merge.created_tombstone_count, 0);
-});
+        assert_eq!(second_merge.outcome, MergeOutcome::AlreadyUpToDate);
+        assert_eq!(second_merge.source_head_before_commit_id, source_head);
+        assert_eq!(
+            second_merge.target_head_before_commit_id,
+            target_head.clone()
+        );
+        assert_eq!(second_merge.target_head_after_commit_id, target_head);
+        assert_eq!(second_merge.created_merge_commit_id, None);
+        assert_eq!(second_merge.applied_change_count, 0);
+        assert_eq!(second_merge.created_tombstone_count, 0);
+    }
+);
 
 simulation_test!(
     merge_version_creates_merge_commit_for_diverged_versions,
@@ -331,76 +337,80 @@ simulation_test!(
     }
 );
 
-simulation_test!(merge_version_rejects_stale_expected_target_head, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix(None)
-        .await
-        .expect("boot_simulated_lix should succeed");
-    engine.initialize().await.expect("init should succeed");
+simulation_test!(
+    merge_version_rejects_stale_expected_target_head,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.expect("init should succeed");
 
-    engine
-        .create_version(CreateVersionOptions {
-            id: Some("merge-source-stale-head".to_string()),
-            ..Default::default()
-        })
-        .await
-        .expect("source version should be created");
-    engine
-        .create_version(CreateVersionOptions {
-            id: Some("merge-target-stale-head".to_string()),
-            ..Default::default()
-        })
-        .await
-        .expect("target version should be created");
+        engine
+            .create_version(CreateVersionOptions {
+                id: Some("merge-source-stale-head".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("source version should be created");
+        engine
+            .create_version(CreateVersionOptions {
+                id: Some("merge-target-stale-head".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("target version should be created");
 
-    let source_head_before = version_commit_id(&engine, "merge-source-stale-head").await;
-    let target_head_before = version_commit_id(&engine, "merge-target-stale-head").await;
+        let source_head_before = version_commit_id(&engine, "merge-source-stale-head").await;
+        let target_head_before = version_commit_id(&engine, "merge-target-stale-head").await;
 
-    engine
-        .switch_version("merge-target-stale-head".to_string())
-        .await
-        .expect("switch to target should succeed");
-    engine
+        engine
+            .switch_version("merge-target-stale-head".to_string())
+            .await
+            .expect("switch to target should succeed");
+        engine
         .execute(
             "INSERT INTO lix_key_value (key, value) VALUES ('merge-version-stale-head-target', 'target-newer')",
             &[],
         )
         .await
         .expect("target branch write should succeed");
-    let target_head_after_local_write = version_commit_id(&engine, "merge-target-stale-head").await;
-    assert_ne!(target_head_after_local_write, target_head_before);
+        let target_head_after_local_write =
+            version_commit_id(&engine, "merge-target-stale-head").await;
+        assert_ne!(target_head_after_local_write, target_head_before);
 
-    let error = engine
-        .merge_version(MergeVersionOptions {
-            source_version_id: "merge-source-stale-head".to_string(),
-            target_version_id: "merge-target-stale-head".to_string(),
-            expected_heads: Some(ExpectedVersionHeads {
-                source_head_commit_id: Some(source_head_before.clone()),
-                target_head_commit_id: Some(target_head_before.clone()),
-            }),
-        })
-        .await
-        .expect_err("merge_version should reject a stale expected target head");
-
-    assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
-    assert!(error.description.contains("expected target version"));
-    assert!(error.description.contains(&target_head_before));
-    assert!(error.description.contains(&target_head_after_local_write));
-    assert_eq!(
-        version_commit_id(&engine, "merge-source-stale-head").await,
-        source_head_before
-    );
-    assert_eq!(
-        version_commit_id(&engine, "merge-target-stale-head").await,
-        target_head_after_local_write
-    );
-    assert_eq!(
-        key_value_value(&engine, "merge-version-stale-head-target")
+        let error = engine
+            .merge_version(MergeVersionOptions {
+                source_version_id: "merge-source-stale-head".to_string(),
+                target_version_id: "merge-target-stale-head".to_string(),
+                expected_heads: Some(ExpectedVersionHeads {
+                    source_head_commit_id: Some(source_head_before.clone()),
+                    target_head_commit_id: Some(target_head_before.clone()),
+                }),
+            })
             .await
-            .as_deref(),
-        Some("target-newer")
-    );
-});
+            .expect_err("merge_version should reject a stale expected target head");
+
+        assert_eq!(error.code, "LIX_ERROR_UNKNOWN");
+        assert!(error.description.contains("expected target version"));
+        assert!(error.description.contains(&target_head_before));
+        assert!(error.description.contains(&target_head_after_local_write));
+        assert_eq!(
+            version_commit_id(&engine, "merge-source-stale-head").await,
+            source_head_before
+        );
+        assert_eq!(
+            version_commit_id(&engine, "merge-target-stale-head").await,
+            target_head_after_local_write
+        );
+        assert_eq!(
+            key_value_value(&engine, "merge-version-stale-head-target")
+                .await
+                .as_deref(),
+            Some("target-newer")
+        );
+    }
+);
 
 simulation_test!(merge_version_rejects_entity_conflicts, |sim| async move {
     let engine = sim
