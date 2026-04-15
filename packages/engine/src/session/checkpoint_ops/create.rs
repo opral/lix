@@ -185,9 +185,9 @@ async fn insert_canonical_checkpoint_label_change(
         .execute(
             &format!(
                 "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at\
              ) \
-             SELECT $1, $2, '{schema_key}', '1', 'lix', 'lix', $3, NULL, $4 \
+             SELECT $1, $2, '{schema_key}', '1', 'lix', 'lix', $3, NULL, false, $4 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
                 schema_key = CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
             ),

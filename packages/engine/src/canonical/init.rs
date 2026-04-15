@@ -1,4 +1,4 @@
-use crate::backend::execute_ddl_batch;
+use crate::backend::{add_column_if_missing, execute_ddl_batch};
 use crate::{LixBackend, LixError};
 
 const CANONICAL_INIT_STATEMENTS: &[&str] = &[
@@ -20,6 +20,7 @@ const CANONICAL_INIT_STATEMENTS: &[&str] = &[
      plugin_key TEXT NOT NULL,\
      snapshot_id TEXT NOT NULL,\
      metadata TEXT,\
+     untracked BOOLEAN NOT NULL DEFAULT false,\
      created_at TEXT NOT NULL\
      )",
     "CREATE TABLE IF NOT EXISTS lix_internal_commit_graph_node (\
@@ -54,6 +55,26 @@ const CANONICAL_INIT_STATEMENTS: &[&str] = &[
      )",
 ];
 
+const CHANGE_UNTRACKED_INDEX_STATEMENTS: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_change_untracked_created_at \
+     ON lix_internal_change (untracked, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_lix_internal_change_untracked_identity \
+     ON lix_internal_change (untracked, entity_id, schema_key, file_id)",
+];
+
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_ddl_batch(backend, "canonical", CANONICAL_INIT_STATEMENTS).await
+    execute_ddl_batch(backend, "canonical", CANONICAL_INIT_STATEMENTS).await?;
+    add_column_if_missing(
+        backend,
+        "lix_internal_change",
+        "untracked",
+        "BOOLEAN NOT NULL DEFAULT false",
+    )
+    .await?;
+    execute_ddl_batch(
+        backend,
+        "canonical.change_untracked_indexes",
+        CHANGE_UNTRACKED_INDEX_STATEMENTS,
+    )
+    .await
 }

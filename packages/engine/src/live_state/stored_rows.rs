@@ -122,6 +122,7 @@ mod tests {
             global: false,
             plugin_key: "plug".to_string(),
             metadata: None,
+            change_id: "chg-u1".to_string(),
             writer_key: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
@@ -135,7 +136,12 @@ mod tests {
             }
             StoredRow::Untracked(_) => panic!("expected tracked row"),
         }
-        assert!(matches!(untracked, StoredRow::Untracked(_)));
+        match untracked {
+            StoredRow::Untracked(row) => {
+                assert_eq!(row.change_id, "chg-u1");
+            }
+            StoredRow::Tracked(_) => panic!("expected untracked row"),
+        }
     }
 
     #[test]

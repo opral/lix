@@ -197,7 +197,7 @@ async fn hydrate_input_rows_with_backend(
                         row.schema_version,
                         row.plugin_key,
                         row.metadata,
-                        None,
+                        Some(row.change_id),
                         row.writer_key,
                         row.global,
                         Some(row.created_at),
@@ -531,7 +531,9 @@ mod tests {
             version_id: version_id.to_string(),
             plugin_key: plugin_key.to_string(),
             metadata: None,
-            change_id: None,
+            change_id: Some(format!(
+                "change-untracked::{schema_key}::{entity_id}::{version_id}::{timestamp}"
+            )),
             writer_key: None,
             global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: true,

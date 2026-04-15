@@ -2,6 +2,7 @@
 pub struct UpdatedVersionRef {
     pub version_id: crate::VersionId,
     pub commit_id: String,
+    pub change_id: String,
     pub created_at: String,
 }
 

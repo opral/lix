@@ -30,5 +30,8 @@ pub(crate) use planned_write::{
     PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit, TrackedTxnUnit, TransactionWriteDelta,
     TransactionWriteUnit,
 };
+pub(crate) use registered_schema_mirror::{
+    upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,
+};
 #[cfg(test)]
-pub(crate) use write_plan::{WriteDelta, WriteJournal};
+pub(crate) use write_plan::{WriteDelta, WriteJournal, WritePlan};

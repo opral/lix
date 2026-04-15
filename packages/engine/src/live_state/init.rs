@@ -96,7 +96,7 @@ async fn seed_registered_schema_bootstrap_rows(backend: &dyn LixBackend) -> Resu
                 "INSERT INTO lix_internal_registered_schema_bootstrap (\
                  entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, untracked, created_at, updated_at\
                  ) \
-                 SELECT m.entity_id, m.schema_key, m.schema_version, m.file_id, m.version_id, m.global, m.plugin_key, {snapshot_expr}, COALESCE(m.change_id, ''), m.metadata, m.is_tombstone, m.untracked, m.created_at, m.updated_at \
+                 SELECT m.entity_id, m.schema_key, m.schema_version, m.file_id, m.version_id, m.global, m.plugin_key, {snapshot_expr}, m.change_id, m.metadata, m.is_tombstone, m.untracked, m.created_at, m.updated_at \
                  FROM {registered_schema_table} m \
                  WHERE NOT EXISTS (\
                    SELECT 1 \

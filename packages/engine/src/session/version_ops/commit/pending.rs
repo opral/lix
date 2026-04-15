@@ -22,8 +22,9 @@ use super::create::{
 use super::generate::generate_commit;
 use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{
-    tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
-    GenerateCommitArgs, GenerateCommitResult, StagedChange,
+    canonical_changes_from_updated_version_refs, tracked_live_rows_from_staged_changes,
+    untracked_live_rows_from_updated_version_refs, GenerateCommitArgs, GenerateCommitResult,
+    StagedChange,
 };
 struct TransactionCommitExecutor<'a> {
     transaction: &'a mut dyn LixBackendTransaction,
@@ -317,16 +318,27 @@ fn rewrite_generated_commit_result_for_pending_session(
         .map(|update| UpdatedVersionRef {
             version_id: update.version_id,
             commit_id: session.commit_id.clone(),
+            change_id: update.change_id,
             created_at: timestamp.to_string(),
         })
-        .collect();
+        .collect::<Vec<_>>();
+
+    let mut canonical_changes = generated
+        .canonical_changes
+        .into_iter()
+        .filter(|change| {
+            !change.untracked
+                && change.schema_key.as_str() != "lix_commit"
+                && change.schema_key.as_str() != "lix_change_set"
+        })
+        .take(change_count)
+        .collect::<Vec<_>>();
+    canonical_changes.extend(canonical_changes_from_updated_version_refs(
+        &updated_version_refs,
+    )?);
 
     Ok(GenerateCommitResult {
-        canonical_changes: generated
-            .canonical_changes
-            .into_iter()
-            .take(change_count)
-            .collect(),
+        canonical_changes,
         updated_version_refs,
         affected_versions: generated.affected_versions,
     })

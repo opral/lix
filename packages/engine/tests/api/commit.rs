@@ -15,7 +15,8 @@ use support::simulation_test::SimulatedLix;
 //    - business row writes to change+snapshot are asserted
 //    - no edge change rows and exactly one derived commit_edge row are asserted
 // 2) "commit with no changes should not create a change set"
-//    - adapted to current Rust flow: untracked-only writes create no tracked commit artifacts
+//    - adapted to current Rust flow: untracked-only writes create no tracked commit artifacts,
+//      but they do create untracked canonical change facts
 // 3) "groups changes of a transaction into the same change set for the given version"
 //    - both single-statement and explicit BEGIN/COMMIT transaction variants are asserted
 //
@@ -486,11 +487,11 @@ simulation_test!(
                  WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
-        assert_eq!(as_i64(&after.statements[0].rows[0][0]), before_count);
+        assert_eq!(as_i64(&after.statements[0].rows[0][0]), before_count + 1);
 
         let row = engine
             .execute(
-                "SELECT snapshot_content, untracked \
+                "SELECT snapshot_content, untracked, change_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'entity-untracked'",
@@ -507,6 +508,10 @@ simulation_test!(
             Value::Boolean(value) => assert!(*value),
             Value::Integer(value) => assert_eq!(*value, 1),
             other => panic!("expected true-like untracked marker, got {other:?}"),
+        }
+        match &row.statements[0].rows[0][2] {
+            Value::Text(value) => assert!(!value.is_empty()),
+            other => panic!("expected text lixcol_change_id, got {other:?}"),
         }
     }
 );
@@ -842,6 +847,21 @@ simulation_test!(
 
         let version_id = engine.active_version_id().await.unwrap();
         let before = read_version_ref_commit_id(&engine, &version_id).await;
+        let before_version_ref_change_count = as_i64(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_change \
+                     WHERE schema_key = 'lix_version_ref' \
+                       AND entity_id = $1 \
+                       AND untracked = true",
+                    &[Value::Text(version_id.clone())],
+                )
+                .await
+                .unwrap()
+                .statements[0]
+                .rows[0][0],
+        );
 
         engine
             .execute(
@@ -854,5 +874,42 @@ simulation_test!(
 
         let after = read_version_ref_commit_id(&engine, &version_id).await;
         assert_ne!(after, before);
+
+        let version_ref_change = engine
+            .execute(
+                "SELECT change_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(version_ref_change.statements[0].rows.len(), 1);
+        match &version_ref_change.statements[0].rows[0][0] {
+            Value::Text(value) => assert!(!value.is_empty()),
+            other => panic!("expected text version_ref change_id, got {other:?}"),
+        }
+
+        let after_version_ref_change_count = as_i64(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_change \
+                     WHERE schema_key = 'lix_version_ref' \
+                       AND entity_id = $1 \
+                       AND untracked = true",
+                    &[Value::Text(version_id)],
+                )
+                .await
+                .unwrap()
+                .statements[0]
+                .rows[0][0],
+        );
+        assert_eq!(
+            after_version_ref_change_count,
+            before_version_ref_change_count + 1
+        );
     }
 );

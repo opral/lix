@@ -9,7 +9,7 @@ use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
     collect_state_column_overrides_with_shared_runtime, schema_from_registered_snapshot, SchemaKey,
 };
-use crate::transaction::overlay::{PendingOverlay, PendingSemanticStorage};
+use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     apply_entity_state_assignments, apply_state_assignments, assignments_from_payload,
@@ -73,11 +73,8 @@ async fn load_latest_registered_schema(
             )?;
         }
 
-        for storage in [
-            PendingSemanticStorage::Tracked,
-            PendingSemanticStorage::Untracked,
-        ] {
-            for row in pending_overlay.visible_semantic_rows(storage, REGISTERED_SCHEMA_KEY) {
+        for untracked in [false, true] {
+            for row in pending_overlay.visible_semantic_rows(untracked, REGISTERED_SCHEMA_KEY) {
                 let Some(snapshot_content) = row.snapshot_content else {
                     continue;
                 };

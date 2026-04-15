@@ -5,7 +5,6 @@ use async_trait::async_trait;
 use jsonschema::JSONSchema;
 
 use crate::catalog::CatalogProjectionRegistry;
-use crate::common::escape_sql_string;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::RowIdentity;
 use crate::schema::CompiledSchemaCache;
@@ -26,9 +25,10 @@ use crate::sql::{
 };
 use crate::streams::StateChangeRecord;
 use crate::transaction::{
-    resolve_binary_blob_writes_in_transaction, validate_commit_time_write, BinaryBlobWrite,
-    PendingCommitState, PendingOverlay, PreparedPublicWrite, TrackedCommitExecutionOutcome,
-    TrackedTxnUnit, TransactionExecutionBackend, WriteExecutionContext,
+    resolve_binary_blob_writes_in_transaction, upsert_registered_schema_mirror_row_in_transaction,
+    validate_commit_time_write, BinaryBlobWrite, PendingCommitState, PendingOverlay,
+    PreparedPublicWrite, RegisteredSchemaMirrorRow, TrackedCommitExecutionOutcome, TrackedTxnUnit,
+    TransactionExecutionBackend, WriteExecutionContext,
 };
 use crate::version::{parse_active_version_snapshot, GLOBAL_VERSION_ID};
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
@@ -36,8 +36,6 @@ use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
 const ACTIVE_VERSION_SCHEMA_KEY: &str = "lix_active_version";
 const ACTIVE_VERSION_FILE_ID: &str = "lix";
-const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 
 struct WriteCompiledSchemaCache {
     inner: RwLock<HashMap<SchemaKey, Arc<JSONSchema>>>,
@@ -380,52 +378,26 @@ async fn mirror_public_registered_schema_bootstrap_rows(
     applied_output: &CreateCommitAppliedOutput,
 ) -> Result<(), LixError> {
     for row in &applied_output.canonical_changes {
-        if row.schema_key != REGISTERED_SCHEMA_KEY {
+        if row.schema_key != "lix_registered_schema" {
             continue;
         }
 
-        let snapshot_sql = row
-            .snapshot_content
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
-        let metadata_sql = row
-            .metadata
-            .as_ref()
-            .map(|value| format!("'{}'", escape_sql_string(value)))
-            .unwrap_or_else(|| "NULL".to_string());
-
-        let sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, created_at, updated_at\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', true, '{plugin_key}', {snapshot_content}, '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'\
-             ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
-             schema_key = excluded.schema_key, \
-             schema_version = excluded.schema_version, \
-             global = excluded.global, \
-             plugin_key = excluded.plugin_key, \
-             snapshot_content = excluded.snapshot_content, \
-             change_id = excluded.change_id, \
-             metadata = excluded.metadata, \
-             is_tombstone = excluded.is_tombstone, \
-             updated_at = excluded.updated_at",
-            table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-            entity_id = escape_sql_string(&row.entity_id),
-            schema_key = escape_sql_string(&row.schema_key),
-            schema_version = escape_sql_string(&row.schema_version),
-            file_id = escape_sql_string(&row.file_id),
-            version_id = escape_sql_string(GLOBAL_VERSION_ID),
-            plugin_key = escape_sql_string(&row.plugin_key),
-            snapshot_content = snapshot_sql,
-            change_id = escape_sql_string(&row.id),
-            metadata = metadata_sql,
-            is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 },
-            created_at = escape_sql_string(&row.created_at),
-            updated_at = escape_sql_string(&row.created_at),
-        );
-
-        transaction.execute(&sql, &[]).await?;
+        upsert_registered_schema_mirror_row_in_transaction(
+            transaction,
+            RegisteredSchemaMirrorRow {
+                entity_id: &row.entity_id,
+                schema_version: &row.schema_version,
+                file_id: &row.file_id,
+                version_id: GLOBAL_VERSION_ID,
+                plugin_key: &row.plugin_key,
+                snapshot_content: row.snapshot_content.as_ref().map(|value| value.as_str()),
+                metadata: row.metadata.as_ref().map(|value| value.as_str()),
+                change_id: &row.id,
+                untracked: false,
+                created_at: &row.created_at,
+            },
+        )
+        .await?;
     }
 
     Ok(())

@@ -16,11 +16,9 @@ use crate::sql::MutationRow;
 use crate::sql::OptionalTextPatch;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
-    build_ensure_runtime_sequence_row_sql, build_update_runtime_sequence_highest_sql,
-};
-use crate::transaction::{
     compile_filesystem_transaction_state_from_state,
-    filesystem_transaction_state_needs_exact_descriptors, with_exact_filesystem_descriptors,
+    filesystem_transaction_state_needs_exact_descriptors,
+    persist_runtime_sequence_highest_seen_in_transaction, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
     FilesystemSemanticChange, FilesystemTransactionState, WriteBatch,
     FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
@@ -405,14 +403,9 @@ pub(crate) async fn create_commit(
     let mut write_batch = WriteBatch::new();
     write_batch.push_statement(insert_idempotency_row_sql(&idempotency_write), Vec::new());
     if let Some(highest_seen) = deterministic_sequence_highest_seen {
-        write_batch.push_statement(
-            build_ensure_runtime_sequence_row_sql(highest_seen, transaction.dialect()),
-            Vec::new(),
-        );
-        write_batch.push_statement(
-            build_update_runtime_sequence_highest_sql(highest_seen, transaction.dialect()),
-            Vec::new(),
-        );
+        persist_runtime_sequence_highest_seen_in_transaction(transaction, highest_seen)
+            .await
+            .map_err(backend_error)?;
     }
     if let Some(observe_tick) = observe_tick.as_ref() {
         write_batch.push_statement(
@@ -1377,6 +1370,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 snapshot_content: Some(&snapshot_content),
                 metadata: None,
+                untracked: false,
                 created_at,
             },
         )
@@ -2077,6 +2071,7 @@ mod tests {
                 plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
                 snapshot_content: None,
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-06T14:22:00.000Z".to_string(),
             },
             CanonicalChangeWrite {
@@ -2088,12 +2083,14 @@ mod tests {
                 plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
                 snapshot_content: None,
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-06T14:22:01.000Z".to_string(),
             },
         ];
         let updated_version_refs = vec![UpdatedVersionRef {
             version_id: VersionId::new("version-a").expect("valid version id"),
             commit_id: "commit-123".to_string(),
+            change_id: "change-version-ref-1".to_string(),
             created_at: "2026-03-06T14:22:01.000Z".to_string(),
         }];
         let affected_versions = vec!["global".to_string(), "version-a".to_string()];

@@ -16,9 +16,7 @@ use crate::sql::{
     PendingOverlayQuery, PreparedPublicRead, PublicReadResultColumn, PublicReadResultColumns,
     PublicReadSource,
 };
-use crate::transaction::{
-    PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
-};
+use crate::transaction::{PendingFilesystemFileView, PendingOverlay, PendingSemanticRow};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
@@ -146,9 +144,7 @@ impl<'a> PendingOverlayReadModel<'a> {
                 }
             }
 
-            for row in pending_overlay
-                .visible_semantic_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY)
-            {
+            for row in pending_overlay.visible_semantic_rows(false, REGISTERED_SCHEMA_KEY) {
                 if row.version_id != GLOBAL_VERSION_ID {
                     continue;
                 }
@@ -177,7 +173,7 @@ impl<'a> PendingOverlayReadModel<'a> {
             .iter()
             .map(|column| column.property_name.clone())
             .collect::<Vec<_>>();
-        let storage = pending_semantic_storage(query.lane);
+        let untracked = pending_overlay_lane_is_untracked(query.lane);
         let mut rows = match query.lane {
             PendingOverlayLane::Tracked => scan_visible_live_rows(
                 self.base,
@@ -209,7 +205,7 @@ impl<'a> PendingOverlayReadModel<'a> {
             .map(|row| (visible_live_row_identity(&row), row))
             .collect::<BTreeMap<_, _>>();
         if let Some(pending_overlay) = self.pending_overlay {
-            for row in pending_overlay.visible_semantic_rows(storage, &query.schema_key) {
+            for row in pending_overlay.visible_semantic_rows(untracked, &query.schema_key) {
                 let visible = visible_live_row_from_pending(&access, &row)?;
                 let identity = visible_live_row_identity(&visible);
                 if visible.is_tombstone && matches!(query.lane, PendingOverlayLane::Tracked) {
@@ -309,9 +305,7 @@ impl<'a> PendingOverlayReadModel<'a> {
             return;
         }
 
-        for pending in pending_overlay
-            .visible_directory_rows(PendingSemanticStorage::Tracked, &query.schema_key)
-        {
+        for pending in pending_overlay.visible_directory_rows(false, &query.schema_key) {
             let Ok(visible) = visible_live_row_from_pending(access, &pending) else {
                 continue;
             };
@@ -429,11 +423,8 @@ type LiveProjection = PendingOverlayProjection;
 type LiveFilter = PendingOverlayFilter;
 type LiveOrderClause = PendingOverlayOrderClause;
 
-fn pending_semantic_storage(lane: PendingOverlayLane) -> PendingSemanticStorage {
-    match lane {
-        PendingOverlayLane::Tracked => PendingSemanticStorage::Tracked,
-        PendingOverlayLane::Untracked => PendingSemanticStorage::Untracked,
-    }
+fn pending_overlay_lane_is_untracked(lane: PendingOverlayLane) -> bool {
+    matches!(lane, PendingOverlayLane::Untracked)
 }
 
 #[derive(Clone)]
@@ -593,11 +584,11 @@ fn visible_live_row_from_pending(
         file_id: pending.file_id.clone(),
         version_id: pending.version_id.clone(),
         global: pending.version_id == GLOBAL_VERSION_ID,
-        untracked: matches!(pending.storage, PendingSemanticStorage::Untracked),
+        untracked: pending.untracked,
         plugin_key: pending.plugin_key.clone(),
         metadata: pending.metadata.clone(),
         writer_key: None,
-        change_id: None,
+        change_id: pending.change_id.clone(),
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
         normalized_values: access.normalized_values(pending.snapshot_content.as_deref())?,

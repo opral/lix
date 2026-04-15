@@ -17,7 +17,7 @@ use crate::sql::PendingOverlayFilter;
 use crate::sql::{
     resolve_placeholder_index, CanonicalStateRowKey, PlaceholderState, PlannedWrite, ScopeProof,
 };
-use crate::transaction::{PendingOverlay, PendingSemanticStorage};
+use crate::transaction::PendingOverlay;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 
@@ -234,13 +234,7 @@ async fn scan_selector_lane(
         return Ok(lane_rows);
     };
 
-    let pending_storage = if lane.is_untracked() {
-        PendingSemanticStorage::Untracked
-    } else {
-        PendingSemanticStorage::Tracked
-    };
-
-    for pending in pending_overlay.visible_semantic_rows(pending_storage, schema_key) {
+    for pending in pending_overlay.visible_semantic_rows(lane.is_untracked(), schema_key) {
         if pending.version_id != storage_version_id
             || !crate::live_state::matches_constraints(
                 &pending.entity_id,

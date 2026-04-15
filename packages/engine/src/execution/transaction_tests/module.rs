@@ -1,14 +1,12 @@
 use std::sync::{Arc, Mutex};
 
 use crate::backend::execute_ddl_batch;
-use crate::live_state::tracked::{
-    load_exact_row_with_backend, ExactTrackedRowRequest, TrackedWriteOperation, TrackedWriteRow,
-};
+use crate::live_state::tracked::{load_exact_row_with_backend, ExactTrackedRowRequest};
 use crate::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
-    UntrackedWriteOperation, UntrackedWriteRow,
 };
 use crate::live_state::writer_key::WRITER_KEY_TABLE;
+use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
@@ -173,6 +171,7 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
 }
 
 async fn init_workspace(backend: &dyn LixBackend) -> Result<(), LixError> {
+    crate::canonical::init(backend).await?;
     let workspace_metadata_table = "lix_workspace_metadata";
     let statements = [
         format!(
@@ -198,19 +197,15 @@ async fn init_workspace(backend: &dyn LixBackend) -> Result<(), LixError> {
     execute_ddl_batch(backend, "workspace", &statement_refs).await
 }
 
-fn tracked_row(
-    entity_id: &str,
-    child_id: &str,
-    change_id: &str,
-    timestamp: &str,
-) -> TrackedWriteRow {
-    TrackedWriteRow {
+fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str) -> LiveWriteRow {
+    LiveWriteRow {
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
         schema_version: "1".to_string(),
         file_id: "lix".to_string(),
         version_id: "main".to_string(),
         global: false,
+        untracked: false,
         plugin_key: "lix".to_string(),
         metadata: Some("{\"kind\":\"txn-module\"}".to_string()),
         change_id: change_id.to_string(),
@@ -220,7 +215,7 @@ fn tracked_row(
         )),
         created_at: Some(timestamp.to_string()),
         updated_at: timestamp.to_string(),
-        operation: TrackedWriteOperation::Upsert,
+        operation: LiveWriteOperation::Upsert,
     }
 }
 
@@ -228,23 +223,25 @@ fn local_version_head_untracked_write_row(
     version_id: &str,
     commit_id: &str,
     timestamp: &str,
-) -> UntrackedWriteRow {
-    UntrackedWriteRow {
+) -> LiveWriteRow {
+    LiveWriteRow {
         entity_id: version_id.to_string(),
         schema_key: "lix_version_ref".to_string(),
         schema_version: "1".to_string(),
         file_id: "lix".to_string(),
         version_id: GLOBAL_VERSION_ID.to_string(),
         global: true,
+        untracked: true,
         plugin_key: "lix".to_string(),
         metadata: None,
+        change_id: format!("change-version-ref::{version_id}::{commit_id}::{timestamp}"),
         writer_key: None,
         snapshot_content: Some(format!(
             "{{\"id\":\"{version_id}\",\"commit_id\":\"{commit_id}\"}}"
         )),
         created_at: Some(timestamp.to_string()),
         updated_at: timestamp.to_string(),
-        operation: UntrackedWriteOperation::Upsert,
+        operation: LiveWriteOperation::Upsert,
     }
 }
 
@@ -270,10 +267,10 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
         .expect("untracked schema registration should stage");
     write_tx
         .stage(TransactionDelta {
-            tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![local_version_head_untracked_write_row(
-                "main", "commit-1", timestamp,
-            )],
+            writes: vec![
+                tracked_row("edge-1", "child-1", "change-1", timestamp),
+                local_version_head_untracked_write_row("main", "commit-1", timestamp),
+            ],
         })
         .expect("staging should succeed");
 
@@ -318,6 +315,38 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
         version_ref.property_text("commit_id").as_deref(),
         Some("commit-1")
     );
+
+    let version_ref_change = backend
+        .execute(
+            "SELECT change_id \
+             FROM lix_internal_live_v1_lix_version_ref \
+             WHERE entity_id = 'main' \
+               AND version_id = 'global' \
+               AND untracked = true \
+             LIMIT 1",
+            &[],
+        )
+        .await
+        .expect("untracked live row change_id lookup should succeed");
+    assert_eq!(version_ref_change.rows.len(), 1);
+    match &version_ref_change.rows[0][0] {
+        Value::Text(value) => assert!(!value.is_empty()),
+        other => panic!("expected text untracked change_id, got {other:?}"),
+    }
+
+    let canonical = backend
+        .execute(
+            "SELECT COUNT(*) \
+             FROM lix_internal_change \
+             WHERE schema_key = 'lix_version_ref' \
+               AND entity_id = 'main' \
+               AND untracked = true",
+            &[],
+        )
+        .await
+        .expect("canonical untracked change lookup should succeed");
+    assert_eq!(canonical.rows.len(), 1);
+    assert_eq!(canonical.rows[0][0], Value::Integer(1));
 }
 
 #[tokio::test]
@@ -339,16 +368,14 @@ async fn isolated_transaction_rejects_staging_after_execute() {
         .expect("tracked schema registration should stage");
     write_tx
         .stage(TransactionDelta {
-            tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: Vec::<UntrackedWriteRow>::new(),
+            writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
         })
         .expect("staging should succeed");
 
     write_tx.execute().await.expect("execute should succeed");
     let error = write_tx
         .stage(TransactionDelta {
-            tracked_writes: vec![tracked_row("edge-2", "child-2", "change-2", timestamp)],
-            untracked_writes: Vec::new(),
+            writes: vec![tracked_row("edge-2", "child-2", "change-2", timestamp)],
         })
         .expect_err("staging after execute must fail");
 
@@ -379,10 +406,10 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
         .expect("untracked schema registration should stage");
     write_tx
         .stage(TransactionDelta {
-            tracked_writes: vec![tracked_row("edge-1", "child-1", "change-1", timestamp)],
-            untracked_writes: vec![local_version_head_untracked_write_row(
-                "main", "commit-1", timestamp,
-            )],
+            writes: vec![
+                tracked_row("edge-1", "child-1", "change-1", timestamp),
+                local_version_head_untracked_write_row("main", "commit-1", timestamp),
+            ],
         })
         .expect("staging should succeed");
 

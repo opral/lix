@@ -24,12 +24,6 @@ pub(crate) struct BufferedWriteTransaction<'a> {
     latest_canonical_commit_receipt: Option<CanonicalCommitProjectionReceipt>,
 }
 
-pub(crate) struct BorrowedBufferedWriteTransaction<'tx> {
-    backend_txn: &'tx mut dyn LixBackendTransaction,
-    buffered_write_state: BufferedWriteState,
-    pending_commit_state: Option<PendingCommitState>,
-}
-
 impl<'a> BufferedWriteTransaction<'a> {
     pub(crate) fn new(backend_txn: Box<dyn LixBackendTransaction + 'a>) -> Self {
         Self {
@@ -197,107 +191,6 @@ impl<'a> BufferedWriteTransaction<'a> {
 impl PreparedWriteStatementStager for BufferedWriteTransaction<'_> {
     fn mark_public_surface_registry_refresh_pending(&mut self) {
         Self::mark_public_surface_registry_refresh_pending(self);
-    }
-
-    fn stage_transaction_write_delta(
-        &mut self,
-        delta: TransactionWriteDelta,
-    ) -> Result<(), LixError> {
-        Self::stage_transaction_write_delta(self, delta)
-    }
-}
-
-impl<'tx> BorrowedBufferedWriteTransaction<'tx> {
-    pub(crate) fn new(backend_txn: &'tx mut dyn LixBackendTransaction) -> Self {
-        Self {
-            backend_txn,
-            buffered_write_state: BufferedWriteState::default(),
-            pending_commit_state: None,
-        }
-    }
-
-    pub(crate) fn backend_transaction_mut(&mut self) -> &mut dyn LixBackendTransaction {
-        &mut *self.backend_txn
-    }
-
-    pub(crate) fn buffered_write_journal_is_empty(&self) -> bool {
-        self.buffered_write_state.journal_is_empty()
-    }
-
-    pub(crate) fn buffered_write_pending_write_overlay(
-        &self,
-    ) -> Result<Option<PendingWriteOverlay>, LixError> {
-        self.buffered_write_state.pending_write_overlay()
-    }
-
-    pub(crate) fn can_stage_transaction_write_delta(
-        &self,
-        delta: &TransactionWriteDelta,
-    ) -> Result<bool, LixError> {
-        self.buffered_write_state.can_stage_delta(delta)
-    }
-
-    pub(crate) fn stage_transaction_write_delta(
-        &mut self,
-        delta: TransactionWriteDelta,
-    ) -> Result<(), LixError> {
-        self.buffered_write_state.stage_delta(delta)
-    }
-
-    pub(crate) fn clear_pending_commit_state(&mut self) {
-        self.pending_commit_state = None;
-    }
-
-    pub(crate) fn pending_commit_state_mut(&mut self) -> &mut Option<PendingCommitState> {
-        &mut self.pending_commit_state
-    }
-
-    pub(crate) async fn flush_journal(
-        &mut self,
-        execution_context: &dyn WriteExecutionContext,
-        execution_input: &mut BufferedWriteExecutionInput,
-    ) -> Result<(), LixError> {
-        let Some(delta) = self.buffered_write_state.take_staged_delta() else {
-            return Ok(());
-        };
-        let mut latest_canonical_commit_receipt = None;
-        apply_schema_registrations_in_transaction(self.backend_txn, delta.schema_registrations())
-            .await?;
-        let write_outcome = delta
-            .execute(
-                execution_context,
-                self.backend_txn,
-                Some(&mut self.pending_commit_state),
-            )
-            .await?;
-        apply_buffered_write_execution_outcome(
-            &mut self.buffered_write_state,
-            &mut latest_canonical_commit_receipt,
-            execution_input,
-            write_outcome,
-        );
-        Ok(())
-    }
-
-    pub(crate) fn buffered_write_commit_outcome_mut(&mut self) -> &mut TransactionCommitOutcome {
-        self.buffered_write_state.commit_outcome_mut()
-    }
-
-    pub(crate) fn mark_public_surface_registry_refresh_pending(&mut self) {
-        self.buffered_write_state
-            .mark_public_surface_registry_refresh_pending();
-    }
-
-    pub(crate) fn mark_installed_plugins_cache_invalidation_pending(&mut self) {
-        self.buffered_write_state
-            .mark_installed_plugins_cache_invalidation_pending();
-    }
-}
-
-impl PreparedWriteStatementStager for BorrowedBufferedWriteTransaction<'_> {
-    fn mark_public_surface_registry_refresh_pending(&mut self) {
-        self.buffered_write_state
-            .mark_public_surface_registry_refresh_pending();
     }
 
     fn stage_transaction_write_delta(

@@ -12,7 +12,6 @@ pub(crate) use direct_execution::{
     WriteExecutionOutcome,
 };
 pub(crate) use execution::{
-    execute_parsed_statements_in_borrowed_write_transaction,
     execute_parsed_statements_in_write_transaction, execute_statement_batch_with_write_transaction,
 };
 pub(crate) use execution_effects::{command_metadata, complete_sql_command_execution};

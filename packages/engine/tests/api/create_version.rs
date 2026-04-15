@@ -254,7 +254,9 @@ simulation_test!(create_version_rejects_invalid_inputs, |sim| async move {
         })
         .await
         .expect_err("empty version id should fail");
-    assert!(empty_id.description.contains("id must be a non-empty string"));
+    assert!(empty_id
+        .description
+        .contains("id must be a non-empty string"));
 
     let empty_name = engine
         .create_version(CreateVersionOptions {
@@ -263,7 +265,9 @@ simulation_test!(create_version_rejects_invalid_inputs, |sim| async move {
         })
         .await
         .expect_err("empty version name should fail");
-    assert!(empty_name.description.contains("name must be a non-empty string"));
+    assert!(empty_name
+        .description
+        .contains("name must be a non-empty string"));
 
     let reserved = engine
         .create_version(CreateVersionOptions {

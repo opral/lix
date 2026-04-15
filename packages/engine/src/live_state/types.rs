@@ -6,11 +6,7 @@ use crate::common::Value;
 use crate::live_state::tracked::TrackedRow;
 #[cfg(test)]
 use crate::live_state::tracked::TrackedTombstoneMarker;
-#[cfg(test)]
-use crate::live_state::tracked::TrackedWriteRow;
 use crate::live_state::untracked::UntrackedRow;
-#[cfg(test)]
-use crate::live_state::untracked::UntrackedWriteRow;
 use crate::version::CommittedVersionFrontier;
 
 use super::constraints::{ScanConstraint, ScanField, ScanOperator};
@@ -73,6 +69,32 @@ pub struct LiveSnapshotRow {
     pub metadata: Option<String>,
     pub source_change_id: Option<String>,
     pub snapshot: JsonValue,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum LiveWriteOperation {
+    Upsert,
+    Tombstone,
+    Delete,
+}
+
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct LiveWriteRow {
+    pub entity_id: String,
+    pub schema_key: String,
+    pub schema_version: String,
+    pub file_id: String,
+    pub version_id: String,
+    pub global: bool,
+    pub untracked: bool,
+    pub plugin_key: String,
+    pub metadata: Option<String>,
+    pub change_id: String,
+    pub writer_key: Option<String>,
+    pub snapshot_content: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: String,
+    pub operation: LiveWriteOperation,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -326,17 +348,7 @@ pub struct RowIdentity {
 
 impl RowIdentity {
     #[cfg(test)]
-    pub fn from_tracked_write(row: &TrackedWriteRow) -> Self {
-        Self {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        }
-    }
-
-    #[cfg(test)]
-    pub fn from_untracked_write(row: &UntrackedWriteRow) -> Self {
+    pub fn from_live_write(row: &LiveWriteRow) -> Self {
         Self {
             schema_key: row.schema_key.clone(),
             version_id: row.version_id.clone(),

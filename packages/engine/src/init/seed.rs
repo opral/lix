@@ -1,21 +1,25 @@
 use std::collections::BTreeMap;
 
-use crate::backend::QueryExecutor;
+use crate::backend::{transaction_backend_view, QueryExecutor};
 use crate::canonical::{
-    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
+    append_changes, load_exact_committed_change_from_commit_with_executor,
+    ExactCommittedStateRowRequest, UpdatedVersionRef,
 };
 use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
     key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
-    write_live_rows, LiveRow,
+    load_exact_live_row, load_version_head_commit_id_with_executor,
+    load_version_head_commit_map_with_executor, write_live_rows, ExactLiveRowQuery, LiveRow,
+    LiveRowSource,
 };
-use crate::sql::parse_sql;
+use crate::session::{
+    canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
+};
 use crate::transaction::{
-    execute_parsed_statements_in_borrowed_write_transaction, BorrowedBufferedWriteTransaction,
-    SessionCompilerCache, SessionCompilerState,
+    upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,
 };
+use crate::transaction::{SessionCompilerCache, SessionCompilerState};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
@@ -25,10 +29,11 @@ use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) const LIX_ID_KEY: &str = "lix_id";
+const BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP: &str = "1970-01-01T00:00:00Z";
 
 pub(crate) struct InitExecutor<'engine, 'tx> {
     lix: &'engine Lix,
-    write_transaction: BorrowedBufferedWriteTransaction<'tx>,
+    backend_transaction: &'tx mut dyn LixBackendTransaction,
     context: SessionCompilerState,
 }
 
@@ -39,7 +44,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<Self, LixError> {
         Ok(Self {
             lix,
-            write_transaction: BorrowedBufferedWriteTransaction::new(transaction),
+            backend_transaction: transaction,
             context: SessionCompilerState::new(
                 None,
                 lix.engine().public_surface_registry(),
@@ -54,53 +59,25 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         self.lix.boot_key_values()
     }
 
-    pub(crate) async fn execute_internal(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<crate::ExecuteResult, LixError> {
-        let parsed_statements = parse_sql(sql).map_err(LixError::from)?;
-        let result = execute_parsed_statements_in_borrowed_write_transaction(
-            self.lix.engine().as_ref(),
-            &mut self.write_transaction,
-            parsed_statements,
-            params,
-            true,
-            &mut self.context,
-            None,
-        )
-        .await?;
-        let mut execution_input = self.context.buffered_write_execution_input();
-        self.write_transaction
-            .flush_journal(self.lix.engine().as_ref(), &mut execution_input)
-            .await?;
-        self.context
-            .apply_buffered_write_execution_input(&execution_input);
-        Ok(result)
-    }
-
     pub(crate) async fn execute_backend(
         &mut self,
         sql: &str,
         params: &[Value],
     ) -> Result<QueryResult, LixError> {
-        self.write_transaction
-            .backend_transaction_mut()
-            .execute(sql, params)
-            .await
+        self.backend_transaction.execute(sql, params).await
     }
 
     pub(crate) fn backend_transaction_mut(
         &mut self,
     ) -> Result<&mut dyn LixBackendTransaction, LixError> {
-        Ok(self.write_transaction.backend_transaction_mut())
+        Ok(&mut *self.backend_transaction)
     }
 
     pub(crate) async fn generate_runtime_uuid(&mut self) -> Result<String, LixError> {
         let function_bindings = self.ensure_function_bindings().await?;
         let mut runtime_functions = function_bindings.provider().clone();
         crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
-            self.write_transaction.backend_transaction_mut(),
+            self.backend_transaction,
             &mut runtime_functions,
         )
         .await?;
@@ -111,7 +88,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let function_bindings = self.ensure_function_bindings().await?;
         let mut runtime_functions = function_bindings.provider().clone();
         crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
-            self.write_transaction.backend_transaction_mut(),
+            self.backend_transaction,
             &mut runtime_functions,
         )
         .await?;
@@ -123,7 +100,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             return Ok(());
         };
         crate::transaction::persist_runtime_sequence_in_transaction(
-            self.write_transaction.backend_transaction_mut(),
+            self.backend_transaction,
             function_bindings.provider(),
         )
         .await
@@ -133,9 +110,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         if let Some(function_bindings) = self.context.function_bindings().cloned() {
             return Ok(function_bindings);
         }
-        let backend = crate::backend::transaction_backend_view(
-            self.write_transaction.backend_transaction_mut(),
-        );
+        let backend = crate::backend::transaction_backend_view(self.backend_transaction);
         let functions = self
             .lix
             .engine()
@@ -151,9 +126,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn load_latest_commit_id(&mut self) -> Result<Option<String>, LixError> {
-        let mut backend = crate::backend::transaction_backend_view(
-            self.write_transaction.backend_transaction_mut(),
-        );
+        let mut backend = crate::backend::transaction_backend_view(self.backend_transaction);
         if let Some(commit_id) =
             load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         {
@@ -188,9 +161,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     }
 
     pub(crate) async fn load_global_version_commit_id(&mut self) -> Result<String, LixError> {
-        let mut backend = crate::backend::transaction_backend_view(
-            self.write_transaction.backend_transaction_mut(),
-        );
+        let mut backend = crate::backend::transaction_backend_view(self.backend_transaction);
         let Some(commit_id) =
             load_version_head_commit_id_with_executor(&mut backend, GLOBAL_VERSION_ID).await?
         else {
@@ -207,12 +178,40 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         &mut self,
         commit_id: &str,
     ) -> Result<Option<String>, LixError> {
-        let mut backend = crate::backend::transaction_backend_view(
-            self.write_transaction.backend_transaction_mut(),
-        );
+        let mut backend = crate::backend::transaction_backend_view(self.backend_transaction);
         crate::canonical::resolve_last_checkpoint_commit_id_for_tip_with_executor(
             &mut backend,
             commit_id,
+        )
+        .await
+    }
+
+    async fn load_exact_bootstrap_live_row(
+        &mut self,
+        source: LiveRowSource,
+        schema_key: &str,
+        entity_id: &str,
+        version_id: &str,
+        file_id: &str,
+    ) -> Result<Option<LiveRow>, LixError> {
+        let backend = transaction_backend_view(self.backend_transaction_mut()?);
+        load_exact_live_row(
+            &backend,
+            &ExactLiveRowQuery {
+                source,
+                schema_key: schema_key.to_string(),
+                version_id: version_id.to_string(),
+                entity_id: entity_id.to_string(),
+                file_id: Some(file_id.to_string()),
+                schema_version: None,
+                plugin_key: None,
+                writer_key: None,
+                global: Some(version_id == GLOBAL_VERSION_ID),
+                untracked: Some(matches!(source, LiveRowSource::Untracked)),
+                include_tombstones: false,
+                include_global_overlay: true,
+                include_untracked_overlay: true,
+            },
         )
         .await
     }
@@ -226,25 +225,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 })?;
             let entity_id = builtin_schema_entity_id(schema)?;
 
-            let existing = self
-                .execute_internal(
-                    "SELECT 1 FROM lix_state_by_version \
-                     WHERE schema_key = 'lix_registered_schema' \
-                       AND entity_id = $1 \
-                       AND version_id = 'global' \
-                       AND snapshot_content IS NOT NULL \
-                     LIMIT 1",
-                    &[Value::Text(entity_id.clone())],
+            if self
+                .load_exact_bootstrap_live_row(
+                    LiveRowSource::Untracked,
+                    "lix_registered_schema",
+                    &entity_id,
+                    GLOBAL_VERSION_ID,
+                    "lix",
                 )
-                .await?;
-            let [statement] = existing.statements.as_slice() else {
-                return Err(crate::common::unexpected_statement_count_error(
-                    "builtin schema existence query",
-                    1,
-                    existing.statements.len(),
-                ));
-            };
-            if !statement.rows.is_empty() {
+                .await?
+                .is_some()
+            {
                 continue;
             }
 
@@ -252,14 +243,55 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 "value": schema
             })
             .to_string();
-            self.execute_internal(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, created_at, updated_at, untracked\
-                 ) VALUES ($1, 'lix_registered_schema', 'lix', 'global', 'lix', $2, '1', '1970-01-01T00:00:00Z', '1970-01-01T00:00:00Z', true)",
-                &[
-                    Value::Text(entity_id),
-                    Value::Text(snapshot_content),
-                ],
+            let change_id = self.generate_runtime_uuid().await?;
+            self.insert_change_row_for_snapshot(
+                &entity_id,
+                "lix_registered_schema",
+                "1",
+                "lix",
+                "lix",
+                &snapshot_content,
+                &change_id,
+                BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP,
+                true,
+            )
+            .await?;
+
+            write_live_rows(
+                self.backend_transaction_mut()?,
+                &[LiveRow {
+                    entity_id: entity_id.clone(),
+                    schema_key: "lix_registered_schema".to_string(),
+                    schema_version: "1".to_string(),
+                    file_id: "lix".to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    plugin_key: "lix".to_string(),
+                    metadata: None,
+                    change_id: Some(change_id.clone()),
+                    writer_key: None,
+                    global: true,
+                    untracked: true,
+                    created_at: Some(BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP.to_string()),
+                    updated_at: Some(BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP.to_string()),
+                    snapshot_content: Some(snapshot_content.clone()),
+                }],
+            )
+            .await?;
+
+            upsert_registered_schema_mirror_row_in_transaction(
+                self.backend_transaction_mut()?,
+                RegisteredSchemaMirrorRow {
+                    entity_id: &entity_id,
+                    schema_version: "1",
+                    file_id: "lix",
+                    version_id: GLOBAL_VERSION_ID,
+                    plugin_key: "lix",
+                    snapshot_content: Some(&snapshot_content),
+                    metadata: None,
+                    change_id: &change_id,
+                    untracked: true,
+                    created_at: BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP,
+                },
             )
             .await?;
         }
@@ -413,26 +445,37 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         version_id: &str,
         commit_id: &str,
     ) -> Result<(), LixError> {
+        let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
-        let row = LiveRow {
-            entity_id: version_id.to_string(),
-            schema_key: crate::version::version_ref_schema_key().to_string(),
-            schema_version: crate::version::version_ref_schema_version().to_string(),
-            file_id: crate::version::version_ref_file_id().to_string(),
-            version_id: crate::version::version_ref_storage_version_id().to_string(),
-            plugin_key: crate::version::version_ref_plugin_key().to_string(),
-            metadata: None,
-            change_id: None,
-            writer_key: None,
-            global: true,
-            untracked: true,
-            created_at: Some(timestamp.clone()),
-            updated_at: Some(timestamp),
-            snapshot_content: Some(crate::version::version_ref_snapshot_content(
-                version_id, commit_id,
-            )),
+        let update = UpdatedVersionRef {
+            version_id: version_id
+                .to_string()
+                .try_into()
+                .map_err(|error: LixError| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "init bootstrap version_ref version_id '{version_id}' is invalid: {}",
+                            error.description
+                        ),
+                    )
+                })?,
+            commit_id: commit_id.to_string(),
+            change_id,
+            created_at: timestamp,
         };
-        write_live_rows(self.backend_transaction_mut()?, &[row]).await
+        let canonical_changes = canonical_changes_from_updated_version_refs(&[update.clone()])?;
+        let live_rows = untracked_live_rows_from_updated_version_refs(&[update]);
+        let function_bindings = self.ensure_function_bindings().await?;
+        let mut runtime_functions = function_bindings.provider().clone();
+        append_changes(
+            self.backend_transaction_mut()?,
+            &canonical_changes,
+            &mut runtime_functions,
+        )
+        .await?;
+        write_live_rows(self.backend_transaction_mut()?, &live_rows).await?;
+        Ok(())
     }
 
     pub(crate) async fn seed_commit_graph_nodes(&mut self) -> Result<(), LixError> {
@@ -499,6 +542,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &snapshot_content,
             &change_id,
             &timestamp,
+            false,
         )
         .await?;
         self.add_change_id_to_commit(initial_commit_id, &change_id)
@@ -546,6 +590,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &snapshot_content,
             &change_id,
             &timestamp,
+            false,
         )
         .await?;
         Ok(())
@@ -584,6 +629,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &snapshot_content,
             &change_id,
             &timestamp,
+            false,
         )
         .await?;
         Ok(())
@@ -600,39 +646,24 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
     pub(crate) async fn seed_default_checkpoint_label(&mut self) -> Result<(), LixError> {
         let bootstrap_commit_id = self.load_global_version_commit_id().await?;
-        let existing = self
-            .execute_internal(
-                "SELECT snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = $2 \
-                   AND entity_id = $1 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
-                 ORDER BY updated_at DESC, created_at DESC, change_id DESC \
-                 LIMIT 1",
-                &[
-                    Value::Text(crate::canonical::CHECKPOINT_LABEL_ID.to_string()),
-                    Value::Text(crate::canonical::CHECKPOINT_LABEL_SCHEMA_KEY.to_string()),
-                ],
+        if let Some(row) = self
+            .load_exact_bootstrap_live_row(
+                LiveRowSource::Tracked,
+                crate::canonical::CHECKPOINT_LABEL_SCHEMA_KEY,
+                crate::canonical::CHECKPOINT_LABEL_ID,
+                GLOBAL_VERSION_ID,
+                "lix",
             )
-            .await?;
-        let [statement] = existing.statements.as_slice() else {
-            return Err(crate::common::unexpected_statement_count_error(
-                "default checkpoint label query",
-                1,
-                existing.statements.len(),
-            ));
-        };
-        if let Some(row) = statement.rows.first() {
-            let Some(Value::Text(snapshot_content)) = row.first() else {
+            .await?
+        {
+            let Some(snapshot_content) = row.snapshot_content.as_deref() else {
                 return Err(LixError::new(
                     "LIX_ERROR_UNKNOWN",
                     "checkpoint label snapshot_content must be text",
                 ));
             };
-            let parsed: serde_json::Value = serde_json::from_str(snapshot_content.as_str())
-                .map_err(|error| LixError {
+            let parsed: serde_json::Value =
+                serde_json::from_str(snapshot_content).map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("checkpoint label snapshot invalid JSON: {error}"),
                 })?;
@@ -682,30 +713,17 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
     ) -> Result<(), LixError> {
         let entity_label_id =
             crate::canonical::checkpoint_commit_label_entity_id(bootstrap_commit_id);
-        let existing = self
-            .execute_internal(
-                "SELECT 1 \
-                 FROM lix_state_by_version \
-                 WHERE entity_id = $1 \
-                   AND schema_key = $2 \
-                   AND file_id = 'lix' \
-                   AND version_id = 'global' \
-                   AND snapshot_content IS NOT NULL \
-                 LIMIT 1",
-                &[
-                    Value::Text(entity_label_id.clone()),
-                    Value::Text(crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string()),
-                ],
+        if self
+            .load_exact_bootstrap_live_row(
+                LiveRowSource::Tracked,
+                crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
+                &entity_label_id,
+                GLOBAL_VERSION_ID,
+                "lix",
             )
-            .await?;
-        let [statement] = existing.statements.as_slice() else {
-            return Err(crate::common::unexpected_statement_count_error(
-                "checkpoint label bootstrap link existence query",
-                1,
-                existing.statements.len(),
-            ));
-        };
-        if !statement.rows.is_empty() {
+            .await?
+            .is_some()
+        {
             return Ok(());
         }
 
@@ -1029,6 +1047,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             snapshot_content,
             &change_id,
             &timestamp,
+            false,
         )
         .await?;
 
@@ -1049,6 +1068,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         plugin_key: &str,
         snapshot_content: &str,
     ) -> Result<(), LixError> {
+        let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = LiveRow {
             entity_id: entity_id.to_string(),
@@ -1058,7 +1078,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             version_id: version_id.to_string(),
             plugin_key: plugin_key.to_string(),
             metadata: None,
-            change_id: None,
+            change_id: Some(change_id.clone()),
             writer_key: None,
             global: version_id == GLOBAL_VERSION_ID,
             untracked: true,
@@ -1066,6 +1086,20 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             updated_at: Some(timestamp),
             snapshot_content: Some(snapshot_content.to_string()),
         };
+        self.insert_change_row_for_snapshot(
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            plugin_key,
+            snapshot_content,
+            &change_id,
+            row.created_at
+                .as_deref()
+                .expect("bootstrap untracked timestamp should exist"),
+            true,
+        )
+        .await?;
         write_live_rows(self.backend_transaction_mut()?, &[row]).await?;
         Ok(())
     }
@@ -1080,6 +1114,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         snapshot_content: &str,
         change_id: &str,
         created_at: &str,
+        untracked: bool,
     ) -> Result<(), LixError> {
         let snapshot_id = format!("{change_id}~snapshot");
         self.execute_backend(
@@ -1094,9 +1129,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         self.execute_backend(
             "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
+             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at\
              ) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8 \
+             SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8, $9 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
             &[
                 Value::Text(change_id.to_string()),
@@ -1106,6 +1141,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 Value::Text(file_id.to_string()),
                 Value::Text(plugin_key.to_string()),
                 Value::Text(snapshot_id),
+                Value::Boolean(untracked),
                 Value::Text(created_at.to_string()),
             ],
         )

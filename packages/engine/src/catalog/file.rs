@@ -244,14 +244,10 @@ fn derive_file_rows_for_versions(
                 .as_deref()
                 .and_then(|hash| input.context().blob_data(hash))
                 .map(|value| value.to_vec());
-            let commit_id = if descriptor.storage() == CatalogProjectionStorageKind::Untracked {
-                Some("untracked".to_string())
-            } else {
-                descriptor
-                    .change_id()
-                    .and_then(|change_id| input.context().commit_id_for_change(change_id))
-                    .map(str::to_string)
-            };
+            let commit_id = descriptor
+                .change_id()
+                .and_then(|change_id| input.context().commit_id_for_change(change_id))
+                .map(str::to_string);
 
             rows.push(DerivedFileRow {
                 identity: descriptor.identity().clone(),
@@ -454,10 +450,7 @@ fn file_row_to_surface(
     active_commit_id: Option<&str>,
 ) -> CatalogDerivedRow {
     let identity = row.identity.clone();
-    let commit_id = active_commit_id
-        .map(str::to_string)
-        .or(row.commit_id)
-        .unwrap_or_default();
+    let commit_id = active_commit_id.map(str::to_string).or(row.commit_id);
     CatalogDerivedRow::new(
         surface_name,
         BTreeMap::from([
@@ -509,7 +502,10 @@ fn file_row_to_surface(
                 "lixcol_updated_at".to_string(),
                 row.updated_at.map(Value::Text).unwrap_or(Value::Null),
             ),
-            ("lixcol_commit_id".to_string(), Value::Text(commit_id)),
+            (
+                "lixcol_commit_id".to_string(),
+                commit_id.map(Value::Text).unwrap_or(Value::Null),
+            ),
             (
                 "lixcol_writer_key".to_string(),
                 row.writer_key.map(Value::Text).unwrap_or(Value::Null),
@@ -819,6 +815,103 @@ mod tests {
         assert_eq!(
             derived[0].values.get("lixcol_version_id"),
             Some(&Value::Text("main".to_string()))
+        );
+    }
+
+    #[test]
+    fn by_version_file_projection_leaves_untracked_commit_id_null() {
+        let projection = LixFileByVersionProjection;
+        let input = CatalogProjectionInput::with_context(
+            vec![
+                CatalogProjectionInputRows::new(
+                    local_frontier_tracked(FILE_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    local_frontier_untracked(FILE_DESCRIPTOR_SCHEMA_KEY),
+                    vec![sample_row(
+                        CatalogProjectionStorageKind::Untracked,
+                        FILE_DESCRIPTOR_SCHEMA_KEY,
+                        "main",
+                        "file-untracked-1",
+                        "lix",
+                        BTreeMap::from([
+                            (
+                                "id".to_string(),
+                                Value::Text("file-untracked-1".to_string()),
+                            ),
+                            ("directory_id".to_string(), Value::Null),
+                            ("name".to_string(), Value::Text("scratch".to_string())),
+                            ("extension".to_string(), Value::Null),
+                            ("metadata".to_string(), Value::Null),
+                            ("hidden".to_string(), Value::Boolean(false)),
+                        ]),
+                    )
+                    .with_live_metadata(
+                        "1",
+                        "lix",
+                        None,
+                        Some("change-untracked-1".to_string()),
+                        None,
+                        false,
+                        Some("2026-04-10T00:00:00Z".to_string()),
+                        Some("2026-04-10T00:00:00Z".to_string()),
+                    )],
+                ),
+                CatalogProjectionInputRows::new(global_tracked(FILE_DESCRIPTOR_SCHEMA_KEY), vec![]),
+                CatalogProjectionInputRows::new(
+                    global_untracked(FILE_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    local_frontier_tracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    local_frontier_untracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    global_tracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    global_untracked(DIRECTORY_DESCRIPTOR_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    local_frontier_tracked(BINARY_BLOB_REF_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(
+                    local_frontier_untracked(BINARY_BLOB_REF_SCHEMA_KEY),
+                    vec![],
+                ),
+                CatalogProjectionInputRows::new(global_tracked(BINARY_BLOB_REF_SCHEMA_KEY), vec![]),
+                CatalogProjectionInputRows::new(
+                    global_untracked(BINARY_BLOB_REF_SCHEMA_KEY),
+                    vec![],
+                ),
+            ],
+            CatalogProjectionContext {
+                requested_version_id: None,
+                current_committed_version_ids: vec!["main".to_string()],
+                current_version_heads: BTreeMap::new(),
+                change_commit_ids: BTreeMap::new(),
+                blob_data_by_hash: BTreeMap::new(),
+            },
+        );
+
+        let derived = projection.derive(&input).expect("derive should succeed");
+
+        assert_eq!(derived.len(), 1);
+        assert_eq!(
+            derived[0].values.get("lixcol_commit_id"),
+            Some(&Value::Null)
+        );
+        assert_eq!(
+            derived[0].values.get("lixcol_untracked"),
+            Some(&Value::Boolean(true))
         );
     }
 

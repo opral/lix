@@ -5,7 +5,6 @@ mod pending_write_overlay;
 
 pub(crate) use contracts::{
     PendingFilesystemDescriptorView, PendingFilesystemFileView, PendingOverlay, PendingSemanticRow,
-    PendingSemanticStorage,
 };
 #[cfg(test)]
 pub(crate) use pending_row_overlay::PendingRowOverlay;

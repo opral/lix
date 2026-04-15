@@ -16,7 +16,7 @@ pub(crate) const CHANGE_TABLE: &str = "lix_internal_change";
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
 const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
-const CHANGE_INSERT_PARAM_COLUMNS: usize = 9;
+const CHANGE_INSERT_PARAM_COLUMNS: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRow {
@@ -28,6 +28,7 @@ pub struct ChangeRow {
     pub plugin_key: CanonicalPluginKey,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
+    pub untracked: bool,
     pub created_at: String,
 }
 
@@ -52,6 +53,7 @@ struct CanonicalChangeInsertRow {
     plugin_key: String,
     snapshot_id: String,
     metadata: Option<String>,
+    untracked: bool,
     created_at: String,
 }
 
@@ -92,6 +94,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
                 .metadata
                 .as_ref()
                 .map(|value| value.as_str().to_string()),
+            untracked: change.untracked,
             created_at: change.created_at.clone(),
         });
     }
@@ -139,6 +142,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
             "plugin_key",
             "snapshot_id",
             "metadata",
+            "untracked",
             "created_at",
         ],
         &change_rows,
@@ -160,6 +164,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
                     params,
                     dialect,
                 ),
+                bool_param_value(row.untracked, next_placeholder, params, dialect),
                 text_param_value(&row.created_at, next_placeholder, params, dialect),
             ]
         },
@@ -260,4 +265,16 @@ fn optional_text_param_value(
         Some(value) => text_param_value(value, next_placeholder, params, dialect),
         None => "NULL".to_string(),
     }
+}
+
+fn bool_param_value(
+    value: bool,
+    next_placeholder: &mut usize,
+    params: &mut Vec<Value>,
+    dialect: SqlDialect,
+) -> String {
+    let index = *next_placeholder;
+    *next_placeholder += 1;
+    params.push(Value::Boolean(value));
+    dialect.placeholder(index)
 }

@@ -15,18 +15,16 @@ use super::tracked::{
     apply_write_batch_in_transaction as apply_tracked_write_batch_in_transaction,
     ExactTrackedRowRequest, TrackedScanRequest,
 };
-use super::tracked::{TrackedWriteOperation, TrackedWriteRow};
 use super::untracked::{
     apply_write_batch_in_transaction as apply_untracked_write_batch_in_transaction,
     load_exact_row_with_backend as load_exact_untracked_row_with_backend,
     scan_rows_with_backend as scan_untracked_rows_with_backend, ExactUntrackedRowRequest,
     UntrackedScanRequest,
 };
-use super::untracked::{UntrackedWriteOperation, UntrackedWriteRow};
 use super::{
     load_exact_tracked_row_with_backend, load_exact_tracked_tombstone_with_executor,
     load_exact_untracked_row_with_executor, scan_tracked_rows_with_backend,
-    scan_tracked_tombstones_with_executor, RowIdentity,
+    scan_tracked_tombstones_with_executor, LiveWriteOperation, LiveWriteRow, RowIdentity,
 };
 use crate::schema::{schema_key_from_definition, SchemaKey};
 use crate::version::GLOBAL_VERSION_ID;
@@ -189,15 +187,15 @@ pub async fn write_live_rows(
 
 fn partition_live_rows_for_write(
     rows: &[LiveRow],
-) -> Result<(Vec<TrackedWriteRow>, Vec<UntrackedWriteRow>), LixError> {
-    let mut tracked = Vec::<TrackedWriteRow>::new();
-    let mut untracked = Vec::<UntrackedWriteRow>::new();
+) -> Result<(Vec<LiveWriteRow>, Vec<LiveWriteRow>), LixError> {
+    let mut tracked = Vec::<LiveWriteRow>::new();
+    let mut untracked = Vec::<LiveWriteRow>::new();
 
     for row in rows {
         if row.untracked {
-            untracked.push(untracked_write_from_live_row(row)?);
+            untracked.push(live_write_from_live_row(row)?);
         } else {
-            tracked.push(tracked_write_from_live_row(row)?);
+            tracked.push(live_write_from_live_row(row)?);
         }
     }
 
@@ -819,7 +817,7 @@ fn untracked_row_to_row(
         version_id: row.version_id,
         plugin_key: row.plugin_key,
         metadata: row.metadata,
-        change_id: None,
+        change_id: Some(row.change_id),
         writer_key: row.writer_key,
         global: row.global,
         untracked: true,
@@ -890,12 +888,12 @@ fn default_true() -> bool {
     true
 }
 
-fn tracked_write_from_live_row(row: &LiveRow) -> Result<TrackedWriteRow, LixError> {
+fn live_write_from_live_row(row: &LiveRow) -> Result<LiveWriteRow, LixError> {
     let updated_at = row.updated_at.clone().ok_or_else(|| {
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "tracked live_state write for '{}:{}' requires updated_at",
+                "live_state write for '{}:{}' requires updated_at",
                 row.schema_key, row.entity_id
             ),
         )
@@ -904,19 +902,20 @@ fn tracked_write_from_live_row(row: &LiveRow) -> Result<TrackedWriteRow, LixErro
         LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!(
-                "tracked live_state write for '{}:{}' requires change_id",
+                "live_state write for '{}:{}' requires change_id",
                 row.schema_key, row.entity_id
             ),
         )
     })?;
 
-    Ok(TrackedWriteRow {
+    Ok(LiveWriteRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         schema_version: row.schema_version.clone(),
         file_id: row.file_id.clone(),
         version_id: row.version_id.clone(),
         global: row.global,
+        untracked: row.untracked,
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
         change_id,
@@ -925,41 +924,11 @@ fn tracked_write_from_live_row(row: &LiveRow) -> Result<TrackedWriteRow, LixErro
         created_at: row.created_at.clone(),
         updated_at,
         operation: if row.snapshot_content.is_some() {
-            TrackedWriteOperation::Upsert
+            LiveWriteOperation::Upsert
+        } else if row.untracked {
+            LiveWriteOperation::Delete
         } else {
-            TrackedWriteOperation::Tombstone
-        },
-    })
-}
-
-fn untracked_write_from_live_row(row: &LiveRow) -> Result<UntrackedWriteRow, LixError> {
-    let updated_at = row.updated_at.clone().ok_or_else(|| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "untracked live_state write for '{}:{}' requires updated_at",
-                row.schema_key, row.entity_id
-            ),
-        )
-    })?;
-
-    Ok(UntrackedWriteRow {
-        entity_id: row.entity_id.clone(),
-        schema_key: row.schema_key.clone(),
-        schema_version: row.schema_version.clone(),
-        file_id: row.file_id.clone(),
-        version_id: row.version_id.clone(),
-        global: row.global,
-        plugin_key: row.plugin_key.clone(),
-        metadata: row.metadata.clone(),
-        writer_key: row.writer_key.clone(),
-        snapshot_content: row.snapshot_content.clone(),
-        created_at: row.created_at.clone(),
-        updated_at,
-        operation: if row.snapshot_content.is_some() {
-            UntrackedWriteOperation::Upsert
-        } else {
-            UntrackedWriteOperation::Delete
+            LiveWriteOperation::Tombstone
         },
     })
 }
@@ -967,13 +936,12 @@ fn untracked_write_from_live_row(row: &LiveRow) -> Result<UntrackedWriteRow, Lix
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_registered_schema_row, exact_live_row_matches_query, load_exact_live_row,
-        partition_live_rows_for_write, tracked_write_from_live_row, untracked_write_from_live_row,
-        ExactLiveRowQuery, LiveRow, LiveRowSource,
+        decode_registered_schema_row, exact_live_row_matches_query, live_write_from_live_row,
+        load_exact_live_row, partition_live_rows_for_write, ExactLiveRowQuery, LiveRow,
+        LiveRowSource,
     };
     use crate::backend::TransactionBeginMode;
-    use crate::live_state::tracked::TrackedWriteOperation;
-    use crate::live_state::untracked::UntrackedWriteOperation;
+    use crate::live_state::LiveWriteOperation;
     use crate::live_state::ReplayCursor;
     use crate::live_state::{write_live_rows, LiveStateMode};
     use crate::schema::SchemaKey;
@@ -993,7 +961,7 @@ mod tests {
             version_id: "global".to_string(),
             plugin_key: "lix".to_string(),
             metadata: None,
-            change_id: None,
+            change_id: Some("chg_schema".to_string()),
             writer_key: None,
             global: true,
             untracked: false,
@@ -1064,46 +1032,46 @@ mod tests {
     fn tracked_write_uses_snapshot_none_as_tombstone() {
         let row = writable_live_row(false, None);
 
-        let write = tracked_write_from_live_row(&row).expect("tracked write should build");
+        let write = live_write_from_live_row(&row).expect("tracked write should build");
 
         assert_eq!(write.snapshot_content, None);
-        assert_eq!(write.operation, TrackedWriteOperation::Tombstone);
+        assert_eq!(write.operation, LiveWriteOperation::Tombstone);
     }
 
     #[test]
     fn tracked_write_uses_snapshot_some_as_upsert() {
         let row = writable_live_row(false, Some(r#"{"key":"theme","value":"dark"}"#));
 
-        let write = tracked_write_from_live_row(&row).expect("tracked write should build");
+        let write = live_write_from_live_row(&row).expect("tracked write should build");
 
         assert_eq!(
             write.snapshot_content,
             Some(r#"{"key":"theme","value":"dark"}"#.to_string())
         );
-        assert_eq!(write.operation, TrackedWriteOperation::Upsert);
+        assert_eq!(write.operation, LiveWriteOperation::Upsert);
     }
 
     #[test]
     fn untracked_write_uses_snapshot_none_as_delete() {
         let row = writable_live_row(true, None);
 
-        let write = untracked_write_from_live_row(&row).expect("untracked write should build");
+        let write = live_write_from_live_row(&row).expect("untracked write should build");
 
         assert_eq!(write.snapshot_content, None);
-        assert_eq!(write.operation, UntrackedWriteOperation::Delete);
+        assert_eq!(write.operation, LiveWriteOperation::Delete);
     }
 
     #[test]
     fn untracked_write_uses_snapshot_some_as_upsert() {
         let row = writable_live_row(true, Some(r#"{"key":"theme","value":"dark"}"#));
 
-        let write = untracked_write_from_live_row(&row).expect("untracked write should build");
+        let write = live_write_from_live_row(&row).expect("untracked write should build");
 
         assert_eq!(
             write.snapshot_content,
             Some(r#"{"key":"theme","value":"dark"}"#.to_string())
         );
-        assert_eq!(write.operation, UntrackedWriteOperation::Upsert);
+        assert_eq!(write.operation, LiveWriteOperation::Upsert);
     }
 
     #[test]
@@ -1116,11 +1084,18 @@ mod tests {
 
         assert_eq!(tracked_writes.len(), 1);
         assert_eq!(untracked_writes.len(), 1);
-        assert_eq!(tracked_writes[0].operation, TrackedWriteOperation::Upsert);
-        assert_eq!(
-            untracked_writes[0].operation,
-            UntrackedWriteOperation::Delete
-        );
+        assert_eq!(tracked_writes[0].operation, LiveWriteOperation::Upsert);
+        assert_eq!(untracked_writes[0].operation, LiveWriteOperation::Delete);
+    }
+
+    #[test]
+    fn untracked_write_requires_change_id() {
+        let mut row = writable_live_row(true, Some(r#"{"key":"theme","value":"dark"}"#));
+        row.change_id = None;
+
+        let error = live_write_from_live_row(&row).expect_err("missing change_id should fail");
+
+        assert!(error.description.contains("requires change_id"));
     }
 
     #[test]
@@ -1164,6 +1139,7 @@ mod tests {
                 snapshot_id: "snapshot-1",
                 snapshot_content: Some(r#"{"key":"theme","value":"canonical"}"#),
                 metadata: Some(r#"{"kind":"state"}"#),
+                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )
@@ -1183,6 +1159,7 @@ mod tests {
                     r#"{"id":"commit-1","change_set_id":"cs-1","change_ids":["change-1"],"parent_commit_ids":[]}"#,
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )

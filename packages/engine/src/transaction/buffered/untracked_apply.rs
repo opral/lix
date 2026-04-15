@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
-use crate::functions::LixFunctionProvider;
+use crate::canonical::append_changes;
+use crate::canonical::CanonicalChangeWrite;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::sql::PlannedStateRow;
 use crate::transaction::pipeline::WriteExecutionOutcome;
@@ -19,7 +20,6 @@ pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transac
     plan: &PlannedPublicUntrackedWriteUnit,
 ) -> Result<Option<WriteExecutionOutcome>, LixError> {
     let mut runtime_functions = plan.function_bindings.provider().clone();
-    let timestamp = runtime_functions.timestamp();
 
     if plan.execution.persist_filesystem_payloads_before_write {
         // Untracked filesystem writes materialize blob payloads eagerly, but keep
@@ -28,13 +28,15 @@ pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transac
 
     let rows = live_rows_from_planned_rows(
         &plan.execution.intended_post_state,
-        &timestamp,
+        &plan.canonical_changes,
         plan.writer_key.as_deref(),
     )?;
+    append_changes(transaction, &plan.canonical_changes, &mut runtime_functions).await?;
     write_live_rows(transaction, &rows).await?;
     mirror_registered_schema_planned_rows_in_transaction(
         transaction,
         &plan.execution.intended_post_state,
+        &plan.canonical_changes,
         true,
     )
     .await?;
@@ -96,17 +98,29 @@ pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transac
 
 fn live_rows_from_planned_rows(
     rows: &[PlannedStateRow],
-    timestamp: &str,
+    canonical_changes: &[CanonicalChangeWrite],
     execution_writer_key: Option<&str>,
 ) -> Result<Vec<LiveRow>, LixError> {
+    if rows.len() != canonical_changes.len() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "public untracked execution expected {} canonical changes for {} planned rows",
+                rows.len(),
+                canonical_changes.len()
+            ),
+        ));
+    }
+
     rows.iter()
-        .map(|row| live_row_from_planned_row(row, timestamp, execution_writer_key))
+        .zip(canonical_changes.iter())
+        .map(|(row, change)| live_row_from_planned_row(row, change, execution_writer_key))
         .collect()
 }
 
 fn live_row_from_planned_row(
     row: &PlannedStateRow,
-    timestamp: &str,
+    change: &CanonicalChangeWrite,
     execution_writer_key: Option<&str>,
 ) -> Result<LiveRow, LixError> {
     let file_id = planned_row_text_value(row, "file_id")?;
@@ -130,15 +144,15 @@ fn live_row_from_planned_row(
         global,
         plugin_key: plugin_key.to_string(),
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
-        change_id: None,
+        change_id: Some(change.id.clone()),
         writer_key: row
             .writer_key
             .as_deref()
             .or(execution_writer_key)
             .map(ToString::to_string),
         untracked: true,
-        created_at: Some(timestamp.to_string()),
-        updated_at: Some(timestamp.to_string()),
+        created_at: Some(change.created_at.clone()),
+        updated_at: Some(change.created_at.clone()),
         snapshot_content: (!row.tombstone)
             .then(|| planned_row_json_text_value(row, "snapshot_content"))
             .transpose()?,

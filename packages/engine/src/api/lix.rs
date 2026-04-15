@@ -484,7 +484,7 @@ impl ImageChunkWriter for VecImageWriter {
 
 #[cfg(test)]
 fn should_invalidate_installed_plugins_cache_for_sql(sql: &str) -> bool {
-    let Ok(statements) = crate::sql::parse_sql(sql) else {
+    let Ok(statements) = crate::sql::parse_sql_statements(sql) else {
         return false;
     };
     crate::sql::should_invalidate_installed_plugins_cache_for_statements(&statements)

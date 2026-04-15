@@ -29,6 +29,7 @@ pub(crate) struct CommittedCanonicalChangeRow {
     pub(crate) plugin_key: String,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
+    pub(crate) untracked: bool,
     pub(crate) created_at: String,
 }
 
@@ -235,7 +236,7 @@ pub(crate) async fn load_canonical_change_row_by_id(
     executor: &mut dyn CommitQueryExecutor,
     change_id: &str,
 ) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.created_at \
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.untracked, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                WHERE c.id = $1 \
@@ -255,7 +256,8 @@ pub(crate) async fn load_canonical_change_row_by_id(
         plugin_key: required_text(row, 5, "lix_internal_change.plugin_key")?,
         snapshot_content: row.get(6).and_then(text_from_value),
         metadata: row.get(7).and_then(text_from_value),
-        created_at: required_text(row, 8, "lix_internal_change.created_at")?,
+        untracked: required_bool(row, 8, "lix_internal_change.untracked")?,
+        created_at: required_text(row, 9, "lix_internal_change.created_at")?,
     }))
 }
 
@@ -280,6 +282,24 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
         Some(Value::Integer(value)) => Ok(value.to_string()),
         Some(other) => Err(LixError::unknown(format!(
             "expected text-like value for {field}, got {other:?}"
+        ))),
+        None => Err(LixError::unknown(format!("missing {field}"))),
+    }
+}
+
+fn required_bool(row: &[Value], index: usize, field: &str) -> Result<bool, LixError> {
+    match row.get(index) {
+        Some(Value::Boolean(value)) => Ok(*value),
+        Some(Value::Integer(value)) => Ok(*value != 0),
+        Some(Value::Text(value)) => match value.as_str() {
+            "true" | "t" | "1" => Ok(true),
+            "false" | "f" | "0" => Ok(false),
+            _ => Err(LixError::unknown(format!(
+                "expected boolean-like value for {field}, got {value:?}"
+            ))),
+        },
+        Some(other) => Err(LixError::unknown(format!(
+            "expected boolean-like value for {field}, got {other:?}"
         ))),
         None => Err(LixError::unknown(format!("missing {field}"))),
     }
@@ -350,6 +370,7 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"contract\",\"extension\":null,\"metadata\":{\"k\":\"v\"},\"hidden\":false}",
                 ),
                 metadata: Some("{\"k\":\"v\"}"),
+                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )
@@ -368,6 +389,7 @@ mod tests {
                     "{\"id\":\"parent-1\",\"change_set_id\":\"cs-parent\",\"change_ids\":[],\"parent_commit_ids\":[]}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T00:00:30Z",
             },
         )
@@ -386,6 +408,7 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-fallback\"],\"parent_commit_ids\":[\"parent-1\"]}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T00:01:00Z",
             },
         )
@@ -404,6 +427,7 @@ mod tests {
                     "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T00:02:00Z",
             },
         )
@@ -439,6 +463,7 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"deep\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: &synthetic_timestamp(0),
             },
         )
@@ -473,6 +498,7 @@ mod tests {
                     snapshot_id: &snapshot_id,
                     snapshot_content: Some(&snapshot_content),
                     metadata: None,
+                    untracked: false,
                     created_at: &created_at,
                 },
             )
@@ -597,6 +623,7 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"cycle\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T01:00:00Z",
             },
         )
@@ -616,6 +643,7 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-cycle-row\"],\"parent_commit_ids\":[\"commit-2\"]}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T01:01:00Z",
             },
         )
@@ -635,6 +663,7 @@ mod tests {
                     "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T01:02:00Z",
             },
         )
@@ -674,6 +703,7 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"broken-parent\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T02:00:00Z",
             },
         )
@@ -693,6 +723,7 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-missing-parent-row\"],\"parent_commit_ids\":[\"missing-parent\"]}",
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T02:01:00Z",
             },
         )

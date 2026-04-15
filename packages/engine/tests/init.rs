@@ -1,5 +1,5 @@
 mod support;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -774,6 +774,232 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
 });
 
 simulation_test!(
+    init_seeds_version_refs_through_public_journal_path,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let main_version_id = engine.active_version_id().await.unwrap();
+        let state_rows = engine
+            .execute(
+                "SELECT entity_id, change_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND untracked = true \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(state_rows.statements[0].rows.len(), 2);
+
+        let mut state_change_ids = BTreeMap::new();
+        for row in &state_rows.statements[0].rows {
+            let entity_id = text_value(&row[0], "version_ref.entity_id");
+            let change_id = text_value(&row[1], "version_ref.change_id");
+            assert_uuid_v7_like(&change_id, "bootstrap version_ref change_id");
+            state_change_ids.insert(entity_id, change_id);
+        }
+        assert_eq!(
+            state_change_ids.keys().cloned().collect::<BTreeSet<_>>(),
+            BTreeSet::from(["global".to_string(), main_version_id])
+        );
+
+        let change_rows = engine
+            .execute(
+                "SELECT id, entity_id, untracked \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND file_id = 'lix' \
+                   AND untracked = true \
+                   AND snapshot_content IS NOT NULL \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(change_rows.statements[0].rows.len(), 2);
+
+        for row in &change_rows.statements[0].rows {
+            let change_id = text_value(&row[0], "lix_change.id");
+            let entity_id = text_value(&row[1], "lix_change.entity_id");
+            match &row[2] {
+                Value::Boolean(true) => {}
+                other => panic!("expected boolean true for lix_change.untracked, got {other:?}"),
+            }
+            assert_eq!(
+                state_change_ids.get(&entity_id).map(String::as_str),
+                Some(change_id.as_str()),
+                "bootstrap version_ref state row should point at journaled change"
+            );
+        }
+    }
+);
+
+simulation_test!(
+    init_seeds_registered_schemas_through_public_journal_path,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let expected_entity_ids = BTreeSet::from([
+            "lix_change~1".to_string(),
+            "lix_change_author~1".to_string(),
+            "lix_change_set~1".to_string(),
+            "lix_change_set_element~1".to_string(),
+            "lix_commit~1".to_string(),
+            "lix_commit_edge~1".to_string(),
+            "lix_key_value~1".to_string(),
+            "lix_registered_schema~1".to_string(),
+            "lix_version_ref~1".to_string(),
+        ]);
+
+        let state_rows = engine
+            .execute(
+                "SELECT entity_id, change_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_registered_schema' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND untracked = true \
+                   AND entity_id IN (\
+                     'lix_registered_schema~1', \
+                     'lix_key_value~1', \
+                     'lix_change~1', \
+                     'lix_change_author~1', \
+                     'lix_change_set~1', \
+                     'lix_commit~1', \
+                     'lix_version_ref~1', \
+                     'lix_change_set_element~1', \
+                     'lix_commit_edge~1'\
+                   ) \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state_rows.statements[0].rows.len(),
+            expected_entity_ids.len()
+        );
+
+        let mut state_change_ids = BTreeMap::new();
+        for row in &state_rows.statements[0].rows {
+            let entity_id = text_value(&row[0], "registered_schema.entity_id");
+            let change_id = text_value(&row[1], "registered_schema.change_id");
+            assert_uuid_v7_like(&change_id, "bootstrap registered_schema change_id");
+            state_change_ids.insert(entity_id, change_id);
+        }
+        assert_eq!(
+            state_change_ids.keys().cloned().collect::<BTreeSet<_>>(),
+            expected_entity_ids
+        );
+
+        let change_rows = engine
+            .execute(
+                "SELECT id, entity_id, untracked \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_registered_schema' \
+                   AND file_id = 'lix' \
+                   AND untracked = true \
+                   AND entity_id IN (\
+                     'lix_registered_schema~1', \
+                     'lix_key_value~1', \
+                     'lix_change~1', \
+                     'lix_change_author~1', \
+                     'lix_change_set~1', \
+                     'lix_commit~1', \
+                     'lix_version_ref~1', \
+                     'lix_change_set_element~1', \
+                     'lix_commit_edge~1'\
+                   ) \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(change_rows.statements[0].rows.len(), state_change_ids.len());
+
+        for row in &change_rows.statements[0].rows {
+            let change_id = text_value(&row[0], "lix_change.id");
+            let entity_id = text_value(&row[1], "lix_change.entity_id");
+            match &row[2] {
+                Value::Boolean(true) => {}
+                other => panic!("expected boolean true for lix_change.untracked, got {other:?}"),
+            }
+            assert_eq!(
+                state_change_ids.get(&entity_id).map(String::as_str),
+                Some(change_id.as_str()),
+                "bootstrap registered_schema state row should point at journaled change"
+            );
+        }
+
+        let bootstrap_rows = engine
+            .execute(
+                "SELECT entity_id, change_id, untracked \
+                 FROM lix_internal_registered_schema_bootstrap \
+                 WHERE schema_key = 'lix_registered_schema' \
+                   AND file_id = 'lix' \
+                   AND version_id = 'global' \
+                   AND untracked = true \
+                   AND entity_id IN (\
+                     'lix_registered_schema~1', \
+                     'lix_key_value~1', \
+                     'lix_change~1', \
+                     'lix_change_author~1', \
+                     'lix_change_set~1', \
+                     'lix_commit~1', \
+                     'lix_version_ref~1', \
+                     'lix_change_set_element~1', \
+                     'lix_commit_edge~1'\
+                   ) \
+                 ORDER BY entity_id",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            bootstrap_rows.statements[0].rows.len(),
+            state_change_ids.len()
+        );
+
+        for row in &bootstrap_rows.statements[0].rows {
+            let entity_id = text_value(&row[0], "registered_schema_bootstrap.entity_id");
+            let change_id = text_value(&row[1], "registered_schema_bootstrap.change_id");
+            match &row[2] {
+                Value::Boolean(true) | Value::Integer(1) => {}
+                other => {
+                    panic!("expected truthy registered_schema bootstrap untracked, got {other:?}")
+                }
+            }
+            assert_eq!(
+                state_change_ids.get(&entity_id).map(String::as_str),
+                Some(change_id.as_str()),
+                "bootstrap registered_schema mirror row should point at journaled change"
+            );
+        }
+    }
+);
+
+simulation_test!(
     init_seeds_bootstrap_change_set_for_hidden_global_version_commit,
     |sim| async move {
         let engine = sim
@@ -1274,6 +1500,64 @@ simulation_test!(
             .expect("initialize_if_needed should initialize fresh engine");
         assert!(initialized, "fresh engine should initialize");
 
+        let global_commit_id = global_version_commit_id(&engine).await;
+        let version_ref_change_count_before = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_change \
+                     WHERE schema_key = 'lix_version_ref' \
+                       AND file_id = 'lix' \
+                       AND untracked = true \
+                       AND snapshot_content IS NOT NULL",
+                    &[],
+                )
+                .await
+                .expect("version_ref journal count query should succeed"),
+        );
+        let registered_schema_bootstrap_count_before = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_internal_registered_schema_bootstrap \
+                     WHERE schema_key = 'lix_registered_schema' \
+                       AND file_id = 'lix' \
+                       AND version_id = 'global' \
+                       AND untracked = true",
+                    &[],
+                )
+                .await
+                .expect("registered schema bootstrap count query should succeed"),
+        );
+        let checkpoint_link_count_before = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_entity_label \
+                     WHERE entity_id = $1 \
+                       AND schema_key = 'lix_commit' \
+                       AND file_id = 'lix' \
+                       AND label_id = $2",
+                    &[
+                        Value::Text(global_commit_id.clone()),
+                        Value::Text(CHECKPOINT_LABEL_ID.to_string()),
+                    ],
+                )
+                .await
+                .expect("checkpoint link count query should succeed"),
+        );
+        let system_directory_count_before = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_directory \
+                     WHERE path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/')",
+                    &[],
+                )
+                .await
+                .expect("system directory count query should succeed"),
+        );
+
         let initialized_again = engine
             .initialize_if_needed()
             .await
@@ -1299,6 +1583,80 @@ simulation_test!(
             first_result_rows(&boot_key).len(),
             1,
             "boot key seed row should persist"
+        );
+
+        let version_ref_change_count_after = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_change \
+                     WHERE schema_key = 'lix_version_ref' \
+                       AND file_id = 'lix' \
+                       AND untracked = true \
+                       AND snapshot_content IS NOT NULL",
+                    &[],
+                )
+                .await
+                .expect("version_ref journal count query should succeed after re-init"),
+        );
+        let registered_schema_bootstrap_count_after = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_internal_registered_schema_bootstrap \
+                     WHERE schema_key = 'lix_registered_schema' \
+                       AND file_id = 'lix' \
+                       AND version_id = 'global' \
+                       AND untracked = true",
+                    &[],
+                )
+                .await
+                .expect("registered schema bootstrap count query should succeed after re-init"),
+        );
+        let checkpoint_link_count_after = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_entity_label \
+                     WHERE entity_id = $1 \
+                       AND schema_key = 'lix_commit' \
+                       AND file_id = 'lix' \
+                       AND label_id = $2",
+                    &[
+                        Value::Text(global_commit_id),
+                        Value::Text(CHECKPOINT_LABEL_ID.to_string()),
+                    ],
+                )
+                .await
+                .expect("checkpoint link count query should succeed after re-init"),
+        );
+        let system_directory_count_after = scalar_count(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_directory \
+                     WHERE path IN ('/.lix/', '/.lix/app_data/', '/.lix/plugins/')",
+                    &[],
+                )
+                .await
+                .expect("system directory count query should succeed after re-init"),
+        );
+
+        assert_eq!(
+            version_ref_change_count_after, version_ref_change_count_before,
+            "repeated init must not duplicate journaled version refs"
+        );
+        assert_eq!(
+            registered_schema_bootstrap_count_after, registered_schema_bootstrap_count_before,
+            "repeated init must not duplicate registered schema bootstrap rows"
+        );
+        assert_eq!(
+            checkpoint_link_count_after, checkpoint_link_count_before,
+            "repeated init must not duplicate checkpoint label links"
+        );
+        assert_eq!(
+            system_directory_count_after, system_directory_count_before,
+            "repeated init must not duplicate seeded system directories"
         );
     }
 );

@@ -1,9 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::canonical::CanonicalChangeWrite;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedRelation,
 };
+use crate::functions::LixFunctionProvider;
 use crate::live_state::{RowIdentity, SchemaRegistration, SchemaRegistrationSet};
 use crate::sql::{
     coalesce_live_table_requirements, ChangeBatch, CommitPreconditions, ExpectedHead,
@@ -15,7 +17,7 @@ use crate::transaction::filesystem::runtime::{
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
 use crate::transaction::filesystem::state::filesystem_transaction_state_from_planned;
-use crate::transaction::overlay::{PendingSemanticRow, PendingSemanticStorage};
+use crate::transaction::overlay::PendingSemanticRow;
 use crate::transaction::{
     PendingWriteOverlay, PreparedDirectWriteArtifact, PreparedPublicWrite,
     PreparedPublicWriteExecutionPartition, PreparedPublicWritePlanArtifact,
@@ -75,6 +77,7 @@ fn build_tracked_txn_unit(
 #[derive(Clone)]
 pub(crate) struct PlannedPublicUntrackedWriteUnit {
     pub(crate) execution: PreparedUntrackedWriteExecution,
+    pub(crate) canonical_changes: Vec<CanonicalChangeWrite>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) function_bindings: PreparedWriteFunctionBindings,
     pub(crate) writer_key: Option<String>,
@@ -335,7 +338,7 @@ pub(crate) struct PendingSemanticOverlay {
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct PendingSemanticRowIdentity {
-    storage: PendingSemanticStorage,
+    untracked: bool,
     schema_key: String,
     entity_id: String,
     file_id: String,
@@ -358,12 +361,12 @@ pub(crate) struct PendingWriterKeyOverlay {
 impl PendingFilesystemOverlay {
     pub(crate) fn visible_directory_rows<'a>(
         &'a self,
-        storage: PendingSemanticStorage,
+        untracked: bool,
         schema_key: &'a str,
     ) -> impl Iterator<Item = &'a PendingSemanticRow> {
         self.directory_rows
             .values()
-            .filter(move |row| row.storage == storage && row.schema_key == schema_key)
+            .filter(move |row| row.untracked == untracked && row.schema_key == schema_key)
     }
 
     pub(crate) fn visible_files(&self) -> impl Iterator<Item = &FilesystemTransactionFileState> {
@@ -391,17 +394,17 @@ impl PendingWriterKeyOverlay {
 impl PendingSemanticOverlay {
     pub(crate) fn visible_rows<'a>(
         &'a self,
-        storage: PendingSemanticStorage,
+        untracked: bool,
         schema_key: &'a str,
     ) -> impl Iterator<Item = &'a PendingSemanticRow> {
         self.rows
             .values()
-            .filter(move |row| row.storage == storage && row.schema_key == schema_key)
+            .filter(move |row| row.untracked == untracked && row.schema_key == schema_key)
     }
 
     pub(crate) fn registered_schema_overlay(&self) -> Option<PendingRegisteredSchemaOverlay> {
         let mut overlay = PendingRegisteredSchemaOverlay::default();
-        for row in self.visible_rows(PendingSemanticStorage::Tracked, REGISTERED_SCHEMA_KEY) {
+        for row in self.visible_rows(false, REGISTERED_SCHEMA_KEY) {
             if row.version_id != GLOBAL_VERSION_ID {
                 continue;
             }
@@ -448,9 +451,15 @@ pub(crate) fn build_planned_write_plan(
                         units.push(TransactionWriteUnit::PublicTracked(tracked_plan));
                     }
                     PreparedPublicWriteExecutionPartition::Untracked(untracked) => {
+                        let canonical_changes = build_untracked_canonical_changes(
+                            &untracked.intended_post_state,
+                            function_bindings.provider().clone(),
+                        )
+                        .ok()?;
                         units.push(TransactionWriteUnit::PublicUntracked(
                             PlannedPublicUntrackedWriteUnit {
                                 execution: untracked.clone(),
+                                canonical_changes,
                                 filesystem_state: filesystem_state.clone(),
                                 function_bindings: function_bindings.clone(),
                                 writer_key: public_write.contract.writer_key.clone(),
@@ -747,10 +756,16 @@ fn collect_semantic_overlay_from_planned_write_plan(
                         })?
             }
             TransactionWriteUnit::PublicUntracked(untracked) => {
+                let planned_rows = untracked
+                    .execution
+                    .intended_post_state
+                    .iter()
+                    .collect::<Vec<_>>();
                 untracked.filesystem_state.files.is_empty()
                     && collect_semantic_overlay_from_planned_rows(
-                        untracked.execution.intended_post_state.iter(),
-                        PendingSemanticStorage::Untracked,
+                        &planned_rows,
+                        true,
+                        &untracked.canonical_changes,
                         overlay,
                     )?
             }
@@ -870,7 +885,7 @@ fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
         };
         overlay.directory_rows.insert(
             PendingSemanticRowIdentity {
-                storage: PendingSemanticStorage::Tracked,
+                untracked: false,
                 schema_key: row.schema_key.clone(),
                 entity_id: row.entity_id.clone(),
                 file_id: file_id.clone(),
@@ -879,13 +894,14 @@ fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
                 schema_version: schema_version.clone(),
             },
             PendingSemanticRow {
-                storage: PendingSemanticStorage::Tracked,
+                untracked: false,
                 entity_id: row.entity_id.clone(),
                 schema_key: row.schema_key.clone(),
                 schema_version,
                 file_id,
                 version_id,
                 plugin_key,
+                change_id: None,
                 snapshot_content,
                 metadata: row.values.get("metadata").and_then(|value| match value {
                     crate::Value::Text(text) => Some(text.clone()),
@@ -909,80 +925,106 @@ fn collect_semantic_overlay_from_public_write(
         is_catalog_filesystem_file_surface(&public_write.contract.target);
     let mut saw_row = false;
     for partition in &resolved.partitions {
-        let storage = match partition.execution_mode {
-            WriteMode::Tracked => PendingSemanticStorage::Tracked,
-            WriteMode::Untracked => PendingSemanticStorage::Untracked,
-        };
-        saw_row |= collect_semantic_overlay_from_planned_rows(
-            partition.intended_post_state.iter().filter(|row| {
-                !(skip_file_descriptor_rows && row.schema_key == "lix_file_descriptor")
-            }),
-            storage,
-            overlay,
-        )?;
+        let untracked = matches!(partition.execution_mode, WriteMode::Untracked);
+        let planned_rows = partition
+            .intended_post_state
+            .iter()
+            .filter(|row| !(skip_file_descriptor_rows && row.schema_key == "lix_file_descriptor"))
+            .collect::<Vec<_>>();
+        saw_row |=
+            collect_semantic_overlay_from_planned_rows(&planned_rows, untracked, &[], overlay)?;
     }
     Ok(saw_row)
 }
 
-fn collect_semantic_overlay_from_planned_rows<'a>(
-    rows: impl Iterator<Item = &'a PlannedStateRow>,
-    storage: PendingSemanticStorage,
+fn collect_semantic_overlay_from_planned_rows(
+    rows: &[&PlannedStateRow],
+    default_untracked: bool,
+    canonical_changes: &[CanonicalChangeWrite],
     overlay: &mut PendingSemanticOverlay,
 ) -> Result<bool, LixError> {
-    let mut saw_row = false;
-    for row in rows {
-        saw_row = true;
-        let file_id = match row.values.get("file_id") {
-            Some(crate::Value::Text(value)) => value.clone(),
-            _ => return Ok(false),
-        };
-        let version_id = match row.version_id.as_deref() {
-            Some(value) => value.to_string(),
-            None => return Ok(false),
-        };
-        let plugin_key = match row.values.get("plugin_key") {
-            Some(crate::Value::Text(value)) => value.clone(),
-            _ => return Ok(false),
-        };
-        let schema_version = match row.values.get("schema_version") {
-            Some(crate::Value::Text(value)) => value.clone(),
-            _ => return Ok(false),
-        };
-        let snapshot_content = match row.values.get("snapshot_content") {
-            Some(crate::Value::Text(snapshot)) => Some(snapshot.clone()),
-            Some(crate::Value::Null) | None if row.tombstone => None,
-            None => None,
-            _ => return Ok(false),
-        };
-        overlay.rows.insert(
-            PendingSemanticRowIdentity {
-                storage,
-                schema_key: row.schema_key.clone(),
-                entity_id: row.entity_id.clone(),
-                file_id: file_id.clone(),
-                version_id: version_id.clone(),
-                plugin_key: plugin_key.clone(),
-                schema_version: schema_version.clone(),
-            },
-            PendingSemanticRow {
-                storage,
-                entity_id: row.entity_id.clone(),
-                schema_key: row.schema_key.clone(),
-                schema_version,
-                file_id,
-                version_id,
-                plugin_key,
-                snapshot_content,
-                metadata: row.values.get("metadata").and_then(|value| match value {
-                    crate::Value::Text(text) => Some(text.clone()),
-                    _ => None,
-                }),
-                tombstone: row.tombstone,
-            },
-        );
+    if rows.is_empty() {
+        return Ok(false);
     }
 
-    Ok(saw_row)
+    if !canonical_changes.is_empty() && rows.len() != canonical_changes.len() {
+        return Ok(false);
+    }
+
+    for (index, row) in rows.iter().enumerate() {
+        let change = canonical_changes.get(index);
+        if !collect_semantic_overlay_row(
+            row,
+            change
+                .map(|change| change.untracked)
+                .unwrap_or(default_untracked),
+            change.map(|change| change.id.as_str()),
+            overlay,
+        )? {
+            return Ok(false);
+        }
+    }
+
+    Ok(true)
+}
+
+fn collect_semantic_overlay_row(
+    row: &PlannedStateRow,
+    untracked: bool,
+    change_id: Option<&str>,
+    overlay: &mut PendingSemanticOverlay,
+) -> Result<bool, LixError> {
+    let file_id = match row.values.get("file_id") {
+        Some(crate::Value::Text(value)) => value.clone(),
+        _ => return Ok(false),
+    };
+    let version_id = match row.version_id.as_deref() {
+        Some(value) => value.to_string(),
+        None => return Ok(false),
+    };
+    let plugin_key = match row.values.get("plugin_key") {
+        Some(crate::Value::Text(value)) => value.clone(),
+        _ => return Ok(false),
+    };
+    let schema_version = match row.values.get("schema_version") {
+        Some(crate::Value::Text(value)) => value.clone(),
+        _ => return Ok(false),
+    };
+    let snapshot_content = match row.values.get("snapshot_content") {
+        Some(crate::Value::Text(snapshot)) => Some(snapshot.clone()),
+        Some(crate::Value::Null) | None if row.tombstone => None,
+        None => None,
+        _ => return Ok(false),
+    };
+    overlay.rows.insert(
+        PendingSemanticRowIdentity {
+            untracked,
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: file_id.clone(),
+            version_id: version_id.clone(),
+            plugin_key: plugin_key.clone(),
+            schema_version: schema_version.clone(),
+        },
+        PendingSemanticRow {
+            untracked,
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            schema_version,
+            file_id,
+            version_id,
+            plugin_key,
+            change_id: change_id.map(ToOwned::to_owned),
+            snapshot_content,
+            metadata: row.values.get("metadata").and_then(|value| match value {
+                crate::Value::Text(text) => Some(text.clone()),
+                _ => None,
+            }),
+            tombstone: row.tombstone,
+        },
+    );
+
+    Ok(true)
 }
 
 fn collect_semantic_overlay_from_mutation_rows(
@@ -1005,14 +1047,9 @@ fn collect_semantic_overlay_from_mutation_rows(
                     format!("failed to serialize pending registered schema snapshot: {error}"),
                 )
             })?;
-        let storage = if row.untracked {
-            PendingSemanticStorage::Untracked
-        } else {
-            PendingSemanticStorage::Tracked
-        };
         overlay.rows.insert(
             PendingSemanticRowIdentity {
-                storage,
+                untracked: row.untracked,
                 schema_key: row.schema_key.clone(),
                 entity_id: row.entity_id.clone(),
                 file_id: row.file_id.clone(),
@@ -1021,13 +1058,14 @@ fn collect_semantic_overlay_from_mutation_rows(
                 schema_version: row.schema_version.clone(),
             },
             PendingSemanticRow {
-                storage,
+                untracked: row.untracked,
                 entity_id: row.entity_id.clone(),
                 schema_key: row.schema_key.clone(),
                 schema_version: row.schema_version.clone(),
                 file_id: row.file_id.clone(),
                 version_id: row.version_id.clone(),
                 plugin_key: row.plugin_key.clone(),
+                change_id: None,
                 snapshot_content,
                 metadata: None,
                 tombstone: false,
@@ -1161,6 +1199,252 @@ fn tracked_plan_entity_targets(plan: &TrackedTxnUnit) -> BTreeSet<(String, Strin
         }
     }
     targets
+}
+
+fn build_untracked_canonical_changes(
+    rows: &[PlannedStateRow],
+    mut functions: impl LixFunctionProvider,
+) -> Result<Vec<CanonicalChangeWrite>, LixError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let created_at = functions.timestamp();
+    rows.iter()
+        .map(|row| {
+            let schema_key = row.schema_key.clone();
+            Ok(CanonicalChangeWrite {
+                id: functions.uuid_v7(),
+                entity_id: row.entity_id.clone().try_into().map_err(|_| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "public untracked planning produced invalid entity_id '{}'",
+                            row.entity_id
+                        ),
+                    )
+                })?,
+                schema_key: schema_key.clone().try_into().map_err(|_| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "public untracked planning produced invalid schema_key '{}'",
+                            schema_key
+                        ),
+                    )
+                })?,
+                schema_version: required_planned_text(row, "schema_version")?
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public untracked planning produced invalid schema_version for '{}'",
+                                schema_key
+                            ),
+                        )
+                    })?,
+                file_id: required_planned_text(row, "file_id")?
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public untracked planning produced invalid file_id for '{}'",
+                                schema_key
+                            ),
+                        )
+                    })?,
+                plugin_key: required_planned_text(row, "plugin_key")?
+                    .to_string()
+                    .try_into()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public untracked planning produced invalid plugin_key for '{}'",
+                                schema_key
+                            ),
+                        )
+                    })?,
+                snapshot_content: (!row.tombstone)
+                    .then(|| planned_json_text(row, "snapshot_content"))
+                    .transpose()?
+                    .flatten()
+                    .map(crate::canonical::CanonicalJson::from_text)
+                    .transpose()
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public untracked planning produced invalid snapshot_content for '{}': {}",
+                                schema_key, error.description
+                            ),
+                        )
+                    })?,
+                metadata: optional_planned_text(row, "metadata")
+                    .map(crate::canonical::CanonicalJson::from_text)
+                    .transpose()
+                    .map_err(|error| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "public untracked planning produced invalid metadata for '{}': {}",
+                                schema_key, error.description
+                            ),
+                        )
+                    })?,
+                untracked: true,
+                created_at: created_at.clone(),
+            })
+        })
+        .collect()
+}
+
+fn required_planned_text<'a>(row: &'a PlannedStateRow, key: &str) -> Result<&'a str, LixError> {
+    optional_planned_text(row, key).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "public untracked planning requires text field '{}' for schema '{}'",
+                key, row.schema_key
+            ),
+        )
+    })
+}
+
+fn optional_planned_text<'a>(row: &'a PlannedStateRow, key: &str) -> Option<&'a str> {
+    match row.values.get(key) {
+        Some(crate::Value::Text(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{collect_semantic_overlay_from_planned_rows, PendingSemanticOverlay};
+    use crate::canonical::{CanonicalChangeWrite, CanonicalJson};
+    use crate::sql::PlannedStateRow;
+    use crate::Value;
+    use std::collections::BTreeMap;
+
+    fn untracked_planned_row() -> PlannedStateRow {
+        PlannedStateRow {
+            entity_id: "pending-untracked".to_string(),
+            schema_key: "lix_key_value".to_string(),
+            version_id: Some("main".to_string()),
+            values: BTreeMap::from([
+                ("file_id".to_string(), Value::Text("lix".to_string())),
+                ("plugin_key".to_string(), Value::Text("lix".to_string())),
+                ("schema_version".to_string(), Value::Text("1".to_string())),
+                (
+                    "snapshot_content".to_string(),
+                    Value::Text("{\"key\":\"pending-untracked\",\"value\":\"after\"}".to_string()),
+                ),
+            ]),
+            writer_key: None,
+            tombstone: false,
+        }
+    }
+
+    fn untracked_canonical_change() -> CanonicalChangeWrite {
+        CanonicalChangeWrite {
+            id: "change-untracked-1".to_string(),
+            entity_id: "pending-untracked".try_into().expect("valid entity id"),
+            schema_key: "lix_key_value".try_into().expect("valid schema key"),
+            schema_version: "1".try_into().expect("valid schema version"),
+            file_id: "lix".try_into().expect("valid file id"),
+            plugin_key: "lix".try_into().expect("valid plugin key"),
+            snapshot_content: Some(
+                CanonicalJson::from_text("{\"key\":\"pending-untracked\",\"value\":\"after\"}")
+                    .expect("valid canonical json"),
+            ),
+            metadata: None,
+            untracked: true,
+            created_at: "2026-04-14T00:00:00Z".to_string(),
+        }
+    }
+
+    fn tracked_canonical_change() -> CanonicalChangeWrite {
+        CanonicalChangeWrite {
+            id: "change-tracked-1".to_string(),
+            untracked: false,
+            ..untracked_canonical_change()
+        }
+    }
+
+    #[test]
+    fn pending_untracked_overlay_rows_preserve_planned_change_ids() {
+        let rows = vec![untracked_planned_row()];
+        let planned_rows = rows.iter().collect::<Vec<_>>();
+        let canonical_changes = vec![untracked_canonical_change()];
+        let mut overlay = PendingSemanticOverlay::default();
+
+        let collected = collect_semantic_overlay_from_planned_rows(
+            &planned_rows,
+            true,
+            &canonical_changes,
+            &mut overlay,
+        )
+        .expect("overlay collection should succeed");
+
+        assert!(collected);
+        let pending = overlay
+            .visible_rows(true, "lix_key_value")
+            .next()
+            .expect("expected pending untracked row");
+        assert_eq!(pending.change_id.as_deref(), Some("change-untracked-1"));
+    }
+
+    #[test]
+    fn pending_overlay_uses_canonical_storage_and_change_id_when_changes_are_available() {
+        let rows = vec![untracked_planned_row()];
+        let planned_rows = rows.iter().collect::<Vec<_>>();
+        let canonical_changes = vec![tracked_canonical_change()];
+        let mut overlay = PendingSemanticOverlay::default();
+
+        let collected = collect_semantic_overlay_from_planned_rows(
+            &planned_rows,
+            true,
+            &canonical_changes,
+            &mut overlay,
+        )
+        .expect("overlay collection should succeed");
+
+        assert!(collected);
+        let pending = overlay
+            .visible_rows(false, "lix_key_value")
+            .next()
+            .expect("expected pending tracked row");
+        assert_eq!(pending.change_id.as_deref(), Some("change-tracked-1"));
+    }
+}
+
+fn planned_json_text(row: &PlannedStateRow, key: &str) -> Result<Option<String>, LixError> {
+    match row.values.get(key) {
+        Some(crate::Value::Text(value)) => Ok(Some(value.clone())),
+        Some(crate::Value::Json(value)) => {
+            serde_json::to_string(value).map(Some).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "failed to serialize planned JSON field '{}' for schema '{}': {}",
+                        key, row.schema_key, error
+                    ),
+                )
+            })
+        }
+        Some(crate::Value::Null) | None => Ok(None),
+        Some(other) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "public untracked planning expected text/json field '{}' for schema '{}', got {:?}",
+                key, row.schema_key, other
+            ),
+        )),
+    }
 }
 
 fn merge_optional_change_batches(

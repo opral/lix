@@ -663,7 +663,7 @@ mod tests {
                         version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
                         plugin_key: version_ref_plugin_key().to_string(),
                         metadata: None,
-                        change_id: None,
+                        change_id: Some(format!("change-version-ref-{}", descriptor.id)),
                         writer_key: None,
                         global: true,
                         untracked: true,
@@ -708,6 +708,7 @@ mod tests {
                     snapshot_id: &snapshot_id,
                     snapshot_content: Some(snapshot_content.as_str()),
                     metadata: None,
+                    untracked: false,
                     created_at: match index {
                         0 => "2026-04-01T01:00:00Z",
                         1 => "2026-04-01T01:00:01Z",
@@ -739,6 +740,7 @@ mod tests {
                 snapshot_id: "snapshot-commit-global-head",
                 snapshot_content: Some(commit_snapshot.as_str()),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-04-01T01:10:00Z",
             },
         )

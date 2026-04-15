@@ -7,6 +7,13 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_boolean(value: &Value, expected: bool) {
+    match value {
+        Value::Boolean(actual) => assert_eq!(*actual, expected),
+        other => panic!("expected boolean value '{expected}', got {other:?}"),
+    }
+}
+
 simulation_test!(
     lix_change_view_exposes_file_descriptor_change_rows,
     |sim| async move {
@@ -47,7 +54,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "SELECT \
-                   id, entity_id, schema_key, file_id, plugin_key, snapshot_content \
+                   id, entity_id, schema_key, file_id, plugin_key, untracked, snapshot_content \
                  FROM lix_change \
                  WHERE id = $1",
                 &[Value::Text(change_id.clone())],
@@ -62,7 +69,8 @@ simulation_test!(
         assert_text(&row[2], "lix_file_descriptor");
         assert_text(&row[3], "lix");
         assert_text(&row[4], "lix");
-        match &row[5] {
+        assert_boolean(&row[5], false);
+        match &row[6] {
             Value::Null | Value::Text(_) => {}
             other => panic!("expected snapshot_content as text or null, got {other:?}"),
         }

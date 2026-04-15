@@ -37,7 +37,7 @@ use crate::session::workspace::{
     require_workspace_active_version_id,
 };
 #[cfg(test)]
-use crate::sql::parse_sql;
+use crate::sql::parse_sql_statements;
 use crate::sql::{
     extract_explicit_transaction_script, parse_sql_with_timing,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
@@ -64,6 +64,9 @@ pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
 pub use runtime::ExecuteOptions;
 pub(crate) use runtime::SessionExecutionMode;
 pub(crate) use state::SessionStateSnapshot;
+pub(crate) use version_ops::commit::{
+    canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
+};
 pub(crate) use workspace::DEFAULT_ACTIVE_VERSION_NAME;
 
 pub(crate) async fn execute_prepared_public_read_with_registry(
@@ -977,31 +980,6 @@ impl<'a> SessionTransaction<'a> {
         .await
     }
 
-    #[allow(dead_code)]
-    pub(crate) async fn execute_internal(
-        &mut self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<crate::ExecuteResult, LixError> {
-        let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
-        let parsed_statements = parsed.statements;
-        let execution_context = self.execution_context();
-        let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction is no longer active".to_string(),
-        })?;
-        execute_parsed_statements_in_write_transaction(
-            &execution_context,
-            write_transaction,
-            parsed_statements,
-            params,
-            true,
-            &mut self.context,
-            Some(parsed.parse_duration),
-        )
-        .await
-    }
-
     pub async fn commit(mut self) -> Result<(), LixError> {
         let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -1334,7 +1312,7 @@ mod tests {
                 Vec::new(),
             );
             let parsed_statements =
-                parse_sql("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
+                parse_sql_statements("SELECT lix_uuid_v7()").expect("parse SQL should succeed");
             let runtime_bindings = session
                 .new_compiler_state(ExecuteOptions::default())
                 .runtime_binding_values()

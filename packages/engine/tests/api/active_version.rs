@@ -227,7 +227,11 @@ simulation_test!(
         insert_version(&engine, "version-hop-alpha").await;
         insert_version(&engine, "version-hop-beta").await;
 
-        for expected in ["version-hop-alpha", "version-hop-beta", start_version_id.as_str()] {
+        for expected in [
+            "version-hop-alpha",
+            "version-hop-beta",
+            start_version_id.as_str(),
+        ] {
             engine
                 .switch_version(expected.to_string())
                 .await

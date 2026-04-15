@@ -980,8 +980,8 @@ fn effective_state_schema_winner_rows_sql(
                        u.created_at AS effective_created_at, \
                        u.updated_at AS effective_updated_at, \
                        CASE WHEN tv.version_id = '{global_version}' THEN true ELSE false END AS effective_global, \
-                       NULL AS effective_change_id, \
-                       'untracked' AS effective_commit_id, \
+                       u.change_id AS effective_change_id, \
+                       NULL AS effective_commit_id, \
                        true AS effective_untracked, \
                        uwk.writer_key AS effective_writer_key, \
                        u.metadata AS effective_metadata, \
@@ -1003,8 +1003,8 @@ fn effective_state_schema_winner_rows_sql(
                        u.created_at AS effective_created_at, \
                        u.updated_at AS effective_updated_at, \
                        true AS effective_global, \
-                       NULL AS effective_change_id, \
-                       'untracked' AS effective_commit_id, \
+                       u.change_id AS effective_change_id, \
+                       NULL AS effective_commit_id, \
                        true AS effective_untracked, \
                        uwk_global.writer_key AS effective_writer_key, \
                        u.metadata AS effective_metadata, \

@@ -80,11 +80,11 @@ fn function_args_empty(function: &Function) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{derive_statement_effects, StatementEffects};
-    use crate::sql::parse_sql;
+    use crate::sql::parse_sql_statements;
 
     #[test]
     fn statement_effects_detect_uuid_and_timestamp_usage() {
-        let statements = parse_sql("SELECT lix_uuid_v7(), lix_timestamp(), 1")
+        let statements = parse_sql_statements("SELECT lix_uuid_v7(), lix_timestamp(), 1")
             .expect("parse SQL should succeed");
         assert_eq!(
             derive_statement_effects(&statements),
@@ -96,7 +96,7 @@ mod tests {
 
     #[test]
     fn statement_effects_ignore_plain_reads() {
-        let statements = parse_sql("SELECT 1, 2, 3").expect("parse SQL should succeed");
+        let statements = parse_sql_statements("SELECT 1, 2, 3").expect("parse SQL should succeed");
         assert_eq!(
             derive_statement_effects(&statements),
             StatementEffects::default()

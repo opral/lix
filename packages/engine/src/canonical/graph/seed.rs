@@ -122,6 +122,7 @@ mod tests {
                     r#"{"id":"commit-1","change_set_id":"cs-1","parent_commit_ids":[],"change_ids":[]}"#,
                 ),
                 metadata: None,
+                untracked: false,
                 created_at: "2026-03-30T10:00:00Z",
             },
         )

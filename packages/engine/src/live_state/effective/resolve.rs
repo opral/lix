@@ -320,7 +320,7 @@ fn effective_row_from_untracked(
         writer_key: row.writer_key,
         created_at: Some(row.created_at),
         updated_at: Some(row.updated_at),
-        source_change_id: None,
+        source_change_id: Some(row.change_id),
         overlay_lane: lane,
         state: EffectiveRowState::Visible,
         values: row.values,

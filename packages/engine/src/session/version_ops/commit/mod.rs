@@ -25,4 +25,7 @@ pub(crate) use append::{
     CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitWriteLane,
 };
 pub(crate) use init::init;
-pub(crate) use types::StagedChange;
+pub(crate) use types::{
+    canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
+    StagedChange,
+};

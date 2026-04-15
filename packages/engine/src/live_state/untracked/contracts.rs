@@ -38,6 +38,7 @@ pub struct UntrackedRow {
     pub global: bool,
     pub plugin_key: String,
     pub metadata: Option<String>,
+    pub change_id: String,
     pub writer_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -51,30 +52,6 @@ impl UntrackedRow {
             .and_then(value_as_text)
             .map(ToString::to_string)
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum UntrackedWriteOperation {
-    Upsert,
-    Delete,
-}
-
-/// Single untracked/helper write operation.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct UntrackedWriteRow {
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub version_id: String,
-    pub global: bool,
-    pub plugin_key: String,
-    pub metadata: Option<String>,
-    pub writer_key: Option<String>,
-    pub snapshot_content: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: String,
-    pub operation: UntrackedWriteOperation,
 }
 
 fn value_as_text(value: &Value) -> Option<&str> {

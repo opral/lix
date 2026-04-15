@@ -3,21 +3,29 @@ use crate::live_state::storage::{
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
     quoted_live_table_name,
 };
+use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::{LixBackendTransaction, LixError};
-
-use super::contracts::{TrackedWriteOperation, TrackedWriteRow};
 
 pub(crate) async fn apply_write_batch_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    batch: &[TrackedWriteRow],
+    batch: &[LiveWriteRow],
 ) -> Result<(), LixError> {
     if batch.is_empty() {
         return Ok(());
     }
 
     for row in batch {
+        if row.untracked {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "tracked live-state writer received untracked row '{}' '{}'",
+                    row.schema_key, row.entity_id
+                ),
+            ));
+        }
         match row.operation {
-            TrackedWriteOperation::Upsert => {
+            LiveWriteOperation::Upsert => {
                 let snapshot_content = row.snapshot_content.as_deref().ok_or_else(|| {
                     LixError::new(
                         "LIX_ERROR_UNKNOWN",
@@ -35,8 +43,17 @@ pub(crate) async fn apply_write_batch_in_transaction(
                 )
                 .await?;
             }
-            TrackedWriteOperation::Tombstone => {
+            LiveWriteOperation::Tombstone => {
                 apply_materialized_row_in_transaction(transaction, row, None, true).await?;
+            }
+            LiveWriteOperation::Delete => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "tracked live-state writer cannot apply delete for '{}' '{}'",
+                        row.schema_key, row.entity_id
+                    ),
+                ));
             }
         }
     }
@@ -46,7 +63,7 @@ pub(crate) async fn apply_write_batch_in_transaction(
 
 async fn apply_materialized_row_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    row: &TrackedWriteRow,
+    row: &LiveWriteRow,
     snapshot_content: Option<&str>,
     is_tombstone: bool,
 ) -> Result<(), LixError> {

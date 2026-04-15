@@ -2,9 +2,7 @@ use crate::catalog::FilesystemProjectionScope;
 use crate::common::escape_sql_string;
 use crate::common::{compose_directory_path, NormalizedDirectoryPath, ParsedFilePath};
 use crate::live_state::tracked_relation_name;
-use crate::transaction::{
-    PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingSemanticStorage,
-};
+use crate::transaction::{PendingFilesystemFileView, PendingOverlay, PendingSemanticRow};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
@@ -567,12 +565,7 @@ async fn pending_directory_row_by_id(
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
     let Some(pending) = pending_write_overlay
         .into_iter()
-        .flat_map(|view| {
-            view.visible_directory_rows(
-                PendingSemanticStorage::Tracked,
-                FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-            )
-        })
+        .flat_map(|view| view.visible_directory_rows(false, FILESYSTEM_DIRECTORY_SCHEMA_KEY))
         .find(|row| row.version_id == version_id && row.entity_id == directory_id)
     else {
         return Ok(None);
@@ -591,12 +584,10 @@ async fn pending_directory_row_by_path(
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
 ) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
-    for pending in pending_write_overlay.into_iter().flat_map(|view| {
-        view.visible_directory_rows(
-            PendingSemanticStorage::Tracked,
-            FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-        )
-    }) {
+    for pending in pending_write_overlay
+        .into_iter()
+        .flat_map(|view| view.visible_directory_rows(false, FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+    {
         if pending.version_id != version_id || pending.tombstone {
             continue;
         }
@@ -665,12 +656,7 @@ fn pending_directory_row_is_hidden(
 ) -> bool {
     pending_write_overlay
         .into_iter()
-        .flat_map(|view| {
-            view.visible_directory_rows(
-                PendingSemanticStorage::Tracked,
-                FILESYSTEM_DIRECTORY_SCHEMA_KEY,
-            )
-        })
+        .flat_map(|view| view.visible_directory_rows(false, FILESYSTEM_DIRECTORY_SCHEMA_KEY))
         .any(|row| row.version_id == version_id && row.entity_id == directory_id && row.tombstone)
 }
 

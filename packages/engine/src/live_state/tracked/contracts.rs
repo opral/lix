@@ -79,31 +79,6 @@ pub struct TrackedTombstoneMarker {
     pub change_id: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TrackedWriteOperation {
-    Upsert,
-    Tombstone,
-}
-
-/// Single tracked live-state write operation.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
-pub struct TrackedWriteRow {
-    pub entity_id: String,
-    pub schema_key: String,
-    pub schema_version: String,
-    pub file_id: String,
-    pub version_id: String,
-    pub global: bool,
-    pub plugin_key: String,
-    pub metadata: Option<String>,
-    pub change_id: String,
-    pub writer_key: Option<String>,
-    pub snapshot_content: Option<String>,
-    pub created_at: Option<String>,
-    pub updated_at: String,
-    pub operation: TrackedWriteOperation,
-}
-
 #[cfg(test)]
 fn value_as_text(value: &Value) -> Option<&str> {
     match value {

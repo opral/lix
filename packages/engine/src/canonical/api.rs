@@ -40,6 +40,7 @@ pub(crate) struct CanonicalChange {
     pub(crate) plugin_key: String,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
+    pub(crate) untracked: bool,
     pub(crate) created_at: String,
 }
 
@@ -323,6 +324,7 @@ fn canonical_change_from_row(
         plugin_key: row.plugin_key,
         snapshot_content: row.snapshot_content,
         metadata: row.metadata,
+        untracked: row.untracked,
         created_at: row.created_at,
     }
 }

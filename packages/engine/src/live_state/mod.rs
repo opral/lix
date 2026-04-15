@@ -70,7 +70,6 @@ pub use effective::{
     EffectiveRowsRequest, LaneResult, OverlayLane,
 };
 pub(crate) use frontier::{
-    load_all_version_head_commit_ids_with_executor,
     load_current_committed_version_frontier_with_backend,
     load_current_committed_version_frontier_with_executor,
     load_version_head_commit_id_with_backend, load_version_head_commit_id_with_executor,
@@ -115,14 +114,13 @@ pub(crate) use tracked::{
 };
 #[cfg(test)]
 pub(crate) use tracked::{TrackedReadView, TrackedTombstoneView};
-#[allow(unused_imports)]
-pub(crate) use tracked::{TrackedWriteOperation, TrackedWriteRow};
 #[cfg(test)]
 pub(crate) use types::values_from_snapshot_content;
 #[cfg(test)]
 pub(crate) use types::{batch_row_constraints, BatchRowRequest};
 pub(crate) use types::{
-    exact_row_constraints, matches_constraints, ExactRowRequest, RowIdentity, ScanRequest,
+    exact_row_constraints, matches_constraints, ExactRowRequest, LiveWriteOperation, LiveWriteRow,
+    RowIdentity, ScanRequest,
 };
 #[allow(unused_imports)]
 pub(crate) use types::{
@@ -134,9 +132,7 @@ pub(crate) use untracked::load_exact_row_with_executor as load_exact_untracked_r
 #[cfg(test)]
 pub(crate) use untracked::UntrackedReadView;
 #[allow(unused_imports)]
-pub(crate) use untracked::{
-    ExactUntrackedRowRequest, UntrackedRow, UntrackedWriteOperation, UntrackedWriteRow,
-};
+pub(crate) use untracked::{ExactUntrackedRowRequest, UntrackedRow};
 pub(crate) use visible_rows::{
     scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
 };

@@ -1,6 +1,6 @@
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRow, LiveRowSource};
-use crate::transaction::overlay::{PendingOverlay, PendingSemanticRow, PendingSemanticStorage};
+use crate::transaction::overlay::{PendingOverlay, PendingSemanticRow};
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     overlay_lanes_for_version, CanonicalStateRowKey, ExactEffectiveStateRow,
     ExactEffectiveStateRowRequest, OverlayLane,
@@ -127,23 +127,19 @@ async fn load_exact_pending_effective_row(
             request.version_id.clone()
         };
 
-        let storage = match overlay_lane {
-            OverlayLane::LocalTracked | OverlayLane::GlobalTracked => {
-                PendingSemanticStorage::Tracked
-            }
-            OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked => {
-                PendingSemanticStorage::Untracked
-            }
-        };
+        let untracked = matches!(
+            overlay_lane,
+            OverlayLane::LocalUntracked | OverlayLane::GlobalUntracked
+        );
         let Some(pending) = pending_overlay.and_then(|view| {
-            view.visible_semantic_rows(storage, &request.schema_key)
+            view.visible_semantic_rows(untracked, &request.schema_key)
                 .into_iter()
                 .find(|row| pending_row_matches_exact_request(row, request, &internal_version_id))
         }) else {
             continue;
         };
 
-        if pending.tombstone && matches!(storage, PendingSemanticStorage::Tracked) {
+        if pending.tombstone && !untracked {
             return Ok(Some(None));
         }
 
@@ -246,7 +242,10 @@ async fn exact_effective_state_row_from_pending(
         file_id: row.file_id.clone(),
         version_id: projected_version_id,
         values,
-        source_change_id: Some("pending".to_string()),
+        source_change_id: row
+            .change_id
+            .clone()
+            .or_else(|| Some("pending".to_string())),
         overlay_lane,
     })
 }

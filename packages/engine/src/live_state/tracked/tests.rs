@@ -5,10 +5,11 @@ use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOpera
 use crate::live_state::init as init_live_state;
 use crate::live_state::tracked::{
     load_exact_row_with_backend, load_exact_rows_with_backend, scan_rows_with_backend,
-    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest, TrackedWriteOperation,
-    TrackedWriteRow,
+    BatchTrackedRowRequest, ExactTrackedRowRequest, TrackedScanRequest,
 };
-use crate::live_state::{load_exact_live_row, ExactLiveRowQuery, LiveRowSource};
+use crate::live_state::{
+    load_exact_live_row, ExactLiveRowQuery, LiveRowSource, LiveWriteOperation, LiveWriteRow,
+};
 use crate::session::workspace::init as init_workspace;
 use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::{
@@ -172,19 +173,15 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
     }
 }
 
-fn tracked_row(
-    entity_id: &str,
-    child_id: &str,
-    change_id: &str,
-    timestamp: &str,
-) -> TrackedWriteRow {
-    TrackedWriteRow {
+fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str) -> LiveWriteRow {
+    LiveWriteRow {
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
         schema_version: "1".to_string(),
         file_id: "lix".to_string(),
         version_id: "main".to_string(),
         global: true,
+        untracked: false,
         plugin_key: "lix".to_string(),
         metadata: Some("{\"kind\":\"module-test\"}".to_string()),
         change_id: change_id.to_string(),
@@ -194,13 +191,13 @@ fn tracked_row(
         )),
         created_at: Some(timestamp.to_string()),
         updated_at: timestamp.to_string(),
-        operation: TrackedWriteOperation::Upsert,
+        operation: LiveWriteOperation::Upsert,
     }
 }
 
 async fn commit_tracked_rows(
     backend: &SqliteBackend,
-    rows: Vec<TrackedWriteRow>,
+    rows: Vec<LiveWriteRow>,
 ) -> Result<(), LixError> {
     let read_context = OverlayReadContext::new(backend, backend, backend);
     let backend_txn = backend
@@ -214,10 +211,7 @@ async fn commit_tracked_rows(
     for schema_key in schema_keys {
         write_tx.register_schema(schema_key)?;
     }
-    write_tx.stage(TransactionDelta {
-        tracked_writes: rows,
-        untracked_writes: Vec::new(),
-    })?;
+    write_tx.stage(TransactionDelta { writes: rows })?;
     write_tx.commit().await?;
     Ok(())
 }
@@ -353,13 +347,14 @@ async fn live_tracked_state_tombstones_hide_rows() {
 
     commit_tracked_rows(
         &backend,
-        vec![TrackedWriteRow {
+        vec![LiveWriteRow {
             entity_id: "edge-1".to_string(),
             schema_key: "lix_commit_edge".to_string(),
             schema_version: "1".to_string(),
             file_id: "lix".to_string(),
             version_id: "main".to_string(),
             global: true,
+            untracked: false,
             plugin_key: "lix".to_string(),
             metadata: Some("{\"kind\":\"module-test\"}".to_string()),
             change_id: "change-2".to_string(),
@@ -367,7 +362,7 @@ async fn live_tracked_state_tombstones_hide_rows() {
             snapshot_content: None,
             created_at: Some(tombstone_time.to_string()),
             updated_at: tombstone_time.to_string(),
-            operation: TrackedWriteOperation::Tombstone,
+            operation: LiveWriteOperation::Tombstone,
         }],
     )
     .await
