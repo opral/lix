@@ -200,7 +200,7 @@ pub(crate) fn with_exact_filesystem_descriptors(
 
 pub(crate) fn compile_filesystem_transaction_state_from_state(
     state: &FilesystemTransactionState,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     mutations: &[MutationRow],
 ) -> Result<CompiledFilesystemFinalization, LixError> {
     let mut semantic_changes = BTreeMap::new();
@@ -219,7 +219,7 @@ pub(crate) fn compile_filesystem_transaction_state_from_state(
                     plugin_key: None,
                     snapshot_content: None,
                     metadata: None,
-                    writer_key: writer_key.map(ToString::to_string),
+                    origin_key: origin_key.map(ToString::to_string),
                 },
             );
             upsert_semantic_change(
@@ -228,7 +228,7 @@ pub(crate) fn compile_filesystem_transaction_state_from_state(
                     &file.file_id,
                     &file.version_id,
                     file.untracked,
-                    writer_key,
+                    origin_key,
                 ),
             );
             continue;
@@ -242,7 +242,7 @@ pub(crate) fn compile_filesystem_transaction_state_from_state(
                     &file.version_id,
                     descriptor,
                     file.untracked,
-                    writer_key,
+                    origin_key,
                 ),
             );
         }
@@ -255,7 +255,7 @@ pub(crate) fn compile_filesystem_transaction_state_from_state(
                     &file.version_id,
                     data,
                     file.untracked,
-                    writer_key,
+                    origin_key,
                 )?,
             );
             binary_blob_writes.push(BinaryBlobWrite {
@@ -286,7 +286,7 @@ pub(crate) struct FilesystemSemanticChange {
     pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
 }
 
 impl FilesystemSemanticChange {
@@ -301,7 +301,7 @@ impl FilesystemSemanticChange {
             plugin_key: self.plugin_key.clone(),
             snapshot_content: self.snapshot_content.clone(),
             metadata: self.metadata.clone(),
-            writer_key: self.writer_key.clone(),
+            origin_key: self.origin_key.clone(),
         }
     }
 }
@@ -383,7 +383,7 @@ fn binary_blob_ref_change_for_bytes(
     version_id: &str,
     data: &[u8],
     untracked: bool,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<FilesystemSemanticChange, LixError> {
     let size_bytes = u64::try_from(data.len()).map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -408,7 +408,7 @@ fn binary_blob_ref_change_for_bytes(
         plugin_key: None,
         snapshot_content: Some(snapshot_content),
         metadata: None,
-        writer_key: writer_key.map(ToString::to_string),
+        origin_key: origin_key.map(ToString::to_string),
     })
 }
 
@@ -417,7 +417,7 @@ fn file_descriptor_change_for_state(
     version_id: &str,
     descriptor: &FilesystemDescriptorState,
     untracked: bool,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> FilesystemSemanticChange {
     let metadata = descriptor.metadata.clone();
     FilesystemSemanticChange {
@@ -444,7 +444,7 @@ fn file_descriptor_change_for_state(
             .to_string(),
         ),
         metadata,
-        writer_key: writer_key.map(ToString::to_string),
+        origin_key: origin_key.map(ToString::to_string),
     }
 }
 
@@ -466,7 +466,7 @@ fn binary_blob_ref_tombstone_change_for_target(
     file_id: &str,
     version_id: &str,
     untracked: bool,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> FilesystemSemanticChange {
     FilesystemSemanticChange {
         entity_id: file_id.to_string(),
@@ -478,7 +478,7 @@ fn binary_blob_ref_tombstone_change_for_target(
         plugin_key: None,
         snapshot_content: None,
         metadata: None,
-        writer_key: writer_key.map(ToString::to_string),
+        origin_key: origin_key.map(ToString::to_string),
     }
 }
 
@@ -536,7 +536,7 @@ pub(crate) async fn persist_filesystem_payload_changes_with_untracked_in_transac
 pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     filesystem_state: &FilesystemTransactionState,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     mutations: &[MutationRow],
 ) -> Result<CompiledFilesystemFinalization, LixError> {
     let state = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state) {
@@ -549,7 +549,7 @@ pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
     } else {
         filesystem_state.clone()
     };
-    compile_filesystem_transaction_state_from_state(&state, writer_key, mutations)
+    compile_filesystem_transaction_state_from_state(&state, origin_key, mutations)
 }
 
 async fn load_exact_filesystem_descriptors_for_state_in_transaction(
@@ -696,8 +696,8 @@ pub(crate) fn build_filesystem_payload_changes_insert(
             Some(metadata) => Value::Text(metadata.clone()),
             None => Value::Null,
         });
-        params.push(match &change.writer_key {
-            Some(writer_key) => Value::Text(writer_key.clone()),
+        params.push(match &change.origin_key {
+            Some(origin_key) => Value::Text(origin_key.clone()),
             None => Value::Null,
         });
         if untracked {
@@ -723,7 +723,7 @@ fn insert_filesystem_payload_changes_sql(row_values: &str, untracked: bool) -> S
     if untracked {
         return format!(
             "INSERT INTO {} (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key, untracked\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, origin_key, untracked\
              ) VALUES {row_values}",
             state_by_version_table,
         );
@@ -731,7 +731,7 @@ fn insert_filesystem_payload_changes_sql(row_values: &str, untracked: bool) -> S
 
     format!(
         "INSERT INTO {} (\
-         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, writer_key\
+         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, origin_key\
          ) VALUES {row_values}",
         state_by_version_table,
     )

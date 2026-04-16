@@ -549,7 +549,6 @@ mod tests {
                         None,
                         None,
                         Some("change-untracked-dir".to_string()),
-                        None,
                         false,
                         Some("2026-04-10T00:00:00Z".to_string()),
                         Some("2026-04-10T00:00:00Z".to_string()),
@@ -619,7 +618,6 @@ mod tests {
         )
         .with_live_metadata(
             "1",
-            None,
             None,
             None,
             None,

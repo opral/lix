@@ -1,17 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 
-use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 #[cfg(test)]
 use crate::live_state::{exact_row_constraints, BatchRowRequest, EffectiveRowRequest, ScanRequest};
-use crate::live_state::{
-    EffectiveRowsRequest, EffectiveRowsResolver, LiveReadContext, WriterKeyReadView,
-};
+use crate::live_state::{EffectiveRowsRequest, EffectiveRowsResolver, LiveReadContext};
 use crate::{LixError, NullableKeyFilter, Value};
 
 use super::{
@@ -72,12 +69,10 @@ pub(crate) async fn resolve_effective_row(
                     .into_iter()
                     .next()
                 {
-                    let writer_key = tracked_row_writer_key(context.writer_keys, &row).await?;
                     return Ok(Some(effective_row_from_tracked(
                         row,
                         &request.version_id,
                         lane,
-                        writer_key,
                     )));
                 }
                 if let Some(tombstone_view) = context.tracked_tombstones {
@@ -216,11 +211,8 @@ async fn scan_tracked_lane(
         })
         .await?;
 
-    let rows = tracked_rows_with_writer_keys(context.writer_keys, rows).await?;
-
     for row in rows {
-        let writer_key = row.writer_key.clone();
-        let effective = effective_row_from_tracked(row, &request.version_id, lane, writer_key);
+        let effective = effective_row_from_tracked(row, &request.version_id, lane);
         rows_by_identity.insert(effective.identity(), LaneResult::Found(effective));
     }
 
@@ -270,12 +262,10 @@ async fn scan_untracked_lane(
 }
 
 fn effective_row_from_tracked(
-    mut row: TrackedRow,
+    row: TrackedRow,
     requested_version_id: &str,
     lane: OverlayLane,
-    writer_key: Option<String>,
 ) -> EffectiveRow {
-    row.writer_key = writer_key;
     let source_version_id = row.version_id.clone();
     let version_id = projected_version_id(requested_version_id, lane, &source_version_id);
     EffectiveRow {
@@ -289,7 +279,6 @@ fn effective_row_from_tracked(
         untracked: false,
         plugin_key: row.plugin_key,
         metadata: row.metadata,
-        writer_key: row.writer_key,
         created_at: Some(row.created_at),
         updated_at: Some(row.updated_at),
         source_change_id: row.change_id,
@@ -317,7 +306,6 @@ fn effective_row_from_untracked(
         untracked: true,
         plugin_key: row.plugin_key,
         metadata: row.metadata,
-        writer_key: row.writer_key,
         created_at: Some(row.created_at),
         updated_at: Some(row.updated_at),
         source_change_id: Some(row.change_id),
@@ -345,7 +333,6 @@ fn effective_row_from_tombstone(
         untracked: false,
         plugin_key: row.plugin_key,
         metadata: row.metadata,
-        writer_key: row.writer_key,
         created_at: row.created_at,
         updated_at: row.updated_at,
         source_change_id: row.change_id,
@@ -372,7 +359,6 @@ fn tombstone_placeholder_row(
         untracked: false,
         plugin_key: None,
         metadata: None,
-        writer_key: None,
         created_at: None,
         updated_at: None,
         source_change_id: None,
@@ -425,13 +411,10 @@ async fn load_effective_rows_exact_batch(
                     file_id: NullableKeyFilter::Any,
                 })
                 .await?;
-            let rows = tracked_rows_with_writer_keys(context.writer_keys, rows).await?;
             Ok(rows
                 .into_iter()
                 .map(|row| {
-                    let writer_key = row.writer_key.clone();
-                    let effective =
-                        effective_row_from_tracked(row, &request.version_id, lane, writer_key);
+                    let effective = effective_row_from_tracked(row, &request.version_id, lane);
                     (effective.identity(), effective)
                 })
                 .collect())
@@ -459,37 +442,3 @@ async fn load_effective_rows_exact_batch(
 
 #[allow(dead_code)]
 fn _preserve_value_type(_value: &Value) {}
-
-#[cfg(test)]
-async fn tracked_row_writer_key(
-    writer_keys: &dyn WriterKeyReadView,
-    row: &TrackedRow,
-) -> Result<Option<String>, LixError> {
-    writer_keys
-        .load_annotation(&RowIdentity::from_tracked_row(row))
-        .await
-}
-
-async fn tracked_rows_with_writer_keys(
-    writer_keys: &dyn WriterKeyReadView,
-    mut rows: Vec<TrackedRow>,
-) -> Result<Vec<TrackedRow>, LixError> {
-    if rows.is_empty() {
-        return Ok(rows);
-    }
-
-    let row_identities = rows
-        .iter()
-        .map(RowIdentity::from_tracked_row)
-        .collect::<BTreeSet<_>>();
-    let annotations = writer_keys.load_annotations(&row_identities).await?;
-
-    for row in &mut rows {
-        row.writer_key = annotations
-            .get(&RowIdentity::from_tracked_row(row))
-            .cloned()
-            .unwrap_or(None);
-    }
-
-    Ok(rows)
-}

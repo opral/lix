@@ -631,7 +631,6 @@ fn entity_visible_columns(spec: &DynamicEntitySurfaceSpec, variant: SurfaceVaria
             "lixcol_metadata".to_string(),
             "lixcol_global".to_string(),
             "lixcol_untracked".to_string(),
-            "lixcol_writer_key".to_string(),
         ]),
         SurfaceVariant::WorkingChanges => {}
     }
@@ -650,7 +649,6 @@ fn entity_hidden_columns(variant: SurfaceVariant) -> Vec<String> {
             "lixcol_metadata".to_string(),
             "lixcol_global".to_string(),
             "lixcol_untracked".to_string(),
-            "lixcol_writer_key".to_string(),
         ],
         SurfaceVariant::ByVersion => vec![
             "lixcol_entity_id".to_string(),
@@ -661,7 +659,6 @@ fn entity_hidden_columns(variant: SurfaceVariant) -> Vec<String> {
             "lixcol_metadata".to_string(),
             "lixcol_global".to_string(),
             "lixcol_untracked".to_string(),
-            "lixcol_writer_key".to_string(),
         ],
         SurfaceVariant::History => Vec::new(),
         SurfaceVariant::WorkingChanges => Vec::new(),
@@ -686,7 +683,6 @@ fn entity_column_types(
         ("lixcol_metadata".to_string(), SurfaceColumnType::Json),
         ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
         ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
-        ("lixcol_writer_key".to_string(), SurfaceColumnType::String),
     ]));
 
     if variant == SurfaceVariant::History {
@@ -784,7 +780,6 @@ fn filesystem_file_columns() -> Vec<String> {
         "lixcol_created_at".to_string(),
         "lixcol_updated_at".to_string(),
         "lixcol_commit_id".to_string(),
-        "lixcol_writer_key".to_string(),
         "lixcol_untracked".to_string(),
         "lixcol_metadata".to_string(),
     ]

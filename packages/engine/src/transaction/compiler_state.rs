@@ -72,7 +72,7 @@ impl SessionCompilerCache {
 }
 
 pub(crate) struct SessionCompilerState {
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) public_surface_registry: SurfaceRegistry,
     compiler_cache: SessionCompilerCacheHandle,
     pub(crate) active_version_id: String,
@@ -82,14 +82,14 @@ pub(crate) struct SessionCompilerState {
 
 impl SessionCompilerState {
     pub(crate) fn new(
-        writer_key: Option<String>,
+        origin_key: Option<String>,
         public_surface_registry: SurfaceRegistry,
         compiler_cache: SessionCompilerCacheHandle,
         active_version_id: String,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
-            writer_key,
+            origin_key,
             public_surface_registry,
             compiler_cache,
             active_version_id,
@@ -157,7 +157,7 @@ impl SessionCompilerState {
 
     pub(crate) fn buffered_write_execution_input(&self) -> BufferedWriteExecutionInput {
         BufferedWriteExecutionInput::new(
-            self.writer_key.clone(),
+            self.origin_key.clone(),
             self.active_version_id.clone(),
             self.active_account_ids.clone(),
         )

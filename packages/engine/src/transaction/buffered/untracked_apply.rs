@@ -26,11 +26,8 @@ pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transac
         // descriptor visibility in the untracked live tables owned here.
     }
 
-    let rows = live_rows_from_planned_rows(
-        &plan.execution.intended_post_state,
-        &plan.canonical_changes,
-        plan.writer_key.as_deref(),
-    )?;
+    let rows =
+        live_rows_from_planned_rows(&plan.execution.intended_post_state, &plan.canonical_changes)?;
     append_changes(transaction, &plan.canonical_changes, &mut runtime_functions).await?;
     write_live_rows(transaction, &rows).await?;
     mirror_registered_schema_planned_rows_in_transaction(
@@ -44,7 +41,7 @@ pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transac
     let filesystem_finalization = compile_filesystem_finalization_from_state_in_transaction(
         transaction,
         &plan.filesystem_state,
-        plan.writer_key.as_deref(),
+        plan.origin_key.as_deref(),
         &[],
     )
     .await?;
@@ -99,7 +96,6 @@ pub(crate) async fn execute_public_untracked_transaction_write_unit_with_transac
 fn live_rows_from_planned_rows(
     rows: &[PlannedStateRow],
     canonical_changes: &[CanonicalChangeWrite],
-    execution_writer_key: Option<&str>,
 ) -> Result<Vec<LiveRow>, LixError> {
     if rows.len() != canonical_changes.len() {
         return Err(LixError::new(
@@ -114,14 +110,13 @@ fn live_rows_from_planned_rows(
 
     rows.iter()
         .zip(canonical_changes.iter())
-        .map(|(row, change)| live_row_from_planned_row(row, change, execution_writer_key))
+        .map(|(row, change)| live_row_from_planned_row(row, change))
         .collect()
 }
 
 fn live_row_from_planned_row(
     row: &PlannedStateRow,
     change: &CanonicalChangeWrite,
-    execution_writer_key: Option<&str>,
 ) -> Result<LiveRow, LixError> {
     let file_id = planned_row_optional_text_value(row, "file_id").map(ToString::to_string);
     let plugin_key = planned_row_optional_text_value(row, "plugin_key").map(ToString::to_string);
@@ -145,11 +140,6 @@ fn live_row_from_planned_row(
         plugin_key,
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
         change_id: Some(change.id.clone()),
-        writer_key: row
-            .writer_key
-            .as_deref()
-            .or(execution_writer_key)
-            .map(ToString::to_string),
         untracked: true,
         created_at: Some(change.created_at.clone()),
         updated_at: Some(change.created_at.clone()),

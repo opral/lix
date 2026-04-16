@@ -88,22 +88,18 @@ impl<'a> LiveStateWriteTransaction<'a> {
 
 #[cfg(test)]
 mod tests {
-    use async_trait::async_trait;
-    use std::cell::Cell;
-    use std::collections::{BTreeMap, BTreeSet};
-
     use crate::live_state::tracked::{
         BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
     };
     use crate::live_state::untracked::{
         BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest,
     };
-    use crate::live_state::RowIdentity;
-    use crate::live_state::WriterKeyReadView;
     use crate::live_state::{
         LiveWriteOperation, LiveWriteRow, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
     };
     use crate::transaction::buffered::prepare_materialization_plan;
+    use async_trait::async_trait;
+    use std::cell::Cell;
 
     use super::*;
 
@@ -118,8 +114,6 @@ mod tests {
     }
 
     struct EmptyTombstones;
-    struct EmptyWriterKeys;
-
     fn live_write_row(
         schema_key: &str,
         entity_id: &str,
@@ -140,7 +134,6 @@ mod tests {
             plugin_key: None,
             metadata: None,
             change_id: change_id.to_string(),
-            writer_key: None,
             snapshot_content: snapshot_content.map(ToString::to_string),
             created_at: Some("2026-03-24T00:00:00Z".to_string()),
             updated_at: if matches!(operation, LiveWriteOperation::Tombstone) {
@@ -198,35 +191,13 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
-    impl WriterKeyReadView for EmptyWriterKeys {
-        async fn load_annotation(
-            &self,
-            _row_identity: &RowIdentity,
-        ) -> Result<Option<String>, LixError> {
-            Ok(None)
-        }
-
-        async fn load_annotations(
-            &self,
-            row_identities: &BTreeSet<RowIdentity>,
-        ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
-            Ok(row_identities
-                .iter()
-                .cloned()
-                .map(|row_identity| (row_identity, None))
-                .collect())
-        }
-    }
-
     #[tokio::test]
     async fn prepare_materialization_plan_scans_each_partition_once() {
         let tracked = CountingTrackedView::default();
         let untracked = CountingUntrackedView::default();
         let tombstones = EmptyTombstones;
-        let writer_keys = EmptyWriterKeys;
-        let read_context = OverlayReadContext::new(&tracked, &untracked, &writer_keys)
-            .with_tracked_tombstones(&tombstones);
+        let read_context =
+            OverlayReadContext::new(&tracked, &untracked).with_tracked_tombstones(&tombstones);
         let mut journal = TransactionJournal::default();
         journal
             .stage(TransactionDelta {

@@ -9,5 +9,5 @@ pub struct FilesystemPayloadChange {
     pub plugin_key: Option<String>,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
 }

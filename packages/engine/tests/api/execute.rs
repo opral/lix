@@ -122,7 +122,7 @@ simulation_test!(
 
         let error = engine
             .execute(
-                "UPDATE lix_internal_live_v1_lix_active_version SET writer_key = NULL WHERE untracked = true AND 1 = 0",
+                "UPDATE lix_internal_live_v1_lix_active_version SET metadata = NULL WHERE untracked = true AND 1 = 0",
                 &[],
             )
             .await
@@ -155,7 +155,7 @@ simulation_test!(
             .expect("begin transaction should succeed");
         let error = tx
             .execute(
-                "UPDATE lix_internal_live_v1_lix_active_version SET writer_key = NULL WHERE untracked = true AND 1 = 0",
+                "UPDATE lix_internal_live_v1_lix_active_version SET metadata = NULL WHERE untracked = true AND 1 = 0",
                 &[],
             )
             .await

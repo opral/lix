@@ -21,7 +21,7 @@ pub(crate) async fn execute_direct_transaction_write_unit_with_transaction(
         &plan.execution,
         plan.result_contract,
         plan.function_bindings.provider(),
-        plan.execution.writer_key.as_deref(),
+        plan.execution.origin_key.as_deref(),
     )
     .await
     .map_err(LixError::from)?;
@@ -33,7 +33,7 @@ pub(crate) async fn execute_direct_transaction_write_unit_with_transaction(
     let filesystem_finalization = compile_filesystem_finalization_from_state_in_transaction(
         transaction,
         &filesystem_state,
-        plan.execution.writer_key.as_deref(),
+        plan.execution.origin_key.as_deref(),
         &plan.execution.mutations,
     )
     .await?;

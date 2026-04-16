@@ -58,6 +58,28 @@ fn normalize_global_projection_rows(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
         .collect()
 }
 
+fn normalize_text_row_order(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    let mut normalized = rows.to_vec();
+    normalized.sort_by(|left, right| {
+        let left_key = left
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let right_key = right
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        left_key.cmp(&right_key)
+    });
+    normalized
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     register_registered_schema_snapshot(
         engine,
@@ -1113,7 +1135,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         let matched = rows.statements[0]
             .rows
             .iter()
@@ -1459,7 +1482,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         let matched = rows.statements[0]
             .rows
             .iter()

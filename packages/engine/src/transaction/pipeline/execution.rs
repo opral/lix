@@ -127,6 +127,7 @@ async fn execute_statement_batch_with_buffered_write_scope(
 
     Ok(ExecuteResult {
         statements: results,
+        write_receipt: None,
     })
 }
 
@@ -375,7 +376,7 @@ async fn execute_direct_write_command(
         direct,
         command.prepared().result_contract,
         command.function_bindings().provider(),
-        direct.writer_key.as_deref(),
+        direct.origin_key.as_deref(),
     )
     .await
     .map_err(LixError::from)

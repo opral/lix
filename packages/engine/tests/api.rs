@@ -34,3 +34,5 @@ mod state_commit_stream;
 mod transaction_execution;
 #[path = "api/undo_redo.rs"]
 mod undo_redo;
+#[path = "api/write_receipt.rs"]
+mod write_receipt;

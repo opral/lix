@@ -36,12 +36,7 @@ pub(crate) fn collect_lixcol_overrides(
     reject_removed_lixcol_overrides(schema, schema_key)?;
 
     let mut overrides = Vec::new();
-    for key in [
-        "lixcol_entity_id",
-        "lixcol_schema_key",
-        "lixcol_metadata",
-        "lixcol_writer_key",
-    ] {
+    for key in ["lixcol_entity_id", "lixcol_schema_key", "lixcol_metadata"] {
         let Some(value) =
             extract_lixcol_scalar_override(schema, schema_key, key, evaluator, functions)?
         else {
@@ -188,7 +183,6 @@ fn entity_state_column_name(column: &str) -> Option<&'static str> {
         "lixcol_entity_id" => Some("entity_id"),
         "lixcol_schema_key" => Some("schema_key"),
         "lixcol_schema_version" => Some("schema_version"),
-        "lixcol_writer_key" => Some("writer_key"),
         "lixcol_metadata" => Some("metadata"),
         _ => None,
     }
@@ -237,8 +231,7 @@ mod tests {
                 "x-lix-key": "message",
                 "x-lix-override-lixcols": {
                     "lixcol_entity_id": "\"message-1\"",
-                    "lixcol_metadata": "\"plugin\"",
-                    "lixcol_writer_key": "\"ignored\""
+                    "lixcol_metadata": "\"plugin\""
                 }
             }),
             "message",

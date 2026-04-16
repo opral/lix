@@ -12,9 +12,9 @@ use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     CanonicalStateRowKey, ExactEffectiveStateRow, ExactEffectiveStateRowRequest, MutationPayload,
     OverlayLane, PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState,
-    PlannedRowIdentity, PlannedStateRow, PlannedWrite, ResolvedRowRef, ResolvedWritePartition,
-    ResolvedWritePlan, RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof,
-    WriteLane, WriteMode, WriteModeRequest, WriteOperationKind,
+    PlannedStateRow, PlannedWrite, ResolvedRowRef, ResolvedWritePartition, ResolvedWritePlan,
+    RowLineage, SchemaProof, ScopeProof, StateAssignmentsError, TargetSetProof, WriteLane,
+    WriteMode, WriteModeRequest, WriteOperationKind,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
@@ -74,7 +74,6 @@ struct ResolvedWritePartitionBuilder {
     authoritative_pre_state: Vec<ResolvedRowRef>,
     authoritative_pre_state_rows: Vec<PlannedStateRow>,
     intended_post_state: Vec<PlannedStateRow>,
-    writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     tombstones: Vec<ResolvedRowRef>,
     lineage: Vec<RowLineage>,
     filesystem_state: PlannedFilesystemState,
@@ -84,7 +83,6 @@ impl ResolvedWritePartitionBuilder {
     fn is_empty(&self) -> bool {
         self.authoritative_pre_state.is_empty()
             && self.intended_post_state.is_empty()
-            && self.writer_key_updates.is_empty()
             && self.tombstones.is_empty()
             && self.lineage.is_empty()
     }
@@ -96,7 +94,6 @@ impl ResolvedWritePartitionBuilder {
             authoritative_pre_state: self.authoritative_pre_state,
             authoritative_pre_state_rows: self.authoritative_pre_state_rows,
             intended_post_state: self.intended_post_state,
-            writer_key_updates: self.writer_key_updates,
             tombstones: self.tombstones,
             lineage: self.lineage,
             target_write_lane: None,
@@ -123,15 +120,6 @@ impl ResolvedWritePartitionBuilder {
                 return true;
             };
             let unchanged = !row.tombstone && planned_state_rows_equivalent(authoritative, row);
-            if unchanged {
-                if authoritative.writer_key != row.writer_key {
-                    let Some(row_identity) = planned_row_identity_from_state_row(row) else {
-                        return true;
-                    };
-                    self.writer_key_updates
-                        .insert(row_identity, row.writer_key.clone());
-                }
-            }
             if unchanged && row.schema_key == "lix_binary_blob_ref" && row.version_id.is_some() {
                 dropped_blob_rows.insert((
                     row.entity_id.clone(),
@@ -622,7 +610,7 @@ fn version_descriptor_row(id: &str, name: &str, hidden: bool) -> PlannedStateRow
         schema_key: version_descriptor_schema_key().to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
-        writer_key: None,
+        origin_key: None,
         tombstone: false,
     }
 }
@@ -663,7 +651,7 @@ fn version_ref_row(id: &str, commit_id: &str) -> PlannedStateRow {
         schema_key: version_ref_schema_key().to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
-        writer_key: None,
+        origin_key: None,
         tombstone: false,
     }
 }
@@ -701,7 +689,6 @@ fn single_partition_write_plan(
         authoritative_pre_state,
         authoritative_pre_state_rows,
         intended_post_state,
-        writer_key_updates: BTreeMap::new(),
         tombstones,
         lineage,
         filesystem_state: Default::default(),
@@ -718,19 +705,6 @@ fn planned_state_row_identity(row: &PlannedStateRow) -> (String, String, Option<
         row.schema_key.clone(),
         row.version_id.clone(),
     )
-}
-
-fn planned_row_identity_from_state_row(row: &PlannedStateRow) -> Option<PlannedRowIdentity> {
-    Some(PlannedRowIdentity {
-        schema_key: row.schema_key.clone(),
-        version_id: row.version_id.clone()?,
-        entity_id: row.entity_id.clone(),
-        file_id: row.values.get("file_id").and_then(|value| match value {
-            Value::Text(value) => Some(value.clone()),
-            Value::Null => None,
-            _ => None,
-        }),
-    })
 }
 
 fn planned_state_rows_equivalent(left: &PlannedStateRow, right: &PlannedStateRow) -> bool {
@@ -1023,9 +997,7 @@ fn finalize_resolved_write_plan(
     mut resolved: ResolvedWritePlan,
 ) -> Result<ResolvedWritePlan, WriteResolveError> {
     resolved.partitions.retain(|partition| {
-        !partition.intended_post_state.is_empty()
-            || !partition.filesystem_state.files.is_empty()
-            || !partition.writer_key_updates.is_empty()
+        !partition.intended_post_state.is_empty() || !partition.filesystem_state.files.is_empty()
     });
     for partition in &mut resolved.partitions {
         if partition.execution_mode == WriteMode::Untracked {
@@ -1167,30 +1139,19 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn writer_key_change_is_normalized_into_overlay_update() {
+    fn semantic_noop_is_removed_from_intended_post_state() {
         let mut builder = ResolvedWritePartitionBuilder {
-            authoritative_pre_state_rows: vec![planned_state_row(Some("writer-a"))],
-            intended_post_state: vec![planned_state_row(Some("writer-b"))],
+            authoritative_pre_state_rows: vec![planned_state_row()],
+            intended_post_state: vec![planned_state_row()],
             ..ResolvedWritePartitionBuilder::default()
         };
 
         builder.normalize_semantic_noops();
 
         assert!(builder.intended_post_state.is_empty());
-        assert_eq!(builder.writer_key_updates.len(), 1);
-        assert_eq!(
-            builder
-                .writer_key_updates
-                .values()
-                .next()
-                .cloned()
-                .flatten()
-                .as_deref(),
-            Some("writer-b")
-        );
     }
 
-    fn planned_state_row(writer_key: Option<&str>) -> PlannedStateRow {
+    fn planned_state_row() -> PlannedStateRow {
         let mut values = BTreeMap::new();
         values.insert("file_id".to_string(), Value::Text("file-1".to_string()));
         values.insert(
@@ -1208,7 +1169,7 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             version_id: Some("version-a".to_string()),
             values,
-            writer_key: writer_key.map(str::to_string),
+            origin_key: None,
             tombstone: false,
         }
     }

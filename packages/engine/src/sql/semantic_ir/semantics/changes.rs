@@ -39,8 +39,8 @@ impl StateChangeRecord for PublicChange {
         &self.version_id
     }
 
-    fn writer_key(&self) -> Option<&str> {
-        self.writer_key.as_deref()
+    fn origin_key(&self) -> Option<&str> {
+        self.origin_key.as_deref()
     }
 }
 
@@ -132,7 +132,7 @@ fn build_change_batch_for_partition(
             .version_id
             .clone()
             .unwrap_or_else(|| "active".to_string());
-        let writer_key = resolved_row_writer_key(row);
+        let origin_key = resolved_row_origin_key(row);
         let operation_key = if row.tombstone {
             "state.delete"
         } else {
@@ -181,7 +181,7 @@ fn build_change_batch_for_partition(
                 "public change version_id",
             )?
             .into_inner(),
-            writer_key,
+            origin_key,
         });
         semantic_effects.push(SemanticEffect {
             effect_key: operation_key.to_string(),
@@ -195,7 +195,7 @@ fn build_change_batch_for_partition(
     Ok(ChangeBatch {
         changes,
         write_lane,
-        writer_key: planned_write.command.statement_context.writer_key.clone(),
+        origin_key: planned_write.command.statement_context.origin_key.clone(),
         semantic_effects,
     })
 }
@@ -211,7 +211,7 @@ fn build_idempotency_key(
         "operation": write_operation_kind_name(planned_write.command.operation_kind),
         "partition_index": partition_index,
         "lane": write_lane_name(write_lane),
-        "writer_key": planned_write.command.statement_context.writer_key,
+        "origin_key": planned_write.command.statement_context.origin_key,
         "payload": summarize_mutation_payload(&planned_write.command.payload),
         "resolved_rows": summarize_partition_rows(partition),
     });
@@ -366,8 +366,8 @@ where
     })
 }
 
-fn resolved_row_writer_key(row: &PlannedStateRow) -> Option<String> {
-    row.writer_key.clone()
+fn resolved_row_origin_key(row: &PlannedStateRow) -> Option<String> {
+    row.origin_key.clone()
 }
 
 #[cfg(test)]
@@ -407,7 +407,7 @@ mod tests {
             params,
             StatementContext {
                 requested_version_id: Some(session.active_version_id()),
-                writer_key: Some("writer-a".to_string()),
+                origin_key: Some("writer-a".to_string()),
                 ..StatementContext::default()
             },
         );
@@ -478,8 +478,8 @@ mod tests {
                     );
                     assert_eq!(batches.changes.len(), 1);
                     assert_eq!(batches.semantic_effects.len(), 1);
-                    assert_eq!(batches.writer_key.as_deref(), Some("writer-a"));
-                    assert_eq!(batches.changes[0].writer_key.as_deref(), Some("writer-a"));
+                    assert_eq!(batches.origin_key.as_deref(), Some("writer-a"));
+                    assert_eq!(batches.changes[0].origin_key.as_deref(), Some("writer-a"));
                     assert_eq!(batches.changes[0].schema_version.as_deref(), Some("1"));
                     assert_eq!(batches.changes[0].file_id.as_deref(), None);
                     assert_eq!(batches.changes[0].plugin_key.as_deref(), None);

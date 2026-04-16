@@ -1264,7 +1264,6 @@ fn entity_hidden_alias_source_column(alias: &str, variant: SurfaceVariant) -> Op
         "lixcol_created_at" => Some("created_at"),
         "lixcol_updated_at" => Some("updated_at"),
         "lixcol_global" => Some("global"),
-        "lixcol_writer_key" => Some("writer_key"),
         "lixcol_untracked" => Some("untracked"),
         "lixcol_metadata" => Some("metadata"),
         "lixcol_version_id" if variant == SurfaceVariant::ByVersion => Some("version_id"),

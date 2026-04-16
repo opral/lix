@@ -49,7 +49,12 @@ pub(crate) trait SessionHost: Send + Sync {
 
     fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream;
 
-    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>);
+    fn latest_state_commit_sequence(&self) -> Option<u64>;
+
+    fn emit_state_commit_stream_changes(
+        &self,
+        changes: Vec<StateCommitStreamChange>,
+    ) -> Option<u64>;
 
     fn invalidate_deterministic_settings_cache(&self);
 

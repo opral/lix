@@ -14,7 +14,7 @@ pub(crate) async fn preprocess_with_surfaces_to_logical_plan<P: LixFunctionProvi
     statements: Vec<Statement>,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<DirectLogicalPlan, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -22,7 +22,7 @@ where
     reject_public_surface_statements(registry, &statements)?;
     let result_contract = result_contract_for_statements(&statements);
     let normalized_statements =
-        prepare_direct_statements_to_plan(dialect, statements, params, functions, writer_key)
+        prepare_direct_statements_to_plan(dialect, statements, params, functions, origin_key)
             .await?;
     let logical_plan = DirectLogicalPlan {
         normalized_statements,
