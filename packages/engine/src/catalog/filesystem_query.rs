@@ -14,6 +14,7 @@ const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FilesystemQueryError {
     pub(crate) message: String,
+    pub(crate) hint: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,6 +119,7 @@ pub(crate) async fn ensure_no_file_at_directory_path(
             "Directory path collides with existing file path: {}",
             file_path.normalized_path.as_str()
         ),
+        hint: Some("directory paths must end with '/', while file paths must not".to_string()),
     })
 }
 
@@ -139,6 +141,7 @@ pub(crate) async fn ensure_no_directory_at_file_path(
     }
     Err(FilesystemQueryError {
         message: format!("File path collides with existing directory path: {directory_path}"),
+        hint: Some("file paths must not end with '/', while directory paths must".to_string()),
     })
 }
 
@@ -706,6 +709,7 @@ async fn build_pending_directory_row(
     let snapshot: JsonValue =
         serde_json::from_str(snapshot_content).map_err(|error| FilesystemQueryError {
             message: format!("filesystem pending directory snapshot invalid JSON: {error}"),
+            hint: None,
         })?;
     let parent_id = snapshot
         .get("parent_id")
@@ -1298,6 +1302,7 @@ async fn load_effective_descriptor_rows(
             directory_id: row.get(2).and_then(text_from_value),
             name: name.ok_or_else(|| FilesystemQueryError {
                 message: "filesystem descriptor row missing name".to_string(),
+                hint: None,
             })?,
             extension: row.get(4).and_then(text_from_value),
             hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
@@ -1329,6 +1334,7 @@ async fn build_directory_path_from_descriptor(
                     "filesystem directory '{}' references missing parent '{}'",
                     directory_id, parent_id
                 ),
+                hint: None,
             });
         };
         segments.push(parent.name.clone());
@@ -1337,6 +1343,7 @@ async fn build_directory_path_from_descriptor(
         if safety > 1024 {
             return Err(FilesystemQueryError {
                 message: "filesystem directory parent chain appears cyclic".to_string(),
+                hint: None,
             });
         }
     }
@@ -1370,6 +1377,7 @@ fn required_text_value_index(
         .and_then(text_from_value)
         .ok_or_else(|| FilesystemQueryError {
             message: format!("public filesystem resolver expected text {}", label),
+            hint: None,
         })
 }
 
@@ -1403,6 +1411,7 @@ fn value_as_bool(value: &Value) -> Option<bool> {
 fn filesystem_query_backend_error(error: crate::LixError) -> FilesystemQueryError {
     FilesystemQueryError {
         message: error.description,
+        hint: error.hint,
     }
 }
 
@@ -1708,10 +1717,9 @@ mod tests {
         let backend = DirectFilesystemLookupBackend {
             projection_seen: Arc::new(AtomicBool::new(false)),
         };
-        let directory_path = NormalizedDirectoryPath::try_from_path(
-            "/bench:alpha@beta/nested!$&()*+,;=/",
-        )
-        .expect("normalized directory path");
+        let directory_path =
+            NormalizedDirectoryPath::try_from_path("/bench:alpha@beta/nested!$&()*+,;=/")
+                .expect("normalized directory path");
 
         let directory_id = lookup_directory_id_by_path(
             &backend,
@@ -1737,5 +1745,19 @@ mod tests {
             file_row.path,
             "/bench:alpha@beta/nested!$&()*+,;=/report:summary@v1.txt"
         );
+    }
+
+    #[test]
+    fn filesystem_query_backend_error_preserves_hint() {
+        let wrapped = filesystem_query_backend_error(
+            LixError::new(
+                "LIX_ERROR_PATH_MISSING_LEADING_SLASH",
+                "path must start with '/'",
+            )
+            .with_hint("prefix the path with '/'"),
+        );
+
+        assert_eq!(wrapped.message, "path must start with '/'");
+        assert_eq!(wrapped.hint.as_deref(), Some("prefix the path with '/'"));
     }
 }

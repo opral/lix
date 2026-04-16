@@ -351,7 +351,7 @@ fn text_value_required(
 
 fn filesystem_path_error(error: crate::LixError) -> FilesystemAssignmentsError {
     FilesystemAssignmentsError {
-        message: error.description,
+        message: error.description_with_hint(),
     }
 }
 
@@ -465,11 +465,13 @@ mod tests {
         assert_eq!(directory_insert.name, directory_update.name);
 
         let mut file_payload = BTreeMap::new();
-        file_payload.insert("path".to_string(), Value::Text(special_file_path.to_string()));
+        file_payload.insert(
+            "path".to_string(),
+            Value::Text(special_file_path.to_string()),
+        );
 
-        let file_insert =
-            parse_file_insert_assignments(&file_payload, &system_functions())
-                .expect("file insert parse should succeed");
+        let file_insert = parse_file_insert_assignments(&file_payload, &system_functions())
+            .expect("file insert parse should succeed");
         let file_update =
             parse_file_update_assignments(&file_payload).expect("file update parse should succeed");
 
@@ -484,5 +486,20 @@ mod tests {
                 .as_str(),
             special_file_path
         );
+    }
+
+    #[test]
+    fn assignment_path_errors_preserve_recovery_hints_in_message() {
+        let mut payload = BTreeMap::new();
+        payload.insert(
+            "path".to_string(),
+            Value::Text("docs/readme.md".to_string()),
+        );
+
+        let error = parse_file_insert_assignments(&payload, &system_functions())
+            .expect_err("invalid path should fail");
+
+        assert!(error.message.contains("path must start with '/'"));
+        assert!(error.message.contains("hint: prefix the path with '/'"));
     }
 }
