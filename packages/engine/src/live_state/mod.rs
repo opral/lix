@@ -72,8 +72,7 @@ pub use effective::{
 pub(crate) use frontier::{
     load_current_committed_version_frontier_with_backend,
     load_current_committed_version_frontier_with_executor,
-    load_version_head_commit_id_with_backend, load_version_head_commit_id_with_executor,
-    load_version_head_commit_map_with_executor,
+    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
 };
 pub use init::init;
 pub use lifecycle::LiveStateReadiness;
@@ -100,9 +99,9 @@ pub(crate) use schema_access::LiveRowShape;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
 #[cfg(test)]
 pub(crate) use storage_metadata::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
-pub(crate) use storage_metadata::{
-    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-};
+#[cfg(test)]
+pub(crate) use storage_metadata::{key_value_file_id, key_value_plugin_key};
+pub(crate) use storage_metadata::{key_value_schema_key, key_value_schema_version};
 #[cfg(test)]
 pub(crate) use testing::LIVE_STATE_SCHEMA_EPOCH;
 pub(crate) use tracked::{
@@ -140,6 +139,9 @@ pub(crate) use visible_rows::{
 #[cfg(test)]
 pub(crate) use writer_key::WriterKeyReadView;
 pub(crate) use writer_key::WRITER_KEY_TABLE;
+pub(crate) use writer_key::{
+    apply_writer_key_annotations_with_executor, tracked_writer_key_annotations_from_changes,
+};
 
 pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;
 pub(crate) use naming::{tracked_relation_name, INTERNAL_RELATION_PREFIX};

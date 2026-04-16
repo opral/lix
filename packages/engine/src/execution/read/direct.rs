@@ -581,8 +581,14 @@ fn state_history_field_value(row: &StateHistoryRow, field: &PreparedStateHistory
     match field {
         PreparedStateHistoryField::EntityId => Value::Text(row.entity_id.clone()),
         PreparedStateHistoryField::SchemaKey => Value::Text(row.schema_key.clone()),
-        PreparedStateHistoryField::FileId => Value::Text(row.file_id.clone()),
-        PreparedStateHistoryField::PluginKey => Value::Text(row.plugin_key.clone()),
+        PreparedStateHistoryField::FileId => {
+            row.file_id.clone().map(Value::Text).unwrap_or(Value::Null)
+        }
+        PreparedStateHistoryField::PluginKey => row
+            .plugin_key
+            .clone()
+            .map(Value::Text)
+            .unwrap_or(Value::Null),
         PreparedStateHistoryField::SnapshotContent => row
             .snapshot_content
             .as_ref()
@@ -792,9 +798,17 @@ fn file_history_field_value(row: &FileHistoryRow, field: &PreparedFileHistoryFie
         PreparedFileHistoryField::Hidden => row.hidden.map(Value::Boolean).unwrap_or(Value::Null),
         PreparedFileHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),
         PreparedFileHistoryField::SchemaKey => Value::Text(row.lixcol_schema_key.clone()),
-        PreparedFileHistoryField::FileId => Value::Text(row.lixcol_file_id.clone()),
+        PreparedFileHistoryField::FileId => row
+            .lixcol_file_id
+            .as_ref()
+            .map(|value| Value::Text(value.clone()))
+            .unwrap_or(Value::Null),
         PreparedFileHistoryField::VersionId => Value::Text(row.lixcol_version_id.clone()),
-        PreparedFileHistoryField::PluginKey => Value::Text(row.lixcol_plugin_key.clone()),
+        PreparedFileHistoryField::PluginKey => row
+            .lixcol_plugin_key
+            .as_ref()
+            .map(|value| Value::Text(value.clone()))
+            .unwrap_or(Value::Null),
         PreparedFileHistoryField::SchemaVersion => Value::Text(row.lixcol_schema_version.clone()),
         PreparedFileHistoryField::ChangeId => Value::Text(row.lixcol_change_id.clone()),
         PreparedFileHistoryField::LixcolMetadata => row
@@ -1004,9 +1018,17 @@ fn directory_history_field_value(
         }
         PreparedDirectoryHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),
         PreparedDirectoryHistoryField::SchemaKey => Value::Text(row.lixcol_schema_key.clone()),
-        PreparedDirectoryHistoryField::FileId => Value::Text(row.lixcol_file_id.clone()),
+        PreparedDirectoryHistoryField::FileId => row
+            .lixcol_file_id
+            .as_ref()
+            .map(|value| Value::Text(value.clone()))
+            .unwrap_or(Value::Null),
         PreparedDirectoryHistoryField::VersionId => Value::Text(row.lixcol_version_id.clone()),
-        PreparedDirectoryHistoryField::PluginKey => Value::Text(row.lixcol_plugin_key.clone()),
+        PreparedDirectoryHistoryField::PluginKey => row
+            .lixcol_plugin_key
+            .as_ref()
+            .map(|value| Value::Text(value.clone()))
+            .unwrap_or(Value::Null),
         PreparedDirectoryHistoryField::SchemaVersion => {
             Value::Text(row.lixcol_schema_version.clone())
         }

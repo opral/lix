@@ -7,7 +7,7 @@ use crate::canonical::{
     CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
     CanonicalVisibleStateRow,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, Value};
 
 use super::constraints::ScanConstraint;
 use super::schema_access::load_live_row_shape_with_backend;
@@ -28,7 +28,7 @@ use super::{
 };
 use crate::schema::{schema_key_from_definition, SchemaKey};
 use crate::version::GLOBAL_VERSION_ID;
-use crate::version::{version_ref_file_id, version_ref_schema_key, version_ref_storage_version_id};
+use crate::version::{version_ref_schema_key, version_ref_storage_version_id};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiveRowSource {
@@ -57,11 +57,11 @@ pub struct ExactLiveRowQuery {
     pub version_id: String,
     pub entity_id: String,
     #[serde(default)]
-    pub file_id: Option<String>,
+    pub file_id: NullableKeyFilter<String>,
     #[serde(default)]
     pub schema_version: Option<String>,
     #[serde(default)]
-    pub plugin_key: Option<String>,
+    pub plugin_key: NullableKeyFilter<String>,
     #[serde(default)]
     pub writer_key: Option<String>,
     #[serde(default)]
@@ -79,11 +79,11 @@ pub struct ExactLiveRowQuery {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct LiveRow {
     pub entity_id: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub schema_key: String,
     pub schema_version: String,
     pub version_id: String,
-    pub plugin_key: String,
+    pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub change_id: Option<String>,
     pub writer_key: Option<String>,
@@ -349,8 +349,8 @@ async fn scan_effective_rows_with_options(
     include_global_overlay: bool,
     include_untracked_overlay: bool,
 ) -> Result<Vec<LiveRow>, LixError> {
-    let mut resolved = BTreeMap::<(String, String), LiveRow>::new();
-    let mut hidden = BTreeSet::<(String, String)>::new();
+    let mut resolved = BTreeMap::<(String, Option<String>), LiveRow>::new();
+    let mut hidden = BTreeSet::<(String, Option<String>)>::new();
     let lanes = effective_lanes(
         &request.version_id,
         include_global_overlay,
@@ -401,7 +401,7 @@ async fn load_exact_effective_row(
         }],
         include_tombstones: request.include_tombstones,
     };
-    if let Some(file_id) = request.file_id.as_ref() {
+    if let NullableKeyFilter::Value(file_id) = &request.file_id {
         query.constraints.push(ScanConstraint {
             field: super::ScanField::FileId,
             operator: super::ScanOperator::Eq(Value::Text(file_id.clone())),
@@ -502,10 +502,10 @@ async fn load_exact_tracked_row_from_canonical_for_lane(
     let mut filter = CanonicalVisibleStateFilter::default();
     filter.schema_keys.insert(request.schema_key.clone());
     filter.entity_ids.insert(request.entity_id.clone());
-    if let Some(file_id) = request.file_id.as_ref() {
+    if let NullableKeyFilter::Value(file_id) = &request.file_id {
         filter.file_ids.insert(file_id.clone());
     }
-    if let Some(plugin_key) = request.plugin_key.as_ref() {
+    if let NullableKeyFilter::Value(plugin_key) = &request.plugin_key {
         filter.plugin_keys.insert(plugin_key.clone());
     }
 
@@ -543,7 +543,7 @@ async fn load_version_head_commit_id_from_live_row(
             schema_key: version_ref_schema_key().to_string(),
             version_id: version_ref_storage_version_id().to_string(),
             entity_id: version_id.to_string(),
-            file_id: Some(version_ref_file_id().to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await?
@@ -570,18 +570,12 @@ fn canonical_visible_state_row_matches_query(
 ) -> bool {
     row.entity_id == request.entity_id
         && row.schema_key == request.schema_key
-        && request
-            .file_id
-            .as_ref()
-            .is_none_or(|file_id| row.file_id == *file_id)
+        && request.file_id.matches(row.file_id.as_ref())
         && request
             .schema_version
             .as_ref()
             .is_none_or(|schema_version| row.schema_version == *schema_version)
-        && request
-            .plugin_key
-            .as_ref()
-            .is_none_or(|plugin_key| row.plugin_key == *plugin_key)
+        && request.plugin_key.matches(row.plugin_key.as_ref())
 }
 
 async fn canonical_effective_lane_outcome_from_visible_row(
@@ -605,7 +599,7 @@ async fn canonical_effective_lane_outcome_from_visible_row(
         &storage_version_id,
         &row.schema_key,
         &row.entity_id,
-        &row.file_id,
+        row.file_id.as_deref(),
     )
     .await?;
 
@@ -834,7 +828,7 @@ fn tracked_tombstone_to_row(tombstone: super::TrackedTombstoneMarker) -> LiveRow
         schema_key: tombstone.schema_key,
         schema_version: tombstone.schema_version.unwrap_or_default(),
         version_id: tombstone.version_id,
-        plugin_key: tombstone.plugin_key.unwrap_or_default(),
+        plugin_key: tombstone.plugin_key,
         metadata: tombstone.metadata,
         change_id: tombstone.change_id,
         writer_key: tombstone.writer_key,
@@ -866,14 +860,12 @@ fn row_sort_key(left: &LiveRow, right: &LiveRow) -> std::cmp::Ordering {
 }
 
 fn exact_live_row_matches_query(row: &LiveRow, request: &ExactLiveRowQuery) -> bool {
-    request
-        .schema_version
-        .as_deref()
-        .is_none_or(|schema_version| row.schema_version == schema_version)
+    request.file_id.matches(row.file_id.as_ref())
         && request
-            .plugin_key
+            .schema_version
             .as_deref()
-            .is_none_or(|plugin_key| row.plugin_key == plugin_key)
+            .is_none_or(|schema_version| row.schema_version == schema_version)
+        && request.plugin_key.matches(row.plugin_key.as_ref())
         && request
             .writer_key
             .as_deref()
@@ -949,17 +941,17 @@ mod tests {
         init_test_backend_core, seed_canonical_change_row, seed_live_state_status_row,
         seed_local_version_head, CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::{CommittedVersionFrontier, LixBackend};
+    use crate::{CommittedVersionFrontier, LixBackend, NullableKeyFilter};
     use serde_json::Value as JsonValue;
 
     fn registered_schema_row(snapshot_content: Option<&str>) -> LiveRow {
         LiveRow {
             entity_id: "users~1".to_string(),
-            file_id: "users~1".to_string(),
+            file_id: None,
             schema_key: "lix_registered_schema".to_string(),
             schema_version: "1".to_string(),
             version_id: "global".to_string(),
-            plugin_key: "lix".to_string(),
+            plugin_key: None,
             metadata: None,
             change_id: Some("chg_schema".to_string()),
             writer_key: None,
@@ -974,11 +966,11 @@ mod tests {
     fn writable_live_row(untracked: bool, snapshot_content: Option<&str>) -> LiveRow {
         LiveRow {
             entity_id: "settings".to_string(),
-            file_id: "state".to_string(),
+            file_id: None,
             schema_key: "lix_key_value".to_string(),
             schema_version: "1".to_string(),
             version_id: "main".to_string(),
-            plugin_key: "lix".to_string(),
+            plugin_key: None,
             metadata: Some("{\"kind\":\"state\"}".to_string()),
             change_id: Some("chg_123".to_string()),
             writer_key: Some("writer-a".to_string()),
@@ -996,9 +988,9 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             version_id: "main".to_string(),
             entity_id: "settings".to_string(),
-            file_id: Some("state".to_string()),
+            file_id: NullableKeyFilter::Null,
             schema_version: None,
-            plugin_key: None,
+            plugin_key: NullableKeyFilter::Any,
             writer_key: None,
             global: None,
             untracked: None,
@@ -1103,7 +1095,7 @@ mod tests {
         let row = writable_live_row(false, Some(r#"{"key":"theme","value":"dark"}"#));
         let mut query = exact_live_row_query();
         query.schema_version = Some("1".to_string());
-        query.plugin_key = Some("lix".to_string());
+        query.plugin_key = NullableKeyFilter::Null;
         query.writer_key = Some("writer-a".to_string());
 
         assert!(exact_live_row_matches_query(&row, &query));
@@ -1134,8 +1126,8 @@ mod tests {
                 entity_id: "settings",
                 schema_key: "lix_key_value",
                 schema_version: "1",
-                file_id: "state",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-1",
                 snapshot_content: Some(r#"{"key":"theme","value":"canonical"}"#),
                 metadata: Some(r#"{"kind":"state"}"#),
@@ -1152,8 +1144,8 @@ mod tests {
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-commit-1",
                 snapshot_content: Some(
                     r#"{"id":"commit-1","change_set_id":"cs-1","change_ids":["change-1"],"parent_commit_ids":[]}"#,
@@ -1209,9 +1201,9 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 version_id: "main".to_string(),
                 entity_id: "settings".to_string(),
-                file_id: Some("state".to_string()),
+                file_id: NullableKeyFilter::Null,
                 schema_version: Some("1".to_string()),
-                plugin_key: Some("lix".to_string()),
+                plugin_key: NullableKeyFilter::Null,
                 writer_key: None,
                 global: Some(false),
                 untracked: Some(false),

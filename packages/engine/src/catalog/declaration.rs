@@ -161,7 +161,7 @@ impl CatalogProjectionSourceRow {
     pub(crate) fn with_live_metadata(
         mut self,
         schema_version: impl Into<String>,
-        plugin_key: impl Into<String>,
+        plugin_key: Option<String>,
         metadata: Option<String>,
         change_id: Option<String>,
         writer_key: Option<String>,
@@ -170,7 +170,7 @@ impl CatalogProjectionSourceRow {
         updated_at: Option<String>,
     ) -> Self {
         self.schema_version = Some(schema_version.into());
-        self.plugin_key = Some(plugin_key.into());
+        self.plugin_key = plugin_key;
         self.metadata = metadata;
         self.change_id = change_id;
         self.writer_key = writer_key;
@@ -207,8 +207,8 @@ impl CatalogProjectionSourceRow {
         &self.values
     }
 
-    pub(crate) fn file_id(&self) -> &str {
-        self.identity.file_id.as_str()
+    pub(crate) fn file_id(&self) -> Option<&str> {
+        self.identity.file_id.as_deref()
     }
 
     pub(crate) fn schema_version(&self) -> Option<&str> {
@@ -622,7 +622,7 @@ mod tests {
             schema_key: "lix_version_descriptor".into(),
             version_id: "v1".into(),
             entity_id: "version-1".into(),
-            file_id: "file-1".into(),
+            file_id: Some("file-1".to_string()),
         });
 
         assert_eq!(derived.surface_name, "lix_version");
@@ -632,7 +632,7 @@ mod tests {
                 schema_key: "lix_version_descriptor".into(),
                 version_id: "v1".into(),
                 entity_id: "version-1".into(),
-                file_id: "file-1".into(),
+                file_id: Some("file-1".to_string()),
             })
         );
     }
@@ -675,7 +675,7 @@ mod tests {
                 schema_key: "demo_schema".into(),
                 version_id: "v1".into(),
                 entity_id: "entity-1".into(),
-                file_id: "file-1".into(),
+                file_id: Some("file-1".to_string()),
             },
             "demo_schema",
             "v1",
@@ -690,7 +690,7 @@ mod tests {
                 schema_key: "demo_schema".into(),
                 version_id: "v2".into(),
                 entity_id: "entity-2".into(),
-                file_id: "file-2".into(),
+                file_id: Some("file-2".to_string()),
             },
             "demo_schema",
             "v2",

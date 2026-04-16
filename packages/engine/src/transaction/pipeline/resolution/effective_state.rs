@@ -90,8 +90,8 @@ fn lane_matches_untracked_filter(lane: OverlayLane, requested_untracked: Option<
 fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Option<&'a str> {
     match column {
         "entity_id" => Some(row_key.entity_id.as_str()),
-        "file_id" => row_key.file_id.as_deref(),
-        "plugin_key" => row_key.plugin_key.as_deref(),
+        "file_id" => row_key.file_id.as_value().map(String::as_str),
+        "plugin_key" => row_key.plugin_key.as_value().map(String::as_str),
         "schema_version" => row_key.schema_version.as_deref(),
         "writer_key" => row_key.writer_key.as_deref(),
         _ => None,
@@ -166,11 +166,21 @@ fn pending_row_matches_exact_request(
     request: &ExactEffectiveStateRowRequest,
     internal_version_id: &str,
 ) -> bool {
+    let requested_file_id = match &request.row_key.file_id {
+        crate::NullableKeyFilter::Any => row.file_id.as_deref(),
+        crate::NullableKeyFilter::Null => None,
+        crate::NullableKeyFilter::Value(value) => Some(value.as_str()),
+    };
+    let requested_plugin_key = match &request.row_key.plugin_key {
+        crate::NullableKeyFilter::Any => row.plugin_key.as_deref(),
+        crate::NullableKeyFilter::Null => None,
+        crate::NullableKeyFilter::Value(value) => Some(value.as_str()),
+    };
+
     row.entity_id == request.row_key.entity_id
         && row.version_id == internal_version_id
-        && row.file_id == row_key_text_value(&request.row_key, "file_id").unwrap_or(&row.file_id)
-        && row.plugin_key
-            == row_key_text_value(&request.row_key, "plugin_key").unwrap_or(&row.plugin_key)
+        && row.file_id.as_deref() == requested_file_id
+        && row.plugin_key.as_deref() == requested_plugin_key
         && row.schema_version
             == row_key_text_value(&request.row_key, "schema_version").unwrap_or(&row.schema_version)
 }
@@ -203,14 +213,20 @@ async fn exact_effective_state_row_from_pending(
         "schema_version".to_string(),
         Value::Text(row.schema_version.clone()),
     );
-    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
+    values.insert(
+        "file_id".to_string(),
+        row.file_id.clone().map(Value::Text).unwrap_or(Value::Null),
+    );
     values.insert(
         "version_id".to_string(),
         Value::Text(projected_version_id.clone()),
     );
     values.insert(
         "plugin_key".to_string(),
-        Value::Text(row.plugin_key.clone()),
+        row.plugin_key
+            .clone()
+            .map(Value::Text)
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "snapshot_content".to_string(),
@@ -228,7 +244,7 @@ async fn exact_effective_state_row_from_pending(
         &row.version_id,
         &row.schema_key,
         &row.entity_id,
-        &row.file_id,
+        row.file_id.as_deref(),
     )
     .flatten();
     values.insert(
@@ -267,7 +283,7 @@ fn pending_writer_key_annotation(
     version_id: &str,
     schema_key: &str,
     entity_id: &str,
-    file_id: &str,
+    file_id: Option<&str>,
 ) -> Option<Option<String>> {
     pending_overlay.and_then(|view| {
         view.writer_key_annotation_for_state_row(version_id, schema_key, entity_id, file_id)
@@ -297,14 +313,20 @@ async fn exact_effective_state_row_from_live_row(
         "schema_version".to_string(),
         Value::Text(row.schema_version.clone()),
     );
-    values.insert("file_id".to_string(), Value::Text(row.file_id.clone()));
+    values.insert(
+        "file_id".to_string(),
+        row.file_id.clone().map(Value::Text).unwrap_or(Value::Null),
+    );
     values.insert(
         "version_id".to_string(),
         Value::Text(projected_version_id.clone()),
     );
     values.insert(
         "plugin_key".to_string(),
-        Value::Text(row.plugin_key.clone()),
+        row.plugin_key
+            .clone()
+            .map(Value::Text)
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "snapshot_content".to_string(),

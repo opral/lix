@@ -155,6 +155,9 @@ fn state_predicate_is_pushdown_safe(expr: &Expr, resolved_relation: &ResolvedRel
             op: BinaryOperator::Eq,
             right,
         } => state_pushdown_column(left, resolved_relation).is_some() && constant_like_expr(right),
+        Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
+            state_pushdown_column(expr, resolved_relation).is_some()
+        }
         Expr::InList {
             expr,
             list,

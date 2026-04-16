@@ -230,7 +230,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                             "SELECT COUNT(*) \
                              FROM lix_working_changes \
                              WHERE schema_key = 'lix_file_descriptor' \
-                               AND file_id = 'lix' \
+                               AND file_id IS NULL \
                                AND entity_id = $1", &[lix_engine::Value::Text(file_id.clone())])
                         .await
                         .expect("working changes query before reopen should succeed");
@@ -265,7 +265,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                             "SELECT COUNT(*) \
                              FROM lix_working_changes \
                              WHERE schema_key = 'lix_file_descriptor' \
-                               AND file_id = 'lix' \
+                               AND file_id IS NULL \
                                AND entity_id = $1", &[lix_engine::Value::Text(file_id.clone())])
                         .await
                         .expect("working changes query after reopen should succeed");
@@ -301,7 +301,7 @@ fn init_reopen_preserves_working_changes_sqlite() {
                             "SELECT status, before_change_id, after_change_id \
                              FROM lix_working_changes \
                              WHERE schema_key = 'lix_file_descriptor' \
-                               AND file_id = 'lix' \
+                               AND file_id IS NULL \
                                AND entity_id = $1", &[lix_engine::Value::Text(file_id)])
                         .await
                         .expect("working row query after reopen should succeed");
@@ -626,7 +626,7 @@ simulation_test!(init_seeds_key_value_schema_definition, |sim| async move {
              FROM lix_state_by_version \
              WHERE entity_id = 'lix_key_value~1' \
                AND schema_key = 'lix_registered_schema' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND version_id = 'global' \
              LIMIT 1",
             &[],
@@ -664,7 +664,7 @@ simulation_test!(init_seeds_lix_id_key_value, |sim| async move {
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'lix_id' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND version_id = 'global' \
                AND snapshot_content IS NOT NULL \
              LIMIT 1",
@@ -711,7 +711,7 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
                'lix_commit_edge~1'\
              ) \
                AND schema_key = 'lix_registered_schema' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND version_id = 'global' \
              ORDER BY entity_id",
             &[],
@@ -744,15 +744,11 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             .get("x-lix-version")
             .and_then(serde_json::Value::as_str)
             .expect("schema must include x-lix-version");
-        let plugin_key_override = schema
-            .get("x-lix-override-lixcols")
-            .and_then(serde_json::Value::as_object)
-            .and_then(|overrides| overrides.get("lixcol_plugin_key"))
-            .and_then(serde_json::Value::as_str)
-            .expect("schema must include lixcol_plugin_key override");
-
         assert_eq!(schema_version, "1");
-        assert_eq!(plugin_key_override, "\"lix\"");
+        assert!(
+            schema.get("x-lix-override-lixcols").is_none(),
+            "builtin schema bootstrap should not carry removed file/plugin overrides"
+        );
         assert_eq!(entity_id, format!("{schema_key}~{schema_version}"));
         seen_schema_keys.insert(schema_key.to_string());
     }
@@ -790,7 +786,7 @@ simulation_test!(
                 "SELECT entity_id, change_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND version_id = 'global' \
                    AND untracked = true \
                    AND snapshot_content IS NOT NULL \
@@ -819,7 +815,7 @@ simulation_test!(
                 "SELECT id, entity_id, untracked \
                  FROM lix_change \
                  WHERE schema_key = 'lix_version_ref' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND untracked = true \
                    AND snapshot_content IS NOT NULL \
                  ORDER BY entity_id",
@@ -874,7 +870,7 @@ simulation_test!(
                 "SELECT entity_id, change_id \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_registered_schema' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND version_id = 'global' \
                    AND untracked = true \
                    AND entity_id IN (\
@@ -916,7 +912,7 @@ simulation_test!(
                 "SELECT id, entity_id, untracked \
                  FROM lix_change \
                  WHERE schema_key = 'lix_registered_schema' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND untracked = true \
                    AND entity_id IN (\
                      'lix_registered_schema~1', \
@@ -956,7 +952,7 @@ simulation_test!(
                 "SELECT entity_id, change_id, untracked \
                  FROM lix_internal_registered_schema_bootstrap \
                  WHERE schema_key = 'lix_registered_schema' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND version_id = 'global' \
                    AND untracked = true \
                    AND entity_id IN (\
@@ -1215,7 +1211,7 @@ simulation_test!(
                 "SELECT entity_id, snapshot_content \
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_label' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND version_id = 'global' \
                AND snapshot_content IS NOT NULL",
                 &[],
@@ -1256,7 +1252,7 @@ simulation_test!(
                  FROM lix_entity_label \
                  WHERE entity_id = $1 \
                    AND schema_key = 'lix_commit' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND label_id = $2",
                 &[
                     lix_engine::Value::Text(global_commit_id),
@@ -1507,7 +1503,7 @@ simulation_test!(
                     "SELECT COUNT(*) \
                      FROM lix_change \
                      WHERE schema_key = 'lix_version_ref' \
-                       AND file_id = 'lix' \
+                       AND file_id IS NULL \
                        AND untracked = true \
                        AND snapshot_content IS NOT NULL",
                     &[],
@@ -1521,7 +1517,7 @@ simulation_test!(
                     "SELECT COUNT(*) \
                      FROM lix_internal_registered_schema_bootstrap \
                      WHERE schema_key = 'lix_registered_schema' \
-                       AND file_id = 'lix' \
+                       AND file_id IS NULL \
                        AND version_id = 'global' \
                        AND untracked = true",
                     &[],
@@ -1536,7 +1532,7 @@ simulation_test!(
                      FROM lix_entity_label \
                      WHERE entity_id = $1 \
                        AND schema_key = 'lix_commit' \
-                       AND file_id = 'lix' \
+                       AND file_id IS NULL \
                        AND label_id = $2",
                     &[
                         Value::Text(global_commit_id.clone()),
@@ -1591,7 +1587,7 @@ simulation_test!(
                     "SELECT COUNT(*) \
                      FROM lix_change \
                      WHERE schema_key = 'lix_version_ref' \
-                       AND file_id = 'lix' \
+                       AND file_id IS NULL \
                        AND untracked = true \
                        AND snapshot_content IS NOT NULL",
                     &[],
@@ -1605,7 +1601,7 @@ simulation_test!(
                     "SELECT COUNT(*) \
                      FROM lix_internal_registered_schema_bootstrap \
                      WHERE schema_key = 'lix_registered_schema' \
-                       AND file_id = 'lix' \
+                       AND file_id IS NULL \
                        AND version_id = 'global' \
                        AND untracked = true",
                     &[],
@@ -1620,7 +1616,7 @@ simulation_test!(
                      FROM lix_entity_label \
                      WHERE entity_id = $1 \
                        AND schema_key = 'lix_commit' \
-                       AND file_id = 'lix' \
+                       AND file_id IS NULL \
                        AND label_id = $2",
                     &[
                         Value::Text(global_commit_id),

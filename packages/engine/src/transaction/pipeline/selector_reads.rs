@@ -23,7 +23,7 @@ use crate::sql::{
 };
 use crate::transaction::{PendingOverlay, WriteResolveError, WriteSelectorResolver};
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, Value};
 
 use super::state_write_target_resolver::try_resolve_state_write_targets_with_backend;
 
@@ -188,8 +188,8 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
         for row in query_result.rows {
             let selector_row = CanonicalStateRowKey {
                 entity_id: required_text_value_index(&row, 0, "lixcol_entity_id")?,
-                file_id: None,
-                plugin_key: None,
+                file_id: NullableKeyFilter::Any,
+                plugin_key: NullableKeyFilter::Any,
                 schema_version: None,
                 version_id: selector
                     .version_column
@@ -242,8 +242,12 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
             let version_offset = usize::from(selector.version_column.is_some());
             let selector_row = CanonicalStateRowKey {
                 entity_id: required_text_value_index(&row, 0, "entity_id")?,
-                file_id: Some(required_text_value_index(&row, 1, "file_id")?),
-                plugin_key: Some(required_text_value_index(&row, 2, "plugin_key")?),
+                file_id: NullableKeyFilter::Value(required_text_value_index(&row, 1, "file_id")?),
+                plugin_key: NullableKeyFilter::Value(required_text_value_index(
+                    &row,
+                    2,
+                    "plugin_key",
+                )?),
                 schema_version: Some(required_text_value_index(&row, 3, "schema_version")?),
                 version_id: selector
                     .version_column

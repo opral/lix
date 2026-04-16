@@ -132,17 +132,9 @@ pub(super) async fn undo_in_session_transaction(
                             .clone()
                             .map(|value| value.to_string())
                             .unwrap_or_default(),
-                        file_id: restored
-                            .file_id
-                            .clone()
-                            .map(|value| value.to_string())
-                            .unwrap_or_default(),
+                        file_id: restored.file_id.clone().map(|value| value.to_string()),
                         version_id: version_id.clone(),
-                        plugin_key: restored
-                            .plugin_key
-                            .clone()
-                            .map(|value| value.to_string())
-                            .unwrap_or_default(),
+                        plugin_key: restored.plugin_key.clone().map(|value| value.to_string()),
                         snapshot_content: restored
                             .snapshot_content
                             .as_deref()
@@ -175,17 +167,9 @@ pub(super) async fn undo_in_session_transaction(
                             .clone()
                             .map(|value| value.to_string())
                             .unwrap_or_default(),
-                        file_id: restored
-                            .file_id
-                            .clone()
-                            .map(|value| value.to_string())
-                            .unwrap_or_default(),
+                        file_id: restored.file_id.clone().map(|value| value.to_string()),
                         version_id: version_id.clone(),
-                        plugin_key: restored
-                            .plugin_key
-                            .clone()
-                            .map(|value| value.to_string())
-                            .unwrap_or_default(),
+                        plugin_key: restored.plugin_key.clone().map(|value| value.to_string()),
                         snapshot_content: restored
                             .snapshot_content
                             .as_deref()
@@ -268,17 +252,9 @@ pub(super) async fn redo_in_session_transaction(
                     .clone()
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
-                file_id: proposed
-                    .file_id
-                    .clone()
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
+                file_id: proposed.file_id.clone().map(|value| value.to_string()),
                 version_id: version_id.clone(),
-                plugin_key: proposed
-                    .plugin_key
-                    .clone()
-                    .map(|value| value.to_string())
-                    .unwrap_or_default(),
+                plugin_key: proposed.plugin_key.clone().map(|value| value.to_string()),
                 snapshot_content: proposed
                     .snapshot_content
                     .as_deref()
@@ -677,14 +653,16 @@ fn build_forward_proposed_change(
             change.schema_version.clone(),
             "undo forward schema_version",
         )?),
-        file_id: Some(require_identity(
-            change.file_id.clone(),
-            "undo forward file_id",
-        )?),
-        plugin_key: Some(require_identity(
-            change.plugin_key.clone(),
-            "undo forward plugin_key",
-        )?),
+        file_id: change
+            .file_id
+            .clone()
+            .map(|value| require_identity(value, "undo forward file_id"))
+            .transpose()?,
+        plugin_key: change
+            .plugin_key
+            .clone()
+            .map(|value| require_identity(value, "undo forward plugin_key"))
+            .transpose()?,
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
         version_id: require_identity(version_id.to_string(), "undo forward version_id")?,
@@ -705,14 +683,16 @@ fn build_restore_proposed_change(
             row.schema_version.clone(),
             "undo restore schema_version",
         )?),
-        file_id: Some(require_identity(
-            row.file_id.clone(),
-            "undo restore file_id",
-        )?),
-        plugin_key: Some(require_identity(
-            row.plugin_key.clone(),
-            "undo restore plugin_key",
-        )?),
+        file_id: row
+            .file_id
+            .clone()
+            .map(|value| require_identity(value, "undo restore file_id"))
+            .transpose()?,
+        plugin_key: row
+            .plugin_key
+            .clone()
+            .map(|value| require_identity(value, "undo restore plugin_key"))
+            .transpose()?,
         snapshot_content: Some(row.snapshot_content.clone()),
         metadata: row.metadata.clone(),
         version_id: require_identity(version_id.to_string(), "undo restore version_id")?,
@@ -733,14 +713,16 @@ fn build_tombstone_proposed_change(
             change.schema_version.clone(),
             "undo tombstone schema_version",
         )?),
-        file_id: Some(require_identity(
-            change.file_id.clone(),
-            "undo tombstone file_id",
-        )?),
-        plugin_key: Some(require_identity(
-            change.plugin_key.clone(),
-            "undo tombstone plugin_key",
-        )?),
+        file_id: change
+            .file_id
+            .clone()
+            .map(|value| require_identity(value, "undo tombstone file_id"))
+            .transpose()?,
+        plugin_key: change
+            .plugin_key
+            .clone()
+            .map(|value| require_identity(value, "undo tombstone plugin_key"))
+            .transpose()?,
         snapshot_content: None,
         metadata: None,
         version_id: require_identity(version_id.to_string(), "undo tombstone version_id")?,

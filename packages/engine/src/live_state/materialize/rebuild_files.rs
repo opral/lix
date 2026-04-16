@@ -88,8 +88,8 @@ pub(crate) async fn rebuild_file_payloads_with_plugins(
         writes_by_target
             .entry((
                 write.version_id.to_string(),
-                write.file_id.to_string(),
-                write.plugin_key.to_string(),
+                write.file_id.clone().unwrap_or_default(),
+                write.plugin_key.clone().unwrap_or_default(),
             ))
             .or_default()
             .push(write);

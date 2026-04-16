@@ -12,14 +12,20 @@ pub(crate) fn checkpoint_label_snapshot() -> String {
 }
 
 pub(crate) fn checkpoint_commit_label_entity_id(commit_id: &str) -> String {
-    format!("{commit_id}~lix_commit~lix~{CHECKPOINT_LABEL_ID}")
+    serde_json::json!([
+        commit_id,
+        "lix_commit",
+        serde_json::Value::Null,
+        CHECKPOINT_LABEL_ID
+    ])
+    .to_string()
 }
 
 pub(crate) fn checkpoint_commit_label_snapshot(commit_id: &str) -> String {
     serde_json::json!({
         "entity_id": commit_id,
         "schema_key": "lix_commit",
-        "file_id": "lix",
+        "file_id": serde_json::Value::Null,
         "label_id": CHECKPOINT_LABEL_ID,
     })
     .to_string()

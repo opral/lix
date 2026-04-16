@@ -546,7 +546,7 @@ mod tests {
                     )
                     .with_live_metadata(
                         "1",
-                        "lix",
+                        None,
                         None,
                         Some("change-untracked-dir".to_string()),
                         None,
@@ -611,7 +611,7 @@ mod tests {
                 schema_key: DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 version_id: version_id.to_string(),
                 entity_id: entity_id.to_string(),
-                file_id: "lix".to_string(),
+                file_id: None,
             },
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
             version_id,
@@ -619,7 +619,7 @@ mod tests {
         )
         .with_live_metadata(
             "1",
-            "lix",
+            None,
             None,
             None,
             None,

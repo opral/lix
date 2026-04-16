@@ -12,8 +12,8 @@ pub(crate) struct ChangeRecord {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
-    pub file_id: String,
-    pub plugin_key: String,
+    pub file_id: Option<String>,
+    pub plugin_key: Option<String>,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
     pub untracked: bool,
@@ -34,8 +34,8 @@ pub(crate) struct VersionDescriptorRecord {
     pub id: String,
     pub entity_id: String,
     pub schema_version: String,
-    pub file_id: String,
-    pub plugin_key: String,
+    pub file_id: Option<String>,
+    pub plugin_key: Option<String>,
     pub snapshot_content: CanonicalJson,
     pub metadata: Option<CanonicalJson>,
     pub created_at: String,
@@ -66,8 +66,8 @@ pub(crate) async fn load_data_with_executor(
         let entity_id = text_required(&row, 1, "entity_id")?;
         let schema_key = text_required(&row, 2, "schema_key")?;
         let schema_version = text_required(&row, 3, "schema_version")?;
-        let file_id = text_required(&row, 4, "file_id")?;
-        let plugin_key = text_required(&row, 5, "plugin_key")?;
+        let file_id = text_optional(&row, 4, "file_id")?;
+        let plugin_key = text_optional(&row, 5, "plugin_key")?;
         let snapshot_content_raw = json_text_optional(&row, 6, "snapshot_content")?;
         let metadata_raw = json_text_optional(&row, 7, "metadata")?;
         let snapshot_content = snapshot_content_raw

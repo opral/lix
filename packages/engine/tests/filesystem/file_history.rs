@@ -127,6 +127,10 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_null(value: &Value) {
+    assert_eq!(*value, Value::Null, "expected NULL, got {value:?}");
+}
+
 fn assert_integer(value: &Value, expected: i64) {
     match value {
         Value::Integer(actual) => assert_eq!(*actual, expected),
@@ -1037,7 +1041,7 @@ simulation_test!(
         );
         assert_text(&after.statements[0].rows[0][1], "lix_file_descriptor");
         assert_text(&after.statements[0].rows[0][2], "history-partial");
-        assert_text(&after.statements[0].rows[0][3], "lix");
+        assert_null(&after.statements[0].rows[0][3]);
         assert_text(&after.statements[0].rows[0][4], "1");
         assert_text(
             &after.statements[0].rows[0][5],
@@ -1173,7 +1177,7 @@ simulation_test!(
                 "INSERT INTO lix_key_value (\
                  key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'history-lixcol-kv', 'value-0', 'lix', 'lix', '1'\
+                 'history-lixcol-kv', 'value-0', NULL, NULL, '1'\
                  )",
                 &[],
             )
@@ -1232,7 +1236,7 @@ simulation_test!(
             &file_history.statements[0].rows[0][3],
             "file_history.lixcol_version_id",
         );
-        assert_text(&file_history.statements[0].rows[0][4], "lix");
+        assert_null(&file_history.statements[0].rows[0][4]);
         assert_text(&file_history.statements[0].rows[0][5], "1");
         assert_not_null(
             &file_history.statements[0].rows[0][6],
@@ -1274,12 +1278,12 @@ simulation_test!(
             "history-lixcol-kv",
         );
         assert_text(&key_value_history.statements[0].rows[0][1], "lix_key_value");
-        assert_text(&key_value_history.statements[0].rows[0][2], "lix");
+        assert_null(&key_value_history.statements[0].rows[0][2]);
         assert_not_null(
             &key_value_history.statements[0].rows[0][3],
             "key_value_history.lixcol_version_id",
         );
-        assert_text(&key_value_history.statements[0].rows[0][4], "lix");
+        assert_null(&key_value_history.statements[0].rows[0][4]);
         assert_text(&key_value_history.statements[0].rows[0][5], "1");
         assert_not_null(
             &key_value_history.statements[0].rows[0][6],

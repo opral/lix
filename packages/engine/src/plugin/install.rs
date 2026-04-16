@@ -39,12 +39,8 @@ use crate::{LixError, Value};
 use crate::transaction::WriteCommand;
 const REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY: &str = "lix_registered_schema";
 const REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION: &str = "1";
-const REGISTERED_SCHEMA_STORAGE_FILE_ID: &str = "lix";
-const REGISTERED_SCHEMA_STORAGE_PLUGIN_KEY: &str = "lix";
 const FILESYSTEM_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
-const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
-const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 
@@ -169,8 +165,8 @@ fn prepare_registered_schema_write_statement_from_schemas(
             entity_id: row.entity_id.clone(),
             schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
             schema_version: Some(REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION.to_string()),
-            file_id: Some(REGISTERED_SCHEMA_STORAGE_FILE_ID.to_string()),
-            plugin_key: Some(REGISTERED_SCHEMA_STORAGE_PLUGIN_KEY.to_string()),
+            file_id: None,
+            plugin_key: None,
             snapshot_content: Some(row.snapshot.to_string()),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.to_string(),
@@ -282,14 +278,8 @@ fn registered_schema_planned_row(row: &RegisteredSchemaRowSpec) -> PlannedStateR
         "schema_key".to_string(),
         Value::Text(REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string()),
     );
-    values.insert(
-        "file_id".to_string(),
-        Value::Text(REGISTERED_SCHEMA_STORAGE_FILE_ID.to_string()),
-    );
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(REGISTERED_SCHEMA_STORAGE_PLUGIN_KEY.to_string()),
-    );
+    values.insert("file_id".to_string(), Value::Null);
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(REGISTERED_SCHEMA_STORAGE_SCHEMA_VERSION.to_string()),
@@ -331,14 +321,8 @@ fn plugin_archive_file_descriptor_row(
         "schema_key".to_string(),
         Value::Text(FILESYSTEM_DESCRIPTOR_SCHEMA_KEY.to_string()),
     );
-    values.insert(
-        "file_id".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-    );
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-    );
+    values.insert("file_id".to_string(), Value::Null);
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(FILESYSTEM_DESCRIPTOR_SCHEMA_VERSION.to_string()),
@@ -387,10 +371,7 @@ fn plugin_archive_binary_blob_ref_row(
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string()),
     );
     values.insert("file_id".to_string(), Value::Text(archive_id.to_string()));
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-    );
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION.to_string()),

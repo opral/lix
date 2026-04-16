@@ -14,6 +14,10 @@ fn assert_boolean(value: &Value, expected: bool) {
     }
 }
 
+fn assert_null(value: &Value) {
+    assert_eq!(*value, Value::Null, "expected NULL, got {value:?}");
+}
+
 simulation_test!(
     lix_change_view_exposes_file_descriptor_change_rows,
     |sim| async move {
@@ -67,8 +71,8 @@ simulation_test!(
         assert_text(&row[0], &change_id);
         assert_text(&row[1], "change-view-file-1");
         assert_text(&row[2], "lix_file_descriptor");
-        assert_text(&row[3], "lix");
-        assert_text(&row[4], "lix");
+        assert_null(&row[3]);
+        assert_null(&row[4]);
         assert_boolean(&row[5], false);
         match &row[6] {
             Value::Null | Value::Text(_) => {}
@@ -87,7 +91,7 @@ simulation_test!(lix_change_rejects_insert_update_delete, |sim| async move {
     let insert_err = engine
         .execute(
             "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
-             VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')", &[])
+             VALUES ('c1', 'e1', 's1', '1', NULL, NULL, '2026-01-01T00:00:00Z')", &[])
             .await
         .expect_err("INSERT on lix_change should fail");
     assert_eq!(insert_err.code, "LIX_ERROR_READ_ONLY_VIEW_WRITE_DENIED");

@@ -114,8 +114,8 @@ struct DerivedFileRow {
     metadata: Option<String>,
     hidden: bool,
     schema_key: String,
-    file_id: String,
-    plugin_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
     schema_version: String,
     global: bool,
     change_id: Option<String>,
@@ -248,7 +248,6 @@ fn derive_file_rows_for_versions(
                 .change_id()
                 .and_then(|change_id| input.context().commit_id_for_change(change_id))
                 .map(str::to_string);
-
             rows.push(DerivedFileRow {
                 identity: descriptor.identity().clone(),
                 version_id: version_id.clone(),
@@ -261,8 +260,8 @@ fn derive_file_rows_for_versions(
                 metadata,
                 hidden,
                 schema_key: descriptor.schema_key.clone(),
-                file_id: descriptor.file_id().to_string(),
-                plugin_key: descriptor.plugin_key().unwrap_or_default().to_string(),
+                file_id: descriptor.file_id().map(str::to_string),
+                plugin_key: descriptor.plugin_key().map(str::to_string),
                 schema_version: descriptor.schema_version().unwrap_or_default().to_string(),
                 global: descriptor.global().unwrap_or(false),
                 change_id: descriptor.change_id().map(str::to_string),
@@ -482,9 +481,15 @@ fn file_row_to_surface(
                 Value::Text(identity.entity_id.clone()),
             ),
             ("lixcol_schema_key".to_string(), Value::Text(row.schema_key)),
-            ("lixcol_file_id".to_string(), Value::Text(row.file_id)),
+            (
+                "lixcol_file_id".to_string(),
+                row.file_id.map(Value::Text).unwrap_or(Value::Null),
+            ),
             ("lixcol_version_id".to_string(), Value::Text(row.version_id)),
-            ("lixcol_plugin_key".to_string(), Value::Text(row.plugin_key)),
+            (
+                "lixcol_plugin_key".to_string(),
+                row.plugin_key.map(Value::Text).unwrap_or(Value::Null),
+            ),
             (
                 "lixcol_schema_version".to_string(),
                 Value::Text(row.schema_version),
@@ -625,7 +630,7 @@ mod tests {
                         FILE_DESCRIPTOR_SCHEMA_KEY,
                         "main",
                         "file-1",
-                        "lix",
+                        None,
                         BTreeMap::from([
                             ("id".to_string(), Value::Text("file-1".to_string())),
                             ("directory_id".to_string(), Value::Text("dir-1".to_string())),
@@ -646,7 +651,7 @@ mod tests {
                         DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
                         "main",
                         "dir-1",
-                        "lix",
+                        None,
                         BTreeMap::from([
                             ("id".to_string(), Value::Text("dir-1".to_string())),
                             ("parent_id".to_string(), Value::Null),
@@ -662,7 +667,7 @@ mod tests {
                         BINARY_BLOB_REF_SCHEMA_KEY,
                         "main",
                         "file-1",
-                        "lix",
+                        None,
                         BTreeMap::from([
                             ("id".to_string(), Value::Text("file-1".to_string())),
                             ("blob_hash".to_string(), Value::Text("hash-1".to_string())),
@@ -739,7 +744,7 @@ mod tests {
                         FILE_DESCRIPTOR_SCHEMA_KEY,
                         "main",
                         "file-1",
-                        "lix",
+                        None,
                         BTreeMap::from([
                             ("id".to_string(), Value::Text("file-1".to_string())),
                             ("directory_id".to_string(), Value::Null),
@@ -751,7 +756,7 @@ mod tests {
                     )
                     .with_live_metadata(
                         "1",
-                        "lix",
+                        None,
                         None,
                         Some("change-1".to_string()),
                         None,
@@ -840,7 +845,7 @@ mod tests {
                         FILE_DESCRIPTOR_SCHEMA_KEY,
                         "main",
                         "file-untracked-1",
-                        "lix",
+                        None,
                         BTreeMap::from([
                             (
                                 "id".to_string(),
@@ -855,7 +860,7 @@ mod tests {
                     )
                     .with_live_metadata(
                         "1",
-                        "lix",
+                        None,
                         None,
                         Some("change-untracked-1".to_string()),
                         None,
@@ -926,7 +931,7 @@ mod tests {
         schema_key: &str,
         version_id: &str,
         entity_id: &str,
-        file_id: &str,
+        file_id: Option<&str>,
         values: BTreeMap<String, Value>,
     ) -> CatalogProjectionSourceRow {
         CatalogProjectionSourceRow::new(
@@ -935,7 +940,7 @@ mod tests {
                 schema_key: schema_key.to_string(),
                 version_id: version_id.to_string(),
                 entity_id: entity_id.to_string(),
-                file_id: file_id.to_string(),
+                file_id: file_id.map(str::to_string),
             },
             schema_key,
             version_id,
@@ -943,7 +948,7 @@ mod tests {
         )
         .with_live_metadata(
             "1",
-            "lix",
+            None,
             None,
             None,
             None,

@@ -115,8 +115,8 @@ mod tests {
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-1",
                 snapshot_content: Some(
                     r#"{"id":"commit-1","change_set_id":"cs-1","parent_commit_ids":[],"change_ids":[]}"#,

@@ -19,7 +19,7 @@ use crate::sql::{
 };
 use crate::transaction::PendingOverlay;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, NullableKeyFilter, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum WriteTargetOverlayLane {
@@ -42,7 +42,7 @@ impl WriteTargetOverlayLane {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct SelectorRowIdentity {
     entity_id: String,
-    file_id: String,
+    file_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -50,11 +50,11 @@ struct CandidateWriteTargetRow {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
     global: bool,
     untracked: bool,
-    plugin_key: String,
+    plugin_key: Option<String>,
     metadata: Option<String>,
     writer_key: Option<String>,
     snapshot_content: Option<String>,
@@ -126,8 +126,8 @@ pub(crate) async fn try_resolve_state_write_targets_with_backend(
     for row in selector_rows {
         let row_key = CanonicalStateRowKey {
             entity_id: row.entity_id,
-            file_id: Some(row.file_id),
-            plugin_key: Some(row.plugin_key),
+            file_id: NullableKeyFilter::from_nullable(row.file_id),
+            plugin_key: NullableKeyFilter::from_nullable(row.plugin_key),
             schema_version: Some(row.schema_version),
             version_id: expose_version_id.then_some(row.version_id),
             global: Some(row.global),
@@ -238,8 +238,8 @@ async fn scan_selector_lane(
         if pending.version_id != storage_version_id
             || !crate::live_state::matches_constraints(
                 &pending.entity_id,
-                &pending.file_id,
-                &pending.plugin_key,
+                pending.file_id.as_deref(),
+                pending.plugin_key.as_deref(),
                 &pending.schema_version,
                 constraints,
             )
@@ -265,7 +265,7 @@ async fn scan_selector_lane(
             &pending.version_id,
             &pending.schema_key,
             &pending.entity_id,
-            &pending.file_id,
+            pending.file_id.as_deref(),
         );
         let values = LiveStateQueryBackend::normalize_live_snapshot_values(
             backend,
@@ -624,11 +624,18 @@ fn selector_row_value(row: &CandidateWriteTargetRow, column: &str) -> Option<Val
         "entity_id" | "lixcol_entity_id" => Some(Value::Text(row.entity_id.clone())),
         "schema_key" | "lixcol_schema_key" => Some(Value::Text(row.schema_key.clone())),
         "schema_version" | "lixcol_schema_version" => Some(Value::Text(row.schema_version.clone())),
-        "file_id" | "lixcol_file_id" => Some(Value::Text(row.file_id.clone())),
+        "file_id" | "lixcol_file_id" => {
+            Some(row.file_id.clone().map(Value::Text).unwrap_or(Value::Null))
+        }
         "version_id" | "lixcol_version_id" => Some(Value::Text(row.version_id.clone())),
         "global" | "lixcol_global" => Some(Value::Boolean(row.global)),
         "untracked" | "lixcol_untracked" => Some(Value::Boolean(row.untracked)),
-        "plugin_key" | "lixcol_plugin_key" => Some(Value::Text(row.plugin_key.clone())),
+        "plugin_key" | "lixcol_plugin_key" => Some(
+            row.plugin_key
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+        ),
         "metadata" | "lixcol_metadata" => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }

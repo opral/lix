@@ -595,11 +595,15 @@ fn version_descriptor_row(id: &str, name: &str, hidden: bool) -> PlannedStateRow
     );
     values.insert(
         "file_id".to_string(),
-        Value::Text(version_descriptor_file_id().to_string()),
+        version_descriptor_file_id()
+            .map(|value| Value::Text(value.to_string()))
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "plugin_key".to_string(),
-        Value::Text(version_descriptor_plugin_key().to_string()),
+        version_descriptor_plugin_key()
+            .map(|value| Value::Text(value.to_string()))
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "schema_version".to_string(),
@@ -632,11 +636,15 @@ fn version_ref_row(id: &str, commit_id: &str) -> PlannedStateRow {
     );
     values.insert(
         "file_id".to_string(),
-        Value::Text(version_ref_file_id().to_string()),
+        version_ref_file_id()
+            .map(|value| Value::Text(value.to_string()))
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "plugin_key".to_string(),
-        Value::Text(version_ref_plugin_key().to_string()),
+        version_ref_plugin_key()
+            .map(|value| Value::Text(value.to_string()))
+            .unwrap_or(Value::Null),
     );
     values.insert(
         "schema_version".to_string(),
@@ -719,8 +727,9 @@ fn planned_row_identity_from_state_row(row: &PlannedStateRow) -> Option<PlannedR
         entity_id: row.entity_id.clone(),
         file_id: row.values.get("file_id").and_then(|value| match value {
             Value::Text(value) => Some(value.clone()),
+            Value::Null => None,
             _ => None,
-        })?,
+        }),
     })
 }
 

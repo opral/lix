@@ -367,7 +367,7 @@ impl<'a> PendingOverlayReadModel<'a> {
                 &row.version_id,
                 &row.schema_key,
                 &row.entity_id,
-                &row.file_id,
+                row.file_id.as_deref(),
             ) else {
                 continue;
             };
@@ -433,11 +433,11 @@ struct OverlayVisibleLiveRow {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
     global: bool,
     untracked: bool,
-    plugin_key: String,
+    plugin_key: Option<String>,
     metadata: Option<String>,
     writer_key: Option<String>,
     change_id: Option<String>,
@@ -451,9 +451,9 @@ struct OverlayVisibleLiveRowIdentity {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
-    plugin_key: String,
+    plugin_key: Option<String>,
 }
 
 fn decode_public_read_result_contract(
@@ -560,11 +560,11 @@ fn visible_live_row_from_raw(
         entity_id: row.entity_id().to_string(),
         schema_key: row.schema_key().to_string(),
         schema_version: row.schema_version().to_string(),
-        file_id: row.file_id().to_string(),
+        file_id: row.file_id().map(ToOwned::to_owned),
         version_id: row.version_id().to_string(),
         global: row.version_id() == GLOBAL_VERSION_ID,
         untracked,
-        plugin_key: row.plugin_key().to_string(),
+        plugin_key: row.plugin_key().map(ToOwned::to_owned),
         metadata: row.metadata().map(ToOwned::to_owned),
         writer_key: row.writer_key().map(ToOwned::to_owned),
         change_id: row.change_id().map(ToOwned::to_owned),
@@ -618,11 +618,11 @@ fn visible_live_row_from_pending_filesystem_state(
         entity_id: pending.file_id.clone(),
         schema_key: "lix_file_descriptor".to_string(),
         schema_version: "1".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: pending.version_id.clone(),
         global: pending.version_id == GLOBAL_VERSION_ID,
         untracked: pending.untracked,
-        plugin_key: "lix".to_string(),
+        plugin_key: None,
         metadata: descriptor.metadata.clone(),
         writer_key: None,
         change_id: None,
@@ -677,11 +677,18 @@ fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
         "entity_id" | "lixcol_entity_id" => Some(Value::Text(row.entity_id.clone())),
         "schema_key" | "lixcol_schema_key" => Some(Value::Text(row.schema_key.clone())),
         "schema_version" | "lixcol_schema_version" => Some(Value::Text(row.schema_version.clone())),
-        "file_id" | "lixcol_file_id" => Some(Value::Text(row.file_id.clone())),
+        "file_id" | "lixcol_file_id" => {
+            Some(row.file_id.clone().map(Value::Text).unwrap_or(Value::Null))
+        }
         "version_id" | "lixcol_version_id" => Some(Value::Text(row.version_id.clone())),
         "global" | "lixcol_global" => Some(Value::Boolean(row.global)),
         "untracked" | "lixcol_untracked" => Some(Value::Boolean(row.untracked)),
-        "plugin_key" | "lixcol_plugin_key" => Some(Value::Text(row.plugin_key.clone())),
+        "plugin_key" | "lixcol_plugin_key" => Some(
+            row.plugin_key
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
+        ),
         "metadata" | "lixcol_metadata" => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }

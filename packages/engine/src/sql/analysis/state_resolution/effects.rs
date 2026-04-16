@@ -29,10 +29,14 @@ fn direct_state_file_cache_refresh_targets(
     mutations
         .iter()
         .filter(|mutation| !mutation.untracked)
-        .filter(|mutation| mutation.file_id != "lix")
         .filter(|mutation| mutation.schema_key != "lix_file_descriptor")
         .filter(|mutation| mutation.schema_key != "lix_directory_descriptor")
-        .map(|mutation| (mutation.file_id.clone(), mutation.version_id.clone()))
+        .filter_map(|mutation| {
+            mutation
+                .file_id
+                .as_ref()
+                .map(|file_id| (file_id.clone(), mutation.version_id.clone()))
+        })
         .collect()
 }
 
@@ -56,9 +60,9 @@ mod tests {
                 entity_id: "main".to_string(),
                 schema_key: "lix_active_version".to_string(),
                 schema_version: "1".to_string(),
-                file_id: "lix".to_string(),
+                file_id: None,
                 version_id: "global".to_string(),
-                plugin_key: "lix".to_string(),
+                plugin_key: None,
                 snapshot_content: Some(json!({
                     "id": "main",
                     "version_id": "version-b"

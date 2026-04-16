@@ -36,7 +36,7 @@ pub(crate) struct ExactEffectiveStateRowRequest {
 pub(crate) struct ExactEffectiveStateRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
-    pub(crate) file_id: String,
+    pub(crate) file_id: Option<String>,
     pub(crate) version_id: String,
     pub(crate) values: BTreeMap<String, Value>,
     pub(crate) source_change_id: Option<String>,
@@ -334,7 +334,7 @@ mod tests {
         let registry = crate::catalog::build_builtin_surface_registry();
         let structured_read = structured_read(
             &registry,
-            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND file_id = 'lix'",
+            "SELECT entity_id FROM lix_state WHERE schema_key = 'lix_key_value' AND file_id IS NULL",
             Vec::new(),
         );
 
@@ -348,7 +348,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 "schema_key = 'lix_key_value'".to_string(),
-                "file_id = 'lix'".to_string()
+                "file_id IS NULL".to_string()
             ]
         );
         assert!(plan.residual_predicates.is_empty());

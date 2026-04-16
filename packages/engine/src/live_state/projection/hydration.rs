@@ -156,7 +156,7 @@ async fn hydrate_input_rows_with_backend(
                             .with_tombstone(true)
                             .with_live_metadata(
                                 row.schema_version.unwrap_or_default(),
-                                row.plugin_key.unwrap_or_default(),
+                                row.plugin_key,
                                 row.metadata,
                                 row.change_id,
                                 row.writer_key,
@@ -393,13 +393,13 @@ mod tests {
             .schema_version
     }
 
-    fn version_descriptor_file_id() -> String {
+    fn version_descriptor_file_id() -> Option<String> {
         builtin_schema_storage_metadata("lix_version_descriptor")
             .expect("lix_version_descriptor metadata should exist")
             .file_id
     }
 
-    fn version_descriptor_plugin_key() -> String {
+    fn version_descriptor_plugin_key() -> Option<String> {
         builtin_schema_storage_metadata("lix_version_descriptor")
             .expect("lix_version_descriptor metadata should exist")
             .plugin_key
@@ -426,13 +426,13 @@ mod tests {
             .schema_version
     }
 
-    fn version_ref_file_id() -> String {
+    fn version_ref_file_id() -> Option<String> {
         builtin_schema_storage_metadata("lix_version_ref")
             .expect("lix_version_ref metadata should exist")
             .file_id
     }
 
-    fn version_ref_plugin_key() -> String {
+    fn version_ref_plugin_key() -> Option<String> {
         builtin_schema_storage_metadata("lix_version_ref")
             .expect("lix_version_ref metadata should exist")
             .plugin_key
@@ -458,18 +458,6 @@ mod tests {
             .schema_version
     }
 
-    fn key_value_file_id() -> String {
-        builtin_schema_storage_metadata("lix_key_value")
-            .expect("lix_key_value metadata should exist")
-            .file_id
-    }
-
-    fn key_value_plugin_key() -> String {
-        builtin_schema_storage_metadata("lix_key_value")
-            .expect("lix_key_value metadata should exist")
-            .plugin_key
-    }
-
     fn key_value_snapshot_content(key: &str, value: serde_json::Value) -> String {
         serde_json::json!({
             "key": key,
@@ -482,20 +470,20 @@ mod tests {
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
-        file_id: &str,
+        file_id: Option<&str>,
         version_id: &str,
-        plugin_key: &str,
+        plugin_key: Option<&str>,
         change_id: &str,
         snapshot_content: &str,
         timestamp: &str,
     ) -> LiveRow {
         LiveRow {
             entity_id: entity_id.to_string(),
-            file_id: file_id.to_string(),
+            file_id: file_id.map(str::to_string),
             schema_key: schema_key.to_string(),
             schema_version: schema_version.to_string(),
             version_id: version_id.to_string(),
-            plugin_key: plugin_key.to_string(),
+            plugin_key: plugin_key.map(str::to_string),
             metadata: None,
             change_id: Some(change_id.to_string()),
             writer_key: None,
@@ -511,19 +499,19 @@ mod tests {
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
-        file_id: &str,
+        file_id: Option<&str>,
         version_id: &str,
-        plugin_key: &str,
+        plugin_key: Option<&str>,
         snapshot_content: &str,
         timestamp: &str,
     ) -> LiveRow {
         LiveRow {
             entity_id: entity_id.to_string(),
-            file_id: file_id.to_string(),
+            file_id: file_id.map(str::to_string),
             schema_key: schema_key.to_string(),
             schema_version: schema_version.to_string(),
             version_id: version_id.to_string(),
-            plugin_key: plugin_key.to_string(),
+            plugin_key: plugin_key.map(str::to_string),
             metadata: None,
             change_id: Some(format!(
                 "change-untracked::{schema_key}::{entity_id}::{version_id}::{timestamp}"
@@ -559,9 +547,9 @@ mod tests {
                 crate::version::GLOBAL_VERSION_ID,
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
-                &version_descriptor_file_id(),
+                version_descriptor_file_id().as_deref(),
                 crate::version::GLOBAL_VERSION_ID,
-                &version_descriptor_plugin_key(),
+                version_descriptor_plugin_key().as_deref(),
                 "change-global",
                 &version_descriptor_snapshot_content(
                     crate::version::GLOBAL_VERSION_ID,
@@ -579,9 +567,9 @@ mod tests {
                 "version-main",
                 &version_descriptor_schema_key(),
                 &version_descriptor_schema_version(),
-                &version_descriptor_file_id(),
+                version_descriptor_file_id().as_deref(),
                 crate::version::GLOBAL_VERSION_ID,
-                &version_descriptor_plugin_key(),
+                version_descriptor_plugin_key().as_deref(),
                 "change-main",
                 &version_descriptor_snapshot_content(
                     "version-main",
@@ -599,9 +587,9 @@ mod tests {
                 crate::version::GLOBAL_VERSION_ID,
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
-                &version_ref_file_id(),
+                version_ref_file_id().as_deref(),
                 crate::version::GLOBAL_VERSION_ID,
-                &version_ref_plugin_key(),
+                version_ref_plugin_key().as_deref(),
                 &version_ref_snapshot_content(crate::version::GLOBAL_VERSION_ID, "commit-global"),
                 "2026-04-01T00:00:02Z",
             )],
@@ -614,9 +602,9 @@ mod tests {
                 "version-main",
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
-                &version_ref_file_id(),
+                version_ref_file_id().as_deref(),
                 crate::version::GLOBAL_VERSION_ID,
-                &version_ref_plugin_key(),
+                version_ref_plugin_key().as_deref(),
                 &version_ref_snapshot_content("version-main", "commit-main"),
                 "2026-04-01T00:00:03Z",
             )],
@@ -718,9 +706,9 @@ mod tests {
                 "version-main",
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
-                &version_ref_file_id(),
+                version_ref_file_id().as_deref(),
                 crate::version::GLOBAL_VERSION_ID,
-                &version_ref_plugin_key(),
+                version_ref_plugin_key().as_deref(),
                 &version_ref_snapshot_content("version-main", "commit-main"),
                 "2026-04-02T00:00:00Z",
             )],
@@ -733,9 +721,9 @@ mod tests {
                 "version-dev",
                 &version_ref_schema_key(),
                 &version_ref_schema_version(),
-                &version_ref_file_id(),
+                version_ref_file_id().as_deref(),
                 crate::version::GLOBAL_VERSION_ID,
-                &version_ref_plugin_key(),
+                version_ref_plugin_key().as_deref(),
                 &version_ref_snapshot_content("version-dev", "commit-dev"),
                 "2026-04-02T00:00:01Z",
             )],
@@ -748,9 +736,9 @@ mod tests {
                 "theme",
                 &key_value_schema_key(),
                 &key_value_schema_version(),
-                &key_value_file_id(),
+                None,
                 "version-main",
-                &key_value_plugin_key(),
+                None,
                 "change-main",
                 &key_value_snapshot_content("theme", serde_json::Value::String("dark".to_string())),
                 "2026-04-02T00:00:02Z",
@@ -764,9 +752,9 @@ mod tests {
                 "theme",
                 &key_value_schema_key(),
                 &key_value_schema_version(),
-                &key_value_file_id(),
+                None,
                 "version-dev",
-                &key_value_plugin_key(),
+                None,
                 "change-dev",
                 &key_value_snapshot_content(
                     "theme",

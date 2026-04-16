@@ -123,8 +123,8 @@ fn live_row_from_planned_row(
     change: &CanonicalChangeWrite,
     execution_writer_key: Option<&str>,
 ) -> Result<LiveRow, LixError> {
-    let file_id = planned_row_text_value(row, "file_id")?;
-    let plugin_key = planned_row_text_value(row, "plugin_key")?;
+    let file_id = planned_row_optional_text_value(row, "file_id").map(ToString::to_string);
+    let plugin_key = planned_row_optional_text_value(row, "plugin_key").map(ToString::to_string);
     let schema_version = planned_row_text_value(row, "schema_version")?;
     let global = row
         .values
@@ -136,13 +136,13 @@ fn live_row_from_planned_row(
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
         schema_version: schema_version.to_string(),
-        file_id: file_id.to_string(),
+        file_id,
         version_id: row
             .version_id
             .clone()
             .unwrap_or_else(|| GLOBAL_VERSION_ID.to_string()),
         global,
-        plugin_key: plugin_key.to_string(),
+        plugin_key,
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
         change_id: Some(change.id.clone()),
         writer_key: row

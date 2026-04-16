@@ -8,7 +8,7 @@ mod frontier;
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
 use crate::schema::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::LixError;
 
@@ -23,14 +23,13 @@ static ACTIVE_VERSION_SCHEMA_METADATA: OnceLock<ActiveVersionSchemaMetadata> = O
 struct VersionRowSchemaMetadata {
     schema_key: String,
     schema_version: String,
-    file_id: String,
-    plugin_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
     storage_version_id: String,
 }
 
 struct ActiveVersionSchemaMetadata {
     schema_key: String,
-    file_id: String,
     storage_version_id: String,
 }
 
@@ -42,12 +41,12 @@ pub fn version_descriptor_schema_version() -> &'static str {
     &version_descriptor_schema_metadata().schema_version
 }
 
-pub fn version_descriptor_file_id() -> &'static str {
-    &version_descriptor_schema_metadata().file_id
+pub fn version_descriptor_file_id() -> Option<&'static str> {
+    version_descriptor_schema_metadata().file_id.as_deref()
 }
 
-pub fn version_descriptor_plugin_key() -> &'static str {
-    &version_descriptor_schema_metadata().plugin_key
+pub fn version_descriptor_plugin_key() -> Option<&'static str> {
+    version_descriptor_schema_metadata().plugin_key.as_deref()
 }
 
 pub fn version_ref_schema_key() -> &'static str {
@@ -58,12 +57,12 @@ pub fn version_ref_schema_version() -> &'static str {
     &version_ref_schema_metadata().schema_version
 }
 
-pub fn version_ref_file_id() -> &'static str {
-    &version_ref_schema_metadata().file_id
+pub fn version_ref_file_id() -> Option<&'static str> {
+    version_ref_schema_metadata().file_id.as_deref()
 }
 
-pub fn version_ref_plugin_key() -> &'static str {
-    &version_ref_schema_metadata().plugin_key
+pub fn version_ref_plugin_key() -> Option<&'static str> {
+    version_ref_schema_metadata().plugin_key.as_deref()
 }
 
 pub fn version_ref_storage_version_id() -> &'static str {
@@ -72,10 +71,6 @@ pub fn version_ref_storage_version_id() -> &'static str {
 
 pub fn active_version_schema_key() -> &'static str {
     &active_version_schema_metadata().schema_key
-}
-
-pub fn active_version_file_id() -> &'static str {
-    &active_version_schema_metadata().file_id
 }
 
 pub fn active_version_storage_version_id() -> &'static str {
@@ -106,6 +101,13 @@ pub fn version_ref_snapshot_content(id: &str, commit_id: &str) -> String {
         commit_id: commit_id.to_string(),
     })
     .expect("lix_version_ref snapshot serialization must succeed")
+}
+
+pub fn parse_version_ref_snapshot(snapshot_content: &str) -> Result<LixVersionRef, LixError> {
+    serde_json::from_str(snapshot_content).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("version ref snapshot_content invalid JSON: {error}"),
+    })
 }
 
 pub fn parse_active_version_snapshot(snapshot_content: &str) -> Result<String, LixError> {
@@ -155,7 +157,6 @@ fn parse_active_version_schema_metadata() -> ActiveVersionSchemaMetadata {
 
     ActiveVersionSchemaMetadata {
         schema_key: metadata.schema_key,
-        file_id: metadata.file_id,
         storage_version_id: GLOBAL_VERSION_ID.to_string(),
     }
 }
@@ -163,8 +164,8 @@ fn parse_active_version_schema_metadata() -> ActiveVersionSchemaMetadata {
 struct ParsedBuiltinRowSchemaMetadata {
     schema_key: String,
     schema_version: String,
-    file_id: String,
-    plugin_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
 }
 
 fn parse_builtin_row_schema_metadata(schema_key: &str) -> ParsedBuiltinRowSchemaMetadata {
@@ -181,29 +182,12 @@ fn parse_builtin_row_schema_metadata(schema_key: &str) -> ParsedBuiltinRowSchema
         .and_then(JsonValue::as_str)
         .unwrap_or_else(|| panic!("builtin schema '{schema_key}' must define string x-lix-version"))
         .to_string();
-    let overrides = schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)
-        .unwrap_or_else(|| {
-            panic!("builtin schema '{schema_key}' must define object x-lix-override-lixcols")
-        });
-    let file_id_raw = overrides
-        .get("lixcol_file_id")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_else(|| {
-            panic!("builtin schema '{schema_key}' must define string lixcol_file_id")
-        });
-    let plugin_key_raw = overrides
-        .get("lixcol_plugin_key")
-        .and_then(JsonValue::as_str)
-        .unwrap_or_else(|| {
-            panic!("builtin schema '{schema_key}' must define string lixcol_plugin_key")
-        });
-
+    let defaults = builtin_schema_storage_defaults(schema_key)
+        .unwrap_or_else(|| panic!("builtin schema '{schema_key}' must define storage defaults"));
     ParsedBuiltinRowSchemaMetadata {
         schema_key: parsed_schema_key,
         schema_version,
-        file_id: decode_lixcol_literal(file_id_raw),
-        plugin_key: decode_lixcol_literal(plugin_key_raw),
+        file_id: defaults.file_id.map(str::to_string),
+        plugin_key: defaults.plugin_key.map(str::to_string),
     }
 }

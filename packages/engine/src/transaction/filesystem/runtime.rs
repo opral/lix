@@ -12,9 +12,6 @@ use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
-pub(crate) const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
-pub(crate) const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 pub(crate) const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
@@ -216,10 +213,10 @@ pub(crate) fn compile_filesystem_transaction_state_from_state(
                     entity_id: file.file_id.clone(),
                     schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
                     schema_version: FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
-                    file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+                    file_id: None,
                     version_id: file.version_id.clone(),
                     untracked: file.untracked,
-                    plugin_key: FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+                    plugin_key: None,
                     snapshot_content: None,
                     metadata: None,
                     writer_key: writer_key.map(ToString::to_string),
@@ -283,10 +280,10 @@ pub(crate) struct FilesystemSemanticChange {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
+    pub(crate) file_id: Option<String>,
     pub(crate) version_id: String,
     pub(crate) untracked: bool,
-    pub(crate) plugin_key: String,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) writer_key: Option<String>,
@@ -405,10 +402,10 @@ fn binary_blob_ref_change_for_bytes(
         entity_id: file_id.to_string(),
         schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
-        file_id: file_id.to_string(),
+        file_id: Some(file_id.to_string()),
         version_id: version_id.to_string(),
         untracked,
-        plugin_key: INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
+        plugin_key: None,
         snapshot_content: Some(snapshot_content),
         metadata: None,
         writer_key: writer_key.map(ToString::to_string),
@@ -427,10 +424,10 @@ fn file_descriptor_change_for_state(
         entity_id: file_id.to_string(),
         schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
         schema_version: FILESYSTEM_FILE_SCHEMA_VERSION.to_string(),
-        file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+        file_id: None,
         version_id: version_id.to_string(),
         untracked,
-        plugin_key: FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string(),
+        plugin_key: None,
         snapshot_content: Some(
             serde_json::json!({
                 "id": file_id,
@@ -458,7 +455,7 @@ fn upsert_semantic_change(
     let key = (
         change.entity_id.clone(),
         change.schema_key.clone(),
-        change.file_id.clone(),
+        change.file_id.clone().unwrap_or_default(),
         change.version_id.clone(),
         change.untracked,
     );
@@ -475,10 +472,10 @@ fn binary_blob_ref_tombstone_change_for_target(
         entity_id: file_id.to_string(),
         schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         schema_version: BINARY_BLOB_REF_SCHEMA_VERSION.to_string(),
-        file_id: file_id.to_string(),
+        file_id: Some(file_id.to_string()),
         version_id: version_id.to_string(),
         untracked,
-        plugin_key: INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
+        plugin_key: None,
         snapshot_content: None,
         metadata: None,
         writer_key: writer_key.map(ToString::to_string),
@@ -625,7 +622,7 @@ trait DedupableFilesystemPayloadChange {
 impl DedupableFilesystemPayloadChange for FilesystemPayloadChange {
     fn dedupe_key(&self) -> (&str, &str, &str, &str, bool) {
         (
-            &self.file_id,
+            self.file_id.as_deref().unwrap_or(""),
             &self.version_id,
             &self.schema_key,
             &self.entity_id,
@@ -681,9 +678,15 @@ pub(crate) fn build_filesystem_payload_changes_insert(
         rows.push(values_row_placeholders_sql(row_index, values_per_row));
         params.push(Value::Text(change.entity_id.clone()));
         params.push(Value::Text(change.schema_key.clone()));
-        params.push(Value::Text(change.file_id.clone()));
+        params.push(match &change.file_id {
+            Some(file_id) => Value::Text(file_id.clone()),
+            None => Value::Null,
+        });
         params.push(Value::Text(change.version_id.clone()));
-        params.push(Value::Text(change.plugin_key.clone()));
+        params.push(match &change.plugin_key {
+            Some(plugin_key) => Value::Text(plugin_key.clone()),
+            None => Value::Null,
+        });
         params.push(match &change.snapshot_content {
             Some(snapshot_content) => Value::Text(snapshot_content.clone()),
             None => Value::Null,

@@ -12,7 +12,7 @@ use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, Untra
 use crate::live_state::{
     LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
 };
-use crate::{LixError, Value};
+use crate::{LixError, NullableKeyFilter, Value};
 use async_trait::async_trait;
 
 use super::resolve::{overlay_lanes_for_version, resolve_effective_row, resolve_effective_rows};
@@ -50,10 +50,7 @@ impl TrackedReadView for MockTrackedView {
                 row.schema_key == request.schema_key
                     && row.version_id == request.version_id
                     && request.entity_ids.contains(&row.entity_id)
-                    && request
-                        .file_id
-                        .as_ref()
-                        .is_none_or(|file_id| row.file_id == *file_id)
+                    && request.file_id.matches(row.file_id.as_ref())
             })
             .cloned()
             .collect())
@@ -82,10 +79,7 @@ impl UntrackedReadView for MockUntrackedView {
                 row.schema_key == request.schema_key
                     && row.version_id == request.version_id
                     && request.entity_ids.contains(&row.entity_id)
-                    && request
-                        .file_id
-                        .as_ref()
-                        .is_none_or(|file_id| row.file_id == *file_id)
+                    && request.file_id.matches(row.file_id.as_ref())
             })
             .cloned()
             .collect())
@@ -148,10 +142,10 @@ fn tracked_row(entity_id: &str, version_id: &str, global: bool, child_id: &str) 
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
         schema_version: "1".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: version_id.to_string(),
         global,
-        plugin_key: "lix".to_string(),
+        plugin_key: None,
         metadata: Some("{\"kind\":\"tracked\"}".to_string()),
         change_id: Some(format!("chg-{entity_id}-{version_id}")),
         writer_key: Some("writer-a".to_string()),
@@ -172,10 +166,10 @@ fn untracked_row(entity_id: &str, version_id: &str, global: bool, child_id: &str
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
         schema_version: "1".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: version_id.to_string(),
         global,
-        plugin_key: "lix".to_string(),
+        plugin_key: None,
         metadata: Some("{\"kind\":\"untracked\"}".to_string()),
         change_id: format!("change-{entity_id}"),
         writer_key: Some("writer-b".to_string()),
@@ -195,11 +189,11 @@ fn tombstone(entity_id: &str, version_id: &str, global: bool) -> TrackedTombston
     TrackedTombstoneMarker {
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: version_id.to_string(),
         global,
         schema_version: Some("1".to_string()),
-        plugin_key: Some("lix".to_string()),
+        plugin_key: None,
         metadata: Some("{\"kind\":\"tombstone\"}".to_string()),
         writer_key: Some("writer-a".to_string()),
         created_at: Some("2026-03-24T00:05:00Z".to_string()),
@@ -238,7 +232,7 @@ async fn effective_state_exact_prefers_local_untracked_first() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
             include_global: true,
             include_untracked: true,
         },
@@ -273,7 +267,7 @@ async fn effective_state_exact_tombstone_hides_global_fallback() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
             include_global: true,
             include_untracked: true,
         },
@@ -404,7 +398,7 @@ async fn effective_state_exact_overlays_writer_key_annotation() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
             include_global: false,
             include_untracked: false,
         },
@@ -423,9 +417,9 @@ fn tracked_row_matches_scan(row: &TrackedRow, request: &TrackedScanRequest) -> b
         && constraints_match(
             &request.constraints,
             &row.entity_id,
-            &row.file_id,
-            &row.plugin_key,
-            &row.schema_version,
+            row.file_id.as_deref(),
+            row.plugin_key.as_deref(),
+            Some(row.schema_version.as_str()),
         )
 }
 
@@ -435,9 +429,9 @@ fn untracked_row_matches_scan(row: &UntrackedRow, request: &UntrackedScanRequest
         && constraints_match(
             &request.constraints,
             &row.entity_id,
-            &row.file_id,
-            &row.plugin_key,
-            &row.schema_version,
+            row.file_id.as_deref(),
+            row.plugin_key.as_deref(),
+            Some(row.schema_version.as_str()),
         )
 }
 
@@ -447,25 +441,31 @@ fn tombstone_matches_scan(row: &TrackedTombstoneMarker, request: &TrackedScanReq
         && constraints_match(
             &request.constraints,
             &row.entity_id,
-            &row.file_id,
-            row.plugin_key.as_deref().unwrap_or(""),
-            row.schema_version.as_deref().unwrap_or(""),
+            row.file_id.as_deref(),
+            row.plugin_key.as_deref(),
+            row.schema_version.as_deref(),
         )
 }
 
 fn constraints_match(
     constraints: &[ScanConstraint],
     entity_id: &str,
-    file_id: &str,
-    plugin_key: &str,
-    schema_version: &str,
+    file_id: Option<&str>,
+    plugin_key: Option<&str>,
+    schema_version: Option<&str>,
 ) -> bool {
     constraints.iter().all(|constraint| {
         let value = match constraint.field {
             ScanField::EntityId => Value::Text(entity_id.to_string()),
-            ScanField::FileId => Value::Text(file_id.to_string()),
-            ScanField::PluginKey => Value::Text(plugin_key.to_string()),
-            ScanField::SchemaVersion => Value::Text(schema_version.to_string()),
+            ScanField::FileId => {
+                file_id.map_or(Value::Null, |value| Value::Text(value.to_string()))
+            }
+            ScanField::PluginKey => {
+                plugin_key.map_or(Value::Null, |value| Value::Text(value.to_string()))
+            }
+            ScanField::SchemaVersion => {
+                schema_version.map_or(Value::Null, |value| Value::Text(value.to_string()))
+            }
         };
         operator_matches(&constraint.operator, &value)
     })

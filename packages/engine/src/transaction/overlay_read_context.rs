@@ -326,8 +326,8 @@ fn matches_tracked_scan_request(
     matches_tracked_scan_identity(identity, request)
         && matches_constraints(
             &row.entity_id,
-            &row.file_id,
-            &row.plugin_key,
+            row.file_id.as_deref(),
+            row.plugin_key.as_deref(),
             &row.schema_version,
             &request.constraints,
         )
@@ -341,8 +341,8 @@ fn matches_untracked_scan_request(
     matches_untracked_scan_identity(identity, request)
         && matches_constraints(
             &row.entity_id,
-            &row.file_id,
-            &row.plugin_key,
+            row.file_id.as_deref(),
+            row.plugin_key.as_deref(),
             &row.schema_version,
             &request.constraints,
         )

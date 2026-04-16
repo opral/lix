@@ -19,7 +19,7 @@ use crate::live_state::storage_metadata::{
 };
 use crate::live_state::ReplayCursor;
 use crate::schema::LixVersionRef;
-use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
 use crate::{CanonicalJson, LixBackend, LixError};
 
 type VersionHeadMap = BTreeMap<String, Vec<String>>;
@@ -34,8 +34,8 @@ struct VisibleRow {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    file_id: String,
-    plugin_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
     snapshot_content: Option<CanonicalJson>,
     metadata: Option<CanonicalJson>,
     created_at: String,
@@ -58,8 +58,8 @@ struct ProjectionCandidate {
 struct BuiltinProjectionSchemaMeta {
     schema_key: String,
     schema_version: String,
-    file_id: String,
-    plugin_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
 }
 
 pub(crate) async fn live_state_rebuild_plan_internal(
@@ -245,8 +245,10 @@ fn build_global_projection_rows(
     let change_author_schema = builtin_projection_schema_meta("lix_change_author");
     let commit_depths = min_depth_by_commit_rows(visible_state_rows);
 
-    let mut candidates: BTreeMap<(String, String, String, String), Vec<ProjectionCandidate>> =
-        BTreeMap::new();
+    let mut candidates: BTreeMap<
+        (String, String, String, Option<String>),
+        Vec<ProjectionCandidate>,
+    > = BTreeMap::new();
 
     for descriptor in data.version_descriptors.values() {
         let effective_commit_id = version_refs
@@ -768,7 +770,7 @@ async fn load_canonical_visible_state(
 }
 
 fn resolve_projection_candidates(
-    candidates: BTreeMap<(String, String, String, String), Vec<ProjectionCandidate>>,
+    candidates: BTreeMap<(String, String, String, Option<String>), Vec<ProjectionCandidate>>,
 ) -> Vec<VisibleRow> {
     let mut rows = Vec::new();
     for ((_version_id, _entity_id, _schema_key, _file_id), mut items) in candidates {
@@ -815,39 +817,18 @@ fn builtin_projection_schema_meta(schema_key: &str) -> BuiltinProjectionSchemaMe
         .and_then(serde_json::Value::as_str)
         .unwrap_or_else(|| panic!("builtin schema '{}' must define x-lix-version", schema_key))
         .to_string();
-    let overrides = schema
-        .get("x-lix-override-lixcols")
-        .and_then(serde_json::Value::as_object)
-        .unwrap_or_else(|| {
-            panic!(
-                "builtin schema '{}' must define object x-lix-override-lixcols",
-                schema_key
-            )
-        });
-    let file_id = overrides
-        .get("lixcol_file_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| {
-            panic!(
-                "builtin schema '{}' must define string lixcol_file_id",
-                schema_key
-            )
-        });
-    let plugin_key = overrides
-        .get("lixcol_plugin_key")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_else(|| {
-            panic!(
-                "builtin schema '{}' must define string lixcol_plugin_key",
-                schema_key
-            )
-        });
+    let defaults = builtin_schema_storage_defaults(schema_key).unwrap_or_else(|| {
+        panic!(
+            "builtin schema '{}' must define storage defaults",
+            schema_key
+        )
+    });
 
     BuiltinProjectionSchemaMeta {
         schema_key: parsed_schema_key,
         schema_version,
-        file_id: decode_lixcol_literal(file_id),
-        plugin_key: decode_lixcol_literal(plugin_key),
+        file_id: defaults.file_id.map(str::to_string),
+        plugin_key: defaults.plugin_key.map(str::to_string),
     }
 }
 
@@ -895,7 +876,8 @@ fn build_final_state(
             continue;
         };
 
-        let mut chosen: BTreeMap<(String, String, String, bool), FinalStateRow> = BTreeMap::new();
+        let mut chosen: BTreeMap<(String, String, Option<String>, bool), FinalStateRow> =
+            BTreeMap::new();
         let mut sorted_candidates = candidates.clone();
         sorted_candidates.sort_by(|a, b| {
             a.schema_key
@@ -962,7 +944,7 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
                 row.source.entity_id.clone(),
                 "live-state write entity_id",
             )?,
-            file_id: require_identity(row.source.file_id.clone(), "live-state write file_id")?,
+            file_id: optional_identity(row.source.file_id.as_deref(), "live-state write file_id")?,
             version_id: require_identity(row.version_id.clone(), "live-state write version_id")?,
             global: row.version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: row.source.untracked,
@@ -973,8 +955,8 @@ fn build_writes(final_state: &[FinalStateRow]) -> Result<Vec<LiveStateWrite>, Li
                 row.source.schema_version.clone(),
                 "live-state write schema_version",
             )?,
-            plugin_key: require_identity(
-                row.source.plugin_key.clone(),
+            plugin_key: optional_identity(
+                row.source.plugin_key.as_deref(),
                 "live-state write plugin_key",
             )?,
             change_id: row.source.change_id.clone(),
@@ -1097,7 +1079,10 @@ fn build_debug_trace(
                         row.schema_key.clone(),
                         "debug latest-visible schema_key",
                     )?,
-                    file_id: require_identity(row.file_id.clone(), "debug latest-visible file_id")?,
+                    file_id: optional_identity(
+                        row.file_id.as_deref(),
+                        "debug latest-visible file_id",
+                    )?,
                     commit_id: row.commit_id.clone(),
                     change_id: row.change_id.clone(),
                 })
@@ -1122,7 +1107,10 @@ fn build_debug_trace(
                         row.source.schema_key.clone(),
                         "debug scope schema_key",
                     )?,
-                    file_id: require_identity(row.source.file_id.clone(), "debug scope file_id")?,
+                    file_id: optional_identity(
+                        row.source.file_id.as_deref(),
+                        "debug scope file_id",
+                    )?,
                     global: row.version_id == crate::version::GLOBAL_VERSION_ID,
                     change_id: row.source.change_id.clone(),
                 })
@@ -1206,6 +1194,18 @@ where
     })
 }
 
+fn optional_identity(value: Option<&str>, context: &str) -> Result<Option<String>, LixError> {
+    value
+        .map(|value| {
+            if value.is_empty() {
+                Err(LixError::unknown(format!("{context} must not be empty")))
+            } else {
+                Ok(value.to_string())
+            }
+        })
+        .transpose()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,8 +1228,8 @@ mod tests {
                 entity_id: "commit-local",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-commit-local",
                 snapshot_content: Some(
                     "{\"id\":\"commit-local\",\"change_set_id\":\"cs-local\",\"change_ids\":[],\"parent_commit_ids\":[]}",
@@ -1248,8 +1248,8 @@ mod tests {
                 entity_id: "commit-legacy",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-commit-legacy",
                 snapshot_content: Some(
                     "{\"id\":\"commit-legacy\",\"change_set_id\":\"cs-legacy\",\"change_ids\":[],\"parent_commit_ids\":[]}",
@@ -1268,8 +1268,8 @@ mod tests {
                 entity_id: "main",
                 schema_key: "lix_version_ref",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-version-ref-legacy",
                 snapshot_content: Some("{\"id\":\"main\",\"commit_id\":\"commit-legacy\"}"),
                 metadata: None,
@@ -1315,8 +1315,8 @@ mod tests {
                 entity_id: "commit-local",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-commit-local",
                 snapshot_content: Some(
                     "{\"id\":\"commit-local\",\"change_set_id\":\"cs-local\",\"change_ids\":[],\"parent_commit_ids\":[]}",
@@ -1335,8 +1335,8 @@ mod tests {
                 entity_id: "main",
                 schema_key: "lix_version_ref",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-version-ref-main",
                 snapshot_content: Some("{\"id\":\"main\",\"commit_id\":\"commit-local\"}"),
                 metadata: None,
@@ -1389,7 +1389,7 @@ mod tests {
             crate::version::GLOBAL_VERSION_ID.to_string(),
             "version-deleted".to_string(),
             "lix_version_descriptor".to_string(),
-            "lix".to_string(),
+            None,
         );
         let older_descriptor = ProjectionCandidate {
             depth: usize::MAX / 4,
@@ -1402,8 +1402,8 @@ mod tests {
                 entity_id: "version-deleted".to_string(),
                 schema_key: "lix_version_descriptor".to_string(),
                 schema_version: "1".to_string(),
-                file_id: "lix".to_string(),
-                plugin_key: "lix".to_string(),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: Some(
                     CanonicalJson::from_text(
                         "{\"id\":\"version-deleted\",\"name\":\"Version Deleted\",\"hidden\":false}",
@@ -1426,8 +1426,8 @@ mod tests {
                 entity_id: "version-deleted".to_string(),
                 schema_key: "lix_version_descriptor".to_string(),
                 schema_version: "1".to_string(),
-                file_id: "lix".to_string(),
-                plugin_key: "lix".to_string(),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: None,
                 metadata: None,
                 created_at: "2026-04-01T00:00:01Z".to_string(),
@@ -1456,8 +1456,8 @@ mod tests {
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
-            file_id: "lix".to_string(),
-            plugin_key: "lix".to_string(),
+            file_id: None,
+            plugin_key: None,
             snapshot_content: Some(
                 CanonicalJson::from_text("{\"id\":\"main\",\"commit_id\":\"commit-old\"}")
                     .expect("version ref snapshot should parse"),
@@ -1475,8 +1475,8 @@ mod tests {
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
-            file_id: "lix".to_string(),
-            plugin_key: "lix".to_string(),
+            file_id: None,
+            plugin_key: None,
             snapshot_content: Some(
                 CanonicalJson::from_text("{\"id\":\"main\",\"commit_id\":\"commit-new\"}")
                     .expect("version ref snapshot should parse"),

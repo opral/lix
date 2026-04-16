@@ -12,9 +12,10 @@ simulation_test!(
 
         let result = engine
             .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-             lix_json('{\"x-lix-key\":\"same_request_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
-             );\
+                "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) VALUES (\
+             lix_json('{\"x-lix-key\":\"same_request_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             'global'\
+             ); \
              INSERT INTO same_request_schema (id, name) VALUES ('entity-1', 'Ada')", &[])
             .await;
 
@@ -81,9 +82,10 @@ simulation_test!(
 
         let result = engine
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             lix_json('{\"x-lix-key\":\"same_request_default_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\",\"x-lix-default\":\"name + ''-slug''\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
-             );\
+            "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) VALUES (\
+             lix_json('{\"x-lix-key\":\"same_request_default_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"},\"slug\":{\"type\":\"string\",\"x-lix-default\":\"name + ''-slug''\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+             'global'\
+             ); \
              INSERT INTO same_request_default_schema (id, name) VALUES ('entity-1', 'Sample')", &[])
         .await;
 

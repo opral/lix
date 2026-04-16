@@ -134,10 +134,10 @@ pub(crate) fn decode_untracked_row(
     let entity_id = required_text_cell(row, 0, schema_key, "entity_id", "untracked")?;
     let schema_key_value = required_text_cell(row, 1, schema_key, "schema_key", "untracked")?;
     let schema_version = required_text_cell(row, 2, schema_key, "schema_version", "untracked")?;
-    let file_id = required_text_cell(row, 3, schema_key, "file_id", "untracked")?;
+    let file_id = row.get(3).and_then(text_from_value);
     let version_id = required_text_cell(row, 4, schema_key, "version_id", "untracked")?;
     let global = required_bool_cell(row, 5, schema_key, "global", "untracked")?;
-    let plugin_key = required_text_cell(row, 6, schema_key, "plugin_key", "untracked")?;
+    let plugin_key = row.get(6).and_then(text_from_value);
     let metadata = row.get(7).and_then(text_from_value);
     let change_id = required_text_cell(row, 8, schema_key, "change_id", "untracked")?;
     let created_at = required_text_cell(row, 9, schema_key, "created_at", "untracked")?;

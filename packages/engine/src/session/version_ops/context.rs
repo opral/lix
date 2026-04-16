@@ -4,10 +4,14 @@ use crate::session::version_ops::commit::{
     CreateCommitWriteLane,
 };
 use crate::session::workspace::require_workspace_active_version_id;
+use crate::transaction::PendingOverlay;
 use crate::{LixError, SessionTransaction};
 
-use super::committed_state::load_version_head_commit_id_with_executor;
-use super::descriptors::{version_exists_with_backend, version_exists_with_executor};
+use super::committed_state::load_version_head_commit_id_with_pending_overlay;
+use super::descriptors::{
+    load_version_descriptor_with_pending_overlay, version_exists_with_backend,
+    version_exists_with_executor,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VersionContextSource {
@@ -141,8 +145,20 @@ pub(crate) async fn load_version_context_with_executor(
     executor: &mut dyn QueryExecutor,
     target: ResolvedVersionTarget,
 ) -> Result<Option<VersionContext>, LixError> {
-    let Some(commit_id) =
-        load_version_head_commit_id_with_executor(executor, &target.version_id).await?
+    load_version_context_with_pending_overlay(executor, None, target).await
+}
+
+async fn load_version_context_with_pending_overlay(
+    executor: &mut dyn QueryExecutor,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    target: ResolvedVersionTarget,
+) -> Result<Option<VersionContext>, LixError> {
+    let Some(commit_id) = load_version_head_commit_id_with_pending_overlay(
+        executor,
+        pending_overlay,
+        &target.version_id,
+    )
+    .await?
     else {
         return Ok(None);
     };
@@ -161,9 +177,32 @@ pub(crate) async fn require_version_context_with_executor(
     target: ResolvedVersionTarget,
     subject: &str,
 ) -> Result<VersionContext, LixError> {
-    ensure_version_exists_with_executor(executor, &target.version_id).await?;
+    require_version_context_with_pending_overlay(executor, None, target, subject).await
+}
+
+async fn require_version_context_with_pending_overlay(
+    executor: &mut dyn QueryExecutor,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    target: ResolvedVersionTarget,
+    subject: &str,
+) -> Result<VersionContext, LixError> {
     let version_id = target.version_id.clone();
-    let Some(context) = load_version_context_with_executor(executor, target).await? else {
+    if pending_overlay.is_some() {
+        if load_version_descriptor_with_pending_overlay(executor, pending_overlay, &version_id)
+            .await?
+            .is_none()
+        {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("version '{version_id}' does not exist"),
+            ));
+        }
+    } else {
+        ensure_version_exists_with_executor(executor, &version_id).await?;
+    }
+    let Some(context) =
+        load_version_context_with_pending_overlay(executor, pending_overlay, target).await?
+    else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("{subject} '{version_id}' has no committed head"),
@@ -180,8 +219,22 @@ pub(crate) async fn require_target_version_context_in_transaction(
 ) -> Result<VersionContext, LixError> {
     let target =
         resolve_target_version_in_transaction(tx, requested_version_id, field_name).await?;
+    let pending_overlay = tx
+        .write_transaction
+        .as_ref()
+        .map(|write_transaction| write_transaction.buffered_write_pending_write_overlay())
+        .transpose()?
+        .flatten();
     let mut executor = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
-    require_version_context_with_executor(&mut executor, target, subject).await
+    require_version_context_with_pending_overlay(
+        &mut executor,
+        pending_overlay
+            .as_ref()
+            .map(|overlay| overlay as &dyn PendingOverlay),
+        target,
+        subject,
+    )
+    .await
 }
 
 #[allow(dead_code)]
@@ -222,11 +275,30 @@ pub(crate) async fn require_version_context_pair_in_transaction(
     let target =
         resolve_target_version_in_transaction(tx, Some(target_version_id), target_field_name)
             .await?;
+    let pending_overlay = tx
+        .write_transaction
+        .as_ref()
+        .map(|write_transaction| write_transaction.buffered_write_pending_write_overlay())
+        .transpose()?
+        .flatten();
+    let pending_overlay = pending_overlay
+        .as_ref()
+        .map(|overlay| overlay as &dyn PendingOverlay);
     let mut executor = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
-    let source_context =
-        require_version_context_with_executor(&mut executor, source, "source version").await?;
-    let target_context =
-        require_version_context_with_executor(&mut executor, target, "target version").await?;
+    let source_context = require_version_context_with_pending_overlay(
+        &mut executor,
+        pending_overlay,
+        source,
+        "source version",
+    )
+    .await?;
+    let target_context = require_version_context_with_pending_overlay(
+        &mut executor,
+        pending_overlay,
+        target,
+        "target version",
+    )
+    .await?;
     Ok(VersionContextPair {
         source: source_context,
         target: target_context,

@@ -65,7 +65,8 @@ impl<'a> PublicWriteHydrator<'a> {
         version_id: &str,
     ) -> Result<Option<HydratedVersionAdminRow>, LixError> {
         let Some(admin_state) =
-            load_version_admin_state_with_backend(self.backend, version_id).await?
+            load_version_admin_state_with_backend(self.backend, self.pending_overlay, version_id)
+                .await?
         else {
             return Ok(None);
         };

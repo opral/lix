@@ -115,8 +115,8 @@ async fn ensure_checkpoint_label_on_commit(
              FROM lix_internal_change \
              WHERE entity_id = $1 \
                AND schema_key = $2 \
-               AND file_id = 'lix' \
-               AND plugin_key = 'lix' \
+               AND file_id IS NULL \
+               AND plugin_key IS NULL \
              LIMIT 1",
             &[
                 Value::Text(state_entity_id.clone()),
@@ -135,11 +135,11 @@ async fn ensure_checkpoint_label_on_commit(
         tx.backend_transaction_mut()?,
         &[crate::live_state::LiveRow {
             entity_id: state_entity_id.clone(),
-            file_id: "lix".to_string(),
+            file_id: None,
             schema_key: CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string(),
             schema_version: "1".to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            plugin_key: "lix".to_string(),
+            plugin_key: None,
             metadata: None,
             change_id: Some(change_id.clone()),
             writer_key: None,
@@ -187,7 +187,7 @@ async fn insert_canonical_checkpoint_label_change(
                 "INSERT INTO lix_internal_change (\
              id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at\
              ) \
-             SELECT $1, $2, '{schema_key}', '1', 'lix', 'lix', $3, NULL, false, $4 \
+             SELECT $1, $2, '{schema_key}', '1', NULL, NULL, $3, NULL, false, $4 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
                 schema_key = CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
             ),

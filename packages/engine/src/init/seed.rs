@@ -8,10 +8,9 @@ use crate::canonical::{
 use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
-    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-    load_exact_live_row, load_version_head_commit_id_with_executor,
-    load_version_head_commit_map_with_executor, write_live_rows, ExactLiveRowQuery, LiveRow,
-    LiveRowSource,
+    key_value_schema_key, key_value_schema_version, load_exact_live_row,
+    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
+    write_live_rows, ExactLiveRowQuery, LiveRow, LiveRowSource,
 };
 use crate::session::{
     canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
@@ -25,7 +24,7 @@ use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
     version_descriptor_schema_key, version_descriptor_schema_version,
 };
-use crate::{Lix, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{Lix, LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) const LIX_ID_KEY: &str = "lix_id";
@@ -139,7 +138,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.schema_key = 'lix_commit' \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
+                   AND c.plugin_key IS NULL \
                    AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[],
@@ -192,7 +192,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         schema_key: &str,
         entity_id: &str,
         version_id: &str,
-        file_id: &str,
+        file_id: Option<&str>,
     ) -> Result<Option<LiveRow>, LixError> {
         let backend = transaction_backend_view(self.backend_transaction_mut()?);
         load_exact_live_row(
@@ -202,9 +202,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 schema_key: schema_key.to_string(),
                 version_id: version_id.to_string(),
                 entity_id: entity_id.to_string(),
-                file_id: Some(file_id.to_string()),
+                file_id: NullableKeyFilter::from_nullable(file_id.map(str::to_string)),
                 schema_version: None,
-                plugin_key: None,
+                plugin_key: NullableKeyFilter::Any,
                 writer_key: None,
                 global: Some(version_id == GLOBAL_VERSION_ID),
                 untracked: Some(matches!(source, LiveRowSource::Untracked)),
@@ -231,7 +231,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     "lix_registered_schema",
                     &entity_id,
                     GLOBAL_VERSION_ID,
-                    "lix",
+                    None,
                 )
                 .await?
                 .is_some()
@@ -248,8 +248,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 &entity_id,
                 "lix_registered_schema",
                 "1",
-                "lix",
-                "lix",
+                None,
+                None,
                 &snapshot_content,
                 &change_id,
                 BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP,
@@ -263,9 +263,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     entity_id: entity_id.clone(),
                     schema_key: "lix_registered_schema".to_string(),
                     schema_version: "1".to_string(),
-                    file_id: "lix".to_string(),
+                    file_id: None,
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    plugin_key: "lix".to_string(),
+                    plugin_key: None,
                     metadata: None,
                     change_id: Some(change_id.clone()),
                     writer_key: None,
@@ -283,9 +283,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 RegisteredSchemaMirrorRow {
                     entity_id: &entity_id,
                     schema_version: "1",
-                    file_id: "lix",
+                    file_id: None,
                     version_id: GLOBAL_VERSION_ID,
-                    plugin_key: "lix",
+                    plugin_key: None,
                     snapshot_content: Some(&snapshot_content),
                     metadata: None,
                     change_id: &change_id,
@@ -365,7 +365,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.schema_key = 'lix_commit' \
                    AND c.entity_id = $1 \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
+                   AND c.plugin_key IS NULL \
                    AND s.content IS NOT NULL",
                 &[Value::Text(commit_id.to_string())],
             )
@@ -422,7 +423,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.schema_key = 'lix_change_set' \
                    AND c.entity_id = $1 \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
+                   AND c.plugin_key IS NULL \
                    AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(change_set_id.clone())],
@@ -500,7 +502,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  FROM lix_internal_change c \
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.schema_key = 'lix_commit' \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
+                   AND c.plugin_key IS NULL \
                    AND s.content IS NOT NULL",
                 &[],
             )
@@ -562,7 +565,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.schema_key = 'lix_commit' \
                    AND c.entity_id = $1 \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
                    AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(commit_id.to_string())],
@@ -585,8 +588,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             commit_id,
             "lix_commit",
             "1",
-            "lix",
-            "lix",
+            None,
+            None,
             &snapshot_content,
             &change_id,
             &timestamp,
@@ -607,7 +610,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.schema_key = 'lix_change_set' \
                    AND c.entity_id = $1 \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
                    AND s.content IS NOT NULL \
                  LIMIT 1",
                 &[Value::Text(change_set_id.to_string())],
@@ -624,8 +627,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             change_set_id,
             "lix_change_set",
             "1",
-            "lix",
-            "lix",
+            None,
+            None,
             &snapshot_content,
             &change_id,
             &timestamp,
@@ -652,7 +655,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 crate::canonical::CHECKPOINT_LABEL_SCHEMA_KEY,
                 crate::canonical::CHECKPOINT_LABEL_ID,
                 GLOBAL_VERSION_ID,
-                "lix",
+                None,
             )
             .await?
         {
@@ -691,9 +694,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             crate::canonical::CHECKPOINT_LABEL_ID,
             crate::canonical::CHECKPOINT_LABEL_SCHEMA_KEY,
             "1",
-            "lix",
+            None,
             "global",
-            "lix",
+            None,
             &snapshot_content,
         )
         .await?;
@@ -719,7 +722,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
                 &entity_label_id,
                 GLOBAL_VERSION_ID,
-                "lix",
+                None,
             )
             .await?
             .is_some()
@@ -740,9 +743,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &entity_label_id,
             crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
             "1",
-            "lix",
+            None,
             "global",
-            "lix",
+            None,
             &snapshot_content,
         )
         .await?;
@@ -807,9 +810,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 key,
                 key_value_schema_key(),
                 key_value_schema_version(),
-                key_value_file_id(),
+                None,
                 version_id,
-                key_value_plugin_key(),
+                None,
                 &snapshot_content,
             )
             .await
@@ -819,9 +822,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 key,
                 key_value_schema_key(),
                 key_value_schema_version(),
-                key_value_file_id(),
+                None,
                 version_id,
-                key_value_plugin_key(),
+                None,
                 &snapshot_content,
             )
             .await
@@ -902,7 +905,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                  JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                  WHERE c.entity_id = $1 \
                    AND c.schema_key = 'lix_commit' \
-                   AND c.file_id = 'lix' \
+                   AND c.file_id IS NULL \
+                   AND c.plugin_key IS NULL \
                    AND s.content IS NOT NULL",
                 &[Value::Text(commit_id.to_string())],
             )
@@ -1013,20 +1017,20 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
-        file_id: &str,
+        file_id: Option<&str>,
         version_id: &str,
-        plugin_key: &str,
+        plugin_key: Option<&str>,
         snapshot_content: &str,
     ) -> Result<(), LixError> {
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = LiveRow {
             entity_id: entity_id.to_string(),
-            file_id: file_id.to_string(),
+            file_id: file_id.map(str::to_string),
             schema_key: schema_key.to_string(),
             schema_version: schema_version.to_string(),
             version_id: version_id.to_string(),
-            plugin_key: plugin_key.to_string(),
+            plugin_key: plugin_key.map(str::to_string),
             metadata: None,
             change_id: Some(change_id.clone()),
             writer_key: None,
@@ -1063,20 +1067,20 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
-        file_id: &str,
+        file_id: Option<&str>,
         version_id: &str,
-        plugin_key: &str,
+        plugin_key: Option<&str>,
         snapshot_content: &str,
     ) -> Result<(), LixError> {
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
         let row = LiveRow {
             entity_id: entity_id.to_string(),
-            file_id: file_id.to_string(),
+            file_id: file_id.map(str::to_string),
             schema_key: schema_key.to_string(),
             schema_version: schema_version.to_string(),
             version_id: version_id.to_string(),
-            plugin_key: plugin_key.to_string(),
+            plugin_key: plugin_key.map(str::to_string),
             metadata: None,
             change_id: Some(change_id.clone()),
             writer_key: None,
@@ -1109,8 +1113,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         entity_id: &str,
         schema_key: &str,
         schema_version: &str,
-        file_id: &str,
-        plugin_key: &str,
+        file_id: Option<&str>,
+        plugin_key: Option<&str>,
         snapshot_content: &str,
         change_id: &str,
         created_at: &str,
@@ -1138,8 +1142,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 Value::Text(entity_id.to_string()),
                 Value::Text(schema_key.to_string()),
                 Value::Text(schema_version.to_string()),
-                Value::Text(file_id.to_string()),
-                Value::Text(plugin_key.to_string()),
+                file_id.map(|value| Value::Text(value.to_string())).unwrap_or(Value::Null),
+                plugin_key
+                    .map(|value| Value::Text(value.to_string()))
+                    .unwrap_or(Value::Null),
                 Value::Text(snapshot_id),
                 Value::Boolean(untracked),
                 Value::Text(created_at.to_string()),
@@ -1174,11 +1180,15 @@ async fn find_version_id_by_name_with_executor(
                 exact_filters: BTreeMap::from([
                     (
                         "file_id".to_string(),
-                        Value::Text(version_descriptor_file_id().to_string()),
+                        version_descriptor_file_id()
+                            .map(|value| Value::Text(value.to_string()))
+                            .unwrap_or(Value::Null),
                     ),
                     (
                         "plugin_key".to_string(),
-                        Value::Text(version_descriptor_plugin_key().to_string()),
+                        version_descriptor_plugin_key()
+                            .map(|value| Value::Text(value.to_string()))
+                            .unwrap_or(Value::Null),
                     ),
                     (
                         "schema_version".to_string(),

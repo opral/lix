@@ -36,8 +36,8 @@ pub(crate) struct CanonicalChange {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) untracked: bool,
@@ -48,7 +48,7 @@ pub(crate) struct CanonicalChange {
 pub(crate) struct CanonicalStateIdentity {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
-    pub(crate) file_id: String,
+    pub(crate) file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,8 +56,8 @@ pub(crate) struct CanonicalStateRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: String,
     pub(crate) metadata: Option<String>,
     pub(crate) source_change_id: String,
@@ -107,8 +107,8 @@ pub(crate) struct CanonicalHistoryRequest {
 pub(crate) struct CanonicalHistoryRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) schema_version: String,
@@ -156,8 +156,8 @@ pub(crate) struct CanonicalVisibleStateRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) source_change_id: String,
@@ -237,7 +237,11 @@ pub(crate) async fn load_exact_row_at_commit(
         version_id: String::new(),
         exact_filters: BTreeMap::from([(
             "file_id".to_string(),
-            Value::Text(identity.file_id.clone()),
+            identity
+                .file_id
+                .clone()
+                .map(Value::Text)
+                .unwrap_or(Value::Null),
         )]),
     };
     let Some(change) =
@@ -720,8 +724,8 @@ fn parse_canonical_history_rows(result: QueryResult) -> Result<Vec<CanonicalHist
         rows.push(CanonicalHistoryRow {
             entity_id: required_text_value(&row, 0, "entity_id")?,
             schema_key: required_text_value(&row, 1, "schema_key")?,
-            file_id: required_text_value(&row, 2, "file_id")?,
-            plugin_key: required_text_value(&row, 3, "plugin_key")?,
+            file_id: optional_text_value(&row, 2, "file_id")?,
+            plugin_key: optional_text_value(&row, 3, "plugin_key")?,
             snapshot_content: optional_text_value(&row, 4, "snapshot_content")?,
             metadata: optional_text_value(&row, 5, "metadata")?,
             schema_version: required_text_value(&row, 6, "schema_version")?,
@@ -746,8 +750,8 @@ fn parse_visible_state_rows(
             entity_id: required_text_value(&row, 1, "entity_id")?,
             schema_key: required_text_value(&row, 2, "schema_key")?,
             schema_version: required_text_value(&row, 3, "schema_version")?,
-            file_id: required_text_value(&row, 4, "file_id")?,
-            plugin_key: required_text_value(&row, 5, "plugin_key")?,
+            file_id: optional_text_value(&row, 4, "file_id")?,
+            plugin_key: optional_text_value(&row, 5, "plugin_key")?,
             snapshot_content: optional_text_value(&row, 6, "snapshot_content")?,
             metadata: optional_text_value(&row, 7, "metadata")?,
             source_change_id: required_text_value(&row, 8, "change_id")?,

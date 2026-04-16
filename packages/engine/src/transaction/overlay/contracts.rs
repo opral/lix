@@ -6,9 +6,9 @@ pub struct PendingSemanticRow {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub version_id: String,
-    pub plugin_key: String,
+    pub plugin_key: Option<String>,
     pub change_id: Option<String>,
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
@@ -52,6 +52,6 @@ pub trait PendingOverlay {
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
-        file_id: &str,
+        file_id: Option<&str>,
     ) -> Option<Option<String>>;
 }

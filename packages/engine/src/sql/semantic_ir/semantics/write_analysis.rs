@@ -669,7 +669,7 @@ mod tests {
     fn analyzes_active_scope_for_lix_state_insert() {
         let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_state (entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version) \
-             VALUES ('entity-1', 'lix_key_value', 'lix', 'lix', '{\"key\":\"hello\"}', '1')",
+             VALUES ('entity-1', 'lix_key_value', NULL, NULL, '{\"key\":\"hello\"}', '1')",
             "main",
         ), &system_functions())
         .expect("write analysis should succeed");
@@ -691,7 +691,7 @@ mod tests {
     fn analyzes_single_version_scope_for_lix_state_by_version_insert() {
         let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
-             VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')",
+             VALUES ('entity-1', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"hello\"}', '1')",
             "main",
         ), &system_functions())
         .expect("write analysis should succeed");
@@ -707,8 +707,8 @@ mod tests {
         let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked) \
              VALUES \
-             ('entity-tracked', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"tracked\"}', '1', false), \
-             ('entity-untracked', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"untracked\"}', '1', true)",
+             ('entity-tracked', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"tracked\"}', '1', false), \
+             ('entity-untracked', 'lix_key_value', NULL, 'version-b', NULL, '{\"key\":\"untracked\"}', '1', true)",
             "main",
         ), &system_functions())
         .expect("write analysis should succeed");
@@ -727,8 +727,8 @@ mod tests {
         let planned = analyze_write(&canonicalized_write(
             "INSERT INTO lix_state (entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global) \
              VALUES \
-             ('entity-local', 'lix_key_value', 'lix', 'lix', '{\"key\":\"local\"}', '1', false), \
-             ('entity-global', 'lix_key_value', 'lix', 'lix', '{\"key\":\"global\"}', '1', true)",
+             ('entity-local', 'lix_key_value', NULL, NULL, '{\"key\":\"local\"}', '1', false), \
+             ('entity-global', 'lix_key_value', NULL, NULL, '{\"key\":\"global\"}', '1', true)",
             "version-active",
         ), &system_functions())
         .expect("write analysis should succeed");

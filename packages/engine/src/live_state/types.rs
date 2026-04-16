@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde_json::Value as JsonValue;
 
-use crate::common::Value;
+use crate::common::{NullableKeyFilter, Value};
 use crate::live_state::tracked::TrackedRow;
 #[cfg(test)]
 use crate::live_state::tracked::TrackedTombstoneMarker;
@@ -63,9 +63,9 @@ pub struct LiveSnapshotRow {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub version_id: String,
-    pub plugin_key: String,
+    pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub source_change_id: Option<String>,
     pub snapshot: JsonValue,
@@ -83,11 +83,11 @@ pub struct LiveWriteRow {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub version_id: String,
     pub global: bool,
     pub untracked: bool,
-    pub plugin_key: String,
+    pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub change_id: String,
     pub writer_key: Option<String>,
@@ -216,7 +216,8 @@ pub struct ExactRowRequest {
     pub schema_key: String,
     pub version_id: String,
     pub entity_id: String,
-    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_id: NullableKeyFilter<String>,
 }
 
 #[cfg(test)]
@@ -225,7 +226,8 @@ pub struct BatchRowRequest {
     pub schema_key: String,
     pub version_id: String,
     pub entity_ids: Vec<String>,
-    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_id: NullableKeyFilter<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
@@ -243,12 +245,7 @@ pub fn exact_row_constraints(request: &ExactRowRequest) -> Vec<ScanConstraint> {
         field: ScanField::EntityId,
         operator: ScanOperator::Eq(Value::Text(request.entity_id.clone())),
     }];
-    if let Some(file_id) = &request.file_id {
-        constraints.push(ScanConstraint {
-            field: ScanField::FileId,
-            operator: ScanOperator::Eq(Value::Text(file_id.clone())),
-        });
-    }
+    push_nullable_key_constraint(&mut constraints, ScanField::FileId, &request.file_id);
     constraints
 }
 
@@ -265,41 +262,60 @@ pub fn batch_row_constraints(request: &BatchRowRequest) -> Vec<ScanConstraint> {
                 .collect(),
         ),
     }];
-    if let Some(file_id) = &request.file_id {
-        constraints.push(ScanConstraint {
-            field: ScanField::FileId,
-            operator: ScanOperator::Eq(Value::Text(file_id.clone())),
-        });
-    }
+    push_nullable_key_constraint(&mut constraints, ScanField::FileId, &request.file_id);
     constraints
+}
+
+fn push_nullable_key_constraint(
+    constraints: &mut Vec<ScanConstraint>,
+    field: ScanField,
+    filter: &NullableKeyFilter<String>,
+) {
+    match filter {
+        NullableKeyFilter::Any => {}
+        NullableKeyFilter::Null => constraints.push(ScanConstraint {
+            field,
+            operator: ScanOperator::Eq(Value::Null),
+        }),
+        NullableKeyFilter::Value(value) => constraints.push(ScanConstraint {
+            field,
+            operator: ScanOperator::Eq(Value::Text(value.clone())),
+        }),
+    }
 }
 
 pub fn matches_constraints(
     entity_id: &str,
-    file_id: &str,
-    plugin_key: &str,
+    file_id: Option<&str>,
+    plugin_key: Option<&str>,
     schema_version: &str,
     constraints: &[ScanConstraint],
 ) -> bool {
     constraints.iter().all(|constraint| {
         let candidate = match constraint.field {
-            ScanField::EntityId => entity_id,
+            ScanField::EntityId => Some(entity_id),
             ScanField::FileId => file_id,
             ScanField::PluginKey => plugin_key,
-            ScanField::SchemaVersion => schema_version,
+            ScanField::SchemaVersion => Some(schema_version),
         };
         matches_constraint(candidate, &constraint.operator)
     })
 }
 
-fn matches_constraint(candidate: &str, operator: &ScanOperator) -> bool {
+fn matches_constraint(candidate: Option<&str>, operator: &ScanOperator) -> bool {
     match operator {
-        ScanOperator::Eq(value) => value_as_text(value).is_some_and(|value| value == candidate),
-        ScanOperator::In(values) => values
-            .iter()
-            .filter_map(value_as_text)
-            .any(|value| value == candidate),
+        ScanOperator::Eq(Value::Null) => candidate.is_none(),
+        ScanOperator::Eq(value) => {
+            value_as_text(value).is_some_and(|value| candidate == Some(value))
+        }
+        ScanOperator::In(values) => values.iter().any(|value| match value {
+            Value::Null => candidate.is_none(),
+            _ => value_as_text(value).is_some_and(|expected| candidate == Some(expected)),
+        }),
         ScanOperator::Range { lower, upper } => {
+            let Some(candidate) = candidate else {
+                return false;
+            };
             lower
                 .as_ref()
                 .is_none_or(|bound| compare_lower(candidate, &bound.value, bound.inclusive))
@@ -343,10 +359,14 @@ pub struct RowIdentity {
     pub schema_key: String,
     pub version_id: String,
     pub entity_id: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
 }
 
 impl RowIdentity {
+    pub(crate) fn storage_scope_key(&self) -> String {
+        crate::common::storage_scope_key_for_file_id(self.file_id.as_deref())
+    }
+
     #[cfg(test)]
     pub fn from_live_write(row: &LiveWriteRow) -> Self {
         Self {
@@ -390,10 +410,7 @@ impl RowIdentity {
         self.schema_key == request.schema_key
             && self.version_id == request.version_id
             && request.entity_ids.contains(&self.entity_id)
-            && request
-                .file_id
-                .as_ref()
-                .is_none_or(|file_id| self.file_id == *file_id)
+            && request.file_id.matches(self.file_id.as_ref())
     }
 
     #[cfg(test)]
@@ -407,7 +424,8 @@ pub struct EffectiveRowRequest {
     pub schema_key: String,
     pub version_id: String,
     pub entity_id: String,
-    pub file_id: Option<String>,
+    #[serde(default)]
+    pub file_id: NullableKeyFilter<String>,
     pub include_global: bool,
     pub include_untracked: bool,
 }

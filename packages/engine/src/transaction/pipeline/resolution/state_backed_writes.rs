@@ -18,6 +18,7 @@ use crate::transaction::pipeline::resolution::prepared_artifacts::{
     CanonicalStateRowKey, EntityAssignmentsSemantics, EntityInsertSemantics,
     InsertOnConflictAction,
 };
+use crate::NullableKeyFilter;
 use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -154,16 +155,22 @@ fn assign_state_row_key_value(
             )?;
         }
         "file_id" => {
-            row_key.file_id = Some(exact_text_value(
-                value,
-                "public state row key requires text-compatible 'file_id'",
-            )?);
+            row_key.file_id = match value {
+                Value::Null => NullableKeyFilter::Null,
+                _ => NullableKeyFilter::Value(exact_text_value(
+                    value,
+                    "public state row key requires text-compatible 'file_id'",
+                )?),
+            };
         }
         "plugin_key" => {
-            row_key.plugin_key = Some(exact_text_value(
-                value,
-                "public state row key requires text-compatible 'plugin_key'",
-            )?);
+            row_key.plugin_key = match value {
+                Value::Null => NullableKeyFilter::Null,
+                _ => NullableKeyFilter::Value(exact_text_value(
+                    value,
+                    "public state row key requires text-compatible 'plugin_key'",
+                )?),
+            };
         }
         "schema_version" => {
             row_key.schema_version = Some(exact_text_value(
@@ -401,7 +408,7 @@ impl StateBackedSurface<'_> {
                 ensure_identity_columns_preserved(
                     &current_row.entity_id,
                     &current_row.schema_key,
-                    &current_row.file_id,
+                    current_row.file_id.as_deref(),
                     &current_row.version_id,
                     &values,
                 )
@@ -944,8 +951,8 @@ fn exact_selector_row_key(
 
     let mut row_key = CanonicalStateRowKey {
         entity_id,
-        file_id: None,
-        plugin_key: None,
+        file_id: NullableKeyFilter::Any,
+        plugin_key: NullableKeyFilter::Any,
         schema_version: None,
         version_id: None,
         global: None,
@@ -984,8 +991,12 @@ async fn resolve_exact_state_target_rows(
 fn state_insert_row_key(row: &PlannedStateRow) -> CanonicalStateRowKey {
     CanonicalStateRowKey {
         entity_id: row.entity_id.clone(),
-        file_id: row.values.get("file_id").and_then(text_from_value),
-        plugin_key: row.values.get("plugin_key").and_then(text_from_value),
+        file_id: NullableKeyFilter::from_nullable(
+            row.values.get("file_id").and_then(text_from_value),
+        ),
+        plugin_key: NullableKeyFilter::from_nullable(
+            row.values.get("plugin_key").and_then(text_from_value),
+        ),
         schema_version: row.values.get("schema_version").and_then(text_from_value),
         version_id: row.version_id.clone(),
         global: row.values.get("global").and_then(bool_from_value),
@@ -1211,8 +1222,8 @@ fn entity_state_row_key(
 ) -> Result<CanonicalStateRowKey, WriteResolveError> {
     let mut row_key = CanonicalStateRowKey {
         entity_id: entity_id.to_string(),
-        file_id: None,
-        plugin_key: None,
+        file_id: NullableKeyFilter::Any,
+        plugin_key: NullableKeyFilter::Any,
         schema_version: None,
         version_id: None,
         global: None,
@@ -1243,8 +1254,8 @@ fn entity_insert_row_key(
 ) -> Result<CanonicalStateRowKey, WriteResolveError> {
     let mut row_key = CanonicalStateRowKey {
         entity_id: row.entity_id.clone(),
-        file_id: None,
-        plugin_key: None,
+        file_id: NullableKeyFilter::Any,
+        plugin_key: NullableKeyFilter::Any,
         schema_version: None,
         version_id: row.version_id.clone(),
         global: None,

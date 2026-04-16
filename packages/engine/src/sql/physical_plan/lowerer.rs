@@ -1932,8 +1932,8 @@ mod tests {
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
         assert!(lowered_sql.contains("untracked = false"));
         assert!(lowered_sql.contains("untracked = true"));
-        assert!(lowered_sql.contains("file_id = 'lix'"));
-        assert!(lowered_sql.contains("plugin_key = 'lix'"));
+        assert!(!lowered_sql.contains("file_id = 'lix'"));
+        assert!(!lowered_sql.contains("plugin_key = 'lix'"));
         assert_eq!(
             lowered.pushdown_decision.residual_predicate_sql(),
             vec!["key = 'hello'".to_string()]
@@ -2905,8 +2905,8 @@ mod tests {
             .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_registered_schema"));
-        assert!(lowered_sql.contains("file_id = 'lix'"));
-        assert!(lowered_sql.contains("plugin_key = 'lix'"));
+        assert!(!lowered_sql.contains("file_id = 'lix'"));
+        assert!(!lowered_sql.contains("plugin_key = 'lix'"));
         assert!(!lowered_sql.contains("FROM lix_registered_schema"));
         assert_eq!(
             lowered.pushdown_decision.residual_predicate_sql(),

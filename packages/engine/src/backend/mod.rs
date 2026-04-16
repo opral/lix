@@ -9,7 +9,9 @@ use async_trait::async_trait;
 use crate::common::SqlDialect;
 use crate::{LixError, QueryResult, Value};
 #[allow(unused_imports)]
-pub(crate) use ddl::{add_column_if_missing, execute_ddl_batch};
+pub(crate) use ddl::{
+    add_column_if_missing, add_column_if_missing_with_executor, execute_ddl_batch,
+};
 pub use image::{ImageChunkReader, ImageChunkWriter};
 #[allow(unused_imports)]
 pub use prepared::{PreparedBatch, PreparedStatement};

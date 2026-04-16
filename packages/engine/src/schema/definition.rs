@@ -228,6 +228,22 @@ fn assert_removed_legacy_lixcol_scope_overrides_absent(schema: &JsonValue) -> Re
         });
     }
 
+    if overrides.contains_key("lixcol_file_id") {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_file_id is no longer supported.".to_string(),
+        });
+    }
+
+    if overrides.contains_key("lixcol_plugin_key") {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_plugin_key is no longer supported.".to_string(),
+        });
+    }
+
     if overrides.contains_key("lixcol_global") {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),

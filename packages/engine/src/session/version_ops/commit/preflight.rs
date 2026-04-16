@@ -4,10 +4,10 @@ use crate::live_state::key_value_schema_key;
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
 use crate::transaction::{
     deterministic_sequence_key, ExactFilesystemDescriptorState, FilesystemDescriptorState,
-    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
+    FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixError, Value};
+use crate::{LixError, NullableKeyFilter, Value};
 
 use crate::session::version_ops::load_exact_canonical_row_at_version_head_with_executor;
 
@@ -20,7 +20,7 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
             schema_key: key_value_schema_key().to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: deterministic_sequence_key().to_string(),
-            file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await?;
@@ -45,7 +45,7 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
         &CanonicalStateIdentity {
             entity_id: deterministic_sequence_key().to_string(),
             schema_key: key_value_schema_key().to_string(),
-            file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+            file_id: None,
         },
     )
     .await?;
@@ -66,7 +66,7 @@ pub(crate) async fn load_untracked_file_descriptor(
             schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
             version_id: version_id.to_string(),
             entity_id: file_id.to_string(),
-            file_id: Some(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await?

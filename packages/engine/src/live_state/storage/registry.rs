@@ -1,8 +1,11 @@
 use super::layout::{
-    builtin_live_table_layout, live_table_layout_from_schema, merge_live_table_layouts,
-    LiveTableLayout,
+    builtin_live_table_layout, live_table_layout_from_schema, load_live_table_layout_with_executor,
+    merge_live_table_layouts, LiveTableLayout,
 };
 use super::sql::ensure_schema_live_table_sql_statements;
+use crate::backend::add_column_if_missing_with_executor;
+use crate::backend::QueryExecutor;
+use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};
 use crate::live_state::SchemaRegistration;
 use crate::schema::schema_from_registered_snapshot;
@@ -42,32 +45,64 @@ pub(crate) async fn ensure_schema_live_table_with_requirement(
     backend: &dyn LixBackend,
     requirement: &LiveTableRequirement,
 ) -> Result<(), LixError> {
-    let layout = match requirement.layout.as_ref() {
-        Some(layout) => layout.clone(),
-        None => load_live_table_layout_with_backend(backend, &requirement.schema_key).await?,
-    };
-    for statement in
-        ensure_schema_live_table_sql_statements(&requirement.schema_key, backend.dialect(), &layout)
-    {
-        backend.execute(&statement, &[]).await?;
-    }
-    Ok(())
+    let mut executor = backend;
+    ensure_schema_live_table_with_requirement_for_executor(&mut executor, requirement).await
 }
 
 pub(crate) async fn ensure_schema_live_table_with_requirement_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     requirement: &LiveTableRequirement,
 ) -> Result<(), LixError> {
+    let mut executor = transaction;
+    ensure_schema_live_table_with_requirement_for_executor(&mut executor, requirement).await
+}
+
+async fn ensure_schema_live_table_with_requirement_for_executor(
+    executor: &mut dyn QueryExecutor,
+    requirement: &LiveTableRequirement,
+) -> Result<(), LixError> {
     let layout = match requirement.layout.as_ref() {
         Some(layout) => layout.clone(),
-        None => load_live_table_layout_in_transaction(transaction, &requirement.schema_key).await?,
+        None => load_live_table_layout_with_executor(executor, &requirement.schema_key).await?,
     };
-    for statement in ensure_schema_live_table_sql_statements(
+    let statements = ensure_schema_live_table_sql_statements(
         &requirement.schema_key,
-        transaction.dialect(),
+        executor.dialect(),
         &layout,
-    ) {
-        transaction.execute(&statement, &[]).await?;
+    );
+    let table_name = tracked_relation_name(&requirement.schema_key);
+
+    if let Some(create_table) = statements.first() {
+        executor.execute(create_table, &[]).await?;
+    }
+
+    add_column_if_missing_with_executor(
+        executor,
+        &table_name,
+        STORAGE_SCOPE_KEY_COLUMN,
+        &format!(
+            "TEXT NOT NULL DEFAULT '{}'",
+            storage_scope_key_for_file_id(None)
+        ),
+    )
+    .await?;
+    executor
+        .execute(
+            &format!(
+                "UPDATE {table_name} \
+                 SET {storage_scope_key} = CASE \
+                   WHEN file_id IS NULL THEN '{engine_scope}' \
+                   ELSE 'file:' || file_id \
+                 END",
+                storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
+                engine_scope = storage_scope_key_for_file_id(None),
+            ),
+            &[],
+        )
+        .await?;
+
+    for statement in statements.iter().skip(1) {
+        executor.execute(statement, &[]).await?;
     }
     Ok(())
 }

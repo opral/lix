@@ -41,8 +41,6 @@ use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
-const REGISTERED_SCHEMA_FILE_ID: &str = "lix";
-const REGISTERED_SCHEMA_PLUGIN_KEY: &str = "lix";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConstraintStorageKind {
@@ -54,7 +52,7 @@ enum ConstraintStorageKind {
 struct ConstraintRowIdentity {
     entity_id: String,
     schema_key: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
 }
 
@@ -87,7 +85,7 @@ struct ConstraintDeletedRow {
 struct ConstraintScopeKey {
     storage: ConstraintStorageKind,
     schema_key: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
 }
 
@@ -295,10 +293,7 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             .await?;
 
             for row in &rows {
-                if row.file_id != REGISTERED_SCHEMA_FILE_ID
-                    || row.plugin_key != REGISTERED_SCHEMA_PLUGIN_KEY
-                    || row.untracked
-                {
+                if row.file_id.is_some() || row.plugin_key.is_some() || row.untracked {
                     continue;
                 }
                 let Some((key, schema)) = decode_registered_schema_row(row)? else {
@@ -440,7 +435,7 @@ pub(crate) async fn validate_update_inputs(
                     identity: ConstraintRowIdentity {
                         entity_id: row.entity_id.clone(),
                         schema_key: row.schema_key.clone(),
-                        file_id: row.file_id.clone(),
+                        file_id: Some(row.file_id.clone()),
                         version_id: row.version_id.clone(),
                     },
                     schema_version: row.schema_version.clone(),
@@ -475,7 +470,7 @@ pub(crate) async fn validate_update_inputs(
                     identity: ConstraintRowIdentity {
                         entity_id: row.entity_id.clone(),
                         schema_key: row.schema_key.clone(),
-                        file_id: row.file_id.clone(),
+                        file_id: Some(row.file_id.clone()),
                         version_id: row.version_id.clone(),
                     },
                     schema_version: row.schema_version.clone(),
@@ -706,7 +701,7 @@ fn collect_constraint_candidates(
                 identity: ConstraintRowIdentity {
                     entity_id: row.entity_id.clone(),
                     schema_key: row.schema_key.clone(),
-                    file_id: planned_row_required_text(row, "file_id")?,
+                    file_id: planned_row_optional_text(row, "file_id"),
                     version_id: planned_row_required_text(row, "version_id")?,
                 },
                 schema_version: planned_row_required_text(row, "schema_version")?,
@@ -739,7 +734,7 @@ fn collect_delete_candidates(
                 identity: ConstraintRowIdentity {
                     entity_id: row.entity_id.clone(),
                     schema_key: row.schema_key.clone(),
-                    file_id: planned_row_required_text(row, "file_id")?,
+                    file_id: planned_row_optional_text(row, "file_id"),
                     version_id: planned_row_required_text(row, "version_id")?,
                 },
                 schema_version: planned_row_required_text(row, "schema_version")?,
@@ -848,8 +843,8 @@ async fn validate_planned_row(
         validate_registered_schema_snapshot(provider, &snapshot, &actual_version_id).await?;
         let (key, schema) = schema_from_registered_snapshot(&snapshot)?;
         let expected_entity_id = key.entity_id();
-        let actual_file_id = planned_row_required_text(row, "file_id")?;
-        let actual_plugin_key = planned_row_required_text(row, "plugin_key")?;
+        let actual_file_id = planned_row_optional_text(row, "file_id");
+        let actual_plugin_key = planned_row_optional_text(row, "plugin_key");
         let actual_schema_version = planned_row_required_text(row, "schema_version")?;
 
         if row.entity_id != expected_entity_id {
@@ -861,22 +856,16 @@ async fn validate_planned_row(
                 ),
             });
         }
-        if actual_file_id != REGISTERED_SCHEMA_FILE_ID {
+        if actual_file_id.is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "registered schema file_id '{}' must be '{}'",
-                    actual_file_id, REGISTERED_SCHEMA_FILE_ID
-                ),
+                description: "registered schema file_id must be NULL".to_string(),
             });
         }
-        if actual_plugin_key != REGISTERED_SCHEMA_PLUGIN_KEY {
+        if actual_plugin_key.is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "registered schema plugin_key '{}' must be '{}'",
-                    actual_plugin_key, REGISTERED_SCHEMA_PLUGIN_KEY
-                ),
+                description: "registered schema plugin_key must be NULL".to_string(),
             });
         }
         if actual_schema_version != key.schema_version {
@@ -1256,7 +1245,7 @@ async fn validate_constraint_group_conflict(
                     row.identity.entity_id,
                     pending.identity.entity_id,
                     row.identity.version_id,
-                    row.identity.file_id
+                    format_optional_identity(row.identity.file_id.as_deref())
                 ),
             ));
         }
@@ -1292,7 +1281,7 @@ async fn validate_constraint_group_conflict(
                     row.identity.entity_id,
                     committed.identity.entity_id,
                     row.identity.version_id,
-                    row.identity.file_id
+                    format_optional_identity(row.identity.file_id.as_deref())
                 ),
             ));
         }
@@ -1426,7 +1415,7 @@ async fn validate_foreign_key_constraints(
                 target_schema_key,
                 index,
                 row.identity.version_id,
-                target_file_id
+                format_optional_identity(target_file_id.as_deref())
             ),
         ));
     }
@@ -1570,7 +1559,7 @@ async fn validate_delete_constraints_for_row(
                         deleted_row.identity.schema_key,
                         deleted_row.identity.entity_id,
                         deleted_row.identity.version_id,
-                        deleted_row.identity.file_id
+                        format_optional_identity(deleted_row.identity.file_id.as_deref())
                     ),
                 ));
             }
@@ -1814,7 +1803,13 @@ async fn query_committed_scope_rows(
             &scope.version_id,
             &[LiveFilter {
                 field: LiveFilterField::FileId,
-                operator: LiveFilterOp::Eq(Value::Text(scope.file_id.clone())),
+                operator: LiveFilterOp::Eq(
+                    scope
+                        .file_id
+                        .clone()
+                        .map(Value::Text)
+                        .unwrap_or(Value::Null),
+                ),
             }],
         )
         .await?
@@ -1895,7 +1890,7 @@ fn constraint_pointer_value(
     let value = match path[0].as_str() {
         "entity_id" => Some(JsonValue::String(row.identity.entity_id.clone())),
         "schema_key" => Some(JsonValue::String(row.identity.schema_key.clone())),
-        "file_id" => Some(JsonValue::String(row.identity.file_id.clone())),
+        "file_id" => row.identity.file_id.clone().map(JsonValue::String),
         "version_id" => Some(JsonValue::String(row.identity.version_id.clone())),
         "schema_version" => Some(JsonValue::String(row.schema_version.to_string())),
         _ => None,
@@ -1926,18 +1921,18 @@ fn effective_foreign_key_target_schema_key(
 }
 
 fn effective_foreign_key_target_file_id(
-    source_file_id: &str,
+    source_file_id: &Option<String>,
     referenced_properties: &[String],
     local_values: &[JsonValue],
-) -> Result<String, LixError> {
+) -> Result<Option<String>, LixError> {
     match referenced_properties
         .iter()
         .position(|pointer| pointer == "/file_id")
     {
         Some(position) => {
-            json_value_to_string(&local_values[position], "foreign key target file_id")
+            json_value_to_optional_string(&local_values[position], "foreign key target file_id")
         }
-        None => Ok(source_file_id.to_string()),
+        None => Ok(source_file_id.clone()),
     }
 }
 
@@ -1958,14 +1953,22 @@ fn json_pointer_group(values: &[JsonValue], label: &str) -> Result<Vec<String>, 
         .collect()
 }
 
-fn json_value_to_string(value: &JsonValue, label: &str) -> Result<String, LixError> {
+fn json_value_to_optional_string(
+    value: &JsonValue,
+    label: &str,
+) -> Result<Option<String>, LixError> {
     match value {
-        JsonValue::String(text) => Ok(text.clone()),
+        JsonValue::Null => Ok(None),
+        JsonValue::String(text) => Ok(Some(text.clone())),
         other => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!("{label} must be a string, got {other}"),
+            format!("{label} must be a string or null, got {other}"),
         )),
     }
+}
+
+fn format_optional_identity(value: Option<&str>) -> String {
+    value.unwrap_or("NULL").to_string()
 }
 
 fn pending_row_is_visible(context: &ConstraintContext, pending: &ConstraintCandidateRow) -> bool {
@@ -2063,11 +2066,23 @@ fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String
     })
 }
 
+fn planned_row_optional_text(row: &PlannedStateRow, name: &str) -> Option<String> {
+    match name {
+        "entity_id" => Some(row.entity_id.clone()),
+        "schema_key" => Some(row.schema_key.clone()),
+        "version_id" => row
+            .version_id
+            .clone()
+            .or_else(|| row.values.get(name).and_then(planned_row_text_value)),
+        _ => row.values.get(name).and_then(planned_row_text_value),
+    }
+}
+
 fn planned_state_row_identity(row: &PlannedStateRow) -> Result<ConstraintRowIdentity, LixError> {
     Ok(ConstraintRowIdentity {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
-        file_id: planned_row_required_text(row, "file_id")?,
+        file_id: planned_row_optional_text(row, "file_id"),
         version_id: planned_row_required_text(row, "version_id")?,
     })
 }

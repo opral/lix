@@ -63,7 +63,7 @@ pub(crate) use filesystem::runtime::{
     persist_filesystem_payload_changes_in_transaction, resolve_binary_blob_writes_in_transaction,
     with_exact_filesystem_descriptors, BinaryBlobWrite, ExactFilesystemDescriptorState,
     FilesystemDescriptorState, FilesystemSemanticChange, FilesystemTransactionState,
-    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
+    FILESYSTEM_FILE_SCHEMA_KEY,
 };
 pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
 #[cfg(test)]

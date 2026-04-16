@@ -61,6 +61,14 @@ pub(crate) fn render_qualified_predicate_sql(expr: &Expr, table_alias: &str) -> 
             render_qualified_predicate_sql(left, table_alias),
             render_qualified_predicate_sql(right, table_alias),
         ),
+        Expr::IsNull(inner) => format!(
+            "{} IS NULL",
+            render_qualified_predicate_sql(inner, table_alias)
+        ),
+        Expr::IsNotNull(inner) => format!(
+            "{} IS NOT NULL",
+            render_qualified_predicate_sql(inner, table_alias)
+        ),
         Expr::InList {
             expr,
             list,

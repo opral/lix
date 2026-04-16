@@ -215,10 +215,10 @@ fn decode_tracked_row(
     let entity_id = required_text_cell(row, 0, schema_key, "entity_id", "tracked")?;
     let schema_key_value = required_text_cell(row, 1, schema_key, "schema_key", "tracked")?;
     let schema_version = required_text_cell(row, 2, schema_key, "schema_version", "tracked")?;
-    let file_id = required_text_cell(row, 3, schema_key, "file_id", "tracked")?;
+    let file_id = row.get(3).and_then(text_from_value);
     let version_id = required_text_cell(row, 4, schema_key, "version_id", "tracked")?;
     let global = required_bool_cell(row, 5, schema_key, "global", "tracked")?;
-    let plugin_key = required_text_cell(row, 6, schema_key, "plugin_key", "tracked")?;
+    let plugin_key = row.get(6).and_then(text_from_value);
     let metadata = row.get(7).and_then(text_from_value);
     let change_id = row.get(8).and_then(text_from_value);
     let created_at = required_text_cell(row, 9, schema_key, "created_at", "tracked")?;
@@ -293,16 +293,10 @@ fn decode_tracked_tombstone(
             "schema_version",
             "tracked tombstone",
         )?),
-        file_id: required_text_cell(row, 3, schema_key, "file_id", "tracked tombstone")?,
+        file_id: row.get(3).and_then(text_from_value),
         version_id: required_text_cell(row, 4, schema_key, "version_id", "tracked tombstone")?,
         global: required_bool_cell(row, 5, schema_key, "global", "tracked tombstone")?,
-        plugin_key: Some(required_text_cell(
-            row,
-            6,
-            schema_key,
-            "plugin_key",
-            "tracked tombstone",
-        )?),
+        plugin_key: row.get(6).and_then(text_from_value),
         metadata: row.get(7).and_then(text_from_value),
         change_id: row.get(8).and_then(text_from_value),
         writer_key: None,

@@ -35,8 +35,6 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use self::insert_planning::FilesystemPlanningError;
 
-const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
-const FILESYSTEM_DESCRIPTOR_PLUGIN_KEY: &str = "lix";
 const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILESYSTEM_DIRECTORY_SCHEMA_VERSION: &str = "1";
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -1901,14 +1899,8 @@ fn directory_descriptor_row(
         "schema_key".to_string(),
         Value::Text(FILESYSTEM_DIRECTORY_SCHEMA_KEY.to_string()),
     );
-    values.insert(
-        "file_id".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-    );
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-    );
+    values.insert("file_id".to_string(), Value::Null);
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(FILESYSTEM_DIRECTORY_SCHEMA_VERSION.to_string()),
@@ -1958,14 +1950,8 @@ fn file_descriptor_row(
         "schema_key".to_string(),
         Value::Text(FILESYSTEM_FILE_SCHEMA_KEY.to_string()),
     );
-    values.insert(
-        "file_id".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_FILE_ID.to_string()),
-    );
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-    );
+    values.insert("file_id".to_string(), Value::Null);
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(FILESYSTEM_FILE_SCHEMA_VERSION.to_string()),
@@ -2053,10 +2039,7 @@ fn binary_blob_ref_row(
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string()),
     );
     values.insert("file_id".to_string(), Value::Text(file_id.to_string()));
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-    );
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION.to_string()),
@@ -2087,10 +2070,7 @@ fn binary_blob_ref_tombstone_row(file_id: &str, version_id: &str) -> PlannedStat
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string()),
     );
     values.insert("file_id".to_string(), Value::Text(file_id.to_string()));
-    values.insert(
-        "plugin_key".to_string(),
-        Value::Text(FILESYSTEM_DESCRIPTOR_PLUGIN_KEY.to_string()),
-    );
+    values.insert("plugin_key".to_string(), Value::Null);
     values.insert(
         "schema_version".to_string(),
         Value::Text(FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION.to_string()),

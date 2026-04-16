@@ -11,10 +11,6 @@
       "/extension"
     ]
   ],
-  "x-lix-override-lixcols": {
-    "lixcol_file_id": "\"lix\"",
-    "lixcol_plugin_key": "\"lix\""
-  },
   "type": "object",
   "properties": {
     "id": {

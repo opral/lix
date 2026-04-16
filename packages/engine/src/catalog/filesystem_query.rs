@@ -8,7 +8,6 @@ use crate::{LixBackend, LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 use std::collections::BTreeSet;
 
-const FILESYSTEM_DESCRIPTOR_FILE_ID: &str = "lix";
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -1121,8 +1120,7 @@ fn visible_descriptor_sql(
     version_id: &str,
 ) -> String {
     let tracked_base = format!(
-        "file_id = '{file_id}' AND {tracked_base_predicate}",
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        "file_id IS NULL AND {tracked_base_predicate}",
         tracked_base_predicate = tracked_base_predicate,
     );
     let untracked_table = quote_ident(&tracked_relation_name(schema_key));
@@ -1147,7 +1145,7 @@ fn visible_descriptor_sql(
                 1 AS precedence, 1 AS untracked \
          FROM {untracked_table} \
          WHERE version_id = '{version_id}' \
-           AND file_id = '{file_id}' \
+           AND file_id IS NULL \
            AND untracked = true \
            AND {untracked_base_predicate} \
          UNION ALL \
@@ -1167,7 +1165,6 @@ fn visible_descriptor_sql(
         untracked_table = untracked_table,
         tracked_table = tracked_table,
         version_id = escape_sql_string(version_id),
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
         tracked_base = tracked_base,
         untracked_base_predicate = untracked_base_predicate,
         untracked_parent_expr = untracked_parent_expr,
@@ -1211,13 +1208,11 @@ fn version_shadow_sql(
     entity_id: &str,
 ) -> String {
     let tracked_base = format!(
-        "file_id = '{file_id}' AND entity_id = '{entity_id}'",
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        "file_id IS NULL AND entity_id = '{entity_id}'",
         entity_id = escape_sql_string(entity_id),
     );
     let untracked_base = format!(
-        "file_id = '{file_id}' AND entity_id = '{entity_id}'",
-        file_id = escape_sql_string(FILESYSTEM_DESCRIPTOR_FILE_ID),
+        "file_id IS NULL AND entity_id = '{entity_id}'",
         entity_id = escape_sql_string(entity_id),
     );
     format!(

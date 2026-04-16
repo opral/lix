@@ -24,6 +24,7 @@ use crate::transaction::{
     PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings,
     PreparedWriteStatement,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
@@ -340,9 +341,9 @@ struct PendingSemanticRowIdentity {
     untracked: bool,
     schema_key: String,
     entity_id: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
-    plugin_key: String,
+    plugin_key: Option<String>,
     schema_version: String,
 }
 
@@ -379,13 +380,13 @@ impl PendingWriterKeyOverlay {
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
-        file_id: &str,
+        file_id: Option<&str>,
     ) -> Option<&Option<String>> {
         self.annotations.get(&RowIdentity {
             version_id: version_id.to_string(),
             schema_key: schema_key.to_string(),
             entity_id: entity_id.to_string(),
-            file_id: file_id.to_string(),
+            file_id: file_id.map(str::to_string),
         })
     }
 }
@@ -626,14 +627,11 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                             let Some(version_id) = row.version_id.as_ref() else {
                                 continue;
                             };
-                            let Some(file_id) =
-                                row.values.get("file_id").and_then(|value| match value {
-                                    crate::Value::Text(value) => Some(value.clone()),
-                                    _ => None,
-                                })
-                            else {
-                                continue;
-                            };
+                            let file_id = row.values.get("file_id").and_then(|value| match value {
+                                crate::Value::Text(value) => Some(value.clone()),
+                                crate::Value::Null => None,
+                                _ => None,
+                            });
                             overlay.annotations.insert(
                                 RowIdentity {
                                     schema_key: row.schema_key.clone(),
@@ -652,12 +650,11 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                     let Some(version_id) = row.version_id.as_ref() else {
                         continue;
                     };
-                    let Some(file_id) = row.values.get("file_id").and_then(|value| match value {
+                    let file_id = row.values.get("file_id").and_then(|value| match value {
                         crate::Value::Text(value) => Some(value.clone()),
+                        crate::Value::Null => None,
                         _ => None,
-                    }) else {
-                        continue;
-                    };
+                    });
                     overlay.annotations.insert(
                         RowIdentity {
                             schema_key: row.schema_key.clone(),
@@ -861,7 +858,8 @@ fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
             continue;
         }
         let file_id = match row.values.get("file_id") {
-            Some(crate::Value::Text(value)) => value.clone(),
+            Some(crate::Value::Text(value)) => Some(value.clone()),
+            Some(crate::Value::Null) | None => None,
             _ => return false,
         };
         let version_id = match row.version_id.as_deref() {
@@ -869,7 +867,8 @@ fn collect_directory_descriptor_overlay_from_planned_rows<'a>(
             None => return false,
         };
         let plugin_key = match row.values.get("plugin_key") {
-            Some(crate::Value::Text(value)) => value.clone(),
+            Some(crate::Value::Text(value)) => Some(value.clone()),
+            Some(crate::Value::Null) | None => None,
             _ => return false,
         };
         let schema_version = match row.values.get("schema_version") {
@@ -974,7 +973,8 @@ fn collect_semantic_overlay_row(
     overlay: &mut PendingSemanticOverlay,
 ) -> Result<bool, LixError> {
     let file_id = match row.values.get("file_id") {
-        Some(crate::Value::Text(value)) => value.clone(),
+        Some(crate::Value::Text(value)) => Some(value.clone()),
+        Some(crate::Value::Null) | None => None,
         _ => return Ok(false),
     };
     let version_id = match row.version_id.as_deref() {
@@ -982,7 +982,8 @@ fn collect_semantic_overlay_row(
         None => return Ok(false),
     };
     let plugin_key = match row.values.get("plugin_key") {
-        Some(crate::Value::Text(value)) => value.clone(),
+        Some(crate::Value::Text(value)) => Some(value.clone()),
+        Some(crate::Value::Null) | None => None,
         _ => return Ok(false),
     };
     let schema_version = match row.values.get("schema_version") {
@@ -1244,9 +1245,10 @@ fn build_untracked_canonical_changes(
                             ),
                         )
                     })?,
-                file_id: required_planned_text(row, "file_id")?
-                    .to_string()
-                    .try_into()
+                file_id: optional_planned_text(row, "file_id")
+                    .map(str::to_string)
+                    .map(TryInto::try_into)
+                    .transpose()
                     .map_err(|_| {
                         LixError::new(
                             "LIX_ERROR_UNKNOWN",
@@ -1256,9 +1258,10 @@ fn build_untracked_canonical_changes(
                             ),
                         )
                     })?,
-                plugin_key: required_planned_text(row, "plugin_key")?
-                    .to_string()
-                    .try_into()
+                plugin_key: optional_planned_text(row, "plugin_key")
+                    .map(str::to_string)
+                    .map(TryInto::try_into)
+                    .transpose()
                     .map_err(|_| {
                         LixError::new(
                             "LIX_ERROR_UNKNOWN",
@@ -1335,8 +1338,8 @@ mod tests {
             schema_key: "lix_key_value".to_string(),
             version_id: Some("main".to_string()),
             values: BTreeMap::from([
-                ("file_id".to_string(), Value::Text("lix".to_string())),
-                ("plugin_key".to_string(), Value::Text("lix".to_string())),
+                ("file_id".to_string(), Value::Null),
+                ("plugin_key".to_string(), Value::Null),
                 ("schema_version".to_string(), Value::Text("1".to_string())),
                 (
                     "snapshot_content".to_string(),
@@ -1354,8 +1357,8 @@ mod tests {
             entity_id: "pending-untracked".try_into().expect("valid entity id"),
             schema_key: "lix_key_value".try_into().expect("valid schema key"),
             schema_version: "1".try_into().expect("valid schema version"),
-            file_id: "lix".try_into().expect("valid file id"),
-            plugin_key: "lix".try_into().expect("valid plugin key"),
+            file_id: None,
+            plugin_key: None,
             snapshot_content: Some(
                 CanonicalJson::from_text("{\"key\":\"pending-untracked\",\"value\":\"after\"}")
                     .expect("valid canonical json"),

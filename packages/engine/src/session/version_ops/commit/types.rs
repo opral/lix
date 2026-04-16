@@ -75,24 +75,6 @@ pub(crate) fn tracked_live_rows_from_staged_changes(
                     ),
                 )
             })?;
-            let file_id = change.file_id.as_ref().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "tracked live row materialization requires file_id for '{}:{}'",
-                        change.schema_key, change.entity_id
-                    ),
-                )
-            })?;
-            let plugin_key = change.plugin_key.as_ref().ok_or_else(|| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!(
-                        "tracked live row materialization requires plugin_key for '{}:{}'",
-                        change.schema_key, change.entity_id
-                    ),
-                )
-            })?;
             let change_id = change.id.clone().ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -114,11 +96,11 @@ pub(crate) fn tracked_live_rows_from_staged_changes(
 
             Ok(LiveRow {
                 entity_id: change.entity_id.to_string(),
-                file_id: file_id.to_string(),
+                file_id: change.file_id.as_ref().map(ToString::to_string),
                 schema_key: change.schema_key.to_string(),
                 schema_version: schema_version.to_string(),
                 version_id: change.version_id.to_string(),
-                plugin_key: plugin_key.to_string(),
+                plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
                 metadata: change.metadata.clone(),
                 change_id: Some(change_id),
                 writer_key: change
@@ -142,11 +124,11 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
         .iter()
         .map(|update| LiveRow {
             entity_id: update.version_id.to_string(),
-            file_id: crate::version::version_ref_file_id().to_string(),
+            file_id: None,
             schema_key: crate::version::version_ref_schema_key().to_string(),
             schema_version: crate::version::version_ref_schema_version().to_string(),
             version_id: crate::version::version_ref_storage_version_id().to_string(),
-            plugin_key: crate::version::version_ref_plugin_key().to_string(),
+            plugin_key: None,
             metadata: None,
             change_id: Some(update.change_id.clone()),
             writer_key: None,
@@ -201,24 +183,8 @@ pub(crate) fn canonical_changes_from_updated_version_refs(
                             "builtin lix_version_ref schema version is invalid",
                         )
                     })?,
-                file_id: crate::version::version_ref_file_id()
-                    .to_string()
-                    .try_into()
-                    .map_err(|_| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            "builtin lix_version_ref file id is invalid",
-                        )
-                    })?,
-                plugin_key: crate::version::version_ref_plugin_key()
-                    .to_string()
-                    .try_into()
-                    .map_err(|_| {
-                        LixError::new(
-                            "LIX_ERROR_UNKNOWN",
-                            "builtin lix_version_ref plugin key is invalid",
-                        )
-                    })?,
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: Some(CanonicalJson::from_text(snapshot_content).map_err(
                     |error| {
                         LixError::new(

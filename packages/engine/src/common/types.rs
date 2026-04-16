@@ -1,3 +1,8 @@
+use std::ops::Deref;
+
+pub(crate) const ENGINE_STORAGE_SCOPE_KEY: &str = "engine";
+pub(crate) const STORAGE_SCOPE_KEY_COLUMN: &str = "storage_scope_key";
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Value {
     Null,
@@ -7,6 +12,77 @@ pub enum Value {
     Text(String),
     Json(serde_json::Value),
     Blob(Vec<u8>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NullableKeyFilter<T> {
+    Any,
+    Null,
+    Value(T),
+}
+
+impl<T> Default for NullableKeyFilter<T> {
+    fn default() -> Self {
+        Self::Any
+    }
+}
+
+impl<T> NullableKeyFilter<T> {
+    pub fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+
+    pub fn as_value(&self) -> Option<&T> {
+        match self {
+            Self::Value(value) => Some(value),
+            Self::Any | Self::Null => None,
+        }
+    }
+
+    pub fn as_ref(&self) -> NullableKeyFilter<&T> {
+        match self {
+            Self::Any => NullableKeyFilter::Any,
+            Self::Null => NullableKeyFilter::Null,
+            Self::Value(value) => NullableKeyFilter::Value(value),
+        }
+    }
+
+    pub fn from_nullable(value: Option<T>) -> Self {
+        match value {
+            Some(value) => Self::Value(value),
+            None => Self::Null,
+        }
+    }
+}
+
+impl<T> NullableKeyFilter<T>
+where
+    T: Deref,
+{
+    pub fn as_deref(&self) -> NullableKeyFilter<&T::Target> {
+        match self {
+            Self::Any => NullableKeyFilter::Any,
+            Self::Null => NullableKeyFilter::Null,
+            Self::Value(value) => NullableKeyFilter::Value(value.deref()),
+        }
+    }
+}
+
+impl<T: PartialEq> NullableKeyFilter<T> {
+    pub fn matches(&self, candidate: Option<&T>) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Null => candidate.is_none(),
+            Self::Value(expected) => candidate == Some(expected),
+        }
+    }
+}
+
+pub(crate) fn storage_scope_key_for_file_id(file_id: Option<&str>) -> String {
+    match file_id {
+        Some(file_id) => format!("file:{file_id}"),
+        None => ENGINE_STORAGE_SCOPE_KEY.to_string(),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

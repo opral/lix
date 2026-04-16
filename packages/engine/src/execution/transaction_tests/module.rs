@@ -10,8 +10,8 @@ use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
-    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
-    Value,
+    LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, SqlDialect,
+    TransactionBeginMode, Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
@@ -186,9 +186,10 @@ async fn init_workspace(backend: &dyn LixBackend) -> Result<(), LixError> {
              version_id TEXT NOT NULL, \
              schema_key TEXT NOT NULL, \
              entity_id TEXT NOT NULL, \
-             file_id TEXT NOT NULL, \
+             file_id TEXT, \
+             storage_scope_key TEXT NOT NULL, \
              writer_key TEXT NOT NULL, \
-             PRIMARY KEY (version_id, schema_key, entity_id, file_id)\
+             PRIMARY KEY (version_id, schema_key, entity_id, storage_scope_key)\
              )",
             WRITER_KEY_TABLE
         ),
@@ -202,11 +203,11 @@ fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
         schema_version: "1".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: "main".to_string(),
         global: false,
         untracked: false,
-        plugin_key: "lix".to_string(),
+        plugin_key: None,
         metadata: Some("{\"kind\":\"txn-module\"}".to_string()),
         change_id: change_id.to_string(),
         writer_key: Some("writer-a".to_string()),
@@ -228,11 +229,11 @@ fn local_version_head_untracked_write_row(
         entity_id: version_id.to_string(),
         schema_key: "lix_version_ref".to_string(),
         schema_version: "1".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: GLOBAL_VERSION_ID.to_string(),
         global: true,
         untracked: true,
-        plugin_key: "lix".to_string(),
+        plugin_key: None,
         metadata: None,
         change_id: format!("change-version-ref::{version_id}::{commit_id}::{timestamp}"),
         writer_key: None,
@@ -287,7 +288,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -305,7 +306,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
             schema_key: "lix_version_ref".to_string(),
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -421,7 +422,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -434,7 +435,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
             schema_key: "lix_version_ref".to_string(),
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await

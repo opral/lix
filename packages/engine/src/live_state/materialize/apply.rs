@@ -4,6 +4,7 @@ use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
 use crate::backend::TransactionBeginMode;
+use crate::common::storage_scope_key_for_file_id;
 use crate::live_state::lifecycle::build_set_live_state_mode_sql;
 use crate::live_state::storage::{
     load_live_table_layout_in_transaction, normalized_insert_columns_sql,
@@ -86,6 +87,29 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
         };
         let global_sql = if write.global { "true" } else { "false" };
         let untracked_sql = if write.untracked { "true" } else { "false" };
+        let storage_scope_key = crate::live_state::constraints::escape_sql_string(
+            &storage_scope_key_for_file_id(write.file_id.as_deref()),
+        );
+        let file_id_sql = write
+            .file_id
+            .as_ref()
+            .map(|value| {
+                format!(
+                    "'{}'",
+                    crate::live_state::constraints::escape_sql_string(value.as_str())
+                )
+            })
+            .unwrap_or_else(|| "NULL".to_string());
+        let plugin_key_sql = write
+            .plugin_key
+            .as_ref()
+            .map(|value| {
+                format!(
+                    "'{}'",
+                    crate::live_state::constraints::escape_sql_string(value.as_str())
+                )
+            })
+            .unwrap_or_else(|| "NULL".to_string());
         let metadata_sql = write
             .metadata
             .as_ref()
@@ -104,12 +128,13 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
 
         let sql = format!(
             "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, is_tombstone, untracked, created_at, updated_at{normalized_columns}\
+             entity_id, schema_key, schema_version, file_id, storage_scope_key, version_id, global, plugin_key, change_id, metadata, is_tombstone, untracked, created_at, updated_at{normalized_columns}\
              ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', '{change_id}', {metadata}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'{normalized_values}\
-             ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
+             '{entity_id}', '{schema_key}', '{schema_version}', {file_id}, '{storage_scope_key}', '{version_id}', {global}, {plugin_key}, '{change_id}', {metadata}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'{normalized_values}\
+             ) ON CONFLICT (entity_id, storage_scope_key, version_id, untracked) DO UPDATE SET \
              schema_key = excluded.schema_key, \
              schema_version = excluded.schema_version, \
+             file_id = excluded.file_id, \
              global = excluded.global, \
              plugin_key = excluded.plugin_key, \
              change_id = excluded.change_id, \
@@ -122,10 +147,11 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
             schema_key = crate::live_state::constraints::escape_sql_string(&write.schema_key),
             schema_version =
                 crate::live_state::constraints::escape_sql_string(&write.schema_version),
-            file_id = crate::live_state::constraints::escape_sql_string(&write.file_id),
+            file_id = file_id_sql,
+            storage_scope_key = storage_scope_key,
             version_id = crate::live_state::constraints::escape_sql_string(&write.version_id),
             global = global_sql,
-            plugin_key = crate::live_state::constraints::escape_sql_string(&write.plugin_key),
+            plugin_key = plugin_key_sql,
             change_id = crate::live_state::constraints::escape_sql_string(&write.change_id),
             metadata = metadata_sql,
             is_tombstone = is_tombstone,
