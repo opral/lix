@@ -11,6 +11,7 @@
       "properties": {
         "x-lix-unique": {
           "type": "array",
+          "description": "Array of composite unique constraints. Each inner array is a JSON Pointer (RFC 6901) per participating property, e.g. `[[\"/email\"], [\"/tenant_id\", \"/handle\"]]`.",
           "items": {
             "type": "array",
             "minItems": 1,
@@ -18,7 +19,7 @@
             "items": {
               "type": "string",
               "format": "json-pointer",
-              "description": "JSON Pointer referencing a property"
+              "description": "JSON Pointer (RFC 6901) to the property, e.g. `/id` or `/nested/field`. Note the leading slash."
             }
           }
         },
@@ -31,10 +32,11 @@
           "type": "array",
           "minItems": 1,
           "uniqueItems": true,
+          "description": "Primary-key fields as JSON Pointers (RFC 6901) into the entity, e.g. `[\"/id\"]` for a single-column key or `[\"/tenant_id\", \"/handle\"]` for a composite key. Note the leading slash; `\"id\"` without a slash is not a valid pointer.",
           "items": {
             "type": "string",
             "format": "json-pointer",
-            "description": "JSON Pointer referencing a property that participates in the primary key."
+            "description": "JSON Pointer (RFC 6901) to a property that participates in the primary key, e.g. `/id` or `/nested/field`."
           }
         },
         "x-lix-foreign-keys": {
@@ -53,10 +55,10 @@
                 "items": {
                   "type": "string",
                   "format": "json-pointer",
-                  "description": "JSON Pointer referencing the local field."
+                  "description": "JSON Pointer (RFC 6901) to the local field, e.g. `/author_id` or `/nested/field`."
                 },
                 "uniqueItems": true,
-                "description": "Local JSON-schema property names that participate in the FK"
+                "description": "Local-side participants in the FK, as JSON Pointers (RFC 6901), e.g. `[\"/author_id\"]` or `[\"/tenant_id\", \"/account_id\"]`."
               },
               "references": {
                 "type": "object",
@@ -76,10 +78,10 @@
                     "items": {
                       "type": "string",
                       "format": "json-pointer",
-                      "description": "JSON Pointer referencing the remote field."
+                      "description": "JSON Pointer (RFC 6901) to the remote field on the referenced schema, e.g. `/id`."
                     },
                     "uniqueItems": true,
-                    "description": "Remote property names (same length as local properties)"
+                    "description": "Remote-side participants on the referenced schema, as JSON Pointers (RFC 6901). Must be the same length as the local `properties`."
                   }
                 }
               }

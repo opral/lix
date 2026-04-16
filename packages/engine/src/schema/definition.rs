@@ -23,6 +23,10 @@ pub fn lix_schema_definition_json() -> &'static str {
 }
 
 pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError> {
+    if let Some(err) = detect_missing_pointer_slash(schema) {
+        return Err(err);
+    }
+
     let validator = lix_schema_validator()?;
     if let Err(errors) = validator.validate(schema) {
         let details = format_validation_errors(errors);
@@ -39,6 +43,91 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_known_x_lix_top_level_fields(schema)?;
 
     Ok(())
+}
+
+/// Detect the common no-leading-slash mistake in JSON-Pointer-valued fields
+/// (`x-lix-primary-key`, `x-lix-unique`, `x-lix-foreign-keys[].properties`,
+/// `x-lix-foreign-keys[].references.properties`) and return a targeted
+/// error + hint suggesting the fix.
+///
+/// Surfacing this before the meta-schema validator runs replaces the
+/// generic `format "json-pointer"` failure with a message that tells the
+/// user exactly what to change (e.g. `"id"` → `"/id"`).
+fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
+    let mut offenders: Vec<(String, String)> = Vec::new();
+
+    fn collect(items: Option<&Vec<JsonValue>>, label: &str, out: &mut Vec<(String, String)>) {
+        let Some(items) = items else {
+            return;
+        };
+        for item in items {
+            if let Some(s) = item.as_str() {
+                if !s.is_empty() && !s.starts_with('/') {
+                    out.push((label.to_string(), s.to_string()));
+                }
+            }
+        }
+    }
+
+    collect(
+        schema
+            .get("x-lix-primary-key")
+            .and_then(JsonValue::as_array),
+        "x-lix-primary-key",
+        &mut offenders,
+    );
+
+    if let Some(groups) = schema.get("x-lix-unique").and_then(JsonValue::as_array) {
+        for group in groups {
+            collect(group.as_array(), "x-lix-unique", &mut offenders);
+        }
+    }
+
+    if let Some(fks) = schema
+        .get("x-lix-foreign-keys")
+        .and_then(JsonValue::as_array)
+    {
+        for fk in fks {
+            collect(
+                fk.get("properties").and_then(JsonValue::as_array),
+                "x-lix-foreign-keys[].properties",
+                &mut offenders,
+            );
+            collect(
+                fk.get("references")
+                    .and_then(|r| r.get("properties"))
+                    .and_then(JsonValue::as_array),
+                "x-lix-foreign-keys[].references.properties",
+                &mut offenders,
+            );
+        }
+    }
+
+    if offenders.is_empty() {
+        return None;
+    }
+
+    let examples = offenders
+        .iter()
+        .take(3)
+        .map(|(field, value)| format!("{field}: \"{value}\" → \"/{value}\""))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let description = format!(
+        "Invalid Lix schema definition: JSON Pointer values must begin with '/'. Offending entries: {examples}"
+    );
+    let hint = format!(
+        "prefix property names with '/' — e.g. `\"x-lix-primary-key\": [\"/{}\"]` (JSON Pointer, RFC 6901)",
+        offenders[0].1
+    );
+    Some(
+        LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description,
+            hint: None,
+        }
+        .with_hint(hint),
+    )
 }
 
 pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), LixError> {
@@ -305,5 +394,136 @@ fn format_validation_errors<'a>(
         "Unknown validation error".to_string()
     } else {
         parts.join("; ")
+    }
+}
+
+#[cfg(test)]
+mod pointer_slash_detection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn minimal_schema_with(extras: serde_json::Value) -> JsonValue {
+        let mut obj = json!({
+            "type": "object",
+            "x-lix-key": "book",
+            "x-lix-version": "1",
+            "properties": {
+                "id": { "type": "string" },
+                "author_id": { "type": "string" },
+                "tenant_id": { "type": "string" },
+                "handle": { "type": "string" },
+            },
+            "required": ["id"],
+            "additionalProperties": false,
+        });
+        let extras_obj = extras.as_object().expect("extras must be object").clone();
+        for (k, v) in extras_obj {
+            obj.as_object_mut().unwrap().insert(k, v);
+        }
+        obj
+    }
+
+    fn err_for(schema: &JsonValue) -> LixError {
+        validate_lix_schema_definition(schema).expect_err("should reject")
+    }
+
+    #[test]
+    fn primary_key_without_slash_emits_targeted_hint() {
+        let schema = minimal_schema_with(json!({ "x-lix-primary-key": ["id"] }));
+        let err = err_for(&schema);
+        assert!(
+            err.description.contains("must begin with '/'"),
+            "unexpected description: {}",
+            err.description
+        );
+        assert!(
+            err.description
+                .contains("x-lix-primary-key: \"id\" → \"/id\""),
+            "description should show the fix: {}",
+            err.description
+        );
+        let hint = err.hint.as_deref().expect("should carry a hint");
+        assert!(
+            hint.contains("/id"),
+            "hint should show fixed pointer: {hint}"
+        );
+        assert!(
+            hint.contains("RFC 6901"),
+            "hint should cite the RFC: {hint}"
+        );
+    }
+
+    #[test]
+    fn unique_without_slash_emits_targeted_hint() {
+        let schema = minimal_schema_with(json!({
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["handle"]],
+        }));
+        let err = err_for(&schema);
+        assert!(
+            err.description
+                .contains("x-lix-unique: \"handle\" → \"/handle\""),
+            "should flag x-lix-unique entry: {}",
+            err.description
+        );
+        assert!(err.hint.is_some());
+    }
+
+    #[test]
+    fn foreign_key_local_without_slash_emits_targeted_hint() {
+        let schema = minimal_schema_with(json!({
+            "x-lix-primary-key": ["/id"],
+            "x-lix-foreign-keys": [{
+                "properties": ["author_id"],
+                "references": {
+                    "schemaKey": "author",
+                    "properties": ["/id"],
+                }
+            }]
+        }));
+        let err = err_for(&schema);
+        assert!(
+            err.description
+                .contains("x-lix-foreign-keys[].properties: \"author_id\" → \"/author_id\""),
+            "should flag FK local entry: {}",
+            err.description
+        );
+    }
+
+    #[test]
+    fn foreign_key_remote_without_slash_emits_targeted_hint() {
+        let schema = minimal_schema_with(json!({
+            "x-lix-primary-key": ["/id"],
+            "x-lix-foreign-keys": [{
+                "properties": ["/author_id"],
+                "references": {
+                    "schemaKey": "author",
+                    "properties": ["id"],
+                }
+            }]
+        }));
+        let err = err_for(&schema);
+        assert!(
+            err.description
+                .contains("x-lix-foreign-keys[].references.properties: \"id\" → \"/id\""),
+            "should flag FK remote entry: {}",
+            err.description
+        );
+    }
+
+    #[test]
+    fn valid_pointers_pass_pre_check() {
+        let schema = minimal_schema_with(json!({
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/handle"], ["/tenant_id", "/handle"]],
+            "x-lix-foreign-keys": [{
+                "properties": ["/author_id"],
+                "references": {
+                    "schemaKey": "author",
+                    "properties": ["/id"],
+                }
+            }]
+        }));
+        assert!(detect_missing_pointer_slash(&schema).is_none());
     }
 }
