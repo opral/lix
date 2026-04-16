@@ -54,7 +54,7 @@ pub fn open_lix_at(path: &Path) -> Result<Lix, CliError> {
 
     pollster::block_on(Lix::open(config)).map_err(|err| {
         CliError::msg(format!(
-            "failed to open lix database at {}: {}",
+            "failed to open lix at {}: {}",
             path.display(),
             err
         ))
@@ -82,7 +82,7 @@ pub fn init_lix_at(path: &Path) -> Result<bool, CliError> {
     let init_config = LixConfig::new(Box::new(init_backend), default_wasm_runtime()?);
     let result = pollster::block_on(Lix::init(init_config)).map_err(|err| {
         CliError::msg(format!(
-            "failed to initialize lix database at {}: {}",
+            "failed to initialize lix at {}: {}",
             path.display(),
             err
         ))
