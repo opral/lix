@@ -14,6 +14,11 @@ use crate::canonical::UpdatedVersionRef;
 const COMMIT_SCHEMA_KEY: &str = "lix_commit";
 const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
 
+pub(super) fn canonical_change_is_commit_member(change: &CanonicalChangeWrite) -> bool {
+    change.schema_key.as_str() != COMMIT_SCHEMA_KEY
+        && change.schema_key.as_str() != CHANGE_SET_SCHEMA_KEY
+}
+
 #[derive(Debug, Clone)]
 struct BuiltinSchemaMeta {
     schema_version: String,
@@ -74,6 +79,18 @@ where
         .iter()
         .map(|change| sanitize_staged_change(change))
         .collect();
+    if let Some(non_member_change) = output_changes
+        .iter()
+        .find(|change| !canonical_change_is_commit_member(change))
+    {
+        return Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "generate_commit: staged change '{}' is not a valid tracked commit member",
+                non_member_change.id
+            ),
+        });
+    }
     let mut updated_version_refs: Vec<UpdatedVersionRef> = Vec::new();
 
     let mut changes_by_version: BTreeMap<String, Vec<&StagedChange>> = BTreeMap::new();
@@ -134,7 +151,6 @@ where
                 "id": meta.change_set_id,
             }))?),
             metadata: None,
-            untracked: false,
             created_at: args.timestamp.clone(),
         });
 
@@ -162,7 +178,6 @@ where
                 "change_set_id": meta.change_set_id,
             }))?),
             metadata: None,
-            untracked: false,
             created_at: args.timestamp.clone(),
         });
     }
@@ -208,15 +223,10 @@ where
                 ),
             })?;
 
-        let member_change_ids: Vec<String> = changes_by_version
-            .get(version_id)
-            .into_iter()
-            .flat_map(|changes| {
-                changes
-                    .iter()
-                    .map(|change| require_staged_change_id(change).map(ToString::to_string))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        // All semantic change facts are journaled, but commit membership is
+        // narrower: only tracked staged business rows belong in `change_ids`.
+        let member_change_ids =
+            tracked_commit_member_change_ids_for_version(&changes_by_version, version_id)?;
         snapshot["change_ids"] = serde_json::Value::Array(
             member_change_ids
                 .iter()
@@ -274,6 +284,21 @@ where
     })
 }
 
+fn tracked_commit_member_change_ids_for_version(
+    changes_by_version: &BTreeMap<String, Vec<&StagedChange>>,
+    version_id: &str,
+) -> Result<Vec<String>, LixError> {
+    changes_by_version
+        .get(version_id)
+        .into_iter()
+        .flat_map(|changes| {
+            changes
+                .iter()
+                .map(|change| require_staged_change_id(change).map(ToString::to_string))
+        })
+        .collect::<Result<Vec<_>, _>>()
+}
+
 fn sanitize_staged_change(change: &StagedChange) -> CanonicalChangeWrite {
     CanonicalChangeWrite {
         id: require_staged_change_id(change).unwrap().to_string(),
@@ -294,7 +319,6 @@ fn sanitize_staged_change(change: &StagedChange) -> CanonicalChangeWrite {
             .map(CanonicalJson::from_text)
             .transpose()
             .unwrap(),
-        untracked: false,
         created_at: require_staged_change_created_at(change)
             .unwrap()
             .to_string(),

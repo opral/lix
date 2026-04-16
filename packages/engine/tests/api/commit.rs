@@ -2,7 +2,10 @@ use crate::support;
 
 use std::collections::BTreeSet;
 
-use lix_engine::{ExecuteOptions, Value};
+use lix_engine::{
+    ExecuteOptions, LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+    Value,
+};
 use serde_json::Value as JsonValue;
 use support::simulation_test::SimulatedLix;
 
@@ -16,7 +19,7 @@ use support::simulation_test::SimulatedLix;
 //    - no edge change rows and exactly one derived commit_edge row are asserted
 // 2) "commit with no changes should not create a change set"
 //    - adapted to current Rust flow: untracked-only writes create no tracked commit artifacts,
-//      but they do create untracked canonical change facts
+//      but they do create canonical change facts with derived untracked visibility
 // 3) "groups changes of a transaction into the same change set for the given version"
 //    - both single-statement and explicit BEGIN/COMMIT transaction variants are asserted
 //
@@ -847,21 +850,26 @@ simulation_test!(
 
         let version_id = engine.active_version_id().await.unwrap();
         let before = read_version_ref_commit_id(&engine, &version_id).await;
-        let before_version_ref_change_count = as_i64(
-            &engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_change \
-                     WHERE schema_key = 'lix_version_ref' \
-                       AND entity_id = $1 \
-                       AND untracked = true",
-                    &[Value::Text(version_id.clone())],
-                )
-                .await
-                .unwrap()
-                .statements[0]
-                .rows[0][0],
-        );
+        let before_version_ref_change = engine
+            .execute(
+                "SELECT change_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before_version_ref_change.statements[0].rows.len(), 1);
+        let before_version_ref_change_id = match &before_version_ref_change.statements[0].rows[0][0]
+        {
+            Value::Text(value) => {
+                assert!(!value.is_empty());
+                value.clone()
+            }
+            other => panic!("expected text version_ref change_id before update, got {other:?}"),
+        };
 
         engine
             .execute(
@@ -887,29 +895,215 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(version_ref_change.statements[0].rows.len(), 1);
-        match &version_ref_change.statements[0].rows[0][0] {
-            Value::Text(value) => assert!(!value.is_empty()),
+        let version_ref_change_id = match &version_ref_change.statements[0].rows[0][0] {
+            Value::Text(value) => {
+                assert!(!value.is_empty());
+                value.clone()
+            }
             other => panic!("expected text version_ref change_id, got {other:?}"),
-        }
+        };
 
-        let after_version_ref_change_count = as_i64(
+        let version_ref_scope_count = as_i64(
             &engine
                 .execute(
                     "SELECT COUNT(*) \
-                     FROM lix_change \
-                     WHERE schema_key = 'lix_version_ref' \
-                       AND entity_id = $1 \
-                       AND untracked = true",
-                    &[Value::Text(version_id)],
+                     FROM lix_internal_untracked_change_visibility \
+                     WHERE change_id = $1 \
+                       AND visibility_kind = 'global'",
+                    &[Value::Text(version_ref_change_id.clone())],
                 )
                 .await
                 .unwrap()
                 .statements[0]
                 .rows[0][0],
         );
+        assert_eq!(version_ref_scope_count, 1);
+
+        let commit_snapshot = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_commit' \
+                   AND entity_id = $1",
+                &[Value::Text(after.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(commit_snapshot.statements[0].rows.len(), 1);
+        let commit_snapshot = parse_json(&commit_snapshot.statements[0].rows[0][0]);
+        let commit_change_ids = commit_snapshot["change_ids"]
+            .as_array()
+            .expect("commit snapshot should include change_ids")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            !commit_change_ids.contains(version_ref_change_id.as_str()),
+            "untracked version-ref journal rows must not become commit members: {:?}",
+            commit_change_ids
+        );
+
+        assert!(
+            version_ref_change_id != before_version_ref_change_id,
+            "content commit should rotate the visible journaled version_ref row"
+        );
+    }
+);
+
+simulation_test!(
+    per_version_untracked_state_rebuilds_from_canonical_visibility_after_compaction,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+        register_test_schema(&engine).await;
+
+        engine.create_named_version("version-a").await.unwrap();
+        engine
+            .switch_version("version-a".to_string())
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
+                 ) VALUES (\
+                 'entity-untracked-rebuild', 'file-1', 'test_schema', NULL, '1', '{\"key\":\"value-v1\"}', true\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = '{\"key\":\"value-v2\"}' \
+                 WHERE entity_id = 'entity-untracked-rebuild' \
+                   AND schema_key = 'test_schema' \
+                   AND file_id = 'file-1' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let visible_before = engine
+            .execute(
+                "SELECT change_id, snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-untracked-rebuild' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-a' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible_before.statements[0].rows.len(), 1);
+        let change_id_before = as_text(&visible_before.statements[0].rows[0][0]);
         assert_eq!(
-            after_version_ref_change_count,
-            before_version_ref_change_count + 1
+            visible_before.statements[0].rows[0][1],
+            Value::Text("{\"key\":\"value-v2\"}".to_string())
+        );
+
+        let visibility_count = as_i64(
+            &engine
+                .execute(
+                    "SELECT COUNT(*) \
+                     FROM lix_internal_untracked_change_visibility \
+                     WHERE change_id = $1 \
+                       AND version_id = 'version-a' \
+                       AND visibility_kind = 'version'",
+                    &[Value::Text(change_id_before.clone())],
+                )
+                .await
+                .unwrap()
+                .statements[0]
+                .rows[0][0],
+        );
+        assert_eq!(visibility_count, 1);
+
+        let compacted = engine
+            .compact_untracked_change_journal()
+            .await
+            .expect("compaction should succeed");
+        assert!(
+            compacted <= 1,
+            "expected at most one stale untracked visibility row to be removed, got {compacted}"
+        );
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_live_v1_test_schema \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-untracked-rebuild' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-a' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let missing_before_rebuild = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-untracked-rebuild' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-a' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(as_i64(&missing_before_rebuild.statements[0].rows[0][0]), 0);
+
+        let report = engine
+            .rebuild_live_state(&LiveStateRebuildRequest {
+                scope: LiveStateRebuildScope::Full,
+                debug: LiveStateRebuildDebugMode::Summary,
+                debug_row_limit: 128,
+            })
+            .await
+            .unwrap();
+        assert!(
+            report.plan.writes.iter().any(|write| {
+                write.schema_key.to_string() == "test_schema"
+                    && write.entity_id.to_string() == "entity-untracked-rebuild"
+                    && write.version_id.to_string() == "version-a"
+                    && write.untracked
+            }),
+            "expected rebuild plan to restore the per-version untracked row"
+        );
+
+        let visible_after = engine
+            .execute(
+                "SELECT change_id, snapshot_content \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'test_schema' \
+                   AND entity_id = 'entity-untracked-rebuild' \
+                   AND file_id = 'file-1' \
+                   AND version_id = 'version-a' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(visible_after.statements[0].rows.len(), 1);
+        assert_eq!(
+            visible_after.statements[0].rows[0][0],
+            Value::Text(change_id_before)
+        );
+        assert_eq!(
+            visible_after.statements[0].rows[0][1],
+            Value::Text("{\"key\":\"value-v2\"}".to_string())
         );
     }
 );

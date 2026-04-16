@@ -36,6 +36,9 @@ pub(crate) struct DependencySpec {
     pub(crate) version_ids: BTreeSet<String>,
     pub(crate) query_dependencies: BTreeSet<QueryDependency>,
     pub(crate) writer_filter: DependencyWriterFilter,
+    /// Whether dependency matching should consider untracked rows in the single
+    /// public change stream. This is a filter over one stream, not a selector
+    /// for a separate invalidation mechanism.
     pub(crate) include_untracked: bool,
     pub(crate) depends_on_active_version: bool,
     pub(crate) precision: DependencyPrecision,

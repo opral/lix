@@ -65,7 +65,9 @@ pub use runtime::ExecuteOptions;
 pub(crate) use runtime::SessionExecutionMode;
 pub(crate) use state::SessionStateSnapshot;
 pub(crate) use version_ops::commit::{
-    canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
+    canonical_changes_from_updated_version_refs,
+    canonical_untracked_visibility_rows_from_updated_version_refs,
+    untracked_live_rows_from_updated_version_refs,
 };
 pub(crate) use workspace::DEFAULT_ACTIVE_VERSION_NAME;
 
@@ -106,12 +108,12 @@ pub(crate) async fn persist_runtime_sequence_in_transaction(
     write_execution_context::persist_runtime_sequence(transaction, functions).await
 }
 
-pub(crate) async fn execute_public_tracked_append_txn_with_transaction(
+pub(crate) async fn execute_public_commit_write_txn_with_transaction(
     transaction: &mut dyn crate::LixBackendTransaction,
-    unit: &crate::transaction::TrackedTxnUnit,
+    unit: &crate::transaction::PublicWriteTxnUnit,
     pending_commit_state: Option<&mut Option<PendingCommitState>>,
-) -> Result<crate::transaction::TrackedCommitExecutionOutcome, LixError> {
-    write_execution_context::execute_public_tracked_append(transaction, unit, pending_commit_state)
+) -> Result<crate::transaction::PublicCommitExecutionOutcome, LixError> {
+    write_execution_context::execute_public_commit_write(transaction, unit, pending_commit_state)
         .await
 }
 

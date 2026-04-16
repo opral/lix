@@ -4,7 +4,10 @@ use crate::sql::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec, parse_sql_statements,
     QueryDependency,
 };
-use crate::streams::StateCommitStream;
+use crate::streams::{
+    latest_durable_state_commit_cursor, load_durable_state_commit_catch_up,
+    DurableStateCommitCursor, StateCommitStream, StateCommitStreamFilter,
+};
 use crate::{LixError, QueryResult, Value};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
@@ -92,9 +95,11 @@ struct SharedObserveSubscriberCursor {
 pub(crate) struct SharedObserveSource {
     query: ObserveQuery,
     state_commits: StateCommitStream,
+    state_commit_filter: StateCommitStreamFilter,
     writer_key_filter: ObserveWriterKeyFilter,
     query_dependencies: BTreeSet<QueryDependency>,
     last_seen_tick_seq: Option<i64>,
+    last_seen_state_commit_cursor: Option<DurableStateCommitCursor>,
     last_seen_query_dependency_generations: BTreeMap<QueryDependency, u64>,
     last_result: Option<QueryResult>,
     latest_event: Option<SharedObserveEvent>,
@@ -124,6 +129,8 @@ enum PollWork {
     External {
         query: ObserveQuery,
         last_seen_tick_seq: Option<i64>,
+        last_seen_state_commit_cursor: Option<DurableStateCommitCursor>,
+        state_commit_filter: StateCommitStreamFilter,
         writer_key_filter: ObserveWriterKeyFilter,
         query_dependency_generations: BTreeMap<QueryDependency, u64>,
     },
@@ -132,6 +139,7 @@ enum PollWork {
 struct PollOutcome {
     maybe_rows: Option<(QueryResult, Option<u64>)>,
     update_last_seen_tick_seq: Option<Option<i64>>,
+    update_last_seen_state_commit_cursor: Option<Option<DurableStateCommitCursor>>,
     update_last_seen_query_dependency_generations: Option<BTreeMap<QueryDependency, u64>>,
     mark_initialized: bool,
 }
@@ -140,15 +148,18 @@ impl SharedObserveSource {
     fn new(
         query: ObserveQuery,
         state_commits: StateCommitStream,
+        state_commit_filter: StateCommitStreamFilter,
         writer_key_filter: ObserveWriterKeyFilter,
         query_dependencies: BTreeSet<QueryDependency>,
     ) -> Self {
         Self {
             query,
             state_commits,
+            state_commit_filter,
             writer_key_filter,
             query_dependencies,
             last_seen_tick_seq: None,
+            last_seen_state_commit_cursor: None,
             last_seen_query_dependency_generations: BTreeMap::new(),
             last_result: None,
             latest_event: None,
@@ -413,6 +424,8 @@ impl ObserveState {
                 PollWork::External {
                     query: source.query.clone(),
                     last_seen_tick_seq: source.last_seen_tick_seq,
+                    last_seen_state_commit_cursor: source.last_seen_state_commit_cursor.clone(),
+                    state_commit_filter: source.state_commit_filter.clone(),
                     writer_key_filter: source.writer_key_filter.clone(),
                     query_dependency_generations,
                 }
@@ -426,10 +439,14 @@ impl ObserveState {
             } => {
                 let latest_tick_seq =
                     latest_observe_tick_seq(session.session_host().backend().as_ref()).await?;
+                let latest_state_commit_cursor =
+                    latest_durable_state_commit_cursor(session.session_host().backend().as_ref())
+                        .await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: Some(latest_tick_seq),
+                    update_last_seen_state_commit_cursor: Some(latest_state_commit_cursor),
                     update_last_seen_query_dependency_generations: Some(
                         query_dependency_generations,
                     ),
@@ -444,6 +461,7 @@ impl ObserveState {
                 PollOutcome {
                     maybe_rows: Some((rows, None)),
                     update_last_seen_tick_seq: None,
+                    update_last_seen_state_commit_cursor: None,
                     update_last_seen_query_dependency_generations: Some(
                         query_dependency_generations,
                     ),
@@ -455,10 +473,14 @@ impl ObserveState {
                 state_commit_sequence,
                 query_dependency_generations,
             } => {
+                let latest_state_commit_cursor =
+                    latest_durable_state_commit_cursor(session.session_host().backend().as_ref())
+                        .await?;
                 let rows = execute_observe_query(session, &query).await?;
                 PollOutcome {
                     maybe_rows: Some((rows, Some(state_commit_sequence))),
                     update_last_seen_tick_seq: None,
+                    update_last_seen_state_commit_cursor: Some(latest_state_commit_cursor),
                     update_last_seen_query_dependency_generations: Some(
                         query_dependency_generations,
                     ),
@@ -468,38 +490,60 @@ impl ObserveState {
             PollWork::External {
                 query,
                 last_seen_tick_seq,
+                last_seen_state_commit_cursor,
+                state_commit_filter,
                 writer_key_filter,
                 query_dependency_generations,
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
-                let observed_ticks = observe_ticks_since(
+                let catch_up = load_durable_state_commit_catch_up(
                     session.session_host().backend().as_ref(),
-                    last_seen_tick_seq,
+                    last_seen_state_commit_cursor.as_ref(),
+                    &state_commit_filter,
                 )
                 .await?;
-                if observed_ticks.is_empty() {
+                if !catch_up.has_matching_changes {
                     PollOutcome {
                         maybe_rows: None,
                         update_last_seen_tick_seq: None,
+                        update_last_seen_state_commit_cursor: Some(catch_up.latest_cursor),
                         update_last_seen_query_dependency_generations: Some(
                             query_dependency_generations,
                         ),
                         mark_initialized: true,
                     }
                 } else {
-                    let mut next_last_seen_tick_seq = last_seen_tick_seq;
-                    let mut should_reexecute = false;
-                    for tick in observed_ticks {
-                        next_last_seen_tick_seq = Some(tick.tick_seq);
-                        if writer_key_filter.matches_external_tick(tick.writer_key.as_deref()) {
-                            should_reexecute = true;
-                        }
-                    }
+                    let (next_last_seen_tick_seq, should_reexecute) =
+                        if writer_key_filter.has_constraints() {
+                            let observed_ticks = observe_ticks_since(
+                                session.session_host().backend().as_ref(),
+                                last_seen_tick_seq,
+                            )
+                            .await?;
+                            if observed_ticks.is_empty() {
+                                (last_seen_tick_seq, true)
+                            } else {
+                                let mut next_last_seen_tick_seq = last_seen_tick_seq;
+                                let mut should_reexecute = false;
+                                for tick in observed_ticks {
+                                    next_last_seen_tick_seq = Some(tick.tick_seq);
+                                    if writer_key_filter
+                                        .matches_external_tick(tick.writer_key.as_deref())
+                                    {
+                                        should_reexecute = true;
+                                    }
+                                }
+                                (next_last_seen_tick_seq, should_reexecute)
+                            }
+                        } else {
+                            (last_seen_tick_seq, true)
+                        };
 
                     if !should_reexecute {
                         PollOutcome {
                             maybe_rows: None,
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
+                            update_last_seen_state_commit_cursor: Some(catch_up.latest_cursor),
                             update_last_seen_query_dependency_generations: Some(
                                 query_dependency_generations,
                             ),
@@ -510,6 +554,7 @@ impl ObserveState {
                         PollOutcome {
                             maybe_rows: Some((rows, None)),
                             update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
+                            update_last_seen_state_commit_cursor: Some(catch_up.latest_cursor),
                             update_last_seen_query_dependency_generations: Some(
                                 query_dependency_generations,
                             ),
@@ -534,6 +579,9 @@ impl ObserveState {
         }
         if let Some(last_seen_tick_seq) = outcome.update_last_seen_tick_seq {
             source.last_seen_tick_seq = last_seen_tick_seq;
+        }
+        if let Some(last_seen_state_commit_cursor) = outcome.update_last_seen_state_commit_cursor {
+            source.last_seen_state_commit_cursor = last_seen_state_commit_cursor;
         }
         if let Some(last_seen_query_dependency_generations) =
             outcome.update_last_seen_query_dependency_generations
@@ -604,6 +652,10 @@ impl Drop for PollingGuard {
 }
 
 impl ObserveWriterKeyFilter {
+    fn has_constraints(&self) -> bool {
+        !self.include.is_empty() || !self.exclude.is_empty()
+    }
+
     fn matches_external_tick(&self, writer_key: Option<&str>) -> bool {
         if !self.include.is_empty() {
             let Some(writer_key) = writer_key else {
@@ -767,11 +819,12 @@ fn build_shared_observe_source(
         include: filter.writer_keys.iter().cloned().collect(),
         exclude: filter.exclude_writer_keys.iter().cloned().collect(),
     };
-    let state_commits = session.session_host().state_commit_stream(filter);
+    let state_commits = session.session_host().state_commit_stream(filter.clone());
 
     Ok(SharedObserveSource::new(
         query,
         state_commits,
+        filter,
         writer_key_filter,
         dependency_spec.query_dependencies,
     ))
@@ -1008,6 +1061,12 @@ mod tests {
                     columns: vec!["marker".to_string()],
                 });
             }
+            if sql.contains("FROM lix_internal_change") {
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: vec!["id".to_string(), "created_at".to_string()],
+                });
+            }
             if sql.contains("FROM lix_internal_observe_tick") {
                 return Ok(QueryResult {
                     rows: Vec::new(),
@@ -1054,6 +1113,12 @@ mod tests {
                 return Ok(QueryResult {
                     rows: vec![vec![Value::Text("observe-shared-sentinel".to_string())]],
                     columns: vec!["marker".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_change") {
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
             if sql.contains("FROM lix_internal_observe_tick") {

@@ -46,8 +46,8 @@ pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
-    LiveStateWriteOp, ReplayCursor, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionHeadDebugRow,
+    LiveStateWriteOp, ReplayCursor, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
+    VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
 pub use session::checkpoint_ops::CreateCheckpointResult;
 pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};

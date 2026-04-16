@@ -16,9 +16,20 @@ pub(crate) struct ChangeRecord {
     pub plugin_key: Option<String>,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
-    pub untracked: bool,
     pub created_at: String,
     pub replay_cursor: ReplayCursor,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct UntrackedVisibilityRecord {
+    pub id: String,
+    #[allow(dead_code)]
+    pub append_seq: i64,
+    pub change_id: String,
+    pub version_id: String,
+    pub entity_id: String,
+    pub schema_key: String,
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +56,7 @@ pub(crate) struct VersionDescriptorRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct LoadedData {
     pub changes: BTreeMap<String, ChangeRecord>,
+    pub untracked_visibility_rows: Vec<UntrackedVisibilityRecord>,
     pub commits: BTreeMap<String, CommitRecord>,
     pub version_descriptors: BTreeMap<String, VersionDescriptorRecord>,
 }
@@ -52,7 +64,7 @@ pub(crate) struct LoadedData {
 pub(crate) async fn load_data_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<LoadedData, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.untracked, c.created_at \
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
     let result = executor.execute(sql, &[]).await?;
@@ -78,8 +90,7 @@ pub(crate) async fn load_data_with_executor(
             .as_ref()
             .map(|s| CanonicalJson::from_text(s))
             .transpose()?;
-        let untracked = bool_required(&row, 8, "untracked")?;
-        let created_at = text_required(&row, 9, "created_at")?;
+        let created_at = text_required(&row, 8, "created_at")?;
         let replay_cursor = ReplayCursor::new(id.clone(), created_at.clone());
 
         let change = ChangeRecord {
@@ -91,7 +102,6 @@ pub(crate) async fn load_data_with_executor(
             plugin_key: plugin_key.clone(),
             snapshot_content: snapshot_content.clone(),
             metadata: metadata.clone(),
-            untracked,
             created_at: created_at.clone(),
             replay_cursor: replay_cursor.clone(),
         };
@@ -113,19 +123,6 @@ pub(crate) async fn load_data_with_executor(
                 }
             }
             continue;
-        }
-
-        if schema_key == "lix_version_ref" {
-            if untracked {
-                continue;
-            }
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "materialization: canonical change '{}' uses forbidden schema 'lix_version_ref'; version heads must remain replica-local untracked state",
-                    id
-                ),
-            });
         }
 
         if schema_key == "lix_version_descriptor" {
@@ -155,8 +152,27 @@ pub(crate) async fn load_data_with_executor(
         }
     }
 
+    let scope_sql =
+        "SELECT id, change_id, version_id, visibility_kind, entity_id, schema_key, file_id, created_at, append_seq \
+                     FROM lix_internal_untracked_change_visibility";
+    let scope_result = executor.execute(scope_sql, &[]).await?;
+    let mut untracked_visibility_rows = Vec::new();
+    for row in scope_result.rows {
+        let _visibility_kind = text_required(&row, 3, "visibility_kind")?;
+        untracked_visibility_rows.push(UntrackedVisibilityRecord {
+            id: text_required(&row, 0, "id")?,
+            append_seq: integer_required(&row, 8, "append_seq")?,
+            change_id: text_required(&row, 1, "change_id")?,
+            version_id: text_required(&row, 2, "version_id")?,
+            entity_id: text_required(&row, 4, "entity_id")?,
+            schema_key: text_required(&row, 5, "schema_key")?,
+            file_id: text_optional(&row, 6, "file_id")?,
+        });
+    }
+
     Ok(LoadedData {
         changes,
+        untracked_visibility_rows,
         commits,
         version_descriptors,
     })
@@ -268,7 +284,7 @@ fn text_optional(row: &[Value], index: usize, label: &str) -> Result<Option<Stri
     }
 }
 
-fn bool_required(row: &[Value], index: usize, label: &str) -> Result<bool, LixError> {
+fn integer_required(row: &[Value], index: usize, label: &str) -> Result<i64, LixError> {
     let Some(value) = row.get(index) else {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -276,12 +292,11 @@ fn bool_required(row: &[Value], index: usize, label: &str) -> Result<bool, LixEr
         });
     };
     match value {
-        Value::Boolean(value) => Ok(*value),
-        Value::Integer(value) => Ok(*value != 0),
+        Value::Integer(number) => Ok(*number),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!(
-                "materialization: expected boolean-compatible value for column '{label}' at index {index}"
+                "materialization: expected integer for column '{label}' at index {index}"
             ),
         }),
     }

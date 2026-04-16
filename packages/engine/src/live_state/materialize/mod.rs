@@ -17,8 +17,8 @@ pub use types::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
-    LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionHeadDebugRow,
+    LiveStateWriteOp, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
+    VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
 
 use crate::plugin::FilesystemPluginMaterializer;

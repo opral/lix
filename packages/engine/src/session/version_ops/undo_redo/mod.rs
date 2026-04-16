@@ -3,6 +3,13 @@
 //! This owner resolves a target version head, reconstructs semantic undo/redo
 //! state from committed lineage plus operation records, and authors inverse or
 //! replay commits against that version.
+//!
+//! The current product policy is explicit:
+//! - all canonical change facts may be journaled
+//! - undo/redo only operates on tracked commit members encoded in commit
+//!   `change_ids`
+//! - untracked journal rows such as `lix_version_ref` remain outside the first
+//!   undo/redo cut
 
 mod apply;
 mod init;

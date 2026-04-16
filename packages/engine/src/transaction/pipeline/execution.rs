@@ -20,8 +20,8 @@ use crate::transaction::{
     normalize_sql_error_with_transaction_and_relation_names, BufferedWriteCommandMetadata,
     BufferedWriteFlushClass, BufferedWriteSessionEffects, BufferedWriteTransaction,
     DeferredCommitEffects, PendingCommitState, PendingWriteOverlay, PreparedDirectWriteArtifact,
-    PreparedPublicWriteExecutionPartition, PreparedWriteStatement, SessionCompilerState,
-    TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath, WriteResult,
+    PreparedWriteStatement, SessionCompilerState, TransactionWriteDelta, WriteCommand,
+    WriteExecutionContext, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -493,14 +493,7 @@ fn planning_session_delta(prepared: &PreparedWriteStatement) -> SessionStateDelt
                 execution.partitions.iter().fold(
                     SessionStateDelta::default(),
                     |mut delta, partition| {
-                        match partition {
-                            PreparedPublicWriteExecutionPartition::Tracked(tracked) => {
-                                delta.merge(tracked.semantic_effects.session_delta.clone());
-                            }
-                            PreparedPublicWriteExecutionPartition::Untracked(untracked) => {
-                                delta.merge(untracked.semantic_effects.session_delta.clone());
-                            }
-                        }
+                        delta.merge(partition.semantic_effects.session_delta.clone());
                         delta
                     },
                 )

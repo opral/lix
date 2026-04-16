@@ -14,9 +14,9 @@ use crate::LixError;
 use crate::{LixBackend, LixBackendTransaction, QueryResult};
 
 #[cfg(not(test))]
-use crate::transaction::buffered::TrackedTxnUnit;
+use crate::transaction::buffered::PublicWriteTxnUnit;
 #[cfg(test)]
-use crate::transaction::buffered::{TrackedTxnUnit, WriteDelta, WriteJournal, WritePlan};
+use crate::transaction::buffered::{PublicWriteTxnUnit, WriteDelta, WriteJournal, WritePlan};
 use crate::transaction::filesystem::runtime::BinaryBlobWrite;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
@@ -34,7 +34,7 @@ pub struct TransactionCommitOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct TrackedCommitExecutionOutcome {
+pub struct PublicCommitExecutionOutcome {
     pub receipt: Option<crate::live_state::CanonicalCommitProjectionReceipt>,
     pub applied_changes: Vec<PublicChange>,
     pub plugin_changes_committed: bool,
@@ -249,12 +249,12 @@ pub(crate) trait WriteExecutionContext {
         functions: &SharedFunctionProvider<Box<dyn LixFunctionProvider + Send>>,
     ) -> Result<(), LixError>;
 
-    async fn execute_public_tracked_append_txn_with_transaction(
+    async fn execute_public_commit_write_txn_with_transaction(
         &self,
         transaction: &mut dyn LixBackendTransaction,
-        unit: &TrackedTxnUnit,
+        unit: &PublicWriteTxnUnit,
         pending_commit_state: Option<&mut Option<PendingCommitState>>,
-    ) -> Result<TrackedCommitExecutionOutcome, LixError>;
+    ) -> Result<PublicCommitExecutionOutcome, LixError>;
 }
 
 #[derive(Default)]

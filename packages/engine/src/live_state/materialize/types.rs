@@ -100,7 +100,7 @@ pub struct LatestVisibleWinnerDebugRow {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ScopeWinnerDebugRow {
+pub struct VisibilityWinnerDebugRow {
     pub version_id: VersionId,
     pub entity_id: EntityId,
     pub schema_key: CanonicalSchemaKey,
@@ -115,7 +115,7 @@ pub struct LiveStateRebuildDebugTrace {
     pub traversed_commits: Vec<TraversedCommitDebugRow>,
     pub traversed_edges: Vec<TraversedEdgeDebugRow>,
     pub latest_visible_winners: Vec<LatestVisibleWinnerDebugRow>,
-    pub scope_winners: Vec<ScopeWinnerDebugRow>,
+    pub visibility_winners: Vec<VisibilityWinnerDebugRow>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

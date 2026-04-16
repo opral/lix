@@ -1,5 +1,19 @@
 use lix_engine::streams::{StateCommitStreamFilter, StateCommitStreamOperation};
-use lix_engine::{ExecuteOptions, LixError};
+use lix_engine::{ExecuteOptions, LixError, Value};
+
+fn as_text(value: &Value) -> String {
+    match value {
+        Value::Text(text) => text.clone(),
+        other => panic!("expected text value, got {other:?}"),
+    }
+}
+
+fn as_i64(value: &Value) -> i64 {
+    match value {
+        Value::Integer(value) => *value,
+        other => panic!("expected integer value, got {other:?}"),
+    }
+}
 
 fn insert_key_value_sql(key: &str, value_json: &str) -> String {
     format!(
@@ -29,6 +43,285 @@ fn delete_key_value_sql(key: &str) -> String {
 fn insert_key_value_entity_sql(key: &str, value: &str) -> String {
     format!("INSERT INTO lix_key_value (key, value) VALUES ('{key}', '{value}')")
 }
+
+fn insert_untracked_key_value_sql(key: &str, value_json: &str) -> String {
+    format!(
+        "INSERT INTO lix_state (\
+         entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
+         ) VALUES (\
+         '{key}', 'lix', 'lix_key_value', 'lix', '1', \
+         lix_json('{{\"key\":\"{key}\",\"value\":{value_json}}}'), true\
+         )"
+    )
+}
+
+fn update_untracked_key_value_sql(key: &str, value_json: &str) -> String {
+    format!(
+        "UPDATE lix_state \
+         SET snapshot_content = lix_json('{{\"key\":\"{key}\",\"value\":{value_json}}}') \
+         WHERE entity_id = '{key}' \
+           AND schema_key = 'lix_key_value' \
+           AND file_id = 'lix' \
+           AND untracked = true"
+    )
+}
+
+fn delete_untracked_key_value_sql(key: &str) -> String {
+    format!(
+        "DELETE FROM lix_state \
+         WHERE entity_id = '{key}' \
+           AND schema_key = 'lix_key_value' \
+           AND file_id = 'lix' \
+           AND untracked = true"
+    )
+}
+
+simulation_test!(
+    untracked_write_finalization_compacts_superseded_journal_rows,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_untracked_key_value_sql("state-commit-untracked-compact", "\"v0\""),
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                &update_untracked_key_value_sql("state-commit-untracked-compact", "\"v1\""),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let journal_rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'state-commit-untracked-compact' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(journal_rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            journal_rows.statements[0].rows[0][0],
+            Value::Text(
+                "{\"key\":\"state-commit-untracked-compact\",\"value\":\"v1\"}".to_string()
+            )
+        );
+    }
+);
+
+simulation_test!(
+    maintenance_compaction_sweeps_stale_untracked_tombstones_after_watermark_clears,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_untracked_key_value_sql("state-commit-untracked-maintenance", "\"v0\""),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let first_change = engine
+            .execute(
+                "SELECT c.id, c.created_at, uv.append_seq \
+                 FROM lix_internal_untracked_change_visibility uv \
+                 JOIN lix_internal_change c ON c.id = uv.change_id \
+                 WHERE uv.schema_key = 'lix_key_value' \
+                   AND uv.entity_id = 'state-commit-untracked-maintenance' \
+                 ORDER BY uv.append_seq DESC \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        let first_change_id = as_text(&first_change.statements[0].rows[0][0]);
+        let first_change_created_at = as_text(&first_change.statements[0].rows[0][1]);
+        let first_visibility_append_seq = as_i64(&first_change.statements[0].rows[0][2]);
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_change_consumer_cursor (\
+                 consumer_key, change_id, change_created_at, visibility_append_seq\
+                 ) VALUES ($1, $2, $3, $4)",
+                &[
+                    Value::Text("gc-test".to_string()),
+                    Value::Text(first_change_id),
+                    Value::Text(first_change_created_at),
+                    Value::Integer(first_visibility_append_seq),
+                ],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                &delete_untracked_key_value_sql("state-commit-untracked-maintenance"),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let before = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'state-commit-untracked-maintenance' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(as_i64(&before.statements[0].rows[0][0]), 1);
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_change_consumer_cursor WHERE consumer_key = 'gc-test'",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let deleted = engine
+            .compact_untracked_change_journal()
+            .await
+            .expect("maintenance compaction should succeed");
+        assert_eq!(deleted, 1);
+
+        let after = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'state-commit-untracked-maintenance' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(as_i64(&after.statements[0].rows[0][0]), 0);
+    }
+);
+
+simulation_test!(
+    lix_change_untracked_is_derived_from_visibility_membership,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_untracked_key_value_sql("derived-untracked-flag", "\"v0\""),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let seeded = engine
+            .execute(
+                "SELECT uv.id, uv.change_id, uv.version_id, uv.visibility_kind, uv.entity_id, uv.schema_key, uv.file_id, uv.created_at \
+                 FROM lix_internal_untracked_change_visibility uv \
+                 WHERE uv.entity_id = 'derived-untracked-flag' \
+                   AND uv.schema_key = 'lix_key_value' \
+                 ORDER BY uv.append_seq DESC \
+                 LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(seeded.statements[0].rows.len(), 1);
+        let visibility_id = as_text(&seeded.statements[0].rows[0][0]);
+        let change_id = as_text(&seeded.statements[0].rows[0][1]);
+        let version_id = as_text(&seeded.statements[0].rows[0][2]);
+        let visibility_kind = as_text(&seeded.statements[0].rows[0][3]);
+        let entity_id = as_text(&seeded.statements[0].rows[0][4]);
+        let schema_key = as_text(&seeded.statements[0].rows[0][5]);
+        let visibility_created_at = as_text(&seeded.statements[0].rows[0][7]);
+
+        let before = engine
+            .execute(
+                "SELECT untracked FROM lix_change WHERE id = $1",
+                &[Value::Text(change_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(before.statements[0].rows, vec![vec![Value::Boolean(true)]]);
+
+        engine
+            .execute(
+                "DELETE FROM lix_internal_untracked_change_visibility WHERE id = $1",
+                &[Value::Text(visibility_id)],
+            )
+            .await
+            .unwrap();
+
+        let without_visibility = engine
+            .execute(
+                "SELECT untracked FROM lix_change WHERE id = $1",
+                &[Value::Text(change_id.clone())],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            without_visibility.statements[0].rows,
+            vec![vec![Value::Boolean(false)]]
+        );
+
+        engine
+            .execute(
+                "INSERT INTO lix_internal_untracked_change_visibility (\
+                 id, change_id, version_id, visibility_kind, entity_id, schema_key, file_id, created_at\
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    Value::Text("derived-untracked-flag-restored".to_string()),
+                    Value::Text(change_id.clone()),
+                    Value::Text(version_id),
+                    Value::Text(visibility_kind),
+                    Value::Text(entity_id),
+                    Value::Text(schema_key),
+                    Value::Null,
+                    Value::Text(visibility_created_at),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let restored = engine
+            .execute(
+                "SELECT untracked FROM lix_change WHERE id = $1",
+                &[Value::Text(change_id)],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.statements[0].rows,
+            vec![vec![Value::Boolean(true)]]
+        );
+    }
+);
 
 simulation_test!(
     state_commit_stream_emits_matching_batches,
@@ -116,6 +409,49 @@ simulation_test!(
         assert!(batch.changes.iter().any(|change| {
             change.schema_key == "lix_key_value" && change.entity_id == "state-commit-events-c"
         }));
+    }
+);
+
+simulation_test!(
+    state_commit_stream_include_untracked_filters_untracked_rows,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        let all_events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+        let tracked_only_events = engine.state_commit_stream(StateCommitStreamFilter {
+            schema_keys: vec!["lix_key_value".to_string()],
+            include_untracked: false,
+            ..StateCommitStreamFilter::default()
+        });
+
+        engine
+            .execute(
+                &insert_untracked_key_value_sql("state-commit-untracked-a", "\"v0\""),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let batch = all_events
+            .try_next()
+            .expect("expected untracked event batch when include_untracked=true");
+        assert!(batch.changes.iter().any(|change| {
+            change.schema_key == "lix_key_value"
+                && change.entity_id == "state-commit-untracked-a"
+                && change.untracked
+        }));
+        assert!(
+            tracked_only_events.try_next().is_none(),
+            "include_untracked=false should suppress untracked stream batches"
+        );
     }
 );
 

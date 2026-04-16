@@ -109,6 +109,15 @@ fn first_text_value(value: &Value) -> String {
     }
 }
 
+fn first_bool_value(value: &Value) -> bool {
+    match value {
+        Value::Boolean(value) => *value,
+        Value::Integer(value) => *value != 0,
+        Value::Text(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
+        other => panic!("expected boolean-compatible value, got {other:?}"),
+    }
+}
+
 async fn insert_version(engine: &support::simulation_test::SimulatedLix, version_id: &str) {
     engine
         .create_version(CreateVersionOptions {
@@ -176,6 +185,71 @@ simulation_test!(
     simulations = [sqlite, postgres, materialization],
     |sim| async move {
         run_init_seeds_default_active_version_deterministic(sim).await;
+    }
+);
+
+simulation_test!(
+    initialize_bootstrap_rows_are_backed_by_lix_change_rows,
+    simulations = [sqlite, postgres, materialization],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        let visible_bootstrap_rows = engine
+            .execute(
+                "SELECT schema_key, entity_id, change_id \
+                 FROM lix_state_by_version \
+                 WHERE untracked = true \
+                   AND schema_key IN ('lix_version_ref', 'lix_registered_schema') \
+                 ORDER BY schema_key, entity_id",
+                &[],
+            )
+            .await
+            .expect("bootstrap visible state query should succeed");
+        assert!(
+            !visible_bootstrap_rows.statements[0].rows.is_empty(),
+            "expected bootstrap rows to be visible"
+        );
+
+        for row in &visible_bootstrap_rows.statements[0].rows {
+            let schema_key = first_text_value(&row[0]);
+            let entity_id = first_text_value(&row[1]);
+            let change_id = first_text_value(&row[2]);
+            assert!(
+                !change_id.is_empty(),
+                "bootstrap row {schema_key}/{entity_id} must expose a real change_id"
+            );
+
+            let backing_change = engine
+                .execute(
+                    "SELECT schema_key, entity_id, untracked \
+                     FROM lix_change \
+                     WHERE id = $1",
+                    &[Value::Text(change_id.clone())],
+                )
+                .await
+                .expect("backing lix_change query should succeed");
+            assert_eq!(
+                backing_change.statements[0].rows.len(),
+                1,
+                "expected exactly one backing change row for {schema_key}/{entity_id}"
+            );
+            assert_eq!(
+                first_text_value(&backing_change.statements[0].rows[0][0]),
+                schema_key
+            );
+            assert_eq!(
+                first_text_value(&backing_change.statements[0].rows[0][1]),
+                entity_id
+            );
+            assert!(
+                first_bool_value(&backing_change.statements[0].rows[0][2]),
+                "bootstrap row {schema_key}/{entity_id} should be backed by an untracked change"
+            );
+        }
     }
 );
 

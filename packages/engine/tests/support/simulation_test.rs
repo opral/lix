@@ -596,6 +596,29 @@ struct SharedDeterministicRunGuard {
 }
 
 impl SharedDeterministicRun {
+    fn fallback_grace_remaining(&self, state: &SharedDeterministicCaseState) -> Option<Duration> {
+        const SQLITE_BASELINE_GRACE: Duration = Duration::from_secs(1);
+
+        if state.baseline_backend.is_some() || self.backend_name == state.preferred_baseline_backend
+        {
+            return None;
+        }
+
+        SQLITE_BASELINE_GRACE.checked_sub(state.created_at.elapsed())
+    }
+
+    fn wait_slice_until(
+        &self,
+        state: &SharedDeterministicCaseState,
+        deadline: Instant,
+    ) -> Duration {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match self.fallback_grace_remaining(state) {
+            Some(grace_remaining) => remaining.min(grace_remaining),
+            None => remaining,
+        }
+    }
+
     fn is_current_baseline(&self, state: &SharedDeterministicCaseState) -> bool {
         state.baseline_backend.as_deref() == Some(self.backend_name.as_str())
     }
@@ -684,7 +707,7 @@ impl SharedDeterministicRun {
                     self.case_id, self.backend_name, idx
                 );
             }
-            let remaining = deadline.saturating_duration_since(now);
+            let remaining = self.wait_slice_until(&state, deadline);
             let (next_state, _) = self
                 .state
                 .condvar
@@ -755,7 +778,7 @@ impl SharedDeterministicRun {
                     self.case_id, self.backend_name
                 ));
             }
-            let remaining = deadline.saturating_duration_since(now);
+            let remaining = self.wait_slice_until(&state, deadline);
             let (next_state, _) = self
                 .state
                 .condvar
@@ -1066,6 +1089,31 @@ mod tests {
         }
 
         postgres_expect.assert_deterministic(42usize);
+
+        let state = postgres_expect
+            .run
+            .state
+            .state
+            .lock()
+            .expect("shared deterministic mutex poisoned");
+        assert_eq!(state.baseline_backend.as_deref(), Some("postgres"));
+        assert_eq!(state.expected_values.len(), 1);
+    }
+
+    #[test]
+    fn shared_deterministic_isolated_non_sqlite_run_falls_back_without_peer_wakeup() {
+        let case_id = "simulation_test::isolated_non_sqlite_run";
+        let (postgres_expect, _postgres_guard) =
+            SharedExpectDeterministic::new(case_id, "postgres");
+
+        let started = Instant::now();
+        postgres_expect.assert_deterministic(7usize);
+
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "isolated fallback should happen after grace, not outer timeout: {elapsed:?}"
+        );
 
         let state = postgres_expect
             .run

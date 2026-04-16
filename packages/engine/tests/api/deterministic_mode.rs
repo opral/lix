@@ -26,7 +26,7 @@ fn deterministic_counter_from_uuid(value: &str) -> Option<i64> {
         .and_then(|suffix| i64::from_str_radix(suffix, 16).ok())
 }
 
-async fn read_highest_deterministic_canonical_counter(
+async fn read_highest_uuid_shaped_canonical_counter(
     engine: &support::simulation_test::SimulatedLix,
 ) -> i64 {
     let changes = engine
@@ -326,9 +326,14 @@ simulation_test!(
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
-        assert_eq!(
-            read_sequence_value(&engine).await,
-            read_highest_deterministic_canonical_counter(&engine).await
+        assert!(
+            // The persisted deterministic sequence is the authoritative runtime
+            // counter. It should never lag behind the deterministic UUID-shaped
+            // counters we can observe in canonical history, but it no longer has
+            // to equal them because sequence persistence is itself journaled
+            // through non-UUID change/snapshot ids.
+            read_sequence_value(&engine).await
+                >= read_highest_uuid_shaped_canonical_counter(&engine).await
         );
     }
 );
@@ -431,9 +436,14 @@ simulation_test!(
         assert_eq!(id, deterministic_uuid(1));
         assert_eq!(created_at, "1970-01-01T00:00:00.000Z");
 
-        assert_eq!(
-            read_sequence_value(&engine).await,
-            read_highest_deterministic_canonical_counter(&engine).await
+        assert!(
+            // The persisted deterministic sequence is the authoritative runtime
+            // counter. It should never lag behind the deterministic UUID-shaped
+            // counters we can observe in canonical history, but it no longer has
+            // to equal them because sequence persistence is itself journaled
+            // through non-UUID change/snapshot ids.
+            read_sequence_value(&engine).await
+                >= read_highest_uuid_shaped_canonical_counter(&engine).await
         );
     }
 );
@@ -468,13 +478,28 @@ simulation_test!(
                    AND schema_key = 'lix_key_value' \
                    AND entity_id = 'lix_deterministic_sequence_number' \
                    AND untracked = true",
-                &[Value::Text(change_id)],
+                &[Value::Text(change_id.clone())],
             )
             .await
             .unwrap();
 
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_eq!(rows.statements[0].rows[0][0], Value::Integer(1));
+
+        let scope_rows = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_internal_untracked_change_visibility \
+                 WHERE change_id = $1 \
+                   AND version_id = 'global' \
+                   AND visibility_kind = 'global'",
+                &[Value::Text(change_id)],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(scope_rows.statements[0].rows.len(), 1);
+        assert_eq!(scope_rows.statements[0].rows[0][0], Value::Integer(1));
     }
 );
 

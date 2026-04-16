@@ -10,9 +10,17 @@ use lix_engine::{
 fn scrub_timestamp_fields(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
+            map.remove("timestamp_shuffle");
             for (key, entry) in map.iter_mut() {
                 if key == "created_at" || key == "updated_at" || key == "timestamp" {
                     *entry = serde_json::Value::String("__timestamp__".to_string());
+                } else if key == "snapshot_content" {
+                    if let serde_json::Value::String(text) = entry {
+                        if let Ok(mut nested) = serde_json::from_str::<serde_json::Value>(text) {
+                            scrub_timestamp_fields(&mut nested);
+                            *text = serde_json::to_string(&nested).unwrap();
+                        }
+                    }
                 } else {
                     scrub_timestamp_fields(entry);
                 }

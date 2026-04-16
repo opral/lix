@@ -29,7 +29,6 @@ pub(crate) struct CommittedCanonicalChangeRow {
     pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
-    pub(crate) untracked: bool,
     pub(crate) created_at: String,
 }
 
@@ -71,7 +70,9 @@ pub(crate) async fn load_exact_committed_change_from_commit_with_executor(
             let change = match change_cache.get(change_id) {
                 Some(cached) => cached.clone(),
                 None => {
-                    let loaded = load_canonical_change_row_by_id(executor, change_id).await?;
+                    let loaded =
+                        load_commit_member_change_row_by_id(executor, &commit_id, change_id)
+                            .await?;
                     change_cache.insert(change_id.clone(), loaded.clone());
                     loaded
                 }
@@ -141,6 +142,21 @@ async fn load_reachable_commit_lineage(
     }
 
     Ok(lineage)
+}
+
+async fn load_commit_member_change_row_by_id(
+    executor: &mut dyn CommitQueryExecutor,
+    commit_id: &str,
+    change_id: &str,
+) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
+    let change = load_canonical_change_row_by_id(executor, change_id).await?;
+    if change.is_some() && untracked_visibility_exists(executor, change_id).await? {
+        return Err(LixError::unknown(format!(
+            "canonical commit '{}' references untracked-visible change '{}' as a commit member",
+            commit_id, change_id
+        )));
+    }
+    Ok(change)
 }
 
 fn compute_min_commit_depths(
@@ -236,7 +252,7 @@ pub(crate) async fn load_canonical_change_row_by_id(
     executor: &mut dyn CommitQueryExecutor,
     change_id: &str,
 ) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.untracked, c.created_at \
+    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                WHERE c.id = $1 \
@@ -256,9 +272,26 @@ pub(crate) async fn load_canonical_change_row_by_id(
         plugin_key: row.get(5).and_then(text_from_value),
         snapshot_content: row.get(6).and_then(text_from_value),
         metadata: row.get(7).and_then(text_from_value),
-        untracked: required_bool(row, 8, "lix_internal_change.untracked")?,
-        created_at: required_text(row, 9, "lix_internal_change.created_at")?,
+        created_at: required_text(row, 8, "lix_internal_change.created_at")?,
     }))
+}
+
+async fn untracked_visibility_exists(
+    executor: &mut dyn CommitQueryExecutor,
+    change_id: &str,
+) -> Result<bool, LixError> {
+    let sql = format!(
+        "SELECT 1 \
+         FROM {} \
+         WHERE change_id = {} \
+         LIMIT 1",
+        crate::canonical::journal::UNTRACKED_CHANGE_VISIBILITY_TABLE,
+        executor.dialect().placeholder(1),
+    );
+    let result = executor
+        .execute(&sql, &[Value::Text(change_id.to_string())])
+        .await?;
+    Ok(!result.rows.is_empty())
 }
 
 fn matches_exact_text_filter(actual: Option<&str>, expected: &Value) -> bool {
@@ -298,27 +331,10 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
     }
 }
 
-fn required_bool(row: &[Value], index: usize, field: &str) -> Result<bool, LixError> {
-    match row.get(index) {
-        Some(Value::Boolean(value)) => Ok(*value),
-        Some(Value::Integer(value)) => Ok(*value != 0),
-        Some(Value::Text(value)) => match value.as_str() {
-            "true" | "t" | "1" => Ok(true),
-            "false" | "f" | "0" => Ok(false),
-            _ => Err(LixError::unknown(format!(
-                "expected boolean-like value for {field}, got {value:?}"
-            ))),
-        },
-        Some(other) => Err(LixError::unknown(format!(
-            "expected boolean-like value for {field}, got {other:?}"
-        ))),
-        None => Err(LixError::unknown(format!("missing {field}"))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{LixBackend, TransactionBeginMode};
     use crate::canonical::CanonicalStateIdentity;
     use crate::session::version_ops::committed_state::load_exact_canonical_row_at_version_head_with_executor;
     use crate::session::version_ops::load_version_head_commit_id_with_executor;
@@ -326,6 +342,7 @@ mod tests {
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::{CanonicalSchemaKey, EntityId};
     use std::collections::BTreeMap;
 
     async fn init_state_source_backend() -> TestSqliteBackend {
@@ -380,7 +397,6 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"contract\",\"extension\":null,\"metadata\":{\"k\":\"v\"},\"hidden\":false}",
                 ),
                 metadata: Some("{\"k\":\"v\"}"),
-                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )
@@ -399,7 +415,6 @@ mod tests {
                     "{\"id\":\"parent-1\",\"change_set_id\":\"cs-parent\",\"change_ids\":[],\"parent_commit_ids\":[]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T00:00:30Z",
             },
         )
@@ -418,7 +433,6 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-fallback\"],\"parent_commit_ids\":[\"parent-1\"]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T00:01:00Z",
             },
         )
@@ -437,7 +451,6 @@ mod tests {
                     "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T00:02:00Z",
             },
         )
@@ -473,7 +486,6 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"deep\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: &synthetic_timestamp(0),
             },
         )
@@ -508,7 +520,6 @@ mod tests {
                     snapshot_id: &snapshot_id,
                     snapshot_content: Some(&snapshot_content),
                     metadata: None,
-                    untracked: false,
                     created_at: &created_at,
                 },
             )
@@ -633,7 +644,6 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"cycle\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T01:00:00Z",
             },
         )
@@ -653,7 +663,6 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-cycle-row\"],\"parent_commit_ids\":[\"commit-2\"]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T01:01:00Z",
             },
         )
@@ -673,7 +682,6 @@ mod tests {
                     "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T01:02:00Z",
             },
         )
@@ -713,7 +721,6 @@ mod tests {
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"broken-parent\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T02:00:00Z",
             },
         )
@@ -733,7 +740,6 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-missing-parent-row\"],\"parent_commit_ids\":[\"missing-parent\"]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T02:01:00Z",
             },
         )
@@ -754,6 +760,92 @@ mod tests {
                 .description
                 .contains("missing commit 'missing-parent'"),
             "expected explicit missing-parent error, got: {}",
+            error.description
+        );
+    }
+
+    #[tokio::test]
+    async fn canonical_exact_state_contract_rejects_untracked_change_as_commit_member() {
+        let backend = init_state_source_backend().await;
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-untracked-member-row",
+                entity_id: "file-1",
+                schema_key: "lix_file_descriptor",
+                schema_version: "1",
+                file_id: None,
+                plugin_key: None,
+                snapshot_id: "snapshot-untracked-member-row",
+                snapshot_content: Some(
+                    "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"bad-member\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T03:00:00Z",
+            },
+        )
+        .await
+        .expect("untracked member fixture change should seed");
+        {
+            let mut transaction = backend
+                .begin_transaction(TransactionBeginMode::Write)
+                .await
+                .expect("untracked member fixture visibility transaction should open");
+            crate::canonical::append_untracked_change_visibility_rows(
+                transaction.as_mut(),
+                &[crate::canonical::CanonicalUntrackedVisibilityWrite {
+                    id: "visibility:change-untracked-member-row".to_string(),
+                    change_id: "change-untracked-member-row".to_string(),
+                    version_id: "v1".to_string(),
+                    visibility_kind: crate::canonical::CanonicalUntrackedVisibilityKind::Version,
+                    entity_id: EntityId::new("file-1").expect("valid entity id"),
+                    schema_key: CanonicalSchemaKey::new("lix_file_descriptor")
+                        .expect("valid schema key"),
+                    file_id: None,
+                    created_at: "2026-03-30T03:00:30Z".to_string(),
+                }],
+            )
+            .await
+            .expect("untracked member fixture visibility should seed");
+            transaction
+                .commit()
+                .await
+                .expect("untracked member fixture visibility transaction should commit");
+        }
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-untracked-member-commit",
+                entity_id: "commit-1",
+                schema_key: "lix_commit",
+                schema_version: "1",
+                file_id: None,
+                plugin_key: None,
+                snapshot_id: "snapshot-untracked-member-commit",
+                snapshot_content: Some(
+                    "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-untracked-member-row\"],\"parent_commit_ids\":[]}",
+                ),
+                metadata: None,
+                created_at: "2026-03-30T03:01:00Z",
+            },
+        )
+        .await
+        .expect("untracked member fixture commit should seed");
+        seed_local_version_head(&backend, "v1", "commit-1", "2026-03-30T03:02:00Z")
+            .await
+            .expect("untracked member fixture local head should seed");
+
+        let error = load_exact_committed_state_row_at_version_head(
+            &backend,
+            &exact_file_descriptor_request(),
+        )
+        .await
+        .expect_err("untracked member fixture should fail explicitly");
+        assert!(
+            error
+                .description
+                .contains("references untracked-visible change"),
+            "expected explicit scoped-member error, got: {}",
             error.description
         );
     }

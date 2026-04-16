@@ -6,16 +6,13 @@ use super::loader::{load_data_with_executor, LoadedData};
 use super::types::{
     LatestVisibleWinnerDebugRow, LiveStateRebuildDebugMode, LiveStateRebuildDebugTrace,
     LiveStateRebuildPlan, LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning,
-    LiveStateWrite, LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionHeadDebugRow,
+    LiveStateWrite, LiveStateWriteOp, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
+    VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
 use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_visible_state, CanonicalContentMode, CanonicalTombstoneMode, CanonicalVisibleStateFilter,
     CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
-};
-use crate::live_state::storage_metadata::{
-    builtin_schema_storage_metadata, BuiltinSchemaStorageLane,
 };
 use crate::live_state::ReplayCursor;
 use crate::schema::LixVersionRef;
@@ -78,9 +75,9 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
     let mut stats = Vec::new();
     let mut warnings = Vec::new();
 
-    let mut untracked_projection_rows =
-        build_untracked_projection_rows(&data, &mut warnings, &mut stats)?;
-    untracked_projection_rows.sort_by(|a, b| {
+    let mut visibility_projection_rows =
+        build_untracked_visibility_projection_rows(&data, &mut warnings, &mut stats)?;
+    visibility_projection_rows.sort_by(|a, b| {
         a.schema_key
             .cmp(&b.schema_key)
             .then_with(|| a.version_id.cmp(&b.version_id))
@@ -90,7 +87,7 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
             .then_with(|| a.change_id.cmp(&b.change_id))
     });
     let version_refs =
-        load_version_heads_from_canonical(&untracked_projection_rows, &mut warnings, &mut stats)?;
+        load_version_heads_from_canonical(&visibility_projection_rows, &mut warnings, &mut stats)?;
     let target_versions = resolve_target_versions(req, &version_refs, &data);
     let visible_state_rows =
         load_canonical_visible_state(executor, &version_refs, &target_versions, &mut stats).await?;
@@ -99,7 +96,7 @@ pub(crate) async fn live_state_rebuild_plan_with_executor(
         &data,
         &visible_state_rows,
         &version_refs,
-        &untracked_projection_rows,
+        &visibility_projection_rows,
         &mut warnings,
         &mut stats,
     )?;
@@ -143,7 +140,7 @@ fn build_latest_visible_state(
     data: &LoadedData,
     visible_state_rows: &[CanonicalVisibleStateRow],
     version_refs: &VersionHeadMap,
-    untracked_projection_rows: &[VisibleRow],
+    visibility_projection_rows: &[VisibleRow],
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Result<Vec<VisibleRow>, LixError> {
@@ -211,7 +208,7 @@ fn build_latest_visible_state(
         version_refs,
         warnings,
     ));
-    winners.extend(untracked_projection_rows.iter().cloned());
+    winners.extend(visibility_projection_rows.iter().cloned());
 
     winners.sort_by(|a, b| {
         a.version_id
@@ -224,7 +221,7 @@ fn build_latest_visible_state(
 
     stats.push(StageStat {
         stage: "latest_visible_state".to_string(),
-        input_rows: visible_state_rows.len() + untracked_projection_rows.len(),
+        input_rows: visible_state_rows.len() + visibility_projection_rows.len(),
         output_rows: winners.len(),
     });
 
@@ -537,7 +534,7 @@ fn build_global_projection_rows(
     resolve_projection_candidates(candidates)
 }
 
-fn build_untracked_projection_rows(
+fn build_untracked_visibility_projection_rows(
     data: &LoadedData,
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
@@ -545,12 +542,19 @@ fn build_untracked_projection_rows(
     let mut latest_by_identity = BTreeMap::new();
     let mut input_rows = 0usize;
 
-    for change in data.changes.values() {
-        if !change.untracked {
+    for scope in &data.untracked_visibility_rows {
+        let Some(change) = data.changes.get(&scope.change_id) else {
+            warnings.push(LiveStateRebuildWarning {
+                code: "missing_visibility_change".to_string(),
+                message: format!(
+                    "untracked visibility '{}' references missing change '{}'",
+                    scope.id, scope.change_id
+                ),
+            });
             continue;
-        }
+        };
 
-        let Some(row) = build_untracked_projection_row(change, warnings)? else {
+        let Some(row) = build_untracked_visibility_projection_row(scope, change, warnings)? else {
             continue;
         };
         input_rows += 1;
@@ -562,14 +566,17 @@ fn build_untracked_projection_rows(
             row.file_id.clone(),
         );
         match latest_by_identity.get(&key) {
-            Some(existing) if !untracked_visible_row_is_newer(&row, existing) => {}
+            Some((_, existing_append_seq)) if scope.append_seq <= *existing_append_seq => {}
             _ => {
-                latest_by_identity.insert(key, row);
+                latest_by_identity.insert(key, (row, scope.append_seq));
             }
         }
     }
 
-    let mut rows = latest_by_identity.into_values().collect::<Vec<_>>();
+    let mut rows = latest_by_identity
+        .into_values()
+        .map(|(row, _)| row)
+        .collect::<Vec<_>>();
     rows.sort_by(|a, b| {
         a.schema_key
             .cmp(&b.schema_key)
@@ -581,7 +588,7 @@ fn build_untracked_projection_rows(
     });
 
     stats.push(StageStat {
-        stage: "untracked_projection_rows".to_string(),
+        stage: "visibility_projection_rows".to_string(),
         input_rows,
         output_rows: rows.len(),
     });
@@ -589,47 +596,33 @@ fn build_untracked_projection_rows(
     Ok(rows)
 }
 
-fn build_untracked_projection_row(
+fn build_untracked_visibility_projection_row(
+    visibility: &super::loader::UntrackedVisibilityRecord,
     change: &super::loader::ChangeRecord,
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Result<Option<VisibleRow>, LixError> {
-    if !supports_untracked_rebuild_projection(&change.schema_key) {
-        return Ok(None);
-    }
-
-    let Some(storage) = builtin_schema_storage_metadata(&change.schema_key) else {
+    if visibility.entity_id != change.entity_id
+        || visibility.schema_key != change.schema_key
+        || visibility.file_id != change.file_id
+    {
         warnings.push(LiveStateRebuildWarning {
-            code: "missing_untracked_schema_metadata".to_string(),
+            code: "visibility_change_identity_mismatch".to_string(),
             message: format!(
-                "untracked materialization skipped '{}' because builtin storage metadata is missing",
-                change.schema_key
+                "untracked visibility '{}' identity does not match canonical change '{}'",
+                visibility.id, change.id
             ),
         });
         return Ok(None);
-    };
-
-    let version_id = match storage.storage_lane {
-        BuiltinSchemaStorageLane::Global => crate::version::GLOBAL_VERSION_ID.to_string(),
-        BuiltinSchemaStorageLane::Local => {
-            warnings.push(LiveStateRebuildWarning {
-                code: "unsupported_untracked_storage_lane".to_string(),
-                message: format!(
-                    "untracked materialization skipped '{}:{}' because local-lane rebuilds are not supported yet",
-                    change.schema_key, change.entity_id
-                ),
-            });
-            return Ok(None);
-        }
-    };
+    }
 
     let commit_id = if change.schema_key == "lix_version_ref" {
-        parse_untracked_version_ref_commit_id(change, warnings)?
+        parse_untracked_visibility_version_ref_commit_id(change, warnings)?
     } else {
         String::new()
     };
 
     Ok(Some(VisibleRow {
-        version_id,
+        version_id: visibility.version_id.clone(),
         commit_id,
         replay_cursor: change.replay_cursor.clone(),
         change_id: change.id.clone(),
@@ -646,7 +639,7 @@ fn build_untracked_projection_row(
     }))
 }
 
-fn parse_untracked_version_ref_commit_id(
+fn parse_untracked_visibility_version_ref_commit_id(
     change: &super::loader::ChangeRecord,
     warnings: &mut Vec<LiveStateRebuildWarning>,
 ) -> Result<String, LixError> {
@@ -657,16 +650,16 @@ fn parse_untracked_version_ref_commit_id(
     let parsed: LixVersionRef = snapshot_content.parse().map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
-            "materialization: invalid untracked lix_version_ref snapshot JSON: {}",
+            "materialization: invalid untracked visibility lix_version_ref snapshot JSON: {}",
             error.description
         ),
     })?;
 
     if parsed.id.is_empty() || parsed.commit_id.is_empty() {
         warnings.push(LiveStateRebuildWarning {
-            code: "invalid_untracked_version_ref".to_string(),
+            code: "invalid_visibility_version_ref".to_string(),
             message: format!(
-                "untracked lix_version_ref change '{}' is missing id or commit_id",
+                "untracked visibility lix_version_ref change '{}' is missing id or commit_id",
                 change.id
             ),
         });
@@ -675,9 +668,9 @@ fn parse_untracked_version_ref_commit_id(
 
     if parsed.id != change.entity_id {
         warnings.push(LiveStateRebuildWarning {
-            code: "untracked_version_ref_entity_mismatch".to_string(),
+            code: "visibility_version_ref_entity_mismatch".to_string(),
             message: format!(
-                "untracked lix_version_ref change '{}' snapshot id '{}' does not match entity_id '{}'",
+                "untracked visibility lix_version_ref change '{}' snapshot id '{}' does not match entity_id '{}'",
                 change.id, parsed.id, change.entity_id
             ),
         });
@@ -686,36 +679,21 @@ fn parse_untracked_version_ref_commit_id(
     Ok(parsed.commit_id)
 }
 
-fn supports_untracked_rebuild_projection(schema_key: &str) -> bool {
-    matches!(
-        schema_key,
-        "lix_version_ref" | "lix_active_version" | "lix_active_account"
-    )
-}
-
-fn untracked_visible_row_is_newer(candidate: &VisibleRow, existing: &VisibleRow) -> bool {
-    candidate
-        .change_id
-        .cmp(&existing.change_id)
-        .then_with(|| candidate.replay_cursor.cmp(&existing.replay_cursor))
-        .is_gt()
-}
-
 fn load_version_heads_from_canonical(
-    untracked_projection_rows: &[VisibleRow],
+    visibility_projection_rows: &[VisibleRow],
     warnings: &mut Vec<LiveStateRebuildWarning>,
     stats: &mut Vec<StageStat>,
 ) -> Result<VersionHeadMap, LixError> {
-    let root_version_refs = untracked_projection_rows
+    let root_version_refs = visibility_projection_rows
         .iter()
         .filter(|row| row.schema_key == "lix_version_ref")
         .filter_map(|row| {
             if row.commit_id.is_empty() {
                 if row.snapshot_content.is_some() {
                     warnings.push(LiveStateRebuildWarning {
-                        code: "invalid_untracked_version_ref_head".to_string(),
+                        code: "invalid_visibility_version_ref_head".to_string(),
                         message: format!(
-                            "untracked lix_version_ref row '{}' is missing a rebuildable commit head",
+                            "untracked visibility lix_version_ref row '{}' is missing a rebuildable commit head",
                             row.change_id
                         ),
                     });
@@ -1001,6 +979,11 @@ fn build_debug_trace(
             });
         }
     }
+    heads_by_version.sort_by(|a, b| {
+        a.version_id
+            .cmp(&b.version_id)
+            .then_with(|| a.commit_id.cmp(&b.commit_id))
+    });
 
     let root_versions = root_versions_by_commit(version_refs);
     let mut traversed_commit_set = BTreeSet::new();
@@ -1028,6 +1011,12 @@ fn build_debug_trace(
             }
         }
     }
+    traversed_commits.sort_by(|a, b| {
+        a.version_id
+            .cmp(&b.version_id)
+            .then_with(|| a.depth.cmp(&b.depth))
+            .then_with(|| a.commit_id.cmp(&b.commit_id))
+    });
 
     let commit_depths = min_depth_by_commit_rows(visible_state_rows);
     let mut traversed_edge_set = BTreeSet::new();
@@ -1061,9 +1050,15 @@ fn build_debug_trace(
             }
         }
     }
+    traversed_edges.sort_by(|a, b| {
+        a.version_id
+            .cmp(&b.version_id)
+            .then_with(|| a.parent_id.cmp(&b.parent_id))
+            .then_with(|| a.child_id.cmp(&b.child_id))
+    });
 
     let latest_visible_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
-        latest_visible_state
+        let mut rows = latest_visible_state
             .iter()
             .map(|row| {
                 Ok(LatestVisibleWinnerDebugRow {
@@ -1087,17 +1082,26 @@ fn build_debug_trace(
                     change_id: row.change_id.clone(),
                 })
             })
-            .take(limit)
-            .collect::<Result<Vec<_>, LixError>>()?
+            .collect::<Result<Vec<_>, LixError>>()?;
+        rows.sort_by(|a, b| {
+            a.version_id
+                .cmp(&b.version_id)
+                .then_with(|| a.schema_key.cmp(&b.schema_key))
+                .then_with(|| a.file_id.cmp(&b.file_id))
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+                .then_with(|| a.commit_id.cmp(&b.commit_id))
+                .then_with(|| a.change_id.cmp(&b.change_id))
+        });
+        rows.into_iter().take(limit).collect()
     } else {
         Vec::new()
     };
 
-    let scope_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
-        final_state
+    let visibility_winners = if matches!(req.debug, LiveStateRebuildDebugMode::Full) {
+        let mut rows = final_state
             .iter()
             .map(|row| {
-                Ok(ScopeWinnerDebugRow {
+                Ok(VisibilityWinnerDebugRow {
                     version_id: require_identity(row.version_id.clone(), "debug scope version_id")?,
                     entity_id: require_identity(
                         row.source.entity_id.clone(),
@@ -1115,8 +1119,17 @@ fn build_debug_trace(
                     change_id: row.source.change_id.clone(),
                 })
             })
-            .take(limit)
-            .collect::<Result<Vec<_>, LixError>>()?
+            .collect::<Result<Vec<_>, LixError>>()?;
+        rows.sort_by(|a, b| {
+            a.version_id
+                .cmp(&b.version_id)
+                .then_with(|| a.schema_key.cmp(&b.schema_key))
+                .then_with(|| a.file_id.cmp(&b.file_id))
+                .then_with(|| a.entity_id.cmp(&b.entity_id))
+                .then_with(|| a.global.cmp(&b.global))
+                .then_with(|| a.change_id.cmp(&b.change_id))
+        });
+        rows.into_iter().take(limit).collect()
     } else {
         Vec::new()
     };
@@ -1126,7 +1139,7 @@ fn build_debug_trace(
         traversed_commits: traversed_commits.into_iter().take(limit).collect(),
         traversed_edges: traversed_edges.into_iter().take(limit).collect(),
         latest_visible_winners,
-        scope_winners,
+        visibility_winners,
     }))
 }
 
@@ -1209,13 +1222,54 @@ fn optional_identity(value: Option<&str>, context: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{LixBackend, TransactionBeginMode};
+    use crate::canonical::{
+        append_untracked_change_visibility_rows, CanonicalUntrackedVisibilityKind,
+        CanonicalUntrackedVisibilityWrite,
+    };
+    use crate::live_state::materialize::loader;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_local_version_head,
         CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::{CanonicalSchemaKey, EntityId};
+
+    async fn seed_scope_row(
+        backend: &TestSqliteBackend,
+        change_id: &str,
+        version_id: &str,
+        visibility_kind: CanonicalUntrackedVisibilityKind,
+        entity_id: &str,
+        schema_key: &str,
+        created_at: &str,
+    ) {
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("visibility transaction should open");
+        append_untracked_change_visibility_rows(
+            transaction.as_mut(),
+            &[CanonicalUntrackedVisibilityWrite {
+                id: format!("visibility:{change_id}"),
+                change_id: change_id.to_string(),
+                version_id: version_id.to_string(),
+                visibility_kind,
+                entity_id: EntityId::new(entity_id).expect("valid entity id"),
+                schema_key: CanonicalSchemaKey::new(schema_key).expect("valid schema key"),
+                file_id: None,
+                created_at: created_at.to_string(),
+            }],
+        )
+        .await
+        .expect("visibility row should seed");
+        transaction
+            .commit()
+            .await
+            .expect("visibility transaction should commit");
+    }
 
     #[tokio::test]
-    async fn rebuild_plan_rejects_canonical_version_ref_changes() {
+    async fn rebuild_plan_ignores_unscoped_canonical_version_ref_changes() {
         let backend = TestSqliteBackend::new();
         init_test_backend_core(&backend)
             .await
@@ -1235,7 +1289,6 @@ mod tests {
                     "{\"id\":\"commit-local\",\"change_set_id\":\"cs-local\",\"change_ids\":[],\"parent_commit_ids\":[]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T03:00:00Z",
             },
         )
@@ -1255,7 +1308,6 @@ mod tests {
                     "{\"id\":\"commit-legacy\",\"change_set_id\":\"cs-legacy\",\"change_ids\":[],\"parent_commit_ids\":[]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T03:01:00Z",
             },
         )
@@ -1273,7 +1325,6 @@ mod tests {
                 snapshot_id: "snapshot-version-ref-legacy",
                 snapshot_content: Some("{\"id\":\"main\",\"commit_id\":\"commit-legacy\"}"),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T03:02:00Z",
             },
         )
@@ -1289,20 +1340,30 @@ mod tests {
             debug_row_limit: 32,
         };
         let mut executor = &backend;
-        let error = live_state_rebuild_plan_with_executor(&mut executor, &req)
+        let plan = live_state_rebuild_plan_with_executor(&mut executor, &req)
             .await
-            .expect_err("canonical version-ref changes must fail rebuild planning");
+            .expect("canonical version-ref facts without untracked visibility should be ignored");
         assert!(
-            error
-                .description
-                .contains("forbidden schema 'lix_version_ref'"),
-            "expected explicit canonical version-ref rejection, got: {}",
-            error.description
+            !plan
+                .debug
+                .as_ref()
+                .expect("summary debug trace should be present")
+                .heads_by_version
+                .iter()
+                .any(|head| head.version_id == "main"),
+            "expected canonical version-ref facts without untracked visibility to stay out of rebuild heads"
+        );
+        assert!(
+            !plan.writes.iter().any(|write| {
+                write.schema_key.to_string() == "lix_version_ref"
+                    && write.entity_id.to_string() == "main"
+            }),
+            "expected canonical version-ref facts without untracked visibility to stay out of rebuild writes"
         );
     }
 
     #[tokio::test]
-    async fn rebuild_plan_uses_journaled_untracked_version_refs() {
+    async fn rebuild_plan_uses_untracked_visibility_version_refs() {
         let backend = TestSqliteBackend::new();
         init_test_backend_core(&backend)
             .await
@@ -1322,7 +1383,6 @@ mod tests {
                     "{\"id\":\"commit-local\",\"change_set_id\":\"cs-local\",\"change_ids\":[],\"parent_commit_ids\":[]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T03:00:00Z",
             },
         )
@@ -1340,12 +1400,21 @@ mod tests {
                 snapshot_id: "snapshot-version-ref-main",
                 snapshot_content: Some("{\"id\":\"main\",\"commit_id\":\"commit-local\"}"),
                 metadata: None,
-                untracked: true,
                 created_at: "2026-03-30T03:01:00Z",
             },
         )
         .await
-        .expect("untracked canonical version-ref row should seed");
+        .expect("untracked-visible canonical version-ref row should seed");
+        seed_scope_row(
+            &backend,
+            "change-version-ref-main",
+            crate::version::GLOBAL_VERSION_ID,
+            CanonicalUntrackedVisibilityKind::Global,
+            "main",
+            "lix_version_ref",
+            "2026-03-30T03:01:00Z",
+        )
+        .await;
 
         let req = LiveStateRebuildRequest {
             scope: LiveStateRebuildScope::Full,
@@ -1364,7 +1433,7 @@ mod tests {
                 .heads_by_version
                 .iter()
                 .any(|head| head.version_id == "main" && head.commit_id == "commit-local"),
-            "expected materialization heads to come from canonical untracked version refs"
+            "expected materialization heads to come from canonical visible version refs"
         );
 
         let version_ref_write = plan
@@ -1381,6 +1450,64 @@ mod tests {
             version_ref_write.version_id.to_string(),
             crate::version::GLOBAL_VERSION_ID
         );
+    }
+
+    #[tokio::test]
+    async fn rebuild_plan_materializes_local_rows_from_untracked_visibility_relation() {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-key-value-v1",
+                entity_id: "pref-theme",
+                schema_key: "lix_key_value",
+                schema_version: "1",
+                file_id: None,
+                plugin_key: None,
+                snapshot_id: "snapshot-key-value-v1",
+                snapshot_content: Some("{\"key\":\"theme\",\"value\":\"dark\"}"),
+                metadata: None,
+                created_at: "2026-03-30T04:00:00Z",
+            },
+        )
+        .await
+        .expect("untracked-visible local key-value row should seed");
+        seed_scope_row(
+            &backend,
+            "change-key-value-v1",
+            "v1",
+            CanonicalUntrackedVisibilityKind::Version,
+            "pref-theme",
+            "lix_key_value",
+            "2026-03-30T04:00:00Z",
+        )
+        .await;
+
+        let req = LiveStateRebuildRequest {
+            scope: LiveStateRebuildScope::Versions([String::from("v1")].into_iter().collect()),
+            debug: LiveStateRebuildDebugMode::Summary,
+            debug_row_limit: 32,
+        };
+        let mut executor = &backend;
+        let plan = live_state_rebuild_plan_with_executor(&mut executor, &req)
+            .await
+            .expect("untracked-visible local rows should rebuild");
+
+        let key_value_write = plan
+            .writes
+            .iter()
+            .find(|write| {
+                write.schema_key.to_string() == "lix_key_value"
+                    && write.entity_id.to_string() == "pref-theme"
+            })
+            .expect("rebuild plan should materialize untracked-visible local row");
+        assert!(key_value_write.untracked);
+        assert_eq!(key_value_write.version_id.to_string(), "v1");
+        assert_eq!(key_value_write.change_id, "change-key-value-v1");
     }
 
     #[test]
@@ -1446,13 +1573,9 @@ mod tests {
     }
 
     #[test]
-    fn untracked_visible_row_freshness_prefers_journal_identity_over_shuffled_timestamp() {
-        let older_by_journal = VisibleRow {
-            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
-            commit_id: String::new(),
-            replay_cursor: ReplayCursor::new("change-0001", "2026-04-01T00:00:10Z"),
-            change_id: "change-0001".to_string(),
-            untracked: true,
+    fn build_untracked_visibility_projection_rows_prefers_visibility_append_seq() {
+        let older_change = loader::ChangeRecord {
+            id: "change-0001".to_string(),
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
@@ -1464,35 +1587,61 @@ mod tests {
             ),
             metadata: None,
             created_at: "2026-04-01T00:00:10Z".to_string(),
-            updated_at: "2026-04-01T00:00:10Z".to_string(),
+            replay_cursor: ReplayCursor::new("change-0001", "2026-04-01T00:00:10Z"),
         };
-        let newer_by_journal = VisibleRow {
+        let newer_visibility_to_older_change = loader::UntrackedVisibilityRecord {
+            id: "visibility-0002".to_string(),
+            append_seq: 2,
+            change_id: "change-0001".to_string(),
             version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
-            commit_id: String::new(),
-            replay_cursor: ReplayCursor::new("change-0002", "2026-04-01T00:00:01Z"),
-            change_id: "change-0002".to_string(),
-            untracked: true,
+            entity_id: "main".to_string(),
+            schema_key: "lix_version_ref".to_string(),
+            file_id: None,
+        };
+        let newer_change = loader::ChangeRecord {
+            id: "change-0002".to_string(),
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
             file_id: None,
             plugin_key: None,
             snapshot_content: Some(
-                CanonicalJson::from_text("{\"id\":\"main\",\"commit_id\":\"commit-new\"}")
+                CanonicalJson::from_text("{\"id\":\"main\",\"commit_id\":\"commit-newer-fact\"}")
                     .expect("version ref snapshot should parse"),
             ),
             metadata: None,
             created_at: "2026-04-01T00:00:01Z".to_string(),
-            updated_at: "2026-04-01T00:00:01Z".to_string(),
+            replay_cursor: ReplayCursor::new("change-0002", "2026-04-01T00:00:01Z"),
         };
+        let older_visibility_to_newer_change = loader::UntrackedVisibilityRecord {
+            id: "visibility-0001".to_string(),
+            append_seq: 1,
+            change_id: "change-0002".to_string(),
+            version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+            entity_id: "main".to_string(),
+            schema_key: "lix_version_ref".to_string(),
+            file_id: None,
+        };
+        let data = loader::LoadedData {
+            changes: BTreeMap::from([
+                ("change-0001".to_string(), older_change),
+                ("change-0002".to_string(), newer_change),
+            ]),
+            untracked_visibility_rows: vec![
+                older_visibility_to_newer_change,
+                newer_visibility_to_older_change,
+            ],
+            commits: BTreeMap::new(),
+            version_descriptors: BTreeMap::new(),
+        };
+        let mut warnings = Vec::new();
+        let mut stats = Vec::new();
 
-        assert!(untracked_visible_row_is_newer(
-            &newer_by_journal,
-            &older_by_journal
-        ));
-        assert!(!untracked_visible_row_is_newer(
-            &older_by_journal,
-            &newer_by_journal
-        ));
+        let rows = build_untracked_visibility_projection_rows(&data, &mut warnings, &mut stats)
+            .expect("visibility projection should build");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].change_id, "change-0001");
+        assert_eq!(rows[0].commit_id, "commit-old");
     }
 }

@@ -3,6 +3,8 @@ use crate::support;
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Lix, LixConfig};
 use lix_engine::{ObserveQuery, Value};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::Executor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -751,6 +753,90 @@ simulation_test!(
     }
 );
 
+simulation_test!(
+    observe_late_subscription_after_untracked_compaction_reads_current_rows,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
+                 ) VALUES (\
+                 'observe-untracked-compacted', NULL, 'lix_key_value', NULL, '1', \
+                 lix_json('{\"key\":\"observe-untracked-compacted\",\"value\":\"u0\"}'), true\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+        engine
+            .execute(
+                "UPDATE lix_state \
+                 SET snapshot_content = lix_json('{\"key\":\"observe-untracked-compacted\",\"value\":\"u1\"}') \
+                 WHERE entity_id = 'observe-untracked-compacted' \
+                   AND schema_key = 'lix_key_value' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let compacted = engine
+            .compact_untracked_change_journal()
+            .await
+            .expect("untracked compaction should succeed");
+        assert!(
+            compacted <= 1,
+            "expected at most one stale untracked row to be compacted, got {compacted}"
+        );
+
+        let journal_rows = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'observe-untracked-compacted' \
+                   AND untracked = true",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(journal_rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            journal_rows.statements[0].rows[0][0],
+            Value::Text("{\"key\":\"observe-untracked-compacted\",\"value\":\"u1\"}".to_string())
+        );
+
+        let mut observed = engine
+            .observe(ObserveQuery::new(
+                "SELECT entity_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'observe-untracked-compacted' \
+                   AND untracked = true",
+                vec![],
+            ))
+            .expect("observe should succeed");
+
+        let initial = observed
+            .next()
+            .await
+            .expect("initial observe poll should succeed")
+            .expect("initial observe event should exist");
+        assert_eq!(initial.sequence, 0);
+        assert_eq!(
+            initial.rows.rows,
+            vec![vec![Value::Text("observe-untracked-compacted".to_string())]]
+        );
+    }
+);
+
 #[test]
 fn observe_sqlite_detects_external_insert_without_local_commit_stream_event() {
     run_local_observe_sqlite_case(
@@ -887,6 +973,68 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
 }
 
 #[test]
+fn observe_sqlite_late_subscription_after_restart_reads_existing_untracked_state() {
+    run_local_observe_sqlite_case(
+        "observe_sqlite_late_subscription_after_restart_reads_existing_untracked_state",
+        || async {
+            let path = temp_sqlite_observe_path("late-subscription-restart");
+
+            let engine_a = boot_sqlite_engine_at_path(path.clone());
+            engine_a
+                .initialize_if_needed()
+                .await
+                .expect("engine_a init should succeed");
+            engine_a
+                .execute(
+                    "INSERT INTO lix_state (\
+                     entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
+                     ) VALUES (\
+                     'observe-untracked-restart', 'lix', 'lix_key_value', 'lix', '1', \
+                     lix_json('{\"key\":\"observe-untracked-restart\",\"value\":\"u1\"}'), true\
+                     )",
+                    &[],
+                )
+                .await
+                .expect("seed untracked insert should succeed");
+            drop(engine_a);
+
+            let reopened = reopen_sqlite_engine_at_path(path.clone());
+            reopened
+                .initialize_if_needed()
+                .await
+                .expect("reopened engine init should succeed");
+
+            let mut observed = reopened
+                .observe(ObserveQuery::new(
+                    "SELECT entity_id \
+                     FROM lix_state \
+                     WHERE schema_key = 'lix_key_value' \
+                       AND entity_id = 'observe-untracked-restart' \
+                       AND untracked = true",
+                    vec![],
+                ))
+                .expect("observe should succeed");
+
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert_eq!(initial.sequence, 0);
+            assert_eq!(
+                initial.rows.rows,
+                vec![vec![Value::Text("observe-untracked-restart".to_string())]]
+            );
+
+            observed.close();
+            drop(observed);
+            drop(reopened);
+            cleanup_sqlite_path(&path);
+        },
+    );
+}
+
+#[test]
 fn observe_postgres_detects_external_insert_without_local_commit_stream_event() {
     run_local_observe_postgres_case(
         "observe_postgres_detects_external_insert_without_local_commit_stream_event",
@@ -1010,6 +1158,74 @@ fn observe_postgres_detects_external_untracked_state_insert() {
             assert_eq!(update.state_commit_sequence, None);
         },
     );
+}
+
+#[test]
+fn observe_postgres_detects_external_untracked_state_insert_without_observe_tick() {
+    run_local_observe_postgres_case("observe-external-untracked-no-tick", || async {
+        let connection_string = support::simulations::create_postgres_test_database_url(
+            "observe-external-untracked-no-tick",
+        )
+        .await
+        .expect("postgres database url should be created");
+        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+        let engine_b = boot_postgres_engine_at_url(connection_string.clone());
+
+        engine_a
+            .initialize_if_needed()
+            .await
+            .expect("engine_a init should succeed");
+        engine_b
+            .initialize_if_needed()
+            .await
+            .expect("engine_b init should succeed");
+        let session_a = Arc::clone(&engine_a);
+        let session_b = Arc::clone(&engine_b);
+
+        let mut observed = session_a
+            .observe(ObserveQuery::new(
+                "SELECT entity_id \
+                 FROM lix_state \
+                 WHERE schema_key = 'lix_key_value' \
+                   AND entity_id = 'observe-untracked-external-no-tick' \
+                   AND untracked = true",
+                vec![],
+            ))
+            .expect("observe should succeed");
+
+        let initial = observed
+            .next()
+            .await
+            .expect("initial observe next should succeed")
+            .expect("initial observe event should exist");
+        assert!(initial.rows.rows.is_empty());
+
+        session_b
+                .execute(
+                    "INSERT INTO lix_state (\
+                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
+                 ) VALUES (\
+                 'observe-untracked-external-no-tick', 'lix', 'lix_key_value', 'lix', '1', \
+                 lix_json('{\"key\":\"observe-untracked-external-no-tick\",\"value\":\"u1\"}'), true\
+                 )",
+                    &[],
+                )
+                .await
+                .expect("external untracked insert should succeed");
+        clear_observe_ticks_direct_postgres(&connection_string).await;
+
+        let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+            .await
+            .expect("observe next should not time out")
+            .expect("observe next should succeed")
+            .expect("observe update event should exist");
+        assert_eq!(update.rows.rows.len(), 1);
+        assert_eq!(
+            update.rows.rows[0][0],
+            Value::Text("observe-untracked-external-no-tick".to_string())
+        );
+        assert_eq!(update.state_commit_sequence, None);
+    });
 }
 
 #[test]
@@ -1370,11 +1586,33 @@ fn boot_sqlite_engine_at_path(path: PathBuf) -> Arc<Lix> {
     )))
 }
 
+fn reopen_sqlite_engine_at_path(path: PathBuf) -> Arc<Lix> {
+    Arc::new(Lix::boot(LixConfig::new(
+        support::simulations::sqlite_backend_with_filename(format!(
+            "sqlite://{}",
+            path.to_string_lossy()
+        )),
+        Arc::new(NoopWasmRuntime),
+    )))
+}
+
 fn boot_postgres_engine_at_url(connection_string: String) -> Arc<Lix> {
     Arc::new(Lix::boot(LixConfig::new(
         support::simulations::postgres_backend_with_connection_string(connection_string),
         Arc::new(NoopWasmRuntime),
     )))
+}
+
+async fn clear_observe_ticks_direct_postgres(connection_string: &str) {
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(connection_string)
+        .await
+        .expect("postgres test pool should connect");
+    pool.execute("DELETE FROM lix_internal_observe_tick")
+        .await
+        .expect("direct postgres tick cleanup should succeed");
+    pool.close().await;
 }
 
 fn temp_sqlite_observe_path(label: &str) -> PathBuf {

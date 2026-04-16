@@ -2,7 +2,7 @@ use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedRelation,
 };
-use crate::sql::{PlannedFilesystemState, PreparedWriteStatementKind};
+use crate::sql::{PlannedFilesystemState, PreparedWriteStatementKind, WriteMode};
 use crate::streams::should_invalidate_deterministic_settings_cache;
 use crate::transaction::{
     binary_blob_writes_from_filesystem_state,
@@ -10,9 +10,8 @@ use crate::transaction::{
     filesystem_transaction_state_from_planned, merge_filesystem_transaction_state,
     persist_filesystem_payload_changes_in_transaction, BufferedWriteCommandMetadata,
     BufferedWriteExecutionInput, BufferedWriteExecutionResult, BufferedWriteFlushClass,
-    BufferedWriteSessionEffects, DeferredCommitEffects, PreparedPublicWriteExecutionPartition,
-    PreparedWriteStatement, TransactionCommitOutcome, WriteCommand, WriteExecutionContext,
-    WritePath,
+    BufferedWriteSessionEffects, DeferredCommitEffects, PreparedWriteStatement,
+    TransactionCommitOutcome, WriteCommand, WriteExecutionContext, WritePath,
 };
 use crate::{LixBackendTransaction, LixError};
 
@@ -215,9 +214,10 @@ fn public_write_filesystem_payload_changes_already_committed(
     };
     is_catalog_filesystem_file_surface(&public_write.contract.target)
         && public_write.materialization().is_some_and(|execution| {
-            execution.partitions.iter().any(|partition| {
-                matches!(partition, PreparedPublicWriteExecutionPartition::Tracked(_))
-            })
+            execution
+                .partitions
+                .iter()
+                .any(|partition| partition.execution_mode == WriteMode::Tracked)
         })
 }
 

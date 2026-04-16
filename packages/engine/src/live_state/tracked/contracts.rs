@@ -35,7 +35,7 @@ use crate::LixBackend;
 use crate::LixError;
 use crate::Value;
 
-/// Decoded tracked live row.
+/// Decoded live row from the tracked visibility lane.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct TrackedRow {
     pub entity_id: String,

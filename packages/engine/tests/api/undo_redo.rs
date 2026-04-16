@@ -2,12 +2,20 @@ use crate::support;
 
 use lix_engine::streams::{StateCommitStreamFilter, StateCommitStreamOperation};
 use lix_engine::{CreateVersionOptions, UndoOptions, Value};
+use serde_json::Value as JsonValue;
 
 const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
 
 fn as_text(value: &Value) -> String {
     match value {
         Value::Text(text) => text.clone(),
+        other => panic!("expected text value, got {other:?}"),
+    }
+}
+
+fn parse_json(value: &Value) -> JsonValue {
+    match value {
+        Value::Text(text) => serde_json::from_str(text).expect("expected valid json text"),
         other => panic!("expected text value, got {other:?}"),
     }
 }
@@ -278,6 +286,76 @@ simulation_test!(undo_stops_after_last_user_commit, |sim| async move {
         error.description
     );
 });
+
+simulation_test!(
+    undo_ignores_journaled_untracked_version_ref_rows,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix_deterministic()
+            .await
+            .expect("boot_simulated_lix_deterministic should succeed");
+        engine.initialize().await.expect("init should succeed");
+
+        engine
+            .execute(
+                "INSERT INTO lix_key_value (key, value) VALUES ('undo-tracked-only', 'v1')",
+                &[],
+            )
+            .await
+            .expect("tracked insert should succeed");
+
+        let (version_id, inserted_commit_id) = active_version_ref(&engine).await;
+        let version_ref_change = engine
+            .execute(
+                "SELECT change_id \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_version_ref' \
+                   AND entity_id = $1 \
+                   AND untracked = true \
+                 LIMIT 1",
+                &[Value::Text(version_id.clone())],
+            )
+            .await
+            .expect("version_ref state query should succeed");
+        assert_eq!(version_ref_change.statements[0].rows.len(), 1);
+        let version_ref_change_id = as_text(&version_ref_change.statements[0].rows[0][0]);
+
+        let commit_snapshot = engine
+            .execute(
+                "SELECT snapshot_content \
+                 FROM lix_change \
+                 WHERE schema_key = 'lix_commit' \
+                   AND entity_id = $1 \
+                 LIMIT 1",
+                &[Value::Text(inserted_commit_id.clone())],
+            )
+            .await
+            .expect("commit snapshot query should succeed");
+        assert_eq!(commit_snapshot.statements[0].rows.len(), 1);
+        let commit_snapshot = parse_json(&commit_snapshot.statements[0].rows[0][0]);
+        let tracked_member_change_ids = commit_snapshot["change_ids"]
+            .as_array()
+            .expect("commit snapshot should include change_ids")
+            .iter()
+            .filter_map(|value| value.as_str())
+            .collect::<Vec<_>>();
+        assert!(
+            !tracked_member_change_ids.contains(&version_ref_change_id.as_str()),
+            "undo/redo commit membership must stay tracked-only, got {:?}",
+            tracked_member_change_ids
+        );
+
+        // This is likely a temporary product policy rather than a hard engine limit.
+        // We journal untracked rows now, so we can choose to make some untracked state
+        // undoable in the future without reintroducing the old dual-write mechanism.
+        engine.undo().await.expect("tracked undo should succeed");
+        let error = engine
+            .undo()
+            .await
+            .expect_err("journaled untracked version-ref rows must not create extra undo steps");
+        assert_eq!(error.code, "LIX_ERROR_NOTHING_TO_UNDO");
+    }
+);
 
 simulation_test!(checkpoint_label_delete_is_rejected, |sim| async move {
     let engine = sim
@@ -588,6 +666,11 @@ simulation_test!(
 
         engine.undo().await.expect("undo should succeed");
         let undo_batch = events.try_next().expect("undo should emit one event batch");
+        assert!(
+            undo_batch.changes.iter().all(|change| !change.untracked),
+            "undo stream batch should stay tracked-only: {:?}",
+            undo_batch.changes
+        );
         assert!(undo_batch.changes.iter().any(|change| {
             change.entity_id == "undo-stream"
                 && change.schema_key == "lix_key_value"
@@ -596,6 +679,11 @@ simulation_test!(
 
         engine.redo().await.expect("redo should succeed");
         let redo_batch = events.try_next().expect("redo should emit one event batch");
+        assert!(
+            redo_batch.changes.iter().all(|change| !change.untracked),
+            "redo stream batch should stay tracked-only: {:?}",
+            redo_batch.changes
+        );
         assert!(redo_batch.changes.iter().any(|change| {
             change.entity_id == "undo-stream"
                 && change.schema_key == "lix_key_value"

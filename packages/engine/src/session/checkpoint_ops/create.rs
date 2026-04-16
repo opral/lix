@@ -46,7 +46,7 @@ async fn create_checkpoint_in_transaction(
     let local_commit_id = active_context.head_commit_id().to_string();
     let global_commit_id = global_context.head_commit_id().to_string();
 
-    let commit = load_commit(tx, &local_commit_id)
+    let commit = load_tracked_commit_header(tx, &local_commit_id)
         .await?
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -90,10 +90,12 @@ struct CommitRow {
     change_set_id: String,
 }
 
-async fn load_commit(
+async fn load_tracked_commit_header(
     tx: &mut SessionTransaction<'_>,
     commit_id: &str,
 ) -> Result<Option<CommitRow>, LixError> {
+    // Checkpoint creation only needs the tracked commit header fact; it does
+    // not traverse commit-member change rows here.
     let mut executor = tx.backend_transaction_mut()?;
     let Some(commit) = load_canonical_commit(&mut executor, commit_id).await? else {
         return Ok(None);
@@ -185,9 +187,9 @@ async fn insert_canonical_checkpoint_label_change(
         .execute(
             &format!(
                 "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at\
+             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
              ) \
-             SELECT $1, $2, '{schema_key}', '1', NULL, NULL, $3, NULL, false, $4 \
+             SELECT $1, $2, '{schema_key}', '1', NULL, NULL, $3, NULL, $4 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
                 schema_key = CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
             ),

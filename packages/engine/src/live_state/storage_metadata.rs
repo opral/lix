@@ -44,6 +44,7 @@ fn builtin_storage_lane(schema_key: &str) -> BuiltinSchemaStorageLane {
     match schema_key {
         "lix_version_ref"
         | "lix_version_descriptor"
+        | "lix_registered_schema"
         | "lix_active_version"
         | "lix_active_account" => BuiltinSchemaStorageLane::Global,
         _ => BuiltinSchemaStorageLane::Local,

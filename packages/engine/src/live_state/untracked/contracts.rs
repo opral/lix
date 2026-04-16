@@ -27,7 +27,7 @@ use crate::LixBackend;
 use crate::LixError;
 use crate::Value;
 
-/// Decoded untracked/helper live row.
+/// Decoded live row from the untracked visibility lane.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct UntrackedRow {
     pub entity_id: String,

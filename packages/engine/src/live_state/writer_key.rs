@@ -6,9 +6,9 @@
 //! so engine-owned rows can participate in a single uniqueness shape.
 //!
 //! This table is intentionally separate from canonical changes and live-state
-//! tracked/untracked row tables. It stores only the writer-key metadata that
-//! live-state overlays onto served rows while the migration to pure row-shaped
-//! APIs is still in progress.
+//! tracked/untracked row projections. It stores only the writer-key metadata
+//! that live-state overlays onto served rows while the migration to pure
+//! row-shaped APIs is still in progress.
 
 use std::collections::{BTreeMap, BTreeSet};
 

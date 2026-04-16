@@ -341,6 +341,7 @@ pub(crate) async fn init_test_backend_core(backend: &dyn LixBackend) -> Result<(
     crate::live_state::init(backend).await?;
     crate::init::init_builtin_schema_storage(backend).await?;
     crate::canonical::init(backend).await?;
+    crate::streams::init(backend).await?;
     crate::session::version_ops::commit::init(backend).await?;
     crate::session::version_ops::init(backend).await?;
     Ok(())
@@ -411,7 +412,6 @@ pub(crate) struct CanonicalChangeSeed<'a> {
     pub(crate) snapshot_id: &'a str,
     pub(crate) snapshot_content: Option<&'a str>,
     pub(crate) metadata: Option<&'a str>,
-    pub(crate) untracked: bool,
     pub(crate) created_at: &'a str,
 }
 
@@ -425,9 +425,9 @@ pub(crate) async fn seed_canonical_change_row(
     backend
         .execute(
             "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at\
+             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
              ) VALUES (\
-             $1, $2, $3, $4, $5, $6, $7, $8, $9, $10\
+             $1, $2, $3, $4, $5, $6, $7, $8, $9\
              )",
             &[
                 Value::Text(seed.id.to_string()),
@@ -444,7 +444,6 @@ pub(crate) async fn seed_canonical_change_row(
                 seed.metadata
                     .map(|value| Value::Text(value.to_string()))
                     .unwrap_or(Value::Null),
-                Value::Boolean(seed.untracked),
                 Value::Text(seed.created_at.to_string()),
             ],
         )
@@ -687,7 +686,6 @@ mod tests {
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[],\"parent_commit_ids\":[]}",
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )
@@ -736,8 +734,8 @@ mod tests {
         );
         let error = backend
             .execute(
-                "INSERT INTO lix_internal_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at) \
-                 VALUES ('change-2', 'entity', 'schema', '1', NULL, NULL, 'no-content', NULL, 0, '2026-03-30T00:00:01Z')",
+                "INSERT INTO lix_internal_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at) \
+                 VALUES ('change-2', 'entity', 'schema', '1', NULL, NULL, 'no-content', NULL, '2026-03-30T00:00:01Z')",
                 &[],
             )
             .await

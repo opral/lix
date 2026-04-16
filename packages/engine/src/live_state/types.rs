@@ -353,7 +353,8 @@ fn value_as_text(value: &Value) -> Option<&str> {
     }
 }
 
-/// Logical live-state row key shared across tracked and untracked lanes.
+/// Logical live-state row key shared across the tracked and untracked
+/// visibility lanes.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RowIdentity {
     pub schema_key: String,

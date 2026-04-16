@@ -58,6 +58,75 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulatedLi
     )
 }
 
+async fn bootstrap_visible_state_rows(
+    engine: &support::simulation_test::SimulatedLix,
+) -> Vec<Vec<Value>> {
+    engine
+        .execute(
+            "SELECT schema_key, entity_id, schema_version, file_id, version_id, change_id, untracked, snapshot_content \
+             FROM lix_state_by_version \
+             WHERE schema_key IN (\
+               'lix_registered_schema', \
+               'lix_key_value', \
+               'lix_version_ref', \
+               'lix_version_descriptor', \
+               'lix_directory_descriptor', \
+               'lix_label', \
+               'lix_entity_label'\
+             ) \
+               AND snapshot_content IS NOT NULL \
+             ORDER BY schema_key, entity_id, schema_version, file_id, version_id, untracked, change_id",
+            &[],
+        )
+        .await
+        .expect("bootstrap visible-state query should succeed")
+        .statements[0]
+        .rows
+        .clone()
+}
+
+async fn live_storage_table_names(engine: &support::simulation_test::SimulatedLix) -> Vec<String> {
+    let sqlite_query = engine
+        .execute(
+            "SELECT name \
+             FROM sqlite_master \
+             WHERE type = 'table' \
+               AND name LIKE 'lix_internal_live_v1_%' \
+             ORDER BY name",
+            &[],
+        )
+        .await;
+    let result = match sqlite_query {
+        Ok(result) => result,
+        Err(_) => engine
+            .execute(
+                "SELECT table_name \
+                 FROM information_schema.tables \
+                 WHERE table_schema = current_schema() \
+                   AND table_name LIKE 'lix_internal_live_v1_%' \
+                 ORDER BY table_name",
+                &[],
+            )
+            .await
+            .expect("live storage table discovery query should succeed"),
+    };
+
+    result.statements[0]
+        .rows
+        .iter()
+        .map(|row| text_value(&row[0], "live storage table name"))
+        .collect()
+}
+
+async fn delete_all_live_storage_rows(engine: &support::simulation_test::SimulatedLix) {
+    for table_name in live_storage_table_names(engine).await {
+        engine
+            .execute(&format!("DELETE FROM {table_name}"), &[])
+            .await
+            .unwrap_or_else(|error| panic!("failed to clear live table '{table_name}': {error}"));
+    }
+}
+
 fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Lix> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
@@ -831,7 +900,9 @@ simulation_test!(
             let entity_id = text_value(&row[1], "lix_change.entity_id");
             match &row[2] {
                 Value::Boolean(true) => {}
-                other => panic!("expected boolean true for lix_change.untracked, got {other:?}"),
+                other => {
+                    panic!("expected derived true for public lix_change.untracked, got {other:?}")
+                }
             }
             assert_eq!(
                 state_change_ids.get(&entity_id).map(String::as_str),
@@ -938,7 +1009,9 @@ simulation_test!(
             let entity_id = text_value(&row[1], "lix_change.entity_id");
             match &row[2] {
                 Value::Boolean(true) => {}
-                other => panic!("expected boolean true for lix_change.untracked, got {other:?}"),
+                other => {
+                    panic!("expected derived true for public lix_change.untracked, got {other:?}")
+                }
             }
             assert_eq!(
                 state_change_ids.get(&entity_id).map(String::as_str),
@@ -1653,6 +1726,63 @@ simulation_test!(
         assert_eq!(
             system_directory_count_after, system_directory_count_before,
             "repeated init must not duplicate seeded system directories"
+        );
+    }
+);
+
+simulation_test!(
+    fresh_init_full_rebuild_restores_bootstrap_visible_state_from_journal,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
+                key_values: vec![BootKeyValue {
+                    key: "rebuild_boot_key".to_string(),
+                    value: json!("seeded"),
+                    lixcol_global: Some(true),
+                    lixcol_untracked: Some(false),
+                }],
+                ..support::simulation_test::SimulatedLixBootArgs::default()
+            }))
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+
+        let before_rows = bootstrap_visible_state_rows(&engine).await;
+        assert!(
+            !before_rows.is_empty(),
+            "fresh init should expose bootstrap visible state before rebuild"
+        );
+
+        delete_all_live_storage_rows(&engine).await;
+
+        let after_delete = bootstrap_visible_state_rows(&engine).await;
+        assert!(
+            after_delete.is_empty(),
+            "deleting all live storage rows should clear bootstrap visible state before rebuild"
+        );
+
+        let report = engine
+            .rebuild_live_state(&lix_engine::LiveStateRebuildRequest {
+                scope: lix_engine::LiveStateRebuildScope::Full,
+                debug: lix_engine::LiveStateRebuildDebugMode::Off,
+                debug_row_limit: 0,
+            })
+            .await
+            .expect("full rebuild after fresh init should succeed");
+        assert!(
+            report.apply.rows_written > 0,
+            "fresh-init rebuild should write restored live-state rows"
+        );
+
+        let after_rows = bootstrap_visible_state_rows(&engine).await;
+        assert_eq!(
+            after_rows, before_rows,
+            "full rebuild should restore the same bootstrap-visible state from the journal"
         );
     }
 );

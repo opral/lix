@@ -1,5 +1,6 @@
 mod state_change_record;
 
+use crate::backend::{execute_ddl_batch, LixBackend, LixBackendTransaction, QueryExecutor};
 use crate::sql::PlannedStateRow;
 use crate::sql::{MutationOperation, MutationRow};
 use crate::{LixError, Value};
@@ -15,6 +16,9 @@ use std::task::Poll;
 const MAX_PENDING_BATCHES_PER_LISTENER: usize = 256;
 const DETERMINISTIC_SETTINGS_SCHEMA_KEY: &str = "lix_key_value";
 const DETERMINISTIC_SETTINGS_ENTITY_ID: &str = "lix_deterministic_mode";
+pub(crate) const DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE: &str =
+    "lix_internal_change_consumer_cursor";
+pub(crate) const LIVE_STATE_DURABLE_CONSUMER_KEY: &str = "live_state_projection";
 
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub enum StateCommitStreamOperation {
@@ -48,6 +52,33 @@ pub struct StateCommitStreamFilter {
     pub include_untracked: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableStateCommitCursor {
+    pub(crate) change_id: String,
+    pub(crate) created_at: String,
+    pub(crate) visibility_append_seq: i64,
+}
+
+impl DurableStateCommitCursor {
+    fn is_newer_than(&self, other: &Self) -> bool {
+        self.created_at > other.created_at
+            || (self.created_at == other.created_at && self.change_id > other.change_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableStateCommitCatchUp {
+    pub(crate) latest_cursor: Option<DurableStateCommitCursor>,
+    pub(crate) has_matching_changes: bool,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableStateCommitConsumerCursor {
+    pub(crate) consumer_key: String,
+    pub(crate) cursor: DurableStateCommitCursor,
+}
+
 impl Default for StateCommitStreamFilter {
     fn default() -> Self {
         Self {
@@ -60,6 +91,258 @@ impl Default for StateCommitStreamFilter {
             include_untracked: true,
         }
     }
+}
+
+pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
+    let statements = [
+        format!(
+            "CREATE TABLE IF NOT EXISTS {DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE} (\
+             consumer_key TEXT PRIMARY KEY,\
+             change_id TEXT NOT NULL,\
+             change_created_at TEXT NOT NULL,\
+             visibility_append_seq BIGINT NOT NULL DEFAULT 0\
+             )"
+        ),
+        format!(
+            "CREATE INDEX IF NOT EXISTS idx_lix_internal_change_consumer_cursor_cursor \
+             ON {DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE} \
+             (visibility_append_seq, change_created_at, change_id)"
+        ),
+    ];
+    let statement_refs = statements.iter().map(String::as_str).collect::<Vec<_>>();
+    execute_ddl_batch(backend, "streams", &statement_refs).await
+}
+
+pub(crate) async fn latest_durable_state_commit_cursor(
+    backend: &dyn LixBackend,
+) -> Result<Option<DurableStateCommitCursor>, LixError> {
+    let result = backend
+        .execute(
+            "SELECT id, created_at \
+             FROM lix_internal_change \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            &[],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    let mut executor = backend;
+    let visibility_append_seq =
+        load_latest_untracked_visibility_append_seq_with_executor(&mut executor).await?;
+    Ok(Some(DurableStateCommitCursor {
+        change_id: required_text_value(row.first(), "lix_internal_change.id")?,
+        created_at: required_text_value(row.get(1), "lix_internal_change.created_at")?,
+        visibility_append_seq,
+    }))
+}
+
+#[allow(dead_code)]
+pub(crate) async fn load_durable_state_commit_consumer_cursors(
+    backend: &dyn LixBackend,
+) -> Result<Vec<DurableStateCommitConsumerCursor>, LixError> {
+    let result = backend
+        .execute(
+            &format!(
+                "SELECT consumer_key, change_id, change_created_at \
+                 , visibility_append_seq \
+                 FROM {DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE} \
+                 ORDER BY visibility_append_seq ASC, change_created_at ASC, change_id ASC, consumer_key ASC"
+            ),
+            &[],
+        )
+        .await?;
+
+    result
+        .rows
+        .iter()
+        .map(|row| {
+            Ok(DurableStateCommitConsumerCursor {
+                consumer_key: required_text_value(
+                    row.first(),
+                    "lix_internal_change_consumer_cursor.consumer_key",
+                )?,
+                cursor: DurableStateCommitCursor {
+                    change_id: required_text_value(
+                        row.get(1),
+                        "lix_internal_change_consumer_cursor.change_id",
+                    )?,
+                    created_at: required_text_value(
+                        row.get(2),
+                        "lix_internal_change_consumer_cursor.change_created_at",
+                    )?,
+                    visibility_append_seq: required_integer_value(
+                        row.get(3),
+                        "lix_internal_change_consumer_cursor.visibility_append_seq",
+                    )?,
+                },
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub(crate) async fn load_durable_state_commit_low_watermark(
+    backend: &dyn LixBackend,
+) -> Result<Option<DurableStateCommitCursor>, LixError> {
+    let result = backend
+        .execute(
+            &format!(
+                "SELECT change_id, change_created_at \
+                 , visibility_append_seq \
+                 FROM {DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE} \
+                 ORDER BY visibility_append_seq ASC, change_created_at ASC, change_id ASC, consumer_key ASC \
+                 LIMIT 1"
+            ),
+            &[],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(None);
+    };
+    Ok(Some(DurableStateCommitCursor {
+        change_id: required_text_value(
+            row.first(),
+            "lix_internal_change_consumer_cursor.change_id",
+        )?,
+        created_at: required_text_value(
+            row.get(1),
+            "lix_internal_change_consumer_cursor.change_created_at",
+        )?,
+        visibility_append_seq: required_integer_value(
+            row.get(2),
+            "lix_internal_change_consumer_cursor.visibility_append_seq",
+        )?,
+    }))
+}
+
+pub(crate) async fn upsert_durable_state_commit_consumer_cursor_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    consumer_key: &str,
+    cursor: &DurableStateCommitCursor,
+) -> Result<(), LixError> {
+    let mut executor = &mut *transaction;
+    upsert_durable_state_commit_consumer_cursor_with_executor(&mut executor, consumer_key, cursor)
+        .await
+}
+
+pub(crate) async fn upsert_durable_state_commit_consumer_cursor_with_backend(
+    backend: &dyn LixBackend,
+    consumer_key: &str,
+    cursor: &DurableStateCommitCursor,
+) -> Result<(), LixError> {
+    let mut executor = backend;
+    upsert_durable_state_commit_consumer_cursor_with_executor(&mut executor, consumer_key, cursor)
+        .await
+}
+
+async fn upsert_durable_state_commit_consumer_cursor_with_executor(
+    executor: &mut dyn QueryExecutor,
+    consumer_key: &str,
+    cursor: &DurableStateCommitCursor,
+) -> Result<(), LixError> {
+    let p1 = executor.dialect().placeholder(1);
+    let p2 = executor.dialect().placeholder(2);
+    let p3 = executor.dialect().placeholder(3);
+    let p4 = executor.dialect().placeholder(4);
+    executor
+        .execute(
+            &format!(
+                "INSERT INTO {DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE} \
+                 (consumer_key, change_id, change_created_at, visibility_append_seq) \
+                 VALUES ({p1}, {p2}, {p3}, {p4}) \
+                 ON CONFLICT (consumer_key) DO UPDATE SET \
+                   change_id = excluded.change_id, \
+                   change_created_at = excluded.change_created_at, \
+                   visibility_append_seq = excluded.visibility_append_seq"
+            ),
+            &[
+                Value::Text(consumer_key.to_string()),
+                Value::Text(cursor.change_id.clone()),
+                Value::Text(cursor.created_at.clone()),
+                Value::Integer(cursor.visibility_append_seq),
+            ],
+        )
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn load_latest_untracked_visibility_append_seq(
+    backend: &dyn LixBackend,
+) -> Result<i64, LixError> {
+    let mut executor = backend;
+    load_latest_untracked_visibility_append_seq_with_executor(&mut executor).await
+}
+
+pub(crate) async fn load_latest_untracked_visibility_append_seq_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<i64, LixError> {
+    let mut executor = &mut *transaction;
+    load_latest_untracked_visibility_append_seq_with_executor(&mut executor).await
+}
+
+async fn load_latest_untracked_visibility_append_seq_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<i64, LixError> {
+    let result = executor
+        .execute(
+            "SELECT COALESCE(MAX(append_seq), 0) \
+             FROM lix_internal_untracked_change_visibility",
+            &[],
+        )
+        .await?;
+    let Some(row) = result.rows.first() else {
+        return Ok(0);
+    };
+    required_integer_value(
+        row.first(),
+        "lix_internal_untracked_change_visibility.append_seq",
+    )
+}
+
+pub(crate) async fn delete_durable_state_commit_consumer_cursor_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    consumer_key: &str,
+) -> Result<(), LixError> {
+    let placeholder = transaction.dialect().placeholder(1);
+    transaction
+        .execute(
+            &format!(
+                "DELETE FROM {DURABLE_STATE_COMMIT_CONSUMER_CURSOR_TABLE} \
+                 WHERE consumer_key = {placeholder}"
+            ),
+            &[Value::Text(consumer_key.to_string())],
+        )
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn load_durable_state_commit_catch_up(
+    backend: &dyn LixBackend,
+    after: Option<&DurableStateCommitCursor>,
+    filter: &StateCommitStreamFilter,
+) -> Result<DurableStateCommitCatchUp, LixError> {
+    let latest_cursor = latest_durable_state_commit_cursor(backend).await?;
+    let Some(latest_cursor_ref) = latest_cursor.as_ref() else {
+        return Ok(DurableStateCommitCatchUp {
+            latest_cursor,
+            has_matching_changes: false,
+        });
+    };
+    if after.is_some_and(|cursor| !latest_cursor_ref.is_newer_than(cursor)) {
+        return Ok(DurableStateCommitCatchUp {
+            latest_cursor,
+            has_matching_changes: false,
+        });
+    }
+
+    let has_matching_changes =
+        durable_state_commit_changes_exist_since(backend, after, filter).await?;
+    Ok(DurableStateCommitCatchUp {
+        latest_cursor,
+        has_matching_changes,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -589,9 +872,134 @@ fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValu
     }
 }
 
+async fn durable_state_commit_changes_exist_since(
+    backend: &dyn LixBackend,
+    after: Option<&DurableStateCommitCursor>,
+    filter: &StateCommitStreamFilter,
+) -> Result<bool, LixError> {
+    let dialect = backend.dialect();
+    let mut params = Vec::new();
+    let mut next_placeholder = 1usize;
+    let mut predicates = Vec::new();
+
+    if let Some(after) = after {
+        let created_after = dialect.placeholder(next_placeholder);
+        params.push(Value::Text(after.created_at.clone()));
+        next_placeholder += 1;
+
+        let created_equal = dialect.placeholder(next_placeholder);
+        params.push(Value::Text(after.created_at.clone()));
+        next_placeholder += 1;
+
+        let change_after = dialect.placeholder(next_placeholder);
+        params.push(Value::Text(after.change_id.clone()));
+        next_placeholder += 1;
+
+        predicates.push(format!(
+            "(c.created_at > {created_after} OR (c.created_at = {created_equal} AND c.id > {change_after}))"
+        ));
+    }
+
+    if !filter.include_untracked {
+        predicates.push(
+            "NOT EXISTS ( \
+                 SELECT 1 \
+                 FROM lix_internal_untracked_change_visibility uv \
+                 WHERE uv.change_id = c.id \
+             )"
+            .to_string(),
+        );
+    }
+
+    append_text_in_predicate(
+        &mut predicates,
+        "c.schema_key",
+        &filter.schema_keys,
+        dialect,
+        &mut next_placeholder,
+        &mut params,
+    );
+    append_text_in_predicate(
+        &mut predicates,
+        "c.entity_id",
+        &filter.entity_ids,
+        dialect,
+        &mut next_placeholder,
+        &mut params,
+    );
+    append_text_in_predicate(
+        &mut predicates,
+        "c.file_id",
+        &filter.file_ids,
+        dialect,
+        &mut next_placeholder,
+        &mut params,
+    );
+
+    let where_sql = if predicates.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", predicates.join(" AND "))
+    };
+    let sql = format!(
+        "SELECT 1 \
+         FROM lix_internal_change c \
+         {where_sql} \
+         LIMIT 1"
+    );
+    let result = backend.execute(&sql, &params).await?;
+    Ok(!result.rows.is_empty())
+}
+
+fn append_text_in_predicate(
+    predicates: &mut Vec<String>,
+    column: &str,
+    values: &[String],
+    dialect: crate::SqlDialect,
+    next_placeholder: &mut usize,
+    params: &mut Vec<Value>,
+) {
+    if values.is_empty() {
+        return;
+    }
+
+    let mut placeholders = Vec::with_capacity(values.len());
+    for value in values {
+        placeholders.push(dialect.placeholder(*next_placeholder));
+        params.push(Value::Text(value.clone()));
+        *next_placeholder += 1;
+    }
+    predicates.push(format!("{column} IN ({})", placeholders.join(", ")));
+}
+
 fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
     match operation {
         MutationOperation::Insert => StateCommitStreamOperation::Insert,
+    }
+}
+
+fn required_text_value(value: Option<&Value>, field: &str) -> Result<String, LixError> {
+    match value {
+        Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
+        Some(Value::Integer(number)) => Ok(number.to_string()),
+        Some(other) => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("expected text-like value for {field}, got {other:?}"),
+        }),
+        None => Err(LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("{field} is missing"),
+        }),
+    }
+}
+
+fn required_integer_value(value: Option<&Value>, field: &str) -> Result<i64, LixError> {
+    match value {
+        Some(Value::Integer(number)) => Ok(*number),
+        Some(other) => Err(LixError::unknown(format!(
+            "expected integer for {field}, got {other:?}"
+        ))),
+        None => Err(LixError::unknown(format!("missing column {field}"))),
     }
 }
 
@@ -656,11 +1064,16 @@ fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitStreamBatch) {
 #[cfg(test)]
 mod tests {
     use super::{
+        load_durable_state_commit_consumer_cursors, load_durable_state_commit_low_watermark,
         state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
+        upsert_durable_state_commit_consumer_cursor_in_transaction, DurableStateCommitCursor,
         StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
+    use crate::backend::LixBackend;
     use crate::session::version_ops::commit::StagedChange;
     use crate::sql::PlannedStateRow;
+    use crate::test_support::{init_test_backend_core, TestSqliteBackend};
+    use crate::TransactionBeginMode;
     use crate::Value;
     use std::collections::BTreeMap;
 
@@ -780,5 +1193,64 @@ mod tests {
             }))
         );
         assert!(changes[0].untracked);
+    }
+
+    #[tokio::test]
+    async fn durable_state_commit_low_watermark_returns_oldest_registered_consumer_cursor() {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        let mut transaction = backend
+            .begin_transaction(TransactionBeginMode::Write)
+            .await
+            .expect("transaction should begin");
+
+        upsert_durable_state_commit_consumer_cursor_in_transaction(
+            transaction.as_mut(),
+            "consumer-b",
+            &DurableStateCommitCursor {
+                change_id: "change-002".to_string(),
+                created_at: "2026-04-15T00:00:02Z".to_string(),
+                visibility_append_seq: 2,
+            },
+        )
+        .await
+        .expect("consumer-b cursor should persist");
+        upsert_durable_state_commit_consumer_cursor_in_transaction(
+            transaction.as_mut(),
+            "consumer-a",
+            &DurableStateCommitCursor {
+                change_id: "change-001".to_string(),
+                created_at: "2026-04-15T00:00:01Z".to_string(),
+                visibility_append_seq: 1,
+            },
+        )
+        .await
+        .expect("consumer-a cursor should persist");
+        transaction
+            .commit()
+            .await
+            .expect("transaction commit should succeed");
+
+        let cursors = load_durable_state_commit_consumer_cursors(&backend)
+            .await
+            .expect("consumer cursors should load");
+        assert_eq!(cursors.len(), 2);
+        assert_eq!(cursors[0].consumer_key, "consumer-a");
+        assert_eq!(cursors[1].consumer_key, "consumer-b");
+
+        let low_watermark = load_durable_state_commit_low_watermark(&backend)
+            .await
+            .expect("low watermark should load")
+            .expect("low watermark should exist");
+        assert_eq!(
+            low_watermark,
+            DurableStateCommitCursor {
+                change_id: "change-001".to_string(),
+                created_at: "2026-04-15T00:00:01Z".to_string(),
+                visibility_append_seq: 1,
+            }
+        );
     }
 }

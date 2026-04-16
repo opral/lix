@@ -1,10 +1,10 @@
-/// Narrow shared adapter for tracked state-change rows.
+/// Narrow shared adapter for commit-authored state-change rows.
 ///
-/// This seam is shared on purpose: `streams/*` converts tracked changes into
-/// commit-stream payloads, while `sql/*`, `transaction/*`, and `live_state/*`
-/// reuse the same row-shaped metadata to derive adjacent runtime effects such
-/// as session-selector updates, file-cache refresh targets, and writer-key
-/// annotations.
+/// This seam is shared on purpose: `streams/*` converts commit-member change
+/// rows into commit-stream payloads, while `sql/*`, `transaction/*`, and
+/// `live_state/*` reuse the same row-shaped metadata to derive adjacent runtime
+/// effects such as session-selector updates, file-cache refresh targets, and
+/// writer-key annotations.
 pub(crate) trait StateChangeRecord {
     fn entity_id(&self) -> &str;
     fn schema_key(&self) -> &str;

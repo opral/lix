@@ -1150,7 +1150,11 @@ fn build_change_source_sql() -> String {
         ch.plugin_key AS plugin_key, \
         ch.metadata AS metadata, \
         ch.created_at AS created_at, \
-        ch.untracked AS untracked, \
+        EXISTS ( \
+            SELECT 1 \
+            FROM lix_internal_untracked_change_visibility uv \
+            WHERE uv.change_id = ch.id \
+        ) AS untracked, \
         CASE \
             WHEN ch.snapshot_id = 'no-content' THEN NULL \
             ELSE s.content \
@@ -2100,6 +2104,8 @@ mod tests {
         assert!(lowered_sql.contains("FROM lix_internal_change commit_change"));
         assert!(lowered_sql
             .contains("JOIN json_each(commit_rows.commit_snapshot_content, '$.change_ids')"));
+        assert!(!lowered_sql.contains("commit_change.untracked = false"));
+        assert!(!lowered_sql.contains("changes.untracked = false"));
         assert!(!lowered_sql.contains("FROM lix_state"));
         assert!(!lowered_sql.contains(") WHERE schema_key = 'lix_key_value'"));
         assert!(

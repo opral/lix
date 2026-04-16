@@ -43,6 +43,8 @@ pub(crate) fn build_lazy_change_commit_by_change_id_ctes_sql(dialect: SqlDialect
                commit_members.change_id AS change_id, \
                MAX(commit_members.commit_id) AS commit_id \
              FROM commit_members \
+             JOIN lix_internal_change changes \
+               ON changes.id = commit_members.change_id \
              WHERE commit_members.change_id IS NOT NULL \
              GROUP BY commit_members.change_id \
          )",

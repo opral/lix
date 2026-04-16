@@ -1,6 +1,7 @@
 {
   "x-lix-key": "lix_change",
   "x-lix-version": "1",
+  "description": "Canonical immutable change fact. This surface represents the authoritative stream of journaled change facts. Commit lineage and non-commit scope are modeled separately around these facts. The public `untracked` field is retained as convenience metadata and should not be treated as proof that trackedness is intrinsic to the canonical fact row itself.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -41,7 +42,8 @@
       "type": "string"
     },
     "untracked": {
-      "type": "boolean"
+      "type": "boolean",
+      "description": "Public convenience field indicating that the change currently participates in non-commit visibility rather than commit lineage. This is intended to become derived metadata rather than intrinsic canonical storage truth."
     },
     "snapshot_content": {
       "type": [

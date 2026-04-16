@@ -1,12 +1,15 @@
 use crate::backend::QueryExecutor;
 use crate::canonical::{
-    append_changes, load_exact_row_at_commit, CanonicalChangeWrite, CanonicalJson,
-    CanonicalStateIdentity,
+    append_changes, append_untracked_change_visibility_rows,
+    canonical_untracked_visibility_write_from_change_visibility,
+    compact_untracked_changes_for_touched_rows_in_transaction, load_exact_row_at_commit,
+    CanonicalChangeWrite, CanonicalJson, CanonicalStateIdentity,
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::{
-    key_value_schema_key, key_value_schema_version, load_exact_untracked_row_with_executor,
-    load_version_head_commit_id_with_executor, write_live_rows, ExactUntrackedRowRequest, LiveRow,
+    finalize_live_state_after_immediate_write, key_value_schema_key, key_value_schema_version,
+    load_exact_untracked_row_with_executor, load_version_head_commit_id_with_executor,
+    write_live_rows, ExactUntrackedRowRequest, LiveRow,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackendTransaction, LixError, NullableKeyFilter};
@@ -128,28 +131,45 @@ async fn append_runtime_sequence_row_in_transaction(
     let created_at = deterministic_sequence_created_at(highest_seen);
     let change = deterministic_sequence_change_row(&change_id, &created_at, &snapshot_content)?;
     let mut persistence_functions = DeterministicSequencePersistenceFunctions::new(highest_seen);
+    let live_row = LiveRow {
+        entity_id: deterministic_sequence_key().to_string(),
+        file_id: None,
+        schema_key: key_value_schema_key().to_string(),
+        schema_version: key_value_schema_version().to_string(),
+        version_id: GLOBAL_VERSION_ID.to_string(),
+        plugin_key: None,
+        metadata: None,
+        change_id: Some(change_id),
+        writer_key: None,
+        global: true,
+        untracked: true,
+        created_at: Some(created_at.clone()),
+        updated_at: Some(created_at.clone()),
+        snapshot_content: Some(snapshot_content),
+    };
+    let visibility_row = canonical_untracked_visibility_write_from_change_visibility(
+        &change,
+        &live_row.version_id,
+        live_row.global,
+        live_row.created_at.as_deref(),
+    );
 
-    append_changes(transaction, &[change], &mut persistence_functions).await?;
-    write_live_rows(
+    append_changes(
         transaction,
-        &[LiveRow {
-            entity_id: deterministic_sequence_key().to_string(),
-            file_id: None,
-            schema_key: key_value_schema_key().to_string(),
-            schema_version: key_value_schema_version().to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            plugin_key: None,
-            metadata: None,
-            change_id: Some(change_id),
-            writer_key: None,
-            global: true,
-            untracked: true,
-            created_at: Some(created_at.clone()),
-            updated_at: Some(created_at),
-            snapshot_content: Some(snapshot_content),
-        }],
+        std::slice::from_ref(&change),
+        &mut persistence_functions,
     )
-    .await
+    .await?;
+    append_untracked_change_visibility_rows(transaction, std::slice::from_ref(&visibility_row))
+        .await?;
+    write_live_rows(transaction, &[live_row]).await?;
+    finalize_live_state_after_immediate_write(transaction).await?;
+    compact_untracked_changes_for_touched_rows_in_transaction(
+        transaction,
+        std::slice::from_ref(&visibility_row),
+    )
+    .await?;
+    Ok(())
 }
 
 fn deterministic_sequence_snapshot_content(highest_seen: i64) -> String {
@@ -236,7 +256,6 @@ fn deterministic_sequence_change_row(
             })?,
         ),
         metadata: None,
-        untracked: true,
         created_at: created_at.to_string(),
     })
 }

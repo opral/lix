@@ -1,12 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use crate::backend::execute_ddl_batch;
 use crate::live_state::tracked::{load_exact_row_with_backend, ExactTrackedRowRequest};
 use crate::live_state::untracked::{
     load_exact_row_with_backend as load_exact_untracked_row_with_backend, ExactUntrackedRowRequest,
 };
-use crate::live_state::writer_key::WRITER_KEY_TABLE;
 use crate::live_state::{LiveWriteOperation, LiveWriteRow};
+use crate::test_support::init_test_backend_core;
 use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
@@ -171,31 +170,7 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
 }
 
 async fn init_workspace(backend: &dyn LixBackend) -> Result<(), LixError> {
-    crate::canonical::init(backend).await?;
-    let workspace_metadata_table = "lix_workspace_metadata";
-    let statements = [
-        format!(
-            "CREATE TABLE {} (\
-             key TEXT PRIMARY KEY, \
-             value TEXT NOT NULL\
-             )",
-            workspace_metadata_table
-        ),
-        format!(
-            "CREATE TABLE {} (\
-             version_id TEXT NOT NULL, \
-             schema_key TEXT NOT NULL, \
-             entity_id TEXT NOT NULL, \
-             file_id TEXT, \
-             storage_scope_key TEXT NOT NULL, \
-             writer_key TEXT NOT NULL, \
-             PRIMARY KEY (version_id, schema_key, entity_id, storage_scope_key)\
-             )",
-            WRITER_KEY_TABLE
-        ),
-    ];
-    let statement_refs = statements.iter().map(String::as_str).collect::<Vec<_>>();
-    execute_ddl_batch(backend, "workspace", &statement_refs).await
+    init_test_backend_core(backend).await
 }
 
 fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str) -> LiveWriteRow {
@@ -338,14 +313,16 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     let canonical = backend
         .execute(
             "SELECT COUNT(*) \
-             FROM lix_internal_change \
-             WHERE schema_key = 'lix_version_ref' \
-               AND entity_id = 'main' \
-               AND untracked = true",
+             FROM lix_internal_untracked_change_visibility v \
+             JOIN lix_internal_change ch ON ch.id = v.change_id \
+             WHERE ch.schema_key = 'lix_version_ref' \
+               AND ch.entity_id = 'main' \
+               AND v.version_id = 'global' \
+               AND v.visibility_kind = 'global'",
             &[],
         )
         .await
-        .expect("canonical untracked change lookup should succeed");
+        .expect("canonical untracked visibility lookup should succeed");
     assert_eq!(canonical.rows.len(), 1);
     assert_eq!(canonical.rows[0][0], Value::Integer(1));
 }

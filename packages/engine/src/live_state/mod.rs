@@ -1,14 +1,16 @@
 //! Live-state query-serving subsystem boundary.
 //!
-//! `live_state` owns query-oriented state surfaces over tracked and untracked
-//! rows. Use this module when the question is "what is visible for version V
-//! right now?".
+//! `live_state` owns query-oriented materialized state surfaces. Tracked and
+//! untracked remain visibility properties on live rows, not separate write
+//! authorities. Use this module when the question is "what is visible for
+//! version V right now?".
 //!
 //! `live_state` owns:
 //! - lifecycle initialization and readiness checks for live-state serving
 //! - projection replay/catch-up orchestration for live-state derived rows
 //! - schema-scoped storage initialization
-//! - stored, tracked, untracked, and effective row access
+//! - stored row access split by tracked/untracked visibility lanes, plus
+//!   effective-row resolution over those lanes
 //! - rebuild planning and apply for visible-row materialization
 //! - read-only passthrough query surfaces for canonical-owned facts when
 //!   SQL/public reads need them
@@ -80,8 +82,8 @@ pub use materialize::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
     LiveStateRebuildRequest, LiveStateRebuildScope, LiveStateRebuildWarning, LiveStateWrite,
-    LiveStateWriteOp, ScopeWinnerDebugRow, StageStat, TraversedCommitDebugRow,
-    TraversedEdgeDebugRow, VersionHeadDebugRow,
+    LiveStateWriteOp, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
+    VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
 pub(crate) use plugin_archives::PluginArchiveRef;
 pub use projection::{
@@ -237,6 +239,12 @@ pub async fn register_schema(
 }
 
 pub async fn finalize_live_state_after_commit_write(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    finalize_live_state_after_immediate_write(transaction).await
+}
+
+pub(crate) async fn finalize_live_state_after_immediate_write(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<(), LixError> {
     if lifecycle::require_ready_in_transaction(transaction)

@@ -86,32 +86,20 @@ pub struct PreparedPublicWriteContract {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub struct PreparedTrackedWriteExecution {
+pub struct PreparedPublicWriteExecution {
+    pub execution_mode: WriteMode,
+    pub intended_post_state: Vec<PlannedStateRow>,
     pub schema_live_table_requirements: Vec<SchemaLiveTableRequirement>,
     pub change_batch: Option<ChangeBatch>,
-    pub create_preconditions: CommitPreconditions,
-    pub semantic_effects: PlanEffects,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedUntrackedWriteExecution {
-    pub intended_post_state: Vec<PlannedStateRow>,
+    pub create_preconditions: Option<CommitPreconditions>,
     pub semantic_effects: PlanEffects,
     pub persist_filesystem_payloads_before_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
-pub enum PreparedPublicWriteExecutionPartition {
-    Tracked(PreparedTrackedWriteExecution),
-    Untracked(PreparedUntrackedWriteExecution),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
 pub struct PreparedPublicWriteMaterialization {
-    pub partitions: Vec<PreparedPublicWriteExecutionPartition>,
+    pub partitions: Vec<PreparedPublicWriteExecution>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

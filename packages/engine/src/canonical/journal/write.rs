@@ -13,10 +13,13 @@ use crate::{
 
 pub(crate) const SNAPSHOT_TABLE: &str = "lix_internal_snapshot";
 pub(crate) const CHANGE_TABLE: &str = "lix_internal_change";
+pub(crate) const UNTRACKED_CHANGE_VISIBILITY_TABLE: &str =
+    "lix_internal_untracked_change_visibility";
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
 const POSTGRES_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 65_535;
 const SNAPSHOT_INSERT_PARAM_COLUMNS: usize = 2;
-const CHANGE_INSERT_PARAM_COLUMNS: usize = 10;
+const CHANGE_INSERT_PARAM_COLUMNS: usize = 9;
+const CHANGE_VISIBILITY_INSERT_PARAM_COLUMNS: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangeRow {
@@ -28,7 +31,43 @@ pub struct ChangeRow {
     pub plugin_key: Option<CanonicalPluginKey>,
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
-    pub untracked: bool,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum UntrackedChangeVisibilityKind {
+    Global,
+    Version,
+}
+
+impl UntrackedChangeVisibilityKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Version => "version",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self, LixError> {
+        match raw {
+            "global" => Ok(Self::Global),
+            "version" => Ok(Self::Version),
+            other => Err(LixError::unknown(format!(
+                "invalid canonical scope kind '{other}'"
+            ))),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UntrackedChangeVisibilityRow {
+    pub id: String,
+    pub change_id: String,
+    pub version_id: String,
+    pub visibility_kind: UntrackedChangeVisibilityKind,
+    pub entity_id: EntityId,
+    pub schema_key: CanonicalSchemaKey,
+    pub file_id: Option<FileId>,
     pub created_at: String,
 }
 
@@ -53,7 +92,18 @@ struct CanonicalChangeInsertRow {
     plugin_key: Option<String>,
     snapshot_id: String,
     metadata: Option<String>,
-    untracked: bool,
+    created_at: String,
+}
+
+#[derive(Debug, Clone)]
+struct CanonicalUntrackedVisibilityInsertRow {
+    id: String,
+    change_id: String,
+    version_id: String,
+    visibility_kind: String,
+    entity_id: String,
+    schema_key: String,
+    file_id: Option<String>,
     created_at: String,
 }
 
@@ -94,7 +144,6 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
                 .metadata
                 .as_ref()
                 .map(|value| value.as_str().to_string()),
-            untracked: change.untracked,
             created_at: change.created_at.clone(),
         });
     }
@@ -142,7 +191,6 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
             "plugin_key",
             "snapshot_id",
             "metadata",
-            "untracked",
             "created_at",
         ],
         &change_rows,
@@ -174,7 +222,64 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
                     params,
                     dialect,
                 ),
-                bool_param_value(row.untracked, next_placeholder, params, dialect),
+                text_param_value(&row.created_at, next_placeholder, params, dialect),
+            ]
+        },
+    )?;
+
+    Ok(prepared)
+}
+
+pub(crate) fn build_prepared_batch_from_visibility_rows(
+    visibility_rows: &[UntrackedChangeVisibilityRow],
+    dialect: SqlDialect,
+) -> Result<PreparedBatch, LixError> {
+    let visibility_rows = visibility_rows
+        .iter()
+        .map(|row| CanonicalUntrackedVisibilityInsertRow {
+            id: row.id.clone(),
+            change_id: row.change_id.clone(),
+            version_id: row.version_id.clone(),
+            visibility_kind: row.visibility_kind.as_str().to_string(),
+            entity_id: row.entity_id.to_string(),
+            schema_key: row.schema_key.to_string(),
+            file_id: row.file_id.as_ref().map(ToString::to_string),
+            created_at: row.created_at.clone(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut prepared = PreparedBatch { steps: Vec::new() };
+    push_chunked_prepared_insert_statements(
+        &mut prepared,
+        UNTRACKED_CHANGE_VISIBILITY_TABLE,
+        &[
+            "id",
+            "change_id",
+            "version_id",
+            "visibility_kind",
+            "entity_id",
+            "schema_key",
+            "file_id",
+            "created_at",
+        ],
+        &visibility_rows,
+        None,
+        max_rows_per_insert_for_dialect(dialect, CHANGE_VISIBILITY_INSERT_PARAM_COLUMNS),
+        dialect,
+        |row, next_placeholder, params| {
+            vec![
+                text_param_value(&row.id, next_placeholder, params, dialect),
+                text_param_value(&row.change_id, next_placeholder, params, dialect),
+                text_param_value(&row.version_id, next_placeholder, params, dialect),
+                text_param_value(&row.visibility_kind, next_placeholder, params, dialect),
+                text_param_value(&row.entity_id, next_placeholder, params, dialect),
+                text_param_value(&row.schema_key, next_placeholder, params, dialect),
+                optional_text_param_value(
+                    row.file_id.as_deref(),
+                    next_placeholder,
+                    params,
+                    dialect,
+                ),
                 text_param_value(&row.created_at, next_placeholder, params, dialect),
             ]
         },
@@ -275,16 +380,4 @@ fn optional_text_param_value(
         Some(value) => text_param_value(value, next_placeholder, params, dialect),
         None => "NULL".to_string(),
     }
-}
-
-fn bool_param_value(
-    value: bool,
-    next_placeholder: &mut usize,
-    params: &mut Vec<Value>,
-    dialect: SqlDialect,
-) -> String {
-    let index = *next_placeholder;
-    *next_placeholder += 1;
-    params.push(Value::Boolean(value));
-    dialect.placeholder(index)
 }
