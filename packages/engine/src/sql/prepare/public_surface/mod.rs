@@ -1163,19 +1163,20 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
                 if let Some(operation_kind) =
                     statement_write_operation_kind(&bound_statement.statement)
                 {
-                    if let Some(error) = public_write_preparation_error_for_surface(
+                    if let Some(lix_err) = public_write_preparation_error_for_surface(
                         &binding,
                         operation_kind,
                         &error.message,
                     ) {
-                        return Err(error);
+                        return Err(attach_canonicalize_hint(lix_err, error.hint.as_deref()));
                     }
                 }
                 if binding.descriptor.surface_family == SurfaceFamily::Filesystem {
-                    return Err(public_filesystem_write_error(
+                    let fs_err = public_filesystem_write_error(
                         &binding.descriptor.public_name,
                         &error.message,
-                    ));
+                    );
+                    return Err(attach_canonicalize_hint(fs_err, error.hint.as_deref()));
                 }
             }
             return Ok(None);
@@ -1534,6 +1535,17 @@ pub(crate) fn public_write_preparation_error(
         canonicalized.write_command.operation_kind,
         message,
     )
+}
+
+/// Attach an optional hint (sourced from a `CanonicalizeError` or similar
+/// upstream error) to a `LixError` that has already been built. Used at call
+/// sites where the upstream structured error carries a hint that needs to
+/// survive the conversion to `LixError`.
+fn attach_canonicalize_hint(err: LixError, hint: Option<&str>) -> LixError {
+    match hint {
+        Some(hint) => err.with_hint(hint),
+        None => err,
+    }
 }
 
 fn public_write_preparation_error_for_surface(

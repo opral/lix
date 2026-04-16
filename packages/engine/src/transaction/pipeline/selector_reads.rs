@@ -161,6 +161,7 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
             let Some(value) = row.first().and_then(text_from_value) else {
                 return Err(WriteResolveError {
                     message: error_message.to_string(),
+                    hint: None,
                 });
             };
             if !values.iter().any(|existing| existing == &value) {
@@ -541,6 +542,7 @@ fn required_text_value_index(
         .and_then(text_from_value)
         .ok_or_else(|| WriteResolveError {
             message: format!("public selector resolver expected text {}", label),
+            hint: None,
         })
 }
 
@@ -553,6 +555,7 @@ fn required_bool_value_index(
         .and_then(bool_from_value)
         .ok_or_else(|| WriteResolveError {
             message: format!("public selector resolver expected bool {}", label),
+            hint: None,
         })
 }
 
@@ -582,5 +585,6 @@ fn bool_from_value(value: &Value) -> Option<bool> {
 fn write_resolve_backend_error(error: LixError) -> WriteResolveError {
     WriteResolveError {
         message: error.description,
+        hint: error.hint,
     }
 }
