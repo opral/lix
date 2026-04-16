@@ -70,6 +70,7 @@ impl NormalizedDirectoryPath {
         normalize_directory_path(path).map(Self)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn root() -> Self {
         Self("/".to_string())
     }
@@ -82,6 +83,7 @@ impl NormalizedDirectoryPath {
         self.0.as_str()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn is_root(&self) -> bool {
         self.as_str() == "/"
     }
@@ -399,6 +401,7 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
     true
 }
 
+#[allow(dead_code)]
 pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
     normalize_file_path_impl(path).map_err(PathError::into_lix_error)
 }
