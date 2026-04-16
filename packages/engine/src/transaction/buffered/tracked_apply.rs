@@ -28,7 +28,7 @@ pub(crate) async fn execute_public_tracked_transaction_write_unit_with_transacti
                     .contract
                     .operation_kind
                     .state_commit_stream_operation(),
-                unit.writer_key.as_deref(),
+                unit.origin_key.as_deref(),
                 tracked_write_outcome.next_active_version_id.clone(),
             )?
         } else {
@@ -56,14 +56,14 @@ pub(crate) async fn execute_public_tracked_transaction_write_unit_with_transacti
 fn plan_effects_from_tracked_changes<Change: StateChangeRecord>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     next_active_version_id: Option<String>,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             stream_operation,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(origin_key),
         )?,
         session_delta: SessionStateDelta {
             next_active_version_id,

@@ -3564,7 +3564,7 @@ pub(super) async fn try_prepare_public_read(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     let functions = crate::functions::clone_boxed_function_provider(
         &crate::functions::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
@@ -3587,7 +3587,7 @@ pub(super) async fn try_prepare_public_read(
         params,
         active_version_id,
         active_history_root_commit_id,
-        writer_key,
+        origin_key,
         false,
         None,
     )
@@ -3602,7 +3602,7 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -3618,7 +3618,7 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
         params,
         active_version_id,
         active_history_root_commit_id,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         parse_duration,
     )
@@ -3633,7 +3633,7 @@ async fn try_prepare_public_read_with_internal_access(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -3677,7 +3677,7 @@ async fn try_prepare_public_read_with_internal_access(
         params.to_vec(),
         StatementContext {
             dialect: Some(dialect),
-            writer_key: writer_key.map(ToString::to_string),
+            origin_key: origin_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
             active_account_ids: Vec::new(),
         },
@@ -3962,7 +3962,7 @@ pub(super) async fn prepare_public_read(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Option<PublicReadPlan> {
     try_prepare_public_read(
         backend,
@@ -3970,7 +3970,7 @@ pub(super) async fn prepare_public_read(
         params,
         active_version_id,
         active_history_root_commit_id,
-        writer_key,
+        origin_key,
     )
     .await
     .ok()
@@ -3984,7 +3984,7 @@ pub(super) async fn prepare_public_read_strict(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     try_prepare_public_read(
         backend,
@@ -3992,7 +3992,7 @@ pub(super) async fn prepare_public_read_strict(
         params,
         active_version_id,
         active_history_root_commit_id,
-        writer_key,
+        origin_key,
     )
     .await
 }

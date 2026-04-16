@@ -284,7 +284,7 @@ async fn merge_version_in_transaction(
                     plugin_key: previous.plugin_key.clone(),
                     snapshot_content: None,
                     untracked: false,
-                    writer_key: None,
+                    origin_key: None,
                 });
                 created_tombstone_count += 1;
             }
@@ -333,8 +333,8 @@ async fn merge_version_in_transaction(
                 ]),
                 allow_empty_commit: true,
                 should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
+                observe_tick_origin_key: None,
+                origin_key: None,
             },
             &mut functions,
             None,
@@ -493,7 +493,7 @@ fn proposed_change_from_exact_row(
         snapshot_content: Some(row.snapshot_content.clone()),
         metadata: row.metadata.clone(),
         version_id: parse_identity(version_id.to_string(), "merge version_id")?,
-        writer_key: None,
+        origin_key: None,
         created_at: None,
     })
 }
@@ -524,7 +524,7 @@ fn tombstone_change_from_state(
         snapshot_content: None,
         metadata: None,
         version_id: parse_identity(version_id.to_string(), "merge tombstone version_id")?,
-        writer_key: None,
+        origin_key: None,
         created_at: None,
     })
 }
@@ -550,7 +550,7 @@ fn stream_change_from_row(
             })?,
         ),
         untracked: false,
-        writer_key: None,
+        origin_key: None,
     })
 }
 

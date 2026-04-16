@@ -23,6 +23,11 @@ pub enum StateCommitStreamOperation {
     Delete,
 }
 
+/// Committed semantic change delivered through the state-commit stream.
+///
+/// `origin_key` is delivery metadata attached to the emitted batch. It is not
+/// part of the durable row model exposed by query surfaces such as `lix_file`
+/// or `lix_directory`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
 pub struct StateCommitStreamChange {
     pub operation: StateCommitStreamOperation,
@@ -34,17 +39,26 @@ pub struct StateCommitStreamChange {
     pub plugin_key: Option<String>,
     pub snapshot_content: Option<JsonValue>,
     pub untracked: bool,
-    pub writer_key: Option<String>,
+    #[serde(default)]
+    pub origin_key: Option<String>,
 }
 
+/// Subscription filter for the state-commit stream.
+///
+/// Origin filters operate on delivery metadata carried by the emitted change
+/// batches. They do not require callers to project origin data through SQL.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct StateCommitStreamFilter {
     pub schema_keys: Vec<String>,
     pub entity_ids: Vec<String>,
     pub file_ids: Vec<String>,
     pub version_ids: Vec<String>,
-    pub writer_keys: Vec<String>,
-    pub exclude_writer_keys: Vec<String>,
+    #[serde(default)]
+    pub include_origin_keys: Vec<String>,
+    #[serde(default)]
+    pub exclude_origin_keys: Vec<String>,
+    #[serde(default)]
+    pub exclude_self: bool,
     pub include_untracked: bool,
 }
 
@@ -55,22 +69,56 @@ impl Default for StateCommitStreamFilter {
             entity_ids: Vec::new(),
             file_ids: Vec::new(),
             version_ids: Vec::new(),
-            writer_keys: Vec::new(),
-            exclude_writer_keys: Vec::new(),
+            include_origin_keys: Vec::new(),
+            exclude_origin_keys: Vec::new(),
+            exclude_self: false,
             include_untracked: true,
         }
     }
 }
 
+impl StateCommitStreamFilter {
+    /// Drop batches authored by the current session's effective `origin_key`.
+    pub fn exclude_self() -> Self {
+        Self {
+            exclude_self: true,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn resolved_for_origin_key(&self, origin_key: &str) -> Self {
+        let mut resolved = self.clone();
+        if resolved.exclude_self {
+            let origin_key = origin_key.trim();
+            if !origin_key.is_empty()
+                && !resolved
+                    .exclude_origin_keys
+                    .iter()
+                    .any(|value| value.trim() == origin_key)
+            {
+                resolved.exclude_origin_keys.push(origin_key.to_string());
+            }
+        }
+        resolved.exclude_self = false;
+        resolved
+    }
+
+    pub(crate) fn resolved_without_session_origin(&self) -> Self {
+        let mut resolved = self.clone();
+        resolved.exclude_self = false;
+        resolved
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StateCommitStreamRuntimeMetadata {
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
 }
 
 impl StateCommitStreamRuntimeMetadata {
-    pub fn from_runtime_writer_key(writer_key: Option<&str>) -> Self {
+    pub fn from_runtime_origin_key(origin_key: Option<&str>) -> Self {
         Self {
-            writer_key: writer_key.map(str::to_string),
+            origin_key: origin_key.map(str::to_string),
         }
     }
 }
@@ -95,7 +143,7 @@ pub fn state_commit_stream_changes_from_mutations(
             plugin_key: mutation.plugin_key.clone(),
             snapshot_content: mutation.snapshot_content.clone(),
             untracked: mutation.untracked,
-            writer_key: runtime_metadata.writer_key.clone(),
+            origin_key: runtime_metadata.origin_key.clone(),
         })
         .collect()
 }
@@ -138,7 +186,7 @@ pub(crate) fn state_commit_stream_changes_from_changes<Change: StateChangeRecord
             plugin_key: change.plugin_key().map(str::to_string),
             snapshot_content,
             untracked: false,
-            writer_key: state_commit_stream_writer_key(change.writer_key(), &runtime_metadata),
+            origin_key: state_commit_stream_origin_key(change.origin_key(), &runtime_metadata),
         });
     }
 
@@ -178,7 +226,7 @@ pub fn state_commit_stream_changes_from_planned_rows(
             plugin_key,
             snapshot_content,
             untracked,
-            writer_key: runtime_metadata.writer_key.clone(),
+            origin_key: runtime_metadata.origin_key.clone(),
         });
     }
 
@@ -298,8 +346,8 @@ impl StateCommitStreamBus {
             listener_id,
         );
         index_listener(
-            &mut inner.by_writer_key,
-            &compiled_filter.writer_keys,
+            &mut inner.by_origin_key,
+            &compiled_filter.include_origin_keys,
             listener_id,
         );
 
@@ -311,14 +359,21 @@ impl StateCommitStreamBus {
         }
     }
 
-    pub(crate) fn emit(&self, changes: Vec<StateCommitStreamChange>) {
+    pub(crate) fn latest_sequence(&self) -> Option<u64> {
+        let inner = self.inner.lock().unwrap();
+        inner.next_sequence.checked_sub(1)
+    }
+
+    pub(crate) fn emit(&self, changes: Vec<StateCommitStreamChange>) -> Option<u64> {
         if changes.is_empty() {
-            return;
+            return None;
         }
 
-        let (batch, candidate_listeners) = {
+        let (sequence, batch, candidate_listeners) = {
             let mut inner = self.inner.lock().unwrap();
             let touched = TouchedFields::from_changes(&changes);
+            let sequence = inner.next_sequence;
+            inner.next_sequence = inner.next_sequence.saturating_add(1);
 
             let mut candidate_ids: HashSet<u64> = HashSet::new();
             candidate_ids.extend(inner.wildcard_listeners.iter().copied());
@@ -344,16 +399,14 @@ impl StateCommitStreamBus {
             );
             extend_candidates(
                 &mut candidate_ids,
-                &inner.by_writer_key,
-                touched.writer_keys.iter(),
+                &inner.by_origin_key,
+                touched.origin_keys.iter(),
             );
 
             if candidate_ids.is_empty() {
-                return;
+                return Some(sequence);
             }
 
-            let sequence = inner.next_sequence;
-            inner.next_sequence = inner.next_sequence.saturating_add(1);
             let batch = StateCommitStreamBatch { sequence, changes };
 
             let listeners = candidate_ids
@@ -361,7 +414,7 @@ impl StateCommitStreamBus {
                 .filter_map(|listener_id| inner.listeners.get(&listener_id).cloned())
                 .collect::<Vec<_>>();
 
-            (batch, listeners)
+            (sequence, batch, listeners)
         };
 
         for listener in candidate_listeners {
@@ -370,6 +423,8 @@ impl StateCommitStreamBus {
             }
             enqueue_batch(&listener.queue, batch.clone());
         }
+
+        Some(sequence)
     }
 
     fn unsubscribe(&self, listener_id: u64) {
@@ -400,8 +455,8 @@ impl StateCommitStreamBus {
             listener_id,
         );
         unindex_listener(
-            &mut inner.by_writer_key,
-            &listener.filter.writer_keys,
+            &mut inner.by_origin_key,
+            &listener.filter.include_origin_keys,
             listener_id,
         );
     }
@@ -417,7 +472,7 @@ struct StateCommitStreamBusInner {
     by_entity_id: HashMap<String, HashSet<u64>>,
     by_file_id: HashMap<String, HashSet<u64>>,
     by_version_id: HashMap<String, HashSet<u64>>,
-    by_writer_key: HashMap<String, HashSet<u64>>,
+    by_origin_key: HashMap<String, HashSet<u64>>,
 }
 
 #[derive(Clone)]
@@ -445,8 +500,8 @@ struct CompiledStateCommitStreamFilter {
     entity_ids: HashSet<String>,
     file_ids: HashSet<String>,
     version_ids: HashSet<String>,
-    writer_keys: HashSet<String>,
-    exclude_writer_keys: HashSet<String>,
+    include_origin_keys: HashSet<String>,
+    exclude_origin_keys: HashSet<String>,
     include_untracked: bool,
 }
 
@@ -457,8 +512,8 @@ impl CompiledStateCommitStreamFilter {
             entity_ids: normalize_filter_values(filter.entity_ids),
             file_ids: normalize_filter_values(filter.file_ids),
             version_ids: normalize_filter_values(filter.version_ids),
-            writer_keys: normalize_filter_values(filter.writer_keys),
-            exclude_writer_keys: normalize_filter_values(filter.exclude_writer_keys),
+            include_origin_keys: normalize_filter_values(filter.include_origin_keys),
+            exclude_origin_keys: normalize_filter_values(filter.exclude_origin_keys),
             include_untracked: filter.include_untracked,
         }
     }
@@ -468,7 +523,7 @@ impl CompiledStateCommitStreamFilter {
             && self.entity_ids.is_empty()
             && self.file_ids.is_empty()
             && self.version_ids.is_empty()
-            && self.writer_keys.is_empty()
+            && self.include_origin_keys.is_empty()
     }
 
     fn matches_batch(&self, batch: &StateCommitStreamBatch) -> bool {
@@ -499,16 +554,16 @@ impl CompiledStateCommitStreamFilter {
         if !self.version_ids.is_empty() && !self.version_ids.contains(&change.version_id) {
             return false;
         }
-        if !self.writer_keys.is_empty() {
-            let Some(writer_key) = change.writer_key.as_ref() else {
+        if !self.include_origin_keys.is_empty() {
+            let Some(origin_key) = change.origin_key.as_ref() else {
                 return false;
             };
-            if !self.writer_keys.contains(writer_key) {
+            if !self.include_origin_keys.contains(origin_key) {
                 return false;
             }
         }
-        if let Some(writer_key) = change.writer_key.as_ref() {
-            if self.exclude_writer_keys.contains(writer_key) {
+        if let Some(origin_key) = change.origin_key.as_ref() {
+            if self.exclude_origin_keys.contains(origin_key) {
                 return false;
             }
         }
@@ -522,7 +577,7 @@ struct TouchedFields {
     entity_ids: HashSet<String>,
     file_ids: HashSet<String>,
     version_ids: HashSet<String>,
-    writer_keys: HashSet<String>,
+    origin_keys: HashSet<String>,
 }
 
 impl TouchedFields {
@@ -535,21 +590,21 @@ impl TouchedFields {
                 touched.file_ids.insert(file_id.clone());
             }
             touched.version_ids.insert(change.version_id.clone());
-            if let Some(writer_key) = change.writer_key.as_ref() {
-                touched.writer_keys.insert(writer_key.clone());
+            if let Some(origin_key) = change.origin_key.as_ref() {
+                touched.origin_keys.insert(origin_key.clone());
             }
         }
         touched
     }
 }
 
-fn state_commit_stream_writer_key(
-    row_writer_key: Option<&str>,
+fn state_commit_stream_origin_key(
+    row_origin_key: Option<&str>,
     runtime_metadata: &StateCommitStreamRuntimeMetadata,
 ) -> Option<String> {
-    row_writer_key
+    row_origin_key
         .map(str::to_string)
-        .or_else(|| runtime_metadata.writer_key.clone())
+        .or_else(|| runtime_metadata.origin_key.clone())
 }
 
 fn planned_row_required_text(row: &PlannedStateRow, key: &str) -> Result<String, LixError> {
@@ -657,12 +712,28 @@ fn enqueue_batch(queue: &ListenerQueue, batch: StateCommitStreamBatch) {
 mod tests {
     use super::{
         state_commit_stream_changes_from_changes, state_commit_stream_changes_from_planned_rows,
+        CompiledStateCommitStreamFilter, StateCommitStreamChange, StateCommitStreamFilter,
         StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
     };
     use crate::session::version_ops::commit::StagedChange;
     use crate::sql::PlannedStateRow;
     use crate::Value;
     use std::collections::BTreeMap;
+
+    fn sample_change(origin_key: Option<&str>) -> StateCommitStreamChange {
+        StateCommitStreamChange {
+            operation: StateCommitStreamOperation::Insert,
+            entity_id: "entity-1".to_string(),
+            schema_key: "lix_key_value".to_string(),
+            schema_version: "1".to_string(),
+            file_id: None,
+            version_id: "version-a".to_string(),
+            plugin_key: None,
+            snapshot_content: None,
+            untracked: false,
+            origin_key: origin_key.map(str::to_string),
+        }
+    }
 
     #[test]
     fn changes_map_to_update_changes() {
@@ -677,7 +748,7 @@ mod tests {
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
-                writer_key: Some("writer-a".to_string()),
+                origin_key: Some("origin-a".to_string()),
                 created_at: None,
             }],
             StateCommitStreamOperation::Update,
@@ -689,11 +760,11 @@ mod tests {
         assert_eq!(changes[0].operation, StateCommitStreamOperation::Update);
         assert_eq!(changes[0].entity_id, "entity-1");
         assert_eq!(changes[0].schema_key, "lix_key_value");
-        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-a"));
+        assert_eq!(changes[0].origin_key.as_deref(), Some("origin-a"));
     }
 
     #[test]
-    fn state_commit_stream_uses_runtime_writer_metadata_when_change_omits_it() {
+    fn state_commit_stream_uses_runtime_origin_metadata_when_change_omits_it() {
         let changes = state_commit_stream_changes_from_changes(
             &[StagedChange {
                 id: None,
@@ -705,20 +776,20 @@ mod tests {
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
-                writer_key: None,
+                origin_key: None,
                 created_at: None,
             }],
             StateCommitStreamOperation::Update,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(Some("origin-runtime")),
         )
         .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-runtime"));
+        assert_eq!(changes[0].origin_key.as_deref(), Some("origin-runtime"));
     }
 
     #[test]
-    fn state_commit_stream_prefers_change_writer_key_over_runtime_metadata() {
+    fn state_commit_stream_prefers_change_origin_key_over_runtime_metadata() {
         let changes = state_commit_stream_changes_from_changes(
             &[StagedChange {
                 id: None,
@@ -730,16 +801,55 @@ mod tests {
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
-                writer_key: Some("writer-change".to_string()),
+                origin_key: Some("origin-change".to_string()),
                 created_at: None,
             }],
             StateCommitStreamOperation::Update,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(Some("writer-runtime")),
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(Some("origin-runtime")),
         )
         .expect("changes should map");
 
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].writer_key.as_deref(), Some("writer-change"));
+        assert_eq!(changes[0].origin_key.as_deref(), Some("origin-change"));
+    }
+
+    #[test]
+    fn state_commit_stream_filter_suppresses_matching_origin() {
+        let filter = CompiledStateCommitStreamFilter::new(StateCommitStreamFilter {
+            exclude_origin_keys: vec!["origin-a".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        assert!(
+            !filter.matches_change(&sample_change(Some("origin-a"))),
+            "matching origin metadata should be suppressed"
+        );
+    }
+
+    #[test]
+    fn state_commit_stream_filter_keeps_different_origin() {
+        let filter = CompiledStateCommitStreamFilter::new(StateCommitStreamFilter {
+            exclude_origin_keys: vec!["origin-a".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        assert!(
+            filter.matches_change(&sample_change(Some("origin-b"))),
+            "different origin metadata should still be delivered"
+        );
+    }
+
+    #[test]
+    fn state_commit_stream_filter_broadcasts_null_origin_without_include_filter() {
+        let filter = CompiledStateCommitStreamFilter::new(StateCommitStreamFilter {
+            exclude_origin_keys: vec!["origin-a".to_string()],
+            ..StateCommitStreamFilter::default()
+        });
+
+        assert!(
+            filter.matches_change(&sample_change(None)),
+            "null origin should broadcast unless the subscription explicitly requires an origin"
+        );
     }
 
     #[test]
@@ -762,7 +872,7 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 version_id: Some("global".to_string()),
                 values,
-                writer_key: None,
+                origin_key: None,
                 tombstone: false,
             }],
             StateCommitStreamOperation::Insert,

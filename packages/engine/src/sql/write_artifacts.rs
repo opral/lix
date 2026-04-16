@@ -85,7 +85,7 @@ pub struct PlannedStateRow {
     pub schema_key: String,
     pub version_id: Option<String>,
     pub values: BTreeMap<String, Value>,
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
     pub tombstone: bool,
 }
 
@@ -124,14 +124,6 @@ impl PlannedFilesystemState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct PlannedRowIdentity {
-    pub schema_key: String,
-    pub version_id: String,
-    pub entity_id: String,
-    pub file_id: Option<String>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PublicChange {
     pub entity_id: String,
@@ -142,7 +134,7 @@ pub struct PublicChange {
     pub snapshot_content: Option<String>,
     pub metadata: Option<String>,
     pub version_id: String,
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -155,7 +147,7 @@ pub struct SemanticEffect {
 pub struct ChangeBatch {
     pub changes: Vec<PublicChange>,
     pub write_lane: WriteLane,
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
     pub semantic_effects: Vec<SemanticEffect>,
 }
 

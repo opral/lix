@@ -29,6 +29,8 @@ pub struct TransactionCommitOutcome {
     pub invalidate_installed_plugins_cache: bool,
     #[serde(default)]
     pub refresh_public_surface_registry: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_receipt: Option<crate::WriteReceipt>,
     #[serde(default)]
     pub state_commit_stream_changes: Vec<crate::streams::StateCommitStreamChange>,
 }
@@ -78,6 +80,9 @@ impl TransactionCommitOutcome {
             other.invalidate_deterministic_settings_cache;
         self.invalidate_installed_plugins_cache |= other.invalidate_installed_plugins_cache;
         self.refresh_public_surface_registry |= other.refresh_public_surface_registry;
+        if let Some(receipt) = other.write_receipt {
+            self.write_receipt = Some(receipt);
+        }
         self.state_commit_stream_changes
             .extend(other.state_commit_stream_changes);
     }
@@ -85,26 +90,26 @@ impl TransactionCommitOutcome {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BufferedWriteExecutionInput {
-    writer_key: Option<String>,
+    origin_key: Option<String>,
     active_version_id: String,
     active_account_ids: Vec<String>,
 }
 
 impl BufferedWriteExecutionInput {
     pub fn new(
-        writer_key: Option<String>,
+        origin_key: Option<String>,
         active_version_id: impl Into<String>,
         active_account_ids: Vec<String>,
     ) -> Self {
         Self {
-            writer_key,
+            origin_key,
             active_version_id: active_version_id.into(),
             active_account_ids,
         }
     }
 
-    pub fn writer_key(&self) -> Option<&str> {
-        self.writer_key.as_deref()
+    pub fn origin_key(&self) -> Option<&str> {
+        self.origin_key.as_deref()
     }
 
     pub fn active_version_id(&self) -> &str {

@@ -6,15 +6,6 @@ use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_
 use crate::{LixBackend, LixError};
 
 const LIVE_STATE_CREATE_TABLE_STATEMENTS: &[&str] = &[
-    "CREATE TABLE IF NOT EXISTS lix_internal_writer_key (\
-     version_id TEXT NOT NULL,\
-     schema_key TEXT NOT NULL,\
-     entity_id TEXT NOT NULL,\
-     file_id TEXT,\
-     storage_scope_key TEXT NOT NULL,\
-     writer_key TEXT NOT NULL,\
-     PRIMARY KEY (version_id, schema_key, entity_id, storage_scope_key)\
-     )",
     "CREATE TABLE IF NOT EXISTS lix_internal_registered_schema_bootstrap (\
      entity_id TEXT NOT NULL,\
      schema_key TEXT NOT NULL,\
@@ -61,14 +52,11 @@ const LIVE_STATE_CREATE_TABLE_STATEMENTS: &[&str] = &[
      latest_commit_id TEXT,\
      created_at TEXT,\
      updated_at TEXT,\
-     writer_key TEXT,\
      PRIMARY KEY (file_id, version_id)\
      )",
 ];
 
 const LIVE_STATE_INDEX_STATEMENTS: &[&str] = &[
-    "CREATE UNIQUE INDEX IF NOT EXISTS uq_lix_internal_writer_key_scope_identity \
-     ON lix_internal_writer_key (version_id, schema_key, entity_id, storage_scope_key)",
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_lix_internal_registered_schema_bootstrap_scope_identity \
      ON lix_internal_registered_schema_bootstrap (entity_id, storage_scope_key, version_id, untracked)",
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_registered_schema_bootstrap_version_id \
@@ -137,31 +125,6 @@ async fn seed_registered_schema_bootstrap_rows(backend: &dyn LixBackend) -> Resu
 }
 
 async fn ensure_internal_storage_scope_keys(backend: &dyn LixBackend) -> Result<(), LixError> {
-    add_column_if_missing(
-        backend,
-        "lix_internal_writer_key",
-        STORAGE_SCOPE_KEY_COLUMN,
-        &format!(
-            "TEXT NOT NULL DEFAULT '{}'",
-            storage_scope_key_for_file_id(None)
-        ),
-    )
-    .await?;
-    backend
-        .execute(
-            &format!(
-                "UPDATE lix_internal_writer_key \
-                 SET {storage_scope_key} = CASE \
-                   WHEN file_id IS NULL THEN '{engine_scope}' \
-                   ELSE 'file:' || file_id \
-                 END",
-                storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
-                engine_scope = storage_scope_key_for_file_id(None),
-            ),
-            &[],
-        )
-        .await?;
-
     add_column_if_missing(
         backend,
         "lix_internal_registered_schema_bootstrap",

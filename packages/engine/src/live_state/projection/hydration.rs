@@ -12,7 +12,6 @@ use crate::live_state::tracked::{
 use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
-use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::{LixBackend, LixError, Value};
 
 /// Hydrate the declared tracked/untracked source rows for one projection.
@@ -129,7 +128,6 @@ async fn hydrate_input_rows_with_backend(
                                 row.plugin_key,
                                 row.metadata,
                                 row.change_id,
-                                row.writer_key,
                                 row.global,
                                 Some(row.created_at),
                                 Some(row.updated_at),
@@ -159,7 +157,6 @@ async fn hydrate_input_rows_with_backend(
                                 row.plugin_key,
                                 row.metadata,
                                 row.change_id,
-                                row.writer_key,
                                 row.global,
                                 row.created_at,
                                 row.updated_at,
@@ -193,7 +190,6 @@ async fn hydrate_input_rows_with_backend(
                         row.plugin_key,
                         row.metadata,
                         Some(row.change_id),
-                        row.writer_key,
                         row.global,
                         Some(row.created_at),
                         Some(row.updated_at),
@@ -203,24 +199,7 @@ async fn hydrate_input_rows_with_backend(
         }
     }
 
-    overlay_writer_keys_on_source_rows_with_backend(backend, &mut rows).await?;
-
     Ok(CatalogProjectionInputRows::new(spec, rows))
-}
-
-async fn overlay_writer_keys_on_source_rows_with_backend(
-    backend: &dyn LixBackend,
-    rows: &mut [CatalogProjectionSourceRow],
-) -> Result<(), LixError> {
-    let row_identities = rows
-        .iter()
-        .map(|row| row.identity().clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let annotations = load_writer_key_annotations(backend, &row_identities).await?;
-    for row in rows {
-        row.set_writer_key(annotations.get(row.identity()).cloned().flatten());
-    }
-    Ok(())
 }
 
 async fn build_catalog_projection_context_with_backend(
@@ -486,7 +465,6 @@ mod tests {
             plugin_key: plugin_key.map(str::to_string),
             metadata: None,
             change_id: Some(change_id.to_string()),
-            writer_key: None,
             global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: false,
             created_at: Some(timestamp.to_string()),
@@ -516,7 +494,6 @@ mod tests {
             change_id: Some(format!(
                 "change-untracked::{schema_key}::{entity_id}::{version_id}::{timestamp}"
             )),
-            writer_key: None,
             global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: true,
             created_at: Some(timestamp.to_string()),

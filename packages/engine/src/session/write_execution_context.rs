@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -6,10 +6,6 @@ use jsonschema::JSONSchema;
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::live_state::{
-    apply_writer_key_annotations_with_executor, tracked_writer_key_annotations_from_changes,
-    RowIdentity,
-};
 use crate::schema::CompiledSchemaCache;
 use crate::schema::SchemaKey;
 use crate::session::host::{
@@ -24,7 +20,7 @@ use crate::session::version_ops::commit::{
 };
 use crate::sql::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PreparedPublicRead, PublicChange,
-    PublicReadSource, WriteLane, WriteMode,
+    PublicReadSource, WriteLane,
 };
 use crate::streams::StateChangeRecord;
 use crate::transaction::{
@@ -35,7 +31,7 @@ use crate::transaction::{
 };
 use crate::version::{parse_active_version_snapshot, GLOBAL_VERSION_ID};
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
-use crate::{LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, VersionId};
+use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
 
 const ACTIVE_VERSION_SCHEMA_KEY: &str = "lix_active_version";
 
@@ -232,27 +228,13 @@ pub(crate) async fn execute_public_tracked_append(
     unit: &TrackedTxnUnit,
     mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
 ) -> Result<TrackedCommitExecutionOutcome, LixError> {
-    let writer_key_updates = tracked_writer_key_updates_for_unit(unit);
     if unit
         .execution
         .change_batch
         .as_ref()
         .is_some_and(|batch| batch.changes.is_empty())
         && !unit.has_compiler_only_filesystem_changes()
-        && writer_key_updates.is_empty()
     {
-        return Ok(TrackedCommitExecutionOutcome::default());
-    }
-
-    if unit.execution.change_batch.is_none()
-        && !unit.has_compiler_only_filesystem_changes()
-        && !writer_key_updates.is_empty()
-    {
-        let live_rows =
-            tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
-        if !live_rows.is_empty() {
-            crate::live_state::write_live_rows(transaction, &live_rows).await?;
-        }
         return Ok(TrackedCommitExecutionOutcome::default());
     }
 
@@ -292,7 +274,7 @@ pub(crate) async fn execute_public_tracked_append(
             filesystem_state: unit.filesystem_state.clone(),
             preconditions: canonical_preconditions,
             active_account_ids: unit.public_write.contract.active_account_ids.clone(),
-            writer_key: unit.writer_key.clone(),
+            origin_key: unit.origin_key.clone(),
             should_emit_observe_tick: unit.should_emit_observe_tick(),
         },
         &mut create_commit_functions,
@@ -301,24 +283,6 @@ pub(crate) async fn execute_public_tracked_append(
         !unit.has_compiler_only_filesystem_changes(),
     )
     .await?;
-
-    let tracked_writer_key_annotations = tracked_writer_key_annotations_from_changes(
-        &append_outcome.applied_changes,
-        unit.writer_key.as_deref(),
-    );
-    if !tracked_writer_key_annotations.is_empty() {
-        let mut executor = &mut *transaction;
-        apply_writer_key_annotations_with_executor(&mut executor, &tracked_writer_key_annotations)
-            .await?;
-    }
-
-    if !writer_key_updates.is_empty() {
-        let live_rows =
-            tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
-        if !live_rows.is_empty() {
-            crate::live_state::write_live_rows(transaction, &live_rows).await?;
-        }
-    }
 
     if append_outcome.merged_into_pending_session
         && create_commit_functions
@@ -358,12 +322,12 @@ pub(crate) async fn execute_public_tracked_append(
                         WriteLane::ActiveVersion => WriteLane::ActiveVersion,
                         WriteLane::GlobalAdmin => WriteLane::GlobalAdmin,
                     }),
-                writer_key: unit
+                origin_key: unit
                     .execution
                     .change_batch
                     .as_ref()
-                    .and_then(|batch| batch.writer_key.clone())
-                    .or_else(|| unit.public_write.contract.writer_key.clone()),
+                    .and_then(|batch| batch.origin_key.clone())
+                    .or_else(|| unit.public_write.contract.origin_key.clone()),
                 semantic_effects: Vec::new(),
             },
         )
@@ -468,79 +432,6 @@ fn public_changes_to_staged(changes: &[PublicChange]) -> Result<Vec<StagedChange
     changes.iter().map(public_change_to_staged).collect()
 }
 
-fn tracked_writer_key_updates_for_unit(
-    unit: &TrackedTxnUnit,
-) -> BTreeMap<RowIdentity, Option<String>> {
-    let mut updates = BTreeMap::new();
-    for public_write in &unit.public_writes {
-        let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
-            continue;
-        };
-        for partition in &resolved.partitions {
-            if partition.execution_mode != WriteMode::Tracked {
-                continue;
-            }
-            updates.extend(partition.writer_key_updates.iter().map(
-                |(row_identity, writer_key)| {
-                    (
-                        RowIdentity {
-                            schema_key: row_identity.schema_key.clone(),
-                            version_id: row_identity.version_id.clone(),
-                            entity_id: row_identity.entity_id.clone(),
-                            file_id: row_identity.file_id.clone(),
-                        },
-                        writer_key.clone(),
-                    )
-                },
-            ));
-        }
-    }
-    updates
-}
-
-async fn tracked_live_rows_for_writer_key_updates(
-    transaction: &mut dyn LixBackendTransaction,
-    updates: &BTreeMap<RowIdentity, Option<String>>,
-) -> Result<Vec<crate::live_state::LiveRow>, LixError> {
-    let backend = crate::backend::transaction_backend_view(transaction);
-    let mut rows = Vec::with_capacity(updates.len());
-    for (row_identity, writer_key) in updates {
-        let row = crate::live_state::load_exact_live_row(
-            &backend,
-            &crate::live_state::ExactLiveRowQuery {
-                source: crate::live_state::LiveRowSource::Tracked,
-                schema_key: row_identity.schema_key.clone(),
-                version_id: row_identity.version_id.clone(),
-                entity_id: row_identity.entity_id.clone(),
-                file_id: NullableKeyFilter::from_nullable(row_identity.file_id.clone()),
-                schema_version: None,
-                plugin_key: NullableKeyFilter::Any,
-                writer_key: None,
-                global: None,
-                untracked: Some(false),
-                include_tombstones: true,
-                include_global_overlay: true,
-                include_untracked_overlay: true,
-            },
-        )
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "writer_key-only live-state update requires tracked row '{}:{}'",
-                    row_identity.schema_key, row_identity.entity_id
-                ),
-            )
-        })?;
-        rows.push(crate::live_state::LiveRow {
-            writer_key: writer_key.clone(),
-            ..row
-        });
-    }
-    Ok(rows)
-}
-
 fn public_change_to_staged(change: &PublicChange) -> Result<StagedChange, LixError> {
     Ok(StagedChange {
         id: None,
@@ -560,7 +451,7 @@ fn public_change_to_staged(change: &PublicChange) -> Result<StagedChange, LixErr
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
         version_id: VersionId::new(change.version_id.clone())?,
-        writer_key: change.writer_key.clone(),
+        origin_key: change.origin_key.clone(),
         created_at: None,
     })
 }
@@ -577,7 +468,7 @@ fn public_changes_from_staged(changes: &[StagedChange]) -> Vec<PublicChange> {
             snapshot_content: change.snapshot_content.clone(),
             metadata: change.metadata.clone(),
             version_id: change.version_id.to_string(),
-            writer_key: change.writer_key.clone(),
+            origin_key: change.origin_key.clone(),
         })
         .collect()
 }

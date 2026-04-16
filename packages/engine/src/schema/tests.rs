@@ -800,8 +800,7 @@ fn x_lix_override_lixcols_accepts_valid_cel_expression() {
         "x-lix-key": "mock",
         "x-lix-version": "1",
         "x-lix-override-lixcols": {
-            "lixcol_metadata": "'meta'",
-            "lixcol_writer_key": "'writer'"
+            "lixcol_metadata": "'meta'"
         },
         "properties": {
             "id": { "type": "string" }

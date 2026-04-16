@@ -78,7 +78,7 @@ impl From<NormalizedDirectStatements> for PlannedStatementSet {
 pub(crate) async fn rewrite_direct_statement<P>(
     statement: Statement,
     _params: &[Value],
-    _writer_key: Option<&str>,
+    _origin_key: Option<&str>,
     _known_live_schema_definitions: &BTreeMap<String, JsonValue>,
     _provider: &mut P,
 ) -> Result<DirectStatementRewrite, LixError>
@@ -142,7 +142,7 @@ pub(crate) async fn prepare_direct_statements_to_plan<P>(
     statements: Vec<Statement>,
     params: &[Value],
     functions: SharedFunctionProvider<P>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<NormalizedDirectStatements, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
@@ -150,7 +150,7 @@ where
     let mut statements = statements;
     normalize_statement_placeholders_in_batch(&mut statements)?;
     let mut provider = functions.clone();
-    prepare_rewritten_statements(dialect, statements, params, &mut provider, writer_key).await
+    prepare_rewritten_statements(dialect, statements, params, &mut provider, origin_key).await
 }
 
 async fn prepare_rewritten_statements<P>(
@@ -158,7 +158,7 @@ async fn prepare_rewritten_statements<P>(
     statements: Vec<Statement>,
     params: &[Value],
     provider: &mut P,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<NormalizedDirectStatements, LixError>
 where
     P: LixFunctionProvider + Clone + Send + 'static,
@@ -173,7 +173,7 @@ where
         let output = Box::pin(rewrite_direct_statement(
             statement,
             params,
-            writer_key,
+            origin_key,
             &known_live_schema_definitions,
             provider,
         ))

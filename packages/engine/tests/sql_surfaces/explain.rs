@@ -1464,7 +1464,7 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
             "query_dependencies",
             "schema_keys",
             "version_ids",
-            "writer_filter",
+            "origin_filter",
         ],
         "dependency_spec",
     );

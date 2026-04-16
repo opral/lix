@@ -217,7 +217,6 @@ impl<'a> PendingOverlayReadModel<'a> {
             }
         }
         self.apply_filesystem_overlay_to_rows(query, &access, &mut by_identity);
-        self.apply_writer_key_overlay_to_rows(query, &mut by_identity);
         let mut rows = by_identity
             .into_values()
             .filter(|row| {
@@ -349,35 +348,6 @@ impl<'a> PendingOverlayReadModel<'a> {
             }
         }
     }
-
-    fn apply_writer_key_overlay_to_rows(
-        &self,
-        query: &LiveTableOverlayQuery,
-        rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
-    ) {
-        if query.lane != PendingOverlayLane::Tracked {
-            return;
-        }
-        let Some(pending_overlay) = self.pending_overlay else {
-            return;
-        };
-
-        for row in rows.values_mut() {
-            let Some(writer_key) = pending_overlay.writer_key_annotation_for_state_row(
-                &row.version_id,
-                &row.schema_key,
-                &row.entity_id,
-                row.file_id.as_deref(),
-            ) else {
-                continue;
-            };
-            row.writer_key = writer_key.clone();
-            row.normalized_values.insert(
-                "writer_key".to_string(),
-                writer_key.clone().map(Value::Text).unwrap_or(Value::Null),
-            );
-        }
-    }
 }
 
 pub(crate) async fn build_public_read_surface_registry_with_pending_overlay(
@@ -439,7 +409,6 @@ struct OverlayVisibleLiveRow {
     untracked: bool,
     plugin_key: Option<String>,
     metadata: Option<String>,
-    writer_key: Option<String>,
     change_id: Option<String>,
     snapshot_content: Option<String>,
     is_tombstone: bool,
@@ -566,7 +535,6 @@ fn visible_live_row_from_raw(
         untracked,
         plugin_key: row.plugin_key().map(ToOwned::to_owned),
         metadata: row.metadata().map(ToOwned::to_owned),
-        writer_key: row.writer_key().map(ToOwned::to_owned),
         change_id: row.change_id().map(ToOwned::to_owned),
         normalized_values: row.values().clone(),
         snapshot_content: Some(snapshot_content),
@@ -588,7 +556,6 @@ fn visible_live_row_from_pending(
         untracked: pending.untracked,
         plugin_key: pending.plugin_key.clone(),
         metadata: pending.metadata.clone(),
-        writer_key: None,
         change_id: pending.change_id.clone(),
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
@@ -624,7 +591,6 @@ fn visible_live_row_from_pending_filesystem_state(
         untracked: pending.untracked,
         plugin_key: None,
         metadata: descriptor.metadata.clone(),
-        writer_key: None,
         change_id: None,
         snapshot_content: Some(snapshot_content.clone()),
         is_tombstone: false,
@@ -692,12 +658,6 @@ fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
         "metadata" | "lixcol_metadata" => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }
-        "writer_key" | "lixcol_writer_key" => Some(
-            row.writer_key
-                .clone()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
-        ),
         "change_id" | "lixcol_change_id" => Some(
             row.change_id
                 .clone()
