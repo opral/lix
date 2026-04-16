@@ -1971,7 +1971,6 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
 
@@ -2299,7 +2298,6 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
 
@@ -2358,7 +2356,6 @@ mod tests {
                 schema_key: "test_json_entity".to_string(),
                 visible_columns: vec!["key".to_string(), "payload".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
         let canonicalized = canonicalize_write(

@@ -94,15 +94,6 @@ pub(crate) struct SurfaceResolutionCapabilities {
 pub(crate) struct SurfaceImplicitOverrides {
     pub(crate) fixed_schema_key: Option<String>,
     pub(crate) expose_version_id: bool,
-    pub(crate) predicate_overrides: Vec<SurfaceOverridePredicate>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum SurfaceOverrideValue {
-    Null,
-    Boolean(bool),
-    Number(String),
-    String(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,12 +103,6 @@ pub(crate) enum SurfaceColumnType {
     Number,
     Boolean,
     Json,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SurfaceOverridePredicate {
-    pub(crate) column: String,
-    pub(crate) value: SurfaceOverrideValue,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,7 +142,6 @@ pub(crate) struct DynamicEntitySurfaceSpec {
     pub(crate) schema_key: String,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
-    pub(crate) predicate_overrides: Vec<SurfaceOverridePredicate>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -547,10 +531,6 @@ pub(crate) fn dynamic_entity_surface_descriptor(
                 variant,
                 SurfaceVariant::ByVersion | SurfaceVariant::History
             ),
-            predicate_overrides: entity_override_predicates_for_variant(
-                &spec.predicate_overrides,
-                variant,
-            ),
         },
         catalog_source,
     }
@@ -595,20 +575,6 @@ fn entity_surface_capability(schema_key: &str, variant: SurfaceVariant) -> Surfa
         | "lix_change_author" => SurfaceCapability::ReadOnly,
         _ => SurfaceCapability::ReadWrite,
     }
-}
-
-fn entity_override_predicates_for_variant(
-    predicates: &[SurfaceOverridePredicate],
-    variant: SurfaceVariant,
-) -> Vec<SurfaceOverridePredicate> {
-    predicates
-        .iter()
-        .filter(|predicate| match predicate.column.as_str() {
-            "global" | "untracked" => !matches!(variant, SurfaceVariant::History),
-            _ => true,
-        })
-        .cloned()
-        .collect()
 }
 
 fn entity_visible_columns(spec: &DynamicEntitySurfaceSpec, variant: SurfaceVariant) -> Vec<String> {

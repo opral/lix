@@ -7,27 +7,23 @@ use crate::catalog::{
     register_dynamic_entity_surface_spec, remove_dynamic_entity_surfaces_for_schema_key,
     SurfaceRegistry,
 };
-use crate::functions::DynFunctionProvider;
 use crate::live_state::{
     decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
     scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::schema_from_registered_snapshot;
-use crate::schema::SchemaAnnotationEvaluator;
 use crate::schema::SchemaKey;
 use crate::{LixBackend, LixError};
 
 pub(crate) async fn load_public_surface_registry_with_backend(
     backend: &dyn LixBackend,
     requested_version_id: Option<&str>,
-    evaluator: &dyn SchemaAnnotationEvaluator,
-    functions: &DynFunctionProvider,
 ) -> Result<SurfaceRegistry, LixError> {
     let mut registry = build_builtin_surface_registry();
     let visible_version_ids =
         visible_registered_schema_version_ids(backend, requested_version_id).await?;
     for (_, schema) in load_latest_registered_schemas(backend, &visible_version_ids).await? {
-        let spec = dynamic_entity_surface_spec_from_schema(&schema, evaluator, functions)?;
+        let spec = dynamic_entity_surface_spec_from_schema(&schema)?;
         register_dynamic_entity_surface_spec(&mut registry, spec);
     }
     Ok(registry)
@@ -36,12 +32,10 @@ pub(crate) async fn load_public_surface_registry_with_backend(
 pub(crate) fn apply_registered_schema_snapshot_to_surface_registry(
     registry: &mut SurfaceRegistry,
     snapshot: &JsonValue,
-    evaluator: &dyn SchemaAnnotationEvaluator,
-    functions: &DynFunctionProvider,
 ) -> Result<(), LixError> {
     let (key, schema) = schema_from_registered_snapshot(snapshot)?;
     remove_dynamic_entity_surfaces_for_schema_key(registry, &key.schema_key);
-    let spec = dynamic_entity_surface_spec_from_schema(&schema, evaluator, functions)?;
+    let spec = dynamic_entity_surface_spec_from_schema(&schema)?;
     register_dynamic_entity_surface_spec(registry, spec);
     Ok(())
 }
@@ -108,95 +102,26 @@ fn schema_key_is_older(candidate: &SchemaKey, existing: &SchemaKey) -> bool {
 mod tests {
     use super::load_public_surface_registry_with_backend;
     use crate::catalog::{dynamic_entity_surface_spec_from_schema, SurfaceFamily};
-    use crate::cel::shared_runtime;
-    use crate::functions::SystemFunctionProvider;
-    use crate::functions::{clone_boxed_function_provider, SharedFunctionProvider};
     use crate::{LixBackend, LixError, QueryResult, SqlDialect, Value};
     use async_trait::async_trait;
     use serde_json::json;
     use std::collections::HashMap;
 
-    fn system_functions() -> crate::functions::DynFunctionProvider {
-        clone_boxed_function_provider(&SharedFunctionProvider::new(SystemFunctionProvider))
-    }
-
     #[test]
     fn entity_surface_spec_is_derived_from_schema_properties() {
-        let functions = system_functions();
-        let spec = dynamic_entity_surface_spec_from_schema(
-            &json!({
-                "x-lix-key": "project_message",
-                "properties": {
-                    "message": { "type": "string" },
-                    "id": { "type": "string" }
-                }
-            }),
-            shared_runtime(),
-            &functions,
-        )
+        let spec = dynamic_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "project_message",
+            "properties": {
+                "message": { "type": "string" },
+                "id": { "type": "string" }
+            }
+        }))
         .expect("schema spec should derive");
 
         assert_eq!(spec.schema_key, "project_message");
         assert_eq!(
             spec.visible_columns,
             vec!["id".to_string(), "message".to_string()]
-        );
-    }
-
-    #[test]
-    fn entity_surface_spec_evaluates_override_metadata() {
-        let functions = system_functions();
-        let spec = dynamic_entity_surface_spec_from_schema(
-            &json!({
-                "x-lix-key": "message",
-                "x-lix-version": "1",
-                "x-lix-override-lixcols": {
-                    "lixcol_entity_id": "\"message-1\"",
-                    "lixcol_metadata": "\"meta\""
-                },
-                "properties": {
-                    "body": { "type": "string" },
-                    "id": { "type": "string" }
-                }
-            }),
-            shared_runtime(),
-            &functions,
-        )
-        .expect("schema spec should derive");
-
-        assert_eq!(spec.predicate_overrides.len(), 2);
-        assert!(
-            !spec
-                .predicate_overrides
-                .iter()
-                .any(|predicate| predicate.column == "global"),
-            "dynamic entity surfaces should not derive hidden global predicates"
-        );
-    }
-
-    #[test]
-    fn entity_surface_spec_rejects_removed_lixcol_version_override() {
-        let functions = system_functions();
-        let err = dynamic_entity_surface_spec_from_schema(
-            &json!({
-                "x-lix-key": "message",
-                "x-lix-version": "1",
-                "x-lix-override-lixcols": {
-                    "lixcol_version_id": "\"global\""
-                },
-                "properties": {
-                    "id": { "type": "string" }
-                }
-            }),
-            shared_runtime(),
-            &functions,
-        )
-        .expect_err("removed lixcol_version_id override should be rejected");
-
-        assert!(
-            err.description
-                .contains("x-lix-override-lixcols.lixcol_version_id"),
-            "unexpected error: {err:?}"
         );
     }
 
@@ -348,12 +273,9 @@ mod tests {
             )]),
         };
 
-        let functions = system_functions();
         let registry = load_public_surface_registry_with_backend(
             &backend,
             Some(crate::version::GLOBAL_VERSION_ID),
-            shared_runtime(),
-            &functions,
         )
         .await
         .expect("load surface registry");

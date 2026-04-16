@@ -4,8 +4,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 use cel::Program;
 use serde_json::{Map as JsonMap, Value as JsonValue};
 
-use crate::functions::{DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider};
-use crate::schema::SchemaAnnotationEvaluator;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::LixError;
 
 use super::context::build_context_with_functions;
@@ -60,17 +59,6 @@ impl CelEvaluator {
             .insert(expression.to_string(), compiled.clone());
 
         Ok(compiled)
-    }
-}
-
-impl SchemaAnnotationEvaluator for CelEvaluator {
-    fn evaluate_schema_annotation_expression(
-        &self,
-        expression: &str,
-        variables: &JsonMap<String, JsonValue>,
-        functions: &DynFunctionProvider,
-    ) -> Result<JsonValue, LixError> {
-        self.evaluate_with_functions(expression, variables, functions.clone())
     }
 }
 
