@@ -45,7 +45,7 @@ const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> WriteResolveError {
     WriteResolveError {
         message: error.message,
-        hint: None,
+        hint: error.hint,
     }
 }
 

@@ -209,8 +209,8 @@ impl PathError {
             ),
             Self::InvalidIriCodePoint => (
                 "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT",
-                "path contains characters outside the RFC 3987 path grammar",
-                Some("remove the disallowed character or percent-encode it at the boundary"),
+                "path contains a raw character that is not allowed in canonical Lix paths",
+                Some("canonical paths allow Unicode, but raw spaces, '?' and '#' must be percent-encoded at boundaries"),
             ),
             Self::NulByte => (
                 "LIX_ERROR_PATH_NUL_BYTE",
@@ -326,13 +326,7 @@ fn is_iunreserved_ucschar(ch: char) -> bool {
 fn is_disallowed_bidi_formatting_char(ch: char) -> bool {
     matches!(
         ch,
-        '\u{200E}'
-            | '\u{200F}'
-            | '\u{202A}'
-            | '\u{202B}'
-            | '\u{202C}'
-            | '\u{202D}'
-            | '\u{202E}'
+        '\u{200E}' | '\u{200F}' | '\u{202A}' | '\u{202B}' | '\u{202C}' | '\u{202D}' | '\u{202E}'
     )
 }
 
@@ -661,10 +655,9 @@ mod tests {
                     fixture.label,
                     fixture.input
                 ),
-                Err(expected) => assert_path_error(
-                    normalize_file_path_impl(fixture.input),
-                    expected,
-                ),
+                Err(expected) => {
+                    assert_path_error(normalize_file_path_impl(fixture.input), expected)
+                }
             },
             LixFixtureKind::Directory => match fixture.expected {
                 Ok(expected) => assert_eq!(
@@ -674,10 +667,9 @@ mod tests {
                     fixture.label,
                     fixture.input
                 ),
-                Err(expected) => assert_path_error(
-                    normalize_directory_path_impl(fixture.input),
-                    expected,
-                ),
+                Err(expected) => {
+                    assert_path_error(normalize_directory_path_impl(fixture.input), expected)
+                }
             },
         }
     }
@@ -929,7 +921,10 @@ mod tests {
             normalize_file_path_impl("no-leading"),
             PathError::MissingLeadingSlash,
         );
-        assert_path_error(normalize_file_path_impl("/bad//double"), PathError::EmptySegment);
+        assert_path_error(
+            normalize_file_path_impl("/bad//double"),
+            PathError::EmptySegment,
+        );
     }
 
     #[test]
@@ -945,21 +940,30 @@ mod tests {
     #[test]
     fn rejects_file_paths_with_invalid_characters() {
         for path in ["/docs/file?.md", "/docs/#hash", "/docs/file name.md"] {
-            assert_path_error(normalize_file_path_impl(path), PathError::InvalidIriCodePoint);
+            assert_path_error(
+                normalize_file_path_impl(path),
+                PathError::InvalidIriCodePoint,
+            );
         }
     }
 
     #[test]
     fn rejects_file_paths_with_private_use_and_noncharacter_code_points() {
         for path in ["/docs/\u{E000}.md", "/docs/\u{FDD0}.md"] {
-            assert_path_error(normalize_file_path_impl(path), PathError::InvalidIriCodePoint);
+            assert_path_error(
+                normalize_file_path_impl(path),
+                PathError::InvalidIriCodePoint,
+            );
         }
     }
 
     #[test]
     fn rejects_file_paths_with_bidi_formatting_characters() {
         for path in ["/docs/\u{200E}.md", "/docs/\u{202E}.md"] {
-            assert_path_error(normalize_file_path_impl(path), PathError::InvalidIriCodePoint);
+            assert_path_error(
+                normalize_file_path_impl(path),
+                PathError::InvalidIriCodePoint,
+            );
         }
     }
 
@@ -1005,7 +1009,13 @@ mod tests {
 
     #[test]
     fn accepts_and_rejects_directory_paths_like_legacy_rules() {
-        for path in ["/", "/docs/", "/docs/guides/", "/unicodé/章节/", "/docs/%20/"] {
+        for path in [
+            "/",
+            "/docs/",
+            "/docs/guides/",
+            "/unicodé/章节/",
+            "/docs/%20/",
+        ] {
             assert!(
                 normalize_directory_path(path).is_ok(),
                 "expected valid directory path {path}"
@@ -1065,26 +1075,17 @@ mod tests {
 
     #[test]
     fn compose_directory_path_under_root() {
-        assert_eq!(
-            compose_directory_path("/", "docs").as_deref(),
-            Ok("/docs/")
-        );
+        assert_eq!(compose_directory_path("/", "docs").as_deref(), Ok("/docs/"));
     }
 
     #[test]
     fn exposes_stable_lix_errors_with_hints() {
         let missing_leading = normalize_file_path("docs/readme.md").expect_err("leading slash");
-        assert_eq!(
-            missing_leading.code,
-            "LIX_ERROR_PATH_MISSING_LEADING_SLASH"
-        );
+        assert_eq!(missing_leading.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
         assert_eq!(missing_leading.hint(), Some("prefix the path with '/'"));
 
         let bad_percent = normalize_file_path("/docs/%zz.md").expect_err("bad percent");
-        assert_eq!(
-            bad_percent.code,
-            "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING"
-        );
+        assert_eq!(bad_percent.code, "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING");
         assert_eq!(
             bad_percent.hint(),
             Some("use percent triplets like %20 and escape '%' as %25")

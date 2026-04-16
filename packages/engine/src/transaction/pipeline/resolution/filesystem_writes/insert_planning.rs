@@ -22,12 +22,14 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct FilesystemPlanningError {
     pub(super) message: String,
+    pub(super) hint: Option<String>,
 }
 
 impl From<FilesystemQueryError> for FilesystemPlanningError {
     fn from(error: FilesystemQueryError) -> Self {
         Self {
             message: error.message,
+            hint: error.hint,
         }
     }
 }
@@ -283,6 +285,9 @@ impl PendingFilesystemInsertBatch {
                     "Directory path collides with file path already inserted in this statement: {}",
                     file_collision_path
                 ),
+                hint: Some(
+                    "directory paths must end with '/', while file paths must not".to_string(),
+                ),
             });
         }
 
@@ -300,6 +305,7 @@ impl PendingFilesystemInsertBatch {
                             "Unique constraint violation: directory path '{}' already exists in this INSERT",
                             target.path
                         ),
+                        hint: None,
                     });
                 }
                 entry.insert(PendingDirectoryInsert {
@@ -326,6 +332,9 @@ impl PendingFilesystemInsertBatch {
                     "File path collides with directory path already inserted in this statement: {}",
                     directory_collision_path
                 ),
+                hint: Some(
+                    "file paths must not end with '/', while directory paths must".to_string(),
+                ),
             });
         }
         if self.files_by_path.contains_key(&target.path) {
@@ -334,6 +343,7 @@ impl PendingFilesystemInsertBatch {
                     "Unique constraint violation: file path '{}' already exists in this INSERT",
                     target.path
                 ),
+                hint: None,
             });
         }
         self.files_by_path
@@ -353,6 +363,7 @@ impl PendingFilesystemInsertBatch {
                             "public filesystem directory insert produced duplicate id '{}' for paths '{}' and '{}'",
                             pending.target.id, existing_path, pending.target.path
                         ),
+                        hint: None,
                     });
                 }
             }
@@ -372,6 +383,7 @@ impl PendingFilesystemInsertBatch {
                             "public filesystem file insert produced duplicate id '{}' for paths '{}' and '{}'",
                             pending.target.id, existing_path, pending.target.path
                         ),
+                        hint: None,
                     });
                 }
             }
@@ -640,6 +652,7 @@ where
                     "Unique constraint violation: file path '{}' already exists in this INSERT",
                     parsed.normalized_path.as_str()
                 ),
+                hint: None,
             });
         }
     } else if let Some(existing_id) = snapshot.file_id_by_path(parsed.normalized_path.as_str()) {
@@ -653,6 +666,7 @@ where
                     parsed.normalized_path.as_str(),
                     version_id
                 ),
+                hint: None,
             });
         }
     }
@@ -691,6 +705,7 @@ where
         let derived_name =
             directory_name_from_path(&normalized_path).ok_or_else(|| FilesystemPlanningError {
                 message: "Directory name must be provided".to_string(),
+                hint: None,
             })?;
         let derived_parent_path = ensure_parent_directories_for_insert_batch(
             parent_directory_path(&normalized_path)
@@ -713,6 +728,7 @@ where
                     "Provided parent_id does not match parent derived from path {}",
                     normalized_path
                 ),
+                hint: None,
             });
         }
         if let Some(name) = explicit_name {
@@ -722,6 +738,7 @@ where
                         "Provided directory name '{}' does not match path '{}'",
                         name, normalized_path
                     ),
+                    hint: None,
                 });
             }
         }
@@ -730,12 +747,14 @@ where
         let name = explicit_name
             .ok_or_else(|| FilesystemPlanningError {
                 message: "Directory name must be provided".to_string(),
+                hint: None,
             })?
             .to_string();
         let parent_path = match explicit_parent_id {
             Some(parent_id) => lookup_directory_path_by_id_in_snapshot(parent_id, snapshot, batch)
                 .ok_or_else(|| FilesystemPlanningError {
                     message: format!("Parent directory does not exist for id {parent_id}"),
+                    hint: None,
                 })?,
             None => "/".to_string(),
         };
@@ -753,6 +772,7 @@ where
                     "Unique constraint violation: directory path '{}' already exists in this INSERT",
                     normalized_path
                 ),
+                hint: None,
             });
         }
     } else if let Some(existing_id) = snapshot.directory_id_by_path(&normalized_path) {
@@ -765,6 +785,7 @@ where
                     "Unique constraint violation: directory path '{}' already exists in version '{}'",
                     normalized_path, version_id
                 ),
+                hint: None,
             });
         }
     }
@@ -1085,6 +1106,7 @@ fn ensure_no_file_at_directory_path_in_snapshot(
                 "Directory path collides with existing file path: {}",
                 file_path.normalized_path.as_str()
             ),
+            hint: Some("directory paths must end with '/', while file paths must not".to_string()),
         });
     }
     if snapshot
@@ -1096,6 +1118,7 @@ fn ensure_no_file_at_directory_path_in_snapshot(
                 "Directory path collides with existing file path: {}",
                 file_path.normalized_path.as_str()
             ),
+            hint: Some("directory paths must end with '/', while file paths must not".to_string()),
         });
     }
     Ok(())
@@ -1121,6 +1144,7 @@ fn ensure_no_directory_at_file_path_in_snapshot(
                 "File path collides with existing directory path: {}",
                 directory_path.as_str()
             ),
+            hint: Some("file paths must not end with '/', while directory paths must".to_string()),
         });
     }
     if snapshot
@@ -1132,6 +1156,7 @@ fn ensure_no_directory_at_file_path_in_snapshot(
                 "File path collides with existing directory path: {}",
                 directory_path.as_str()
             ),
+            hint: Some("file paths must not end with '/', while directory paths must".to_string()),
         });
     }
     Ok(())
@@ -1168,6 +1193,7 @@ where
 {
     let schema = builtin_schema_definition(schema_key).ok_or_else(|| FilesystemPlanningError {
         message: format!("public filesystem insert missing builtin schema '{schema_key}'"),
+        hint: None,
     })?;
     let schema_version = schema
         .get("x-lix-version")
@@ -1176,6 +1202,7 @@ where
             message: format!(
                 "public filesystem insert requires string x-lix-version for '{schema_key}'"
             ),
+            hint: None,
         })?;
     let mut snapshot = JsonMap::new();
     apply_schema_defaults_with_shared_runtime(
@@ -1194,12 +1221,14 @@ where
             message: format!(
                 "public filesystem insert default id for '{schema_key}' must resolve to text"
             ),
+            hint: None,
         })
 }
 
 fn filesystem_path_error(error: crate::LixError) -> FilesystemPlanningError {
     FilesystemPlanningError {
         message: error.description,
+        hint: error.hint,
     }
 }
 
@@ -1217,10 +1246,8 @@ mod tests {
             hidden: false,
             metadata: None,
         }];
-        let existing_directory_paths_by_id = BTreeMap::from([(
-            "parent-1".to_string(),
-            "/docs:root/".to_string(),
-        )]);
+        let existing_directory_paths_by_id =
+            BTreeMap::from([("parent-1".to_string(), "/docs:root/".to_string())]);
 
         let (requested_directory_paths, requested_file_paths) =
             collect_directory_insert_requests(&assignments, &existing_directory_paths_by_id)
@@ -1265,6 +1292,27 @@ mod tests {
             ),
             "unexpected error: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn directory_file_collision_explains_trailing_slash_expectation() {
+        let mut snapshot = FilesystemInsertSnapshot::default();
+        snapshot.existing_file_ids_by_path.insert(
+            "/docs:root/guide:alpha@beta".to_string(),
+            "file-1".to_string(),
+        );
+
+        let err = ensure_no_file_at_directory_path_in_snapshot(
+            &NormalizedDirectoryPath::from_normalized("/docs:root/guide:alpha@beta/".to_string()),
+            &snapshot,
+            &PendingFilesystemInsertBatch::default(),
+        )
+        .expect_err("directory/file collision should be rejected");
+
+        assert_eq!(
+            err.hint.as_deref(),
+            Some("directory paths must end with '/', while file paths must not")
         );
     }
 }
