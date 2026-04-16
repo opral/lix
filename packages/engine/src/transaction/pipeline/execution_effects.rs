@@ -111,6 +111,7 @@ pub(crate) async fn complete_sql_command_execution(
                         "transaction pending filesystem payload persistence failed: {}",
                         error.description
                     ),
+                    hint: None,
                 })?;
         }
         let filesystem_finalization = if filesystem_payload_changes_already_committed {
@@ -133,6 +134,7 @@ pub(crate) async fn complete_sql_command_execution(
                         "transaction filesystem finalization compilation failed: {}",
                         error.description
                     ),
+                    hint: None,
                 })?,
             )
         };
@@ -148,6 +150,7 @@ pub(crate) async fn complete_sql_command_execution(
                     "transaction tracked filesystem side-effect persistence failed: {}",
                     error.description
                 ),
+                hint: None,
             })?;
         }
         if filesystem_finalization
@@ -163,6 +166,7 @@ pub(crate) async fn complete_sql_command_execution(
                         "transaction binary CAS garbage collection failed: {}",
                         error.description
                     ),
+                    hint: None,
                 })?;
         }
     }
@@ -180,6 +184,7 @@ pub(crate) async fn complete_sql_command_execution(
                     "transaction runtime-sequence persistence failed: {}",
                     error.description
                 ),
+                hint: None,
             })?;
     }
 

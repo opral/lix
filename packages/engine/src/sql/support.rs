@@ -32,6 +32,7 @@ pub(crate) fn parse_sql_statements_with_timing(sql: &str) -> Result<ParsedSql, L
     parse_sql_script_with_timing(sql).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.to_string(),
+        hint: None,
     })
 }
 
@@ -168,6 +169,7 @@ pub(crate) fn parse_placeholder_ref(token: &str) -> Result<PlaceholderRef, LixEr
     Err(LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("unsupported SQL placeholder format '{trimmed}'"),
+        hint: None,
     })
 }
 
@@ -197,6 +199,7 @@ pub(crate) fn resolve_placeholder_ref(
                 source_index + 1,
                 params_len
             ),
+            hint: None,
         });
     }
 
@@ -216,11 +219,13 @@ fn parse_1_based_index(token: &str, numeric: &str) -> Result<usize, LixError> {
     let parsed = numeric.parse::<usize>().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("invalid SQL placeholder '{token}'"),
+        hint: None,
     })?;
     if parsed == 0 {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("invalid SQL placeholder '{token}'"),
+            hint: None,
         });
     }
     Ok(parsed)

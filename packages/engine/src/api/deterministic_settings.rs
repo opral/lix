@@ -158,6 +158,7 @@ async fn load_persisted_key_value_payloads(
         let parsed: JsonValue = serde_json::from_str(&raw).map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("deterministic mode value_json invalid JSON: {err}"),
+            hint: None,
         })?;
         values.insert(entity_id, parsed);
     }
@@ -171,6 +172,7 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("expected text value for {name}"),
+            hint: None,
         }),
     }
 }

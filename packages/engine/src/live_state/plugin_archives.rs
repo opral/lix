@@ -55,6 +55,7 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
             description: format!(
                 "plugin archive lookup: row missing column '{column}' at index {index}"
             ),
+            hint: None,
         });
     };
 
@@ -65,6 +66,7 @@ fn text_required(row: &[Value], index: usize, column: &str) -> Result<String, Li
             description: format!(
                 "plugin archive lookup: expected text in column '{column}', got {other:?}"
             ),
+            hint: None,
         }),
     }
 }

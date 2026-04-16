@@ -60,6 +60,7 @@ fn parse_lix_json_extract_named(
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("{function_name}() does not support DISTINCT/ALL/clauses"),
+                    hint: None,
                 });
             }
             &list.args
@@ -68,6 +69,7 @@ fn parse_lix_json_extract_named(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("{function_name}() requires a regular argument list"),
+                hint: None,
             })
         }
     };
@@ -76,6 +78,7 @@ fn parse_lix_json_extract_named(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{function_name}() requires at least 2 arguments"),
+            hint: None,
         });
     }
 
@@ -89,6 +92,7 @@ fn parse_lix_json_extract_named(
             description: format!(
                 "{function_name}() path arguments must be single-quoted strings for object keys or non-negative integer literals for array indexes"
             ),
+            hint: None,
         })?;
         path.push(segment);
     }
@@ -107,6 +111,7 @@ pub(crate) fn parse_lix_json(function: &Function) -> Result<Option<LixJsonCall>,
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "lix_json() does not support DISTINCT/ALL/clauses".to_string(),
+                    hint: None,
                 });
             }
             &list.args
@@ -115,6 +120,7 @@ pub(crate) fn parse_lix_json(function: &Function) -> Result<Option<LixJsonCall>,
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "lix_json() requires a regular argument list".to_string(),
+                hint: None,
             });
         }
     };
@@ -123,6 +129,7 @@ pub(crate) fn parse_lix_json(function: &Function) -> Result<Option<LixJsonCall>,
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "lix_json() requires exactly 1 argument".to_string(),
+            hint: None,
         });
     }
 
@@ -141,12 +148,14 @@ pub(crate) fn parse_lix_empty_blob(function: &Function) -> Result<Option<()>, Li
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "lix_empty_blob() does not support DISTINCT/ALL/clauses"
                         .to_string(),
+                    hint: None,
                 });
             }
             if !list.args.is_empty() {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "lix_empty_blob() does not accept arguments".to_string(),
+                    hint: None,
                 });
             }
             Ok(Some(()))
@@ -155,6 +164,7 @@ pub(crate) fn parse_lix_empty_blob(function: &Function) -> Result<Option<()>, Li
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "lix_empty_blob() requires a regular argument list".to_string(),
+            hint: None,
         }),
     }
 }
@@ -184,6 +194,7 @@ fn parse_lix_text_codec(
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("{fn_name}() does not support DISTINCT/ALL/clauses"),
+                    hint: None,
                 });
             }
             &list.args
@@ -192,6 +203,7 @@ fn parse_lix_text_codec(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("{fn_name}() requires a regular argument list"),
+                hint: None,
             });
         }
     };
@@ -199,6 +211,7 @@ fn parse_lix_text_codec(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{fn_name}() requires 1 or 2 arguments"),
+            hint: None,
         });
     }
     let value_expr = function_arg_expr(&args[0], &format!("{fn_name}()"))?;
@@ -207,6 +220,7 @@ fn parse_lix_text_codec(
         let raw = string_literal(&expr).ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{fn_name}() encoding must be a single-quoted string literal"),
+            hint: None,
         })?;
         normalize_utf8_encoding(raw, fn_name)?
     } else {
@@ -234,6 +248,7 @@ fn function_arg_expr(arg: &FunctionArg, function_name: &str) -> Result<Expr, Lix
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("{function_name} does not support named arguments"),
+                hint: None,
             })
         }
     };
@@ -243,6 +258,7 @@ fn function_arg_expr(arg: &FunctionArg, function_name: &str) -> Result<Expr, Lix
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{function_name} arguments must be SQL expressions"),
+            hint: None,
         }),
     }
 }
@@ -281,6 +297,7 @@ fn normalize_utf8_encoding(raw: &str, fn_name: &str) -> Result<String, LixError>
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{fn_name}() only supports UTF8 encoding, got '{raw}'"),
+            hint: None,
         })
     }
 }

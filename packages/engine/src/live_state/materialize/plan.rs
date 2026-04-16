@@ -653,6 +653,7 @@ fn parse_untracked_visibility_version_ref_commit_id(
             "materialization: invalid untracked visibility lix_version_ref snapshot JSON: {}",
             error.description
         ),
+        hint: None,
     })?;
 
     if parsed.id.is_empty() || parsed.commit_id.is_empty() {

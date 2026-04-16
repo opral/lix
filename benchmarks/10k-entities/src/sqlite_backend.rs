@@ -34,6 +34,7 @@ impl BenchSqliteBackend {
                     "failed to create sqlite benchmark directory {}: {error}",
                     parent.display()
                 ),
+                hint: None,
             })?;
         }
 
@@ -63,6 +64,7 @@ impl BenchSqliteBackend {
                     .map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: error.to_string(),
+                        hint: None,
                     })?
                     .create_if_missing(true)
                     .foreign_keys(true)
@@ -75,6 +77,7 @@ impl BenchSqliteBackend {
                     .map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: error.to_string(),
+                        hint: None,
                     })
             })
             .await
@@ -110,6 +113,7 @@ impl LixBackend for BenchSqliteBackend {
         let mut conn = pool.acquire().await.map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: error.to_string(),
+            hint: None,
         })?;
 
         sqlx::query(match mode {
@@ -121,6 +125,7 @@ impl LixBackend for BenchSqliteBackend {
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: error.to_string(),
+            hint: None,
         })?;
 
         Ok(Box::new(BenchSqliteTransaction { conn, mode }))
@@ -163,6 +168,7 @@ impl LixBackendTransaction for BenchSqliteTransaction {
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: error.to_string(),
+                hint: None,
             })?;
 
         Ok(QueryResult {
@@ -178,6 +184,7 @@ impl LixBackendTransaction for BenchSqliteTransaction {
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: error.to_string(),
+                hint: None,
             })?;
         Ok(())
     }
@@ -189,6 +196,7 @@ impl LixBackendTransaction for BenchSqliteTransaction {
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: error.to_string(),
+                hint: None,
             })?;
         Ok(())
     }
@@ -210,6 +218,7 @@ async fn execute_query_with_connection(
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: error.to_string(),
+            hint: None,
         })?;
 
     let columns = rows
@@ -256,6 +265,7 @@ fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value
     let raw = row.try_get_raw(index).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.to_string(),
+        hint: None,
     })?;
 
     if raw.is_null() {
@@ -277,5 +287,6 @@ fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value
     .map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.to_string(),
+        hint: None,
     })
 }

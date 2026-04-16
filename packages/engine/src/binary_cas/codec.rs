@@ -65,6 +65,7 @@ pub(crate) fn decode_binary_chunk_payload(
                 "{context}: unsupported chunk codec '{}' for blob hash '{}' chunk '{}'",
                 other, blob_hash, chunk_hash
             ),
+            hint: None,
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -72,6 +73,7 @@ pub(crate) fn decode_binary_chunk_payload(
                 "{context}: missing chunk codec for blob hash '{}' chunk '{}'",
                 blob_hash, chunk_hash
             ),
+            hint: None,
         }),
     }
 }
@@ -81,6 +83,7 @@ fn compress_binary_chunk_payload(chunk_data: &[u8]) -> Result<Vec<u8>, LixError>
     zstd::bulk::compress(chunk_data, 3).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("binary chunk compression failed: {error}"),
+        hint: None,
     })
 }
 
@@ -106,6 +109,7 @@ fn decode_binary_chunk_zstd_payload(
             "{context}: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
             blob_hash, chunk_hash
         ),
+        hint: None,
     })
 }
 
@@ -126,6 +130,7 @@ fn decode_binary_chunk_zstd_payload(
                 "{context}: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
                 blob_hash, chunk_hash
             ),
+            hint: None,
         })?;
 
     let mut output = Vec::new();
@@ -135,6 +140,7 @@ fn decode_binary_chunk_zstd_payload(
             "{context}: chunk decompression failed for blob hash '{}' chunk '{}': {error}",
             blob_hash, chunk_hash
         ),
+        hint: None,
     })?;
     Ok(output)
 }

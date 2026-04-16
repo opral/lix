@@ -53,6 +53,7 @@ impl<'a> QueryExecutor for TransactionExecutionBackend<'a> {
         let mut guard = self.transaction.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
+            hint: None,
         })?;
         unsafe { (&mut **guard).execute(sql, params).await }
     }
@@ -68,6 +69,7 @@ impl<'a> LixBackend for TransactionExecutionBackend<'a> {
         let mut guard = self.transaction.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
+            hint: None,
         })?;
         unsafe { (&mut **guard).execute(sql, params).await }
     }
@@ -80,6 +82,7 @@ impl<'a> LixBackend for TransactionExecutionBackend<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "nested transactions are not supported via TransactionExecutionBackend"
                 .to_string(),
+            hint: None,
         })
     }
 
@@ -90,6 +93,7 @@ impl<'a> LixBackend for TransactionExecutionBackend<'a> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "savepoints are not supported via TransactionExecutionBackend".to_string(),
+            hint: None,
         })
     }
 }

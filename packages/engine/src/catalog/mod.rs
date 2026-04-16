@@ -120,6 +120,7 @@ pub(crate) fn dynamic_entity_surface_spec_from_schema(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "schema is missing string x-lix-key".to_string(),
+            hint: None,
         })?;
 
     let mut visible_columns = schema
@@ -225,6 +226,7 @@ fn builtin_entity_surface_spec_from_schema(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "schema is missing string x-lix-key".to_string(),
+            hint: None,
         })?;
 
     let mut visible_columns = schema

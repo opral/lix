@@ -131,6 +131,7 @@ fn build_binary_cas_write_batch(
                 "binary blob size exceeds supported range for file '{}' version '{}'",
                 payload.file_id, payload.version_id
             ),
+            hint: None,
         })?;
         let materialize_chunk_cas = should_materialize_chunk_cas(payload.data);
         let chunk_ranges = if materialize_chunk_cas {
@@ -144,6 +145,7 @@ fn build_binary_cas_write_batch(
                 "binary chunk count exceeds supported range for file '{}' version '{}'",
                 payload.file_id, payload.version_id
             ),
+            hint: None,
         })?;
 
         manifest_rows
@@ -173,6 +175,7 @@ fn build_binary_cas_write_batch(
                     "binary chunk size exceeds supported range for file '{}' version '{}'",
                     payload.file_id, payload.version_id
                 ),
+                hint: None,
             })?;
             let stored_chunk_size =
                 i64::try_from(encoded_chunk.data.len()).map_err(|_| LixError {
@@ -181,6 +184,7 @@ fn build_binary_cas_write_batch(
                         "binary stored chunk size exceeds supported range for file '{}' version '{}'",
                         payload.file_id, payload.version_id
                     ),
+                    hint: None,
                 })?;
             let chunk_index = i64::try_from(chunk_index).map_err(|_| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -188,6 +192,7 @@ fn build_binary_cas_write_batch(
                     "binary chunk index exceeds supported range for file '{}' version '{}'",
                     payload.file_id, payload.version_id
                 ),
+                hint: None,
             })?;
 
             chunk_store_rows

@@ -170,6 +170,32 @@ export type ExecuteResult = {
 	statements: QueryResult[];
 };
 
+/**
+ * Error thrown by the Lix engine. Extends the standard `Error` with a
+ * machine-readable `code` and an optional `hint` suggesting how to recover.
+ *
+ * Hints follow the Postgres/rustc convention: `message` states what went
+ * wrong in factual terms; `hint` offers a fix when one is known. Consumers
+ * typically render the hint alongside the primary message (e.g. as
+ * `hint: <text>` in a CLI, secondary text in a UI).
+ */
+export interface LixError extends Error {
+	code: string;
+	hint?: string;
+}
+
+/**
+ * Type guard: returns `true` when `err` is a Lix-produced error carrying a
+ * structured `code` field (all engine codes start with `LIX_ERROR_`).
+ */
+export function isLixError(err: unknown): err is LixError {
+	return (
+		err instanceof Error &&
+		typeof (err as Partial<LixError>).code === "string" &&
+		(err as LixError).code.startsWith("LIX_ERROR")
+	);
+}
+
 function isLixValue(value: unknown): value is LixValue {
 	if (!value || typeof value !== "object") {
 		return false;

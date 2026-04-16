@@ -14,7 +14,7 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<CommandOutput, 
     let lix_path = db::resolve_db_path(context)?;
     let lix = db::open_lix_at(&lix_path)?;
     let result = pollster::block_on(lix.execute(&sql, &params))
-        .map_err(|err| CliError::msg(format!("sql execution failed: {err}")))?;
+        .map_err(|err| CliError::from_lix("sql execution failed", err))?;
 
     match args.format {
         SqlOutputFormat::Json => output::print_execute_result_json(&result),
@@ -24,9 +24,7 @@ pub fn run(context: &AppContext, args: SqlExecuteArgs) -> Result<CommandOutput, 
     let output_hints = if context.no_hints || !hints::are_hints_enabled(&lix) {
         Vec::new()
     } else {
-        let mut h = hints::hint_sqlite_master_query(&sql);
-        h.extend(hints::hint_blob_in_result(&result));
-        h
+        hints::hint_blob_in_result(&result)
     };
 
     Ok(CommandOutput::with_hints(output_hints))

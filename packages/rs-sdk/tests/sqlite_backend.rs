@@ -187,7 +187,10 @@ async fn sqlite_backend_rejects_nested_deferred_transaction_mode() {
         .await
         .expect("outer write transaction should succeed");
 
-    let error = match backend.begin_transaction(TransactionBeginMode::Deferred).await {
+    let error = match backend
+        .begin_transaction(TransactionBeginMode::Deferred)
+        .await
+    {
         Ok(_) => panic!("nested deferred transaction should be rejected"),
         Err(error) => error,
     };

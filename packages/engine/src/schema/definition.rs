@@ -29,6 +29,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Invalid Lix schema definition: {details}"),
+            hint: None,
         });
     }
 
@@ -49,6 +50,7 @@ pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), L
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Data validation failed: {details}"),
+            hint: None,
         });
     }
 
@@ -62,6 +64,7 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
         Err(err) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.description.clone(),
+            hint: None,
         }),
     }
 }
@@ -75,6 +78,7 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
     options.compile(schema).map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Failed to compile Lix schema definition: {err}"),
+        hint: None,
     })
 }
 
@@ -94,6 +98,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "Invalid JSON pointer".to_string(),
+            hint: None,
         });
     }
 
@@ -116,6 +121,7 @@ fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "Invalid JSON pointer".to_string(),
+                        hint: None,
                     })
                 }
             }
@@ -144,6 +150,7 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
                     "Invalid Lix schema definition: x-lix-primary-key references missing property \"{}\".",
                     pointer
                 ),
+                hint: None,
             });
         }
     }
@@ -173,6 +180,7 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
                         "Invalid Lix schema definition: x-lix-unique references missing property \"{}\".",
                         pointer
                     ),
+                    hint: None,
                 });
             }
         }
@@ -205,6 +213,7 @@ fn assert_non_aliased_lix_foreign_key_references(schema: &JsonValue) -> Result<(
         return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
                 "Invalid Lix schema definition: x-lix-foreign-keys references.schemaKey uses deprecated alias \"{schema_key}\"; use \"{replacement}\"."
             ),
+            hint: None,
         });
     }
 
@@ -237,6 +246,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
                     "Invalid Lix schema definition: unknown x-lix field '{}'.",
                     key
                 ),
+                hint: None,
             });
         }
     }
