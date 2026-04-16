@@ -121,17 +121,8 @@ impl Engine {
     pub(crate) async fn load_public_surface_registry_from_backend(
         &self,
     ) -> Result<SurfaceRegistry, LixError> {
-        let functions = self
-            .prepare_runtime_functions_with_backend(self.backend().as_ref())
-            .await?;
-        let functions = clone_boxed_function_provider(&functions);
-        crate::catalog::load_public_surface_registry_with_backend(
-            self.backend().as_ref(),
-            None,
-            crate::cel::shared_runtime(),
-            &functions,
-        )
-        .await
+        crate::catalog::load_public_surface_registry_with_backend(self.backend().as_ref(), None)
+            .await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {

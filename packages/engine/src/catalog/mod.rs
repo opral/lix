@@ -20,12 +20,7 @@ use serde_json::Value as JsonValue;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
-use crate::functions::DynFunctionProvider;
-use crate::schema::SchemaAnnotationEvaluator;
-use crate::schema::{
-    builtin_schema_definition, builtin_schema_keys, collect_dynamic_entity_surface_overrides,
-    decode_lixcol_literal, DynamicEntitySurfaceOverride, LixcolOverrideValue,
-};
+use crate::schema::{builtin_schema_definition, builtin_schema_keys};
 use crate::LixError;
 
 #[allow(unused_imports)]
@@ -118,8 +113,6 @@ pub(crate) fn build_builtin_surface_registry() -> SurfaceRegistry {
 
 pub(crate) fn dynamic_entity_surface_spec_from_schema(
     schema: &JsonValue,
-    evaluator: &dyn SchemaAnnotationEvaluator,
-    functions: &DynFunctionProvider,
 ) -> Result<DynamicEntitySurfaceSpec, LixError> {
     let schema_key = schema
         .get("x-lix-key")
@@ -158,14 +151,10 @@ pub(crate) fn dynamic_entity_surface_spec_from_schema(
         })
         .unwrap_or_default();
 
-    let predicate_overrides =
-        collect_dynamic_override_predicates(schema, schema_key, evaluator, functions)?;
-
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         visible_columns,
         column_types,
-        predicate_overrides,
     })
 }
 
@@ -271,119 +260,7 @@ fn builtin_entity_surface_spec_from_schema(
         schema_key: schema_key.to_string(),
         visible_columns,
         column_types,
-        predicate_overrides: collect_builtin_override_predicates(schema, schema_key)?,
     })
-}
-
-fn collect_builtin_override_predicates(
-    schema: &JsonValue,
-    schema_key: &str,
-) -> Result<Vec<SurfaceOverridePredicate>, LixError> {
-    let Some(overrides) = schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)
-    else {
-        return Ok(Vec::new());
-    };
-
-    for key in [
-        "lixcol_file_id",
-        "lixcol_plugin_key",
-        "lixcol_version_id",
-        "lixcol_global",
-        "lixcol_untracked",
-    ] {
-        if overrides.contains_key(key) {
-            return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "schema '{}' uses removed x-lix-override-lixcols.{} support",
-                    schema_key, key
-                ),
-            });
-        }
-    }
-
-    let mut predicates = Vec::new();
-    for key in ["lixcol_entity_id", "lixcol_metadata"] {
-        let Some(raw_value) = overrides.get(key).and_then(JsonValue::as_str) else {
-            continue;
-        };
-        let Some(column) = (match key {
-            "lixcol_entity_id" => Some("entity_id"),
-            "lixcol_metadata" => Some("metadata"),
-            _ => None,
-        }) else {
-            continue;
-        };
-        predicates.push(SurfaceOverridePredicate {
-            column: column.to_string(),
-            value: parse_builtin_override_value(schema_key, key, raw_value)?,
-        });
-    }
-
-    Ok(predicates)
-}
-
-fn parse_builtin_override_value(
-    schema_key: &str,
-    key: &str,
-    raw_value: &str,
-) -> Result<SurfaceOverrideValue, LixError> {
-    let value = serde_json::from_str::<JsonValue>(raw_value).map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!(
-            "builtin schema '{}.{}' must use a scalar JSON literal override: {}",
-            schema_key, key, error
-        ),
-    })?;
-
-    match value {
-        JsonValue::Null => Ok(SurfaceOverrideValue::Null),
-        JsonValue::Bool(value) => Ok(SurfaceOverrideValue::Boolean(value)),
-        JsonValue::Number(value) => Ok(SurfaceOverrideValue::Number(value.to_string())),
-        JsonValue::String(_) => Ok(SurfaceOverrideValue::String(decode_lixcol_literal(
-            raw_value,
-        ))),
-        JsonValue::Array(_) | JsonValue::Object(_) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "builtin schema '{}.{}' override must evaluate to a scalar or null",
-                schema_key, key
-            ),
-        }),
-    }
-}
-
-fn collect_dynamic_override_predicates(
-    schema: &JsonValue,
-    schema_key: &str,
-    evaluator: &dyn SchemaAnnotationEvaluator,
-    functions: &DynFunctionProvider,
-) -> Result<Vec<SurfaceOverridePredicate>, LixError> {
-    collect_dynamic_entity_surface_overrides(schema, schema_key, evaluator, functions).map(
-        |overrides| {
-            overrides
-                .into_iter()
-                .map(dynamic_surface_override_to_predicate)
-                .collect()
-        },
-    )
-}
-
-fn dynamic_surface_override_to_predicate(
-    override_entry: DynamicEntitySurfaceOverride,
-) -> SurfaceOverridePredicate {
-    let value = match override_entry.value {
-        LixcolOverrideValue::Null => SurfaceOverrideValue::Null,
-        LixcolOverrideValue::Boolean(value) => SurfaceOverrideValue::Boolean(value),
-        LixcolOverrideValue::Number(value) => SurfaceOverrideValue::Number(value),
-        LixcolOverrideValue::String(value) => SurfaceOverrideValue::String(value),
-    };
-    SurfaceOverridePredicate {
-        column: override_entry.column,
-        value,
-    }
 }
 
 fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnType> {

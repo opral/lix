@@ -7,15 +7,10 @@ mod key;
 mod tests;
 
 pub(crate) use annotations::defaults::apply_schema_defaults_with_shared_runtime;
-pub(crate) use annotations::overrides::{
-    collect_dynamic_entity_surface_overrides, collect_state_column_overrides_with_shared_runtime,
-    DynamicEntitySurfaceOverride, LixcolOverrideValue,
-};
-pub(crate) use annotations::SchemaAnnotationEvaluator;
 pub(crate) use builtin::{
     builtin_schema_definition, builtin_schema_keys, builtin_schema_storage_defaults,
-    decode_lixcol_literal, lix_state_surface_schema_definition, LixActiveVersion, LixCommit,
-    LixVersionDescriptor, LixVersionRef,
+    lix_state_surface_schema_definition, LixActiveVersion, LixCommit, LixVersionDescriptor,
+    LixVersionRef,
 };
 pub use compiled_cache::CompiledSchemaCache;
 pub use definition::{
