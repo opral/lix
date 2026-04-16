@@ -19,6 +19,6 @@ pub(crate) use preparation::{
     build_write_preparation_context, ensure_function_bindings_for_write_scope,
     prepare_buffered_write_execution_step, prepared_write_function_bindings_for_execution,
 };
-pub(crate) use resolution::{WriteResolveError, WriteSelectorResolver};
+pub(crate) use resolution::WriteSelectorResolver;
 pub(crate) use selector_reads::TransactionWriteSelectorResolver;
 pub(crate) use validation::validate_commit_time_write;

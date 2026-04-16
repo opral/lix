@@ -24,7 +24,7 @@ pub(crate) use fingerprint::stable_content_fingerprint_hex;
 #[allow(unused_imports)]
 pub(crate) use fs_path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
-    normalize_directory_path, normalize_file_path, normalize_path_segment, parent_directory_path,
+    normalize_directory_path, normalize_path_segment, parent_directory_path,
     NormalizedDirectoryPath, NormalizedFilePath, ParsedFilePath,
 };
 #[allow(unused_imports)]

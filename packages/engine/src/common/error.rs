@@ -25,6 +25,39 @@ pub struct LixError {
 }
 
 impl LixError {
+    /// True fallback — use when no more specific category fits. Producing
+    /// sites should prefer the categorized codes below whenever possible;
+    /// the SDK contract is that `LIX_ERROR_UNKNOWN` is the *last* resort,
+    /// never the default.
+    pub const CODE_UNKNOWN: &'static str = "LIX_ERROR_UNKNOWN";
+
+    /// Write-time failure where user data did not conform to a registered
+    /// schema (type mismatch, missing required field, pattern violation,
+    /// additionalProperties, etc.). Raised from the JSON-Schema validator
+    /// run over a candidate row's snapshot.
+    pub const CODE_SCHEMA_VALIDATION: &'static str = "LIX_ERROR_SCHEMA_VALIDATION";
+
+    /// A foreign-key constraint could not be satisfied. Covers both the
+    /// insert-side "no matching target row" failure and the delete-side
+    /// "still referenced" (restrict) failure.
+    pub const CODE_FOREIGN_KEY: &'static str = "LIX_ERROR_FOREIGN_KEY";
+
+    /// A primary-key or `x-lix-unique` constraint was violated — another
+    /// row already owns the value(s) for the declared pointer group.
+    pub const CODE_UNIQUE: &'static str = "LIX_ERROR_UNIQUE";
+
+    /// An `INSERT ... VALUES (...)` expression is not supported by the
+    /// public write surface (e.g. `json(...)`, subqueries, arbitrary SQL
+    /// expressions). Users should wrap inline JSON with `lix_json(...)`.
+    pub const CODE_UNSUPPORTED_WRITE_EXPRESSION: &'static str =
+        "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION";
+
+    /// The schema JSON itself (the *definition*, not a row against it) is
+    /// malformed — a missing `x-lix-key`, a JSON-Pointer without the
+    /// leading slash, a reserved-namespace collision, or any other
+    /// meta-schema validation failure.
+    pub const CODE_SCHEMA_DEFINITION: &'static str = "LIX_ERROR_SCHEMA_DEFINITION";
+
     pub fn new(code: impl Into<String>, description: impl Into<String>) -> Self {
         Self {
             code: code.into(),

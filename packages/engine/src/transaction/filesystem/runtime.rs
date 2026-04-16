@@ -580,11 +580,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
             FilesystemProjectionScope::ExplicitVersion,
         )
         .await
-        .map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: error.message,
-            hint: None,
-        })?;
+        ?;
         let row = if row.is_some() || version_id == GLOBAL_VERSION_ID {
             row
         } else {
@@ -595,11 +591,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
                 FilesystemProjectionScope::ExplicitVersion,
             )
             .await
-            .map_err(|error| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: error.message,
-                hint: None,
-            })?
+            ?
         };
         let Some(row) = row else {
             continue;

@@ -1,7 +1,22 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
   "title": "Lix Schema Definition",
-  "description": "A JSON schema document that defines Lix schema documents, including custom x-lix-* metadata for identification and versioning.",
+  "description": "A Lix schema is a JSON Schema draft-07 document augmented with `x-lix-*` extensions that identify, version, and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions), `x-lix-version` (string-as-integer, e.g. `\"1\"`), and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers) to make the schema writable — Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
+  "examples": [
+    {
+      "x-lix-key": "library_book",
+      "x-lix-version": "1",
+      "type": "object",
+      "x-lix-primary-key": ["/id"],
+      "properties": {
+        "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },
+        "title": { "type": "string" },
+        "author": { "type": "string" }
+      },
+      "required": ["id", "title"],
+      "additionalProperties": false
+    }
+  ],
   "allOf": [
     {
       "$ref": "http://json-schema.org/draft-07/schema#"
@@ -91,8 +106,9 @@
         "x-lix-key": {
           "type": "string",
           "pattern": "^[a-z][a-z0-9_]*$",
-          "description": "The schema identifier. Must be snake_case (lowercase, underscores) to safely embed in SQL identifiers.",
+          "description": "The schema identifier. Must be snake_case (lowercase, underscores) to safely embed in SQL identifiers. Prefix keys with a plugin, app, or domain namespace such as `library_book` or `csv_plugin_cell` to avoid collisions with other schemas.",
           "examples": [
+            "library_book",
             "csv_plugin_cell"
           ]
         },
@@ -117,7 +133,13 @@
                   "x-lix-default": {
                     "type": "string",
                     "format": "cel",
-                    "description": "CEL expression evaluated to produce the default value when the property is omitted."
+                    "description": "CEL expression evaluated to produce the default value when the property is omitted. Available Lix-registered functions: `lix_uuid_v7()` (RFC 9562 UUIDv7), `lix_timestamp()` (ISO-8601 string). CEL literals are also valid: strings (`'open'`), numbers (`0`, `3.14`), booleans (`true` / `false`), and `null`.",
+                    "examples": [
+                      "lix_uuid_v7()",
+                      "lix_timestamp()",
+                      "false",
+                      "'open'"
+                    ]
                   }
                 }
               }

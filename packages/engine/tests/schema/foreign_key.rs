@@ -332,3 +332,192 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    foreign_key_missing_target_error_names_pointers_and_schemas,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        register_parent_schema(&engine, "fk_msg_parent").await;
+        register_child_schema(&engine, "fk_msg_child", "fk_msg_parent").await;
+        engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'child-1', 'fk_msg_child', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"child-1\",\"parent_id\":\"ghost\",\"name\":\"child\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("missing parent should surface an FK violation");
+
+        assert_eq!(
+            err.code, "LIX_ERROR_FOREIGN_KEY",
+            "FK violations should carry the categorized code"
+        );
+        let desc = &err.description;
+        assert!(
+            desc.contains("foreign key on fk_msg_child./parent_id"),
+            "expected local pointer in message: {desc}"
+        );
+        assert!(
+            desc.contains("→ fk_msg_parent./id"),
+            "expected target schema + pointer in message: {desc}"
+        );
+        assert!(
+            desc.contains("no matching row"),
+            "expected 'no matching row' in message: {desc}"
+        );
+        assert!(
+            desc.contains("\"ghost\""),
+            "expected looked-up value in message: {desc}"
+        );
+        assert!(
+            !desc.contains("constraint 0"),
+            "new message should not expose the internal FK index: {desc}"
+        );
+        assert!(
+            !desc.contains("version '"),
+            "new message should not expose the internal version UUID: {desc}"
+        );
+        assert!(
+            !desc.contains("'NULL'"),
+            "new message should not print the literal 'NULL' file reference: {desc}"
+        );
+    }
+);
+
+simulation_test!(
+    foreign_key_composite_error_renders_pointer_tuples,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        register_parent_schema(&engine, "fk_composite_doc").await;
+        register_state_ref_schema(&engine, "fk_composite_ref").await;
+        engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'ref-1', 'fk_composite_ref', NULL, 'version-a', NULL, '1', '{\"id\":\"ref-1\",\"target_entity_id\":\"ghost\",\"target_schema_key\":\"fk_composite_doc\",\"target_file_id\":\"alpha.md\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("missing target tuple should surface an FK violation");
+
+        let desc = &err.description;
+        assert!(
+            desc.contains(
+                "foreign key on fk_composite_ref.(/target_entity_id, /target_schema_key, /target_file_id)"
+            ),
+            "expected composite local tuple in message: {desc}"
+        );
+        assert!(
+            desc.contains("→ fk_composite_doc.(/entity_id, /schema_key, /file_id)"),
+            "expected composite target tuple (resolved effective schema) in message: {desc}"
+        );
+        assert!(
+            desc.contains("(\"ghost\", \"fk_composite_doc\", \"alpha.md\")"),
+            "expected composite looked-up value tuple in message: {desc}"
+        );
+    }
+);
+
+simulation_test!(
+    foreign_key_restrict_delete_error_names_source_and_target,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        register_parent_schema(&engine, "fk_msg_parent_restrict").await;
+        register_child_schema(&engine, "fk_msg_child_restrict", "fk_msg_parent_restrict").await;
+        engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'parent-1', 'fk_msg_parent_restrict', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"parent-1\",\"name\":\"parent\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'child-1', 'fk_msg_child_restrict', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"child-1\",\"parent_id\":\"parent-1\",\"name\":\"child\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "DELETE FROM lix_state_by_version \
+                 WHERE entity_id = 'parent-1' \
+                   AND schema_key = 'fk_msg_parent_restrict' \
+                   AND file_id = 'alpha.md' \
+                   AND version_id = 'version-a'",
+                &[],
+            )
+            .await
+            .expect_err("deleting a referenced target should fail with a restrict error");
+
+        assert_eq!(
+            err.code, "LIX_ERROR_FOREIGN_KEY",
+            "FK restrict violations should carry the categorized code"
+        );
+        let desc = &err.description;
+        assert!(
+            desc.contains("foreign key restrict"),
+            "expected restrict prefix in message: {desc}"
+        );
+        assert!(
+            desc.contains("cannot delete fk_msg_parent_restrict entity 'parent-1'"),
+            "expected target schema + entity_id in message: {desc}"
+        );
+        assert!(
+            desc.contains(
+                "still referenced by fk_msg_child_restrict./parent_id → fk_msg_parent_restrict./id"
+            ),
+            "expected source→target FK descriptor in message: {desc}"
+        );
+        assert!(
+            !desc.contains("version '"),
+            "new message should not expose the internal version UUID: {desc}"
+        );
+        assert!(
+            !desc.contains("'NULL'"),
+            "new message should not print the literal 'NULL' file reference: {desc}"
+        );
+    }
+);

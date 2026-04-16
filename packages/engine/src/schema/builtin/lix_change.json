@@ -9,37 +9,45 @@
   "properties": {
     "id": {
       "type": "string",
-      "x-lix-default": "lix_uuid_v7()"
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Stable change identifier (UUIDv7). Referenced from `lix_commit.change_ids` and `lix_change_set_element.change_id`."
     },
     "entity_id": {
-      "type": "string"
+      "type": "string",
+      "description": "The entity this change applies to, scoped by (`schema_key`, `file_id`)."
     },
     "schema_key": {
-      "type": "string"
+      "type": "string",
+      "description": "Schema identifier of the entity (e.g. `lix_file_descriptor`, `lix_commit`, or a user-registered key)."
     },
     "schema_version": {
-      "type": "string"
+      "type": "string",
+      "description": "Schema version the snapshot_content was written against (matches `x-lix-version` on the schema at write time)."
     },
     "file_id": {
       "type": [
         "string",
         "null"
-      ]
+      ],
+      "description": "Filesystem-scoped file identifier when the change belongs to a file; NULL for engine-internal entities (commits, versions, settings)."
     },
     "plugin_key": {
       "type": [
         "string",
         "null"
-      ]
+      ],
+      "description": "Plugin that authored the change; NULL for engine-internal changes."
     },
     "metadata": {
       "type": [
         "object",
         "null"
-      ]
+      ],
+      "description": "Optional user-provided JSON metadata attached to the change; NULL when nothing was supplied."
     },
     "created_at": {
-      "type": "string"
+      "type": "string",
+      "description": "ISO-8601 timestamp at which the change was recorded (set via `lix_timestamp()` at write time)."
     },
     "untracked": {
       "type": "boolean",
@@ -49,7 +57,8 @@
       "type": [
         "object",
         "null"
-      ]
+      ],
+      "description": "Entity JSON body at this change; NULL represents a tombstone (deletion)."
     }
   },
   "required": [

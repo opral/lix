@@ -144,6 +144,215 @@ simulation_test!(
     }
 );
 
+async fn register_composite_unique_schema(
+    engine: &support::simulation_test::SimulatedLix,
+    schema_key: &str,
+) {
+    engine
+        .register_schema(&json!({
+            "x-lix-key": schema_key,
+            "x-lix-version": "1",
+            "x-lix-primary-key": ["/id"],
+            "x-lix-unique": [["/locale", "/slug"]],
+            "type": "object",
+            "properties": {
+                "id": { "type": "string" },
+                "locale": { "type": "string" },
+                "slug": { "type": "string" }
+            },
+            "required": ["id", "locale", "slug"],
+            "additionalProperties": false
+        }))
+        .await
+        .unwrap();
+}
+
+simulation_test!(
+    unique_violation_error_names_pointers_and_conflicting_value,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        register_unique_schema(&engine, "unique_msg_single").await;
+        engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'post-1', 'unique_msg_single', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"post-1\",\"slug\":\"hello-world\",\"title\":\"first\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'post-2', 'unique_msg_single', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"post-2\",\"slug\":\"hello-world\",\"title\":\"second\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("duplicate unique value should surface a violation");
+
+        assert_eq!(
+            err.code, "LIX_ERROR_UNIQUE",
+            "unique violations should carry the categorized code"
+        );
+        let desc = &err.description;
+        assert!(
+            desc.contains("unique constraint violation on unique_msg_single./slug"),
+            "expected schema + pointer in message: {desc}"
+        );
+        assert!(
+            desc.contains("value \"hello-world\" already in use"),
+            "expected conflicting value in message: {desc}"
+        );
+        assert!(
+            desc.contains("conflicts with entity 'post-1'"),
+            "expected conflicting entity in message: {desc}"
+        );
+        assert!(
+            !desc.contains("version '"),
+            "new message should not expose the internal version UUID: {desc}"
+        );
+        assert!(
+            !desc.contains("'NULL'"),
+            "new message should not print the literal 'NULL' file reference: {desc}"
+        );
+    }
+);
+
+simulation_test!(
+    unique_violation_composite_renders_pointer_and_value_tuples,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        register_composite_unique_schema(&engine, "unique_msg_composite").await;
+        engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'post-1', 'unique_msg_composite', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"post-1\",\"locale\":\"en\",\"slug\":\"hello\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'post-2', 'unique_msg_composite', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"post-2\",\"locale\":\"en\",\"slug\":\"hello\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("duplicate composite unique tuple should surface a violation");
+
+        let desc = &err.description;
+        assert!(
+            desc.contains("unique constraint violation on unique_msg_composite.(/locale, /slug)"),
+            "expected composite pointer tuple in message: {desc}"
+        );
+        assert!(
+            desc.contains("values (\"en\", \"hello\") already in use"),
+            "expected composite value tuple in message: {desc}"
+        );
+        assert!(
+            desc.contains("conflicts with entity 'post-1'"),
+            "expected conflicting entity in message: {desc}"
+        );
+    }
+);
+
+simulation_test!(
+    primary_key_violation_error_names_pointer_and_conflicting_value,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        register_unique_schema(&engine, "pk_msg_single").await;
+        engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+
+        engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'post-1', 'pk_msg_single', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"post-1\",\"slug\":\"first\",\"title\":\"first\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let err = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+                 ) VALUES (\
+                 'post-1', 'pk_msg_single', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"post-1\",\"slug\":\"second\",\"title\":\"second\"}'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("duplicate primary key should surface a violation");
+
+        assert_eq!(
+            err.code, "LIX_ERROR_UNIQUE",
+            "primary-key violations should carry the categorized code"
+        );
+        let desc = &err.description;
+        assert!(
+            desc.contains("primary key violation on pk_msg_single./id"),
+            "expected schema + pointer in message: {desc}"
+        );
+        assert!(
+            desc.contains("value \"post-1\" already in use"),
+            "expected conflicting value in message: {desc}"
+        );
+        assert!(
+            desc.contains("conflicts with entity 'post-1'"),
+            "expected conflicting entity in message: {desc}"
+        );
+        assert!(
+            !desc.contains("version '"),
+            "new message should not expose the internal version UUID: {desc}"
+        );
+        assert!(
+            !desc.contains("'NULL'"),
+            "new message should not print the literal 'NULL' file reference: {desc}"
+        );
+    }
+);
+
 simulation_test!(
     unique_allows_same_value_in_different_versions,
     simulations = [sqlite],
