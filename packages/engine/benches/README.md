@@ -17,6 +17,7 @@ Current families:
 - `state_commit_bulk`
 - `state_update_large_doc`
 - `state_insert_history`
+- `live_state_rebuild`
 - `version_create`
 - `version_storage`
 - `version_diff`
@@ -59,6 +60,7 @@ Run one family:
 
 ```bash
 cargo bench -p lix_engine --bench state_insert_bulk
+cargo bench -p lix_engine --bench live_state_rebuild
 cargo bench -p lix_engine --bench version_merge
 cargo bench -p lix_engine --bench commit_graph_walk
 ```
