@@ -71,6 +71,13 @@ impl LixError {
         self.hint.as_deref()
     }
 
+    pub fn description_with_hint(&self) -> String {
+        match self.hint() {
+            Some(hint) => format!("{}\nhint: {hint}", self.description),
+            None => self.description.clone(),
+        }
+    }
+
     pub fn format(&self) -> String {
         let mut s = format!("code: {}\ndescription: {}", self.code, self.description);
         if let Some(hint) = &self.hint {

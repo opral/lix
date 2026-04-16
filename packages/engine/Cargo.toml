@@ -23,6 +23,7 @@ base64 = "0.22"
 
 [dev-dependencies]
 criterion = "0.8.2"
+iref = "4.0.0"
 postgresql_embedded = { version = "0.20", features = ["tokio"] }
 paste = "1"
 sqlx = { version = "0.8", features = ["sqlite", "postgres", "runtime-tokio-rustls"] }
