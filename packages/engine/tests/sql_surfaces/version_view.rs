@@ -1,6 +1,7 @@
 use crate::support;
 
 use lix_engine::Value;
+use serde_json::json;
 use support::simulation_test::SimulationArgs;
 
 fn assert_text(value: &Value, expected: &str) {
@@ -51,6 +52,61 @@ async fn register_test_state_schema(engine: &support::simulation_test::Simulated
                 "{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}",
             )
             .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn ensure_file_descriptor(
+    engine: &support::simulation_test::SimulatedLix,
+    version_id: &str,
+    file_id: &str,
+) {
+    let existing = engine
+        .execute(
+            "SELECT entity_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND entity_id = $1 \
+               AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    if !existing.statements[0].rows.is_empty() {
+        return;
+    }
+
+    let (name, extension) = file_id
+        .rsplit_once('.')
+        .map(|(name, extension)| (name, Some(extension)))
+        .unwrap_or((file_id, None));
+    let snapshot = json!({
+        "id": file_id,
+        "directory_id": null,
+        "name": name,
+        "extension": extension,
+        "metadata": null,
+        "hidden": false
+    })
+    .to_string();
+
+    engine
+        .execute(
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             $1, 'lix_file_descriptor', NULL, $2, NULL, $3, '1'\
+             )",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(snapshot),
+            ],
         )
         .await
         .unwrap();
@@ -748,6 +804,7 @@ simulation_test!(
 
         engine.create_named_version("version-state").await.unwrap();
         register_test_state_schema(&engine).await;
+        ensure_file_descriptor(&engine, "version-state", "file-state").await;
 
         let before_version = engine
             .execute(
@@ -765,7 +822,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'state-entity-1', 'test_schema', 'file-state', 'version-state', 'lix', '{\"key\":\"value\"}', '1'\
+                 'state-entity-1', 'test_schema', 'file-state', 'version-state', NULL, '{\"key\":\"value\"}', '1'\
                  )", &[])
             .await
             .unwrap();

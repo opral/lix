@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
@@ -72,16 +73,24 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
 pub(crate) async fn load_installed_plugins_from_backend(
     host: &impl PluginMaterializationHost,
 ) -> Result<Vec<InstalledPlugin>, LixError> {
-    let archive_refs = list_installed_plugin_archive_refs(host.plugin_backend().as_ref()).await?;
+    load_installed_plugins_from_backend_state(host.plugin_backend().as_ref()).await
+}
+
+pub(crate) async fn load_installed_plugins_from_backend_state(
+    backend: &dyn LixBackend,
+) -> Result<Vec<InstalledPlugin>, LixError> {
+    let archive_refs = list_installed_plugin_archive_refs(backend).await?;
     let mut plugins = Vec::with_capacity(archive_refs.len());
     for archive_ref in archive_refs {
-        plugins.push(load_installed_plugin_from_archive_ref(host, &archive_ref).await?);
+        plugins.push(
+            load_installed_plugin_from_archive_ref_with_backend(backend, &archive_ref).await?,
+        );
     }
     Ok(plugins)
 }
 
-pub(crate) async fn load_installed_plugin_from_archive_ref(
-    host: &impl PluginMaterializationHost,
+pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
+    backend: &dyn LixBackend,
     archive_ref: &PluginArchiveRef,
 ) -> Result<InstalledPlugin, LixError> {
     let Some(plugin_key) = plugin_key_from_archive_path(&archive_ref.path) else {
@@ -93,16 +102,15 @@ pub(crate) async fn load_installed_plugin_from_archive_ref(
             ),
         });
     };
-    let archive_bytes =
-        load_blob_data_by_hash(host.plugin_backend().as_ref(), &archive_ref.blob_hash)
-            .await?
-            .ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: format!(
-                    "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
-                    archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
-                ),
-            })?;
+    let archive_bytes = load_blob_data_by_hash(backend, &archive_ref.blob_hash)
+        .await?
+        .ok_or_else(|| LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
+                "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
+                archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
+            ),
+        })?;
     if archive_bytes.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -113,6 +121,26 @@ pub(crate) async fn load_installed_plugin_from_archive_ref(
         });
     }
     load_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
+}
+
+pub(crate) async fn list_installed_plugin_manifest_keys(
+    backend: &dyn LixBackend,
+) -> Result<BTreeSet<String>, LixError> {
+    Ok(load_installed_plugins_from_backend_state(backend)
+        .await?
+        .into_iter()
+        .map(|plugin| plugin.key)
+        .collect())
+}
+
+#[allow(dead_code)]
+pub(crate) async fn installed_plugin_manifest_key_exists(
+    backend: &dyn LixBackend,
+    plugin_key: &str,
+) -> Result<bool, LixError> {
+    Ok(list_installed_plugin_manifest_keys(backend)
+        .await?
+        .contains(plugin_key))
 }
 
 pub(crate) fn invalidate_installed_plugins_cache(
@@ -149,5 +177,155 @@ where
         payload: &[u8],
     ) -> Result<Vec<u8>, LixError> {
         apply_changes_with_plugin(self, plugin, payload).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binary_cas::binary_blob_store_relation_name;
+    use crate::{LixBackendTransaction, QueryResult, SqlDialect, Value};
+    use async_trait::async_trait;
+    use std::io::{Cursor, Write};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    struct InstalledPluginLookupBackend {
+        archive_bytes: Vec<u8>,
+    }
+
+    struct UnusedTransaction;
+
+    #[async_trait(?Send)]
+    impl LixBackend for InstalledPluginLookupBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("LIKE '/.lix/plugins/%.lixplugin'") {
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("lix_plugin_archive::plugin_json".to_string()),
+                        Value::Text("global".to_string()),
+                        Value::Text("/.lix/plugins/plugin_json.lixplugin".to_string()),
+                        Value::Text("blob-plugin-json".to_string()),
+                    ]],
+                    columns: Vec::new(),
+                });
+            }
+            if sql.contains(binary_blob_store_relation_name()) {
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Blob(self.archive_bytes.clone())]],
+                    columns: Vec::new(),
+                });
+            }
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn begin_transaction(
+            &self,
+            _mode: crate::backend::TransactionBeginMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            Ok(Box::new(UnusedTransaction))
+        }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            self.begin_transaction(crate::backend::TransactionBeginMode::Write)
+                .await
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackendTransaction for UnusedTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::backend::TransactionBeginMode {
+            crate::backend::TransactionBeginMode::Write
+        }
+
+        async fn execute(
+            &mut self,
+            _sql: &str,
+            _params: &[Value],
+        ) -> Result<QueryResult, LixError> {
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
+
+    fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        let cursor = Cursor::new(Vec::new());
+        let mut writer = ZipWriter::new(cursor);
+        for (path, bytes) in entries {
+            writer
+                .start_file(*path, options)
+                .expect("archive entry start should succeed");
+            writer
+                .write_all(bytes)
+                .expect("archive entry write should succeed");
+        }
+        writer
+            .finish()
+            .expect("archive finish should succeed")
+            .into_inner()
+    }
+
+    fn build_plugin_archive(manifest_json: &str) -> Vec<u8> {
+        let wasm = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00];
+        build_archive(&[
+            ("manifest.json", manifest_json.as_bytes()),
+            ("plugin.wasm", &wasm),
+        ])
+    }
+
+    fn plugin_manifest_json(key: &str) -> String {
+        format!(
+            r#"{{
+  "key":"{key}",
+  "runtime":"wasm-component-v1",
+  "api_version":"0.1.0",
+  "match":{{"path_glob":"*.json"}},
+  "entry":"plugin.wasm",
+  "schemas":["schema/plugin_json_schema.json"]
+}}"#
+        )
+    }
+
+    #[tokio::test]
+    async fn installed_plugin_manifest_key_exists_reads_installed_manifest_keys() {
+        let backend = InstalledPluginLookupBackend {
+            archive_bytes: build_plugin_archive(&plugin_manifest_json("plugin_json")),
+        };
+
+        assert!(
+            installed_plugin_manifest_key_exists(&backend, "plugin_json")
+                .await
+                .expect("installed manifest key lookup should succeed")
+        );
+        assert!(
+            !installed_plugin_manifest_key_exists(&backend, "missing_plugin")
+                .await
+                .expect("missing manifest key lookup should succeed")
+        );
     }
 }

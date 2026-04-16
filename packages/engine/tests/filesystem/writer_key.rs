@@ -103,7 +103,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'wk-tracked', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"tracked\"}}', '1'\
+                     'wk-tracked', 'wk_writer_key_schema', NULL, '{version_id}', NULL, '{{\"key\":\"tracked\"}}', '1'\
                      )"
                 ),
                 &[],
@@ -120,7 +120,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
-                     'wk-untracked', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"untracked\"}}', '1', true\
+                     'wk-untracked', 'wk_writer_key_schema', NULL, '{version_id}', NULL, '{{\"key\":\"untracked\"}}', '1', true\
                      )"
                 ),
                 &[],
@@ -139,7 +139,7 @@ simulation_test!(
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-tracked' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                      LIMIT 1"
                 ),
                 &[],
@@ -159,7 +159,7 @@ simulation_test!(
                      FROM lix_internal_writer_key \
                      WHERE entity_id = 'wk-untracked' \
                        AND schema_key = 'wk_writer_key_schema' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                        AND version_id = '{version_id}' \
                      LIMIT 1"
                 ),
@@ -814,7 +814,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'wk-public-update', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"before\"}}', '1'\
+                     'wk-public-update', 'wk_writer_key_schema', NULL, '{version_id}', NULL, '{{\"key\":\"before\"}}', '1'\
                      )"
                 ),
                 &[],
@@ -832,7 +832,7 @@ simulation_test!(
                      SET snapshot_content = '{{\"key\":\"after\"}}' \
                      WHERE schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-public-update' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                        AND version_id = '{version_id}'"
                 ),
                 &[],
@@ -850,7 +850,7 @@ simulation_test!(
                      FROM lix_state_by_version \
                      WHERE schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-public-update' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                        AND version_id = '{version_id}'"
                 ),
                 &[],

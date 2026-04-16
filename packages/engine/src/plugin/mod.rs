@@ -27,8 +27,10 @@ pub(crate) use manifest::{
 };
 #[allow(unused_imports)]
 pub(crate) use materializer::{
-    invalidate_installed_plugins_cache, load_installed_plugins_with_runtime_cache,
-    FilesystemPluginMaterializer, InstalledPlugin, PluginMaterializationHost,
+    installed_plugin_manifest_key_exists, invalidate_installed_plugins_cache,
+    list_installed_plugin_manifest_keys, load_installed_plugins_from_backend_state,
+    load_installed_plugins_with_runtime_cache, FilesystemPluginMaterializer, InstalledPlugin,
+    PluginMaterializationHost,
 };
 #[allow(unused_imports)]
 pub(crate) use storage::{

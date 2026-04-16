@@ -23,7 +23,7 @@ simulation_test!(
                 "INSERT INTO lix_key_value_by_version (\
                  key, value, lixcol_file_id, lixcol_version_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'key-bv', 'value-insert', 'lix', $1, 'lix', '1'\
+                 'key-bv', 'value-insert', NULL, $1, NULL, '1'\
                  )", &[Value::Text(version_id.clone())])
             .await
             .unwrap();
@@ -115,7 +115,7 @@ simulation_test!(
                 "INSERT INTO lix_key_value_by_version (\
                  key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'missing-version', 'x', 'lix', 'lix', '1'\
+                 'missing-version', 'x', NULL, NULL, '1'\
                  )",
                 &[],
             )

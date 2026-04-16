@@ -23,7 +23,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'test_schema', NULL, lix_active_version_id(), NULL, '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await;
 
@@ -32,7 +32,7 @@ simulation_test!(allows_valid_snapshot, |sim| async move {
     let stored = engine
             .execute(
                 "SELECT snapshot_content FROM lix_state_by_version \
-             WHERE schema_key = 'test_schema' AND entity_id = 'entity-1' AND file_id = 'file-1' AND version_id = lix_active_version_id()", &[])
+             WHERE schema_key = 'test_schema' AND entity_id = 'entity-1' AND file_id IS NULL AND version_id = lix_active_version_id()", &[])
             .await
             .unwrap();
 
@@ -65,7 +65,7 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"missing\":\"field\"}', '1'\
+             'entity-1', 'test_schema', NULL, lix_active_version_id(), NULL, '{\"missing\":\"field\"}', '1'\
              )", &[])
             .await;
 
@@ -90,7 +90,7 @@ simulation_test!(requires_registered_schema, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'missing_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'missing_schema', NULL, lix_active_version_id(), NULL, '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await;
 
@@ -125,7 +125,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
                 "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'entity-1', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Ada\"}', '1'\
+             'entity-1', 'test_schema', NULL, lix_active_version_id(), NULL, '{\"name\":\"Ada\"}', '1'\
              )", &[])
             .await
             .unwrap();
@@ -133,7 +133,7 @@ simulation_test!(rejects_invalid_update, |sim| async move {
     let result = engine
             .execute(
                 "UPDATE lix_state_by_version SET snapshot_content = '{\"missing\":\"field\"}' \
-             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id = 'file-1' AND version_id = lix_active_version_id()", &[])
+             WHERE entity_id = 'entity-1' AND schema_key = 'test_schema' AND file_id IS NULL AND version_id = lix_active_version_id()", &[])
             .await;
 
     let err = result.expect_err("expected validation error");
