@@ -62,9 +62,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &entity_id,
             "lix_directory_descriptor",
             "1",
-            "lix",
+            None,
             "global",
-            "lix",
+            None,
             &snapshot_content,
         )
         .await?;
@@ -85,7 +85,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                         "SELECT entity_id \
                          FROM {directory_table} \
                          WHERE schema_key = 'lix_directory_descriptor' \
-                           AND file_id = 'lix' \
+                           AND file_id IS NULL \
                            AND version_id = 'global' \
                            AND untracked = false \
                            AND is_tombstone = 0 \
@@ -107,7 +107,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                         "SELECT entity_id \
                          FROM {directory_table} \
                          WHERE schema_key = 'lix_directory_descriptor' \
-                           AND file_id = 'lix' \
+                           AND file_id IS NULL \
                            AND version_id = 'global' \
                            AND untracked = false \
                            AND is_tombstone = 0 \

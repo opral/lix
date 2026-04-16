@@ -1,8 +1,9 @@
 #![allow(dead_code)]
 //! Durable writer-key annotation storage owned by `live_state`.
 //!
-//! The storage key is the semantic row identity:
-//! `(version_id, schema_key, entity_id, file_id)`.
+//! The semantic row identity is `(version_id, schema_key, entity_id, file_id)`.
+//! Storage normalizes nullable `file_id` into an internal `storage_scope_key`
+//! so engine-owned rows can participate in a single uniqueness shape.
 //!
 //! This table is intentionally separate from canonical changes and live-state
 //! tracked/untracked row tables. It stores only the writer-key metadata that
@@ -88,7 +89,7 @@ pub(crate) async fn load_writer_key_annotation_for_state_row(
     version_id: &str,
     schema_key: &str,
     entity_id: &str,
-    file_id: &str,
+    file_id: Option<&str>,
 ) -> Result<Option<String>, LixError> {
     load_writer_key_annotation(
         backend,
@@ -96,7 +97,7 @@ pub(crate) async fn load_writer_key_annotation_for_state_row(
             version_id: version_id.to_string(),
             schema_key: schema_key.to_string(),
             entity_id: entity_id.to_string(),
-            file_id: file_id.to_string(),
+            file_id: file_id.map(str::to_string),
         },
     )
     .await
@@ -106,6 +107,7 @@ pub(crate) async fn load_writer_key_annotation_with_executor(
     executor: &mut dyn QueryExecutor,
     row_identity: &RowIdentity,
 ) -> Result<Option<String>, LixError> {
+    let storage_scope_key = row_identity.storage_scope_key();
     let result = executor
         .execute(
             &format!(
@@ -114,14 +116,14 @@ pub(crate) async fn load_writer_key_annotation_with_executor(
                  WHERE version_id = $1 \
                    AND schema_key = $2 \
                    AND entity_id = $3 \
-                   AND file_id = $4 \
+                   AND storage_scope_key = $4 \
                  LIMIT 1"
             ),
             &[
                 Value::Text(row_identity.version_id.clone()),
                 Value::Text(row_identity.schema_key.clone()),
                 Value::Text(row_identity.entity_id.clone()),
-                Value::Text(row_identity.file_id.clone()),
+                Value::Text(storage_scope_key),
             ],
         )
         .await?;
@@ -211,7 +213,7 @@ pub(crate) async fn load_writer_key_annotations_for_versions_with_executor(
                 version_id: required_text_value(&row, 0, "version_id")?,
                 schema_key: required_text_value(&row, 1, "schema_key")?,
                 entity_id: required_text_value(&row, 2, "entity_id")?,
-                file_id: required_text_value(&row, 3, "file_id")?,
+                file_id: optional_text_value(&row, 3, "file_id")?,
             },
             required_text_value(&row, 4, "writer_key")?,
         );
@@ -238,16 +240,21 @@ pub(crate) async fn persist_writer_key_annotation_with_executor(
         .execute(
             &format!(
                 "INSERT INTO {WRITER_KEY_TABLE} (\
-                 version_id, schema_key, entity_id, file_id, writer_key\
-                 ) VALUES ($1, $2, $3, $4, $5) \
-                 ON CONFLICT (version_id, schema_key, entity_id, file_id) \
+                 version_id, schema_key, entity_id, file_id, storage_scope_key, writer_key\
+                 ) VALUES ($1, $2, $3, $4, $5, $6) \
+                 ON CONFLICT (version_id, schema_key, entity_id, storage_scope_key) \
                  DO UPDATE SET writer_key = excluded.writer_key"
             ),
             &[
                 Value::Text(row_identity.version_id.clone()),
                 Value::Text(row_identity.schema_key.clone()),
                 Value::Text(row_identity.entity_id.clone()),
-                Value::Text(row_identity.file_id.clone()),
+                row_identity
+                    .file_id
+                    .clone()
+                    .map(Value::Text)
+                    .unwrap_or(Value::Null),
+                Value::Text(row_identity.storage_scope_key()),
                 Value::Text(writer_key.to_string()),
             ],
         )
@@ -321,6 +328,7 @@ async fn clear_writer_key_annotation_with_executor(
     executor: &mut dyn QueryExecutor,
     row_identity: &RowIdentity,
 ) -> Result<(), LixError> {
+    let storage_scope_key = row_identity.storage_scope_key();
     executor
         .execute(
             &format!(
@@ -328,13 +336,13 @@ async fn clear_writer_key_annotation_with_executor(
                  WHERE version_id = $1 \
                    AND schema_key = $2 \
                    AND entity_id = $3 \
-                   AND file_id = $4"
+                   AND storage_scope_key = $4"
             ),
             &[
                 Value::Text(row_identity.version_id.clone()),
                 Value::Text(row_identity.schema_key.clone()),
                 Value::Text(row_identity.entity_id.clone()),
-                Value::Text(row_identity.file_id.clone()),
+                Value::Text(storage_scope_key),
             ],
         )
         .await?;
@@ -342,12 +350,11 @@ async fn clear_writer_key_annotation_with_executor(
 }
 
 fn tracked_change_row_identity<Change: StateChangeRecord>(change: &Change) -> Option<RowIdentity> {
-    let file_id = change.file_id()?;
     Some(RowIdentity {
         version_id: change.version_id().to_string(),
         schema_key: change.schema_key().to_string(),
         entity_id: change.entity_id().to_string(),
-        file_id: file_id.to_string(),
+        file_id: change.file_id().map(str::to_string),
     })
 }
 
@@ -361,6 +368,21 @@ fn required_text_value(row: &[Value], index: usize, column: &str) -> Result<Stri
         None => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
             format!("writer_key row missing {column}"),
+        )),
+    }
+}
+
+fn optional_text_value(
+    row: &[Value],
+    index: usize,
+    column: &str,
+) -> Result<Option<String>, LixError> {
+    match row.get(index) {
+        Some(Value::Null) | None => Ok(None),
+        Some(Value::Text(value)) => Ok(Some(value.clone())),
+        Some(other) => Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("writer_key {column} must be nullable text, got {other:?}"),
         )),
     }
 }

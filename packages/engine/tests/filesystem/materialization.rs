@@ -73,7 +73,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'entity-1', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"A\"}}', '1'\
+                     'entity-1', 'materialization_test_schema', 'file-1', '{}', NULL, '{{\"value\":\"A\"}}', '1'\
                      )",
                     main_version_id
                 ), &[])
@@ -85,7 +85,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'entity-1b', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
+                     'entity-1b', 'materialization_test_schema', 'file-1', '{}', NULL, '{{\"value\":\"B\"}}', '1'\
                      )",
                     main_version_id
                 ), &[])
@@ -151,7 +151,7 @@ simulation_test!(
                         "INSERT INTO lix_state_by_version (\
                          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
-                         'entity-2', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"B\"}}', '1'\
+                         'entity-2', 'materialization_test_schema', 'file-1', '{}', NULL, '{{\"value\":\"B\"}}', '1'\
                          )",
                         main_version_id
                     ), &[])
@@ -239,7 +239,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'entity-version-ref', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"tracked\"}}', '1'\
+                     'entity-version-ref', 'materialization_test_schema', 'file-1', '{}', NULL, '{{\"value\":\"tracked\"}}', '1'\
                      )",
                     main_version_id
                 ),
@@ -353,7 +353,7 @@ simulation_test!(
             writes: vec![LiveStateWrite {
                 schema_key: "materialization_test_schema".try_into().unwrap(),
                 entity_id: "entity-old".try_into().unwrap(),
-                file_id: "file-1".try_into().unwrap(),
+                file_id: Some("file-1".to_string()),
                 version_id: main_version_id.clone().try_into().unwrap(),
                 global: false,
                 untracked: false,
@@ -364,7 +364,7 @@ simulation_test!(
                 ),
                 metadata: None,
                 schema_version: "1".try_into().unwrap(),
-                plugin_key: "lix".try_into().unwrap(),
+                plugin_key: None,
                 change_id: "seed-change".to_string(),
                 created_at: "1970-01-01T00:00:00Z".to_string(),
                 updated_at: "1970-01-01T00:00:00Z".to_string(),
@@ -384,7 +384,7 @@ simulation_test!(
             writes: vec![LiveStateWrite {
                 schema_key: "materialization_test_schema".try_into().unwrap(),
                 entity_id: "entity-new".try_into().unwrap(),
-                file_id: "file-1".try_into().unwrap(),
+                file_id: Some("file-1".to_string()),
                 version_id: main_version_id.clone().try_into().unwrap(),
                 global: false,
                 untracked: false,
@@ -395,7 +395,7 @@ simulation_test!(
                 ),
                 metadata: None,
                 schema_version: "1".try_into().unwrap(),
-                plugin_key: "lix".try_into().unwrap(),
+                plugin_key: None,
                 change_id: "full-change".to_string(),
                 created_at: "1970-01-01T00:00:00Z".to_string(),
                 updated_at: "1970-01-01T00:00:00Z".to_string(),
@@ -454,7 +454,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'entity-writer', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"seed\"}}', '1'\
+                     'entity-writer', 'materialization_test_schema', 'file-1', '{}', NULL, '{{\"value\":\"seed\"}}', '1'\
                      )",
                     main_version_id
                 ),
@@ -590,7 +590,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'entity-writer-missing', 'materialization_test_schema', 'file-1', '{}', 'lix', '{{\"value\":\"seed\"}}', '1'\
+                     'entity-writer-missing', 'materialization_test_schema', 'file-1', '{}', NULL, '{{\"value\":\"seed\"}}', '1'\
                      )",
                     main_version_id
                 ),

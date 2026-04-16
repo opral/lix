@@ -48,7 +48,7 @@ async fn seed_key_value_row(
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{entity_id}', 'lix_key_value', 'lix', '{version_id}', 'lix', '{snapshot}', '1'\
+         '{entity_id}', 'lix_key_value', NULL, '{version_id}', NULL, '{snapshot}', '1'\
          )",
         entity_id = key.replace('\'', "''"),
         version_id = version_id.replace('\'', "''"),
@@ -71,10 +71,6 @@ async fn install_lix_owned_schema(
             "x-lix-key": schema_key,
             "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\""
-            },
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
@@ -97,23 +93,11 @@ async fn install_global_override_child_schema(engine: &support::simulation_test:
     install_lix_owned_schema(engine, "lix_version_override_child_schema").await;
 }
 
-async fn install_select_override_schema(engine: &support::simulation_test::SimulatedLix) {
-    engine
-        .register_schema(
-            &serde_json::from_str::<serde_json::Value>(
-                "{\"x-lix-key\":\"lix_select_override_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"inlang\\\"\",\"lixcol_plugin_key\":\"\\\"inlang_sdk\\\"\",\"lixcol_metadata\":\"null\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}",
-            )
-            .unwrap(),
-        )
-        .await
-        .unwrap();
-}
-
 async fn install_default_values_schema(engine: &support::simulation_test::SimulatedLix) {
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
-                "{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}",
+                "{\"x-lix-key\":\"lix_default_values_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\",\"x-lix-default\":\"\\\"default-id-value\\\"\"}},\"required\":[\"id\"],\"additionalProperties\":false}",
             )
             .unwrap(),
         )
@@ -125,7 +109,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
-                "{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}",
+                "{\"x-lix-key\":\"lix_delete_message_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"bundle_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"bundle_id\"],\"additionalProperties\":false}",
             )
             .unwrap(),
         )
@@ -135,7 +119,7 @@ async fn install_delete_subquery_schemas(engine: &support::simulation_test::Simu
     engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
-                "{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"x-lix-override-lixcols\":{\"lixcol_file_id\":\"\\\"lix\\\"\",\"lixcol_plugin_key\":\"\\\"lix\\\"\"},\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}",
+                "{\"x-lix-key\":\"lix_delete_variant_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"message_id\":{\"type\":\"string\"}},\"required\":[\"id\",\"message_id\"],\"additionalProperties\":false}",
             )
             .unwrap(),
         )
@@ -201,7 +185,7 @@ simulation_test!(
                 "INSERT INTO lix_key_value (\
                  key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'key-write', 'value-insert', 'lix', 'lix', '1'\
+                 'key-write', 'value-insert', NULL, NULL, '1'\
                  )",
                 &[],
             )
@@ -257,7 +241,7 @@ simulation_test!(
                 "INSERT INTO lix_key_value (\
                  key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'key-state-update', 'value-before', 'lix', 'lix', '1'\
+                 'key-state-update', 'value-before', NULL, NULL, '1'\
                  )",
                 &[],
             )
@@ -268,7 +252,6 @@ simulation_test!(
             .execute(
                 "UPDATE lix_key_value \
                  SET value = 'value-after', \
-                     lixcol_plugin_key = 'custom_plugin', \
                      lixcol_metadata = '{\"source\":\"update\"}' \
                  WHERE key = 'key-state-update'",
                 &[],
@@ -294,7 +277,7 @@ simulation_test!(
             snapshot_field(&updated.statements[0].rows[0][0], "value"),
             "value-after".to_string()
         );
-        assert_text(&updated.statements[0].rows[0][1], "custom_plugin");
+        assert_eq!(updated.statements[0].rows[0][1], Value::Null);
         assert_text(&updated.statements[0].rows[0][2], "{\"source\":\"update\"}");
     }
 );
@@ -541,7 +524,7 @@ simulation_test!(
                 "INSERT INTO lix_patch_validation (\
                  id, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'entity-1', 'valid', 'lix', 'lix', '1'\
+                 'entity-1', 'valid', NULL, NULL, '1'\
                  )",
                 &[],
             )
@@ -587,7 +570,7 @@ simulation_test!(
                 "INSERT INTO lix_version_override_schema (\
                  id, name, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'ovr-1', 'Original', 'lix', 'lix', '1'\
+                 'ovr-1', 'Original', NULL, NULL, '1'\
                  )",
                 &[],
             )
@@ -776,7 +759,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'ovr-global-1', 'lix_version_override_child_schema', 'lix', 'global', 'lix', '{\"id\":\"ovr-global-1\",\"name\":\"Global\"}', '1'\
+                 'ovr-global-1', 'lix_version_override_child_schema', NULL, 'global', NULL, '{\"id\":\"ovr-global-1\",\"name\":\"Global\"}', '1'\
                  )", &[])
             .await
             .unwrap();
@@ -785,7 +768,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'ovr-active-1', 'lix_version_override_child_schema', 'lix', lix_active_version_id(), 'lix', '{\"id\":\"ovr-active-1\",\"name\":\"Active\"}', '1'\
+                 'ovr-active-1', 'lix_version_override_child_schema', NULL, lix_active_version_id(), NULL, '{\"id\":\"ovr-active-1\",\"name\":\"Active\"}', '1'\
                  )", &[])
             .await
             .unwrap();
@@ -808,92 +791,6 @@ simulation_test!(
         assert_text(&rows.statements[0].rows[1][0], "ovr-global-1");
         assert_text(&rows.statements[0].rows[1][1], "Global");
         assert_boolean_like(&rows.statements[0].rows[1][2], true);
-    }
-);
-
-simulation_test!(
-    lix_entity_view_select_pushes_down_literal_lixcol_overrides,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix_deterministic()
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-        install_select_override_schema(&engine).await;
-
-        engine
-            .execute(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, untracked\
-                 ) VALUES \
-                 ('match-global', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"match-global\"}', NULL, '1', true), \
-                 ('mismatch-file', 'lix_select_override_schema', 'other', 'global', 'inlang_sdk', '{\"id\":\"mismatch-file\"}', NULL, '1', true), \
-                 ('mismatch-plugin', 'lix_select_override_schema', 'inlang', 'global', 'other_plugin', '{\"id\":\"mismatch-plugin\"}', NULL, '1', true), \
-                 ('mismatch-metadata', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-metadata\"}', '{\"k\":1}', '1', true)",
-                &[],
-            )
-            .await
-            .unwrap();
-        engine
-            .execute(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, metadata, schema_version, untracked\
-                 ) VALUES \
-                 ('mismatch-untracked', 'lix_select_override_schema', 'inlang', 'global', 'inlang_sdk', '{\"id\":\"mismatch-untracked\"}', NULL, '1', false)",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let base_rows = engine
-            .execute(
-                "SELECT id \
-                 FROM lix_select_override_schema \
-                 ORDER BY id",
-                &[],
-            )
-            .await
-            .unwrap();
-        sim.assert_deterministic(base_rows.statements[0].rows.clone());
-        assert_eq!(base_rows.statements[0].rows.len(), 2);
-        assert_text(&base_rows.statements[0].rows[0][0], "match-global");
-        assert_text(&base_rows.statements[0].rows[1][0], "mismatch-untracked");
-
-        let by_version_rows = engine
-            .execute(
-                "SELECT id, lixcol_version_id, lixcol_global \
-                 FROM lix_select_override_schema_by_version \
-                 ORDER BY id, lixcol_version_id",
-                &[],
-            )
-            .await
-            .unwrap();
-        sim.assert_deterministic(normalize_bool_like_rows(
-            &by_version_rows.statements[0].rows,
-            &[2],
-        ));
-        assert_eq!(by_version_rows.statements[0].rows.len(), 2);
-        let mut matched_rows = Vec::new();
-        for row in &by_version_rows.statements[0].rows {
-            let id = match &row[0] {
-                Value::Text(value) => value.clone(),
-                other => panic!("expected id text, got {other:?}"),
-            };
-            if id == "match-global" || id == "mismatch-untracked" {
-                matched_rows.push(row);
-            }
-        }
-
-        assert_eq!(matched_rows.len(), 2);
-
-        assert!(matched_rows.iter().all(|row| is_true(&row[2])));
-        assert!(matched_rows
-            .iter()
-            .all(|row| { matches!(&row[1], Value::Text(version) if version != "global") }));
-        let active_version_id = engine.active_version_id().await.unwrap();
-        assert!(matched_rows.iter().all(|row| {
-            matches!(&row[1], Value::Text(version) if version == &active_version_id)
-        }));
     }
 );
 
@@ -935,7 +832,7 @@ simulation_test!(
                 "INSERT INTO lix_key_value (\
                  key, value, lixcol_file_id, lixcol_plugin_key, lixcol_schema_version\
                  ) VALUES (\
-                 'k-update-unknown', 'v', 'lix', 'lix', '1'\
+                 'k-update-unknown', 'v', NULL, NULL, '1'\
                  )",
                 &[],
             )

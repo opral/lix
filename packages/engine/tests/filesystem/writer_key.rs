@@ -222,6 +222,28 @@ simulation_test!(
             .await
             .unwrap();
 
+        let version_id = engine.active_version_id().await.unwrap();
+        let workspace_annotation = engine
+            .execute(
+                &format!(
+                    "SELECT COUNT(*) \
+                     FROM lix_internal_writer_key \
+                     WHERE version_id = '{version_id}' \
+                       AND schema_key = 'lix_file_descriptor' \
+                       AND entity_id = 'wk-file-1' \
+                       AND file_id IS NULL \
+                     LIMIT 1"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(workspace_annotation.statements[0].rows.len(), 1);
+        assert_eq!(
+            workspace_annotation.statements[0].rows[0][0],
+            Value::Integer(1)
+        );
+
         let file_row = engine
             .execute(
                 "SELECT lixcol_writer_key FROM lix_file WHERE id = 'wk-file-1'",
@@ -232,7 +254,6 @@ simulation_test!(
         assert_eq!(file_row.statements[0].rows.len(), 1);
         assert_text(&file_row.statements[0].rows[0][0], "editor:single");
 
-        let version_id = engine.active_version_id().await.unwrap();
         let state_row = engine
             .execute(
                 &format!(
@@ -248,27 +269,6 @@ simulation_test!(
             .unwrap();
         assert_eq!(state_row.statements[0].rows.len(), 1);
         assert_text(&state_row.statements[0].rows[0][0], "editor:single");
-
-        let workspace_annotation = engine
-            .execute(
-                &format!(
-                    "SELECT writer_key \
-                     FROM lix_internal_writer_key \
-                     WHERE version_id = '{version_id}' \
-                       AND schema_key = 'lix_file_descriptor' \
-                       AND entity_id = 'wk-file-1' \
-                       AND file_id = 'lix' \
-                     LIMIT 1"
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(workspace_annotation.statements[0].rows.len(), 1);
-        assert_text(
-            &workspace_annotation.statements[0].rows[0][0],
-            "editor:single",
-        );
 
         engine
             .rebuild_live_state(&lix_engine::LiveStateRebuildRequest {
@@ -396,22 +396,19 @@ fn writer_key_annotation_persists_across_engine_reopen_sqlite() {
                 let workspace_annotation = session_b
                     .execute(
                         &format!(
-                            "SELECT writer_key \
+                            "SELECT COUNT(*) \
                              FROM lix_internal_writer_key \
                              WHERE version_id = '{version_id}' \
                                AND schema_key = 'lix_file_descriptor' \
                                AND entity_id = 'wk-reopen' \
-                               AND file_id = 'lix'"
+                               AND file_id IS NULL"
                         ),
                         &[],
                     )
                     .await
                     .expect("workspace annotation query should succeed");
                 assert_eq!(workspace_annotation.statements[0].rows.len(), 1);
-                assert_text(
-                    &workspace_annotation.statements[0].rows[0][0],
-                    "editor:persist",
-                );
+                assert_eq!(workspace_annotation.statements[0].rows[0][0], Value::Integer(1));
 
                 let raw_tracked = session_b
                     .execute(
@@ -574,7 +571,7 @@ simulation_test!(
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'lix_file_descriptor' \
                        AND entity_id = 'wk-clear-update' \
-                       AND file_id = 'lix'"
+                       AND file_id IS NULL"
                 ),
                 &[],
             )
@@ -683,7 +680,7 @@ simulation_test!(
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'lix_file_descriptor' \
                        AND entity_id = 'wk-rolled-back' \
-                       AND file_id = 'lix'"
+                       AND file_id IS NULL"
                 ),
                 &[],
             )

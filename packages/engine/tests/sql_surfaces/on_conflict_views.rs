@@ -249,7 +249,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_internal_registered_schema_bootstrap \
                  WHERE entity_id = 'on_conflict_schema~1' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND version_id = 'global'",
                 &[],
             )

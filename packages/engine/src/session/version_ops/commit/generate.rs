@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::canonical::CanonicalChangeWrite;
-use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
 use crate::{CanonicalJson, LixError};
 use serde_json::json;
 
@@ -17,8 +17,8 @@ const CHANGE_SET_SCHEMA_KEY: &str = "lix_change_set";
 #[derive(Debug, Clone)]
 struct BuiltinSchemaMeta {
     schema_version: String,
-    file_id: String,
-    plugin_key: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,11 +122,14 @@ where
                 change_set_schema.schema_version.clone(),
                 "change_set schema_version",
             ),
-            file_id: expect_identity(change_set_schema.file_id.clone(), "change_set file_id"),
-            plugin_key: expect_identity(
-                change_set_schema.plugin_key.clone(),
-                "change_set plugin_key",
-            ),
+            file_id: change_set_schema
+                .file_id
+                .clone()
+                .map(|value| expect_identity(value, "change_set file_id")),
+            plugin_key: change_set_schema
+                .plugin_key
+                .clone()
+                .map(|value| expect_identity(value, "change_set plugin_key")),
             snapshot_content: Some(canonical_json(json!({
                 "id": meta.change_set_id,
             }))?),
@@ -146,8 +149,14 @@ where
                 commit_schema.schema_version.clone(),
                 "commit schema_version",
             ),
-            file_id: expect_identity(commit_schema.file_id.clone(), "commit file_id"),
-            plugin_key: expect_identity(commit_schema.plugin_key.clone(), "commit plugin_key"),
+            file_id: commit_schema
+                .file_id
+                .clone()
+                .map(|value| expect_identity(value, "commit file_id")),
+            plugin_key: commit_schema
+                .plugin_key
+                .clone()
+                .map(|value| expect_identity(value, "commit plugin_key")),
             snapshot_content: Some(canonical_json(json!({
                 "id": meta.commit_id,
                 "change_set_id": meta.change_set_id,
@@ -271,8 +280,8 @@ fn sanitize_staged_change(change: &StagedChange) -> CanonicalChangeWrite {
         entity_id: change.entity_id.clone(),
         schema_key: change.schema_key.clone(),
         schema_version: change.schema_version.clone().unwrap(),
-        file_id: change.file_id.clone().unwrap(),
-        plugin_key: change.plugin_key.clone().unwrap(),
+        file_id: change.file_id.clone(),
+        plugin_key: change.plugin_key.clone(),
         snapshot_content: change
             .snapshot_content
             .as_deref()
@@ -296,8 +305,6 @@ fn validate_staged_change(change: &StagedChange) -> Result<(), LixError> {
     let change_id = require_staged_change_id(change)?;
     let created_at = require_staged_change_created_at(change)?;
     let schema_version = require_staged_change_schema_version(change)?;
-    let file_id = require_staged_change_file_id(change)?;
-    let plugin_key = require_staged_change_plugin_key(change)?;
 
     let change_label = if change_id.is_empty() {
         "<empty change id>"
@@ -310,8 +317,6 @@ fn validate_staged_change(change: &StagedChange) -> Result<(), LixError> {
         ("entity_id", change.entity_id.as_str()),
         ("schema_key", change.schema_key.as_str()),
         ("schema_version", schema_version),
-        ("file_id", file_id),
-        ("plugin_key", plugin_key),
         ("version_id", change.version_id.as_str()),
         ("created_at", created_at),
     ] {
@@ -362,34 +367,6 @@ fn require_staged_change_schema_version(change: &StagedChange) -> Result<&str, L
         })
 }
 
-fn require_staged_change_file_id(change: &StagedChange) -> Result<&str, LixError> {
-    change
-        .file_id
-        .as_ref()
-        .map(|value| value.as_str())
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: staged change '{}:{}' requires file_id",
-                change.schema_key, change.entity_id
-            ),
-        })
-}
-
-fn require_staged_change_plugin_key(change: &StagedChange) -> Result<&str, LixError> {
-    change
-        .plugin_key
-        .as_ref()
-        .map(|value| value.as_str())
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: staged change '{}:{}' requires plugin_key",
-                change.schema_key, change.entity_id
-            ),
-        })
-}
-
 fn expect_identity<T>(value: impl Into<String>, context: &str) -> T
 where
     T: TryFrom<String, Error = LixError>,
@@ -425,41 +402,17 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
             ),
         })?
         .to_string();
-    let overrides = schema
-        .get("x-lix-override-lixcols")
-        .and_then(serde_json::Value::as_object)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: builtin schema '{}' is missing x-lix-override-lixcols",
-                schema_key
-            ),
-        })?;
-    let file_id = overrides
-        .get("lixcol_file_id")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: builtin schema '{}' is missing string lixcol_file_id",
-                schema_key
-            ),
-        })?;
-    let plugin_key = overrides
-        .get("lixcol_plugin_key")
-        .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "generate_commit: builtin schema '{}' is missing string lixcol_plugin_key",
-                schema_key
-            ),
-        })?;
-
+    let defaults = builtin_schema_storage_defaults(schema_key).ok_or_else(|| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
+            "generate_commit: builtin schema '{}' is missing storage defaults",
+            schema_key
+        ),
+    })?;
     Ok(BuiltinSchemaMeta {
         schema_version,
-        file_id: decode_lixcol_literal(file_id),
-        plugin_key: decode_lixcol_literal(plugin_key),
+        file_id: defaults.file_id.map(str::to_string),
+        plugin_key: defaults.plugin_key.map(str::to_string),
     })
 }
 
@@ -483,9 +436,11 @@ fn collapse_staged_changes_last_wins(changes: &[StagedChange]) -> Vec<&StagedCha
                 change.version_id.to_string(),
                 change.entity_id.to_string(),
                 change.schema_key.to_string(),
-                require_staged_change_file_id(change)
-                    .expect("validated staged changes require file_id")
-                    .to_string(),
+                change
+                    .file_id
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
             ),
             index,
         );
@@ -516,8 +471,8 @@ mod tests {
             entity_id: entity_id.try_into().unwrap(),
             schema_key: schema_key.try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
-            file_id: Some("lix".try_into().unwrap()),
-            plugin_key: Some("lix".try_into().unwrap()),
+            file_id: None,
+            plugin_key: None,
             snapshot_content: Some(
                 CanonicalJson::from_text(format!(r#"{{"id":"{id}"}}"#))
                     .expect("test snapshot should be valid canonical json")
@@ -589,7 +544,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_commit")
             .expect("expected commit row");
-        assert_eq!(commit_row.plugin_key, "lix");
+        assert!(commit_row.plugin_key.is_none());
         let commit_snapshot: serde_json::Value =
             serde_json::from_str(commit_row.snapshot_content.as_ref().unwrap()).unwrap();
         assert_eq!(

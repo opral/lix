@@ -286,30 +286,31 @@ fn collect_builtin_override_predicates(
         return Ok(Vec::new());
     };
 
-    if overrides.contains_key("lixcol_version_id") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "schema '{}' uses removed x-lix-override-lixcols.lixcol_version_id support",
-                schema_key
-            ),
-        });
+    for key in [
+        "lixcol_file_id",
+        "lixcol_plugin_key",
+        "lixcol_version_id",
+        "lixcol_global",
+        "lixcol_untracked",
+    ] {
+        if overrides.contains_key(key) {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
+                    "schema '{}' uses removed x-lix-override-lixcols.{} support",
+                    schema_key, key
+                ),
+            });
+        }
     }
 
     let mut predicates = Vec::new();
-    for key in [
-        "lixcol_entity_id",
-        "lixcol_file_id",
-        "lixcol_plugin_key",
-        "lixcol_metadata",
-    ] {
+    for key in ["lixcol_entity_id", "lixcol_metadata"] {
         let Some(raw_value) = overrides.get(key).and_then(JsonValue::as_str) else {
             continue;
         };
         let Some(column) = (match key {
             "lixcol_entity_id" => Some("entity_id"),
-            "lixcol_file_id" => Some("file_id"),
-            "lixcol_plugin_key" => Some("plugin_key"),
             "lixcol_metadata" => Some("metadata"),
             _ => None,
         }) else {

@@ -20,8 +20,7 @@ use crate::transaction::{
     filesystem_transaction_state_needs_exact_descriptors,
     persist_runtime_sequence_highest_seen_in_transaction, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
-    FilesystemSemanticChange, FilesystemTransactionState, WriteBatch,
-    FILESYSTEM_DESCRIPTOR_FILE_ID, FILESYSTEM_FILE_SCHEMA_KEY,
+    FilesystemSemanticChange, FilesystemTransactionState, WriteBatch, FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
@@ -41,7 +40,6 @@ use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
 use super::COMMIT_IDEMPOTENCY_TABLE;
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
-const INTERNAL_FILESYSTEM_PLUGIN_KEY: &str = "lix";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
 const IDEMPOTENCY_KIND_CURRENT_HEAD_FINGERPRINT: &str = "current_head_fingerprint";
 
@@ -280,8 +278,12 @@ pub(crate) async fn create_commit(
         invariant_checker.recheck_invariants(transaction).await?;
     }
 
-    let (applied_changes, mut compiled_filesystem_state) =
-        resolve_staged_changes(&args.changes, &preflight, &args.filesystem_state)?;
+    let (applied_changes, mut compiled_filesystem_state) = resolve_staged_changes(
+        &args.changes,
+        &preflight,
+        &args.filesystem_state,
+        args.writer_key.as_deref(),
+    )?;
     let applied_changes = {
         let mut executor = TransactionCommitExecutor { transaction };
         normalize_staged_changes(&mut executor, &applied_changes).await?
@@ -550,11 +552,15 @@ fn resolve_staged_changes(
     changes: &[StagedChange],
     preflight: &CreateCommitPreflightState,
     filesystem_state: &FilesystemTransactionState,
+    writer_key: Option<&str>,
 ) -> Result<(Vec<StagedChange>, CompiledTrackedFilesystemState), CreateCommitError> {
     let hydrated = with_exact_filesystem_descriptors(filesystem_state, &preflight.file_descriptors);
-    let compiled_filesystem =
-        compile_filesystem_transaction_state_from_state(&hydrated, None, &[] as &[MutationRow])
-            .map_err(backend_error)?;
+    let compiled_filesystem = compile_filesystem_transaction_state_from_state(
+        &hydrated,
+        writer_key,
+        &[] as &[MutationRow],
+    )
+    .map_err(backend_error)?;
 
     let mut resolved = changes.to_vec();
     let mut index_by_identity = resolved
@@ -606,12 +612,6 @@ async fn staged_change_is_noop(
     executor: &mut dyn QueryExecutor,
     change: &StagedChange,
 ) -> Result<bool, CreateCommitError> {
-    let Some(file_id) = change.file_id.clone() else {
-        return Ok(false);
-    };
-    let Some(_plugin_key) = change.plugin_key.clone() else {
-        return Ok(false);
-    };
     let Some(_schema_version) = change.schema_version.clone() else {
         return Ok(false);
     };
@@ -621,7 +621,7 @@ async fn staged_change_is_noop(
         &CanonicalStateIdentity {
             entity_id: change.entity_id.to_string(),
             schema_key: change.schema_key.to_string(),
-            file_id: file_id.to_string(),
+            file_id: change.file_id.as_ref().map(ToString::to_string),
         },
     )
     .await
@@ -642,7 +642,7 @@ async fn staged_change_is_noop(
                 &CanonicalStateIdentity {
                     entity_id: change.entity_id.to_string(),
                     schema_key: change.schema_key.to_string(),
-                    file_id: file_id.to_string(),
+                    file_id: change.file_id.as_ref().map(ToString::to_string),
                 },
             )
             .await
@@ -695,14 +695,16 @@ fn staged_change_from_filesystem_semantic_change(
             change.schema_version.clone(),
             "filesystem semantic change schema_version",
         )?),
-        file_id: Some(try_identity(
-            change.file_id.clone(),
-            "filesystem semantic change file_id",
-        )?),
-        plugin_key: Some(try_identity(
-            change.plugin_key.clone(),
-            "filesystem semantic change plugin_key",
-        )?),
+        file_id: change
+            .file_id
+            .clone()
+            .map(|value| try_identity(value, "filesystem semantic change file_id"))
+            .transpose()?,
+        plugin_key: change
+            .plugin_key
+            .clone()
+            .map(|value| try_identity(value, "filesystem semantic change plugin_key"))
+            .transpose()?,
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
         version_id: try_identity(
@@ -747,7 +749,7 @@ fn binary_blob_write_still_needed(
         BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         write.version_id.clone(),
         file_id.clone(),
-        INTERNAL_FILESYSTEM_PLUGIN_KEY.to_string(),
+        String::new(),
         Some(BINARY_BLOB_REF_SCHEMA_VERSION.to_string()),
     ))
 }
@@ -769,17 +771,9 @@ fn materialize_staged_changes(
                     &change.schema_key,
                     "schema_version",
                 )?),
-                file_id: Some(require_change_field(
-                    change.file_id.clone(),
-                    &change.schema_key,
-                    "file_id",
-                )?),
+                file_id: change.file_id.clone(),
                 version_id: change.version_id.clone(),
-                plugin_key: Some(require_change_field(
-                    change.plugin_key.clone(),
-                    &change.schema_key,
-                    "plugin_key",
-                )?),
+                plugin_key: change.plugin_key.clone(),
                 snapshot_content: canonicalize_change_payload(
                     change.snapshot_content.as_deref(),
                     &change.schema_key,
@@ -1051,7 +1045,7 @@ async fn load_tracked_file_descriptor(
         &CanonicalStateIdentity {
             entity_id: file_id.to_string(),
             schema_key: FILESYSTEM_FILE_SCHEMA_KEY.to_string(),
-            file_id: FILESYSTEM_DESCRIPTOR_FILE_ID.to_string(),
+            file_id: None,
         },
     )
     .await
@@ -1303,8 +1297,8 @@ mod tests {
     use crate::transaction::{FilesystemTransactionFileState, FilesystemTransactionState};
     use crate::version::GLOBAL_VERSION_ID;
     use crate::{
-        CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId,
-        LixBackend, LixBackendTransaction, LixError, Value, VersionId,
+        CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, LixBackend, LixBackendTransaction,
+        LixError, Value, VersionId,
     };
     use async_trait::async_trait;
     const TEST_TIMESTAMP: &str = "2026-03-06T14:22:00.000Z";
@@ -1365,8 +1359,8 @@ mod tests {
                 entity_id: commit_id,
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: &snapshot_id,
                 snapshot_content: Some(&snapshot_content),
                 metadata: None,
@@ -1433,8 +1427,8 @@ mod tests {
             entity_id: "entity-1".try_into().unwrap(),
             schema_key: "lix_key_value".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
-            file_id: Some("lix".try_into().unwrap()),
-            plugin_key: Some("lix".try_into().unwrap()),
+            file_id: None,
+            plugin_key: None,
             snapshot_content: Some("{\"key\":\"hello\"}".to_string()),
             metadata: None,
             version_id: "version-a".try_into().unwrap(),
@@ -1449,18 +1443,10 @@ mod tests {
             entity_id: "version-a".try_into().unwrap(),
             schema_key: "lix_version_descriptor".try_into().unwrap(),
             schema_version: Some("1".try_into().unwrap()),
-            file_id: Some(
-                crate::version::version_descriptor_file_id()
-                    .to_string()
-                    .try_into()
-                    .unwrap(),
-            ),
-            plugin_key: Some(
-                crate::version::version_descriptor_plugin_key()
-                    .to_string()
-                    .try_into()
-                    .unwrap(),
-            ),
+            file_id: crate::version::version_descriptor_file_id()
+                .map(|value| value.to_string().try_into().unwrap()),
+            plugin_key: crate::version::version_descriptor_plugin_key()
+                .map(|value| value.to_string().try_into().unwrap()),
             snapshot_content: Some(crate::version::version_descriptor_snapshot_content(
                 "version-a",
                 "Version A",
@@ -2067,8 +2053,8 @@ mod tests {
                 entity_id: EntityId::new("entity-1").expect("valid entity id"),
                 schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
                 schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
-                file_id: FileId::new("lix").expect("valid file id"),
-                plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: None,
                 metadata: None,
                 untracked: false,
@@ -2079,8 +2065,8 @@ mod tests {
                 entity_id: EntityId::new("entity-2").expect("valid entity id"),
                 schema_key: CanonicalSchemaKey::new("lix_key_value").expect("valid schema key"),
                 schema_version: CanonicalSchemaVersion::new("1").expect("valid schema version"),
-                file_id: FileId::new("lix").expect("valid file id"),
-                plugin_key: CanonicalPluginKey::new("lix").expect("valid plugin key"),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: None,
                 metadata: None,
                 untracked: false,

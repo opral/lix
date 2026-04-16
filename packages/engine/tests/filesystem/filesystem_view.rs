@@ -10,6 +10,10 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_null(value: &Value) {
+    assert_eq!(*value, Value::Null, "expected NULL, got {value:?}");
+}
+
 fn assert_blob_text(value: &Value, expected: &str) {
     match value {
         Value::Blob(actual) => assert_eq!(actual.as_slice(), expected.as_bytes()),
@@ -3328,7 +3332,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                      ) VALUES (\
-                        'file-path-untracked', 'lix_file_descriptor', 'lix', '{version_id}', 'lix', '{snapshot_content}', '1', true\
+                        'file-path-untracked', 'lix_file_descriptor', NULL, '{version_id}', NULL, '{snapshot_content}', '1', true\
                      )",
                     version_id = version_id_sql,
                     snapshot_content = snapshot_content
@@ -3972,7 +3976,8 @@ simulation_test!(
             .unwrap();
         assert_eq!(file_rows.statements[0].rows.len(), 1);
         assert_text(&file_rows.statements[0].rows[0][1], "lix_file_descriptor");
-        assert_text(&file_rows.statements[0].rows[0][3], "lix");
+        assert_null(&file_rows.statements[0].rows[0][2]);
+        assert_null(&file_rows.statements[0].rows[0][3]);
         assert_boolean_like(&file_rows.statements[0].rows[0][5], false);
         match &file_rows.statements[0].rows[0][9] {
             Value::Text(_) | Value::Null => {}

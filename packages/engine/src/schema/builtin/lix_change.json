@@ -4,10 +4,6 @@
   "x-lix-primary-key": [
     "/id"
   ],
-  "x-lix-override-lixcols": {
-    "lixcol_file_id": "\"lix\"",
-    "lixcol_plugin_key": "\"lix\""
-  },
   "type": "object",
   "properties": {
     "id": {
@@ -24,10 +20,16 @@
       "type": "string"
     },
     "file_id": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "plugin_key": {
-      "type": "string"
+      "type": [
+        "string",
+        "null"
+      ]
     },
     "metadata": {
       "type": [

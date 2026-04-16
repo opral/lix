@@ -2,10 +2,9 @@ use crate::backend::QueryExecutor;
 use crate::common::is_missing_relation_error;
 use crate::version::CommittedVersionFrontier;
 use crate::version::{
-    version_ref_file_id, version_ref_plugin_key, version_ref_schema_key,
-    version_ref_schema_version, version_ref_storage_version_id,
+    version_ref_schema_key, version_ref_schema_version, version_ref_storage_version_id,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError, NullableKeyFilter, Value};
 
 use super::naming::tracked_relation_name;
 use super::untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
@@ -15,14 +14,6 @@ use super::ExactUntrackedRowRequest;
 struct VersionHeadRef {
     version_id: String,
     commit_id: String,
-}
-
-pub(crate) async fn load_version_head_commit_id_with_backend(
-    backend: &dyn LixBackend,
-    version_id: &str,
-) -> Result<Option<String>, LixError> {
-    let mut executor = backend;
-    load_version_head_commit_id_with_executor(&mut executor, version_id).await
 }
 
 pub(crate) async fn load_version_head_commit_id_with_executor(
@@ -35,7 +26,7 @@ pub(crate) async fn load_version_head_commit_id_with_executor(
             schema_key: version_ref_schema_key().to_string(),
             version_id: version_ref_storage_version_id().to_string(),
             entity_id: version_id.to_string(),
-            file_id: Some(version_ref_file_id().to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await?
@@ -98,9 +89,9 @@ async fn load_all_version_head_refs_with_executor(
                  FROM {table} \
                  WHERE schema_key = $1 \
                    AND schema_version = $2 \
-                   AND file_id = $3 \
-                   AND version_id = $4 \
-                   AND plugin_key = $5 \
+                   AND file_id IS NULL \
+                   AND version_id = $3 \
+                   AND plugin_key IS NULL \
                    AND untracked = true \
                    AND is_tombstone = 0 \
                    AND commit_id IS NOT NULL \
@@ -111,9 +102,7 @@ async fn load_all_version_head_refs_with_executor(
             &[
                 Value::Text(version_ref_schema_key().to_string()),
                 Value::Text(version_ref_schema_version().to_string()),
-                Value::Text(version_ref_file_id().to_string()),
                 Value::Text(version_ref_storage_version_id().to_string()),
-                Value::Text(version_ref_plugin_key().to_string()),
             ],
         )
         .await

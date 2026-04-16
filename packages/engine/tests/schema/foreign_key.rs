@@ -61,10 +61,6 @@ async fn register_state_ref_schema(
             "x-lix-key": schema_key,
             "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\""
-            },
             "x-lix-foreign-keys": [
                 {
                     "properties": ["/target_entity_id", "/target_schema_key", "/target_file_id"],
@@ -208,7 +204,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'ref-1', 'fk_state_ref_meta', 'lix', 'version-a', 'lix', '1', '{\"id\":\"ref-1\",\"target_entity_id\":\"doc-1\",\"target_schema_key\":\"fk_state_target_doc\",\"target_file_id\":\"alpha.md\"}'\
+                 'ref-1', 'fk_state_ref_meta', NULL, 'version-a', NULL, '1', '{\"id\":\"ref-1\",\"target_entity_id\":\"doc-1\",\"target_schema_key\":\"fk_state_target_doc\",\"target_file_id\":\"alpha.md\"}'\
                  )",
                 &[],
             )
@@ -220,7 +216,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'ref-2', 'fk_state_ref_meta', 'lix', 'version-a', 'lix', '1', '{\"id\":\"ref-2\",\"target_entity_id\":\"doc-1\",\"target_schema_key\":\"fk_state_target_doc\",\"target_file_id\":\"beta.md\"}'\
+                 'ref-2', 'fk_state_ref_meta', NULL, 'version-a', NULL, '1', '{\"id\":\"ref-2\",\"target_entity_id\":\"doc-1\",\"target_schema_key\":\"fk_state_target_doc\",\"target_file_id\":\"beta.md\"}'\
                  )",
                 &[],
             )

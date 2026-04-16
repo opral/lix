@@ -40,7 +40,7 @@ pub use common::SqlDialect;
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
-pub use common::{ExecuteResult, QueryResult, Value};
+pub use common::{ExecuteResult, NullableKeyFilter, QueryResult, Value};
 pub use common::{WireQueryResult, WireValue};
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,

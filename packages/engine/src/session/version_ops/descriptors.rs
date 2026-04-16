@@ -8,6 +8,7 @@ use crate::catalog::{bind_named_relation, RelationBindContext};
 use crate::common::escape_sql_string;
 use crate::live_state::load_version_head_commit_map_with_executor;
 use crate::sql::lower_catalog_relation_binding_to_source_sql;
+use crate::transaction::PendingOverlay;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
     parse_version_descriptor_snapshot, version_descriptor_file_id, version_descriptor_plugin_key,
@@ -43,6 +44,18 @@ pub(crate) async fn load_version_descriptor_with_executor(
     executor: &mut dyn QueryExecutor,
     version_id: &str,
 ) -> Result<Option<VersionDescriptorRow>, LixError> {
+    load_version_descriptor_with_pending_overlay(executor, None, version_id).await
+}
+
+pub(crate) async fn load_version_descriptor_with_pending_overlay(
+    executor: &mut dyn QueryExecutor,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    version_id: &str,
+) -> Result<Option<VersionDescriptorRow>, LixError> {
+    if let Some(pending) = pending_version_descriptor_row(pending_overlay, version_id)? {
+        return Ok(pending);
+    }
+
     let Some(global_head_commit_id) =
         load_version_head_commit_id_with_executor(executor, GLOBAL_VERSION_ID).await?
     else {
@@ -58,11 +71,15 @@ pub(crate) async fn load_version_descriptor_with_executor(
             exact_filters: BTreeMap::from([
                 (
                     "file_id".to_string(),
-                    Value::Text(version_descriptor_file_id().to_string()),
+                    version_descriptor_file_id()
+                        .map(|value| Value::Text(value.to_string()))
+                        .unwrap_or(Value::Null),
                 ),
                 (
                     "plugin_key".to_string(),
-                    Value::Text(version_descriptor_plugin_key().to_string()),
+                    version_descriptor_plugin_key()
+                        .map(|value| Value::Text(value.to_string()))
+                        .unwrap_or(Value::Null),
                 ),
                 (
                     "schema_version".to_string(),
@@ -79,6 +96,42 @@ pub(crate) async fn load_version_descriptor_with_executor(
         return Ok(None);
     };
     Ok(Some(parse_descriptor_row(snapshot_content, Some(row.id))?))
+}
+
+fn pending_version_descriptor_row(
+    pending_overlay: Option<&dyn PendingOverlay>,
+    version_id: &str,
+) -> Result<Option<Option<VersionDescriptorRow>>, LixError> {
+    let Some(row) = pending_overlay.and_then(|overlay| {
+        overlay
+            .visible_semantic_rows(false, version_descriptor_schema_key())
+            .into_iter()
+            .find(|row| {
+                row.entity_id == version_id
+                    && row.version_id == GLOBAL_VERSION_ID
+                    && row.file_id.is_none()
+                    && row.plugin_key.is_none()
+                    && row.schema_version == version_descriptor_schema_version()
+            })
+    }) else {
+        return Ok(None);
+    };
+
+    if row.tombstone {
+        return Ok(Some(None));
+    }
+
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("pending version descriptor for '{version_id}' is missing snapshot_content"),
+        ));
+    };
+
+    Ok(Some(Some(parse_descriptor_row(
+        snapshot_content,
+        row.change_id.clone(),
+    )?)))
 }
 
 pub(crate) async fn load_all_version_descriptors_with_executor(

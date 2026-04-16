@@ -5,12 +5,11 @@ use crate::canonical::{
 };
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::{
-    key_value_file_id, key_value_plugin_key, key_value_schema_key, key_value_schema_version,
-    load_exact_untracked_row_with_executor, load_version_head_commit_id_with_executor,
-    write_live_rows, ExactUntrackedRowRequest, LiveRow,
+    key_value_schema_key, key_value_schema_version, load_exact_untracked_row_with_executor,
+    load_version_head_commit_id_with_executor, write_live_rows, ExactUntrackedRowRequest, LiveRow,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackendTransaction, LixError};
+use crate::{LixBackendTransaction, LixError, NullableKeyFilter};
 
 const DETERMINISTIC_SEQUENCE_KEY: &str = "lix_deterministic_sequence_number";
 
@@ -87,7 +86,7 @@ async fn load_runtime_sequence_untracked_row_with_executor(
             schema_key: key_value_schema_key().to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
             entity_id: deterministic_sequence_key().to_string(),
-            file_id: Some(key_value_file_id().to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -107,7 +106,7 @@ async fn load_runtime_sequence_tracked_highest_seen_with_executor(
         &CanonicalStateIdentity {
             entity_id: deterministic_sequence_key().to_string(),
             schema_key: key_value_schema_key().to_string(),
-            file_id: key_value_file_id().to_string(),
+            file_id: None,
         },
     )
     .await?
@@ -135,11 +134,11 @@ async fn append_runtime_sequence_row_in_transaction(
         transaction,
         &[LiveRow {
             entity_id: deterministic_sequence_key().to_string(),
-            file_id: key_value_file_id().to_string(),
+            file_id: None,
             schema_key: key_value_schema_key().to_string(),
             schema_version: key_value_schema_version().to_string(),
             version_id: GLOBAL_VERSION_ID.to_string(),
-            plugin_key: key_value_plugin_key().to_string(),
+            plugin_key: None,
             metadata: None,
             change_id: Some(change_id),
             writer_key: None,
@@ -223,24 +222,8 @@ fn deterministic_sequence_change_row(
                     ),
                 )
             })?,
-        file_id: key_value_file_id().to_string().try_into().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "invalid deterministic sequence file_id '{}'",
-                    key_value_file_id()
-                ),
-            )
-        })?,
-        plugin_key: key_value_plugin_key().to_string().try_into().map_err(|_| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "invalid deterministic sequence plugin_key '{}'",
-                    key_value_plugin_key()
-                ),
-            )
-        })?,
+        file_id: None,
+        plugin_key: None,
         snapshot_content: Some(
             CanonicalJson::from_text(snapshot_content.to_string()).map_err(|error| {
                 LixError::new(

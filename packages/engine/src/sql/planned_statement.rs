@@ -43,9 +43,9 @@ pub struct MutationRow {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub version_id: String,
-    pub plugin_key: String,
+    pub plugin_key: Option<String>,
     pub snapshot_content: Option<JsonValue>,
     pub untracked: bool,
 }

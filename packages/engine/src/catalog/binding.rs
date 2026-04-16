@@ -55,16 +55,16 @@ pub(crate) struct VersionRelationBinding {
 pub(crate) struct VersionDescriptorSourceBinding {
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredVersionHeadSourceBinding {
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) storage_version_id: String,
 }
 
@@ -130,8 +130,8 @@ pub(crate) fn bind_version_relation(
         descriptor_source: VersionDescriptorSourceBinding {
             schema_key: version_descriptor_schema_key().to_string(),
             schema_version: version_descriptor_schema_version().to_string(),
-            file_id: version_descriptor_file_id().to_string(),
-            plugin_key: version_descriptor_plugin_key().to_string(),
+            file_id: version_descriptor_file_id().map(str::to_string),
+            plugin_key: version_descriptor_plugin_key().map(str::to_string),
         },
         head_source: match current_heads {
             Some(current_heads) => {
@@ -140,8 +140,8 @@ pub(crate) fn bind_version_relation(
             None => VersionHeadSourceBinding::StoredRefs(StoredVersionHeadSourceBinding {
                 schema_key: version_ref_schema_key().to_string(),
                 schema_version: version_ref_schema_version().to_string(),
-                file_id: version_ref_file_id().to_string(),
-                plugin_key: version_ref_plugin_key().to_string(),
+                file_id: version_ref_file_id().map(str::to_string),
+                plugin_key: version_ref_plugin_key().map(str::to_string),
                 storage_version_id: version_ref_storage_version_id().to_string(),
             }),
         },

@@ -2050,7 +2050,7 @@ mod tests {
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1'\
+                 'entity-1', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"hello\"}', '1'\
                  )",
             ),
             &registry,
@@ -2093,7 +2093,7 @@ mod tests {
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-1', 'lix_key_value', 'lix', lix_active_version_id(), 'lix', '{\"key\":\"hello\"}', '1'\
+                 'entity-1', 'lix_key_value', NULL, lix_active_version_id(), NULL, '{\"key\":\"hello\"}', '1'\
                  )",
                 StatementContext {
                     requested_version_id: Some("version-active".to_string()),
@@ -2127,9 +2127,9 @@ mod tests {
                 vec![
                     Value::Text("entity-1".to_string()),
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text("version-a".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text("{\"key\":\"hello\"}".to_string()),
                     Value::Text("1".to_string()),
                 ],
@@ -2198,8 +2198,8 @@ mod tests {
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES \
-                 ('entity-tracked', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"tracked\"}', '1', false), \
-                 ('entity-untracked', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"untracked\"}', '1', true)",
+                 ('entity-tracked', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"tracked\"}', '1', false), \
+                 ('entity-untracked', 'lix_key_value', NULL, 'version-b', NULL, '{\"key\":\"untracked\"}', '1', true)",
             ),
             &registry,
         )
@@ -2273,9 +2273,9 @@ mod tests {
             bound_statement(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) SELECT 'entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1' \
+                 ) SELECT 'entity-1', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"hello\"}', '1' \
                  UNION ALL \
-                 SELECT 'entity-2', 'lix_key_value', 'lix', 'version-b', 'lix', '{\"key\":\"world\"}', '1'",
+                 SELECT 'entity-2', 'lix_key_value', NULL, 'version-b', NULL, '{\"key\":\"world\"}', '1'",
             ),
             &registry,
         )

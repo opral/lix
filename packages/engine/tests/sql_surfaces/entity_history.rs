@@ -19,7 +19,7 @@ async fn seed_key_value_row(
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{entity_id}', 'lix_key_value', 'lix', '{version_id}', 'lix', '{snapshot}', '1'\
+         '{entity_id}', 'lix_key_value', NULL, '{version_id}', NULL, '{snapshot}', '1'\
          )",
         entity_id = key.replace('\'', "''"),
         version_id = version_id.replace('\'', "''"),

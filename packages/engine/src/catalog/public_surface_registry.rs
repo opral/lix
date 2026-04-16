@@ -151,8 +151,8 @@ mod tests {
                 "x-lix-key": "message",
                 "x-lix-version": "1",
                 "x-lix-override-lixcols": {
-                    "lixcol_file_id": "\"lix\"",
-                    "lixcol_plugin_key": "\"lix\""
+                    "lixcol_entity_id": "\"message-1\"",
+                    "lixcol_metadata": "\"meta\""
                 },
                 "properties": {
                     "body": { "type": "string" },

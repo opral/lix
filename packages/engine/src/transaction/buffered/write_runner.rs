@@ -137,18 +137,34 @@ fn canonical_changes_from_untracked_writes(
                         ),
                     )
                 })?,
-                file_id: write.file_id.clone().try_into().map_err(|_| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("invalid untracked write file_id '{}'", write.file_id),
-                    )
-                })?,
-                plugin_key: write.plugin_key.clone().try_into().map_err(|_| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("invalid untracked write plugin_key '{}'", write.plugin_key),
-                    )
-                })?,
+                file_id: write
+                    .file_id
+                    .clone()
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "invalid untracked write file_id {:?}",
+                                write.file_id.as_deref()
+                            ),
+                        )
+                    })?,
+                plugin_key: write
+                    .plugin_key
+                    .clone()
+                    .map(TryInto::try_into)
+                    .transpose()
+                    .map_err(|_| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "invalid untracked write plugin_key {:?}",
+                                write.plugin_key.as_deref()
+                            ),
+                        )
+                    })?,
                 snapshot_content: write
                     .snapshot_content
                     .clone()

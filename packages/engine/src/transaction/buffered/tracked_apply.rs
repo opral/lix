@@ -79,7 +79,6 @@ fn file_cache_refresh_targets_from_changes<Change: StateChangeRecord>(
 ) -> BTreeSet<(String, String)> {
     changes
         .iter()
-        .filter(|change| change.file_id() != Some("lix"))
         .filter(|change| change.schema_key() != "lix_file_descriptor")
         .filter(|change| change.schema_key() != "lix_directory_descriptor")
         .filter_map(|change| {

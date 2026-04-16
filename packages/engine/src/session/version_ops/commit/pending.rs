@@ -165,36 +165,16 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
                             )
                         })?,
                 )?),
-                file_id: Some(FileId::new(
-                    change
-                        .file_id
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_UNKNOWN",
-                                format!(
-                                    "public merge requires file_id for '{}:{}'",
-                                    change.schema_key, change.entity_id
-                                ),
-                            )
-                        })?,
-                )?),
-                plugin_key: Some(CanonicalPluginKey::new(
-                    change
-                        .plugin_key
-                        .as_ref()
-                        .map(ToString::to_string)
-                        .ok_or_else(|| {
-                            LixError::new(
-                                "LIX_ERROR_UNKNOWN",
-                                format!(
-                                    "public merge requires plugin_key for '{}:{}'",
-                                    change.schema_key, change.entity_id
-                                ),
-                            )
-                        })?,
-                )?),
+                file_id: change
+                    .file_id
+                    .as_ref()
+                    .map(|value| FileId::new(value.to_string()))
+                    .transpose()?,
+                plugin_key: change
+                    .plugin_key
+                    .as_ref()
+                    .map(|value| CanonicalPluginKey::new(value.to_string()))
+                    .transpose()?,
                 snapshot_content: canonicalize_optional_json_text(
                     change.snapshot_content.as_deref(),
                     "snapshot_content",

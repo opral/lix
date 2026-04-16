@@ -339,6 +339,7 @@ fn live_envelope_column_names() -> BTreeSet<&'static str> {
         "schema_key",
         "schema_version",
         "file_id",
+        "storage_scope_key",
         "version_id",
         "global",
         "plugin_key",

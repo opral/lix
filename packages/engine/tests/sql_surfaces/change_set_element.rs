@@ -61,7 +61,7 @@ simulation_test!(
                  FROM lix_change_set_element \
                  WHERE entity_id = 'change-set-by-version-key-1' \
                    AND schema_key = 'lix_key_value' \
-                   AND file_id = 'lix'",
+                   AND file_id IS NULL",
                 &[],
             )
             .await
@@ -78,7 +78,7 @@ simulation_test!(
                  WHERE lixcol_version_id = $1 \
                    AND entity_id = 'change-set-by-version-key-1' \
                    AND schema_key = 'lix_key_value' \
-                   AND file_id = 'lix'",
+                   AND file_id IS NULL",
                 &[Value::Text("version-a".to_string())],
             )
             .await
@@ -96,7 +96,7 @@ simulation_test!(
                  WHERE lixcol_version_id = $1 \
                    AND entity_id = 'change-set-by-version-key-1' \
                    AND schema_key = 'lix_key_value' \
-                   AND file_id = 'lix'",
+                   AND file_id IS NULL",
                 &[Value::Text("version-b".to_string())],
             )
             .await
@@ -151,7 +151,7 @@ simulation_test!(
                  WHERE change_set_id = $1 \
                    AND entity_id = 'checkpoint-cse-key-1' \
                    AND schema_key = 'lix_key_value' \
-                   AND file_id = 'lix'",
+                   AND file_id IS NULL",
                 &[Value::Text(checkpoint.change_set_id)],
             )
             .await

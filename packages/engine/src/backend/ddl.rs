@@ -1,3 +1,4 @@
+use crate::backend::QueryExecutor;
 use crate::{LixBackend, LixError, SqlDialect, Value};
 
 pub(crate) async fn execute_ddl_batch(
@@ -26,23 +27,33 @@ pub(crate) async fn add_column_if_missing(
     column: &str,
     column_ddl: &str,
 ) -> Result<(), LixError> {
-    if column_exists(backend, table, column).await? {
+    let mut executor = backend;
+    add_column_if_missing_with_executor(&mut executor, table, column, column_ddl).await
+}
+
+pub(crate) async fn add_column_if_missing_with_executor(
+    executor: &mut dyn QueryExecutor,
+    table: &str,
+    column: &str,
+    column_ddl: &str,
+) -> Result<(), LixError> {
+    if column_exists_with_executor(executor, table, column).await? {
         return Ok(());
     }
 
     let alter = format!("ALTER TABLE {table} ADD COLUMN {column} {column_ddl}");
-    backend.execute(&alter, &[]).await?;
+    executor.execute(&alter, &[]).await?;
     Ok(())
 }
 
-async fn column_exists(
-    backend: &dyn LixBackend,
+async fn column_exists_with_executor(
+    executor: &mut dyn QueryExecutor,
     table: &str,
     column: &str,
 ) -> Result<bool, LixError> {
-    let exists = match backend.dialect() {
+    let exists = match executor.dialect() {
         SqlDialect::Sqlite => {
-            backend
+            executor
                 .execute(
                     &format!(
                         "SELECT 1 \
@@ -55,7 +66,7 @@ async fn column_exists(
                 .await?
         }
         SqlDialect::Postgres => {
-            backend
+            executor
                 .execute(
                     "SELECT 1 \
                      FROM information_schema.columns \

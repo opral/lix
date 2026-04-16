@@ -13,11 +13,11 @@ pub(crate) fn local_version_head_live_row(
 ) -> LiveRow {
     LiveRow {
         entity_id: version_id.to_string(),
-        file_id: crate::version::version_ref_file_id().to_string(),
+        file_id: None,
         schema_key: crate::version::version_ref_schema_key().to_string(),
         schema_version: crate::version::version_ref_schema_version().to_string(),
         version_id: crate::version::version_ref_storage_version_id().to_string(),
-        plugin_key: crate::version::version_ref_plugin_key().to_string(),
+        plugin_key: None,
         metadata: None,
         change_id: Some(local_version_head_change_id(
             version_id, commit_id, timestamp,

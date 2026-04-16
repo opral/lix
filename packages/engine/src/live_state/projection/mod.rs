@@ -34,12 +34,12 @@ fn version_ref_schema_version() -> String {
     crate::version::version_ref_schema_version().to_string()
 }
 
-fn version_ref_file_id() -> String {
-    crate::version::version_ref_file_id().to_string()
+fn version_ref_file_id() -> Option<String> {
+    crate::version::version_ref_file_id().map(str::to_string)
 }
 
-fn version_ref_plugin_key() -> String {
-    crate::version::version_ref_plugin_key().to_string()
+fn version_ref_plugin_key() -> Option<String> {
+    crate::version::version_ref_plugin_key().map(str::to_string)
 }
 
 fn version_ref_storage_version_id() -> String {
@@ -389,8 +389,8 @@ mod tests {
                 entity_id: "cursor-entity",
                 schema_key: "lix_key_value",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "no-content",
                 snapshot_content: None,
                 metadata: None,

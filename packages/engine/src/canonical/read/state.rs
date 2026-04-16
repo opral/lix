@@ -25,8 +25,8 @@ pub(crate) struct CommittedCanonicalChangeRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) untracked: bool,
@@ -173,16 +173,16 @@ fn canonical_change_matches_request(
         return false;
     }
     for column in ["file_id", "plugin_key", "schema_version"] {
-        let Some(expected) = request.exact_filters.get(column).and_then(text_from_value) else {
+        let Some(expected) = request.exact_filters.get(column) else {
             continue;
         };
         let actual = match column {
-            "file_id" => &change.file_id,
-            "plugin_key" => &change.plugin_key,
-            "schema_version" => &change.schema_version,
+            "file_id" => change.file_id.as_deref(),
+            "plugin_key" => change.plugin_key.as_deref(),
+            "schema_version" => Some(change.schema_version.as_str()),
             _ => continue,
         };
-        if actual != &expected {
+        if !matches_exact_text_filter(actual, expected) {
             return false;
         }
     }
@@ -199,8 +199,8 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
          LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
          WHERE c.schema_key = 'lix_commit' \
            AND c.entity_id = '{commit_id}' \
-           AND c.file_id = 'lix' \
-           AND c.plugin_key = 'lix' \
+           AND c.file_id IS NULL \
+           AND c.plugin_key IS NULL \
            AND s.content IS NOT NULL \
          LIMIT 1",
         commit_id = escape_sql_string(commit_id),
@@ -252,13 +252,24 @@ pub(crate) async fn load_canonical_change_row_by_id(
         entity_id: required_text(row, 1, "lix_internal_change.entity_id")?,
         schema_key: required_text(row, 2, "lix_internal_change.schema_key")?,
         schema_version: required_text(row, 3, "lix_internal_change.schema_version")?,
-        file_id: required_text(row, 4, "lix_internal_change.file_id")?,
-        plugin_key: required_text(row, 5, "lix_internal_change.plugin_key")?,
+        file_id: row.get(4).and_then(text_from_value),
+        plugin_key: row.get(5).and_then(text_from_value),
         snapshot_content: row.get(6).and_then(text_from_value),
         metadata: row.get(7).and_then(text_from_value),
         untracked: required_bool(row, 8, "lix_internal_change.untracked")?,
         created_at: required_text(row, 9, "lix_internal_change.created_at")?,
     }))
+}
+
+fn matches_exact_text_filter(actual: Option<&str>, expected: &Value) -> bool {
+    match expected {
+        Value::Null => actual.is_none(),
+        Value::Text(expected) => actual == Some(expected.as_str()),
+        Value::Integer(expected) => actual.is_some_and(|actual| actual == expected.to_string()),
+        Value::Boolean(expected) => actual.is_some_and(|actual| actual == expected.to_string()),
+        Value::Real(expected) => actual.is_some_and(|actual| actual == expected.to_string()),
+        _ => false,
+    }
 }
 
 fn text_from_value(value: &Value) -> Option<String> {
@@ -330,16 +341,15 @@ mod tests {
         request: &ExactCommittedStateRowRequest,
     ) -> Result<Option<crate::canonical::CanonicalStateRow>, LixError> {
         let mut executor = backend;
-        let file_id = request
-            .exact_filters
-            .get("file_id")
-            .and_then(|value| match value {
-                Value::Text(text) => Some(text.clone()),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                LixError::unknown("test exact committed state request requires file_id")
-            })?;
+        let file_id = match request.exact_filters.get("file_id") {
+            Some(Value::Text(text)) => Some(text.clone()),
+            Some(Value::Null) | None => None,
+            Some(other) => {
+                return Err(LixError::unknown(format!(
+                "test exact committed state request requires text-or-null file_id, got {other:?}"
+            )))
+            }
+        };
         load_exact_canonical_row_at_version_head_with_executor(
             &mut executor,
             &request.version_id,
@@ -363,8 +373,8 @@ mod tests {
                 entity_id: "file-1",
                 schema_key: "lix_file_descriptor",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-file-1",
                 snapshot_content: Some(
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"contract\",\"extension\":null,\"metadata\":{\"k\":\"v\"},\"hidden\":false}",
@@ -382,8 +392,8 @@ mod tests {
                 entity_id: "parent-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-parent-1",
                 snapshot_content: Some(
                     "{\"id\":\"parent-1\",\"change_set_id\":\"cs-parent\",\"change_ids\":[],\"parent_commit_ids\":[]}",
@@ -401,8 +411,8 @@ mod tests {
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-commit-1",
                 snapshot_content: Some(
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-fallback\"],\"parent_commit_ids\":[\"parent-1\"]}",
@@ -420,8 +430,8 @@ mod tests {
                 entity_id: "commit-2",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-commit-2",
                 snapshot_content: Some(
                     "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
@@ -456,8 +466,8 @@ mod tests {
                 entity_id: "file-1",
                 schema_key: "lix_file_descriptor",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-deep-root",
                 snapshot_content: Some(
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"deep\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
@@ -493,8 +503,8 @@ mod tests {
                     entity_id: &format!("commit-{index}"),
                     schema_key: "lix_commit",
                     schema_version: "1",
-                    file_id: "lix",
-                    plugin_key: "lix",
+                    file_id: None,
+                    plugin_key: None,
                     snapshot_id: &snapshot_id,
                     snapshot_content: Some(&snapshot_content),
                     metadata: None,
@@ -521,8 +531,8 @@ mod tests {
             schema_key: "lix_file_descriptor".to_string(),
             version_id: "v1".to_string(),
             exact_filters: BTreeMap::from([
-                ("file_id".to_string(), Value::Text("lix".to_string())),
-                ("plugin_key".to_string(), Value::Text("lix".to_string())),
+                ("file_id".to_string(), Value::Null),
+                ("plugin_key".to_string(), Value::Null),
                 ("schema_version".to_string(), Value::Text("1".to_string())),
             ]),
         }
@@ -616,8 +626,8 @@ mod tests {
                 entity_id: "file-1",
                 schema_key: "lix_file_descriptor",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-cycle-row",
                 snapshot_content: Some(
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"cycle\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
@@ -636,8 +646,8 @@ mod tests {
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-cycle-commit-1",
                 snapshot_content: Some(
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-cycle-row\"],\"parent_commit_ids\":[\"commit-2\"]}",
@@ -656,8 +666,8 @@ mod tests {
                 entity_id: "commit-2",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-cycle-commit-2",
                 snapshot_content: Some(
                     "{\"id\":\"commit-2\",\"change_set_id\":\"cs-2\",\"change_ids\":[],\"parent_commit_ids\":[\"commit-1\"]}",
@@ -696,8 +706,8 @@ mod tests {
                 entity_id: "file-1",
                 schema_key: "lix_file_descriptor",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-missing-parent-row",
                 snapshot_content: Some(
                     "{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"broken-parent\",\"extension\":null,\"metadata\":null,\"hidden\":false}",
@@ -716,8 +726,8 @@ mod tests {
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-missing-parent-commit",
                 snapshot_content: Some(
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[\"change-missing-parent-row\"],\"parent_commit_ids\":[\"missing-parent\"]}",

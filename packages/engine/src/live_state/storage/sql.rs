@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+use crate::common::STORAGE_SCOPE_KEY_COLUMN;
 use crate::live_state::constraints::{
     quote_ident as constraint_quote_ident, render_constraint_sql, sql_literal, ScanConstraint,
 };
@@ -21,19 +22,21 @@ pub(crate) fn ensure_schema_live_table_sql_statements(
          entity_id TEXT NOT NULL,\
          schema_key TEXT NOT NULL,\
          schema_version TEXT NOT NULL,\
-         file_id TEXT NOT NULL,\
+         file_id TEXT,\
+         {storage_scope_key} TEXT NOT NULL,\
          version_id TEXT NOT NULL,\
          global BOOLEAN NOT NULL DEFAULT false,\
-         plugin_key TEXT NOT NULL,\
+         plugin_key TEXT,\
          change_id TEXT,\
          metadata TEXT,\
          is_tombstone INTEGER NOT NULL DEFAULT 0,\
          untracked BOOLEAN NOT NULL DEFAULT false,\
          created_at TEXT NOT NULL,\
          updated_at TEXT NOT NULL{normalized_columns},\
-         PRIMARY KEY (entity_id, file_id, version_id, untracked)\
+         PRIMARY KEY (entity_id, {storage_scope_key}, version_id, untracked)\
          )",
         table = table_ident,
+        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
         normalized_columns = render_normalized_columns(Some(layout), dialect),
     )];
 
@@ -255,6 +258,12 @@ fn render_normalized_columns(layout: Option<&LiveTableLayout>, dialect: SqlDiale
 fn common_live_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
     let mut statements = vec![
         format!(
+            "CREATE UNIQUE INDEX IF NOT EXISTS {index} ON {table} (entity_id, {storage_scope_key}, version_id, untracked)",
+            index = quote_ident(&format!("uq_{}_scope_identity", table_name)),
+            table = table_ident,
+            storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
+        ),
+        format!(
             "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id)",
             index = quote_ident(&format!("idx_{}_version_id", table_name)),
             table = table_ident,
@@ -270,6 +279,12 @@ fn common_live_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
             table = table_ident,
         ),
         format!(
+            "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, {storage_scope_key}, entity_id, untracked)",
+            index = quote_ident(&format!("idx_{}_vse", table_name)),
+            table = table_ident,
+            storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
+        ),
+        format!(
             "CREATE INDEX IF NOT EXISTS {index} ON {table} (version_id, entity_id, untracked)",
             index = quote_ident(&format!("idx_{}_ve", table_name)),
             table = table_ident,
@@ -282,24 +297,27 @@ fn common_live_indexes(table_name: &str, table_ident: &str) -> Vec<String> {
     ];
     statements.push(format!(
         "CREATE INDEX IF NOT EXISTS {index} \
-         ON {table} (version_id, file_id, entity_id) \
+         ON {table} (version_id, {storage_scope_key}, entity_id) \
          WHERE untracked = false AND is_tombstone = 0",
-        index = quote_ident(&format!("idx_{}_live_vfe", table_name)),
+        index = quote_ident(&format!("idx_{}_live_vse", table_name)),
         table = table_ident,
+        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
     ));
     statements.push(format!(
         "CREATE INDEX IF NOT EXISTS {index} \
-         ON {table} (version_id, file_id, entity_id) \
+         ON {table} (version_id, {storage_scope_key}, entity_id) \
          WHERE untracked = false AND is_tombstone = 1",
-        index = quote_ident(&format!("idx_{}_tomb_vfe", table_name)),
+        index = quote_ident(&format!("idx_{}_tomb_vse", table_name)),
         table = table_ident,
+        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
     ));
     statements.push(format!(
         "CREATE INDEX IF NOT EXISTS {index} \
-         ON {table} (version_id, file_id, entity_id) \
+         ON {table} (version_id, {storage_scope_key}, entity_id) \
          WHERE untracked = true",
-        index = quote_ident(&format!("idx_{}_untracked_vfe", table_name)),
+        index = quote_ident(&format!("idx_{}_untracked_vse", table_name)),
         table = table_ident,
+        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
     ));
     statements
 }

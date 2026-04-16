@@ -13,9 +13,9 @@ pub(crate) use annotations::overrides::{
 };
 pub(crate) use annotations::SchemaAnnotationEvaluator;
 pub(crate) use builtin::{
-    builtin_schema_definition, builtin_schema_keys, decode_lixcol_literal,
-    lix_state_surface_schema_definition, LixActiveVersion, LixCommit, LixVersionDescriptor,
-    LixVersionRef,
+    builtin_schema_definition, builtin_schema_keys, builtin_schema_storage_defaults,
+    decode_lixcol_literal, lix_state_surface_schema_definition, LixActiveVersion, LixCommit,
+    LixVersionDescriptor, LixVersionRef,
 };
 pub use compiled_cache::CompiledSchemaCache;
 pub use definition::{

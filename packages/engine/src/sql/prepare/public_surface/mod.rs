@@ -55,8 +55,7 @@ use crate::streams::{
     StateCommitStreamOperation, StateCommitStreamRuntimeMetadata,
 };
 use crate::version::{
-    active_version_file_id, active_version_schema_key, active_version_storage_version_id,
-    parse_active_version_snapshot,
+    active_version_schema_key, active_version_storage_version_id, parse_active_version_snapshot,
 };
 #[cfg(test)]
 use crate::LixBackend;
@@ -1482,7 +1481,7 @@ fn next_active_version_id_from_changes<Change: StateChangeRecord>(
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {
         if change.schema_key() != active_version_schema_key()
-            || change.file_id() != Some(active_version_file_id())
+            || change.file_id().is_some()
             || change.version_id() != active_version_storage_version_id()
         {
             continue;
@@ -1502,7 +1501,6 @@ fn file_cache_refresh_targets_from_changes<Change: StateChangeRecord>(
 ) -> BTreeSet<(String, String)> {
     changes
         .iter()
-        .filter(|change| change.file_id() != Some("lix"))
         .filter(|change| change.schema_key() != "lix_file_descriptor")
         .filter(|change| change.schema_key() != "lix_directory_descriptor")
         .filter_map(|change| {
@@ -2595,14 +2593,10 @@ mod tests {
             .expect("live public entity read should lower");
         assert!(lowered_sql.contains("FROM (SELECT"));
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
-        assert_eq!(
-            extract_sql_string_filter(lowered_sql, "file_id").as_deref(),
-            Some("lix")
-        );
-        assert_eq!(
-            extract_sql_string_filter(lowered_sql, "plugin_key").as_deref(),
-            Some("lix")
-        );
+        assert_eq!(extract_sql_string_filter(lowered_sql, "file_id"), None);
+        assert_eq!(extract_sql_string_filter(lowered_sql, "plugin_key"), None);
+        assert!(!lowered_sql.contains("file_id = 'lix'"));
+        assert!(!lowered_sql.contains("plugin_key = 'lix'"));
     }
 
     #[tokio::test]
@@ -3660,7 +3654,7 @@ mod tests {
                         &backend,
                         &parse_one(
                             "INSERT INTO lix_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, created_at) \
-                             VALUES ('c1', 'e1', 's1', '1', 'lix', 'lix', '2026-01-01T00:00:00Z')",
+                             VALUES ('c1', 'e1', 's1', '1', NULL, NULL, '2026-01-01T00:00:00Z')",
                         ),
                         &[],
                         "main",
@@ -3971,6 +3965,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepares_state_by_version_reads_with_null_file_id_pushdown_trace() {
+        let backend = FakeBackend::default();
+        let prepared = prepare_public_read(
+            &backend,
+            &parse_one(
+                "SELECT entity_id FROM lix_state_by_version \
+                 WHERE version_id = 'v1' \
+                   AND schema_key = 'lix_key_value' \
+                   AND file_id IS NULL",
+            ),
+            &[],
+            "main",
+            None,
+        )
+        .await
+        .expect("state-by-version read with NULL file scope should canonicalize");
+
+        assert_eq!(
+            prepared
+                .explain
+                .compiled_artifacts
+                .pushdown
+                .as_ref()
+                .expect("pushdown trace should be recorded")
+                .accepted_predicates
+                .clone(),
+            vec![
+                "version_id = 'v1'".to_string(),
+                "schema_key = 'lix_key_value'".to_string(),
+                "file_id IS NULL".to_string(),
+            ]
+        );
+
+        let lowered_sql = prepared
+            .explain
+            .compiled_artifacts
+            .lowered_sql
+            .first()
+            .expect("state-by-version read should lower");
+
+        assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
+        assert!(lowered_sql.contains("\"t\".\"file_id\" IS NULL"));
+        assert!(lowered_sql.contains("\"u\".\"file_id\" IS NULL"));
+        assert!(!lowered_sql.contains(" AND file_id IS NULL"));
+    }
+
+    #[tokio::test]
     async fn prepares_state_history_reads_with_root_commit_pushdown() {
         let backend = FakeBackend::default();
         let prepared = prepare_public_read(
@@ -4166,11 +4207,11 @@ mod tests {
                 transaction.as_mut(),
                 &[live_state::LiveRow {
                     entity_id: descriptor.id.to_string(),
-                    file_id: version_descriptor_file_id().to_string(),
+                    file_id: version_descriptor_file_id().map(str::to_string),
                     schema_key: version_descriptor_schema_key().to_string(),
                     schema_version: version_descriptor_schema_version().to_string(),
                     version_id: GLOBAL_VERSION_ID.to_string(),
-                    plugin_key: version_descriptor_plugin_key().to_string(),
+                    plugin_key: version_descriptor_plugin_key().map(str::to_string),
                     metadata: None,
                     change_id: Some(format!("change-public-{}", descriptor.id)),
                     writer_key: None,
@@ -4189,11 +4230,11 @@ mod tests {
                     transaction.as_mut(),
                     &[live_state::LiveRow {
                         entity_id: descriptor.id.to_string(),
-                        file_id: version_ref_file_id().to_string(),
+                        file_id: version_ref_file_id().map(str::to_string),
                         schema_key: version_ref_schema_key().to_string(),
                         schema_version: version_ref_schema_version().to_string(),
                         version_id: GLOBAL_VERSION_ID.to_string(),
-                        plugin_key: version_ref_plugin_key().to_string(),
+                        plugin_key: version_ref_plugin_key().map(str::to_string),
                         metadata: None,
                         change_id: Some(format!("change-public-ref-{}", descriptor.id)),
                         writer_key: None,
@@ -4258,8 +4299,8 @@ mod tests {
                     entity_id: "commit-public-root",
                     schema_key: "lix_commit",
                     schema_version: "1",
-                    file_id: "lix",
-                    plugin_key: "lix",
+                    file_id: None,
+                    plugin_key: None,
                     snapshot_id: "snapshot-public-root-commit",
                     snapshot_content: Some(commit_snapshot.as_str()),
                     metadata: None,

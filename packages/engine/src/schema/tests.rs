@@ -247,8 +247,8 @@ fn builtin_storage_metadata_treats_lix_account_as_local_under_owner_policy() {
 
     assert_eq!(metadata.schema_key, "lix_account");
     assert_eq!(metadata.schema_version, "1");
-    assert_eq!(metadata.file_id, "lix");
-    assert_eq!(metadata.plugin_key, "lix");
+    assert_eq!(metadata.file_id, None);
+    assert_eq!(metadata.plugin_key, None);
     assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
 }
 
@@ -258,8 +258,8 @@ fn builtin_storage_metadata_marks_non_global_builtins_as_local() {
         .expect("lix_key_value builtin storage metadata should exist");
 
     assert_eq!(metadata.schema_key, "lix_key_value");
-    assert_eq!(metadata.file_id, "lix");
-    assert_eq!(metadata.plugin_key, "lix");
+    assert_eq!(metadata.file_id, None);
+    assert_eq!(metadata.plugin_key, None);
     assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
 }
 
@@ -293,8 +293,8 @@ fn builtin_storage_metadata_treats_registered_schema_as_local() {
 fn key_value_storage_accessors_are_schema_owned() {
     assert_eq!(key_value_schema_key(), "lix_key_value");
     assert_eq!(key_value_schema_version(), "1");
-    assert_eq!(key_value_file_id(), "lix");
-    assert_eq!(key_value_plugin_key(), "lix");
+    assert_eq!(key_value_file_id(), None);
+    assert_eq!(key_value_plugin_key(), None);
 }
 
 #[test]
@@ -800,8 +800,8 @@ fn x_lix_override_lixcols_accepts_valid_cel_expression() {
         "x-lix-key": "mock",
         "x-lix-version": "1",
         "x-lix-override-lixcols": {
-            "lixcol_file_id": "'lix'",
-            "lixcol_plugin_key": "'plugin'"
+            "lixcol_metadata": "'meta'",
+            "lixcol_writer_key": "'writer'"
         },
         "properties": {
             "id": { "type": "string" }
@@ -832,6 +832,56 @@ fn x_lix_override_lixcols_accepts_cel_literals() {
     });
 
     assert!(validate_lix_schema_definition(&schema).is_ok());
+}
+
+#[test]
+fn x_lix_override_lixcols_rejects_lixcol_file_id() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_file_id": "\"lix\""
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("lixcol_file_id override should be rejected");
+    assert!(
+        err.description.contains("lixcol_file_id")
+            && err.description.contains("x-lix-override-lixcols"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn x_lix_override_lixcols_rejects_lixcol_plugin_key() {
+    let schema = json!({
+        "type": "object",
+        "x-lix-key": "mock",
+        "x-lix-version": "1",
+        "x-lix-override-lixcols": {
+            "lixcol_plugin_key": "\"plugin\""
+        },
+        "properties": {
+            "id": { "type": "string" }
+        },
+        "required": ["id"],
+        "additionalProperties": false
+    });
+
+    let err = validate_lix_schema_definition(&schema)
+        .expect_err("lixcol_plugin_key override should be rejected");
+    assert!(
+        err.description.contains("lixcol_plugin_key")
+            && err.description.contains("x-lix-override-lixcols"),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]
@@ -916,7 +966,7 @@ fn x_lix_override_lixcols_rejects_invalid_cel_expression() {
         "x-lix-key": "mock",
         "x-lix-version": "1",
         "x-lix-override-lixcols": {
-            "lixcol_file_id": "lix_uuid_v7("
+            "lixcol_metadata": "lix_uuid_v7("
         },
         "properties": {
             "id": { "type": "string" }

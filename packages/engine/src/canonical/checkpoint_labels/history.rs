@@ -82,8 +82,8 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
          FROM lix_internal_change \
          WHERE entity_id IN ({label_in_list}) \
            AND schema_key = 'lix_entity_label' \
-           AND file_id = 'lix' \
-           AND plugin_key = 'lix'"
+           AND file_id IS NULL \
+           AND plugin_key IS NULL"
     );
     let label_result = match executor.execute(&label_sql, &[]).await {
         Ok(result) => result,
@@ -150,7 +150,6 @@ fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::checkpoint_labels::CHECKPOINT_LABEL_ID;
     use crate::{QueryResult, SqlDialect};
     use async_trait::async_trait;
     use std::collections::BTreeMap;
@@ -204,9 +203,7 @@ mod tests {
                 let rows = extract_single_quoted_values(sql)
                     .into_iter()
                     .filter_map(|entity_id| {
-                        let commit_id = entity_id
-                            .strip_suffix(&format!("~lix_commit~lix~{}", CHECKPOINT_LABEL_ID))?
-                            .to_string();
+                        let commit_id = checkpoint_commit_id_from_entity_label_id(&entity_id)?;
                         self.labeled_commits
                             .contains(&commit_id)
                             .then_some(vec![Value::Text(entity_id)])
@@ -343,5 +340,21 @@ mod tests {
             values.push(value);
         }
         values
+    }
+}
+
+#[cfg(test)]
+fn checkpoint_commit_id_from_entity_label_id(entity_id: &str) -> Option<String> {
+    let parts: [serde_json::Value; 4] = serde_json::from_str(entity_id).ok()?;
+    match (&parts[0], &parts[1], &parts[2], &parts[3]) {
+        (
+            serde_json::Value::String(commit_id),
+            serde_json::Value::String(schema_key),
+            serde_json::Value::Null,
+            serde_json::Value::String(label_id),
+        ) if schema_key == "lix_commit" && label_id == super::CHECKPOINT_LABEL_ID => {
+            Some(commit_id.clone())
+        }
+        _ => None,
     }
 }

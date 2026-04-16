@@ -10,7 +10,7 @@ pub(crate) struct ReadTimeProjectionIdentity {
     pub schema_key: String,
     pub version_id: String,
     pub entity_id: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]

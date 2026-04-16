@@ -541,9 +541,9 @@ pub(crate) struct MutationRowSnapshot {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
+    pub(crate) file_id: Option<String>,
     pub(crate) version_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<JsonValue>,
     pub(crate) untracked: bool,
 }

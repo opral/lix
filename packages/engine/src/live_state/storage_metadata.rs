@@ -1,7 +1,7 @@
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
-use crate::schema::{builtin_schema_definition, decode_lixcol_literal};
+use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,8 +15,8 @@ pub(crate) enum BuiltinSchemaStorageLane {
 pub(crate) struct BuiltinSchemaStorageMetadata {
     pub(crate) schema_key: String,
     pub(crate) schema_version: String,
-    pub(crate) file_id: String,
-    pub(crate) plugin_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
     pub(crate) storage_lane: BuiltinSchemaStorageLane,
 }
 
@@ -29,21 +29,13 @@ pub(crate) fn builtin_schema_storage_metadata(
     let schema = builtin_schema_definition(schema_key)?;
     let parsed_schema_key = schema.get("x-lix-key").and_then(JsonValue::as_str)?;
     let schema_version = schema.get("x-lix-version").and_then(JsonValue::as_str)?;
-    let overrides = schema
-        .get("x-lix-override-lixcols")
-        .and_then(JsonValue::as_object)?;
-    let file_id_raw = overrides
-        .get("lixcol_file_id")
-        .and_then(JsonValue::as_str)?;
-    let plugin_key_raw = overrides
-        .get("lixcol_plugin_key")
-        .and_then(JsonValue::as_str)?;
+    let defaults = builtin_schema_storage_defaults(schema_key)?;
 
     Some(BuiltinSchemaStorageMetadata {
         schema_key: parsed_schema_key.to_string(),
         schema_version: schema_version.to_string(),
-        file_id: decode_lixcol_literal(file_id_raw),
-        plugin_key: decode_lixcol_literal(plugin_key_raw),
+        file_id: defaults.file_id.map(str::to_string),
+        plugin_key: defaults.plugin_key.map(str::to_string),
         storage_lane: builtin_storage_lane(schema_key),
     })
 }
@@ -73,10 +65,12 @@ pub(crate) fn key_value_schema_version() -> &'static str {
     &key_value_storage_metadata().schema_version
 }
 
-pub(crate) fn key_value_file_id() -> &'static str {
-    &key_value_storage_metadata().file_id
+#[cfg(test)]
+pub(crate) fn key_value_file_id() -> Option<&'static str> {
+    key_value_storage_metadata().file_id.as_deref()
 }
 
-pub(crate) fn key_value_plugin_key() -> &'static str {
-    &key_value_storage_metadata().plugin_key
+#[cfg(test)]
+pub(crate) fn key_value_plugin_key() -> Option<&'static str> {
+    key_value_storage_metadata().plugin_key.as_deref()
 }

@@ -1,3 +1,4 @@
+use crate::common::storage_scope_key_for_file_id;
 use crate::live_state::storage::{
     load_live_table_layout_with_executor, normalized_insert_columns_sql,
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
@@ -64,14 +65,28 @@ async fn apply_upsert_in_transaction(
         .map(crate::live_state::constraints::sql_literal_text)
         .unwrap_or_else(|| "NULL".to_string());
     let change_id_sql = crate::live_state::constraints::sql_literal_text(&row.change_id);
+    let file_id_sql = row
+        .file_id
+        .as_deref()
+        .map(crate::live_state::constraints::sql_literal_text)
+        .unwrap_or_else(|| "NULL".to_string());
+    let storage_scope_key_sql = crate::live_state::constraints::sql_literal_text(
+        &storage_scope_key_for_file_id(row.file_id.as_deref()),
+    );
+    let plugin_key_sql = row
+        .plugin_key
+        .as_deref()
+        .map(crate::live_state::constraints::sql_literal_text)
+        .unwrap_or_else(|| "NULL".to_string());
     let sql = format!(
         "INSERT INTO {table} (\
-         entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, change_id, metadata, untracked, created_at, updated_at{normalized_columns}\
+         entity_id, schema_key, schema_version, file_id, storage_scope_key, version_id, global, plugin_key, change_id, metadata, untracked, created_at, updated_at{normalized_columns}\
          ) VALUES (\
-         '{entity_id}', '{schema_key}', '{schema_version}', '{file_id}', '{version_id}', {global}, '{plugin_key}', {change_id}, {metadata}, true, '{created_at}', '{updated_at}'{normalized_values}\
-         ) ON CONFLICT (entity_id, file_id, version_id, untracked) DO UPDATE SET \
+         '{entity_id}', '{schema_key}', '{schema_version}', {file_id}, {storage_scope_key}, '{version_id}', {global}, {plugin_key}, {change_id}, {metadata}, true, '{created_at}', '{updated_at}'{normalized_values}\
+         ) ON CONFLICT (entity_id, storage_scope_key, version_id, untracked) DO UPDATE SET \
          schema_key = excluded.schema_key, \
          schema_version = excluded.schema_version, \
+         file_id = excluded.file_id, \
          global = excluded.global, \
          plugin_key = excluded.plugin_key, \
          change_id = excluded.change_id, \
@@ -81,14 +96,15 @@ async fn apply_upsert_in_transaction(
         entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
         schema_key = crate::live_state::constraints::escape_sql_string(&row.schema_key),
         schema_version = crate::live_state::constraints::escape_sql_string(&row.schema_version),
-        file_id = crate::live_state::constraints::escape_sql_string(&row.file_id),
         version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),
         global = if row.global { "true" } else { "false" },
-        plugin_key = crate::live_state::constraints::escape_sql_string(&row.plugin_key),
         change_id = change_id_sql,
         metadata = metadata_sql,
         created_at = crate::live_state::constraints::escape_sql_string(created_at),
         updated_at = crate::live_state::constraints::escape_sql_string(&row.updated_at),
+        file_id = file_id_sql,
+        storage_scope_key = storage_scope_key_sql,
+        plugin_key = plugin_key_sql,
         normalized_columns = normalized_columns,
         normalized_values = normalized_values_sql,
         normalized_updates = normalized_updates,
@@ -104,12 +120,19 @@ async fn apply_delete_in_transaction(
     let sql = format!(
         "DELETE FROM {table} \
          WHERE entity_id = '{entity_id}' \
-           AND file_id = '{file_id}' \
+           AND {file_id_predicate} \
            AND version_id = '{version_id}' \
            AND untracked = true",
         table = quoted_live_table_name(&row.schema_key),
         entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
-        file_id = crate::live_state::constraints::escape_sql_string(&row.file_id),
+        file_id_predicate = row
+            .file_id
+            .as_deref()
+            .map(|file_id| format!(
+                "file_id = {}",
+                crate::live_state::constraints::sql_literal_text(file_id)
+            ))
+            .unwrap_or_else(|| "file_id IS NULL".to_string()),
         version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),
     );
     transaction.execute(&sql, &[]).await?;

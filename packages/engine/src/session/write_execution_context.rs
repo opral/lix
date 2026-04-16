@@ -6,7 +6,10 @@ use jsonschema::JSONSchema;
 
 use crate::catalog::CatalogProjectionRegistry;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::live_state::RowIdentity;
+use crate::live_state::{
+    apply_writer_key_annotations_with_executor, tracked_writer_key_annotations_from_changes,
+    RowIdentity,
+};
 use crate::schema::CompiledSchemaCache;
 use crate::schema::SchemaKey;
 use crate::session::host::{
@@ -32,10 +35,9 @@ use crate::transaction::{
 };
 use crate::version::{parse_active_version_snapshot, GLOBAL_VERSION_ID};
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
-use crate::{LixBackendTransaction, LixError, QueryResult, VersionId};
+use crate::{LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, VersionId};
 
 const ACTIVE_VERSION_SCHEMA_KEY: &str = "lix_active_version";
-const ACTIVE_VERSION_FILE_ID: &str = "lix";
 
 struct WriteCompiledSchemaCache {
     inner: RwLock<HashMap<SchemaKey, Arc<JSONSchema>>>,
@@ -300,6 +302,16 @@ pub(crate) async fn execute_public_tracked_append(
     )
     .await?;
 
+    let tracked_writer_key_annotations = tracked_writer_key_annotations_from_changes(
+        &append_outcome.applied_changes,
+        unit.writer_key.as_deref(),
+    );
+    if !tracked_writer_key_annotations.is_empty() {
+        let mut executor = &mut *transaction;
+        apply_writer_key_annotations_with_executor(&mut executor, &tracked_writer_key_annotations)
+            .await?;
+    }
+
     if !writer_key_updates.is_empty() {
         let live_rows =
             tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
@@ -387,9 +399,9 @@ async fn mirror_public_registered_schema_bootstrap_rows(
             RegisteredSchemaMirrorRow {
                 entity_id: &row.entity_id,
                 schema_version: &row.schema_version,
-                file_id: &row.file_id,
+                file_id: row.file_id.as_ref().map(|value| value.as_str()),
                 version_id: GLOBAL_VERSION_ID,
-                plugin_key: &row.plugin_key,
+                plugin_key: row.plugin_key.as_ref().map(|value| value.as_str()),
                 snapshot_content: row.snapshot_content.as_ref().map(|value| value.as_str()),
                 metadata: row.metadata.as_ref().map(|value| value.as_str()),
                 change_id: &row.id,
@@ -500,9 +512,9 @@ async fn tracked_live_rows_for_writer_key_updates(
                 schema_key: row_identity.schema_key.clone(),
                 version_id: row_identity.version_id.clone(),
                 entity_id: row_identity.entity_id.clone(),
-                file_id: Some(row_identity.file_id.clone()),
+                file_id: NullableKeyFilter::from_nullable(row_identity.file_id.clone()),
                 schema_version: None,
-                plugin_key: None,
+                plugin_key: NullableKeyFilter::Any,
                 writer_key: None,
                 global: None,
                 untracked: Some(false),
@@ -575,7 +587,7 @@ fn next_active_version_id_from_changes<Change: StateChangeRecord>(
 ) -> Result<Option<String>, LixError> {
     for change in changes.iter().rev() {
         if change.schema_key() != ACTIVE_VERSION_SCHEMA_KEY
-            || change.file_id() != Some(ACTIVE_VERSION_FILE_ID)
+            || change.file_id().is_some()
             || change.version_id() != GLOBAL_VERSION_ID
         {
             continue;

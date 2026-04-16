@@ -2,6 +2,7 @@
 
 use crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::catalog::{RelationBinding, ResolvedRelation, SurfaceVariant};
+use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::tracked_relation_name;
 use crate::live_state::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
@@ -19,8 +20,7 @@ use crate::sql::physical_plan::public_surface_sql_support::{
 use crate::sql::EffectiveStateRequest;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
-    version_descriptor_schema_key, version_ref_file_id, version_ref_plugin_key,
-    version_ref_schema_key, version_ref_schema_version,
+    version_descriptor_schema_key, version_ref_schema_key, version_ref_schema_version,
 };
 use crate::{LixError, SqlDialect};
 use serde_json::Value as JsonValue;
@@ -214,6 +214,7 @@ pub(crate) fn build_working_changes_public_read_source_sql(
     dialect: SqlDialect,
     active_version_id: &str,
 ) -> String {
+    let engine_storage_scope_key = escape_sql_string(&storage_scope_key_for_file_id(None));
     let version_ref_table = tracked_relation_name("lix_version_ref");
     let version_ref_commit_id_column = quote_ident(&builtin_payload_column_name(
         version_ref_schema_key(),
@@ -250,7 +251,8 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ( \
                         SELECT {version_ref_commit_id_column} \
                         FROM {version_ref_table} \
-                        WHERE file_id = 'lix' \
+                        WHERE file_id IS NULL \
+                          AND plugin_key IS NULL \
                           AND entity_id = (SELECT version_id FROM active_version) \
                           AND version_id = 'global' \
                           AND untracked = true \
@@ -264,7 +266,8 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ( \
                         SELECT {version_ref_commit_id_column} \
                         FROM {version_ref_table} \
-                        WHERE file_id = 'lix' \
+                        WHERE file_id IS NULL \
+                          AND plugin_key IS NULL \
                           AND entity_id = 'global' \
                           AND version_id = 'global' \
                           AND untracked = true \
@@ -304,6 +307,10 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ch.entity_id AS entity_id, \
                     ch.schema_key AS schema_key, \
                     ch.file_id AS file_id, \
+                    CASE \
+                        WHEN ch.file_id IS NULL THEN '{engine_storage_scope_key}' \
+                        ELSE 'file:' || ch.file_id \
+                    END AS storage_scope_key, \
                     snap.content AS row_snapshot \
                 FROM lix_internal_change ch \
                 LEFT JOIN lix_internal_snapshot snap \
@@ -374,6 +381,7 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ch.entity_id, \
                     ch.schema_key, \
                     ch.file_id, \
+                    ch.storage_scope_key AS storage_scope_key, \
                     members.change_id, \
                     anc.depth, \
                     members.commit_created_at AS commit_created_at \
@@ -388,32 +396,33 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     scope, \
                     entity_id, \
                     schema_key, \
-                    file_id, \
+                    storage_scope_key, \
                     MIN(depth) AS depth \
                 FROM tip_candidates \
-                GROUP BY scope, entity_id, schema_key, file_id \
+                GROUP BY scope, entity_id, schema_key, storage_scope_key \
             ), \
             tip_best_created_at AS ( \
                 SELECT \
                     tc.scope, \
                     tc.entity_id, \
                     tc.schema_key, \
-                    tc.file_id, \
+                    tc.storage_scope_key, \
                     MAX(tc.commit_created_at) AS commit_created_at \
                 FROM tip_candidates tc \
                 JOIN tip_min_depth d \
                     ON d.scope = tc.scope \
                    AND d.entity_id = tc.entity_id \
                    AND d.schema_key = tc.schema_key \
-                   AND d.file_id = tc.file_id \
+                   AND d.storage_scope_key = tc.storage_scope_key \
                    AND d.depth = tc.depth \
-                GROUP BY tc.scope, tc.entity_id, tc.schema_key, tc.file_id \
+                GROUP BY tc.scope, tc.entity_id, tc.schema_key, tc.storage_scope_key \
             ), \
             tip_entries AS ( \
                 SELECT \
                     tc.scope, \
                     tc.entity_id, \
                     tc.schema_key, \
+                    tc.storage_scope_key, \
                     tc.file_id, \
                     MAX(tc.change_id) AS change_id \
                 FROM tip_candidates tc \
@@ -421,15 +430,15 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ON d.scope = tc.scope \
                    AND d.entity_id = tc.entity_id \
                    AND d.schema_key = tc.schema_key \
-                   AND d.file_id = tc.file_id \
+                   AND d.storage_scope_key = tc.storage_scope_key \
                    AND d.depth = tc.depth \
                 JOIN tip_best_created_at bc \
                     ON bc.scope = tc.scope \
                    AND bc.entity_id = tc.entity_id \
                    AND bc.schema_key = tc.schema_key \
-                   AND bc.file_id = tc.file_id \
+                   AND bc.storage_scope_key = tc.storage_scope_key \
                    AND bc.commit_created_at = tc.commit_created_at \
-                GROUP BY tc.scope, tc.entity_id, tc.schema_key, tc.file_id \
+                GROUP BY tc.scope, tc.entity_id, tc.schema_key, tc.storage_scope_key, tc.file_id \
             ), \
             baseline_candidates AS ( \
                 SELECT \
@@ -437,6 +446,7 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ch.entity_id, \
                     ch.schema_key, \
                     ch.file_id, \
+                    ch.storage_scope_key AS storage_scope_key, \
                     members.change_id, \
                     anc.depth, \
                     members.commit_created_at AS commit_created_at \
@@ -451,32 +461,33 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     scope, \
                     entity_id, \
                     schema_key, \
-                    file_id, \
+                    storage_scope_key, \
                     MIN(depth) AS depth \
                 FROM baseline_candidates \
-                GROUP BY scope, entity_id, schema_key, file_id \
+                GROUP BY scope, entity_id, schema_key, storage_scope_key \
             ), \
             baseline_best_created_at AS ( \
                 SELECT \
                     bc.scope, \
                     bc.entity_id, \
                     bc.schema_key, \
-                    bc.file_id, \
+                    bc.storage_scope_key, \
                     MAX(bc.commit_created_at) AS commit_created_at \
                 FROM baseline_candidates bc \
                 JOIN baseline_min_depth d \
                     ON d.scope = bc.scope \
                    AND d.entity_id = bc.entity_id \
                    AND d.schema_key = bc.schema_key \
-                   AND d.file_id = bc.file_id \
+                   AND d.storage_scope_key = bc.storage_scope_key \
                    AND d.depth = bc.depth \
-                GROUP BY bc.scope, bc.entity_id, bc.schema_key, bc.file_id \
+                GROUP BY bc.scope, bc.entity_id, bc.schema_key, bc.storage_scope_key \
             ), \
             baseline_entries AS ( \
                 SELECT \
                     bc.scope, \
                     bc.entity_id, \
                     bc.schema_key, \
+                    bc.storage_scope_key, \
                     bc.file_id, \
                     MAX(bc.change_id) AS change_id \
                 FROM baseline_candidates bc \
@@ -484,21 +495,22 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ON d.scope = bc.scope \
                    AND d.entity_id = bc.entity_id \
                    AND d.schema_key = bc.schema_key \
-                   AND d.file_id = bc.file_id \
+                   AND d.storage_scope_key = bc.storage_scope_key \
                    AND d.depth = bc.depth \
                 JOIN baseline_best_created_at bca \
                     ON bca.scope = bc.scope \
                    AND bca.entity_id = bc.entity_id \
                    AND bca.schema_key = bc.schema_key \
-                   AND bca.file_id = bc.file_id \
+                   AND bca.storage_scope_key = bc.storage_scope_key \
                    AND bca.commit_created_at = bc.commit_created_at \
-                GROUP BY bc.scope, bc.entity_id, bc.schema_key, bc.file_id \
+                GROUP BY bc.scope, bc.entity_id, bc.schema_key, bc.storage_scope_key, bc.file_id \
             ), \
             paired_entries AS ( \
                 SELECT \
                     tip.scope AS scope, \
                     tip.entity_id AS entity_id, \
                     tip.schema_key AS schema_key, \
+                    tip.storage_scope_key AS storage_scope_key, \
                     tip.file_id AS file_id, \
                     base.change_id AS before_change_id, \
                     tip.change_id AS after_change_id \
@@ -507,12 +519,13 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ON base.scope = tip.scope \
                    AND base.entity_id = tip.entity_id \
                    AND base.schema_key = tip.schema_key \
-                   AND base.file_id = tip.file_id \
+                   AND base.storage_scope_key = tip.storage_scope_key \
                 UNION ALL \
                 SELECT \
                     base.scope AS scope, \
                     base.entity_id AS entity_id, \
                     base.schema_key AS schema_key, \
+                    base.storage_scope_key AS storage_scope_key, \
                     base.file_id AS file_id, \
                     base.change_id AS before_change_id, \
                     NULL AS after_change_id \
@@ -521,7 +534,7 @@ pub(crate) fn build_working_changes_public_read_source_sql(
                     ON tip.scope = base.scope \
                    AND tip.entity_id = base.entity_id \
                    AND tip.schema_key = base.schema_key \
-                   AND tip.file_id = base.file_id \
+                   AND tip.storage_scope_key = base.storage_scope_key \
                 WHERE tip.entity_id IS NULL \
             ), \
             resolved_rows AS ( \
@@ -726,10 +739,11 @@ fn tracked_writer_key_join_sql(row_alias: &str, writer_alias: &str) -> String {
            ON {writer_alias}.version_id = {row_alias}.version_id \
           AND {writer_alias}.schema_key = {row_alias}.schema_key \
           AND {writer_alias}.entity_id = {row_alias}.entity_id \
-          AND {writer_alias}.file_id = {row_alias}.file_id",
+          AND {writer_alias}.{storage_scope_key} = {row_alias}.{storage_scope_key}",
         writer_key_table = WRITER_KEY_TABLE,
         row_alias = quote_ident(row_alias),
         writer_alias = quote_ident(writer_alias),
+        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
     )
 }
 
@@ -1172,8 +1186,8 @@ fn build_commit_rows_scope_cte_sql(surface_variant: SurfaceVariant) -> String {
                    ON vr.entity_id = tv.version_id \
                   AND vr.schema_key = '{version_ref_schema_key}' \
                   AND vr.schema_version = '{version_ref_schema_version}' \
-                  AND vr.file_id = '{version_ref_file_id}' \
-                  AND vr.plugin_key = '{version_ref_plugin_key}' \
+                  AND vr.file_id IS NULL \
+                  AND vr.plugin_key IS NULL \
                   AND vr.version_id = '{global_version}' \
                   AND vr.untracked = true \
                   AND vr.is_tombstone = 0 \
@@ -1199,8 +1213,6 @@ fn build_commit_rows_scope_cte_sql(surface_variant: SurfaceVariant) -> String {
             version_ref_commit_id_column = version_ref_commit_id_column,
             version_ref_schema_key = escape_sql_string(version_ref_schema_key()),
             version_ref_schema_version = escape_sql_string(version_ref_schema_version()),
-            version_ref_file_id = escape_sql_string(version_ref_file_id()),
-            version_ref_plugin_key = escape_sql_string(version_ref_plugin_key()),
             global_version = escape_sql_string(GLOBAL_VERSION_ID),
         ),
         SurfaceVariant::History | SurfaceVariant::WorkingChanges => {
@@ -1328,9 +1340,9 @@ fn build_change_set_element_state_rows_sql(
              SELECT \
                  commit_members.change_set_id || '~' || change_rows.change_id AS entity_id, \
                  'lix_change_set_element' AS schema_key, \
-                 'lix' AS file_id, \
+                 NULL AS file_id, \
                  commit_members.version_id AS version_id, \
-                 'lix' AS plugin_key, \
+                 NULL AS plugin_key, \
                  '1' AS schema_version, \
                  change_rows.member_created_at AS created_at, \
                  change_rows.member_created_at AS updated_at, \
@@ -1438,9 +1450,9 @@ fn build_commit_edge_state_rows_sql(
              SELECT \
                  commit_edges.parent_id || '~' || commit_edges.child_id AS entity_id, \
                  'lix_commit_edge' AS schema_key, \
-                 'lix' AS file_id, \
+                 NULL AS file_id, \
                  commit_edges.version_id AS version_id, \
-                 'lix' AS plugin_key, \
+                 NULL AS plugin_key, \
                  '1' AS schema_version, \
                  commit_edges.created_at AS created_at, \
                  commit_edges.created_at AS updated_at, \
@@ -1549,9 +1561,9 @@ fn build_change_author_state_rows_sql(
              SELECT \
                  change_authors.member_change_id || '~' || change_authors.account_id AS entity_id, \
                  'lix_change_author' AS schema_key, \
-                 'lix' AS file_id, \
+                 NULL AS file_id, \
                  change_authors.version_id AS version_id, \
-                 'lix' AS plugin_key, \
+                 NULL AS plugin_key, \
                  '1' AS schema_version, \
                  change_authors.created_at AS created_at, \
                  change_authors.created_at AS updated_at, \

@@ -1,9 +1,6 @@
 use std::collections::BTreeSet;
 
-use crate::{
-    CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
-    FileId, VersionId,
-};
+use crate::{CanonicalJson, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, VersionId};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LiveStateRebuildScope {
@@ -45,7 +42,7 @@ pub enum LiveStateWriteOp {
 pub struct LiveStateWrite {
     pub schema_key: CanonicalSchemaKey,
     pub entity_id: EntityId,
-    pub file_id: FileId,
+    pub file_id: Option<String>,
     pub version_id: VersionId,
     pub global: bool,
     pub untracked: bool,
@@ -53,7 +50,7 @@ pub struct LiveStateWrite {
     pub snapshot_content: Option<CanonicalJson>,
     pub metadata: Option<CanonicalJson>,
     pub schema_version: CanonicalSchemaVersion,
-    pub plugin_key: CanonicalPluginKey,
+    pub plugin_key: Option<String>,
     pub change_id: String,
     pub created_at: String,
     pub updated_at: String,
@@ -97,7 +94,7 @@ pub struct LatestVisibleWinnerDebugRow {
     pub version_id: VersionId,
     pub entity_id: EntityId,
     pub schema_key: CanonicalSchemaKey,
-    pub file_id: FileId,
+    pub file_id: Option<String>,
     pub commit_id: String,
     pub change_id: String,
 }
@@ -107,7 +104,7 @@ pub struct ScopeWinnerDebugRow {
     pub version_id: VersionId,
     pub entity_id: EntityId,
     pub schema_key: CanonicalSchemaKey,
-    pub file_id: FileId,
+    pub file_id: Option<String>,
     pub global: bool,
     pub change_id: String,
 }

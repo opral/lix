@@ -10,7 +10,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
+         '{key}', 'lix_key_value', NULL, 'global', NULL, '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
          )"
     )
 }
@@ -58,10 +58,6 @@ async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
             "x-lix-key": "test_schema",
             "x-lix-version": "1",
             "x-lix-primary-key": ["/key"],
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\""
-            },
             "type": "object",
             "properties": {
                 "key": { "type": "string" }
@@ -79,10 +75,6 @@ async fn register_defaults_schema(engine: &support::simulation_test::SimulatedLi
             "x-lix-key": "defaults_schema",
             "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\""
-            },
             "type": "object",
             "properties": {
                 "id": { "type": "string", "x-lix-default": "lix_uuid_v7()" },

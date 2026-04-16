@@ -11,8 +11,8 @@ use crate::live_state::untracked::{
 use crate::live_state::LiveRow;
 use crate::schema::LixActiveVersion;
 use crate::{
-    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
-    Value,
+    LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, SqlDialect,
+    TransactionBeginMode, Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
@@ -190,10 +190,10 @@ fn active_version_helper_live_row(entity_id: &str, version_id: &str, timestamp: 
         entity_id: entity_id.to_string(),
         schema_key: metadata.schema_key,
         schema_version: metadata.schema_version,
-        file_id: metadata.file_id,
+        file_id: None,
         version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
         global: true,
-        plugin_key: metadata.plugin_key,
+        plugin_key: None,
         metadata: None,
         writer_key: None,
         snapshot_content: Some(
@@ -216,12 +216,6 @@ fn active_version_schema_key() -> String {
     builtin_schema_storage_metadata("lix_active_version")
         .expect("lix_active_version metadata should exist")
         .schema_key
-}
-
-fn active_version_file_id() -> String {
-    builtin_schema_storage_metadata("lix_active_version")
-        .expect("lix_active_version metadata should exist")
-        .file_id
 }
 
 fn active_version_storage_version_id() -> String {
@@ -258,7 +252,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
             schema_key: active_version_schema_key().to_string(),
             version_id: active_version_storage_version_id().to_string(),
             entity_id: "active-row".to_string(),
-            file_id: Some(active_version_file_id().to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -276,7 +270,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
             schema_key: "lix_version_ref".to_string(),
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -293,7 +287,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
             schema_key: "lix_version_ref".to_string(),
             version_id: "global".to_string(),
             entity_ids: vec!["main".to_string(), "other".to_string()],
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -315,7 +309,7 @@ async fn live_untracked_state_roundtrips_helper_rows() {
                 },
                 ScanConstraint {
                     field: ScanField::PluginKey,
-                    operator: ScanOperator::Eq(Value::Text("lix".to_string())),
+                    operator: ScanOperator::Eq(Value::Null),
                 },
                 ScanConstraint {
                     field: ScanField::SchemaVersion,
@@ -369,10 +363,10 @@ async fn live_untracked_state_delete_removes_rows() {
             entity_id: "main".to_string(),
             schema_key: "lix_version_ref".to_string(),
             schema_version: "1".to_string(),
-            file_id: "lix".to_string(),
+            file_id: None,
             version_id: "global".to_string(),
             global: true,
-            plugin_key: "lix".to_string(),
+            plugin_key: None,
             metadata: None,
             change_id: Some("change-delete-version-ref-main".to_string()),
             writer_key: None,
@@ -391,7 +385,7 @@ async fn live_untracked_state_delete_removes_rows() {
             schema_key: "lix_version_ref".to_string(),
             version_id: "global".to_string(),
             entity_id: "main".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await

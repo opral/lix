@@ -13,7 +13,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
+         '{key}', 'lix_key_value', NULL, 'global', NULL, '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
          )"
     )
 }
@@ -25,7 +25,7 @@ fn insert_many_key_values_sql(row_count: usize) -> String {
             rows.push_str(", ");
         }
         rows.push_str(&format!(
-            "('bulk-{index}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"bulk-{index}\",\"value\":\"value-{index}\"}}', '1')"
+            "('bulk-{index}', 'lix_key_value', NULL, 'global', NULL, '{{\"key\":\"bulk-{index}\",\"value\":\"value-{index}\"}}', '1')"
         ));
     }
     format!(
@@ -133,10 +133,6 @@ fn tx_dynamic_schema_snapshot_sql() -> String {
             "x-lix-key": "lix_tx_dynamic_schema",
             "x-lix-version": "1",
             "x-lix-primary-key": ["/id"],
-            "x-lix-override-lixcols": {
-                "lixcol_file_id": "\"lix\"",
-                "lixcol_plugin_key": "\"lix\""
-            },
             "type": "object",
             "properties": {
                 "id": { "type": "string" },
@@ -156,7 +152,7 @@ fn insert_tx_dynamic_schema_sql() -> String {
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         'lix_tx_dynamic_schema~1', 'lix_registered_schema', 'lix', 'global', 'lix', '{registered_schema_snapshot}', '1'\
+         'lix_tx_dynamic_schema~1', 'lix_registered_schema', NULL, 'global', NULL, '{registered_schema_snapshot}', '1'\
          )"
     )
 }
@@ -166,7 +162,7 @@ fn insert_tx_dynamic_schema_row_sql(version_id: &str) -> String {
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         'row-1', 'lix_tx_dynamic_schema', 'lix', '{version_id}', 'lix', '{{\"id\":\"row-1\",\"name\":\"hello\"}}', '1'\
+         'row-1', 'lix_tx_dynamic_schema', NULL, '{version_id}', NULL, '{{\"id\":\"row-1\",\"name\":\"hello\"}}', '1'\
          )"
     )
 }
@@ -175,7 +171,7 @@ fn delete_tx_dynamic_schema_sql() -> &'static str {
     "DELETE FROM lix_state_by_version \
      WHERE entity_id = 'lix_tx_dynamic_schema~1' \
        AND schema_key = 'lix_registered_schema' \
-       AND file_id = 'lix' \
+       AND file_id IS NULL \
        AND version_id = 'global'"
 }
 
@@ -184,7 +180,7 @@ fn insert_key_value_state_row_sql(entity_id: &str, version_id: &str, value_json:
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{entity_id}', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"{entity_id}\",\"value\":{value_json}}}', '1'\
+         '{entity_id}', 'lix_key_value', NULL, '{version_id}', NULL, '{{\"key\":\"{entity_id}\",\"value\":{value_json}}}', '1'\
          )"
     )
 }
@@ -195,7 +191,7 @@ fn update_key_value_state_row_sql(entity_id: &str, value_json: &str) -> String {
          SET snapshot_content = '{{\"key\":\"{entity_id}\",\"value\":{value_json}}}' \
          WHERE entity_id = '{entity_id}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix' \
+           AND file_id IS NULL \
            AND version_id = lix_active_version_id()"
     )
 }
@@ -205,7 +201,7 @@ fn delete_key_value_state_row_sql(entity_id: &str) -> String {
         "DELETE FROM lix_state_by_version \
          WHERE entity_id = '{entity_id}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix' \
+           AND file_id IS NULL \
            AND version_id = lix_active_version_id()"
     )
 }
@@ -270,7 +266,7 @@ simulation_test!(
                         "INSERT INTO lix_state_by_version (\
                          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
-                         'entity-1', 'tx_validation_schema', 'file-1', lix_active_version_id(), 'lix', '{\"missing\":\"field\"}', '1'\
+                         'entity-1', 'tx_validation_schema', 'file-1', lix_active_version_id(), NULL, '{\"missing\":\"field\"}', '1'\
                          )",
                         &[],
                     )
@@ -307,7 +303,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'tx-history-entity', 'tx_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
+                 'tx-history-entity', 'tx_state_history_schema', 'f0', NULL, '1', '{\"value\":\"initial\"}'\
                  )",
                 &[],
             )
@@ -852,7 +848,7 @@ simulation_test!(
                             "INSERT INTO lix_state_by_version (\
                              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                              ) VALUES (\
-                             'tx-state-a', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-state-a\",\"value\":\"a\"}}', '1'\
+                             'tx-state-a', 'lix_key_value', NULL, '{version_id}', NULL, '{{\"key\":\"tx-state-a\",\"value\":\"a\"}}', '1'\
                              )"
                         ),
                         &[],
@@ -863,7 +859,7 @@ simulation_test!(
                             "INSERT INTO lix_state_by_version (\
                              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                              ) VALUES (\
-                             'tx-state-b', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-state-b\",\"value\":\"b\"}}', '1'\
+                             'tx-state-b', 'lix_key_value', NULL, '{version_id}', NULL, '{{\"key\":\"tx-state-b\",\"value\":\"b\"}}', '1'\
                              )"
                         ),
                         &[],
@@ -910,7 +906,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'tx-history-midpoint', 'tx_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
+                 'tx-history-midpoint', 'tx_state_history_schema', 'f0', NULL, '1', '{\"value\":\"initial\"}'\
                  )",
                 &[],
             )
@@ -938,7 +934,7 @@ simulation_test!(
                             "INSERT INTO lix_state_by_version (\
                              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                              ) VALUES (\
-                             'tx-mid-a', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-mid-a\",\"value\":\"a\"}}', '1'\
+                             'tx-mid-a', 'lix_key_value', NULL, '{version_id}', NULL, '{{\"key\":\"tx-mid-a\",\"value\":\"a\"}}', '1'\
                              )"
                         ),
                         &[],
@@ -959,7 +955,7 @@ simulation_test!(
                             "INSERT INTO lix_state_by_version (\
                              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                              ) VALUES (\
-                             'tx-mid-b', 'lix_key_value', 'lix', '{version_id}', 'lix', '{{\"key\":\"tx-mid-b\",\"value\":\"b\"}}', '1'\
+                             'tx-mid-b', 'lix_key_value', NULL, '{version_id}', NULL, '{{\"key\":\"tx-mid-b\",\"value\":\"b\"}}', '1'\
                              )"
                         ),
                         &[],

@@ -163,7 +163,7 @@ fn tracked_tombstone_from_write(row: &LiveWriteRow) -> TrackedTombstoneMarker {
         version_id: row.version_id.clone(),
         global: row.global,
         schema_version: Some(row.schema_version.clone()),
-        plugin_key: Some(row.plugin_key.clone()),
+        plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
         writer_key: row.writer_key.clone(),
         created_at: row.created_at.clone(),

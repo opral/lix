@@ -12,7 +12,7 @@ fn insert_key_value_sql(key: &str, value_json: &str) -> String {
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
          ) VALUES (\
-         '{key}', 'lix_key_value', 'lix', 'global', 'lix', '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
+         '{key}', 'lix_key_value', NULL, 'global', NULL, '{{\"key\":\"{key}\",\"value\":{value_json}}}', '1'\
          )"
     )
 }
@@ -23,7 +23,7 @@ fn update_key_value_sql(key: &str, value_json: &str) -> String {
          SET snapshot_content = '{{\"key\":\"{key}\",\"value\":{value_json}}}' \
          WHERE entity_id = '{key}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix' \
+           AND file_id IS NULL \
            AND version_id = 'global'"
     )
 }
@@ -440,9 +440,9 @@ simulation_test!(
                 &[
                     Value::Text(entity_id.to_string()),
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text("global".to_string()),
-                    Value::Text("lix_sdk".to_string()),
+                    Value::Null,
                     Value::Text(format!(r#"{{"key":"{entity_id}","value":"global"}}"#)),
                     Value::Text("1".to_string()),
                 ],
@@ -455,9 +455,9 @@ simulation_test!(
                 &[
                     Value::Text(entity_id.to_string()),
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text(branch.id.clone()),
-                    Value::Text("lix_sdk".to_string()),
+                    Value::Null,
                     Value::Text(format!(r#"{{"key":"{entity_id}","value":"branch"}}"#)),
                     Value::Text("1".to_string()),
                 ],
@@ -635,9 +635,9 @@ simulation_test!(
                 &[
                     Value::Text(entity_id.to_string()),
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text("global".to_string()),
-                    Value::Text("lix_sdk".to_string()),
+                    Value::Null,
                     Value::Text(format!(r#"{{"key":"{entity_id}","value":"global"}}"#)),
                     Value::Text("1".to_string()),
                 ],
@@ -650,9 +650,9 @@ simulation_test!(
                 &[
                     Value::Text(entity_id.to_string()),
                     Value::Text("lix_key_value".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text(branch.id.clone()),
-                    Value::Text("lix_sdk".to_string()),
+                    Value::Null,
                     Value::Text(format!(r#"{{"key":"{entity_id}","value":"branch-v1"}}"#)),
                     Value::Text("1".to_string()),
                 ],
@@ -858,7 +858,7 @@ fn observe_sqlite_detects_external_untracked_state_insert() {
                     "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
                  ) VALUES (\
-                 'observe-untracked-external', 'lix', 'lix_key_value', 'lix', '1', \
+                 'observe-untracked-external', NULL, 'lix_key_value', NULL, '1', \
                  lix_json('{\"key\":\"observe-untracked-external\",\"value\":\"u1\"}'), true\
                  )", &[])
                 .await
@@ -991,7 +991,7 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                     "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
                  ) VALUES (\
-                 'observe-untracked-external', 'lix', 'lix_key_value', 'lix', '1', \
+                 'observe-untracked-external', NULL, 'lix_key_value', NULL, '1', \
                  lix_json('{\"key\":\"observe-untracked-external\",\"value\":\"u1\"}'), true\
                  )", &[])
                 .await

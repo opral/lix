@@ -106,15 +106,11 @@ where
         );
         values.insert(
             "file_id".to_string(),
-            Value::Text(resolved_entity_state_text(&payload, semantics, "file_id")?),
+            resolved_entity_state_nullable_text(&payload, semantics, "file_id")?,
         );
         values.insert(
             "plugin_key".to_string(),
-            Value::Text(resolved_entity_state_text(
-                &payload,
-                semantics,
-                "plugin_key",
-            )?),
+            resolved_entity_state_nullable_text(&payload, semantics, "plugin_key")?,
         );
         values.insert(
             "schema_version".to_string(),
@@ -165,21 +161,17 @@ where
 pub(crate) fn ensure_identity_columns_preserved(
     entity_id: &str,
     schema_key: &str,
-    file_id: &str,
+    file_id: Option<&str>,
     version_id: &str,
     values: &BTreeMap<String, Value>,
 ) -> Result<(), StateAssignmentsError> {
     for (column, expected) in [
-        ("entity_id", entity_id),
-        ("schema_key", schema_key),
+        ("entity_id", Some(entity_id)),
+        ("schema_key", Some(schema_key)),
         ("file_id", file_id),
-        ("version_id", version_id),
+        ("version_id", Some(version_id)),
     ] {
-        let Some(actual) = values.get(column).and_then(text_from_value) else {
-            return Err(StateAssignmentsError {
-                message: format!("public update resolver requires '{column}' in authoritative row"),
-            });
-        };
+        let actual = values.get(column).and_then(text_from_value);
         if actual != expected {
             return Err(StateAssignmentsError {
                 message: format!("public update resolver does not support changing '{column}'"),
@@ -257,7 +249,7 @@ pub(crate) fn apply_entity_state_assignments(
     ensure_identity_columns_preserved(
         &current_row.entity_id,
         &current_row.schema_key,
-        &current_row.file_id,
+        current_row.file_id.as_deref(),
         &current_row.version_id,
         &values,
     )?;
@@ -416,6 +408,23 @@ fn resolved_entity_state_text(
                 key
             ),
         })
+}
+
+fn resolved_entity_state_nullable_text(
+    payload: &BTreeMap<String, Value>,
+    semantics: EntityInsertSemantics<'_>,
+    key: &str,
+) -> Result<Value, StateAssignmentsError> {
+    match resolved_entity_state_value(payload, semantics, key) {
+        Some(Value::Null) | None => Ok(Value::Null),
+        Some(Value::Text(text)) => Ok(Value::Text(text)),
+        Some(other) => Err(StateAssignmentsError {
+            message: format!(
+                "public entity resolver expected text/null {} value, got {:?}",
+                key, other
+            ),
+        }),
+    }
 }
 
 fn resolved_entity_state_value(

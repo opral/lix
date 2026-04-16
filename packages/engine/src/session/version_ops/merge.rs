@@ -59,14 +59,14 @@ pub enum MergeOutcome {
 struct EntityKey {
     entity_id: String,
     schema_key: String,
-    file_id: String,
+    file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct VisibleEntityState {
     change_id: String,
     schema_version: String,
-    plugin_key: String,
+    plugin_key: Option<String>,
     snapshot_content: String,
     metadata: Option<String>,
 }
@@ -480,8 +480,16 @@ fn proposed_change_from_exact_row(
             row.schema_version.clone(),
             "merge schema_version",
         )?),
-        file_id: Some(parse_identity(row.file_id.clone(), "merge file_id")?),
-        plugin_key: Some(parse_identity(row.plugin_key.clone(), "merge plugin_key")?),
+        file_id: row
+            .file_id
+            .clone()
+            .map(|value| parse_identity(value, "merge file_id"))
+            .transpose()?,
+        plugin_key: row
+            .plugin_key
+            .clone()
+            .map(|value| parse_identity(value, "merge plugin_key"))
+            .transpose()?,
         snapshot_content: Some(row.snapshot_content.clone()),
         metadata: row.metadata.clone(),
         version_id: parse_identity(version_id.to_string(), "merge version_id")?,
@@ -503,14 +511,16 @@ fn tombstone_change_from_state(
             previous.schema_version.clone(),
             "merge tombstone schema_version",
         )?),
-        file_id: Some(parse_identity(
-            entity.file_id.clone(),
-            "merge tombstone file_id",
-        )?),
-        plugin_key: Some(parse_identity(
-            previous.plugin_key.clone(),
-            "merge tombstone plugin_key",
-        )?),
+        file_id: entity
+            .file_id
+            .clone()
+            .map(|value| parse_identity(value, "merge tombstone file_id"))
+            .transpose()?,
+        plugin_key: previous
+            .plugin_key
+            .clone()
+            .map(|value| parse_identity(value, "merge tombstone plugin_key"))
+            .transpose()?,
         snapshot_content: None,
         metadata: None,
         version_id: parse_identity(version_id.to_string(), "merge tombstone version_id")?,
@@ -555,7 +565,9 @@ fn merge_conflict_error(
         .map(|conflict| {
             format!(
                 "{}:{}:{}",
-                conflict.schema_key, conflict.file_id, conflict.entity_id
+                conflict.schema_key,
+                conflict.file_id.as_deref().unwrap_or("NULL"),
+                conflict.entity_id
             )
         })
         .collect::<Vec<_>>()

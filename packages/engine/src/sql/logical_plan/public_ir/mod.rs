@@ -5,6 +5,7 @@ use crate::catalog::{
 };
 use crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemWriteIntent;
 use crate::sql::semantic_ir::StatementContext;
+use crate::NullableKeyFilter;
 use crate::Value;
 use sqlparser::ast::{
     BinaryOperator, CastFormat, CastKind, CteAsMaterialized, DataType, DuplicateTreatment, Expr,
@@ -754,8 +755,8 @@ pub(crate) struct WriteSelector {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalStateRowKey {
     pub(crate) entity_id: String,
-    pub(crate) file_id: Option<String>,
-    pub(crate) plugin_key: Option<String>,
+    pub(crate) file_id: NullableKeyFilter<String>,
+    pub(crate) plugin_key: NullableKeyFilter<String>,
     pub(crate) schema_version: Option<String>,
     pub(crate) version_id: Option<String>,
     pub(crate) global: Option<bool>,
@@ -765,8 +766,8 @@ pub(crate) struct CanonicalStateRowKey {
 
 impl CanonicalStateRowKey {
     pub(crate) fn targets_single_effective_row(&self, expose_version_id: bool) -> bool {
-        self.file_id.is_some()
-            && self.plugin_key.is_some()
+        !self.file_id.is_any()
+            && !self.plugin_key.is_any()
             && self.schema_version.is_some()
             && self.global.is_some()
             && self.untracked.is_some()

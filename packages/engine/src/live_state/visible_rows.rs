@@ -26,9 +26,9 @@ pub(crate) struct LiveReadRow {
     entity_id: String,
     schema_key: String,
     schema_version: String,
-    file_id: String,
+    file_id: Option<String>,
     version_id: String,
-    plugin_key: String,
+    plugin_key: Option<String>,
     metadata: Option<String>,
     writer_key: Option<String>,
     change_id: Option<String>,
@@ -48,16 +48,16 @@ impl LiveReadRow {
         &self.schema_version
     }
 
-    pub(crate) fn file_id(&self) -> &str {
-        &self.file_id
+    pub(crate) fn file_id(&self) -> Option<&str> {
+        self.file_id.as_deref()
     }
 
     pub(crate) fn version_id(&self) -> &str {
         &self.version_id
     }
 
-    pub(crate) fn plugin_key(&self) -> &str {
-        &self.plugin_key
+    pub(crate) fn plugin_key(&self) -> Option<&str> {
+        self.plugin_key.as_deref()
     }
 
     pub(crate) fn metadata(&self) -> Option<&str> {

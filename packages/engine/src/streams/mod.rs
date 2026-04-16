@@ -29,9 +29,9 @@ pub struct StateCommitStreamChange {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub version_id: String,
-    pub plugin_key: String,
+    pub plugin_key: Option<String>,
     pub snapshot_content: Option<JsonValue>,
     pub untracked: bool,
     pub writer_key: Option<String>,
@@ -133,21 +133,9 @@ pub(crate) fn state_commit_stream_changes_from_changes<Change: StateChangeRecord
                     description: "change state commit stream requires schema_version".to_string(),
                 })?
                 .to_string(),
-            file_id: change
-                .file_id()
-                .ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "change state commit stream requires file_id".to_string(),
-                })?
-                .to_string(),
+            file_id: change.file_id().map(str::to_string),
             version_id: change.version_id().to_string(),
-            plugin_key: change
-                .plugin_key()
-                .ok_or_else(|| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "change state commit stream requires plugin_key".to_string(),
-                })?
-                .to_string(),
+            plugin_key: change.plugin_key().map(str::to_string),
             snapshot_content,
             untracked: false,
             writer_key: state_commit_stream_writer_key(change.writer_key(), &runtime_metadata),
@@ -168,8 +156,8 @@ pub fn state_commit_stream_changes_from_planned_rows(
     }
     let mut resolved = Vec::with_capacity(rows.len());
     for row in rows {
-        let file_id = planned_row_required_text(row, "file_id")?;
-        let plugin_key = planned_row_required_text(row, "plugin_key")?;
+        let file_id = planned_row_optional_text(row, "file_id");
+        let plugin_key = planned_row_optional_text(row, "plugin_key");
         let schema_version = planned_row_required_text(row, "schema_version")?;
         let snapshot_content = planned_row_snapshot_content(row)?;
         let version_id = row
@@ -500,7 +488,12 @@ impl CompiledStateCommitStreamFilter {
         if !self.entity_ids.is_empty() && !self.entity_ids.contains(&change.entity_id) {
             return false;
         }
-        if !self.file_ids.is_empty() && !self.file_ids.contains(&change.file_id) {
+        if !self.file_ids.is_empty()
+            && change
+                .file_id
+                .as_ref()
+                .is_none_or(|file_id| !self.file_ids.contains(file_id))
+        {
             return false;
         }
         if !self.version_ids.is_empty() && !self.version_ids.contains(&change.version_id) {
@@ -538,7 +531,9 @@ impl TouchedFields {
         for change in changes {
             touched.schema_keys.insert(change.schema_key.clone());
             touched.entity_ids.insert(change.entity_id.clone());
-            touched.file_ids.insert(change.file_id.clone());
+            if let Some(file_id) = change.file_id.as_ref() {
+                touched.file_ids.insert(file_id.clone());
+            }
             touched.version_ids.insert(change.version_id.clone());
             if let Some(writer_key) = change.writer_key.as_ref() {
                 touched.writer_keys.insert(writer_key.clone());
@@ -677,8 +672,8 @@ mod tests {
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
-                file_id: Some("file-1".try_into().unwrap()),
-                plugin_key: Some("lix".try_into().unwrap()),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
@@ -705,8 +700,8 @@ mod tests {
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
-                file_id: Some("file-1".try_into().unwrap()),
-                plugin_key: Some("lix".try_into().unwrap()),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
@@ -730,8 +725,8 @@ mod tests {
                 entity_id: "entity-1".try_into().unwrap(),
                 schema_key: "lix_key_value".try_into().unwrap(),
                 schema_version: Some("1".try_into().unwrap()),
-                file_id: Some("file-1".try_into().unwrap()),
-                plugin_key: Some("lix".try_into().unwrap()),
+                file_id: None,
+                plugin_key: None,
                 snapshot_content: Some("{\"value\":\"after\"}".to_string()),
                 metadata: None,
                 version_id: "version-a".try_into().unwrap(),
@@ -750,8 +745,8 @@ mod tests {
     #[test]
     fn planned_rows_accept_structured_json_snapshot_content() {
         let mut values = BTreeMap::new();
-        values.insert("file_id".to_string(), Value::Text("lix".to_string()));
-        values.insert("plugin_key".to_string(), Value::Text("lix".to_string()));
+        values.insert("file_id".to_string(), Value::Null);
+        values.insert("plugin_key".to_string(), Value::Null);
         values.insert("schema_version".to_string(), Value::Text("1".to_string()));
         values.insert(
             "snapshot_content".to_string(),

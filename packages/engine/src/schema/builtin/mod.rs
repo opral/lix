@@ -7,6 +7,12 @@ mod types;
 
 pub(crate) use types::{LixActiveVersion, LixCommit, LixVersionDescriptor, LixVersionRef};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BuiltinSchemaStorageDefaults {
+    pub(crate) file_id: Option<&'static str>,
+    pub(crate) plugin_key: Option<&'static str>,
+}
+
 const LIX_REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 const LIX_KEY_VALUE_SCHEMA_KEY: &str = "lix_key_value";
 const LIX_ACCOUNT_SCHEMA_KEY: &str = "lix_account";
@@ -89,6 +95,17 @@ const BUILTIN_SCHEMA_KEYS: &[&str] = &[
 
 pub(crate) fn builtin_schema_keys() -> &'static [&'static str] {
     BUILTIN_SCHEMA_KEYS
+}
+
+pub(crate) fn builtin_schema_storage_defaults(
+    schema_key: &str,
+) -> Option<BuiltinSchemaStorageDefaults> {
+    builtin_schema_definition(schema_key)?;
+    let _ = schema_key;
+    Some(BuiltinSchemaStorageDefaults {
+        file_id: None,
+        plugin_key: None,
+    })
 }
 
 // `lix_state` is a public SQL surface, not a stored builtin schema row, but
@@ -255,27 +272,28 @@ fn parse_registered_schema_with_inlined_definition() -> JsonValue {
 
 #[cfg(test)]
 mod tests {
-    use super::{builtin_schema_definition, BUILTIN_SCHEMA_KEYS, LIX_BINARY_BLOB_REF_SCHEMA_KEY};
+    use super::{builtin_schema_definition, builtin_schema_storage_defaults, BUILTIN_SCHEMA_KEYS};
 
     #[test]
-    fn builtin_schemas_use_lix_plugin_key_override() {
+    fn builtin_schemas_do_not_define_file_or_plugin_overrides() {
         for schema_key in BUILTIN_SCHEMA_KEYS {
             let schema = builtin_schema_definition(schema_key).expect("schema should exist");
-            let plugin_key = schema
-                .get("x-lix-override-lixcols")
-                .and_then(|value| value.as_object())
-                .and_then(|map| map.get("lixcol_plugin_key"))
-                .and_then(|value| value.as_str());
-            let expected_plugin_key = if *schema_key == LIX_BINARY_BLOB_REF_SCHEMA_KEY {
-                None
-            } else {
-                Some("\"lix\"")
-            };
             assert_eq!(
-                plugin_key, expected_plugin_key,
-                "schema '{}' has unexpected lixcol_plugin_key override",
+                schema.get("x-lix-override-lixcols"),
+                None,
+                "schema '{}' should not carry file/plugin override metadata",
                 schema_key,
             );
+        }
+    }
+
+    #[test]
+    fn builtin_storage_defaults_are_owned_by_code() {
+        for schema_key in BUILTIN_SCHEMA_KEYS {
+            let defaults =
+                builtin_schema_storage_defaults(schema_key).expect("builtin defaults should exist");
+            assert_eq!(defaults.file_id, None);
+            assert_eq!(defaults.plugin_key, None);
         }
     }
 

@@ -102,7 +102,7 @@ simulation_test!(lix_working_changes_reports_added_rows, |sim| async move {
             "SELECT status, before_change_id, after_change_id, before_commit_id, after_commit_id \
              FROM lix_working_changes \
              WHERE schema_key = 'lix_key_value' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND entity_id = $1",
             &[Value::Text(key.clone())],
         )
@@ -156,7 +156,7 @@ simulation_test!(
                 "SELECT status, before_change_id, after_change_id, before_commit_id, after_commit_id \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(key.clone())],
             )
@@ -210,7 +210,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(key.clone())],
             )
@@ -228,7 +228,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(key)],
             )
@@ -274,7 +274,7 @@ simulation_test!(
                 "SELECT status, before_change_id, after_change_id, before_commit_id, after_commit_id \
              FROM lix_working_changes \
              WHERE schema_key = 'lix_key_value' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND entity_id = $1 \
              LIMIT 1", &[Value::Text(key)])
             .await
@@ -333,7 +333,7 @@ simulation_test!(
             "SELECT status, before_change_id, after_change_id, before_commit_id, after_commit_id \
              FROM lix_working_changes \
              WHERE schema_key = 'lix_key_value' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND entity_id = $1 \
              LIMIT 1", &[Value::Text(key)])
         .await
@@ -374,7 +374,7 @@ simulation_test!(
                 "SELECT status, before_change_id, after_change_id \
              FROM lix_working_changes \
              WHERE schema_key = 'lix_key_value' \
-               AND file_id = 'lix' \
+               AND file_id IS NULL \
                AND entity_id = $1 \
              LIMIT 1",
                 &[Value::Text(key)],
@@ -442,7 +442,7 @@ simulation_test!(
                  FROM lix_change_set_element \
                  WHERE change_set_id = $1 \
                    AND schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $2",
                 &[Value::Text(tip_change_set_id), Value::Text(key.clone())],
             )
@@ -459,7 +459,7 @@ simulation_test!(
                 "SELECT status, before_change_id, after_change_id \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(key)],
             )
@@ -500,7 +500,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(key.clone())],
             )
@@ -518,7 +518,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(key.clone())],
             )
@@ -533,7 +533,7 @@ simulation_test!(
                  WHERE change_set_id = $1 \
                    AND entity_id = $2 \
                    AND schema_key = 'lix_key_value' \
-                   AND file_id = 'lix'",
+                   AND file_id IS NULL",
                 &[Value::Text(checkpoint.change_set_id), Value::Text(key)],
             )
             .await
@@ -580,7 +580,7 @@ simulation_test!(
                 "SELECT entity_id, status \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id IN ($1, $2)",
                 &[Value::Text(key_a.clone()), Value::Text(key_b.clone())],
             )
@@ -640,7 +640,7 @@ simulation_test!(
                 "SELECT entity_id, status \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(target_key.clone())],
             )
@@ -721,7 +721,7 @@ simulation_test!(
                 "SELECT entity_id, status \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id IN ($1, $2, $3)",
                 &[
                     Value::Text(main_key_a.clone()),
@@ -772,7 +772,7 @@ simulation_test!(
                 "SELECT entity_id, status \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_key_value' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id IN ($1, $2, $3, $4)",
                 &[
                     Value::Text(main_key_a.clone()),
@@ -846,7 +846,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_file_descriptor' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(file_id.clone())],
             )
@@ -869,7 +869,7 @@ simulation_test!(
                 "SELECT COUNT(*) \
                  FROM lix_working_changes \
                  WHERE schema_key = 'lix_file_descriptor' \
-                   AND file_id = 'lix' \
+                   AND file_id IS NULL \
                    AND entity_id = $1",
                 &[Value::Text(file_id)],
             )

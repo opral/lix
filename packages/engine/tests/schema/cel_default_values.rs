@@ -19,7 +19,7 @@ async fn enable_deterministic_mode(engine: &support::simulation_test::SimulatedL
             "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
              ) VALUES (\
-             'lix_deterministic_mode', 'lix_key_value', 'lix', 'global', 'lix', '{\"key\":\"lix_deterministic_mode\",\"value\":{\"enabled\":true}}', '1'\
+             'lix_deterministic_mode', 'lix_key_value', NULL, 'global', NULL, '{\"key\":\"lix_deterministic_mode\",\"value\":{\"enabled\":true}}', '1'\
              )", &[])
         .await
         .unwrap();
@@ -45,7 +45,7 @@ simulation_test!(insert_applies_cel_default, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'cel_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'cel_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
@@ -89,7 +89,7 @@ simulation_test!(
                     Value::Text("entity-1".to_string()),
                     Value::Text("cel_default_param_schema".to_string()),
                     Value::Text("file-1".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text("{\"name\":\"Sample\"}".to_string()),
                     Value::Text("1".to_string()),
                 ])
@@ -136,7 +136,7 @@ simulation_test!(insert_select_applies_cel_default, |sim| async move {
                 Value::Text("entity-1".to_string()),
                 Value::Text("cel_default_select_schema".to_string()),
                 Value::Text("file-1".to_string()),
-                Value::Text("lix".to_string()),
+                Value::Null,
                 Value::Text("{\"name\":\"Sample\"}".to_string()),
                 Value::Text("1".to_string()),
             ],
@@ -180,7 +180,7 @@ simulation_test!(insert_uses_json_default_fallback, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'json_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'json_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
@@ -214,7 +214,7 @@ simulation_test!(insert_x_lix_default_overrides_default, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'override_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'override_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
@@ -251,7 +251,7 @@ simulation_test!(insert_does_not_override_explicit_null, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'null_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\",\"status\":null}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'null_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\",\"status\":null}', '1')", &[])
         .await
         .unwrap();
 
@@ -285,7 +285,7 @@ simulation_test!(update_does_not_backfill_defaults, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'update_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'update_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
@@ -327,7 +327,7 @@ async fn run_insert_applies_uuid_function_default(sim: SimulationArgs) {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'uuid_fn_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'uuid_fn_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
@@ -373,7 +373,7 @@ async fn run_insert_applies_timestamp_function_default(sim: SimulationArgs) {
 
     engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'timestamp_fn_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'timestamp_fn_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await
         .unwrap();
 
@@ -426,7 +426,7 @@ simulation_test!(insert_fails_on_unknown_cel_variable, |sim| async move {
 
     let result = engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'unknown_var_default_schema', 'file-1', lix_active_version_id(), 'lix', '{\"name\":\"Sample\"}', '1')", &[])
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) VALUES ('entity-1', 'unknown_var_default_schema', 'file-1', lix_active_version_id(), NULL, '{\"name\":\"Sample\"}', '1')", &[])
         .await;
 
     let err = result.expect_err("expected unknown CEL variable error");
@@ -448,7 +448,7 @@ simulation_test!(
         engine
         .register_schema(
             &serde_json::from_str::<serde_json::Value>(
-                r#"{"x-lix-key":"shared_default_outcome_schema","x-lix-version":"1","x-lix-primary-key":["/id"],"x-lix-override-lixcols":{"lixcol_file_id":"\"lix\"","lixcol_plugin_key":"\"lix\""},"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["id","name"],"additionalProperties":false}"#,
+                r#"{"x-lix-key":"shared_default_outcome_schema","x-lix-version":"1","x-lix-primary-key":["/id"],"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"slug":{"type":"string","x-lix-default":"name + '-slug'"}},"required":["id","name"],"additionalProperties":false}"#,
             )
             .unwrap(),
         )
@@ -465,7 +465,7 @@ simulation_test!(
 
         engine
         .execute(
-            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, global) VALUES ('state-row', 'shared_default_outcome_schema', 'lix', 'global', 'lix', '{\"id\":\"state-row\",\"name\":\"Sample\"}', '1', true)",
+            "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, global) VALUES ('state-row', 'shared_default_outcome_schema', NULL, 'global', NULL, '{\"id\":\"state-row\",\"name\":\"Sample\"}', '1', true)",
             &[],
         )
         .await

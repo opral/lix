@@ -13,8 +13,8 @@ use crate::live_state::{
 use crate::session::workspace::init as init_workspace;
 use crate::transaction::{LiveStateWriteTransaction, OverlayReadContext, TransactionDelta};
 use crate::{
-    LixBackend, LixBackendTransaction, LixError, QueryResult, SqlDialect, TransactionBeginMode,
-    Value,
+    LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, SqlDialect,
+    TransactionBeginMode, Value,
 };
 use async_trait::async_trait;
 use rusqlite::types::{Value as SqliteValue, ValueRef};
@@ -178,11 +178,11 @@ fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str
         entity_id: entity_id.to_string(),
         schema_key: "lix_commit_edge".to_string(),
         schema_version: "1".to_string(),
-        file_id: "lix".to_string(),
+        file_id: None,
         version_id: "main".to_string(),
         global: true,
         untracked: false,
-        plugin_key: "lix".to_string(),
+        plugin_key: None,
         metadata: Some("{\"kind\":\"module-test\"}".to_string()),
         change_id: change_id.to_string(),
         writer_key: Some("writer-a".to_string()),
@@ -243,9 +243,9 @@ async fn live_tracked_state_roundtrips_rows() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
             schema_version: None,
-            plugin_key: None,
+            plugin_key: NullableKeyFilter::Any,
             writer_key: None,
             global: None,
             untracked: None,
@@ -274,7 +274,7 @@ async fn live_tracked_state_roundtrips_rows() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_ids: vec!["edge-1".to_string(), "edge-2".to_string()],
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await
@@ -296,7 +296,7 @@ async fn live_tracked_state_roundtrips_rows() {
                 },
                 ScanConstraint {
                     field: ScanField::PluginKey,
-                    operator: ScanOperator::Eq(Value::Text("lix".to_string())),
+                    operator: ScanOperator::Eq(Value::Null),
                 },
                 ScanConstraint {
                     field: ScanField::SchemaVersion,
@@ -351,11 +351,11 @@ async fn live_tracked_state_tombstones_hide_rows() {
             entity_id: "edge-1".to_string(),
             schema_key: "lix_commit_edge".to_string(),
             schema_version: "1".to_string(),
-            file_id: "lix".to_string(),
+            file_id: None,
             version_id: "main".to_string(),
             global: true,
             untracked: false,
-            plugin_key: "lix".to_string(),
+            plugin_key: None,
             metadata: Some("{\"kind\":\"module-test\"}".to_string()),
             change_id: "change-2".to_string(),
             writer_key: Some("writer-a".to_string()),
@@ -374,7 +374,7 @@ async fn live_tracked_state_tombstones_hide_rows() {
             schema_key: "lix_commit_edge".to_string(),
             version_id: "main".to_string(),
             entity_id: "edge-1".to_string(),
-            file_id: Some("lix".to_string()),
+            file_id: NullableKeyFilter::Null,
         },
     )
     .await

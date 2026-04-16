@@ -6,7 +6,7 @@ use crate::catalog::{
     FilesystemProjectionScope, FilesystemRelationBinding, FilesystemRelationKind,
     StoredVersionHeadSourceBinding, VersionHeadSourceBinding, VersionRelationBinding,
 };
-use crate::common::escape_sql_string;
+use crate::common::{escape_sql_string, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::tracked_relation_name;
 use crate::live_state::{payload_column_name_for_schema, WRITER_KEY_TABLE};
 use crate::{LixError, SqlDialect};
@@ -85,8 +85,8 @@ pub(crate) fn build_version_relation_sql(
                ON descriptor_snapshot.id = descriptor_change.snapshot_id \
              WHERE descriptor_change.schema_key = '{descriptor_schema_key}' \
                AND descriptor_change.schema_version = '{descriptor_schema_version}' \
-               AND descriptor_change.file_id = '{descriptor_file_id}' \
-               AND descriptor_change.plugin_key = '{descriptor_plugin_key}' \
+               AND descriptor_change.file_id IS NULL \
+               AND descriptor_change.plugin_key IS NULL \
          ), \
          ranked_descriptors AS ( \
              SELECT \
@@ -124,8 +124,6 @@ pub(crate) fn build_version_relation_sql(
         hidden_expr = hidden_expr,
         descriptor_schema_key = escape_sql_string(&binding.descriptor_source.schema_key),
         descriptor_schema_version = escape_sql_string(&binding.descriptor_source.schema_version),
-        descriptor_file_id = escape_sql_string(&binding.descriptor_source.file_id),
-        descriptor_plugin_key = escape_sql_string(&binding.descriptor_source.plugin_key),
     )
 }
 
@@ -149,8 +147,8 @@ fn build_local_version_ref_heads_source_sql(source: &StoredVersionHeadSourceBind
          FROM {table} \
          WHERE schema_key = '{ref_schema_key}' \
            AND schema_version = '{ref_schema_version}' \
-           AND file_id = '{ref_file_id}' \
-           AND plugin_key = '{ref_plugin_key}' \
+           AND file_id IS NULL \
+           AND plugin_key IS NULL \
            AND version_id = '{storage_version_id}' \
            AND untracked = true \
            AND is_tombstone = 0 \
@@ -159,8 +157,6 @@ fn build_local_version_ref_heads_source_sql(source: &StoredVersionHeadSourceBind
         table = tracked_relation_name(&source.schema_key),
         ref_schema_key = escape_sql_string(&source.schema_key),
         ref_schema_version = escape_sql_string(&source.schema_version),
-        ref_file_id = escape_sql_string(&source.file_id),
-        ref_plugin_key = escape_sql_string(&source.plugin_key),
         storage_version_id = escape_sql_string(&source.storage_version_id),
     )
 }
@@ -179,8 +175,8 @@ fn build_current_version_refs_unique_cte_sql(head_source: &VersionHeadSourceBind
                  LEFT JOIN lix_internal_snapshot commit_snapshot \
                    ON commit_snapshot.id = commit_change.snapshot_id \
                  WHERE commit_change.schema_key = 'lix_commit' \
-                   AND commit_change.file_id = 'lix' \
-                   AND commit_change.plugin_key = 'lix' \
+                   AND commit_change.file_id IS NULL \
+                   AND commit_change.plugin_key IS NULL \
                    AND commit_snapshot.content IS NOT NULL \
              ), \
              current_refs AS ( \
@@ -219,8 +215,8 @@ fn build_inline_current_version_refs_cte_sql(
              LEFT JOIN lix_internal_snapshot commit_snapshot \
                ON commit_snapshot.id = commit_change.snapshot_id \
              WHERE commit_change.schema_key = 'lix_commit' \
-               AND commit_change.file_id = 'lix' \
-               AND commit_change.plugin_key = 'lix' \
+               AND commit_change.file_id IS NULL \
+               AND commit_change.plugin_key IS NULL \
                AND commit_snapshot.content IS NOT NULL \
          ), \
          current_refs(version_id, commit_id) AS ( \
@@ -986,10 +982,11 @@ fn tracked_writer_key_join_sql(row_alias: &str, writer_alias: &str) -> String {
            ON {writer_alias}.version_id = {row_alias}.version_id \
           AND {writer_alias}.schema_key = {row_alias}.schema_key \
           AND {writer_alias}.entity_id = {row_alias}.entity_id \
-          AND {writer_alias}.file_id = {row_alias}.file_id",
+          AND {writer_alias}.{storage_scope_key} = {row_alias}.{storage_scope_key}",
         writer_key_table = WRITER_KEY_TABLE,
         row_alias = quote_ident(row_alias),
         writer_alias = quote_ident(writer_alias),
+        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
     )
 }
 

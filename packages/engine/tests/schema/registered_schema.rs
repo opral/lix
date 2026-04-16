@@ -42,7 +42,7 @@ simulation_test!(
         assert_eq!(row[1], Value::Text("lix_registered_schema".to_string()));
         assert_eq!(row[2], Value::Text("1".to_string()));
         assert_eq!(row[3], Value::Text(active_version_id));
-        assert_eq!(row[4], Value::Text("lix".to_string()));
+        assert_eq!(row[4], Value::Null);
         assert!(matches!(&row[5], Value::Text(change_id) if !change_id.is_empty()));
         assert_boolean_like(&row[7], false);
         let expected_snapshot = serde_json::to_string(
@@ -381,7 +381,7 @@ simulation_test!(
         let result = engine
             .execute(
                 "UPDATE lix_state_by_version SET snapshot_content = '{\"value\":{\"x-lix-version\":\"1\"}}' \
-             WHERE schema_key = 'lix_registered_schema' AND entity_id = 'test_schema~1' AND file_id = 'lix' AND version_id = lix_active_version_id()", &[])
+             WHERE schema_key = 'lix_registered_schema' AND entity_id = 'test_schema~1' AND file_id IS NULL AND version_id = lix_active_version_id()", &[])
             .await;
 
         let err = result.expect_err("expected registered schema validation error");

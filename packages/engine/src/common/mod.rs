@@ -38,6 +38,8 @@ pub(crate) use paths::filesystem::{
 #[allow(unused_imports)]
 pub(crate) use text::escape_sql_string;
 #[allow(unused_imports)]
-pub use types::{ExecuteResult, QueryResult, Value};
+pub(crate) use types::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
+#[allow(unused_imports)]
+pub use types::{ExecuteResult, NullableKeyFilter, QueryResult, Value};
 #[allow(unused_imports)]
 pub use wire::{WireQueryResult, WireValue};

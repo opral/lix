@@ -131,7 +131,7 @@ simulation_test!(checkpoint_labels_current_commit, |sim| async move {
              JOIN lix_label l ON l.id = el.label_id \
              WHERE el.entity_id = $1 \
                AND el.schema_key = 'lix_commit' \
-               AND el.file_id = 'lix' \
+               AND el.file_id IS NULL \
                AND l.name = 'checkpoint'",
             &[Value::Text(commit_id)],
         )

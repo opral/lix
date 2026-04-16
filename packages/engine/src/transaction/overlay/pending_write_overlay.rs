@@ -112,7 +112,7 @@ impl PendingOverlay for PendingWriteOverlay {
         version_id: &str,
         schema_key: &str,
         entity_id: &str,
-        file_id: &str,
+        file_id: Option<&str>,
     ) -> Option<Option<String>> {
         self.writer_key_overlay()
             .and_then(|overlay| {

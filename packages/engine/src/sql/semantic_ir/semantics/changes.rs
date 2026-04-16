@@ -462,7 +462,7 @@ mod tests {
                 .block_on(async move {
                     let (planned_write, _backend) = planned_write(
                         "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
-                         VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')"
+                         VALUES ('entity-1', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"hello\"}', '1')"
                     )
                     .await;
 
@@ -481,8 +481,8 @@ mod tests {
                     assert_eq!(batches.writer_key.as_deref(), Some("writer-a"));
                     assert_eq!(batches.changes[0].writer_key.as_deref(), Some("writer-a"));
                     assert_eq!(batches.changes[0].schema_version.as_deref(), Some("1"));
-                    assert_eq!(batches.changes[0].file_id.as_deref(), Some("lix"));
-                    assert_eq!(batches.changes[0].plugin_key.as_deref(), Some("lix"));
+                    assert_eq!(batches.changes[0].file_id.as_deref(), None);
+                    assert_eq!(batches.changes[0].plugin_key.as_deref(), None);
                 })
         });
     }
@@ -497,7 +497,7 @@ mod tests {
                 .block_on(async move {
                     let (planned_write, _backend) = planned_write(
                         "INSERT INTO lix_state_by_version (entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version) \
-                         VALUES ('entity-1', 'lix_key_value', 'lix', 'version-a', 'lix', '{\"key\":\"hello\"}', '1')"
+                         VALUES ('entity-1', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"hello\"}', '1')"
                     )
                     .await;
 

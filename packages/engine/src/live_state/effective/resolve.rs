@@ -12,7 +12,7 @@ use crate::live_state::{exact_row_constraints, BatchRowRequest, EffectiveRowRequ
 use crate::live_state::{
     EffectiveRowsRequest, EffectiveRowsResolver, LiveReadContext, WriterKeyReadView,
 };
-use crate::{LixError, Value};
+use crate::{LixError, NullableKeyFilter, Value};
 
 use super::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowSet, EffectiveRowState, LaneResult, OverlayLane,
@@ -287,7 +287,7 @@ fn effective_row_from_tracked(
         source_version_id,
         global: lane.is_global() || row.global,
         untracked: false,
-        plugin_key: Some(row.plugin_key),
+        plugin_key: row.plugin_key,
         metadata: row.metadata,
         writer_key: row.writer_key,
         created_at: Some(row.created_at),
@@ -315,7 +315,7 @@ fn effective_row_from_untracked(
         source_version_id,
         global: lane.is_global() || row.global,
         untracked: true,
-        plugin_key: Some(row.plugin_key),
+        plugin_key: row.plugin_key,
         metadata: row.metadata,
         writer_key: row.writer_key,
         created_at: Some(row.created_at),
@@ -422,7 +422,7 @@ async fn load_effective_rows_exact_batch(
                     schema_key: request.schema_key.clone(),
                     version_id: storage_version_id,
                     entity_ids,
-                    file_id: None,
+                    file_id: NullableKeyFilter::Any,
                 })
                 .await?;
             let rows = tracked_rows_with_writer_keys(context.writer_keys, rows).await?;
@@ -442,7 +442,7 @@ async fn load_effective_rows_exact_batch(
                 schema_key: request.schema_key.clone(),
                 version_id: storage_version_id,
                 entity_ids,
-                file_id: None,
+                file_id: NullableKeyFilter::Any,
             })
             .await
             .map(|rows| {

@@ -42,7 +42,7 @@ pub enum LaneResult<T> {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct EffectiveRowIdentity {
     pub entity_id: String,
-    pub file_id: String,
+    pub file_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,7 +56,7 @@ pub struct EffectiveRow {
     pub entity_id: String,
     pub schema_key: String,
     pub schema_version: Option<String>,
-    pub file_id: String,
+    pub file_id: Option<String>,
     pub version_id: String,
     pub source_version_id: String,
     pub global: bool,

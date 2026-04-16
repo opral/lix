@@ -5,10 +5,6 @@
     "/value/x-lix-key",
     "/value/x-lix-version"
   ],
-  "x-lix-override-lixcols": {
-    "lixcol_file_id": "\"lix\"",
-    "lixcol_plugin_key": "\"lix\""
-  },
   "type": "object",
   "properties": {
     "value": {

@@ -57,9 +57,9 @@ pub struct FileHistoryRow {
     pub hidden: Option<bool>,
     pub lixcol_entity_id: String,
     pub lixcol_schema_key: String,
-    pub lixcol_file_id: String,
+    pub lixcol_file_id: Option<String>,
     pub lixcol_version_id: String,
-    pub lixcol_plugin_key: String,
+    pub lixcol_plugin_key: Option<String>,
     pub lixcol_schema_version: String,
     pub lixcol_change_id: String,
     pub lixcol_metadata: Option<String>,
@@ -87,9 +87,9 @@ pub struct DirectoryHistoryRow {
     pub hidden: Option<bool>,
     pub lixcol_entity_id: String,
     pub lixcol_schema_key: String,
-    pub lixcol_file_id: String,
+    pub lixcol_file_id: Option<String>,
     pub lixcol_version_id: String,
-    pub lixcol_plugin_key: String,
+    pub lixcol_plugin_key: Option<String>,
     pub lixcol_schema_version: String,
     pub lixcol_change_id: String,
     pub lixcol_metadata: Option<String>,
@@ -112,9 +112,9 @@ struct FileDescriptorHistoryRow {
     metadata: Option<String>,
     hidden: Option<bool>,
     lixcol_schema_key: String,
-    lixcol_file_id: String,
+    lixcol_file_id: Option<String>,
     lixcol_version_id: String,
-    lixcol_plugin_key: String,
+    lixcol_plugin_key: Option<String>,
     lixcol_schema_version: String,
     lixcol_change_id: String,
     lixcol_origin_commit_id: String,
@@ -132,9 +132,9 @@ struct DirectoryDescriptorHistoryRow {
     hidden: Option<bool>,
     lixcol_entity_id: String,
     lixcol_schema_key: String,
-    lixcol_file_id: String,
+    lixcol_file_id: Option<String>,
     lixcol_version_id: String,
-    lixcol_plugin_key: String,
+    lixcol_plugin_key: Option<String>,
     lixcol_schema_version: String,
     lixcol_change_id: String,
     lixcol_metadata: Option<String>,
@@ -147,6 +147,8 @@ struct DirectoryDescriptorHistoryRow {
 #[derive(Debug, Clone)]
 struct BinaryBlobRefHistoryRow {
     id: String,
+    lixcol_file_id: Option<String>,
+    lixcol_plugin_key: Option<String>,
     lixcol_change_id: String,
     lixcol_commit_id: String,
     lixcol_commit_created_at: String,
@@ -158,6 +160,8 @@ struct BinaryBlobRefHistoryRow {
 #[derive(Debug, Clone)]
 struct FileCheckpointCandidate {
     id: String,
+    lixcol_file_id: Option<String>,
+    lixcol_plugin_key: Option<String>,
     lixcol_root_commit_id: String,
     lixcol_raw_depth: i64,
     lixcol_change_id: String,
@@ -168,6 +172,8 @@ struct FileCheckpointCandidate {
 #[derive(Debug, Clone)]
 struct FileCheckpointRow {
     id: String,
+    lixcol_file_id: Option<String>,
+    lixcol_plugin_key: Option<String>,
     lixcol_root_commit_id: String,
     lixcol_raw_depth: i64,
     lixcol_change_id: String,
@@ -197,6 +203,19 @@ struct DirectoryDescriptorSnapshot {
 #[derive(Debug, Deserialize)]
 struct BinaryBlobRefSnapshot {
     blob_hash: String,
+}
+
+fn required_filesystem_history_field(
+    value: Option<String>,
+    field: &str,
+    schema_key: &str,
+) -> Result<String, LixError> {
+    value.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("filesystem history row for '{schema_key}' is missing {field}"),
+        )
+    })
 }
 
 pub(crate) async fn load_file_history_rows(
@@ -317,8 +336,16 @@ pub(crate) async fn load_file_history_rows(
                             ),
                         )
                     })?;
+                let file_id = row.file_id;
+                let plugin_key = row.plugin_key;
                 blob_rows.push(BinaryBlobRefHistoryRow {
-                    id: row.file_id,
+                    id: required_filesystem_history_field(
+                        file_id.clone(),
+                        "file_id",
+                        BINARY_BLOB_REF_SCHEMA_KEY,
+                    )?,
+                    lixcol_file_id: file_id,
+                    lixcol_plugin_key: plugin_key,
                     lixcol_change_id: row.change_id,
                     lixcol_commit_id: row.commit_id,
                     lixcol_commit_created_at: row.commit_created_at,
@@ -385,6 +412,8 @@ pub(crate) async fn load_file_history_rows(
                     &mut deduped_candidates,
                     FileCheckpointCandidate {
                         id: descriptor.id.clone(),
+                        lixcol_file_id: descriptor.lixcol_file_id.clone(),
+                        lixcol_plugin_key: descriptor.lixcol_plugin_key.clone(),
                         lixcol_root_commit_id: root_commit_id.clone(),
                         lixcol_raw_depth: descriptor.lixcol_depth,
                         lixcol_change_id: descriptor.lixcol_change_id.clone(),
@@ -414,6 +443,8 @@ pub(crate) async fn load_file_history_rows(
                         &mut deduped_candidates,
                         FileCheckpointCandidate {
                             id: file_id.clone(),
+                            lixcol_file_id: directory.lixcol_file_id.clone(),
+                            lixcol_plugin_key: directory.lixcol_plugin_key.clone(),
                             lixcol_root_commit_id: root_commit_id.clone(),
                             lixcol_raw_depth: directory.lixcol_depth,
                             lixcol_change_id: directory.lixcol_change_id.clone(),
@@ -432,6 +463,8 @@ pub(crate) async fn load_file_history_rows(
                 &mut deduped_candidates,
                 FileCheckpointCandidate {
                     id: blob.id.clone(),
+                    lixcol_file_id: blob.lixcol_file_id.clone(),
+                    lixcol_plugin_key: blob.lixcol_plugin_key.clone(),
                     lixcol_root_commit_id: blob.lixcol_root_commit_id.clone(),
                     lixcol_raw_depth: blob.lixcol_depth,
                     lixcol_change_id: blob.lixcol_change_id.clone(),
@@ -453,6 +486,8 @@ pub(crate) async fn load_file_history_rows(
             .or_default()
             .push(FileCheckpointRow {
                 id: candidate.id,
+                lixcol_file_id: candidate.lixcol_file_id,
+                lixcol_plugin_key: candidate.lixcol_plugin_key,
                 lixcol_root_commit_id: candidate.lixcol_root_commit_id,
                 lixcol_raw_depth: candidate.lixcol_raw_depth,
                 lixcol_change_id: candidate.lixcol_change_id,
@@ -536,13 +571,9 @@ pub(crate) async fn load_file_history_rows(
                 hidden: descriptor.hidden,
                 lixcol_entity_id: checkpoint.id.clone(),
                 lixcol_schema_key: descriptor.lixcol_schema_key.clone(),
-                lixcol_file_id: if descriptor.lixcol_change_id == checkpoint.lixcol_change_id {
-                    descriptor.lixcol_file_id.clone()
-                } else {
-                    checkpoint.id.clone()
-                },
+                lixcol_file_id: checkpoint.lixcol_file_id.clone(),
                 lixcol_version_id: descriptor.lixcol_version_id.clone(),
-                lixcol_plugin_key: descriptor.lixcol_plugin_key.clone(),
+                lixcol_plugin_key: checkpoint.lixcol_plugin_key.clone(),
                 lixcol_schema_version: descriptor.lixcol_schema_version.clone(),
                 lixcol_change_id: checkpoint.lixcol_change_id.clone(),
                 lixcol_metadata: descriptor.lixcol_metadata.clone(),

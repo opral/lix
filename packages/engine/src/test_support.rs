@@ -406,8 +406,8 @@ pub(crate) struct CanonicalChangeSeed<'a> {
     pub(crate) entity_id: &'a str,
     pub(crate) schema_key: &'a str,
     pub(crate) schema_version: &'a str,
-    pub(crate) file_id: &'a str,
-    pub(crate) plugin_key: &'a str,
+    pub(crate) file_id: Option<&'a str>,
+    pub(crate) plugin_key: Option<&'a str>,
     pub(crate) snapshot_id: &'a str,
     pub(crate) snapshot_content: Option<&'a str>,
     pub(crate) metadata: Option<&'a str>,
@@ -434,8 +434,12 @@ pub(crate) async fn seed_canonical_change_row(
                 Value::Text(seed.entity_id.to_string()),
                 Value::Text(seed.schema_key.to_string()),
                 Value::Text(seed.schema_version.to_string()),
-                Value::Text(seed.file_id.to_string()),
-                Value::Text(seed.plugin_key.to_string()),
+                seed.file_id
+                    .map(|value| Value::Text(value.to_string()))
+                    .unwrap_or(Value::Null),
+                seed.plugin_key
+                    .map(|value| Value::Text(value.to_string()))
+                    .unwrap_or(Value::Null),
                 Value::Text(seed.snapshot_id.to_string()),
                 seed.metadata
                     .map(|value| Value::Text(value.to_string()))
@@ -676,8 +680,8 @@ mod tests {
                 entity_id: "commit-1",
                 schema_key: "lix_commit",
                 schema_version: "1",
-                file_id: "lix",
-                plugin_key: "lix",
+                file_id: None,
+                plugin_key: None,
                 snapshot_id: "snapshot-1",
                 snapshot_content: Some(
                     "{\"id\":\"commit-1\",\"change_set_id\":\"cs-1\",\"change_ids\":[],\"parent_commit_ids\":[]}",
@@ -733,7 +737,7 @@ mod tests {
         let error = backend
             .execute(
                 "INSERT INTO lix_internal_change (id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at) \
-                 VALUES ('change-2', 'entity', 'schema', '1', 'lix', 'lix', 'no-content', NULL, 0, '2026-03-30T00:00:01Z')",
+                 VALUES ('change-2', 'entity', 'schema', '1', NULL, NULL, 'no-content', NULL, 0, '2026-03-30T00:00:01Z')",
                 &[],
             )
             .await
