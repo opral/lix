@@ -22,18 +22,18 @@ pub struct Cli {
     pub no_hints: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Experimental commands for benchmarking and diagnostics.
     Exp(ExpCommand),
-    /// Initialize a Lix database file at the provided path.
+    /// Initialize a lix at the provided path.
     Init(InitCommand),
     /// Reapply the most recently undone committed change unit.
     Redo(RedoCommand),
-    /// Execute raw SQL against a Lix database.
+    /// Execute raw SQL against a lix.
     Sql(SqlCommand),
     /// Undo the most recent committed change unit.
     Undo(UndoCommand),
@@ -53,7 +53,7 @@ mod tests {
     fn parses_init_command_path_argument() {
         let cli = Cli::try_parse_from(["lix", "init", "tmp/new.lix"]).expect("parse succeeds");
         match cli.command {
-            Command::Init(init) => assert_eq!(init.path, PathBuf::from("tmp/new.lix")),
+            Some(Command::Init(init)) => assert_eq!(init.path, PathBuf::from("tmp/new.lix")),
             _ => panic!("expected init command"),
         }
     }
@@ -71,7 +71,7 @@ mod tests {
         .expect("parse succeeds");
 
         match cli.command {
-            Command::Sql(sql) => match sql.command {
+            Some(Command::Sql(sql)) => match sql.command {
                 SqlSubcommand::Execute(args) => {
                     assert_eq!(args.params, Some("[\"first\", \"second\"]".to_string()));
                     assert_eq!(args.sql, "SELECT ?1, ?2");
@@ -86,7 +86,9 @@ mod tests {
         let cli =
             Cli::try_parse_from(["lix", "undo", "--version", "branch-1"]).expect("parse succeeds");
         match cli.command {
-            Command::Undo(command) => assert_eq!(command.version.as_deref(), Some("branch-1")),
+            Some(Command::Undo(command)) => {
+                assert_eq!(command.version.as_deref(), Some("branch-1"))
+            }
             _ => panic!("expected undo command"),
         }
     }
@@ -95,7 +97,7 @@ mod tests {
     fn parses_redo_command_without_version() {
         let cli = Cli::try_parse_from(["lix", "redo"]).expect("parse succeeds");
         match cli.command {
-            Command::Redo(command) => assert_eq!(command.version, None),
+            Some(Command::Redo(command)) => assert_eq!(command.version, None),
             _ => panic!("expected redo command"),
         }
     }
@@ -113,7 +115,7 @@ mod tests {
         ])
         .expect("parse succeeds");
         match cli.command {
-            Command::Version(command) => match command.command {
+            Some(Command::Version(command)) => match command.command {
                 VersionSubcommand::Merge(args) => {
                     assert_eq!(args.source_name.as_deref(), Some("draft-a"));
                     assert_eq!(args.target_id.as_deref(), Some("main"));
@@ -140,7 +142,7 @@ mod tests {
         ])
         .expect("parse succeeds");
         match cli.command {
-            Command::Version(command) => match command.command {
+            Some(Command::Version(command)) => match command.command {
                 VersionSubcommand::Create(args) => {
                     assert_eq!(args.id.as_deref(), Some("branch-a"));
                     assert_eq!(args.name.as_deref(), Some("Branch A"));
@@ -158,7 +160,7 @@ mod tests {
         let cli = Cli::try_parse_from(["lix", "version", "switch", "--name", "branch-a"])
             .expect("parse succeeds");
         match cli.command {
-            Command::Version(command) => match command.command {
+            Some(Command::Version(command)) => match command.command {
                 VersionSubcommand::Switch(args) => {
                     assert_eq!(args.name.as_deref(), Some("branch-a"));
                 }

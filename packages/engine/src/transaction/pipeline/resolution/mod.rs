@@ -66,7 +66,7 @@ impl From<FilesystemQueryError> for WriteResolveError {
     fn from(error: FilesystemQueryError) -> Self {
         Self {
             message: error.message,
-            hint: None,
+            hint: error.hint,
         }
     }
 }
