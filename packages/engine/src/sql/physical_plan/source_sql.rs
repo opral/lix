@@ -65,6 +65,7 @@ pub(crate) fn build_effective_public_read_source_sql(
                 "public state read lowerer requires a bounded schema set for '{}'",
                 resolved_relation.descriptor.public_name
             ),
+            hint: None,
         });
     }
 
@@ -89,6 +90,7 @@ pub(crate) fn build_effective_public_read_source_sql(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "state lowerer expected default or by-version surface".to_string(),
+                hint: None,
             });
         }
     };

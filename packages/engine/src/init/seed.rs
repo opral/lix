@@ -157,7 +157,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 description:
                     "init invariant violation: commits exist but the local global version head is missing"
                         .to_string(),
-            });
+                        hint: None,
+                    });
         }
 
         Ok(None)
@@ -172,6 +173,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "init invariant violation: local global version head is missing"
                     .to_string(),
+                hint: None,
             });
         };
         Ok(commit_id)
@@ -224,6 +226,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 crate::schema::builtin_schema_definition(schema_key).ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("builtin schema '{schema_key}' is not available"),
+                    hint: None,
                 })?;
             let entity_id = builtin_schema_entity_id(schema)?;
 
@@ -411,6 +414,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     description: format!(
                         "init invariant violation: commit '{commit_id}' is missing from canonical lix_commit facts"
                     ),
+                    hint: None,
                 }
             } else {
                 LixError {
@@ -419,6 +423,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                         "init invariant violation: expected exactly one canonical lix_commit fact for '{commit_id}', got {}",
                         commit_row.rows.len()
                     ),
+                    hint: None,
                 }
             });
         };
@@ -428,6 +433,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 description: format!(
                     "init invariant violation: commit '{commit_id}' canonical snapshot must be text"
                 ),
+                hint: None,
             });
         };
         let commit_snapshot: crate::schema::LixCommit =
@@ -436,6 +442,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 description: format!(
                     "init invariant violation: commit '{commit_id}' canonical snapshot is invalid JSON: {error}"
                 ),
+                hint: None,
             })?;
         let Some(change_set_id) = commit_snapshot
             .change_set_id
@@ -446,6 +453,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 description: format!(
                     "init invariant violation: commit '{commit_id}' has empty change_set_id"
                 ),
+                hint: None,
             });
         };
 
@@ -469,6 +477,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 description: format!(
                     "init invariant violation: commit '{commit_id}' references missing change_set '{change_set_id}'"
                 ),
+                hint: None,
             });
         }
 
@@ -703,6 +712,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 serde_json::from_str(snapshot_content).map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("checkpoint label snapshot invalid JSON: {error}"),
+                    hint: None,
                 })?;
             let id = parsed.get("id").and_then(serde_json::Value::as_str);
             let name = parsed.get("name").and_then(serde_json::Value::as_str);
@@ -1270,16 +1280,19 @@ pub(super) fn read_scalar_count(result: &crate::QueryResult, label: &str) -> Res
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} query returned no rows"),
+            hint: None,
         })?;
     match value {
         Value::Integer(number) => Ok(*number),
         Value::Text(raw) => raw.parse::<i64>().map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} query returned invalid integer '{raw}': {error}"),
+            hint: None,
         }),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} query returned non-integer value: {other:?}"),
+            hint: None,
         }),
     }
 }
@@ -1290,15 +1303,18 @@ pub(super) fn text_value(value: Option<&Value>, label: &str) -> Result<String, L
         Some(Value::Text(_)) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} must not be empty"),
+            hint: None,
         }),
         Some(Value::Integer(number)) => Ok(number.to_string()),
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} must be text-like, got {other:?}"),
+            hint: None,
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("missing {label}"),
+            hint: None,
         }),
     }
 }
@@ -1320,6 +1336,7 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "builtin schema must define string x-lix-key".to_string(),
+            hint: None,
         })?;
     let schema_version = schema
         .get("x-lix-version")
@@ -1327,6 +1344,7 @@ fn builtin_schema_entity_id(schema: &JsonValue) -> Result<String, LixError> {
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "builtin schema must define string x-lix-version".to_string(),
+            hint: None,
         })?;
 
     Ok(format!("{schema_key}~{schema_version}"))

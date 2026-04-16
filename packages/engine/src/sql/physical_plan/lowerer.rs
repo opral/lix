@@ -448,6 +448,7 @@ fn state_read_exposed_column_error(
                 "{} does not expose version_id; use {} for explicit version filters",
                 resolved_relation.descriptor.public_name, explicit_version_surface
             ),
+            hint: None,
         });
     }
     let column = missing[0].clone();

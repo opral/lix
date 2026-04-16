@@ -449,6 +449,7 @@ pub(crate) fn state_commit_stream_changes_from_changes<Change: StateChangeRecord
                     description: format!(
                         "change state commit stream expected JSON snapshot_content text: {error}"
                     ),
+                    hint: None,
                 },
             )?),
             None => None,
@@ -462,6 +463,7 @@ pub(crate) fn state_commit_stream_changes_from_changes<Change: StateChangeRecord
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "change state commit stream requires schema_version".to_string(),
+                    hint: None,
                 })?
                 .to_string(),
             file_id: change.file_id().map(str::to_string),
@@ -505,6 +507,7 @@ pub fn state_commit_stream_changes_from_planned_rows(
             version_id: version_id.ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "planned row state commit stream requires version_id".to_string(),
+                hint: None,
             })?,
             plugin_key,
             snapshot_content,
@@ -894,6 +897,7 @@ fn planned_row_required_text(row: &PlannedStateRow, key: &str) -> Result<String,
     planned_row_optional_text(row, key).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("planned row state commit stream requires '{key}'"),
+        hint: None,
     })
 }
 
@@ -915,6 +919,7 @@ fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValu
                 description: format!(
                     "planned row state commit stream expected JSON snapshot_content text: {error}"
                 ),
+                hint: None,
             })?;
             Ok(Some(parsed))
         }
@@ -923,6 +928,7 @@ fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValu
             description: format!(
                 "planned row state commit stream expected null/text snapshot_content, got {other:?}"
             ),
+            hint: None,
         }),
     }
 }
@@ -1040,10 +1046,12 @@ fn required_text_value(value: Option<&Value>, field: &str) -> Result<String, Lix
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("expected text-like value for {field}, got {other:?}"),
+            hint: None,
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{field} is missing"),
+            hint: None,
         }),
     }
 }

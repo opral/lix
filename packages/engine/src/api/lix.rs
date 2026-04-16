@@ -597,6 +597,7 @@ mod tests {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "no such table: unknown_table".to_string(),
+                    hint: None,
                 });
             }
             Ok(QueryResult {
@@ -639,6 +640,7 @@ mod tests {
                 return Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "no such table: unknown_table".to_string(),
+                    hint: None,
                 });
             }
             Ok(QueryResult {

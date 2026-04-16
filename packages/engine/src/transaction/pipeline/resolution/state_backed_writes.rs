@@ -1074,6 +1074,7 @@ where
                             "schema '{}' has non-string x-lix-primary-key entry",
                             schema_key
                         ),
+                        hint: None,
                     })?;
                     parse_json_pointer(pointer)
                 })
@@ -1103,6 +1104,7 @@ where
         .ok_or_else(|| crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("schema '{}' is missing string x-lix-version", schema_key),
+            hint: None,
         })?
         .to_string();
     let mut state_defaults = BTreeMap::new();
@@ -1189,6 +1191,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, crate::LixError> {
         return Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("invalid JSON pointer '{pointer}'"),
+            hint: None,
         });
     }
     pointer[1..]
@@ -1209,6 +1212,7 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, crate::LixError>
                     return Err(crate::LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("invalid JSON pointer segment '{segment}'"),
+                        hint: None,
                     })
                 }
             }

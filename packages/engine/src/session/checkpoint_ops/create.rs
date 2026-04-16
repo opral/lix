@@ -51,11 +51,13 @@ async fn create_checkpoint_in_transaction(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("commit '{local_commit_id}' is missing"),
+            hint: None,
         })?;
     if commit.change_set_id.trim().is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("commit '{local_commit_id}' has empty change_set_id"),
+            hint: None,
         });
     }
 

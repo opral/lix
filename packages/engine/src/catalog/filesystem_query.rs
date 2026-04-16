@@ -80,6 +80,7 @@ pub(crate) async fn resolve_file_id_by_path_in_version(
     .map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
+        hint: None,
     })
 }
 

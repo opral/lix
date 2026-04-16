@@ -219,6 +219,7 @@ fn parse_commit_snapshot(raw: &CanonicalJson) -> Result<Option<LixCommit>, LixEr
             "materialization: invalid lix_commit snapshot JSON: {}",
             error.description
         ),
+        hint: None,
     })?;
 
     if parsed.id.is_empty() {
@@ -239,6 +240,7 @@ fn parse_version_descriptor_snapshot(
             "materialization: invalid lix_version_descriptor snapshot JSON: {}",
             error.description
         ),
+        hint: None,
     })?;
 
     if parsed.id.is_empty() {
@@ -252,6 +254,7 @@ fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, Lix
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("materialization: missing column '{label}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -261,6 +264,7 @@ fn text_required(row: &[Value], index: usize, label: &str) -> Result<String, Lix
             description: format!(
                 "materialization: expected text for column '{label}' at index {index}"
             ),
+            hint: None,
         }),
     }
 }
@@ -270,6 +274,7 @@ fn text_optional(row: &[Value], index: usize, label: &str) -> Result<Option<Stri
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("materialization: missing column '{label}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -280,6 +285,7 @@ fn text_optional(row: &[Value], index: usize, label: &str) -> Result<Option<Stri
             description: format!(
                 "materialization: expected nullable text for column '{label}' at index {index}"
             ),
+            hint: None,
         }),
     }
 }
@@ -289,6 +295,7 @@ fn integer_required(row: &[Value], index: usize, label: &str) -> Result<i64, Lix
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("materialization: missing column '{label}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -298,6 +305,7 @@ fn integer_required(row: &[Value], index: usize, label: &str) -> Result<i64, Lix
             description: format!(
                 "materialization: expected integer for column '{label}' at index {index}"
             ),
+            hint: None,
         }),
     }
 }

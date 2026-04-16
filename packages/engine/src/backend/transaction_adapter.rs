@@ -39,6 +39,7 @@ impl<'a> QueryExecutor for TransactionBackendAdapter<'a> {
         let mut guard = self.transaction.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
+            hint: None,
         })?;
         // SAFETY: the pointer is created from a live `&mut dyn LixBackendTransaction` and
         // this mutex serializes all calls so the mutable borrow is not aliased.
@@ -56,6 +57,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
         let mut guard = self.transaction.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction adapter lock poisoned".to_string(),
+            hint: None,
         })?;
         // SAFETY: the pointer is created from a live `&mut dyn LixBackendTransaction` and
         // this mutex serializes all calls so the mutable borrow is not aliased.
@@ -70,6 +72,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "nested transactions are not supported via TransactionBackendAdapter"
                 .to_string(),
+            hint: None,
         })
     }
 
@@ -80,6 +83,7 @@ impl<'a> LixBackend for TransactionBackendAdapter<'a> {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "savepoints are not supported via TransactionBackendAdapter".to_string(),
+            hint: None,
         })
     }
 }

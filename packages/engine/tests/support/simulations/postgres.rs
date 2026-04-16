@@ -61,14 +61,17 @@ async fn ensure_postgres() -> Result<Arc<PostgresInstance>, LixError> {
             std::fs::create_dir_all(pg.settings().data_dir.clone()).map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })?;
             pg.setup().await.map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })?;
             pg.start().await.map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })?;
 
             let settings = pg.settings().clone();
@@ -104,6 +107,7 @@ async fn create_database_url(prefix: &str) -> Result<String, LixError> {
             pg.create_database(&db_name).await.map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })
         };
 
@@ -206,6 +210,7 @@ impl PostgresBackend {
                     .map_err(|err| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: err.to_string(),
+                        hint: None,
                     })
             })
             .await
@@ -243,6 +248,7 @@ impl LixBackend for PostgresBackend {
         let mut conn = pool.acquire().await.map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
+            hint: None,
         })?;
         sqlx::query(match mode {
             TransactionBeginMode::Read => "BEGIN READ ONLY",
@@ -253,6 +259,7 @@ impl LixBackend for PostgresBackend {
         .map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
+            hint: None,
         })?;
         Ok(Box::new(PostgresLixBackendTransaction { conn, mode }))
     }
@@ -293,6 +300,7 @@ impl LixBackendTransaction for PostgresLixBackendTransaction {
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })?;
         Ok(QueryResult {
             rows: Vec::new(),
@@ -307,6 +315,7 @@ impl LixBackendTransaction for PostgresLixBackendTransaction {
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })?;
         Ok(())
     }
@@ -318,6 +327,7 @@ impl LixBackendTransaction for PostgresLixBackendTransaction {
             .map_err(|err| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: err.to_string(),
+                hint: None,
             })?;
         Ok(())
     }
@@ -336,6 +346,7 @@ async fn execute_query_with_connection(
     let rows = query.fetch_all(&mut **conn).await.map_err(|err| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: err.to_string(),
+        hint: None,
     })?;
     let columns = rows
         .first()
@@ -383,6 +394,7 @@ fn map_postgres_value(row: &sqlx::postgres::PgRow, index: usize) -> Result<Value
         .map_err(|err| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: err.to_string(),
+            hint: None,
         })?
         .is_null()
     {
@@ -472,6 +484,7 @@ async fn acquire_lock(path: &std::path::Path) -> Result<FileLock, LixError> {
                             "Timed out acquiring postgres simulation lock at {}",
                             path.display()
                         ),
+                        hint: None,
                     });
                 }
 
@@ -485,6 +498,7 @@ async fn acquire_lock(path: &std::path::Path) -> Result<FileLock, LixError> {
                         path.display(),
                         error
                     ),
+                    hint: None,
                 });
             }
         }
@@ -511,6 +525,7 @@ fn cleanup_stale_embedded_postgres_processes() -> Result<(), LixError> {
             description: format!(
                 "failed to list processes for postgres simulation cleanup: {error}"
             ),
+            hint: None,
         })?;
 
     let listing = String::from_utf8_lossy(&output.stdout);

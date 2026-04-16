@@ -110,6 +110,7 @@ impl<'a> PendingOverlayReadModel<'a> {
                     description: format!(
                         "registered schema snapshot_content invalid JSON: {error}"
                     ),
+                    hint: None,
                 })?;
             let (key, _) = crate::schema::schema_from_registered_snapshot(&snapshot)?;
             rows.insert(key.entity_id(), snapshot_content.clone());
