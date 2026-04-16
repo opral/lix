@@ -2,8 +2,8 @@ use std::collections::{BTreeSet, VecDeque};
 
 use crate::backend::QueryExecutor;
 use crate::canonical::{
-    load_change, load_commit, load_exact_row_at_commit, resolve_merge_base, CanonicalStateIdentity,
-    CanonicalStateRow,
+    load_commit, load_commit_member_change, load_exact_row_at_commit, resolve_merge_base,
+    CanonicalStateIdentity, CanonicalStateRow,
 };
 use crate::functions::LixFunctionProvider;
 use crate::live_state::{
@@ -384,8 +384,10 @@ async fn collect_candidate_entities(
         let entry = load_commit(executor, &commit_id).await?.ok_or_else(|| {
             LixError::unknown(format!("missing commit lineage entry for '{}'", commit_id))
         })?;
+        // Merge walks tracked commit members, not arbitrary journal rows.
         for change_id in entry.change_ids {
-            let Some(change) = load_change(executor, &change_id).await? else {
+            let Some(change) = load_commit_member_change(executor, &commit_id, &change_id).await?
+            else {
                 return Err(LixError::unknown(format!(
                     "missing canonical change row '{}'",
                     change_id

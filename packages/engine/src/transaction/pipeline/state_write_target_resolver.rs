@@ -1,8 +1,8 @@
 //! State write-target resolution helpers.
 //!
 //! This module resolves the concrete state rows a write will target across
-//! local/global and tracked/untracked overlay lanes before the write pipeline
-//! falls back to public selector queries.
+//! local/global and tracked/untracked visibility lanes before the write
+//! pipeline falls back to public selector queries.
 
 use std::collections::{BTreeMap, BTreeSet};
 

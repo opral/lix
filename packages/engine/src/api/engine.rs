@@ -416,13 +416,13 @@ impl crate::transaction::WriteExecutionContext for Engine {
         crate::session::persist_runtime_sequence_in_transaction(transaction, functions).await
     }
 
-    async fn execute_public_tracked_append_txn_with_transaction(
+    async fn execute_public_commit_write_txn_with_transaction(
         &self,
         transaction: &mut dyn crate::LixBackendTransaction,
-        unit: &crate::transaction::TrackedTxnUnit,
+        unit: &crate::transaction::PublicWriteTxnUnit,
         pending_commit_state: Option<&mut Option<crate::transaction::PendingCommitState>>,
-    ) -> Result<crate::transaction::TrackedCommitExecutionOutcome, LixError> {
-        crate::session::execute_public_tracked_append_txn_with_transaction(
+    ) -> Result<crate::transaction::PublicCommitExecutionOutcome, LixError> {
+        crate::session::execute_public_commit_write_txn_with_transaction(
             transaction,
             unit,
             pending_commit_state,

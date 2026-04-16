@@ -5,5 +5,7 @@
 pub(crate) mod write;
 
 pub(crate) use write::{
-    build_prepared_batch_from_canonical_output, CanonicalCommitOutput, ChangeRow,
+    build_prepared_batch_from_canonical_output, build_prepared_batch_from_visibility_rows,
+    CanonicalCommitOutput, ChangeRow, UntrackedChangeVisibilityKind, UntrackedChangeVisibilityRow,
+    UNTRACKED_CHANGE_VISIBILITY_TABLE,
 };

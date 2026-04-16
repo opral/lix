@@ -30,8 +30,8 @@ use crate::streams::StateChangeRecord;
 use crate::transaction::{
     resolve_binary_blob_writes_in_transaction, upsert_registered_schema_mirror_row_in_transaction,
     validate_commit_time_write, BinaryBlobWrite, PendingCommitState, PendingOverlay,
-    PreparedPublicWrite, RegisteredSchemaMirrorRow, TrackedCommitExecutionOutcome, TrackedTxnUnit,
-    TransactionExecutionBackend, WriteExecutionContext,
+    PreparedPublicWrite, PublicCommitExecutionOutcome, PublicWriteTxnUnit,
+    RegisteredSchemaMirrorRow, TransactionExecutionBackend, WriteExecutionContext,
 };
 use crate::version::{parse_active_version_snapshot, GLOBAL_VERSION_ID};
 use crate::{CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId};
@@ -161,13 +161,13 @@ impl WriteExecutionContext for SessionExecutionContext<'_> {
         persist_runtime_sequence(transaction, functions).await
     }
 
-    async fn execute_public_tracked_append_txn_with_transaction(
+    async fn execute_public_commit_write_txn_with_transaction(
         &self,
         transaction: &mut dyn LixBackendTransaction,
-        unit: &TrackedTxnUnit,
+        unit: &PublicWriteTxnUnit,
         mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
-    ) -> Result<TrackedCommitExecutionOutcome, LixError> {
-        execute_public_tracked_append(transaction, unit, pending_commit_state.as_deref_mut()).await
+    ) -> Result<PublicCommitExecutionOutcome, LixError> {
+        execute_public_commit_write(transaction, unit, pending_commit_state.as_deref_mut()).await
     }
 }
 
@@ -227,12 +227,13 @@ pub(crate) async fn persist_runtime_sequence(
     crate::transaction::persist_runtime_sequence_in_transaction(transaction, functions).await
 }
 
-pub(crate) async fn execute_public_tracked_append(
+pub(crate) async fn execute_public_commit_write(
     transaction: &mut dyn LixBackendTransaction,
-    unit: &TrackedTxnUnit,
+    unit: &PublicWriteTxnUnit,
     mut pending_commit_state: Option<&mut Option<PendingCommitState>>,
-) -> Result<TrackedCommitExecutionOutcome, LixError> {
-    let writer_key_updates = tracked_writer_key_updates_for_unit(unit);
+) -> Result<PublicCommitExecutionOutcome, LixError> {
+    debug_assert!(unit.is_commit_member_write());
+    let writer_key_updates = commit_writer_key_updates_for_unit(unit);
     if unit
         .execution
         .change_batch
@@ -241,7 +242,7 @@ pub(crate) async fn execute_public_tracked_append(
         && !unit.has_compiler_only_filesystem_changes()
         && writer_key_updates.is_empty()
     {
-        return Ok(TrackedCommitExecutionOutcome::default());
+        return Ok(PublicCommitExecutionOutcome::default());
     }
 
     if unit.execution.change_batch.is_none()
@@ -249,15 +250,15 @@ pub(crate) async fn execute_public_tracked_append(
         && !writer_key_updates.is_empty()
     {
         let live_rows =
-            tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
+            commit_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
         if !live_rows.is_empty() {
             crate::live_state::write_live_rows(transaction, &live_rows).await?;
         }
-        return Ok(TrackedCommitExecutionOutcome::default());
+        return Ok(PublicCommitExecutionOutcome::default());
     }
 
     let mut create_commit_functions = unit.function_bindings.provider().clone();
-    let canonical_preconditions = canonical_create_commit_preconditions_for_tracked_unit(unit)?;
+    let canonical_preconditions = canonical_create_commit_preconditions_for_commit_unit(unit)?;
 
     if pending_commit_state
         .as_ref()
@@ -314,7 +315,7 @@ pub(crate) async fn execute_public_tracked_append(
 
     if !writer_key_updates.is_empty() {
         let live_rows =
-            tracked_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
+            commit_live_rows_for_writer_key_updates(transaction, &writer_key_updates).await?;
         if !live_rows.is_empty() {
             crate::live_state::write_live_rows(transaction, &live_rows).await?;
         }
@@ -351,13 +352,13 @@ pub(crate) async fn execute_public_tracked_append(
                     .change_batch
                     .as_ref()
                     .map(|batch| batch.write_lane.clone())
-                    .unwrap_or_else(|| match &unit.execution.create_preconditions.write_lane {
-                        WriteLane::SingleVersion(version_id) => {
-                            WriteLane::SingleVersion(version_id.clone())
-                        }
-                        WriteLane::ActiveVersion => WriteLane::ActiveVersion,
-                        WriteLane::GlobalAdmin => WriteLane::GlobalAdmin,
-                    }),
+                    .or_else(|| {
+                        unit.execution
+                            .create_preconditions
+                            .as_ref()
+                            .map(|preconditions| preconditions.write_lane.clone())
+                    })
+                    .unwrap_or(WriteLane::ActiveVersion),
                 writer_key: unit
                     .execution
                     .change_batch
@@ -377,7 +378,7 @@ pub(crate) async fn execute_public_tracked_append(
         })?;
     }
 
-    Ok(TrackedCommitExecutionOutcome {
+    Ok(PublicCommitExecutionOutcome {
         receipt: append_outcome.receipt,
         next_active_version_id: next_active_version_id_from_changes(&applied_changes)?,
         applied_changes,
@@ -415,11 +416,21 @@ async fn mirror_public_registered_schema_bootstrap_rows(
     Ok(())
 }
 
-fn canonical_create_commit_preconditions_for_tracked_unit(
-    unit: &TrackedTxnUnit,
+fn canonical_create_commit_preconditions_for_commit_unit(
+    unit: &PublicWriteTxnUnit,
 ) -> Result<CreateCommitPreconditions, LixError> {
+    let commit_preconditions = unit
+        .execution
+        .create_preconditions
+        .as_ref()
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "public commit execution requires commit preconditions",
+            )
+        })?;
     canonical_create_commit_preconditions_from_public_write(
-        &unit.execution.create_preconditions,
+        commit_preconditions,
         unit.execution.change_batch.as_ref(),
         &unit.public_write,
     )
@@ -468,8 +479,8 @@ fn public_changes_to_staged(changes: &[PublicChange]) -> Result<Vec<StagedChange
     changes.iter().map(public_change_to_staged).collect()
 }
 
-fn tracked_writer_key_updates_for_unit(
-    unit: &TrackedTxnUnit,
+fn commit_writer_key_updates_for_unit(
+    unit: &PublicWriteTxnUnit,
 ) -> BTreeMap<RowIdentity, Option<String>> {
     let mut updates = BTreeMap::new();
     for public_write in &unit.public_writes {
@@ -498,7 +509,7 @@ fn tracked_writer_key_updates_for_unit(
     updates
 }
 
-async fn tracked_live_rows_for_writer_key_updates(
+async fn commit_live_rows_for_writer_key_updates(
     transaction: &mut dyn LixBackendTransaction,
     updates: &BTreeMap<RowIdentity, Option<String>>,
 ) -> Result<Vec<crate::live_state::LiveRow>, LixError> {

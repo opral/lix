@@ -1,4 +1,7 @@
-//! Overlay precedence resolution over tracked and untracked live state.
+//! Overlay precedence resolution over live-state visibility lanes.
+//!
+//! Tracked and untracked here describe how already-materialized live rows are
+//! ordered for reads. They do not imply separate write authorities.
 
 #[cfg(test)]
 use async_trait::async_trait;

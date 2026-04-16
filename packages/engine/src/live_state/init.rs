@@ -2,7 +2,6 @@ use crate::backend::{add_column_if_missing, execute_ddl_batch};
 use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::lifecycle;
 use crate::live_state::register_schema;
-use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};
 use crate::{LixBackend, LixError};
 
 const LIVE_STATE_CREATE_TABLE_STATEMENTS: &[&str] = &[
@@ -100,39 +99,6 @@ pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
     ensure_internal_storage_scope_keys(backend).await?;
     execute_ddl_batch(backend, "live_state.indexes", LIVE_STATE_INDEX_STATEMENTS).await?;
     register_schema(backend, "lix_registered_schema").await?;
-    seed_registered_schema_bootstrap_rows(backend).await?;
-    Ok(())
-}
-
-async fn seed_registered_schema_bootstrap_rows(backend: &dyn LixBackend) -> Result<(), LixError> {
-    let registered_schema_table = tracked_relation_name("lix_registered_schema");
-    let snapshot_expr = snapshot_select_expr_for_schema(
-        "lix_registered_schema",
-        None,
-        backend.dialect(),
-        Some("m"),
-    )?;
-    backend
-        .execute(
-            &format!(
-                "INSERT INTO lix_internal_registered_schema_bootstrap (\
-                 entity_id, schema_key, schema_version, file_id, storage_scope_key, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, untracked, created_at, updated_at\
-                 ) \
-                 SELECT m.entity_id, m.schema_key, m.schema_version, m.file_id, m.{storage_scope_key}, m.version_id, m.global, m.plugin_key, {snapshot_expr}, m.change_id, m.metadata, m.is_tombstone, m.untracked, m.created_at, m.updated_at \
-                 FROM {registered_schema_table} m \
-                 WHERE NOT EXISTS (\
-                   SELECT 1 \
-                   FROM lix_internal_registered_schema_bootstrap b \
-                   WHERE b.entity_id = m.entity_id \
-                     AND b.storage_scope_key = m.{storage_scope_key} \
-                     AND b.version_id = m.version_id \
-                     AND b.untracked = m.untracked\
-                 )",
-                storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
-            ),
-            &[],
-        )
-        .await?;
     Ok(())
 }
 

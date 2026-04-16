@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::canonical::{CanonicalChangeWrite, UpdatedVersionRef};
+use crate::canonical::{
+    canonical_untracked_visibility_write_from_change_visibility, CanonicalChangeWrite,
+    CanonicalUntrackedVisibilityWrite, UpdatedVersionRef,
+};
 use crate::live_state::LiveRow;
 use crate::session::version_ops::VersionInfo;
 use crate::streams::StateChangeRecord;
@@ -197,11 +200,28 @@ pub(crate) fn canonical_changes_from_updated_version_refs(
                     },
                 )?),
                 metadata: None,
-                untracked: true,
                 created_at: update.created_at.clone(),
             })
         })
         .collect()
+}
+
+pub(crate) fn canonical_untracked_visibility_rows_from_updated_version_refs(
+    updates: &[UpdatedVersionRef],
+) -> Result<Vec<CanonicalUntrackedVisibilityWrite>, LixError> {
+    let canonical_changes = canonical_changes_from_updated_version_refs(updates)?;
+    Ok(updates
+        .iter()
+        .zip(canonical_changes.iter())
+        .map(|(update, change)| {
+            canonical_untracked_visibility_write_from_change_visibility(
+                change,
+                crate::version::version_ref_storage_version_id(),
+                true,
+                Some(&update.created_at),
+            )
+        })
+        .collect())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

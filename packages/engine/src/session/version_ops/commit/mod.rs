@@ -26,6 +26,7 @@ pub(crate) use append::{
 };
 pub(crate) use init::init;
 pub(crate) use types::{
-    canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
-    StagedChange,
+    canonical_changes_from_updated_version_refs,
+    canonical_untracked_visibility_rows_from_updated_version_refs,
+    untracked_live_rows_from_updated_version_refs, StagedChange,
 };

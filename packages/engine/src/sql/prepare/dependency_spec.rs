@@ -80,6 +80,8 @@ pub(crate) fn derive_dependency_spec_from_statements(
 pub(crate) fn dependency_spec_to_state_commit_stream_filter(
     spec: &DependencySpec,
 ) -> StateCommitStreamFilter {
+    // Observe and stream consumers now filter one change stream. `include_untracked`
+    // narrows durable/in-memory matching without choosing a separate path.
     StateCommitStreamFilter {
         schema_keys: spec.schema_keys.iter().cloned().collect(),
         entity_ids: spec.entity_ids.iter().cloned().collect(),

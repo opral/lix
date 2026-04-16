@@ -31,7 +31,7 @@ use crate::sql::{
     PreparedInsertOnConflictAction, PreparedWriteOperationKind, PreparedWriteStatementKind,
     PublicWriteExecutionPartition, PublicWritePhysicalPlan, PublicWritePlan, ResolvedWritePlan,
     SqlCompilerMetadata, SqlPreparationMetadataReader, SqlPreparationPendingOverlay,
-    UpdateValidationPlan, WriteDiagnosticContext, WriteOperationKind,
+    UpdateValidationPlan, WriteDiagnosticContext, WriteMode, WriteOperationKind,
 };
 use crate::transaction::ensure_runtime_sequence_initialized_in_transaction;
 use crate::transaction::overlay::PendingOverlay;
@@ -42,12 +42,11 @@ use crate::transaction::pipeline::validation::{
 use crate::transaction::{
     PendingWriteOverlay, PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
     PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
-    PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
+    PreparedPublicWriteExecution, PreparedPublicWriteMaterialization,
     PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
-    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteArtifact,
-    PreparedWriteFunctionBindings, PreparedWriteStatement, SessionCompilerState,
-    TransactionWriteSelectorResolver, UpdateValidationInput, UpdateValidationInputRow,
-    WriteCommand, WriteExecutionContext,
+    PreparedWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement,
+    SessionCompilerState, TransactionWriteSelectorResolver, UpdateValidationInput,
+    UpdateValidationInputRow, WriteCommand, WriteExecutionContext,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
@@ -808,24 +807,27 @@ fn prepared_public_write_execution_artifact_from_sql(
 
 fn prepared_public_write_execution_partition_from_sql(
     partition: &PublicWriteExecutionPartition,
-) -> PreparedPublicWriteExecutionPartition {
+) -> PreparedPublicWriteExecution {
     match partition {
-        PublicWriteExecutionPartition::Tracked(tracked) => {
-            PreparedPublicWriteExecutionPartition::Tracked(PreparedTrackedWriteExecution {
-                schema_live_table_requirements: tracked.schema_live_table_requirements.clone(),
-                change_batch: tracked.change_batch.clone(),
-                create_preconditions: tracked.create_preconditions.clone(),
-                semantic_effects: tracked.semantic_effects.clone(),
-            })
-        }
-        PublicWriteExecutionPartition::Untracked(untracked) => {
-            PreparedPublicWriteExecutionPartition::Untracked(PreparedUntrackedWriteExecution {
-                intended_post_state: untracked.intended_post_state.clone(),
-                semantic_effects: untracked.semantic_effects.clone(),
-                persist_filesystem_payloads_before_write: untracked
-                    .persist_filesystem_payloads_before_write,
-            })
-        }
+        PublicWriteExecutionPartition::Tracked(tracked) => PreparedPublicWriteExecution {
+            execution_mode: WriteMode::Tracked,
+            intended_post_state: Vec::new(),
+            schema_live_table_requirements: tracked.schema_live_table_requirements.clone(),
+            change_batch: tracked.change_batch.clone(),
+            create_preconditions: Some(tracked.create_preconditions.clone()),
+            semantic_effects: tracked.semantic_effects.clone(),
+            persist_filesystem_payloads_before_write: false,
+        },
+        PublicWriteExecutionPartition::Untracked(untracked) => PreparedPublicWriteExecution {
+            execution_mode: WriteMode::Untracked,
+            intended_post_state: untracked.intended_post_state.clone(),
+            schema_live_table_requirements: Vec::new(),
+            change_batch: None,
+            create_preconditions: None,
+            semantic_effects: untracked.semantic_effects.clone(),
+            persist_filesystem_payloads_before_write: untracked
+                .persist_filesystem_payloads_before_write,
+        },
     }
 }
 

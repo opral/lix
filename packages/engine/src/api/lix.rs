@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use super::engine::Engine;
-use crate::backend::{ImageChunkReader, ImageChunkWriter};
+use crate::backend::{ImageChunkReader, ImageChunkWriter, TransactionBeginMode};
 use crate::live_state::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildReport, LiveStateRebuildRequest,
     ProjectionStatus,
@@ -414,6 +414,24 @@ impl Lix {
 
     pub async fn live_state_projection_status(&self) -> Result<ProjectionStatus, LixError> {
         crate::live_state::projection_status(self.engine.backend().as_ref()).await
+    }
+
+    /// Runs repository-owned maintenance compaction for stale untracked journal
+    /// rows that are no longer being compacted opportunistically on write.
+    ///
+    /// This keeps tracked history append-only while letting the engine prune
+    /// superseded untracked rows below the durable consumer watermark.
+    pub async fn compact_untracked_change_journal(&self) -> Result<u64, LixError> {
+        let mut transaction = self
+            .engine
+            .backend()
+            .begin_transaction(TransactionBeginMode::Write)
+            .await?;
+        let deleted =
+            crate::canonical::compact_stale_untracked_changes_in_transaction(transaction.as_mut())
+                .await?;
+        transaction.commit().await?;
+        Ok(deleted as u64)
     }
 
     pub async fn live_state_rebuild_plan(

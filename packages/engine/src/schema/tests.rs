@@ -282,11 +282,11 @@ fn builtin_storage_metadata_keeps_version_runtime_builtins_global() {
 }
 
 #[test]
-fn builtin_storage_metadata_treats_registered_schema_as_local() {
+fn builtin_storage_metadata_treats_registered_schema_as_global() {
     let metadata = builtin_schema_storage_metadata("lix_registered_schema")
         .expect("lix_registered_schema builtin storage metadata should exist");
 
-    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Local);
+    assert_eq!(metadata.storage_lane, BuiltinSchemaStorageLane::Global);
 }
 
 #[test]

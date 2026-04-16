@@ -321,6 +321,17 @@ pub(crate) enum ExplainWriteMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
+pub(crate) enum ExplainCommitReferenceStatus {
+    /// Derived lineage metadata describing whether the partition's canonical
+    /// change rows are referenced by commit membership.
+    CommitReferenced,
+    /// Derived lineage metadata for canonical change rows that are journaled
+    /// but not referenced by commit membership.
+    NotCommitReferenced,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ExplainExpectedHead {
     CurrentHead,
 }
@@ -826,6 +837,25 @@ pub(crate) struct PublicChangeSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct LixChangeRowSnapshot {
+    pub(crate) id: Option<String>,
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) schema_version: Option<String>,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) created_at: Option<String>,
+    /// Public/debug convenience metadata on the canonical row snapshot.
+    ///
+    /// This is derived visibility metadata, not stored canonical fact state.
+    /// Commit-reference status is represented separately in explain output so
+    /// that the canonical row shape does not collapse fact data and lineage.
+    pub(crate) untracked: bool,
+    pub(crate) snapshot_content: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SemanticEffectSnapshot {
     pub(crate) effect_key: String,
     pub(crate) target: String,
@@ -865,22 +895,14 @@ pub(crate) struct PublicWriteMaterializationSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum PublicWriteExecutionPartitionSnapshot {
-    Tracked(TrackedWritePlanSnapshot),
-    Untracked(UntrackedWritePlanSnapshot),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct TrackedWritePlanSnapshot {
+pub(crate) struct PublicWriteExecutionPartitionSnapshot {
+    pub(crate) execution_mode: ExplainWriteMode,
+    /// Derived lineage/debug metadata. This is intentionally separate from the
+    /// canonical `lix_change` row shape captured below.
+    pub(crate) commit_reference_status: ExplainCommitReferenceStatus,
+    pub(crate) lix_change_rows: Vec<LixChangeRowSnapshot>,
     pub(crate) schema_live_table_requirements: Vec<SchemaLiveTableRequirementSnapshot>,
-    pub(crate) change_batch: Option<ChangeBatchSnapshot>,
-    pub(crate) create_preconditions: CommitPreconditionsSnapshot,
-    pub(crate) semantic_effects: PlanEffectsSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct UntrackedWritePlanSnapshot {
+    pub(crate) create_preconditions: Option<CommitPreconditionsSnapshot>,
     pub(crate) intended_post_state: Vec<PlannedStateRowSnapshot>,
     pub(crate) semantic_effects: PlanEffectsSnapshot,
     pub(crate) persist_filesystem_payloads_before_write: bool,
@@ -1848,6 +1870,8 @@ pub(crate) struct CompiledExplainArtifacts {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) resolved_write_plan: Option<Box<ResolvedWritePlanSnapshot>>,
     #[serde(default)]
+    pub(crate) lix_change_rows: Vec<LixChangeRowSnapshot>,
+    #[serde(default)]
     pub(crate) change_batches: Vec<ChangeBatchSnapshot>,
     #[serde(default)]
     pub(crate) commit_preconditions: Vec<CommitPreconditionsSnapshot>,
@@ -2119,13 +2143,48 @@ fn render_physical_plan_text(plan: &ExplainPhysicalPlanSnapshot) -> String {
                 explain_history_read_plan_label(plan),
             ),
         },
-        ExplainPhysicalPlanSnapshot::PublicWrite(execution) => match execution.as_ref() {
-            ExplainPublicWriteExecution::Noop => "kind: public_write\nexecution: noop".to_string(),
-            ExplainPublicWriteExecution::Materialize(materialization) => format!(
-                "kind: public_write\nexecution: materialize\npartitions: {}",
+        ExplainPhysicalPlanSnapshot::PublicWrite(execution) => {
+            render_public_write_physical_plan_text(execution)
+        }
+    }
+}
+
+fn render_public_write_physical_plan_text(execution: &ExplainPublicWriteExecution) -> String {
+    match execution {
+        ExplainPublicWriteExecution::Noop => "kind: public_write\nexecution: noop".to_string(),
+        ExplainPublicWriteExecution::Materialize(materialization) => {
+            let lix_change_rows = materialization
+                .partitions
+                .iter()
+                .flat_map(|partition| partition.lix_change_rows.iter())
+                .collect::<Vec<_>>();
+            let commit_referenced_rows = materialization
+                .partitions
+                .iter()
+                .filter(|partition| {
+                    partition.commit_reference_status
+                        == ExplainCommitReferenceStatus::CommitReferenced
+                })
+                .map(|partition| partition.lix_change_rows.len())
+                .sum::<usize>();
+            let not_commit_referenced_rows = materialization
+                .partitions
+                .iter()
+                .filter(|partition| {
+                    partition.commit_reference_status
+                        == ExplainCommitReferenceStatus::NotCommitReferenced
+                })
+                .map(|partition| partition.lix_change_rows.len())
+                .sum::<usize>();
+            format!(
+                "kind: public_write\nexecution: materialize\npartitions: {}\nlix_change_rows: {}\ncommit_referenced_rows: {}\nnot_commit_referenced_rows: {}\nuntracked_rows: {}",
                 materialization.partitions.len(),
-            ),
-        },
+                lix_change_rows.len(),
+                commit_referenced_rows,
+                not_commit_referenced_rows,
+                lix_change_rows.iter().filter(|row| row.untracked).count(),
+            )
+        }
     }
 }
 
@@ -2152,6 +2211,15 @@ fn render_compiled_artifacts_text(artifacts: &CompiledExplainArtifacts) -> Strin
         format!(
             "commit_preconditions: {}",
             artifacts.commit_preconditions.len()
+        ),
+        format!("lix_change_rows: {}", artifacts.lix_change_rows.len()),
+        format!(
+            "untracked_rows: {}",
+            artifacts
+                .lix_change_rows
+                .iter()
+                .filter(|row| row.untracked)
+                .count()
         ),
         format!("change_batches: {}", artifacts.change_batches.len()),
         format!(
@@ -2553,6 +2621,7 @@ pub(crate) fn build_public_write_explain_artifacts(
 ) -> ExplainArtifacts {
     let compiled_artifacts = compiled_artifacts_for_public_write(
         &input.planned_write,
+        &input.execution,
         &input.change_batches,
         input.invariant_trace.as_ref(),
     );
@@ -2691,6 +2760,7 @@ fn compiled_artifacts_for_public_read(
         schema_proof: None,
         target_set_proof: None,
         resolved_write_plan: None,
+        lix_change_rows: Vec::new(),
         change_batches: Vec::new(),
         commit_preconditions: Vec::new(),
         invariant_trace: None,
@@ -2702,6 +2772,7 @@ fn compiled_artifacts_for_public_read(
 
 fn compiled_artifacts_for_public_write(
     planned_write: &PlannedWrite,
+    execution: &PublicWritePhysicalPlan,
     change_batches: &[ChangeBatch],
     invariant_trace: Option<&PublicWriteInvariantTrace>,
 ) -> CompiledExplainArtifacts {
@@ -2736,6 +2807,7 @@ fn compiled_artifacts_for_public_write(
             .as_ref()
             .map(resolved_write_plan_snapshot)
             .map(Box::new),
+        lix_change_rows: public_write_lix_change_row_snapshots(execution),
         change_batches: change_batches.iter().map(change_batch_snapshot).collect(),
         commit_preconditions: planned_write
             .commit_preconditions
@@ -2768,6 +2840,7 @@ fn compiled_artifacts_for_direct(logical_plan: &DirectLogicalPlan) -> CompiledEx
         schema_proof: None,
         target_set_proof: None,
         resolved_write_plan: None,
+        lix_change_rows: Vec::new(),
         change_batches: Vec::new(),
         commit_preconditions: Vec::new(),
         invariant_trace: None,
@@ -4831,31 +4904,58 @@ fn public_write_execution_partition_snapshot(
 ) -> PublicWriteExecutionPartitionSnapshot {
     match partition {
         PublicWriteExecutionPartition::Tracked(execution) => {
-            PublicWriteExecutionPartitionSnapshot::Tracked(tracked_write_plan_snapshot(execution))
+            public_write_tracked_partition_snapshot(execution)
         }
         PublicWriteExecutionPartition::Untracked(execution) => {
-            PublicWriteExecutionPartitionSnapshot::Untracked(untracked_write_plan_snapshot(
-                execution,
-            ))
+            public_write_untracked_partition_snapshot(execution)
         }
     }
 }
 
-fn tracked_write_plan_snapshot(execution: &TrackedWritePlan) -> TrackedWritePlanSnapshot {
-    TrackedWritePlanSnapshot {
+fn public_write_tracked_partition_snapshot(
+    execution: &TrackedWritePlan,
+) -> PublicWriteExecutionPartitionSnapshot {
+    PublicWriteExecutionPartitionSnapshot {
+        execution_mode: ExplainWriteMode::Tracked,
+        commit_reference_status: ExplainCommitReferenceStatus::CommitReferenced,
+        lix_change_rows: execution
+            .change_batch
+            .as_ref()
+            .map(|batch| {
+                batch
+                    .changes
+                    .iter()
+                    .map(|change| lix_change_row_snapshot_from_public_change(change, false))
+                    .collect()
+            })
+            .unwrap_or_default(),
         schema_live_table_requirements: execution
             .schema_live_table_requirements
             .iter()
             .map(schema_live_table_requirement_snapshot)
             .collect(),
-        change_batch: execution.change_batch.as_ref().map(change_batch_snapshot),
-        create_preconditions: commit_preconditions_snapshot(&execution.create_preconditions),
+        create_preconditions: Some(commit_preconditions_snapshot(
+            &execution.create_preconditions,
+        )),
+        intended_post_state: Vec::new(),
         semantic_effects: plan_effects_snapshot(&execution.semantic_effects),
+        persist_filesystem_payloads_before_write: false,
     }
 }
 
-fn untracked_write_plan_snapshot(execution: &UntrackedWritePlan) -> UntrackedWritePlanSnapshot {
-    UntrackedWritePlanSnapshot {
+fn public_write_untracked_partition_snapshot(
+    execution: &UntrackedWritePlan,
+) -> PublicWriteExecutionPartitionSnapshot {
+    PublicWriteExecutionPartitionSnapshot {
+        execution_mode: ExplainWriteMode::Untracked,
+        commit_reference_status: ExplainCommitReferenceStatus::NotCommitReferenced,
+        lix_change_rows: execution
+            .intended_post_state
+            .iter()
+            .map(|row| lix_change_row_snapshot_from_planned_state_row(row, true))
+            .collect(),
+        schema_live_table_requirements: Vec::new(),
+        create_preconditions: None,
         intended_post_state: execution
             .intended_post_state
             .iter()
@@ -5291,6 +5391,93 @@ fn public_change_snapshot(change: &PublicChange) -> PublicChangeSnapshot {
         metadata: change.metadata.clone(),
         version_id: change.version_id.clone(),
         writer_key: change.writer_key.clone(),
+    }
+}
+
+fn public_write_lix_change_row_snapshots(
+    execution: &PublicWritePhysicalPlan,
+) -> Vec<LixChangeRowSnapshot> {
+    match execution {
+        PublicWritePhysicalPlan::Noop => Vec::new(),
+        PublicWritePhysicalPlan::Materialize(materialization) => materialization
+            .partitions
+            .iter()
+            .flat_map(|partition| match partition {
+                PublicWriteExecutionPartition::Tracked(execution) => execution
+                    .change_batch
+                    .as_ref()
+                    .map(|batch| {
+                        batch
+                            .changes
+                            .iter()
+                            .map(|change| lix_change_row_snapshot_from_public_change(change, false))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default(),
+                PublicWriteExecutionPartition::Untracked(execution) => execution
+                    .intended_post_state
+                    .iter()
+                    .map(|row| lix_change_row_snapshot_from_planned_state_row(row, true))
+                    .collect::<Vec<_>>(),
+            })
+            .collect(),
+    }
+}
+
+fn lix_change_row_snapshot_from_public_change(
+    change: &PublicChange,
+    untracked: bool,
+) -> LixChangeRowSnapshot {
+    LixChangeRowSnapshot {
+        id: None,
+        entity_id: change.entity_id.clone(),
+        schema_key: change.schema_key.clone(),
+        schema_version: change.schema_version.clone(),
+        file_id: change.file_id.clone(),
+        plugin_key: change.plugin_key.clone(),
+        metadata: change.metadata.clone(),
+        created_at: None,
+        untracked,
+        snapshot_content: change.snapshot_content.clone(),
+    }
+}
+
+fn lix_change_row_snapshot_from_planned_state_row(
+    row: &PlannedStateRow,
+    untracked: bool,
+) -> LixChangeRowSnapshot {
+    LixChangeRowSnapshot {
+        id: None,
+        entity_id: row.entity_id.clone(),
+        schema_key: row.schema_key.clone(),
+        schema_version: planned_row_text_value(row, "schema_version"),
+        file_id: planned_row_text_value(row, "file_id"),
+        plugin_key: planned_row_text_value(row, "plugin_key"),
+        metadata: planned_row_json_text_value(row, "metadata"),
+        created_at: None,
+        untracked,
+        snapshot_content: if row.tombstone {
+            None
+        } else {
+            planned_row_json_text_value(row, "snapshot_content")
+        },
+    }
+}
+
+fn planned_row_text_value(row: &PlannedStateRow, key: &str) -> Option<String> {
+    match row.values.get(key) {
+        Some(Value::Text(value)) => Some(value.clone()),
+        Some(Value::Integer(value)) => Some(value.to_string()),
+        Some(Value::Boolean(value)) => Some(value.to_string()),
+        Some(Value::Real(value)) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn planned_row_json_text_value(row: &PlannedStateRow, key: &str) -> Option<String> {
+    match row.values.get(key) {
+        Some(Value::Json(value)) => Some(value.to_string()),
+        _ => planned_row_text_value(row, key),
     }
 }
 

@@ -1,3 +1,4 @@
+use crate::canonical::compact_untracked_changes_for_touched_rows_in_transaction;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::transaction::PendingCommitState;
@@ -77,6 +78,17 @@ async fn append_tracked_unchecked(
             crate::live_state::write_live_rows(transaction, &live_rows).await?;
         }
         crate::live_state::finalize_live_state_after_commit_write(transaction).await?;
+        if result.applied_output.is_some() {
+            let visibility_rows =
+                crate::session::canonical_untracked_visibility_rows_from_updated_version_refs(
+                    &receipt.canonical_receipt.updated_version_refs,
+                )?;
+            compact_untracked_changes_for_touched_rows_in_transaction(
+                transaction,
+                &visibility_rows,
+            )
+            .await?;
+        }
     }
 
     Ok(result)

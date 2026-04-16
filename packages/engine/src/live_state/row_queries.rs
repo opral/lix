@@ -1131,7 +1131,6 @@ mod tests {
                 snapshot_id: "snapshot-1",
                 snapshot_content: Some(r#"{"key":"theme","value":"canonical"}"#),
                 metadata: Some(r#"{"kind":"state"}"#),
-                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )
@@ -1151,7 +1150,6 @@ mod tests {
                     r#"{"id":"commit-1","change_set_id":"cs-1","change_ids":["change-1"],"parent_commit_ids":[]}"#,
                 ),
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-30T00:00:00Z",
             },
         )

@@ -1,4 +1,4 @@
-//! Typed access to live tracked rows.
+//! Typed access to live rows in the tracked visibility lane.
 
 mod contracts;
 mod read;

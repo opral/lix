@@ -4271,7 +4271,6 @@ mod tests {
                     snapshot_id: &snapshot_id,
                     snapshot_content: Some(snapshot_content.as_str()),
                     metadata: None,
-                    untracked: false,
                     created_at: match index {
                         0 => "2026-04-02T01:00:00Z",
                         1 => "2026-04-02T01:00:01Z",
@@ -4304,7 +4303,6 @@ mod tests {
                     snapshot_id: "snapshot-public-root-commit",
                     snapshot_content: Some(commit_snapshot.as_str()),
                     metadata: None,
-                    untracked: false,
                     created_at: "2026-04-02T01:10:00Z",
                 },
             )

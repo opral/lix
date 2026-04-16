@@ -1,7 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
-use crate::canonical::{append_changes, CanonicalCommitReceipt, UpdatedVersionRef};
+use crate::canonical::{
+    append_changes, append_untracked_change_visibility_rows,
+    compact_untracked_changes_for_touched_rows_in_transaction, CanonicalCommitReceipt,
+    UpdatedVersionRef,
+};
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
@@ -19,12 +23,13 @@ use super::create::{
     CreateCommitAppliedOutput, CreateCommitError, CreateCommitExpectedHead,
     CreateCommitPreconditions, CreateCommitWriteLane,
 };
-use super::generate::generate_commit;
+use super::generate::{canonical_change_is_commit_member, generate_commit};
 use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{
-    canonical_changes_from_updated_version_refs, tracked_live_rows_from_staged_changes,
-    untracked_live_rows_from_updated_version_refs, GenerateCommitArgs, GenerateCommitResult,
-    StagedChange,
+    canonical_changes_from_updated_version_refs,
+    canonical_untracked_visibility_rows_from_updated_version_refs,
+    tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
+    GenerateCommitArgs, GenerateCommitResult, StagedChange,
 };
 struct TransactionCommitExecutor<'a> {
     transaction: &'a mut dyn LixBackendTransaction,
@@ -306,11 +311,7 @@ fn rewrite_generated_commit_result_for_pending_session(
     let mut canonical_changes = generated
         .canonical_changes
         .into_iter()
-        .filter(|change| {
-            !change.untracked
-                && change.schema_key.as_str() != "lix_commit"
-                && change.schema_key.as_str() != "lix_change_set"
-        })
+        .filter(canonical_change_is_commit_member)
         .take(change_count)
         .collect::<Vec<_>>();
     canonical_changes.extend(canonical_changes_from_updated_version_refs(
@@ -361,7 +362,11 @@ async fn execute_generated_commit_result(
     functions: &mut dyn LixFunctionProvider,
     tracked_live_rows: &[crate::live_state::LiveRow],
 ) -> Result<CanonicalCommitProjectionReceipt, LixError> {
+    let visibility_rows = canonical_untracked_visibility_rows_from_updated_version_refs(
+        &result.updated_version_refs,
+    )?;
     append_changes(transaction, &result.canonical_changes, functions).await?;
+    append_untracked_change_visibility_rows(transaction, &visibility_rows).await?;
     let mut write_batch = WriteBatch::new();
     if !binary_blob_writes.is_empty() {
         let blob_writes = binary_blob_writes
@@ -391,6 +396,11 @@ async fn execute_generated_commit_result(
         crate::live_state::write_live_rows(transaction, &live_rows).await?;
     }
     crate::live_state::finalize_live_state_after_commit_write(transaction).await?;
+    let visibility_rows = canonical_untracked_visibility_rows_from_updated_version_refs(
+        &result.updated_version_refs,
+    )?;
+    compact_untracked_changes_for_touched_rows_in_transaction(transaction, &visibility_rows)
+        .await?;
     Ok(receipt)
 }
 

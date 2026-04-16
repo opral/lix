@@ -20,8 +20,7 @@ use crate::transaction::filesystem::state::filesystem_transaction_state_from_pla
 use crate::transaction::overlay::PendingSemanticRow;
 use crate::transaction::{
     PendingWriteOverlay, PreparedDirectWriteArtifact, PreparedPublicWrite,
-    PreparedPublicWriteExecutionPartition, PreparedPublicWritePlanArtifact,
-    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteFunctionBindings,
+    PreparedPublicWriteExecution, PreparedPublicWritePlanArtifact, PreparedWriteFunctionBindings,
     PreparedWriteStatement,
 };
 use crate::version::GLOBAL_VERSION_ID;
@@ -30,27 +29,39 @@ use crate::LixError;
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 #[derive(Clone)]
-pub(crate) struct TrackedTxnUnit {
+pub(crate) struct PublicWriteTxnUnit {
     pub(crate) public_writes: Vec<PreparedPublicWrite>,
     pub(crate) public_write: PreparedPublicWrite,
-    pub(crate) execution: PreparedTrackedWriteExecution,
+    pub(crate) execution: PreparedPublicWriteExecution,
+    pub(crate) canonical_changes: Vec<CanonicalChangeWrite>,
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) function_bindings: PreparedWriteFunctionBindings,
     pub(crate) writer_key: Option<String>,
 }
 
-impl TrackedTxnUnit {
+impl PublicWriteTxnUnit {
+    pub(crate) fn is_commit_member_write(&self) -> bool {
+        self.execution.execution_mode == WriteMode::Tracked
+    }
+
+    pub(crate) fn is_immediate_write(&self) -> bool {
+        self.execution.execution_mode == WriteMode::Untracked
+    }
+
     pub(crate) fn should_emit_observe_tick(&self) -> bool {
-        self.has_compiler_only_filesystem_changes()
-            || !self
-                .execution
-                .semantic_effects
-                .state_commit_stream_changes
-                .is_empty()
+        self.is_commit_member_write()
+            && (self.has_compiler_only_filesystem_changes()
+                || !self
+                    .execution
+                    .semantic_effects
+                    .state_commit_stream_changes
+                    .is_empty())
     }
 
     pub(crate) fn has_compiler_only_filesystem_changes(&self) -> bool {
-        self.execution.change_batch.is_none() && !self.filesystem_state.files.is_empty()
+        self.is_commit_member_write()
+            && self.execution.change_batch.is_none()
+            && !self.filesystem_state.files.is_empty()
     }
 
     pub(crate) fn is_merged_transaction_plan(&self) -> bool {
@@ -58,29 +69,22 @@ impl TrackedTxnUnit {
     }
 }
 
-fn build_tracked_txn_unit(
+fn build_public_write_txn_unit(
     public_write: &PreparedPublicWrite,
-    execution: &PreparedTrackedWriteExecution,
+    execution: &PreparedPublicWriteExecution,
+    canonical_changes: Vec<CanonicalChangeWrite>,
     filesystem_state: &FilesystemTransactionState,
     function_bindings: &PreparedWriteFunctionBindings,
-) -> TrackedTxnUnit {
-    TrackedTxnUnit {
+) -> PublicWriteTxnUnit {
+    PublicWriteTxnUnit {
         public_writes: vec![public_write.clone()],
         public_write: public_write.clone(),
         execution: execution.clone(),
+        canonical_changes,
         filesystem_state: filesystem_state.clone(),
         function_bindings: function_bindings.clone(),
         writer_key: public_write.contract.writer_key.clone(),
     }
-}
-
-#[derive(Clone)]
-pub(crate) struct PlannedPublicUntrackedWriteUnit {
-    pub(crate) execution: PreparedUntrackedWriteExecution,
-    pub(crate) canonical_changes: Vec<CanonicalChangeWrite>,
-    pub(crate) filesystem_state: FilesystemTransactionState,
-    pub(crate) function_bindings: PreparedWriteFunctionBindings,
-    pub(crate) writer_key: Option<String>,
 }
 
 #[derive(Clone)]
@@ -92,8 +96,7 @@ pub(crate) struct PlannedDirectWriteUnit {
 
 #[derive(Clone)]
 pub(crate) enum TransactionWriteUnit {
-    PublicTracked(TrackedTxnUnit),
-    PublicUntracked(PlannedPublicUntrackedWriteUnit),
+    Public(PublicWriteTxnUnit),
     Direct(PlannedDirectWriteUnit),
 }
 
@@ -105,22 +108,22 @@ pub(crate) struct PlannedWritePlan {
 impl PlannedWritePlan {
     pub(crate) fn extend(&mut self, other: PlannedWritePlan) {
         self.units.extend(other.units);
-        self.coalesce_filesystem_tracked_units();
+        self.coalesce_filesystem_commit_units();
     }
 
-    pub(crate) fn coalesce_filesystem_tracked_units(&mut self) {
+    pub(crate) fn coalesce_filesystem_commit_units(&mut self) {
         let mut coalesced = Vec::with_capacity(self.units.len());
         for unit in std::mem::take(&mut self.units) {
             match unit {
-                TransactionWriteUnit::PublicTracked(next)
+                TransactionWriteUnit::Public(next)
                     if coalesced
                         .last_mut()
                         .and_then(|current| match current {
-                            TransactionWriteUnit::PublicTracked(current) => Some(current),
+                            TransactionWriteUnit::Public(current) => Some(current),
                             _ => None,
                         })
                         .is_some_and(|current| {
-                            try_merge_filesystem_tracked_plans(current, &next)
+                            try_merge_filesystem_commit_plans(current, &next)
                         }) => {}
                 other => coalesced.push(other),
             }
@@ -440,31 +443,30 @@ pub(crate) fn build_planned_write_plan(
             &public_write.execution
         {
             for partition in &materialization.partitions {
-                match partition {
-                    PreparedPublicWriteExecutionPartition::Tracked(tracked) => {
-                        let tracked_plan = build_tracked_txn_unit(
+                match partition.execution_mode {
+                    WriteMode::Tracked => {
+                        let unit = build_public_write_txn_unit(
                             public_write,
-                            tracked,
+                            partition,
+                            Vec::new(),
                             &filesystem_state,
                             function_bindings,
                         );
-                        units.push(TransactionWriteUnit::PublicTracked(tracked_plan));
+                        units.push(TransactionWriteUnit::Public(unit));
                     }
-                    PreparedPublicWriteExecutionPartition::Untracked(untracked) => {
+                    WriteMode::Untracked => {
                         let canonical_changes = build_untracked_canonical_changes(
-                            &untracked.intended_post_state,
+                            &partition.intended_post_state,
                             function_bindings.provider().clone(),
                         )
                         .ok()?;
-                        units.push(TransactionWriteUnit::PublicUntracked(
-                            PlannedPublicUntrackedWriteUnit {
-                                execution: untracked.clone(),
-                                canonical_changes,
-                                filesystem_state: filesystem_state.clone(),
-                                function_bindings: function_bindings.clone(),
-                                writer_key: public_write.contract.writer_key.clone(),
-                            },
-                        ));
+                        units.push(TransactionWriteUnit::Public(build_public_write_txn_unit(
+                            public_write,
+                            partition,
+                            canonical_changes,
+                            &filesystem_state,
+                            function_bindings,
+                        )));
                     }
                 }
             }
@@ -477,14 +479,20 @@ pub(crate) fn build_planned_write_plan(
                 {
                     continue;
                 }
-                units.push(TransactionWriteUnit::PublicTracked(build_tracked_txn_unit(
+                units.push(TransactionWriteUnit::Public(build_public_write_txn_unit(
                     public_write,
-                    &PreparedTrackedWriteExecution {
+                    &PreparedPublicWriteExecution {
+                        execution_mode: WriteMode::Tracked,
+                        intended_post_state: Vec::new(),
                         schema_live_table_requirements: Vec::new(),
                         change_batch: None,
-                        create_preconditions: writer_key_only_commit_preconditions(public_write),
+                        create_preconditions: Some(writer_key_only_commit_preconditions(
+                            public_write,
+                        )),
                         semantic_effects: PlanEffects::default(),
+                        persist_filesystem_payloads_before_write: false,
                     },
+                    Vec::new(),
                     &filesystem_state,
                     function_bindings,
                 )));
@@ -505,7 +513,7 @@ pub(crate) fn build_planned_write_plan(
         None
     } else {
         let mut plan = PlannedWritePlan { units };
-        plan.coalesce_filesystem_tracked_units();
+        plan.coalesce_filesystem_commit_units();
         Some(plan)
     }
 }
@@ -537,9 +545,9 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
     let mut registrations = SchemaRegistrationSet::default();
     for unit in &plan.units {
         match unit {
-            TransactionWriteUnit::PublicTracked(tracked) => {
+            TransactionWriteUnit::Public(public) if public.is_commit_member_write() => {
                 for requirement in coalesce_live_table_requirements(
-                    &tracked.execution.schema_live_table_requirements,
+                    &public.execution.schema_live_table_requirements,
                 ) {
                     match requirement.schema_definition.as_ref() {
                         Some(schema_definition) => {
@@ -552,8 +560,8 @@ fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> Schem
                     }
                 }
             }
-            TransactionWriteUnit::PublicUntracked(untracked) => {
-                for row in &untracked.execution.intended_post_state {
+            TransactionWriteUnit::Public(public) => {
+                for row in &public.execution.intended_post_state {
                     registrations.insert(row.schema_key.clone());
                 }
             }
@@ -603,8 +611,8 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
     let mut overlay = PendingWriterKeyOverlay::default();
     for unit in &plan.units {
         match unit {
-            TransactionWriteUnit::PublicTracked(tracked) => {
-                for public_write in &tracked.public_writes {
+            TransactionWriteUnit::Public(public) if public.is_commit_member_write() => {
+                for public_write in &public.public_writes {
                     let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
                         continue;
                     };
@@ -645,8 +653,8 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                     }
                 }
             }
-            TransactionWriteUnit::PublicUntracked(untracked) => {
-                for row in &untracked.execution.intended_post_state {
+            TransactionWriteUnit::Public(public) => {
+                for row in &public.execution.intended_post_state {
                     let Some(version_id) = row.version_id.as_ref() else {
                         continue;
                     };
@@ -662,9 +670,7 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
                             entity_id: row.entity_id.clone(),
                             file_id,
                         },
-                        row.writer_key
-                            .clone()
-                            .or_else(|| untracked.writer_key.clone()),
+                        row.writer_key.clone().or_else(|| public.writer_key.clone()),
                     );
                 }
             }
@@ -677,10 +683,8 @@ pub(crate) fn pending_writer_key_overlay_for_planned_write_plan(
 pub(crate) fn planned_write_plan_is_independent_filesystem(plan: &PlannedWritePlan) -> bool {
     !plan.units.is_empty()
         && plan.units.iter().all(|unit| match unit {
-            TransactionWriteUnit::PublicTracked(tracked) => {
-                tracked_plan_is_coalescible_filesystem(tracked)
-            }
-            TransactionWriteUnit::PublicUntracked(_) | TransactionWriteUnit::Direct(_) => false,
+            TransactionWriteUnit::Public(public) => commit_plan_is_coalescible_filesystem(public),
+            TransactionWriteUnit::Direct(_) => false,
         })
 }
 
@@ -695,14 +699,14 @@ pub(crate) fn planned_write_plans_can_continue_together(
     }
 
     left.units.iter().all(|left_unit| {
-        let TransactionWriteUnit::PublicTracked(left_tracked) = left_unit else {
+        let TransactionWriteUnit::Public(left_commit) = left_unit else {
             return false;
         };
         right.units.iter().all(|right_unit| {
-            let TransactionWriteUnit::PublicTracked(right_tracked) = right_unit else {
+            let TransactionWriteUnit::Public(right_commit) = right_unit else {
                 return false;
             };
-            filesystem_tracked_plans_are_buffer_compatible(left_tracked, right_tracked)
+            filesystem_commit_plans_are_buffer_compatible(left_commit, right_commit)
         })
     })
 }
@@ -739,9 +743,9 @@ fn collect_semantic_overlay_from_planned_write_plan(
 
     for unit in &plan.units {
         let unit_supported = match unit {
-            TransactionWriteUnit::PublicTracked(tracked) => {
-                !filesystem_transaction_state_has_binary_payloads(&tracked.filesystem_state)
-                    && tracked
+            TransactionWriteUnit::Public(public) if public.is_commit_member_write() => {
+                !filesystem_transaction_state_has_binary_payloads(&public.filesystem_state)
+                    && public
                         .public_writes
                         .iter()
                         .try_fold(true, |supported, public_write| {
@@ -751,17 +755,17 @@ fn collect_semantic_overlay_from_planned_write_plan(
                             collect_semantic_overlay_from_public_write(public_write, overlay)
                         })?
             }
-            TransactionWriteUnit::PublicUntracked(untracked) => {
-                let planned_rows = untracked
+            TransactionWriteUnit::Public(public) => {
+                let planned_rows = public
                     .execution
                     .intended_post_state
                     .iter()
                     .collect::<Vec<_>>();
-                untracked.filesystem_state.files.is_empty()
+                public.filesystem_state.files.is_empty()
                     && collect_semantic_overlay_from_planned_rows(
                         &planned_rows,
                         true,
-                        &untracked.canonical_changes,
+                        &public.canonical_changes,
                         overlay,
                     )?
             }
@@ -794,10 +798,10 @@ fn collect_filesystem_overlay_from_planned_write_plan(
     let mut saw_entry = false;
     for unit in &plan.units {
         let unit_supported = match unit {
-            TransactionWriteUnit::PublicTracked(tracked) => {
-                collect_filesystem_overlay_from_tracked_plan(tracked, overlay, &mut saw_entry)
+            TransactionWriteUnit::Public(public) => {
+                collect_filesystem_overlay_from_commit_plan(public, overlay, &mut saw_entry)
             }
-            TransactionWriteUnit::PublicUntracked(_) | TransactionWriteUnit::Direct(_) => false,
+            TransactionWriteUnit::Direct(_) => false,
         };
         if !unit_supported {
             return false;
@@ -807,16 +811,19 @@ fn collect_filesystem_overlay_from_planned_write_plan(
     saw_entry
 }
 
-fn collect_filesystem_overlay_from_tracked_plan(
-    tracked: &TrackedTxnUnit,
+fn collect_filesystem_overlay_from_commit_plan(
+    commit: &PublicWriteTxnUnit,
     overlay: &mut PendingFilesystemOverlay,
     saw_entry: &mut bool,
 ) -> bool {
-    if !is_catalog_filesystem_file_surface(&tracked.public_write.contract.target) {
+    if !commit.is_commit_member_write() {
+        return false;
+    }
+    if !is_catalog_filesystem_file_surface(&commit.public_write.contract.target) {
         return false;
     }
 
-    for public_write in &tracked.public_writes {
+    for public_write in &commit.public_writes {
         let Some(resolved) = public_write.contract.resolved_write_plan.as_ref() else {
             return false;
         };
@@ -840,7 +847,7 @@ fn collect_filesystem_overlay_from_tracked_plan(
         }
     }
 
-    let state = tracked.filesystem_state.clone();
+    let state = commit.filesystem_state.clone();
     if !state.files.is_empty() {
         *saw_entry = true;
     }
@@ -953,9 +960,7 @@ fn collect_semantic_overlay_from_planned_rows(
         let change = canonical_changes.get(index);
         if !collect_semantic_overlay_row(
             row,
-            change
-                .map(|change| change.untracked)
-                .unwrap_or(default_untracked),
+            default_untracked,
             change.map(|change| change.id.as_str()),
             overlay,
         )? {
@@ -1076,8 +1081,11 @@ fn collect_semantic_overlay_from_mutation_rows(
     Ok(true)
 }
 
-fn try_merge_filesystem_tracked_plans(current: &mut TrackedTxnUnit, next: &TrackedTxnUnit) -> bool {
-    if !filesystem_tracked_plans_are_buffer_compatible(current, next) {
+fn try_merge_filesystem_commit_plans(
+    current: &mut PublicWriteTxnUnit,
+    next: &PublicWriteTxnUnit,
+) -> bool {
+    if !filesystem_commit_plans_are_buffer_compatible(current, next) {
         return false;
     }
 
@@ -1106,29 +1114,45 @@ fn try_merge_filesystem_tracked_plans(current: &mut TrackedTxnUnit, next: &Track
     true
 }
 
-fn filesystem_tracked_plans_are_buffer_compatible(
-    current: &TrackedTxnUnit,
-    next: &TrackedTxnUnit,
+fn filesystem_commit_plans_are_buffer_compatible(
+    current: &PublicWriteTxnUnit,
+    next: &PublicWriteTxnUnit,
 ) -> bool {
-    if !tracked_plan_is_coalescible_filesystem(current)
-        || !tracked_plan_is_coalescible_filesystem(next)
+    if !commit_plan_is_coalescible_filesystem(current)
+        || !commit_plan_is_coalescible_filesystem(next)
     {
         return false;
     }
     current.public_write.contract.target.descriptor.public_name
         == next.public_write.contract.target.descriptor.public_name
-        && current.execution.create_preconditions.write_lane
-            == next.execution.create_preconditions.write_lane
+        && current
+            .execution
+            .create_preconditions
+            .as_ref()
+            .map(|preconditions| &preconditions.write_lane)
+            == next
+                .execution
+                .create_preconditions
+                .as_ref()
+                .map(|preconditions| &preconditions.write_lane)
         && create_commit_expected_head_compatible(
-            &current.execution.create_preconditions.expected_head,
-            &next.execution.create_preconditions.expected_head,
+            current
+                .execution
+                .create_preconditions
+                .as_ref()
+                .map(|preconditions| &preconditions.expected_head),
+            next.execution
+                .create_preconditions
+                .as_ref()
+                .map(|preconditions| &preconditions.expected_head),
         )
         && current.writer_key == next.writer_key
-        && tracked_plan_entity_targets_disjoint(current, next)
+        && commit_plan_entity_targets_disjoint(current, next)
 }
 
-fn tracked_plan_is_coalescible_filesystem(plan: &TrackedTxnUnit) -> bool {
-    is_catalog_filesystem_file_surface(&plan.public_write.contract.target)
+fn commit_plan_is_coalescible_filesystem(plan: &PublicWriteTxnUnit) -> bool {
+    plan.is_commit_member_write()
+        && is_catalog_filesystem_file_surface(&plan.public_write.contract.target)
 }
 
 fn is_catalog_filesystem_file_surface(target: &ResolvedRelation) -> bool {
@@ -1142,16 +1166,25 @@ fn is_catalog_filesystem_file_surface(target: &ResolvedRelation) -> bool {
         })
 }
 
-fn create_commit_expected_head_compatible(left: &ExpectedHead, right: &ExpectedHead) -> bool {
+fn create_commit_expected_head_compatible(
+    left: Option<&ExpectedHead>,
+    right: Option<&ExpectedHead>,
+) -> bool {
     matches!(
         (left, right),
-        (ExpectedHead::CurrentHead, ExpectedHead::CurrentHead)
+        (
+            Some(ExpectedHead::CurrentHead),
+            Some(ExpectedHead::CurrentHead)
+        )
     )
 }
 
-fn tracked_plan_entity_targets_disjoint(left: &TrackedTxnUnit, right: &TrackedTxnUnit) -> bool {
-    let left_targets = tracked_plan_entity_targets(left);
-    let right_targets = tracked_plan_entity_targets(right);
+fn commit_plan_entity_targets_disjoint(
+    left: &PublicWriteTxnUnit,
+    right: &PublicWriteTxnUnit,
+) -> bool {
+    let left_targets = commit_plan_entity_targets(left);
+    let right_targets = commit_plan_entity_targets(right);
     left_targets.is_disjoint(&right_targets)
 }
 
@@ -1165,7 +1198,7 @@ fn merge_plan_effects(current: &mut PlanEffects, next: &PlanEffects) {
         .extend(next.file_cache_refresh_targets.clone());
 }
 
-fn tracked_plan_entity_targets(plan: &TrackedTxnUnit) -> BTreeSet<(String, String, String)> {
+fn commit_plan_entity_targets(plan: &PublicWriteTxnUnit) -> BTreeSet<(String, String, String)> {
     let mut targets = BTreeSet::new();
     if let Some(batch) = plan.execution.change_batch.as_ref() {
         for change in &batch.changes {
@@ -1298,7 +1331,6 @@ fn build_untracked_canonical_changes(
                             ),
                         )
                     })?,
-                untracked: true,
                 created_at: created_at.clone(),
             })
         })
@@ -1364,7 +1396,6 @@ mod tests {
                     .expect("valid canonical json"),
             ),
             metadata: None,
-            untracked: true,
             created_at: "2026-04-14T00:00:00Z".to_string(),
         }
     }
@@ -1372,7 +1403,6 @@ mod tests {
     fn tracked_canonical_change() -> CanonicalChangeWrite {
         CanonicalChangeWrite {
             id: "change-tracked-1".to_string(),
-            untracked: false,
             ..untracked_canonical_change()
         }
     }
@@ -1417,9 +1447,9 @@ mod tests {
 
         assert!(collected);
         let pending = overlay
-            .visible_rows(false, "lix_key_value")
+            .visible_rows(true, "lix_key_value")
             .next()
-            .expect("expected pending tracked row");
+            .expect("expected pending untracked row");
         assert_eq!(pending.change_id.as_deref(), Some("change-tracked-1"));
     }
 }

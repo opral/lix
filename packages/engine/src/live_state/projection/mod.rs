@@ -394,7 +394,6 @@ mod tests {
                 snapshot_id: "no-content",
                 snapshot_content: None,
                 metadata: None,
-                untracked: false,
                 created_at,
             },
         )

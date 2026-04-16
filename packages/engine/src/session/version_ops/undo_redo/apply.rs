@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::backend::QueryExecutor;
 use crate::canonical::{
-    load_change, load_commit, load_exact_row_at_commit, CanonicalChange, CanonicalStateIdentity,
-    CanonicalStateRow,
+    load_commit, load_commit_member_change, load_exact_row_at_commit, CanonicalChange,
+    CanonicalStateIdentity, CanonicalStateRow,
 };
 use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
@@ -88,7 +88,7 @@ pub(super) async fn undo_in_session_transaction(
             load_target_commit_change_effects(transaction, &version_id, &target_commit_id).await?;
         if effects.is_empty() {
             return Err(LixError::unknown(format!(
-                "target commit '{}' has no undoable changes",
+                "target commit '{}' has no tracked undoable changes",
                 target_commit_id
             )));
         }
@@ -234,7 +234,7 @@ pub(super) async fn redo_in_session_transaction(
             load_target_commit_change_effects(transaction, &version_id, &target_commit_id).await?;
         if effects.is_empty() {
             return Err(LixError::unknown(format!(
-                "target commit '{}' has no redoable changes",
+                "target commit '{}' has no tracked redoable changes",
                 target_commit_id
             )));
         }
@@ -471,7 +471,7 @@ async fn rebuild_semantic_undo_redo_stacks(
             continue;
         }
 
-        if !commit.change_ids.is_empty() && !commit.parent_commit_ids.is_empty() {
+        if commit_has_tracked_undo_redo_members(&commit) && !commit.parent_commit_ids.is_empty() {
             stacks.undo_stack.push(commit.id);
             stacks.redo_stack.clear();
         }
@@ -612,9 +612,12 @@ async fn load_target_commit_change_effects(
     }
     let parent_commit_id = target_commit.parent_commit_ids.first().cloned();
 
-    let mut effects = Vec::with_capacity(target_commit.change_ids.len());
-    for change_id in &target_commit.change_ids {
-        let Some(forward_change) = load_change(&mut executor, change_id).await? else {
+    let member_change_ids = tracked_undo_redo_member_change_ids(&target_commit);
+    let mut effects = Vec::with_capacity(member_change_ids.len());
+    for change_id in member_change_ids {
+        let Some(forward_change) =
+            load_commit_member_change(&mut executor, &target_commit.id, change_id).await?
+        else {
             return Err(LixError::unknown(format!(
                 "target commit '{}' references missing change '{}'",
                 target_commit_id, change_id
@@ -639,6 +642,17 @@ async fn load_target_commit_change_effects(
         });
     }
     Ok(effects)
+}
+
+fn commit_has_tracked_undo_redo_members(commit: &crate::canonical::CanonicalCommit) -> bool {
+    !tracked_undo_redo_member_change_ids(commit).is_empty()
+}
+
+fn tracked_undo_redo_member_change_ids(commit: &crate::canonical::CanonicalCommit) -> &[String] {
+    // Undo/redo operates on tracked commit members only. Untracked canonical
+    // rows are journaled facts, but they are not part of the first-cut undo
+    // model unless they are explicitly added to commit membership.
+    &commit.change_ids
 }
 
 fn build_forward_proposed_change(

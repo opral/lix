@@ -11,6 +11,9 @@
 //! The intended ownership model is:
 //! - canonical changes are the only semantic source of truth
 //! - commit graph facts are a canonical projection derived from those changes
+//! - tracked lineage is expressed by commit membership around canonical facts
+//! - non-commit visibility is expected to be expressed by separate untracked
+//!   visibility membership around canonical facts
 //! - `refs` owns replica-local committed-head/root selection
 //! - `commit` owns write orchestration that composes canonical facts with other
 //!   owners atomically
@@ -21,6 +24,11 @@
 //! - canonical change facts and commit headers stored in the journal
 //! - commit DAG interpretation and canonical history indexes
 //! - commit-addressed and root-addressed state lookup
+//!
+//! In the stronger canonical model, classifications such as "tracked" versus
+//! "untracked" are not intrinsic facts about the row identity itself. They are
+//! lineage or visibility relations layered around the canonical fact row and may be
+//! surfaced publicly as derived metadata for ergonomics.
 //!
 //! Derived mirrors, replay cursors, and storage-local append order may help
 //! execution, but they must not redefine committed semantics.
@@ -52,13 +60,18 @@ pub(crate) use receipt::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 #[allow(unused_imports)]
 pub(crate) use api::{
-    append_changes, load_change, load_commit, load_exact_row_at_commit, load_history,
-    load_visible_state, resolve_merge_base, CanonicalAppendSummary, CanonicalChange,
-    CanonicalChangeWrite, CanonicalCommit, CanonicalContentMode, CanonicalHistoryContentMode,
-    CanonicalHistoryRequest, CanonicalHistoryRootSelection, CanonicalHistoryRow,
-    CanonicalRootCommit, CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode,
-    CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
-    CanonicalVisibleStateRow,
+    append_changes, append_untracked_change_visibility_rows, canonical_untracked_visibility_kind,
+    canonical_untracked_visibility_row_id_for_change,
+    canonical_untracked_visibility_write_from_change_visibility,
+    compact_stale_untracked_changes_in_transaction,
+    compact_untracked_changes_for_touched_rows_in_transaction, load_change, load_commit,
+    load_commit_member_change, load_exact_row_at_commit, load_history, load_visible_state,
+    resolve_merge_base, CanonicalAppendSummary, CanonicalChange, CanonicalChangeWrite,
+    CanonicalCommit, CanonicalContentMode, CanonicalHistoryContentMode, CanonicalHistoryRequest,
+    CanonicalHistoryRootSelection, CanonicalHistoryRow, CanonicalRootCommit,
+    CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode,
+    CanonicalUntrackedVisibilityKind, CanonicalUntrackedVisibilityWrite, CanonicalVisibility,
+    CanonicalVisibleStateFilter, CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
 #[allow(unused_imports)]
 pub(crate) use checkpoint_labels::{
@@ -80,6 +93,7 @@ pub(crate) const TIMELINE_STATUS_TABLE: &str = "lix_internal_timeline_status";
 pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
     &[
         journal::write::CHANGE_TABLE,
+        journal::write::UNTRACKED_CHANGE_VISIBILITY_TABLE,
         graph::index::COMMIT_GRAPH_NODE_TABLE,
         journal::write::SNAPSHOT_TABLE,
         ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,

@@ -4,6 +4,14 @@ use crate::backend::add_column_if_missing;
 use crate::common::is_missing_relation_error;
 use crate::live_state::ReplayCursor;
 use crate::live_state::{LiveStateMode, LiveStateProjectionStatus};
+use crate::streams::{
+    delete_durable_state_commit_consumer_cursor_in_transaction,
+    load_latest_untracked_visibility_append_seq,
+    load_latest_untracked_visibility_append_seq_in_transaction,
+    upsert_durable_state_commit_consumer_cursor_in_transaction,
+    upsert_durable_state_commit_consumer_cursor_with_backend, DurableStateCommitCursor,
+    LIVE_STATE_DURABLE_CONSUMER_KEY,
+};
 use crate::version::CommittedVersionFrontier;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -208,6 +216,7 @@ pub(crate) async fn mark_live_state_ready_at_latest_replay_cursor_in_transaction
     transaction
         .execute(&build_mark_live_state_ready_sql(&cursor, &frontier), &[])
         .await?;
+    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, &cursor).await?;
     Ok(cursor)
 }
 
@@ -219,6 +228,7 @@ pub(crate) async fn mark_live_state_ready_at_replay_cursor_in_transaction(
     transaction
         .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
         .await?;
+    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, cursor).await?;
     Ok(())
 }
 
@@ -232,6 +242,7 @@ pub(crate) async fn mark_live_state_ready_without_replay_cursor_in_transaction(
             &[],
         )
         .await?;
+    clear_live_state_durable_consumer_cursor_in_transaction(transaction).await?;
     Ok(())
 }
 
@@ -279,6 +290,7 @@ pub(crate) async fn advance_commit_replay_boundary_to_cursor_in_transaction(
             &[],
         )
         .await?;
+    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, cursor).await?;
     Ok(())
 }
 
@@ -313,6 +325,7 @@ pub(crate) async fn mark_needs_rebuild_at_replay_cursor_in_transaction(
             &[],
         )
         .await?;
+    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, cursor).await?;
     Ok(())
 }
 
@@ -335,7 +348,62 @@ pub(crate) async fn mark_live_state_ready_with_backend(
     backend
         .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
         .await?;
+    upsert_durable_state_commit_consumer_cursor_with_backend(
+        backend,
+        LIVE_STATE_DURABLE_CONSUMER_KEY,
+        &durable_state_commit_cursor_from_replay_with_backend(backend, cursor).await?,
+    )
+    .await?;
     Ok(())
+}
+
+async fn stamp_live_state_durable_consumer_cursor_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    cursor: &ReplayCursor,
+) -> Result<(), LixError> {
+    let durable_cursor =
+        durable_state_commit_cursor_from_replay_in_transaction(transaction, cursor).await?;
+    upsert_durable_state_commit_consumer_cursor_in_transaction(
+        transaction,
+        LIVE_STATE_DURABLE_CONSUMER_KEY,
+        &durable_cursor,
+    )
+    .await
+}
+
+async fn clear_live_state_durable_consumer_cursor_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<(), LixError> {
+    delete_durable_state_commit_consumer_cursor_in_transaction(
+        transaction,
+        LIVE_STATE_DURABLE_CONSUMER_KEY,
+    )
+    .await
+}
+
+async fn durable_state_commit_cursor_from_replay_with_backend(
+    backend: &dyn crate::LixBackend,
+    cursor: &ReplayCursor,
+) -> Result<DurableStateCommitCursor, LixError> {
+    Ok(DurableStateCommitCursor {
+        change_id: cursor.change_id.clone(),
+        created_at: cursor.created_at.clone(),
+        visibility_append_seq: load_latest_untracked_visibility_append_seq(backend).await?,
+    })
+}
+
+async fn durable_state_commit_cursor_from_replay_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    cursor: &ReplayCursor,
+) -> Result<DurableStateCommitCursor, LixError> {
+    Ok(DurableStateCommitCursor {
+        change_id: cursor.change_id.clone(),
+        created_at: cursor.created_at.clone(),
+        visibility_append_seq: load_latest_untracked_visibility_append_seq_in_transaction(
+            transaction,
+        )
+        .await?,
+    })
 }
 
 pub(crate) async fn load_live_state_mode_with_backend(
@@ -768,10 +836,20 @@ async fn live_state_status_column_exists_in_transaction(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::{
+        append_untracked_change_visibility_rows, CanonicalUntrackedVisibilityKind,
+        CanonicalUntrackedVisibilityWrite,
+    };
+    use crate::streams::{
+        load_durable_state_commit_consumer_cursors, load_durable_state_commit_low_watermark,
+        upsert_durable_state_commit_consumer_cursor_in_transaction, DurableStateCommitCursor,
+        LIVE_STATE_DURABLE_CONSUMER_KEY,
+    };
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_live_state_status_row,
         seed_local_version_head, CanonicalChangeSeed, TestSqliteBackend,
     };
+    use crate::version::GLOBAL_VERSION_ID;
 
     async fn init_lifecycle_backend() -> TestSqliteBackend {
         let backend = TestSqliteBackend::new();
@@ -799,12 +877,37 @@ mod tests {
                 snapshot_id: "no-content",
                 snapshot_content: None,
                 metadata: None,
-                untracked,
                 created_at,
             },
         )
         .await
         .expect("latest replay cursor row should seed");
+
+        if untracked {
+            let mut transaction = backend
+                .begin_transaction(crate::backend::TransactionBeginMode::Write)
+                .await
+                .expect("latest replay cursor visibility transaction should begin");
+            append_untracked_change_visibility_rows(
+                transaction.as_mut(),
+                &[CanonicalUntrackedVisibilityWrite {
+                    id: format!("visibility:{change_id}"),
+                    change_id: change_id.to_string(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    visibility_kind: CanonicalUntrackedVisibilityKind::Global,
+                    entity_id: "cursor-entity".try_into().expect("valid entity id"),
+                    schema_key: "lix_key_value".try_into().expect("valid schema key"),
+                    file_id: None,
+                    created_at: created_at.to_string(),
+                }],
+            )
+            .await
+            .expect("latest replay cursor visibility row should seed");
+            transaction
+                .commit()
+                .await
+                .expect("latest replay cursor visibility transaction should commit");
+        }
     }
 
     async fn delete_status_row(backend: &TestSqliteBackend) {
@@ -1042,6 +1145,87 @@ mod tests {
             .rollback()
             .await
             .expect("transaction rollback should succeed");
+    }
+
+    #[tokio::test]
+    async fn live_state_ready_marks_durable_state_commit_consumer_cursor() {
+        let backend = init_lifecycle_backend().await;
+        seed_local_version_head(&backend, "main", "commit-2", "2026-03-15T01:02:03Z")
+            .await
+            .expect("local version head should seed");
+        seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
+        let mut transaction = backend
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .await
+            .expect("transaction should begin");
+
+        mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction.as_mut())
+            .await
+            .expect("ready stamp should succeed");
+        transaction
+            .commit()
+            .await
+            .expect("transaction commit should succeed");
+
+        let cursors = load_durable_state_commit_consumer_cursors(&backend)
+            .await
+            .expect("consumer cursors should load");
+        assert_eq!(cursors.len(), 1);
+        assert_eq!(cursors[0].consumer_key, LIVE_STATE_DURABLE_CONSUMER_KEY);
+        assert_eq!(
+            cursors[0].cursor,
+            DurableStateCommitCursor {
+                change_id: "change-2".to_string(),
+                created_at: "2026-03-15T01:02:03Z".to_string(),
+                visibility_append_seq: 0,
+            }
+        );
+
+        let low_watermark = load_durable_state_commit_low_watermark(&backend)
+            .await
+            .expect("low watermark should load")
+            .expect("low watermark should exist");
+        assert_eq!(low_watermark, cursors[0].cursor);
+    }
+
+    #[tokio::test]
+    async fn live_state_ready_without_replay_cursor_clears_durable_consumer_cursor() {
+        let backend = init_lifecycle_backend().await;
+        let mut transaction = backend
+            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .await
+            .expect("transaction should begin");
+
+        upsert_durable_state_commit_consumer_cursor_in_transaction(
+            transaction.as_mut(),
+            LIVE_STATE_DURABLE_CONSUMER_KEY,
+            &DurableStateCommitCursor {
+                change_id: "change-1".to_string(),
+                created_at: "2026-03-15T01:02:02Z".to_string(),
+                visibility_append_seq: 0,
+            },
+        )
+        .await
+        .expect("seed durable consumer cursor should succeed");
+        mark_live_state_ready_without_replay_cursor_in_transaction(transaction.as_mut())
+            .await
+            .expect("ready without cursor should succeed");
+        transaction
+            .commit()
+            .await
+            .expect("transaction commit should succeed");
+
+        let cursors = load_durable_state_commit_consumer_cursors(&backend)
+            .await
+            .expect("consumer cursors should load");
+        assert!(cursors.is_empty());
+        assert!(
+            load_durable_state_commit_low_watermark(&backend)
+                .await
+                .expect("low watermark should load")
+                .is_none(),
+            "clearing the only durable consumer cursor should clear the low watermark"
+        );
     }
 
     #[tokio::test]

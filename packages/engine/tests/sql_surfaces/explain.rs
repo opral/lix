@@ -1892,6 +1892,47 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
         physical_plan.get("kind").and_then(JsonValue::as_str),
         Some("public_write")
     );
+    let physical_details = physical_plan
+        .get("details")
+        .map(|value| json_object(value, "physical_plan.details"))
+        .expect("public_write physical_plan should include details");
+    assert_eq!(
+        physical_details.get("kind").and_then(JsonValue::as_str),
+        Some("materialize")
+    );
+    let physical_materialization = physical_details
+        .get("details")
+        .map(|value| json_object(value, "physical_plan.details.details"))
+        .expect("public_write physical_plan should include materialization details");
+    let physical_partitions = json_array(
+        physical_materialization
+            .get("partitions")
+            .expect("public_write physical plan should include partitions"),
+        "physical_plan.details.details.partitions",
+    );
+    assert_eq!(physical_partitions.len(), 1);
+    let physical_partition = json_object(
+        &physical_partitions[0],
+        "physical_plan.details.details.partitions[0]",
+    );
+    let physical_lix_change_rows = json_array(
+        physical_partition
+            .get("lix_change_rows")
+            .expect("public write partition should include lix_change_rows"),
+        "physical_plan.details.details.partitions[0].lix_change_rows",
+    );
+    assert_eq!(
+        physical_partition
+            .get("execution_mode")
+            .and_then(JsonValue::as_str),
+        Some("tracked")
+    );
+    assert_eq!(
+        physical_partition
+            .get("commit_reference_status")
+            .and_then(JsonValue::as_str),
+        Some("commit_referenced")
+    );
 
     let compiled_artifacts = json_object_at(explain_json, "compiled_artifacts", "explain_json");
     assert!(
@@ -1989,8 +2030,68 @@ fn assert_public_write_json_contract(explain_json: &JsonValue) {
         change_batch.get("write_lane").and_then(JsonValue::as_str),
         Some("active_version")
     );
+    let lix_change_rows = json_array(
+        compiled_artifacts
+            .get("lix_change_rows")
+            .expect("compiled_artifacts should include lix_change_rows"),
+        "compiled_artifacts.lix_change_rows",
+    );
+    assert!(
+        !lix_change_rows.is_empty(),
+        "compiled_artifacts.lix_change_rows should include at least one canonical row",
+    );
+    assert_eq!(lix_change_rows.len(), physical_lix_change_rows.len());
+    for (index, row) in lix_change_rows.iter().enumerate() {
+        assert_lix_change_row_snapshot(
+            row,
+            false,
+            &format!("compiled_artifacts.lix_change_rows[{index}]"),
+        );
+    }
+    for (index, row) in physical_lix_change_rows.iter().enumerate() {
+        assert_lix_change_row_snapshot(
+            row,
+            false,
+            &format!("physical_plan.details.details.partitions[0].lix_change_rows[{index}]"),
+        );
+    }
 
     assert_no_rust_debug_leaks(explain_json);
+}
+
+fn assert_lix_change_row_snapshot(value: &JsonValue, expected_untracked: bool, context: &str) {
+    let row = json_object(value, context);
+    assert_object_keys(
+        row,
+        &[
+            "created_at",
+            "entity_id",
+            "file_id",
+            "id",
+            "metadata",
+            "plugin_key",
+            "schema_key",
+            "schema_version",
+            "snapshot_content",
+            "untracked",
+        ],
+        context,
+    );
+    assert_eq!(
+        row.get("untracked").and_then(JsonValue::as_bool),
+        Some(expected_untracked),
+        "{context}.untracked should match",
+    );
+    assert_eq!(
+        row.get("id"),
+        Some(&JsonValue::Null),
+        "{context}.id should be null before generated canonical ids are assigned",
+    );
+    assert_eq!(
+        row.get("created_at"),
+        Some(&JsonValue::Null),
+        "{context}.created_at should be null before generated canonical timestamps are assigned",
+    );
 }
 
 simulation_test!(
@@ -2540,6 +2641,93 @@ simulation_test!(
 );
 
 simulation_test!(
+    explain_public_untracked_write_shows_lix_change_rows_as_non_members,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+        let active_version_id = engine.active_version_id().await.unwrap();
+
+        let result = engine
+            .execute(
+                &format!(
+                    "EXPLAIN (FORMAT JSON) INSERT INTO lix_state_by_version (\
+                         entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content, untracked\
+                     ) VALUES (\
+                         'debug-key', 'lix_key_value', 'debug-untracked-file', '{active_version_id}', 'lix', '1', '{{\"key\":\"debug-key\",\"value\":\"debug\"}}', true\
+                     )"
+                ),
+                &[],
+            )
+            .await
+            .unwrap();
+
+        let explain_json = explain_json_payload(&result);
+        let physical_plan = json_object_at(explain_json, "physical_plan", "explain_json");
+        let physical_details = physical_plan
+            .get("details")
+            .map(|value| json_object(value, "physical_plan.details"))
+            .expect("public_write physical_plan should include details");
+        let physical_materialization = physical_details
+            .get("details")
+            .map(|value| json_object(value, "physical_plan.details.details"))
+            .expect("public_write physical_plan should include materialization details");
+        let physical_partitions = json_array(
+            physical_materialization
+                .get("partitions")
+                .expect("public_write physical plan should include partitions"),
+            "physical_plan.details.details.partitions",
+        );
+        assert_eq!(physical_partitions.len(), 1);
+        let physical_partition = json_object(
+            &physical_partitions[0],
+            "physical_plan.details.details.partitions[0]",
+        );
+        assert_eq!(
+            physical_partition
+                .get("execution_mode")
+                .and_then(JsonValue::as_str),
+            Some("untracked")
+        );
+        assert_eq!(
+            physical_partition
+                .get("commit_reference_status")
+                .and_then(JsonValue::as_str),
+            Some("not_commit_referenced")
+        );
+        let physical_lix_change_rows = json_array(
+            physical_partition
+                .get("lix_change_rows")
+                .expect("public write partition should include lix_change_rows"),
+            "physical_plan.details.details.partitions[0].lix_change_rows",
+        );
+        assert_eq!(physical_lix_change_rows.len(), 1);
+        assert_lix_change_row_snapshot(
+            &physical_lix_change_rows[0],
+            true,
+            "physical_plan.details.details.partitions[0].lix_change_rows[0]",
+        );
+
+        let compiled_artifacts = json_object_at(explain_json, "compiled_artifacts", "explain_json");
+        let lix_change_rows = json_array(
+            compiled_artifacts
+                .get("lix_change_rows")
+                .expect("compiled_artifacts should include lix_change_rows"),
+            "compiled_artifacts.lix_change_rows",
+        );
+        assert_eq!(lix_change_rows.len(), 1);
+        assert_lix_change_row_snapshot(
+            &lix_change_rows[0],
+            true,
+            "compiled_artifacts.lix_change_rows[0]",
+        );
+    }
+);
+
+simulation_test!(
     explain_public_write_update_contract_pins_target_set_proof_kind,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -2637,6 +2825,57 @@ simulation_test!(
         );
 
         assert_no_rust_debug_leaks(explain_json);
+    }
+);
+
+simulation_test!(
+    explain_text_public_write_reports_lix_change_row_membership_counts,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "EXPLAIN (FORMAT TEXT) INSERT INTO lix_file (path, data) VALUES ('/explain-membership.md', lix_text_encode('hello'))",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_text_explain_contract(
+            &result,
+            &[
+                "request",
+                "semantic_statement",
+                "logical_plan",
+                "optimized_logical_plan",
+                "physical_plan",
+                "compiled_artifacts",
+                "stage_timings",
+            ],
+            &[
+                ("request", &["mode: plan", "format: text"]),
+                (
+                    "physical_plan",
+                    &[
+                        "kind: public_write",
+                        "execution: materialize",
+                        "lix_change_rows: 2",
+                        "commit_referenced_rows: 2",
+                        "not_commit_referenced_rows: 0",
+                        "untracked_rows: 0",
+                    ],
+                ),
+                (
+                    "compiled_artifacts",
+                    &["lix_change_rows: 2", "untracked_rows: 0"],
+                ),
+            ],
+        );
     }
 );
 

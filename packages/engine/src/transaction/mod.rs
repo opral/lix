@@ -34,8 +34,8 @@ pub(crate) use backend::{
 pub(crate) use buffered::{
     apply_schema_registrations_in_transaction, upsert_registered_schema_mirror_row_in_transaction,
     BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteFlushClass,
-    BufferedWriteSessionEffects, PlannedDirectWriteUnit, PlannedPublicUntrackedWriteUnit,
-    RegisteredSchemaMirrorRow, TrackedTxnUnit, TransactionWriteDelta,
+    BufferedWriteSessionEffects, PlannedDirectWriteUnit, PublicWriteTxnUnit,
+    RegisteredSchemaMirrorRow, TransactionWriteDelta,
 };
 pub(crate) use buffered_write_transaction::BufferedWriteTransaction;
 pub(crate) use commit_artifacts::{PendingCommitLane, PendingCommitState};
@@ -44,7 +44,7 @@ pub(crate) use compiler_state::{
 };
 pub(crate) use contracts::{
     BufferedWriteExecutionInput, DeferredCommitEffects, PreparedWriteFunctionBindings,
-    TrackedCommitExecutionOutcome, TransactionCommitOutcome, WriteExecutionContext,
+    PublicCommitExecutionOutcome, TransactionCommitOutcome, WriteExecutionContext,
 };
 #[cfg(test)]
 pub(crate) use contracts::{CommitOutcome, TransactionDelta, TransactionJournal};
@@ -90,10 +90,9 @@ pub(crate) use pipeline::{
 pub(crate) use prepared_artifacts::{
     PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
     PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
-    PreparedPublicWriteExecutionPartition, PreparedPublicWriteMaterialization,
+    PreparedPublicWriteExecution, PreparedPublicWriteMaterialization,
     PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
-    PreparedTrackedWriteExecution, PreparedUntrackedWriteExecution, PreparedWriteArtifact,
-    PreparedWriteStatement,
+    PreparedWriteArtifact, PreparedWriteStatement,
 };
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};

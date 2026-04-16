@@ -15,7 +15,8 @@ use crate::live_state::untracked::{
 use crate::live_state::writer_key::load_writer_key_annotations;
 use crate::{LixBackend, LixError, Value};
 
-/// Hydrate the declared tracked/untracked source rows for one projection.
+/// Hydrate the declared live-row inputs for one projection across the tracked
+/// and untracked visibility lanes.
 ///
 /// Projection definitions stay storage-free. `live_state` owns the committed
 /// frontier lookups that resolve per-input scope such as global-only or current

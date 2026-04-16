@@ -2,8 +2,9 @@ use std::collections::BTreeMap;
 
 use crate::backend::{transaction_backend_view, QueryExecutor};
 use crate::canonical::{
-    append_changes, load_exact_committed_change_from_commit_with_executor,
-    ExactCommittedStateRowRequest, UpdatedVersionRef,
+    append_changes, append_untracked_change_visibility_rows,
+    load_exact_committed_change_from_commit_with_executor, CanonicalUntrackedVisibilityKind,
+    CanonicalUntrackedVisibilityWrite, ExactCommittedStateRowRequest, UpdatedVersionRef,
 };
 use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
@@ -13,7 +14,9 @@ use crate::live_state::{
     write_live_rows, ExactLiveRowQuery, LiveRow, LiveRowSource,
 };
 use crate::session::{
-    canonical_changes_from_updated_version_refs, untracked_live_rows_from_updated_version_refs,
+    canonical_changes_from_updated_version_refs,
+    canonical_untracked_visibility_rows_from_updated_version_refs,
+    untracked_live_rows_from_updated_version_refs,
 };
 use crate::transaction::{
     upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,
@@ -253,7 +256,39 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 &snapshot_content,
                 &change_id,
                 BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP,
-                true,
+            )
+            .await?;
+
+            append_untracked_change_visibility_rows(
+                self.backend_transaction_mut()?,
+                &[CanonicalUntrackedVisibilityWrite {
+                    id: format!("visibility:{change_id}"),
+                    change_id: change_id.clone(),
+                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    visibility_kind: CanonicalUntrackedVisibilityKind::Global,
+                    entity_id: entity_id.clone().try_into().map_err(|error: LixError| {
+                        LixError::new(
+                            "LIX_ERROR_UNKNOWN",
+                            format!(
+                                "init bootstrap registered schema entity_id '{entity_id}' is invalid: {}",
+                                error.description
+                            ),
+                        )
+                    })?,
+                    schema_key: "lix_registered_schema".to_string().try_into().map_err(
+                        |error: LixError| {
+                            LixError::new(
+                                "LIX_ERROR_UNKNOWN",
+                                format!(
+                                    "init bootstrap registered schema key is invalid: {}",
+                                    error.description
+                                ),
+                            )
+                        },
+                    )?,
+                    file_id: None,
+                    created_at: BOOTSTRAP_REGISTERED_SCHEMA_TIMESTAMP.to_string(),
+                }],
             )
             .await?;
 
@@ -467,6 +502,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             created_at: timestamp,
         };
         let canonical_changes = canonical_changes_from_updated_version_refs(&[update.clone()])?;
+        let visibility_rows =
+            canonical_untracked_visibility_rows_from_updated_version_refs(&[update.clone()])?;
         let live_rows = untracked_live_rows_from_updated_version_refs(&[update]);
         let function_bindings = self.ensure_function_bindings().await?;
         let mut runtime_functions = function_bindings.provider().clone();
@@ -476,6 +513,8 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &mut runtime_functions,
         )
         .await?;
+        append_untracked_change_visibility_rows(self.backend_transaction_mut()?, &visibility_rows)
+            .await?;
         write_live_rows(self.backend_transaction_mut()?, &live_rows).await?;
         Ok(())
     }
@@ -545,7 +584,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &snapshot_content,
             &change_id,
             &timestamp,
-            false,
         )
         .await?;
         self.add_change_id_to_commit(initial_commit_id, &change_id)
@@ -593,7 +631,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &snapshot_content,
             &change_id,
             &timestamp,
-            false,
         )
         .await?;
         Ok(())
@@ -632,7 +669,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             &snapshot_content,
             &change_id,
             &timestamp,
-            false,
         )
         .await?;
         Ok(())
@@ -1051,7 +1087,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             snapshot_content,
             &change_id,
             &timestamp,
-            false,
         )
         .await?;
 
@@ -1101,7 +1136,27 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             row.created_at
                 .as_deref()
                 .expect("bootstrap untracked timestamp should exist"),
-            true,
+        )
+        .await?;
+        append_untracked_change_visibility_rows(
+            self.backend_transaction_mut()?,
+            &[CanonicalUntrackedVisibilityWrite {
+                id: format!("visibility:{change_id}"),
+                change_id: change_id.clone(),
+                version_id: version_id.to_string(),
+                visibility_kind: if version_id == GLOBAL_VERSION_ID {
+                    CanonicalUntrackedVisibilityKind::Global
+                } else {
+                    CanonicalUntrackedVisibilityKind::Version
+                },
+                entity_id: entity_id.to_string().try_into()?,
+                schema_key: schema_key.to_string().try_into()?,
+                file_id: file_id.map(TryInto::try_into).transpose()?,
+                created_at: row
+                    .created_at
+                    .clone()
+                    .expect("bootstrap untracked timestamp should exist"),
+            }],
         )
         .await?;
         write_live_rows(self.backend_transaction_mut()?, &[row]).await?;
@@ -1118,7 +1173,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         snapshot_content: &str,
         change_id: &str,
         created_at: &str,
-        untracked: bool,
     ) -> Result<(), LixError> {
         let snapshot_id = format!("{change_id}~snapshot");
         self.execute_backend(
@@ -1133,9 +1187,9 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .await?;
         self.execute_backend(
             "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, untracked, created_at\
+             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
              ) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8, $9 \
+             SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8 \
              WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
             &[
                 Value::Text(change_id.to_string()),
@@ -1147,7 +1201,6 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                     .map(|value| Value::Text(value.to_string()))
                     .unwrap_or(Value::Null),
                 Value::Text(snapshot_id),
-                Value::Boolean(untracked),
                 Value::Text(created_at.to_string()),
             ],
         )

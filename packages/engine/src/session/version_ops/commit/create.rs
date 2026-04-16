@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::backend::QueryExecutor;
 use crate::canonical::{
-    append_changes, CanonicalChangeWrite, CanonicalCommitReceipt, CanonicalStateIdentity,
-    UpdatedVersionRef,
+    append_changes, append_untracked_change_visibility_rows, CanonicalChangeWrite,
+    CanonicalCommitReceipt, CanonicalStateIdentity, UpdatedVersionRef,
 };
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
@@ -30,13 +30,16 @@ use crate::{
 };
 use async_trait::async_trait;
 
-use super::generate::generate_commit;
+use super::generate::{canonical_change_is_commit_member, generate_commit};
 use super::preflight::{
     load_create_commit_deterministic_sequence_start as load_create_commit_deterministic_sequence_start_impl,
     load_untracked_file_descriptor as load_untracked_file_descriptor_impl,
 };
 use super::receipt::latest_replay_cursor_from_change_rows;
-use super::types::{GenerateCommitArgs, GenerateCommitResult, StagedChange};
+use super::types::{
+    canonical_untracked_visibility_rows_from_updated_version_refs, GenerateCommitArgs,
+    GenerateCommitResult, StagedChange,
+};
 use super::COMMIT_IDEMPOTENCY_TABLE;
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
@@ -377,6 +380,7 @@ pub(crate) async fn create_commit(
     .map_err(backend_error)?;
     let committed_head = extract_committed_head_id(&generated_commit, &concrete_lane)?;
     let canonical_changes = generated_commit.canonical_changes;
+    validate_commit_membership_rows(&canonical_changes)?;
     let updated_version_refs = generated_commit.updated_version_refs;
     let receipt = build_canonical_commit_receipt(
         committed_head.clone(),
@@ -397,7 +401,13 @@ pub(crate) async fn create_commit(
         writer_key: args.observe_tick_writer_key.clone(),
     });
     let pending_public_commit_seed = build_pending_public_commit_seed(&canonical_changes)?;
+    let visibility_rows =
+        canonical_untracked_visibility_rows_from_updated_version_refs(&updated_version_refs)
+            .map_err(backend_error)?;
     append_changes(transaction, &canonical_changes, functions)
+        .await
+        .map_err(backend_error)?;
+    append_untracked_change_visibility_rows(transaction, &visibility_rows)
         .await
         .map_err(backend_error)?;
     let deterministic_sequence_highest_seen =
@@ -501,6 +511,61 @@ fn build_pending_public_commit_seed(
         commit_change_id,
         commit_snapshot_content: commit_snapshot_content.to_string(),
     }))
+}
+
+fn validate_commit_membership_rows(
+    canonical_changes: &[CanonicalChangeWrite],
+) -> Result<(), CreateCommitError> {
+    let changes_by_id = canonical_changes
+        .iter()
+        .map(|change| (change.id.as_str(), change))
+        .collect::<BTreeMap<_, _>>();
+    for commit_row in canonical_changes
+        .iter()
+        .filter(|change| change.schema_key.as_str() == "lix_commit")
+    {
+        let snapshot_content =
+            commit_row
+                .snapshot_content
+                .as_deref()
+                .ok_or_else(|| CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
+                    message: format!(
+                        "tracked commit header '{}' is missing snapshot_content",
+                        commit_row.entity_id
+                    ),
+                })?;
+        let commit: crate::schema::LixCommit =
+            serde_json::from_str(snapshot_content).map_err(|error| CreateCommitError {
+                kind: CreateCommitErrorKind::Internal,
+                message: format!(
+                    "tracked commit header '{}' has invalid snapshot_content: {error}",
+                    commit_row.entity_id
+                ),
+            })?;
+        for change_id in commit.change_ids {
+            let member_row = changes_by_id
+                .get(change_id.as_str())
+                .copied()
+                .ok_or_else(|| CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
+                    message: format!(
+                        "tracked commit '{}' references missing member change '{}'",
+                        commit_row.entity_id, change_id
+                    ),
+                })?;
+            if !canonical_change_is_commit_member(member_row) {
+                return Err(CreateCommitError {
+                    kind: CreateCommitErrorKind::Internal,
+                    message: format!(
+                        "tracked commit '{}' references non-member change '{}' (schema_key='{}')",
+                        commit_row.entity_id, change_id, member_row.schema_key
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn build_observe_tick_insert_sql(writer_key: Option<&str>) -> String {
@@ -1364,7 +1429,6 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 snapshot_content: Some(&snapshot_content),
                 metadata: None,
-                untracked: false,
                 created_at,
             },
         )
@@ -2057,7 +2121,6 @@ mod tests {
                 plugin_key: None,
                 snapshot_content: None,
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-06T14:22:00.000Z".to_string(),
             },
             CanonicalChangeWrite {
@@ -2069,7 +2132,6 @@ mod tests {
                 plugin_key: None,
                 snapshot_content: None,
                 metadata: None,
-                untracked: false,
                 created_at: "2026-03-06T14:22:01.000Z".to_string(),
             },
         ];

@@ -4,9 +4,8 @@ use crate::{LixBackendTransaction, LixError};
 
 use super::{
     direct_apply::execute_direct_transaction_write_unit_with_transaction,
-    tracked_apply::execute_public_tracked_transaction_write_unit_with_transaction,
-    untracked_apply::execute_public_untracked_transaction_write_unit_with_transaction,
-    TransactionWriteDelta, TransactionWriteUnit,
+    public_apply::execute_public_transaction_write_unit_with_transaction, TransactionWriteDelta,
+    TransactionWriteUnit,
 };
 use crate::transaction::pipeline::{empty_public_write_execution_outcome, WriteExecutionOutcome};
 
@@ -21,20 +20,12 @@ impl TransactionWriteDelta {
 
         for unit in &self.materialization_plan().units {
             let write_outcome = match unit {
-                TransactionWriteUnit::PublicTracked(tracked) => {
-                    execute_public_tracked_transaction_write_unit_with_transaction(
+                TransactionWriteUnit::Public(public) => {
+                    execute_public_transaction_write_unit_with_transaction(
                         execution_context,
                         transaction,
-                        tracked,
+                        public,
                         pending_commit_state.as_deref_mut(),
-                    )
-                    .await?
-                }
-                TransactionWriteUnit::PublicUntracked(untracked) => {
-                    execute_public_untracked_transaction_write_unit_with_transaction(
-                        execution_context,
-                        transaction,
-                        untracked,
                     )
                     .await?
                 }

@@ -28,10 +28,10 @@ use crate::streams::{
 };
 use crate::transaction::{
     PreparedPublicSurfaceRegistryEffect, PreparedPublicSurfaceRegistryMutation,
-    PreparedPublicWrite, PreparedPublicWriteContract, PreparedPublicWriteExecutionPartition,
+    PreparedPublicWrite, PreparedPublicWriteContract, PreparedPublicWriteExecution,
     PreparedPublicWriteMaterialization, PreparedPublicWritePlanArtifact,
-    PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedTrackedWriteExecution,
-    PreparedWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement,
+    PreparedResolvedWritePartition, PreparedResolvedWritePlan, PreparedWriteArtifact,
+    PreparedWriteFunctionBindings, PreparedWriteStatement,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, Value};
@@ -436,28 +436,27 @@ fn prepare_public_tracked_write_statement(
                 },
                 execution: PreparedPublicWritePlanArtifact::Materialize(
                     PreparedPublicWriteMaterialization {
-                        partitions: vec![PreparedPublicWriteExecutionPartition::Tracked(
-                            PreparedTrackedWriteExecution {
-                                schema_live_table_requirements,
-                                change_batch: Some(ChangeBatch {
-                                    changes: changes.clone(),
-                                    write_lane: WriteLane::GlobalAdmin,
-                                    writer_key: context.writer_key.clone(),
-                                    semantic_effects: semantic_effect_markers_from_changes(
-                                        &changes,
-                                    ),
-                                }),
-                                create_preconditions: CommitPreconditions {
-                                    write_lane: WriteLane::GlobalAdmin,
-                                    expected_head: ExpectedHead::CurrentHead,
-                                    idempotency_key: semantic_idempotency_key(
-                                        idempotency_purpose,
-                                        &write_payload,
-                                    )?,
-                                },
-                                semantic_effects,
-                            },
-                        )],
+                        partitions: vec![PreparedPublicWriteExecution {
+                            execution_mode: WriteMode::Tracked,
+                            intended_post_state: Vec::new(),
+                            schema_live_table_requirements,
+                            change_batch: Some(ChangeBatch {
+                                changes: changes.clone(),
+                                write_lane: WriteLane::GlobalAdmin,
+                                writer_key: context.writer_key.clone(),
+                                semantic_effects: semantic_effect_markers_from_changes(&changes),
+                            }),
+                            create_preconditions: Some(CommitPreconditions {
+                                write_lane: WriteLane::GlobalAdmin,
+                                expected_head: ExpectedHead::CurrentHead,
+                                idempotency_key: semantic_idempotency_key(
+                                    idempotency_purpose,
+                                    &write_payload,
+                                )?,
+                            }),
+                            semantic_effects,
+                            persist_filesystem_payloads_before_write: false,
+                        }],
                     },
                 ),
             }),

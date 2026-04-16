@@ -263,3 +263,101 @@ async fn prepare_backend_for_init(backend: &dyn LixBackend) -> Result<(), LixErr
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use crate::test_support::TestSqliteBackend;
+    use crate::wasm::NoopWasmRuntime;
+    use crate::{LixConfig, Value};
+    use std::sync::Arc;
+
+    fn value_as_text(value: &Value) -> String {
+        match value {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected text value, got {other:?}"),
+        }
+    }
+
+    fn value_as_bool(value: &Value) -> bool {
+        match value {
+            Value::Boolean(value) => *value,
+            Value::Integer(value) => *value != 0,
+            Value::Text(value) => matches!(value.as_str(), "1" | "true" | "TRUE"),
+            other => panic!("expected boolean-compatible value, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fresh_init_bootstrap_rows_are_journal_backed_without_compatibility_fallbacks() {
+        std::thread::Builder::new()
+            .name("fresh-init-bootstrap-journal-invariants".to_string())
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("tokio runtime should build");
+                runtime.block_on(async {
+                    let backend = TestSqliteBackend::new();
+                    let lix = Arc::new(crate::Lix::boot(LixConfig::new(
+                        Box::new(backend),
+                        Arc::new(NoopWasmRuntime),
+                    )));
+
+                    lix.initialize().await.expect("initialize should succeed");
+
+                    let visible_bootstrap_rows = lix
+                        .execute(
+                            "SELECT schema_key, entity_id, change_id \
+                             FROM lix_state_by_version \
+                             WHERE untracked = true \
+                               AND schema_key IN ('lix_version_ref', 'lix_registered_schema') \
+                             ORDER BY schema_key, entity_id",
+                            &[],
+                        )
+                        .await
+                        .expect("bootstrap visible state query should succeed");
+                    assert!(
+                        !visible_bootstrap_rows.statements[0].rows.is_empty(),
+                        "expected fresh init to materialize bootstrap rows"
+                    );
+
+                    for row in &visible_bootstrap_rows.statements[0].rows {
+                        let schema_key = value_as_text(&row[0]);
+                        let entity_id = value_as_text(&row[1]);
+                        let change_id = value_as_text(&row[2]);
+                        assert!(
+                            !change_id.is_empty(),
+                            "bootstrap row {schema_key}/{entity_id} must expose a real change_id"
+                        );
+
+                        let backing_change = lix
+                            .execute(
+                                "SELECT id, untracked \
+                                 FROM lix_change \
+                                 WHERE id = $1",
+                                &[Value::Text(change_id.clone())],
+                            )
+                            .await
+                            .expect("backing lix_change query should succeed");
+                        assert_eq!(
+                            backing_change.statements[0].rows.len(),
+                            1,
+                            "bootstrap row {schema_key}/{entity_id} should have exactly one canonical backing row"
+                        );
+                        assert_eq!(
+                            value_as_text(&backing_change.statements[0].rows[0][0]),
+                            change_id
+                        );
+                        assert!(
+                            value_as_bool(&backing_change.statements[0].rows[0][1]),
+                            "bootstrap row {schema_key}/{entity_id} should be backed by a canonical row whose public untracked flag derives from visibility"
+                        );
+                    }
+                });
+            })
+            .expect("fresh-init test thread should spawn")
+            .join()
+            .expect("fresh-init test thread should not panic");
+    }
+}
