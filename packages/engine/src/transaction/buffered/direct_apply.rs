@@ -65,6 +65,7 @@ pub(crate) async fn execute_direct_transaction_write_unit_with_transaction(
                 "direct write runtime-sequence persistence failed inside write txn: {}",
                 error.description
             ),
+            hint: None,
         })?;
 
     if write_outcome.plan_effects_override.is_none() {

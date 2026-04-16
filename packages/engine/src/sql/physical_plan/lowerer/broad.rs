@@ -2729,6 +2729,7 @@ fn build_entity_surface_sql_for_broad_lowering(
                 "public-surface lowering requires fixed schema binding for '{}'",
                 resolved_relation.descriptor.public_name
             ),
+            hint: None,
         });
     };
     if builtin_schema_definition(&schema_key).is_none()
@@ -2744,6 +2745,7 @@ fn build_entity_surface_sql_for_broad_lowering(
                 "public-surface lowering could not build canonical state scan for '{}'",
                 resolved_relation.descriptor.public_name
             ),
+            hint: None,
         });
     };
     let request = EffectiveStateRequest {
@@ -2779,6 +2781,7 @@ fn build_entity_surface_sql_for_broad_lowering(
                 "public-surface lowering could not lower entity surface '{}'",
                 resolved_relation.descriptor.public_name
             ),
+            hint: None,
         })?,
     ))
 }

@@ -34,6 +34,7 @@ impl BenchSqliteBackend {
                     "failed to create sqlite benchmark directory {}: {error}",
                     parent.display()
                 ),
+                hint: None,
             })?;
         }
 
@@ -47,6 +48,7 @@ impl BenchSqliteBackend {
         self.conn.lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "sqlite benchmark mutex poisoned".to_string(),
+            hint: None,
         })
     }
 }
@@ -257,5 +259,6 @@ fn sqlite_error(error: impl std::fmt::Display) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.to_string(),
+        hint: None,
     }
 }

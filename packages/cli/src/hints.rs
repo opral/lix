@@ -1,3 +1,4 @@
+use crate::error::CliError;
 use lix_rs_sdk::{ExecuteResult, Lix, Value};
 
 #[derive(Debug)]
@@ -24,17 +25,6 @@ pub fn hint_after_init() -> Vec<String> {
     ]
 }
 
-pub fn hint_sqlite_master_query(sql: &str) -> Vec<String> {
-    let sql_lower = sql.to_lowercase();
-    if sql_lower.contains("sqlite_master") || sql_lower.contains("sqlite_schema") {
-        vec![
-            "lix uses virtual tables not visible in sqlite_master. Query lix_registered_schema, lix_file, lix_state, or lix_key_value instead.".into(),
-        ]
-    } else {
-        Vec::new()
-    }
-}
-
 pub fn hint_blob_in_result(result: &ExecuteResult) -> Vec<String> {
     let has_blob = result.statements.iter().any(|stmt| {
         stmt.rows
@@ -46,6 +36,15 @@ pub fn hint_blob_in_result(result: &ExecuteResult) -> Vec<String> {
     } else {
         Vec::new()
     }
+}
+
+/// Extract an engine-produced hint from a `CliError`, if any.
+///
+/// Returns an empty `Vec` for error variants that do not carry a `LixError`
+/// (e.g. `InvalidArgs`, `Message`, `Io`) or when the underlying `LixError`
+/// has no hint attached.
+pub fn hint_from_error(err: &CliError) -> Vec<String> {
+    err.hint().map(|h| vec![h.to_string()]).unwrap_or_default()
 }
 
 // ── Infrastructure ───────────────────────────────────────────────────
@@ -75,5 +74,35 @@ pub fn are_hints_enabled(lix: &Lix) -> bool {
 pub fn render_hints(hints: &[String]) {
     for hint in hints {
         eprintln!("hint: {hint}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lix_rs_sdk::LixError;
+
+    #[test]
+    fn hint_from_error_returns_empty_for_non_lix_variants() {
+        assert!(hint_from_error(&CliError::msg("oops")).is_empty());
+        assert!(hint_from_error(&CliError::InvalidArgs("bad")).is_empty());
+    }
+
+    #[test]
+    fn hint_from_error_returns_empty_when_lix_error_has_no_hint() {
+        let cli_err = CliError::from_lix("ctx", LixError::new("CODE", "desc"));
+        assert!(hint_from_error(&cli_err).is_empty());
+    }
+
+    #[test]
+    fn hint_from_error_returns_lix_hint() {
+        let cli_err = CliError::from_lix(
+            "sql execution failed",
+            LixError::new("CODE", "desc").with_hint("use lix_json(...)"),
+        );
+        assert_eq!(
+            hint_from_error(&cli_err),
+            vec!["use lix_json(...)".to_string()]
+        );
     }
 }

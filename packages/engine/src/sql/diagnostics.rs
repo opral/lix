@@ -45,7 +45,7 @@ pub(crate) fn sql_unknown_table_error(
     available_tables: &[&str],
     offset: Option<usize>,
 ) -> LixError {
-    let available_tables = if available_tables.is_empty() {
+    let available_tables_text = if available_tables.is_empty() {
         "Available tables: (none).".to_string()
     } else {
         format!("Available tables: {}.", available_tables.join(", "))
@@ -53,10 +53,31 @@ pub(crate) fn sql_unknown_table_error(
     let location = offset
         .map(|value| format!(" Location: SQL offset {value}."))
         .unwrap_or_default();
-    build_error(
+    let mut err = build_error(
         "LIX_ERROR_SQL_UNKNOWN_TABLE",
-        format!("Table `{table_name}` does not exist. {available_tables}{location}"),
-    )
+        format!("Table `{table_name}` does not exist. {available_tables_text}{location}"),
+    );
+    if let Some(hint) = hint_for_unknown_table(table_name) {
+        err = err.with_hint(hint);
+    }
+    err
+}
+
+/// Return a recovery hint for well-known "wrong-namespace" table names.
+///
+/// Users coming from raw SQLite often reach for `sqlite_master` to discover
+/// tables; in Lix, public tables are virtual and not visible there. The hint
+/// points at the real discovery paths (`lix_registered_schema`, `lix_file`,
+/// `lix_state`, `lix_key_value`).
+fn hint_for_unknown_table(table_name: &str) -> Option<&'static str> {
+    let lower = table_name.to_ascii_lowercase();
+    if lower == "sqlite_master" || lower == "sqlite_schema" {
+        return Some(
+            "lix uses virtual tables not visible in sqlite_master. \
+             Query lix_registered_schema, lix_file, lix_state, or lix_key_value instead.",
+        );
+    }
+    None
 }
 
 pub(crate) fn sql_unknown_column_error(
@@ -605,4 +626,36 @@ fn sanitize_name(raw: &str) -> Option<String> {
         return None;
     }
     Some(trimmed.to_string())
+}
+
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    #[test]
+    fn sql_unknown_table_error_attaches_sqlite_master_hint() {
+        let err = sql_unknown_table_error("sqlite_master", &["lix_key_value"], None);
+        assert_eq!(err.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
+        let hint = err.hint().expect("sqlite_master should carry a hint");
+        assert!(hint.contains("lix_registered_schema"));
+        assert!(hint.contains("lix_file"));
+    }
+
+    #[test]
+    fn sql_unknown_table_error_attaches_hint_case_insensitively() {
+        let err = sql_unknown_table_error("SQLITE_MASTER", &[], None);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn sql_unknown_table_error_attaches_sqlite_schema_hint() {
+        let err = sql_unknown_table_error("sqlite_schema", &[], None);
+        assert!(err.hint().is_some());
+    }
+
+    #[test]
+    fn sql_unknown_table_error_has_no_hint_for_other_tables() {
+        let err = sql_unknown_table_error("my_custom_table", &[], None);
+        assert_eq!(err.hint(), None);
+    }
 }

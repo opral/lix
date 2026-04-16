@@ -243,6 +243,7 @@ fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "materialization apply: count query returned no rows".to_string(),
+            hint: None,
         });
     };
 
@@ -254,11 +255,13 @@ fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
                 "materialization apply: invalid count text '{}': {}",
                 text, error
             ),
+            hint: None,
         }),
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "materialization apply: count query returned non-integer value"
                 .to_string(),
+            hint: None,
         }),
     }
 }

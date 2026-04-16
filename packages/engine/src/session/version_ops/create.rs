@@ -53,6 +53,7 @@ async fn create_version_in_transaction(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "version id 'global' is reserved".to_string(),
+            hint: None,
         });
     }
     let hidden = options.hidden;
@@ -91,6 +92,7 @@ async fn generate_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixErr
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "missing generated uuid row".to_string(),
+            hint: None,
         });
     };
     text_at(row, 0, "lix_uuid_v7()")
@@ -102,15 +104,18 @@ fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError>
         Some(Value::Text(_)) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{field} is empty"),
+            hint: None,
         }),
         Some(Value::Integer(value)) => Ok(value.to_string()),
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("expected text-like value for {field}, got {other:?}"),
+            hint: None,
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("missing {field}"),
+            hint: None,
         }),
     }
 }
@@ -123,6 +128,7 @@ fn normalize_optional_non_empty_text(
         Some(value) if value.trim().is_empty() => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{field} must be a non-empty string when provided"),
+            hint: None,
         }),
         Some(value) => Ok(Some(value)),
         None => Ok(None),

@@ -82,6 +82,7 @@ where
                         "failed to evaluate x-lix-default for '{}.{}' ({}): {}",
                         schema_key, field_name, schema_version, err.description
                     ),
+                    hint: None,
                 })?;
             snapshot.insert(field_name.clone(), value);
             changed = true;

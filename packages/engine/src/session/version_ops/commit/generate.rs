@@ -44,6 +44,7 @@ where
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "generate_commit: versions map is required".to_string(),
+            hint: None,
         });
     }
 
@@ -55,6 +56,7 @@ where
                 description: format!(
                     "generate_commit: versions['{version_id}'].snapshot.id must equal version id"
                 ),
+                hint: None,
             });
         }
     }
@@ -67,6 +69,7 @@ where
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("generate_commit: duplicate change id '{}'", change_id),
+                hint: None,
             });
         }
         validate_staged_change(change)?;
@@ -89,6 +92,7 @@ where
                 "generate_commit: staged change '{}' is not a valid tracked commit member",
                 non_member_change.id
             ),
+            hint: None,
         });
     }
     let mut updated_version_refs: Vec<UpdatedVersionRef> = Vec::new();
@@ -114,6 +118,7 @@ where
                 "generate_commit: missing version context for '{}'",
                 version_id
             ),
+            hint: None,
         })?;
         meta_by_version.insert(
             version_id,
@@ -193,6 +198,7 @@ where
                         "generate_commit: missing commit row index for version '{}'",
                         version_id
                     ),
+                    hint: None,
                 })?;
         let commit_row = meta_changes
             .get_mut(commit_row_idx)
@@ -202,6 +208,7 @@ where
                     "generate_commit: missing commit row for version '{}'",
                     version_id
                 ),
+                hint: None,
             })?;
 
         let raw_snapshot = commit_row
@@ -213,6 +220,7 @@ where
                     "generate_commit: commit row for version '{}' is missing snapshot_content",
                     version_id
                 ),
+                hint: None,
             })?;
         let mut snapshot: serde_json::Value =
             raw_snapshot.to_value().map_err(|error| LixError {
@@ -221,6 +229,7 @@ where
                     "generate_commit: commit snapshot for version '{}' is invalid JSON: {}",
                     version_id, error.description
                 ),
+                hint: None,
             })?;
 
         // All semantic change facts are journaled, but commit membership is
@@ -350,6 +359,7 @@ fn validate_staged_change(change: &StagedChange) -> Result<(), LixError> {
                 description: format!(
                     "generate_commit: change '{change_label}' requires non-empty {field}"
                 ),
+                hint: None,
             });
         }
     }
@@ -364,6 +374,7 @@ fn require_staged_change_id(change: &StagedChange) -> Result<&str, LixError> {
             "generate_commit: staged change '{}:{}' requires id",
             change.schema_key, change.entity_id
         ),
+        hint: None,
     })
 }
 
@@ -374,6 +385,7 @@ fn require_staged_change_created_at(change: &StagedChange) -> Result<&str, LixEr
             "generate_commit: staged change '{}:{}' requires created_at",
             change.schema_key, change.entity_id
         ),
+        hint: None,
     })
 }
 
@@ -388,6 +400,7 @@ fn require_staged_change_schema_version(change: &StagedChange) -> Result<&str, L
                 "generate_commit: staged change '{}:{}' requires schema_version",
                 change.schema_key, change.entity_id
             ),
+            hint: None,
         })
 }
 
@@ -407,6 +420,7 @@ fn canonical_json(value: serde_json::Value) -> Result<CanonicalJson, LixError> {
             "generate_commit: failed to encode canonical JSON payload: {}",
             error.description
         ),
+        hint: None,
     })
 }
 
@@ -414,6 +428,7 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
     let schema = builtin_schema_definition(schema_key).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("generate_commit: builtin schema '{}' not found", schema_key),
+        hint: None,
     })?;
     let schema_version = schema
         .get("x-lix-version")
@@ -424,6 +439,7 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
                 "generate_commit: builtin schema '{}' is missing string x-lix-version",
                 schema_key
             ),
+            hint: None,
         })?
         .to_string();
     let defaults = builtin_schema_storage_defaults(schema_key).ok_or_else(|| LixError {
@@ -432,6 +448,7 @@ fn builtin_schema_meta(schema_key: &str) -> Result<BuiltinSchemaMeta, LixError> 
             "generate_commit: builtin schema '{}' is missing storage defaults",
             schema_key
         ),
+        hint: None,
     })?;
     Ok(BuiltinSchemaMeta {
         schema_version,

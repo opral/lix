@@ -337,6 +337,7 @@ async fn resolve_binary_blob_write_in_transaction(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "binary blob write is missing both file_id and auto_path".to_string(),
+            hint: None,
         });
     };
     let resolved = {
@@ -350,6 +351,7 @@ async fn resolve_binary_blob_write_in_transaction(
                 "binary blob write: unable to resolve auto-generated file id for path '{}' in version '{}'",
                 path, write.version_id
             ),
+            hint: None,
         });
     };
     Ok(ResolvedBinaryBlobWrite {
@@ -392,6 +394,7 @@ fn binary_blob_ref_change_for_bytes(
             "binary blob size exceeds supported range for file '{}' version '{}'",
             file_id, version_id
         ),
+        hint: None,
     })?;
     let snapshot_content = serde_json::json!({
         "id": file_id,
@@ -580,6 +583,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: error.message,
+            hint: None,
         })?;
         let row = if row.is_some() || version_id == GLOBAL_VERSION_ID {
             row
@@ -594,6 +598,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: error.message,
+                hint: None,
             })?
         };
         let Some(row) = row else {

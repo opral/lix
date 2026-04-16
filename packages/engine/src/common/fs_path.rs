@@ -153,6 +153,7 @@ pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "path segment cannot be '.' or '..'".to_string(),
+            hint: None,
         });
     }
     Ok(canonical)
@@ -163,30 +164,35 @@ fn validate_path_segment_chars(normalized: &str) -> Result<(), LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "path segment must not be empty".to_string(),
+            hint: None,
         });
     }
     if normalized.contains('/') || normalized.contains('\\') {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "path segment must not contain slashes".to_string(),
+            hint: None,
         });
     }
     if !segment_has_valid_percent_encoding(&normalized) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "path segment contains invalid percent encoding".to_string(),
+            hint: None,
         });
     }
     if normalized.chars().any(is_disallowed_bidi_formatting_char) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "path segment contains disallowed bidi formatting characters".to_string(),
+            hint: None,
         });
     }
     if !normalized.chars().all(is_allowed_segment_char) {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "path segment contains unsupported characters".to_string(),
+            hint: None,
         });
     }
     Ok(())
@@ -330,18 +336,21 @@ pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
             description: format!(
                 "file paths must start with '/'. Got '{path}', use '/{path}' instead"
             ),
+            hint: None,
         });
     }
     if normalized.ends_with('/') || normalized == "/" {
         return Err(LixError {
             code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
+            hint: None,
         });
     }
     if normalized.contains('\\') || normalized.contains("//") {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
+            hint: None,
         });
     }
     let segments = normalized
@@ -352,6 +361,7 @@ pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
+            hint: None,
         });
     }
     let canonical_segments = canonicalize_path_segments(&segments)?;
@@ -359,6 +369,7 @@ pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
             description: format!("lix_file_descriptor: Invalid file path {path}"),
+            hint: None,
         });
     }
     Ok(format!("/{}", canonical_segments.join("/")))
@@ -370,12 +381,14 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
+            hint: None,
         });
     }
     if normalized.contains('\\') || normalized.contains("//") {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
+            hint: None,
         });
     }
     if normalized == "/" {
@@ -385,6 +398,7 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
+            hint: None,
         });
     }
     let segments = normalized
@@ -396,6 +410,7 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("lix_directory_descriptor: Invalid directory path {path}"),
+            hint: None,
         });
     }
     Ok(format!("/{}/", normalized_segments.join("/")))
@@ -427,6 +442,7 @@ pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
     let file_name = segments.last().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("Invalid file path {path}"),
+        hint: None,
     })?;
     let directory_path = if segments.len() > 1 {
         Some(NormalizedDirectoryPath::from_normalized(format!(
@@ -513,6 +529,7 @@ pub(crate) fn compose_directory_path(parent_path: &str, name: &str) -> Result<St
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("Invalid directory parent path {parent_path}"),
+            hint: None,
         })
     }
 }

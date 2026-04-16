@@ -130,6 +130,7 @@ impl WasmComponentInstance for PathEchoInstance {
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode detect-changes payload: {error}"),
+                        hint: None,
                     })?;
                 let _ = (
                     request
@@ -147,6 +148,7 @@ impl WasmComponentInstance for PathEchoInstance {
                 .map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("failed to encode detect-changes response: {error}"),
+                    hint: None,
                 })
             }
             "apply-changes" | "api#apply-changes" => {
@@ -154,6 +156,7 @@ impl WasmComponentInstance for PathEchoInstance {
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode apply-changes payload: {error}"),
+                        hint: None,
                     })?;
                 let _ = request.changes.iter().all(|change| {
                     !change.entity_id.is_empty()
@@ -166,6 +169,7 @@ impl WasmComponentInstance for PathEchoInstance {
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("unsupported test export: {other}"),
+                hint: None,
             }),
         }
     }
@@ -193,6 +197,7 @@ impl WasmComponentInstance for BeforeAwareInstance {
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode detect-changes payload: {error}"),
+                        hint: None,
                     })?;
                 let marker = match request.before {
                     None => "none",
@@ -210,6 +215,7 @@ impl WasmComponentInstance for BeforeAwareInstance {
                 .map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: format!("failed to encode detect-changes response: {error}"),
+                    hint: None,
                 })
             }
             "apply-changes" | "api#apply-changes" => {
@@ -217,6 +223,7 @@ impl WasmComponentInstance for BeforeAwareInstance {
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode apply-changes payload: {error}"),
+                        hint: None,
                     })?;
                 let _ = request;
                 Ok(b"reconstructed-before".to_vec())
@@ -224,6 +231,7 @@ impl WasmComponentInstance for BeforeAwareInstance {
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("unsupported test export: {other}"),
+                hint: None,
             }),
         }
     }
@@ -255,12 +263,14 @@ impl WasmComponentInstance for TxtNoopInstance {
                     serde_json::from_slice(input).map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode apply-changes payload: {error}"),
+                        hint: None,
                     })?;
                 Ok(request.file.data)
             }
             other => Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("unsupported test export: {other}"),
+                hint: None,
             }),
         }
     }

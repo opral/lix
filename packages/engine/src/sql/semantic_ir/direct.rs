@@ -112,12 +112,14 @@ fn validate_statement_output(output: &DirectStatementRewrite) -> Result<(), LixE
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "statement rewrite produced no statements".to_string(),
+            hint: None,
         });
     }
     if !output.mutations.is_empty() && !output.update_validations.is_empty() {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "mutation rewrites cannot emit update validations".to_string(),
+            hint: None,
         });
     }
     if !output.update_validations.is_empty()
@@ -132,6 +134,7 @@ fn validate_statement_output(output: &DirectStatementRewrite) -> Result<(), LixE
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "update validations require an UPDATE or DELETE statement output"
                 .to_string(),
+            hint: None,
         });
     }
     Ok(())
@@ -184,6 +187,7 @@ where
                 "prepare_direct_statements_to_plan rewrite failed for statement {}: {}",
                 statement_index, error.description
             ),
+            hint: None,
         })?;
 
         accumulate_rewrite_output(

@@ -15,4 +15,5 @@ export type {
 	LixRuntimeValue,
 	JsonValue,
 } from "./types.js";
-export { Value } from "./engine-wasm/index.js";
+export { Value, isLixError } from "./engine-wasm/index.js";
+export type { LixError } from "./engine-wasm/index.js";

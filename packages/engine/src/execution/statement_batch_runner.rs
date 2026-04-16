@@ -36,6 +36,7 @@ pub(crate) async fn execute_prepared_statement_batch_with_transaction(
                     "prepared statement batch referenced undefined capture slot '{}'",
                     slot_id.0
                 ),
+                hint: None,
             })?;
             validate_slot_capture(slot, &result)?;
             slot_values.insert(slot_id.clone(), result.clone());
@@ -86,6 +87,7 @@ fn resolve_scalar_slot(
             "prepared statement batch referenced undefined capture slot '{}'",
             slot_id.0
         ),
+        hint: None,
     })?;
     if slot.shape != CaptureShape::Scalar {
         return Err(LixError {
@@ -94,6 +96,7 @@ fn resolve_scalar_slot(
                 "slot '{}' is not a scalar slot and cannot be used with FromScalarSlot",
                 slot_id.0
             ),
+            hint: None,
         });
     }
     let value = slot_values
@@ -104,6 +107,7 @@ fn resolve_scalar_slot(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("scalar slot '{}' did not capture a value", slot_id.0),
+            hint: None,
         })?;
     Ok(value)
 }
@@ -121,6 +125,7 @@ fn resolve_row_column(
             "prepared statement batch referenced undefined capture slot '{}'",
             slot_id.0
         ),
+        hint: None,
     })?;
     match slot.shape {
         CaptureShape::OptionalRow | CaptureShape::ExactlyOneRow => {}
@@ -131,6 +136,7 @@ fn resolve_row_column(
                     "slot '{}' cannot be used with FromRowColumn because it is not row-shaped",
                     slot_id.0
                 ),
+                hint: None,
             })
         }
     }
@@ -142,6 +148,7 @@ fn resolve_row_column(
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("row slot '{}' did not capture a row", slot_id.0),
+                hint: None,
             })
         };
     };
@@ -153,6 +160,7 @@ fn resolve_row_column(
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("row slot '{}' did not capture a row", slot_id.0),
+                hint: None,
             })
         };
     };
@@ -173,6 +181,7 @@ fn resolve_row_column(
                 "row slot '{}' is missing column '{}'",
                 slot_id.0, column_name
             ),
+            hint: None,
         })?;
 
     Ok(row.get(index).cloned().unwrap_or(Value::Null))
@@ -220,6 +229,7 @@ fn validate_slot_capture(slot: &CaptureSlot, result: &QueryResult) -> Result<(),
                     "slot '{}' captured columns {:?} but expected {:?}",
                     slot.id.0, actual, expected
                 ),
+                hint: None,
             });
         }
     }
@@ -232,6 +242,7 @@ fn slot_shape_error(slot: &CaptureSlot, message: &str) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("slot '{}' shape violation: {}", slot.id.0, message),
+        hint: None,
     }
 }
 
