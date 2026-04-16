@@ -143,6 +143,7 @@ async fn execute_public_immediate_write_with_transaction(
                     "public untracked filesystem payload persistence failed inside write txn: {}",
                     error.description
                 ),
+                hint: None,
             })?;
     }
     if filesystem_finalization.should_run_gc {
@@ -160,6 +161,7 @@ async fn execute_public_immediate_write_with_transaction(
                 "public untracked runtime-sequence persistence failed inside write txn: {}",
                 error.description
             ),
+            hint: None,
         })?;
 
     Ok(Some(WriteExecutionOutcome {
@@ -302,6 +304,7 @@ fn planned_row_text_value<'a>(row: &'a PlannedStateRow, key: &str) -> Result<&'a
     planned_row_optional_text_value(row, key).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("public untracked execution requires '{key}' in the resolved row"),
+        hint: None,
     })
 }
 
@@ -323,6 +326,7 @@ fn planned_row_json_text_value(row: &PlannedStateRow, key: &str) -> Result<Strin
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("public untracked execution requires JSON '{key}'"),
+            hint: None,
         })
 }
 

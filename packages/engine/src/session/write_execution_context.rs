@@ -337,6 +337,7 @@ pub(crate) async fn execute_public_commit_write(
                 "public tracked write version checkpoint side effects failed: {}",
                 error.description
             ),
+            hint: None,
         })?;
     }
 

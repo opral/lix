@@ -690,11 +690,11 @@ fn init_and_open_lix_at_path(
 
     let mut config = LixConfig::new(backend, default_wasm_runtime()?);
     config.key_values = vec![BootKeyValue {
-            key: "lix_deterministic_mode".to_string(),
-            value: json!({ "enabled": true }),
-            lixcol_global: Some(true),
-            lixcol_untracked: None,
-        }];
+        key: "lix_deterministic_mode".to_string(),
+        value: json!({ "enabled": true }),
+        lixcol_global: Some(true),
+        lixcol_untracked: None,
+    }];
 
     pollster::block_on(Lix::open(config)).map_err(|err| {
         CliError::msg(format!(

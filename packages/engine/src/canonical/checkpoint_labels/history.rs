@@ -134,15 +134,18 @@ fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
         Some(Value::Text(_)) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} must not be empty"),
+            hint: None,
         }),
         Some(Value::Integer(number)) => Ok(number.to_string()),
         Some(other) => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{label} must be text-like, got {other:?}"),
+            hint: None,
         }),
         None => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("missing {label}"),
+            hint: None,
         }),
     }
 }

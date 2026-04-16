@@ -53,6 +53,7 @@ pub trait LixBackend: Send + Sync {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "export_image is not supported by this backend".to_string(),
+            hint: None,
         })
     }
 
@@ -61,6 +62,7 @@ pub trait LixBackend: Send + Sync {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "restore_from_image is not supported by this backend".to_string(),
+            hint: None,
         })
     }
 
@@ -85,6 +87,7 @@ pub trait LixBackend: Send + Sync {
         Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "destroy is not supported by this backend".to_string(),
+            hint: None,
         })
     }
 }

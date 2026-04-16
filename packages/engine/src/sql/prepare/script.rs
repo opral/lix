@@ -32,6 +32,7 @@ pub(crate) fn extract_explicit_transaction_script_from_statements(
             description:
                 "nested transaction statements are not supported inside BEGIN ... COMMIT scripts"
                     .to_string(),
+            hint: None,
         });
     }
 
@@ -150,12 +151,14 @@ fn append_insert_rows(target: &mut Insert, incoming: &Insert) -> Result<(), LixE
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction insert coalescing expected VALUES rows".to_string(),
+            hint: None,
         })?
         .to_vec();
 
     let target_rows = plain_values_rows_mut(target).ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "transaction insert coalescing expected mutable VALUES rows".to_string(),
+        hint: None,
     })?;
     target_rows.extend(incoming_rows);
     Ok(())

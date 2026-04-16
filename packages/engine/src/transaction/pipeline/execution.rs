@@ -408,6 +408,7 @@ async fn execute_direct_write_command(
                     "transaction direct execution failed: {}",
                     normalized.description
                 ),
+                hint: None,
             })
         }
     }
@@ -515,6 +516,7 @@ fn bind_single_statement_template(
             description:
                 "execute_with_options_in_write_transaction expects exactly one SQL statement"
                     .to_string(),
+            hint: None,
         });
     }
 

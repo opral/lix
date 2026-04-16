@@ -1992,6 +1992,7 @@ mod tests {
             Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "transactions are not needed in this test backend".to_string(),
+                hint: None,
             })
         }
 

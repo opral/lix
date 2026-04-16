@@ -585,6 +585,7 @@ simulation_test!(
                     Err::<(), LixError>(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "rollback state commit stream test".to_string(),
+                        hint: None,
                     })
                 })
             })

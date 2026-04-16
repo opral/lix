@@ -29,6 +29,7 @@ pub(crate) async fn load_or_init_plugin_component(
         let guard = host.plugin_component_cache().lock().map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "plugin component cache lock poisoned".to_string(),
+            hint: None,
         })?;
         if let Some(cached) = guard.get(&plugin.key) {
             if cached.wasm == plugin.wasm {
@@ -44,6 +45,7 @@ pub(crate) async fn load_or_init_plugin_component(
     let mut guard = host.plugin_component_cache().lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "plugin component cache lock poisoned".to_string(),
+        hint: None,
     })?;
     if let Some(cached) = guard.get(&plugin.key) {
         if cached.wasm == plugin.wasm {
@@ -87,6 +89,7 @@ async fn invoke_apply_changes_export(
             "plugin materialization: failed to call apply-changes export ({})",
             errors.join("; ")
         ),
+        hint: None,
     })
 }
 

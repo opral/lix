@@ -71,6 +71,7 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
             description: format!(
                 "plugin materialization: row missing column '{column}' at index {index}"
             ),
+            hint: None,
         });
     };
     match value {
@@ -80,6 +81,7 @@ fn blob_required(row: &[Value], index: usize, column: &str) -> Result<Vec<u8>, L
             description: format!(
                 "plugin materialization: expected blob column '{column}' at index {index}, got {other:?}"
             ),
+            hint: None,
         }),
     }
 }
