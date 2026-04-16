@@ -488,7 +488,7 @@ mod tests {
         entity_id: &str,
         schema_key: &str,
         version_id: &str,
-        writer_key: Option<&str>,
+        origin_key: Option<&str>,
     ) -> StagedChange {
         StagedChange {
             id: Some(id.to_string()),
@@ -506,7 +506,7 @@ mod tests {
             metadata: None,
             created_at: Some("2025-01-01T00:00:00.000Z".to_string()),
             version_id: version_id.try_into().unwrap(),
-            writer_key: writer_key.map(ToString::to_string),
+            origin_key: origin_key.map(ToString::to_string),
         }
     }
 

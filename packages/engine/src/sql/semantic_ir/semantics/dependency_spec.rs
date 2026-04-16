@@ -224,12 +224,12 @@ fn merge_dependency_specs(mut left: DependencySpec, right: DependencySpec) -> De
     left.file_ids.extend(right.file_ids);
     left.version_ids.extend(right.version_ids);
     left.query_dependencies.extend(right.query_dependencies);
-    left.writer_filter
+    left.origin_filter
         .include
-        .extend(right.writer_filter.include);
-    left.writer_filter
+        .extend(right.origin_filter.include);
+    left.origin_filter
         .exclude
-        .extend(right.writer_filter.exclude);
+        .extend(right.origin_filter.exclude);
     left.include_untracked |= right.include_untracked;
     left.depends_on_active_version |= right.depends_on_active_version;
     if left.precision != right.precision {

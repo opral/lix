@@ -1,5 +1,5 @@
 use lix_engine::streams::{StateCommitStreamFilter, StateCommitStreamOperation};
-use lix_engine::{ExecuteOptions, LixError, Value};
+use lix_engine::{AdditionalSessionOptions, ExecuteOptions, LixError, Value};
 
 fn as_text(value: &Value) -> String {
     match value {
@@ -49,7 +49,7 @@ fn insert_untracked_key_value_sql(key: &str, value_json: &str) -> String {
         "INSERT INTO lix_state (\
          entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
          ) VALUES (\
-         '{key}', 'lix', 'lix_key_value', 'lix', '1', \
+         '{key}', NULL, 'lix_key_value', NULL, '1', \
          lix_json('{{\"key\":\"{key}\",\"value\":{value_json}}}'), true\
          )"
     )
@@ -61,7 +61,7 @@ fn update_untracked_key_value_sql(key: &str, value_json: &str) -> String {
          SET snapshot_content = lix_json('{{\"key\":\"{key}\",\"value\":{value_json}}}') \
          WHERE entity_id = '{key}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix' \
+           AND file_id IS NULL \
            AND untracked = true"
     )
 }
@@ -71,7 +71,7 @@ fn delete_untracked_key_value_sql(key: &str) -> String {
         "DELETE FROM lix_state \
          WHERE entity_id = '{key}' \
            AND schema_key = 'lix_key_value' \
-           AND file_id = 'lix' \
+           AND file_id IS NULL \
            AND untracked = true"
     )
 }
@@ -366,7 +366,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    state_commit_stream_respects_excluded_writer_keys,
+    state_commit_stream_exclude_self_suppresses_workspace_origin_only,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -377,26 +377,30 @@ simulation_test!(
 
         let events = engine.state_commit_stream(StateCommitStreamFilter {
             schema_keys: vec!["lix_key_value".to_string()],
-            exclude_writer_keys: vec!["ui-writer".to_string()],
-            ..StateCommitStreamFilter::default()
+            ..StateCommitStreamFilter::exclude_self()
         });
 
         engine
-            .execute_with_options(
+            .execute(
                 &insert_key_value_sql("state-commit-events-b", "\"v0\""),
                 &[],
-                ExecuteOptions {
-                    writer_key: Some("ui-writer".to_string()),
-                },
             )
             .await
             .unwrap();
         assert!(
             events.try_next().is_none(),
-            "excluded writer should not receive events"
+            "exclude_self should suppress workspace-origin events"
         );
 
-        engine
+        let worker = engine
+            .open_additional_session(AdditionalSessionOptions {
+                origin_key: Some("ui-worker".to_string()),
+                ..AdditionalSessionOptions::default()
+            })
+            .await
+            .expect("additional session should open");
+
+        worker
             .execute(
                 &insert_key_value_sql("state-commit-events-c", "\"v0\""),
                 &[],
@@ -405,7 +409,7 @@ simulation_test!(
             .unwrap();
         let batch = events
             .try_next()
-            .expect("expected event batch from non-excluded writer");
+            .expect("expected event batch from a different origin");
         assert!(batch.changes.iter().any(|change| {
             change.schema_key == "lix_key_value" && change.entity_id == "state-commit-events-c"
         }));

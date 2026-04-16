@@ -120,7 +120,6 @@ pub(crate) fn is_live_state_raw_envelope_column(column: &str) -> bool {
             | "change_id"
             | "commit_id"
             | "untracked"
-            | "writer_key"
             | "root_commit_id"
             | "depth"
     )

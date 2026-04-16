@@ -56,7 +56,7 @@ mod receipt;
 
 pub(crate) use change_commit_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 pub use json::CanonicalJson;
-pub(crate) use receipt::{CanonicalCommitReceipt, UpdatedVersionRef};
+pub use receipt::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 #[allow(unused_imports)]
 pub(crate) use api::{

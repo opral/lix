@@ -2,7 +2,7 @@ use crate::support;
 
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Lix, LixConfig};
-use lix_engine::{ObserveQuery, Value};
+use lix_engine::{ObserveOptions, ObserveQuery, Value};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::Executor;
 use std::path::PathBuf;
@@ -989,7 +989,7 @@ fn observe_sqlite_late_subscription_after_restart_reads_existing_untracked_state
                     "INSERT INTO lix_state (\
                      entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
                      ) VALUES (\
-                     'observe-untracked-restart', 'lix', 'lix_key_value', 'lix', '1', \
+                     'observe-untracked-restart', NULL, 'lix_key_value', NULL, '1', \
                      lix_json('{\"key\":\"observe-untracked-restart\",\"value\":\"u1\"}'), true\
                      )",
                     &[],
@@ -1205,7 +1205,7 @@ fn observe_postgres_detects_external_untracked_state_insert_without_observe_tick
                     "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
                  ) VALUES (\
-                 'observe-untracked-external-no-tick', 'lix', 'lix_key_value', 'lix', '1', \
+                 'observe-untracked-external-no-tick', NULL, 'lix_key_value', NULL, '1', \
                  lix_json('{\"key\":\"observe-untracked-external-no-tick\",\"value\":\"u1\"}'), true\
                  )",
                     &[],
@@ -1229,171 +1229,196 @@ fn observe_postgres_detects_external_untracked_state_insert_without_observe_tick
 }
 
 #[test]
-fn observe_external_same_writer_key_is_suppressed() {
-    run_local_observe_postgres_case("observe_external_same_writer_key_is_suppressed", || async {
-        let writer = "observe-external-writer";
-        let connection_string =
-            support::simulations::create_postgres_test_database_url("observe-same-writer")
+fn observe_external_same_origin_is_suppressed_by_exclude_self() {
+    run_local_observe_postgres_case(
+        "observe_external_same_origin_is_suppressed_by_exclude_self",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-same-origin")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a
+                .initialize_if_needed()
                 .await
-                .expect("postgres database url should be created");
-        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
-        let engine_b = boot_postgres_engine_at_url(connection_string);
+                .expect("engine_a init should succeed");
+            engine_b
+                .initialize_if_needed()
+                .await
+                .expect("engine_b init should succeed");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
+            let origin = session_a
+                .origin_key()
+                .expect("workspace session origin should exist")
+                .to_string();
 
-        engine_a
-            .initialize_if_needed()
-            .await
-            .expect("engine_a init should succeed");
-        engine_b
-            .initialize_if_needed()
-            .await
-            .expect("engine_b init should succeed");
-        let session_a = Arc::clone(&engine_a);
-        let session_b = Arc::clone(&engine_b);
+            let mut observed = session_a
+                .observe_with_options(
+                    ObserveQuery::new(
+                        "SELECT path \
+                     FROM lix_file \
+                     WHERE path = '/observe-origin-same.md'",
+                        vec![],
+                    ),
+                    ObserveOptions::exclude_self(),
+                )
+                .expect("observe should succeed");
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
 
-        let mut observed = session_a
-            .observe(ObserveQuery::new(
-                "SELECT path \
-                 FROM lix_file \
-                 WHERE path = '/observe-writer.md' \
-                   AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
-                vec![Value::Text(writer.to_string())],
-            ))
-            .expect("observe should succeed");
-        let initial = observed
-            .next()
-            .await
-            .expect("initial observe next should succeed")
-            .expect("initial observe event should exist");
-        assert!(initial.rows.rows.is_empty());
-
-        session_b
+            session_b
             .execute_with_options(
-                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer.md', lix_text_encode('same-writer'))",
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-origin-same.md', lix_text_encode('same-origin'))",
                 &[],
                 ExecuteOptions {
-                    writer_key: Some(writer.to_string()),
+                    origin_key: Some(origin),
                 },
             )
             .await
             .expect("external insert should succeed");
 
-        let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
-        assert!(
-            timed.is_err(),
-            "same writer key should suppress observe emission"
-        );
-    });
+            let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
+            assert!(
+                timed.is_err(),
+                "same origin should suppress observe emission"
+            );
+        },
+    );
 }
 
 #[test]
-fn observe_external_different_writer_key_emits() {
-    run_local_observe_postgres_case("observe_external_different_writer_key_emits", || async {
-        let connection_string =
-            support::simulations::create_postgres_test_database_url("observe-different-writer")
+fn observe_external_different_origin_emits_with_exclude_self() {
+    run_local_observe_postgres_case(
+        "observe_external_different_origin_emits_with_exclude_self",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-different-origin")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a
+                .initialize_if_needed()
                 .await
-                .expect("postgres database url should be created");
-        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
-        let engine_b = boot_postgres_engine_at_url(connection_string);
+                .expect("engine_a init should succeed");
+            engine_b
+                .initialize_if_needed()
+                .await
+                .expect("engine_b init should succeed");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
 
-        engine_a
-            .initialize_if_needed()
-            .await
-            .expect("engine_a init should succeed");
-        engine_b
-            .initialize_if_needed()
-            .await
-            .expect("engine_b init should succeed");
-        let session_a = Arc::clone(&engine_a);
-        let session_b = Arc::clone(&engine_b);
+            let mut observed = session_a
+                .observe_with_options(
+                    ObserveQuery::new(
+                        "SELECT path \
+                     FROM lix_file \
+                     WHERE path = '/observe-origin-different.md'",
+                        vec![],
+                    ),
+                    ObserveOptions::exclude_self(),
+                )
+                .expect("observe should succeed");
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
 
-        let mut observed = session_a
-            .observe(ObserveQuery::new(
-                "SELECT path \
-                 FROM lix_file \
-                 WHERE path = '/observe-writer-different.md' \
-                   AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
-                vec![Value::Text("observer-writer".to_string())],
-            ))
-            .expect("observe should succeed");
-        let initial = observed
-            .next()
-            .await
-            .expect("initial observe next should succeed")
-            .expect("initial observe event should exist");
-        assert!(initial.rows.rows.is_empty());
-
-        session_b
+            session_b
             .execute_with_options(
-                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-different.md', lix_text_encode('different-writer'))",
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-origin-different.md', lix_text_encode('different-origin'))",
                 &[],
                 ExecuteOptions {
-                    writer_key: Some("different-writer".to_string()),
+                    origin_key: Some("different-origin".to_string()),
                 },
             )
             .await
             .expect("external insert should succeed");
 
-        let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
-            .await
-            .expect("observe next should not time out")
-            .expect("observe next should succeed")
-            .expect("observe update event should exist");
-        assert_eq!(update.rows.rows.len(), 1);
-        assert_eq!(update.state_commit_sequence, None);
-    });
+            let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+                .await
+                .expect("observe next should not time out")
+                .expect("observe next should succeed")
+                .expect("observe update event should exist");
+            assert_eq!(update.rows.rows.len(), 1);
+            assert_eq!(update.state_commit_sequence, None);
+        },
+    );
 }
 
 #[test]
-fn observe_external_null_writer_key_emits() {
-    run_local_observe_postgres_case("observe_external_null_writer_key_emits", || async {
-        let connection_string =
-            support::simulations::create_postgres_test_database_url("observe-null-writer")
+fn observe_external_explicitly_excluded_origin_is_suppressed() {
+    run_local_observe_postgres_case(
+        "observe_external_explicitly_excluded_origin_is_suppressed",
+        || async {
+            let connection_string =
+                support::simulations::create_postgres_test_database_url("observe-excluded-origin")
+                    .await
+                    .expect("postgres database url should be created");
+            let engine_a = boot_postgres_engine_at_url(connection_string.clone());
+            let engine_b = boot_postgres_engine_at_url(connection_string);
+
+            engine_a
+                .initialize_if_needed()
                 .await
-                .expect("postgres database url should be created");
-        let engine_a = boot_postgres_engine_at_url(connection_string.clone());
-        let engine_b = boot_postgres_engine_at_url(connection_string);
+                .expect("engine_a init should succeed");
+            engine_b
+                .initialize_if_needed()
+                .await
+                .expect("engine_b init should succeed");
+            let session_a = Arc::clone(&engine_a);
+            let session_b = Arc::clone(&engine_b);
+            let excluded_origin = "replicator-origin";
 
-        engine_a
-            .initialize_if_needed()
-            .await
-            .expect("engine_a init should succeed");
-        engine_b
-            .initialize_if_needed()
-            .await
-            .expect("engine_b init should succeed");
-        let session_a = Arc::clone(&engine_a);
-        let session_b = Arc::clone(&engine_b);
+            let mut observed = session_a
+                .observe_with_options(
+                    ObserveQuery::new(
+                        "SELECT path \
+                     FROM lix_file \
+                     WHERE path = '/observe-origin-excluded.md'",
+                        vec![],
+                    ),
+                    ObserveOptions {
+                        exclude_origin_keys: vec![excluded_origin.to_string()],
+                        ..ObserveOptions::default()
+                    },
+                )
+                .expect("observe should succeed");
+            let initial = observed
+                .next()
+                .await
+                .expect("initial observe next should succeed")
+                .expect("initial observe event should exist");
+            assert!(initial.rows.rows.is_empty());
 
-        let mut observed = session_a
-            .observe(ObserveQuery::new(
-                "SELECT path \
-                 FROM lix_file \
-                 WHERE path = '/observe-writer-null.md' \
-                   AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
-                vec![Value::Text("observer-writer".to_string())],
-            ))
-            .expect("observe should succeed");
-        let initial = observed
-            .next()
-            .await
-            .expect("initial observe next should succeed")
-            .expect("initial observe event should exist");
-        assert!(initial.rows.rows.is_empty());
-
-        session_b
-            .execute(
-                "INSERT INTO lix_file (path, data) VALUES ('/observe-writer-null.md', lix_text_encode('null-writer'))", &[])
+            session_b
+            .execute_with_options(
+                "INSERT INTO lix_file (path, data) VALUES ('/observe-origin-excluded.md', lix_text_encode('excluded-origin'))",
+                &[],
+                ExecuteOptions {
+                    origin_key: Some(excluded_origin.to_string()),
+                },
+            )
             .await
             .expect("external insert should succeed");
 
-        let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
-            .await
-            .expect("observe next should not time out")
-            .expect("observe next should succeed")
-            .expect("observe update event should exist");
-        assert_eq!(update.rows.rows.len(), 1);
-        assert_eq!(update.state_commit_sequence, None);
-    });
+            let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
+            assert!(
+                timed.is_err(),
+                "explicitly excluded origin should suppress observe emission"
+            );
+        },
+    );
 }
 
 #[test]

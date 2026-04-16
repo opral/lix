@@ -11,6 +11,6 @@ pub(crate) use crate::sql::{
     WriteModeRequest, WriteOperationKind,
 };
 pub(crate) use crate::sql::{
-    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
-    PlannedStateRow, WriteLane, WriteMode,
+    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
+    WriteLane, WriteMode,
 };

@@ -185,7 +185,6 @@ fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str
         plugin_key: None,
         metadata: Some("{\"kind\":\"txn-module\"}".to_string()),
         change_id: change_id.to_string(),
-        writer_key: Some("writer-a".to_string()),
         snapshot_content: Some(format!(
             "{{\"child_id\":\"{child_id}\",\"parent_id\":\"parent-{entity_id}\"}}"
         )),
@@ -211,7 +210,6 @@ fn local_version_head_untracked_write_row(
         plugin_key: None,
         metadata: None,
         change_id: format!("change-version-ref::{version_id}::{commit_id}::{timestamp}"),
-        writer_key: None,
         snapshot_content: Some(format!(
             "{{\"id\":\"{version_id}\",\"commit_id\":\"{commit_id}\"}}"
         )),
@@ -228,7 +226,7 @@ async fn isolated_transaction_commits_tracked_and_untracked_batches() {
     init_workspace(&backend)
         .await
         .expect("workspace init should succeed");
-    let read_context = OverlayReadContext::new(&backend, &backend, &backend);
+    let read_context = OverlayReadContext::new(&backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await
@@ -334,7 +332,7 @@ async fn isolated_transaction_rejects_staging_after_execute() {
     init_workspace(&backend)
         .await
         .expect("workspace init should succeed");
-    let read_context = OverlayReadContext::new(&backend, &backend, &backend);
+    let read_context = OverlayReadContext::new(&backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await
@@ -369,7 +367,7 @@ async fn isolated_transaction_rollback_discards_staged_writes() {
     init_workspace(&backend)
         .await
         .expect("workspace init should succeed");
-    let read_context = OverlayReadContext::new(&backend, &backend, &backend);
+    let read_context = OverlayReadContext::new(&backend, &backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await

@@ -5,7 +5,6 @@
 
 use std::collections::BTreeMap;
 
-use crate::functions::DynFunctionProvider;
 use crate::live_state::{
     compile_live_row_shape_from_registered_snapshots, live_row_shape_from_definition,
     scan_visible_live_rows, LiveReadRow, LiveRowShape, LiveStorageLane, ScanConstraint, ScanField,
@@ -27,19 +26,13 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 struct PendingOverlayReadModel<'a> {
     base: &'a dyn LixBackend,
     pending_overlay: Option<&'a dyn PendingOverlay>,
-    functions: Option<&'a DynFunctionProvider>,
 }
 
 impl<'a> PendingOverlayReadModel<'a> {
-    fn new(
-        base: &'a dyn LixBackend,
-        pending_overlay: Option<&'a dyn PendingOverlay>,
-        functions: Option<&'a DynFunctionProvider>,
-    ) -> Self {
+    fn new(base: &'a dyn LixBackend, pending_overlay: Option<&'a dyn PendingOverlay>) -> Self {
         Self {
             base,
             pending_overlay,
-            functions,
         }
     }
 
@@ -51,17 +44,9 @@ impl<'a> PendingOverlayReadModel<'a> {
     async fn build_public_read_surface_registry(
         &self,
     ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
-        let functions = self
-            .functions
-            .expect("surface registry build requires explicit runtime functions");
         if !self.has_pending_visibility() {
-            return crate::catalog::load_public_surface_registry_with_backend(
-                self.base,
-                None,
-                crate::cel::shared_runtime(),
-                functions,
-            )
-            .await;
+            return crate::catalog::load_public_surface_registry_with_backend(self.base, None)
+                .await;
         }
 
         let mut registry = crate::catalog::build_builtin_surface_registry();
@@ -75,8 +60,6 @@ impl<'a> PendingOverlayReadModel<'a> {
             crate::catalog::apply_registered_schema_snapshot_to_surface_registry(
                 &mut registry,
                 &snapshot,
-                crate::cel::shared_runtime(),
-                functions,
             )?;
         }
         Ok(registry)
@@ -217,7 +200,6 @@ impl<'a> PendingOverlayReadModel<'a> {
             }
         }
         self.apply_filesystem_overlay_to_rows(query, &access, &mut by_identity);
-        self.apply_writer_key_overlay_to_rows(query, &mut by_identity);
         let mut rows = by_identity
             .into_values()
             .filter(|row| {
@@ -349,43 +331,13 @@ impl<'a> PendingOverlayReadModel<'a> {
             }
         }
     }
-
-    fn apply_writer_key_overlay_to_rows(
-        &self,
-        query: &LiveTableOverlayQuery,
-        rows: &mut BTreeMap<OverlayVisibleLiveRowIdentity, OverlayVisibleLiveRow>,
-    ) {
-        if query.lane != PendingOverlayLane::Tracked {
-            return;
-        }
-        let Some(pending_overlay) = self.pending_overlay else {
-            return;
-        };
-
-        for row in rows.values_mut() {
-            let Some(writer_key) = pending_overlay.writer_key_annotation_for_state_row(
-                &row.version_id,
-                &row.schema_key,
-                &row.entity_id,
-                row.file_id.as_deref(),
-            ) else {
-                continue;
-            };
-            row.writer_key = writer_key.clone();
-            row.normalized_values.insert(
-                "writer_key".to_string(),
-                writer_key.clone().map(Value::Text).unwrap_or(Value::Null),
-            );
-        }
-    }
 }
 
 pub(crate) async fn build_public_read_surface_registry_with_pending_overlay(
     base: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
-    functions: &DynFunctionProvider,
 ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
-    PendingOverlayReadModel::new(base, pending_overlay, Some(functions))
+    PendingOverlayReadModel::new(base, pending_overlay)
         .build_public_read_surface_registry()
         .await
 }
@@ -395,7 +347,7 @@ pub(crate) async fn execute_pending_overlay_public_read(
     pending_overlay: Option<&dyn PendingOverlay>,
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    PendingOverlayReadModel::new(base, pending_overlay, None)
+    PendingOverlayReadModel::new(base, pending_overlay)
         .execute_pending_overlay_public_read(public_read)
         .await
 }
@@ -408,7 +360,7 @@ pub(crate) async fn execute_pending_overlay_public_read_in_transaction(
     match public_read.contract.source() {
         PublicReadSource::PendingOverlay => {
             let backend = crate::backend::transaction_backend_view(transaction);
-            PendingOverlayReadModel::new(&backend, pending_overlay, None)
+            PendingOverlayReadModel::new(&backend, pending_overlay)
                 .execute_pending_overlay_public_read(public_read)
                 .await
         }
@@ -439,7 +391,6 @@ struct OverlayVisibleLiveRow {
     untracked: bool,
     plugin_key: Option<String>,
     metadata: Option<String>,
-    writer_key: Option<String>,
     change_id: Option<String>,
     snapshot_content: Option<String>,
     is_tombstone: bool,
@@ -566,7 +517,6 @@ fn visible_live_row_from_raw(
         untracked,
         plugin_key: row.plugin_key().map(ToOwned::to_owned),
         metadata: row.metadata().map(ToOwned::to_owned),
-        writer_key: row.writer_key().map(ToOwned::to_owned),
         change_id: row.change_id().map(ToOwned::to_owned),
         normalized_values: row.values().clone(),
         snapshot_content: Some(snapshot_content),
@@ -588,7 +538,6 @@ fn visible_live_row_from_pending(
         untracked: pending.untracked,
         plugin_key: pending.plugin_key.clone(),
         metadata: pending.metadata.clone(),
-        writer_key: None,
         change_id: pending.change_id.clone(),
         snapshot_content: pending.snapshot_content.clone(),
         is_tombstone: pending.tombstone,
@@ -624,7 +573,6 @@ fn visible_live_row_from_pending_filesystem_state(
         untracked: pending.untracked,
         plugin_key: None,
         metadata: descriptor.metadata.clone(),
-        writer_key: None,
         change_id: None,
         snapshot_content: Some(snapshot_content.clone()),
         is_tombstone: false,
@@ -692,12 +640,6 @@ fn live_row_value(row: &OverlayVisibleLiveRow, column: &str) -> Option<Value> {
         "metadata" | "lixcol_metadata" => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }
-        "writer_key" | "lixcol_writer_key" => Some(
-            row.writer_key
-                .clone()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
-        ),
         "change_id" | "lixcol_change_id" => Some(
             row.change_id
                 .clone()

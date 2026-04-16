@@ -121,25 +121,23 @@ impl Engine {
     pub(crate) async fn load_public_surface_registry_from_backend(
         &self,
     ) -> Result<SurfaceRegistry, LixError> {
-        let functions = self
-            .prepare_runtime_functions_with_backend(self.backend().as_ref())
-            .await?;
-        let functions = clone_boxed_function_provider(&functions);
-        crate::catalog::load_public_surface_registry_with_backend(
-            self.backend().as_ref(),
-            None,
-            crate::cel::shared_runtime(),
-            &functions,
-        )
-        .await
+        crate::catalog::load_public_surface_registry_with_backend(self.backend().as_ref(), None)
+            .await
     }
 
     pub(crate) fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
         self.state_commit_stream_bus.subscribe(filter)
     }
 
-    pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.state_commit_stream_bus.emit(changes);
+    pub(crate) fn latest_state_commit_sequence(&self) -> Option<u64> {
+        self.state_commit_stream_bus.latest_sequence()
+    }
+
+    pub(crate) fn emit_state_commit_stream_changes(
+        &self,
+        changes: Vec<StateCommitStreamChange>,
+    ) -> Option<u64> {
+        self.state_commit_stream_bus.emit(changes)
     }
 
     pub(crate) fn deterministic_boot_pending(&self) -> bool {
@@ -332,8 +330,15 @@ impl crate::session::SessionHost for EngineSessionHost {
         self.engine.state_commit_stream(filter)
     }
 
-    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.engine.emit_state_commit_stream_changes(changes);
+    fn latest_state_commit_sequence(&self) -> Option<u64> {
+        self.engine.latest_state_commit_sequence()
+    }
+
+    fn emit_state_commit_stream_changes(
+        &self,
+        changes: Vec<StateCommitStreamChange>,
+    ) -> Option<u64> {
+        self.engine.emit_state_commit_stream_changes(changes)
     }
 
     fn invalidate_deterministic_settings_cache(&self) {

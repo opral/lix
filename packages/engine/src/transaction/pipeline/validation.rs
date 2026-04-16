@@ -16,8 +16,13 @@ use std::sync::Arc;
 use jsonschema::JSONSchema;
 use serde_json::Value as JsonValue;
 
+use crate::binary_cas::load_blob_data_by_hash;
 use crate::canonical::{CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY};
-use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi, SurfaceFamily};
+use crate::catalog::{
+    builtin_catalog_compiler_facade, file_id_resolves_in_scope, load_file_row_by_id,
+    load_file_row_by_id_with_pending_overlay, lookup_directory_path_by_id_with_pending_overlay,
+    CatalogCompilerApi, FilesystemProjectionScope, SurfaceFamily,
+};
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{
@@ -25,6 +30,7 @@ use crate::live_state::{
     scan_live_rows, LiveFilter, LiveFilterField, LiveFilterOp, LiveRowQuery, LiveRowSource,
     LiveSnapshotRow, LiveSnapshotStorage,
 };
+use crate::plugin::{load_installed_plugin_from_archive_bytes, plugin_key_from_archive_path};
 use crate::schema::CompiledSchemaCache;
 use crate::schema::{
     builtin_schema_definition, builtin_schema_keys, schema_from_registered_snapshot,
@@ -36,10 +42,15 @@ use crate::sql::{
 };
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::UpdateValidationInput;
-use crate::transaction::{PreparedPublicWrite, PreparedResolvedWritePlan};
+use crate::transaction::{
+    filesystem_transaction_state_from_planned, FilesystemTransactionState,
+    PendingFilesystemFileView, PreparedPublicWrite, PreparedResolvedWritePlan,
+};
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixError, Value};
 
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
+const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -332,6 +343,105 @@ impl<'a> WriteValidationSchemaLookup<'a> {
     }
 }
 
+struct PluginOwnershipValidationLookup {
+    manifest_keys: BTreeSet<String>,
+}
+
+impl PluginOwnershipValidationLookup {
+    async fn from_visible_state(
+        backend: &dyn LixBackend,
+        pending_overlay: Option<&dyn PendingOverlay>,
+        planned_filesystem_state: Option<&FilesystemTransactionState>,
+    ) -> Result<Self, LixError> {
+        let mut manifest_keys = collect_backend_visible_plugin_manifest_keys(backend).await?;
+        manifest_keys
+            .extend(collect_pending_overlay_plugin_manifest_keys(backend, pending_overlay).await?);
+        manifest_keys.extend(
+            collect_planned_filesystem_plugin_manifest_keys(
+                backend,
+                pending_overlay,
+                planned_filesystem_state,
+            )
+            .await?,
+        );
+        Ok(Self { manifest_keys })
+    }
+
+    fn contains(&self, plugin_key: &str) -> bool {
+        self.manifest_keys.contains(plugin_key)
+    }
+}
+
+async fn collect_backend_visible_plugin_manifest_keys(
+    backend: &dyn LixBackend,
+) -> Result<BTreeSet<String>, LixError> {
+    let descriptor_rows = scan_live_rows(
+        backend,
+        &LiveRowQuery {
+            schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            source: LiveRowSource::Tracked,
+            constraints: Vec::new(),
+            include_tombstones: false,
+        },
+    )
+    .await?;
+    let blob_rows = scan_live_rows(
+        backend,
+        &LiveRowQuery {
+            schema_key: BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            source: LiveRowSource::Tracked,
+            constraints: Vec::new(),
+            include_tombstones: false,
+        },
+    )
+    .await?;
+
+    let blob_hashes_by_file_id = blob_rows
+        .into_iter()
+        .filter_map(|row| {
+            row.snapshot_content
+                .as_deref()
+                .and_then(|snapshot| serde_json::from_str::<JsonValue>(snapshot).ok())
+                .and_then(|snapshot| {
+                    snapshot
+                        .get("blob_hash")
+                        .and_then(JsonValue::as_str)
+                        .map(|blob_hash| (row.entity_id, blob_hash.to_string()))
+                })
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut manifest_keys = BTreeSet::new();
+    for descriptor in descriptor_rows {
+        let Some(blob_hash) = blob_hashes_by_file_id.get(&descriptor.entity_id) else {
+            continue;
+        };
+        let Some(file_row) = load_file_row_by_id(
+            backend,
+            GLOBAL_VERSION_ID,
+            &descriptor.entity_id,
+            FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .map_err(|error| LixError::unknown(error.message))?
+        else {
+            continue;
+        };
+        let Some(archive_bytes) = load_blob_data_by_hash(backend, blob_hash).await? else {
+            continue;
+        };
+        if let Some(plugin_key) =
+            plugin_manifest_key_from_archive_candidate(&file_row.path, &archive_bytes)?
+        {
+            manifest_keys.insert(plugin_key);
+        }
+    }
+
+    Ok(manifest_keys)
+}
+
 pub async fn validate_inserts(
     backend: &dyn LixBackend,
     cache: &dyn CompiledSchemaCache,
@@ -339,6 +449,8 @@ pub async fn validate_inserts(
     pending_overlay: Option<&dyn PendingOverlay>,
 ) -> Result<(), LixError> {
     let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
+    let plugin_lookup =
+        PluginOwnershipValidationLookup::from_visible_state(backend, pending_overlay, None).await?;
     schema_provider.remember_pending_registered_schemas_from_view(pending_overlay)?;
 
     for row in mutations {
@@ -374,6 +486,8 @@ pub async fn validate_inserts(
         )
         .await?;
         validate_filesystem_insert_integrity(backend, row, snapshot).await?;
+        validate_insert_file_ownership_reference(backend, pending_overlay, mutations, row).await?;
+        validate_insert_plugin_ownership_reference(&plugin_lookup, row)?;
     }
 
     let mut constraints = ConstraintContext {
@@ -547,6 +661,14 @@ async fn validate_prepared_public_write(
     remember_pending_registered_schemas(&mut schema_provider, resolved).await?;
     let planned_binary_blob_hashes =
         collect_planned_binary_blob_hashes(resolved, require_binary_blob_ref_cas)?;
+    let planned_filesystem_state =
+        filesystem_transaction_state_from_planned(&resolved.filesystem_state());
+    let plugin_lookup = PluginOwnershipValidationLookup::from_visible_state(
+        backend,
+        pending_overlay,
+        Some(&planned_filesystem_state),
+    )
+    .await?;
     let shadows_committed_identity = public_write.contract.operation_kind
         == PreparedWriteOperationKind::Update
         || public_write
@@ -589,6 +711,15 @@ async fn validate_prepared_public_write(
             Some(&planned_binary_blob_hashes),
         )
         .await?;
+        validate_planned_file_ownership_reference(
+            backend,
+            pending_overlay,
+            resolved,
+            &planned_filesystem_state,
+            row,
+        )
+        .await?;
+        validate_planned_plugin_ownership_reference(&plugin_lookup, row)?;
     }
 
     if !matches!(
@@ -625,6 +756,428 @@ async fn validate_prepared_public_write(
     }
 
     Ok(())
+}
+
+async fn validate_insert_file_ownership_reference(
+    backend: &dyn LixBackend,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    mutations: &[MutationRow],
+    row: &MutationRow,
+) -> Result<(), LixError> {
+    let Some(file_id) = row.file_id.as_deref() else {
+        return Ok(());
+    };
+
+    if inserted_file_descriptor_exists_in_mutations(mutations, &row.version_id, file_id) {
+        return Ok(());
+    }
+
+    if file_id_resolves_in_scope(
+        backend,
+        pending_overlay,
+        &row.version_id,
+        file_id,
+        FilesystemProjectionScope::ExplicitVersion,
+    )
+    .await
+    .map_err(|error| LixError::unknown(error.message))?
+    {
+        return Ok(());
+    }
+
+    Err(missing_file_owner_reference_error(
+        &row.schema_key,
+        &row.entity_id,
+        file_id,
+        &row.version_id,
+    ))
+}
+
+async fn validate_planned_file_ownership_reference(
+    backend: &dyn LixBackend,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    resolved: &PreparedResolvedWritePlan,
+    planned_filesystem_state: &FilesystemTransactionState,
+    row: &PlannedStateRow,
+) -> Result<(), LixError> {
+    if row.tombstone {
+        return Ok(());
+    }
+
+    let Some(file_id) = planned_row_optional_text(row, "file_id") else {
+        return Ok(());
+    };
+    let version_id = planned_row_required_text(row, "version_id")?;
+    let planned_resolution = planned_file_descriptor_resolution(
+        resolved,
+        planned_filesystem_state,
+        &version_id,
+        &file_id,
+    )?;
+    match planned_resolution {
+        Some(true) => return Ok(()),
+        Some(false) => {
+            return Err(missing_file_owner_reference_error(
+                &row.schema_key,
+                &row.entity_id,
+                &file_id,
+                &version_id,
+            ));
+        }
+        None => {}
+    }
+
+    if file_id_resolves_in_scope(
+        backend,
+        pending_overlay,
+        &version_id,
+        &file_id,
+        FilesystemProjectionScope::ExplicitVersion,
+    )
+    .await
+    .map_err(|error| LixError::unknown(error.message))?
+    {
+        return Ok(());
+    }
+
+    Err(missing_file_owner_reference_error(
+        &row.schema_key,
+        &row.entity_id,
+        &file_id,
+        &version_id,
+    ))
+}
+
+fn inserted_file_descriptor_exists_in_mutations(
+    mutations: &[MutationRow],
+    version_id: &str,
+    file_id: &str,
+) -> bool {
+    inserted_file_descriptor_exists_in_mutations_for_exact_version(mutations, version_id, file_id)
+        || (version_id != GLOBAL_VERSION_ID
+            && inserted_file_descriptor_exists_in_mutations_for_exact_version(
+                mutations,
+                GLOBAL_VERSION_ID,
+                file_id,
+            ))
+}
+
+fn inserted_file_descriptor_exists_in_mutations_for_exact_version(
+    mutations: &[MutationRow],
+    version_id: &str,
+    file_id: &str,
+) -> bool {
+    mutations.iter().any(|candidate| {
+        candidate.operation == MutationOperation::Insert
+            && candidate.schema_key == FILE_DESCRIPTOR_SCHEMA_KEY
+            && candidate.version_id == version_id
+            && candidate.entity_id == file_id
+            && candidate.snapshot_content.is_some()
+    })
+}
+
+fn planned_file_descriptor_resolution(
+    resolved: &PreparedResolvedWritePlan,
+    planned_filesystem_state: &FilesystemTransactionState,
+    version_id: &str,
+    file_id: &str,
+) -> Result<Option<bool>, LixError> {
+    if let Some(resolution) = planned_file_descriptor_resolution_for_exact_version(
+        resolved,
+        planned_filesystem_state,
+        version_id,
+        file_id,
+    )? {
+        return Ok(Some(resolution));
+    }
+
+    if version_id != GLOBAL_VERSION_ID {
+        return planned_file_descriptor_resolution_for_exact_version(
+            resolved,
+            planned_filesystem_state,
+            GLOBAL_VERSION_ID,
+            file_id,
+        );
+    }
+
+    Ok(None)
+}
+
+fn planned_file_descriptor_resolution_for_exact_version(
+    resolved: &PreparedResolvedWritePlan,
+    planned_filesystem_state: &FilesystemTransactionState,
+    version_id: &str,
+    file_id: &str,
+) -> Result<Option<bool>, LixError> {
+    for partition in &resolved.partitions {
+        for row in &partition.intended_post_state {
+            if row.schema_key != FILE_DESCRIPTOR_SCHEMA_KEY || row.entity_id != file_id {
+                continue;
+            }
+            if planned_row_required_text(row, "version_id")? != version_id {
+                continue;
+            }
+            return Ok(Some(!row.tombstone));
+        }
+    }
+
+    for pending in planned_filesystem_state.files.values() {
+        if pending.file_id != file_id || pending.version_id != version_id {
+            continue;
+        }
+        if pending.deleted {
+            return Ok(Some(false));
+        }
+        if pending.descriptor.is_some() {
+            return Ok(Some(true));
+        }
+    }
+
+    Ok(None)
+}
+
+fn missing_file_owner_reference_error(
+    schema_key: &str,
+    entity_id: &str,
+    file_id: &str,
+    version_id: &str,
+) -> LixError {
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!(
+            "file ownership validation failed for schema '{}': entity '{}' references missing file_id '{}' in effective file scope for version '{}'",
+            schema_key, entity_id, file_id, version_id
+        ),
+    )
+}
+
+fn validate_insert_plugin_ownership_reference(
+    plugin_lookup: &PluginOwnershipValidationLookup,
+    row: &MutationRow,
+) -> Result<(), LixError> {
+    let Some(plugin_key) = row.plugin_key.as_deref() else {
+        return Ok(());
+    };
+    if plugin_lookup.contains(plugin_key) {
+        return Ok(());
+    }
+    Err(missing_plugin_owner_reference_error(
+        &row.schema_key,
+        &row.entity_id,
+        plugin_key,
+    ))
+}
+
+fn validate_planned_plugin_ownership_reference(
+    plugin_lookup: &PluginOwnershipValidationLookup,
+    row: &PlannedStateRow,
+) -> Result<(), LixError> {
+    if row.tombstone {
+        return Ok(());
+    }
+
+    let Some(plugin_key) = planned_row_optional_text(row, "plugin_key") else {
+        return Ok(());
+    };
+    if plugin_lookup.contains(&plugin_key) {
+        return Ok(());
+    }
+    Err(missing_plugin_owner_reference_error(
+        &row.schema_key,
+        &row.entity_id,
+        &plugin_key,
+    ))
+}
+
+fn missing_plugin_owner_reference_error(
+    schema_key: &str,
+    entity_id: &str,
+    plugin_key: &str,
+) -> LixError {
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!(
+            "plugin ownership validation failed for schema '{}': entity '{}' references missing installed plugin key '{}'",
+            schema_key, entity_id, plugin_key
+        ),
+    )
+}
+
+async fn collect_pending_overlay_plugin_manifest_keys(
+    backend: &dyn LixBackend,
+    pending_overlay: Option<&dyn PendingOverlay>,
+) -> Result<BTreeSet<String>, LixError> {
+    let Some(pending_overlay) = pending_overlay else {
+        return Ok(BTreeSet::new());
+    };
+
+    let mut manifest_keys = BTreeSet::new();
+    for pending in pending_overlay.visible_files() {
+        if let Some(plugin_key) =
+            pending_plugin_manifest_key_from_overlay_file(backend, pending_overlay, &pending)
+                .await?
+        {
+            manifest_keys.insert(plugin_key);
+        }
+    }
+    Ok(manifest_keys)
+}
+
+async fn collect_planned_filesystem_plugin_manifest_keys(
+    backend: &dyn LixBackend,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    planned_filesystem_state: Option<&FilesystemTransactionState>,
+) -> Result<BTreeSet<String>, LixError> {
+    let Some(planned_filesystem_state) = planned_filesystem_state else {
+        return Ok(BTreeSet::new());
+    };
+
+    let mut manifest_keys = BTreeSet::new();
+    for pending in planned_filesystem_state.files.values() {
+        if let Some(plugin_key) =
+            pending_plugin_manifest_key_from_planned_file(backend, pending_overlay, pending).await?
+        {
+            manifest_keys.insert(plugin_key);
+        }
+    }
+    Ok(manifest_keys)
+}
+
+async fn pending_plugin_manifest_key_from_overlay_file(
+    backend: &dyn LixBackend,
+    pending_overlay: &dyn PendingOverlay,
+    pending: &PendingFilesystemFileView,
+) -> Result<Option<String>, LixError> {
+    let Some(archive_bytes) = pending.data.as_deref() else {
+        return Ok(None);
+    };
+    if pending.deleted || pending.version_id != GLOBAL_VERSION_ID {
+        return Ok(None);
+    }
+
+    let path = match pending.descriptor.as_ref() {
+        Some(descriptor) => {
+            let parent_path = if descriptor.directory_id.is_empty() {
+                "/".to_string()
+            } else {
+                let Some(parent_path) = lookup_directory_path_by_id_with_pending_overlay(
+                    backend,
+                    Some(pending_overlay),
+                    &pending.version_id,
+                    &descriptor.directory_id,
+                    FilesystemProjectionScope::ExplicitVersion,
+                )
+                .await
+                .map_err(|error| LixError::unknown(error.message))?
+                else {
+                    return Ok(None);
+                };
+                parent_path
+            };
+            compose_file_path_for_validation(
+                &parent_path,
+                &descriptor.name,
+                descriptor.extension.as_deref(),
+            )
+        }
+        None => {
+            let Some(path) = load_file_row_by_id_with_pending_overlay(
+                backend,
+                Some(pending_overlay),
+                &pending.version_id,
+                &pending.file_id,
+                FilesystemProjectionScope::ExplicitVersion,
+            )
+            .await
+            .map_err(|error| LixError::unknown(error.message))?
+            .map(|row| row.path) else {
+                return Ok(None);
+            };
+            path
+        }
+    };
+
+    plugin_manifest_key_from_archive_candidate(&path, archive_bytes)
+}
+
+async fn pending_plugin_manifest_key_from_planned_file(
+    backend: &dyn LixBackend,
+    pending_overlay: Option<&dyn PendingOverlay>,
+    pending: &crate::transaction::filesystem::runtime::FilesystemTransactionFileState,
+) -> Result<Option<String>, LixError> {
+    let Some(archive_bytes) = pending.data.as_deref() else {
+        return Ok(None);
+    };
+    if pending.deleted || pending.version_id != GLOBAL_VERSION_ID {
+        return Ok(None);
+    }
+
+    let path = match pending.descriptor.as_ref() {
+        Some(descriptor) => {
+            let parent_path = if descriptor.directory_id.is_empty() {
+                "/".to_string()
+            } else {
+                let Some(parent_path) = lookup_directory_path_by_id_with_pending_overlay(
+                    backend,
+                    pending_overlay,
+                    &pending.version_id,
+                    &descriptor.directory_id,
+                    FilesystemProjectionScope::ExplicitVersion,
+                )
+                .await
+                .map_err(|error| LixError::unknown(error.message))?
+                else {
+                    return Ok(None);
+                };
+                parent_path
+            };
+            compose_file_path_for_validation(
+                &parent_path,
+                &descriptor.name,
+                descriptor.extension.as_deref(),
+            )
+        }
+        None => {
+            let Some(path) = load_file_row_by_id_with_pending_overlay(
+                backend,
+                pending_overlay,
+                &pending.version_id,
+                &pending.file_id,
+                FilesystemProjectionScope::ExplicitVersion,
+            )
+            .await
+            .map_err(|error| LixError::unknown(error.message))?
+            .map(|row| row.path) else {
+                return Ok(None);
+            };
+            path
+        }
+    };
+
+    plugin_manifest_key_from_archive_candidate(&path, archive_bytes)
+}
+
+fn plugin_manifest_key_from_archive_candidate(
+    path: &str,
+    archive_bytes: &[u8],
+) -> Result<Option<String>, LixError> {
+    let Some(path_key) = plugin_key_from_archive_path(path) else {
+        return Ok(None);
+    };
+    Ok(Some(
+        load_installed_plugin_from_archive_bytes(&path_key, path, archive_bytes)?.key,
+    ))
+}
+
+fn compose_file_path_for_validation(
+    directory_path: &str,
+    name: &str,
+    extension: Option<&str>,
+) -> String {
+    match extension {
+        Some(extension) if !extension.is_empty() => format!("{directory_path}{name}.{extension}"),
+        _ => format!("{directory_path}{name}"),
+    }
 }
 
 async fn remember_pending_registered_schemas(

@@ -1277,7 +1277,6 @@ fn selector_column_is_supported(resolved_relation: &ResolvedRelation, column: &s
                 | "schema_version"
                 | "global"
                 | "untracked"
-                | "writer_key"
         ),
         SurfaceFamily::Entity | SurfaceFamily::Admin | SurfaceFamily::Filesystem => {
             write_surface_supports_column(resolved_relation, column, column)
@@ -1337,7 +1336,6 @@ fn candidate_column_key(candidate: &str) -> String {
         "lixcol_plugin_key" => "plugin_key",
         "lixcol_schema_version" => "schema_version",
         "lixcol_global" => "global",
-        "lixcol_writer_key" => "writer_key",
         "lixcol_untracked" => "untracked",
         "lixcol_metadata" => "metadata",
         other => other,
@@ -1971,7 +1969,6 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
 
@@ -2299,7 +2296,6 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
 
@@ -2358,7 +2354,6 @@ mod tests {
                 schema_key: "test_json_entity".to_string(),
                 visible_columns: vec!["key".to_string(), "payload".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
         let canonicalized = canonicalize_write(

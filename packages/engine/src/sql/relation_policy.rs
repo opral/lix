@@ -209,7 +209,6 @@ mod tests {
                 schema_key: "project_message".to_string(),
                 visible_columns: vec!["id".to_string(), "body".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
             CatalogSource::Dynamic,
         ));

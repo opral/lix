@@ -48,7 +48,7 @@ use super::{
 pub(crate) struct CommittedReadContext<'a> {
     pub(crate) active_version_id: &'a str,
     pub(crate) active_account_ids: &'a [String],
-    pub(crate) writer_key: Option<&'a str>,
+    pub(crate) origin_key: Option<&'a str>,
     pub(crate) compiler_seed: SqlCompilerSeed<'a>,
     pub(crate) base_transaction_mode: TransactionBeginMode,
 }
@@ -176,7 +176,7 @@ async fn compile_committed_execution_step(
         bound_statement,
         read_context.active_version_id,
         read_context.active_account_ids,
-        read_context.writer_key,
+        read_context.origin_key,
         allow_internal_relations,
         CompilePolicy {
             skip_side_effect_collection: false,

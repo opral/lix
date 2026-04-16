@@ -17,7 +17,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) use crate::sql::{
     CommitPreconditions, OptionalTextPatch, PlannedFilesystemDescriptor, PlannedFilesystemFile,
-    PlannedFilesystemState, PlannedRowIdentity, PlannedStateRow, WriteLane, WriteMode,
+    PlannedFilesystemState, PlannedStateRow, WriteLane, WriteMode,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,7 +761,6 @@ pub(crate) struct CanonicalStateRowKey {
     pub(crate) version_id: Option<String>,
     pub(crate) global: Option<bool>,
     pub(crate) untracked: Option<bool>,
-    pub(crate) writer_key: Option<String>,
 }
 
 impl CanonicalStateRowKey {
@@ -842,7 +841,6 @@ pub(crate) struct ResolvedWritePartition {
     pub(crate) authoritative_pre_state: Vec<ResolvedRowRef>,
     pub(crate) authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub(crate) intended_post_state: Vec<PlannedStateRow>,
-    pub(crate) writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     pub(crate) tombstones: Vec<ResolvedRowRef>,
     pub(crate) lineage: Vec<RowLineage>,
     pub(crate) target_write_lane: Option<WriteLane>,
@@ -929,7 +927,6 @@ mod tests {
                 schema_key: "lix_key_value".to_string(),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: Vec::new(),
             },
         );
 

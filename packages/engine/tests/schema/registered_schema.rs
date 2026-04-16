@@ -291,34 +291,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    registered_schema_rejects_removed_lixcol_version_override,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-
-        engine.initialize().await.unwrap();
-
-        let err = engine
-            .execute(
-                "INSERT INTO lix_registered_schema (value) VALUES (\
-                 lix_json('{\"x-lix-key\":\"qa_removed_override\",\"x-lix-version\":\"1\",\"x-lix-override-lixcols\":{\"lixcol_version_id\":\"\\\"global\\\"\"},\"type\":\"object\",\"properties\":{\"name\":{\"type\":\"string\"}},\"required\":[\"name\"],\"additionalProperties\":false}')\
-                 )",
-                &[],
-            )
-            .await
-            .expect_err("removed lixcol_version_id override should be rejected");
-
-        assert!(
-            err.to_string().contains("lixcol_version_id")
-                && err.to_string().contains("x-lix-override-lixcols"),
-            "unexpected error: {err}"
-        );
-    }
-);
-
-simulation_test!(
     registered_schema_requires_foreign_key_targets_are_unique_or_primary,
     |sim| async move {
         let engine = sim

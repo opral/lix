@@ -1,5 +1,5 @@
 use lix_engine::image::{ImageChunkReader, ImageChunkWriter};
-use lix_engine::{LixError, TransactionMode};
+use lix_engine::{LixError, TransactionBeginMode};
 use lix_rs_sdk::{LixBackend, SqliteBackend, Value};
 
 struct VecImageWriter {
@@ -38,7 +38,7 @@ async fn sqlite_backend_transaction_commit_persists_changes() {
         .expect("schema setup should succeed");
 
     let mut tx = backend
-        .begin_transaction(TransactionMode::Write)
+        .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("begin_transaction should succeed");
     tx.execute(
@@ -76,7 +76,7 @@ async fn sqlite_backend_transaction_rollback_discards_changes() {
         .expect("schema setup should succeed");
 
     let mut tx = backend
-        .begin_transaction(TransactionMode::Write)
+        .begin_transaction(TransactionBeginMode::Write)
         .await
         .expect("begin_transaction should succeed");
     tx.execute(
@@ -160,7 +160,7 @@ async fn sqlite_backend_rejects_nested_read_transaction_mode() {
         .await
         .expect("outer write transaction should succeed");
 
-    let error = match backend.begin_transaction(TransactionMode::Read).await {
+    let error = match backend.begin_transaction(TransactionBeginMode::Read).await {
         Ok(_) => panic!("nested read transaction should be rejected"),
         Err(error) => error,
     };
@@ -187,7 +187,7 @@ async fn sqlite_backend_rejects_nested_deferred_transaction_mode() {
         .await
         .expect("outer write transaction should succeed");
 
-    let error = match backend.begin_transaction(TransactionMode::Deferred).await {
+    let error = match backend.begin_transaction(TransactionBeginMode::Deferred).await {
         Ok(_) => panic!("nested deferred transaction should be rejected"),
         Err(error) => error,
     };
@@ -214,7 +214,7 @@ async fn sqlite_backend_rejects_nested_write_transaction_mode() {
         .await
         .expect("outer write transaction should succeed");
 
-    let error = match backend.begin_transaction(TransactionMode::Write).await {
+    let error = match backend.begin_transaction(TransactionBeginMode::Write).await {
         Ok(_) => panic!("nested write transaction should be rejected"),
         Err(error) => error,
     };

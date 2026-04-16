@@ -35,12 +35,13 @@ pub use api::{InitResult, Lix, LixConfig};
 pub use backend::TransactionBeginMode;
 pub use backend::{LixBackend, LixBackendTransaction, PreparedBatch, PreparedStatement};
 pub use canonical::CanonicalJson;
+pub use canonical::{CanonicalCommitReceipt, UpdatedVersionRef};
 pub use common::LixError;
 pub use common::SqlDialect;
 pub use common::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
-pub use common::{ExecuteResult, NullableKeyFilter, QueryResult, Value};
+pub use common::{ExecuteResult, NullableKeyFilter, QueryResult, Value, WriteReceipt};
 pub use common::{WireQueryResult, WireValue};
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
@@ -50,7 +51,9 @@ pub use live_state::{
     VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
 pub use session::checkpoint_ops::CreateCheckpointResult;
-pub use session::observe::{ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveQuery};
+pub use session::observe::{
+    ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveOptions, ObserveQuery,
+};
 pub use session::version_ops::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
     MergeVersionOptions, MergeVersionResult, RedoOptions, RedoResult, UndoOptions, UndoResult,

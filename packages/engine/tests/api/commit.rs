@@ -196,7 +196,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'para-0', 'test_schema', 'file-1', 'global', 'lix', '{\"key\":\"v0\"}', '1'\
+                 'para-0', 'test_schema', NULL, 'global', NULL, '{\"key\":\"v0\"}', '1'\
                  )", &[])
             .await
             .unwrap();
@@ -208,7 +208,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'para-1', 'test_schema', 'file-1', 'global', 'lix', '{\"key\":\"v1\"}', '1'\
+                 'para-1', 'test_schema', NULL, 'global', NULL, '{\"key\":\"v1\"}', '1'\
                  )", &[])
             .await
             .unwrap();
@@ -344,7 +344,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'mirrorless-entity', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"value\"}', '1'\
+                 'mirrorless-entity', 'test_schema', NULL, 'version-main', NULL, '{\"key\":\"value\"}', '1'\
                  )",
                 &[],
             )
@@ -478,7 +478,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
                  ) VALUES (\
-                 'entity-untracked', 'test_schema', 'file-1', lix_active_version_id(), 'lix', '{\"key\":\"local\"}', '1', true\
+                 'entity-untracked', 'test_schema', NULL, lix_active_version_id(), NULL, '{\"key\":\"local\"}', '1', true\
                  )", &[])
             .await
             .unwrap();
@@ -536,9 +536,9 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-a', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"a\"}', '1'\
+                 'entity-a', 'test_schema', NULL, 'version-main', NULL, '{\"key\":\"a\"}', '1'\
                  ), (\
-                 'entity-b', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"b\"}', '1'\
+                 'entity-b', 'test_schema', NULL, 'version-main', NULL, '{\"key\":\"b\"}', '1'\
                  )", &[])
             .await
             .unwrap();
@@ -593,12 +593,12 @@ simulation_test!(
                  INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-c', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"c\"}', '1'\
+                 'entity-c', 'test_schema', NULL, 'version-main', NULL, '{\"key\":\"c\"}', '1'\
                  ); \
                  INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-d', 'test_schema', 'file-1', 'version-main', 'lix', '{\"key\":\"d\"}', '1'\
+                 'entity-d', 'test_schema', NULL, 'version-main', NULL, '{\"key\":\"d\"}', '1'\
                  ); \
                  COMMIT;", &[])
             .await
@@ -972,7 +972,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
                  ) VALUES (\
-                 'entity-untracked-rebuild', 'file-1', 'test_schema', NULL, '1', '{\"key\":\"value-v1\"}', true\
+                 'entity-untracked-rebuild', NULL, 'test_schema', NULL, '1', '{\"key\":\"value-v1\"}', true\
                  )",
                 &[],
             )
@@ -984,7 +984,7 @@ simulation_test!(
                  SET snapshot_content = '{\"key\":\"value-v2\"}' \
                  WHERE entity_id = 'entity-untracked-rebuild' \
                    AND schema_key = 'test_schema' \
-                   AND file_id = 'file-1' \
+                   AND file_id IS NULL \
                    AND untracked = true",
                 &[],
             )
@@ -997,7 +997,7 @@ simulation_test!(
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id = 'file-1' \
+                   AND file_id IS NULL \
                    AND version_id = 'version-a' \
                    AND untracked = true",
                 &[],
@@ -1042,7 +1042,7 @@ simulation_test!(
                 "DELETE FROM lix_internal_live_v1_test_schema \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id = 'file-1' \
+                   AND file_id IS NULL \
                    AND version_id = 'version-a' \
                    AND untracked = true",
                 &[],
@@ -1056,7 +1056,7 @@ simulation_test!(
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id = 'file-1' \
+                   AND file_id IS NULL \
                    AND version_id = 'version-a' \
                    AND untracked = true",
                 &[],
@@ -1089,7 +1089,7 @@ simulation_test!(
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id = 'file-1' \
+                   AND file_id IS NULL \
                    AND version_id = 'version-a' \
                    AND untracked = true",
                 &[],

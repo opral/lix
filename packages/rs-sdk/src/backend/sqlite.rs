@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use lix_engine::image::{ImageChunkReader, ImageChunkWriter};
 use lix_engine::{
     LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect,
-    TransactionMode, Value,
+    TransactionBeginMode, Value,
 };
 use rusqlite::{
     backup::{Backup, StepResult},
@@ -22,7 +22,7 @@ struct SqliteTransaction<'a> {
     conn: MutexGuard<'a, Option<Connection>>,
     finalized: bool,
     savepoint_name: Option<String>,
-    mode: TransactionMode,
+    mode: TransactionBeginMode,
 }
 
 #[derive(Clone, Debug)]
@@ -84,15 +84,15 @@ impl LixBackend for SqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let mut conn = self.lock_conn()?;
         let inner = conn.as_mut().ok_or_else(sqlite_backend_destroyed_error)?;
         if inner.is_autocommit() {
             inner
                 .execute_batch(match mode {
-                    TransactionMode::Read | TransactionMode::Deferred => "BEGIN TRANSACTION",
-                    TransactionMode::Write => "BEGIN IMMEDIATE TRANSACTION",
+                    TransactionBeginMode::Read | TransactionBeginMode::Deferred => "BEGIN TRANSACTION",
+                    TransactionBeginMode::Write => "BEGIN IMMEDIATE TRANSACTION",
                 })
                 .map_err(|err| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -106,13 +106,13 @@ impl LixBackend for SqliteBackend {
             }))
         } else {
             match mode {
-                TransactionMode::Write => Err(LixError {
+                TransactionBeginMode::Write => Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description:
                         "sqlite backend cannot open a nested write transaction inside an active transaction; use begin_savepoint(...) for nested write scopes"
                             .to_string(),
                 }),
-                TransactionMode::Read | TransactionMode::Deferred => Err(LixError {
+                TransactionBeginMode::Read | TransactionBeginMode::Deferred => Err(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description:
                         "sqlite backend cannot open a nested read/deferred transaction inside an active transaction; open the read on a separate connection or keep nested scopes write-savepoint based"
@@ -138,7 +138,7 @@ impl LixBackend for SqliteBackend {
             conn,
             finalized: false,
             savepoint_name: Some(name.to_string()),
-            mode: TransactionMode::Write,
+            mode: TransactionBeginMode::Write,
         }))
     }
 
@@ -237,7 +237,7 @@ impl LixBackendTransaction for SqliteTransaction<'_> {
         SqlDialect::Sqlite
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.mode
     }
 

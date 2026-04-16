@@ -168,7 +168,6 @@ pub(crate) fn decode_untracked_row(
         plugin_key,
         metadata,
         change_id,
-        writer_key: None,
         created_at,
         updated_at,
         values,

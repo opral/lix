@@ -92,8 +92,24 @@ pub struct QueryResult {
     pub columns: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub struct WriteReceipt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_commit_sequence: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canonical_commit: Option<crate::canonical::CanonicalCommitReceipt>,
+}
+
+impl WriteReceipt {
+    pub fn is_empty(&self) -> bool {
+        self.state_commit_sequence.is_none() && self.canonical_commit.is_none()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize, Default)]
 pub struct ExecuteResult {
     #[serde(default)]
     pub statements: Vec<QueryResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub write_receipt: Option<WriteReceipt>,
 }

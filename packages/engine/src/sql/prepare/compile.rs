@@ -108,7 +108,7 @@ async fn compile_execution_with_context(
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     policy: CompilePolicy,
     static_artifacts: StaticCompilationArtifacts<'_>,
@@ -141,7 +141,7 @@ async fn compile_execution_with_context(
         active_version_id,
         compiler_context.active_history_root_commit_id(),
         active_account_ids,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         static_artifacts.parse_duration,
     )
@@ -231,7 +231,7 @@ async fn compile_execution_with_context(
             direct_source_statements,
             params,
             functions.clone(),
-            writer_key,
+            origin_key,
         )
         .await
         .map_err(LixError::from)
@@ -246,7 +246,7 @@ async fn compile_execution_with_context(
         let preprocess: PlannedStatementSet =
             direct_logical_plan.normalized_statements.clone().into();
         validate_compiled_direct_execution(&preprocess, direct_logical_plan.result_contract)?;
-        let effects = derive_plan_effects(&preprocess, writer_key).map_err(LixError::from)?;
+        let effects = derive_plan_effects(&preprocess, origin_key).map_err(LixError::from)?;
         let direct_execution = CompiledDirectExecution {
             prepared_statements: preprocess.prepared_statements,
             live_table_requirements: preprocess.live_table_requirements,
@@ -320,7 +320,7 @@ async fn prepare_public_plan_for_compile(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicPlan>, LixError> {
@@ -334,7 +334,7 @@ async fn prepare_public_plan_for_compile(
         active_version_id,
         active_history_root_commit_id,
         active_account_ids,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         parse_duration,
     )
@@ -346,7 +346,7 @@ pub(crate) async fn compile_execution_from_bound_statement_with_context(
     bound_statement: &BoundStatementInstance,
     active_version_id: &str,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     policy: CompilePolicy,
 ) -> Result<CompiledExecution, LixError> {
@@ -356,7 +356,7 @@ pub(crate) async fn compile_execution_from_bound_statement_with_context(
         bound_statement.params(),
         active_version_id,
         active_account_ids,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         policy,
         StaticCompilationArtifacts {

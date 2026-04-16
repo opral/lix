@@ -1464,7 +1464,7 @@ fn assert_public_read_json_contract(explain_json: &JsonValue) {
             "query_dependencies",
             "schema_keys",
             "version_ids",
-            "writer_filter",
+            "origin_filter",
         ],
         "dependency_spec",
     );
@@ -2657,7 +2657,7 @@ simulation_test!(
                     "EXPLAIN (FORMAT JSON) INSERT INTO lix_state_by_version (\
                          entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content, untracked\
                      ) VALUES (\
-                         'debug-key', 'lix_key_value', 'debug-untracked-file', '{active_version_id}', 'lix', '1', '{{\"key\":\"debug-key\",\"value\":\"debug\"}}', true\
+                         'debug-key', 'lix_key_value', NULL, '{active_version_id}', NULL, '1', '{{\"key\":\"debug-key\",\"value\":\"debug\"}}', true\
                      )"
                 ),
                 &[],

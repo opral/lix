@@ -1,6 +1,7 @@
 use crate::support;
 
 use lix_engine::{LixError, Value};
+use serde_json::json;
 use support::simulation_test::assert_boolean_like;
 
 fn assert_text(value: &Value, expected: &str) {
@@ -31,6 +32,61 @@ async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
         .unwrap();
 }
 
+async fn ensure_file_descriptor(
+    engine: &support::simulation_test::SimulatedLix,
+    version_id: &str,
+    file_id: &str,
+) {
+    let existing = engine
+        .execute(
+            "SELECT entity_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND entity_id = $1 \
+               AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    if !existing.statements[0].rows.is_empty() {
+        return;
+    }
+
+    let (name, extension) = file_id
+        .rsplit_once('.')
+        .map(|(name, extension)| (name, Some(extension)))
+        .unwrap_or((file_id, None));
+    let snapshot = json!({
+        "id": file_id,
+        "directory_id": null,
+        "name": name,
+        "extension": extension,
+        "metadata": null,
+        "hidden": false
+    })
+    .to_string();
+
+    engine
+        .execute(
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             $1, 'lix_file_descriptor', NULL, $2, NULL, $3, '1'\
+             )",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(snapshot),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
 async fn insert_state_row(
     engine: &support::simulation_test::SimulatedLix,
     entity_id: &str,
@@ -38,11 +94,12 @@ async fn insert_state_row(
     snapshot_content: &str,
     untracked: bool,
 ) {
+    ensure_file_descriptor(engine, version_id, "test-file").await;
     let sql = format!(
         "INSERT INTO lix_state_by_version (\
          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, untracked\
          ) VALUES (\
-         '{entity_id}', 'test_state_schema', 'test-file', '{version_id}', 'lix', '{snapshot_content}', '1', {untracked}\
+         '{entity_id}', 'test_state_schema', 'test-file', '{version_id}', NULL, '{snapshot_content}', '1', {untracked}\
          )",
         entity_id = entity_id,
         version_id = version_id,
@@ -582,13 +639,14 @@ simulation_test!(
             .switch_version("version-a".to_string())
             .await
             .unwrap();
+        ensure_file_descriptor(&engine, "version-a", "file-0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
              entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
              ) VALUES (\
-             'entity-0', 'file-0', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
+             'entity-0', 'file-0', 'test_state_schema', NULL, '1', '{\"value\":\"A\"}'\
              )",
                 &[],
             )
@@ -616,13 +674,14 @@ simulation_test!(
             .switch_version("version-b".to_string())
             .await
             .unwrap();
+        ensure_file_descriptor(&engine, "version-b", "file-0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
              entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
              ) VALUES (\
-             'entity-0', 'file-0', 'test_state_schema', 'lix', '1', '{\"value\":\"B\"}'\
+             'entity-0', 'file-0', 'test_state_schema', NULL, '1', '{\"value\":\"B\"}'\
              )",
                 &[],
             )
@@ -665,6 +724,7 @@ simulation_test!(
             .switch_version("version-a".to_string())
             .await
             .unwrap();
+        ensure_file_descriptor(&engine, "version-a", "file-p").await;
 
         engine
             .execute(
@@ -675,7 +735,7 @@ simulation_test!(
                     Value::Text("entity-p".to_string()),
                     Value::Text("file-p".to_string()),
                     Value::Text("test_state_schema".to_string()),
-                    Value::Text("lix".to_string()),
+                    Value::Null,
                     Value::Text("1".to_string()),
                     Value::Text("{\"value\":\"P\"}".to_string()),
                 ],
@@ -718,7 +778,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
-                 'entity-missing-version', 'test_state_schema', 'test-file', 'version-missing', 'lix', '{\"value\":\"A\"}', '1'\
+                 'entity-missing-version', 'test_state_schema', 'test-file', 'version-missing', NULL, '{\"value\":\"A\"}', '1'\
                  )",
                 &[],
             )
@@ -744,13 +804,14 @@ simulation_test!(
             .switch_version("version-a".to_string())
             .await
             .unwrap();
+        ensure_file_descriptor(&engine, "version-a", "file-upsert").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', NULL, '1', '{\"value\":\"A\"}'\
                  )", &[])
             .await
             .unwrap();
@@ -760,7 +821,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"B\"}'\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', NULL, '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id) DO UPDATE \
                  SET snapshot_content = '{\"value\":\"B\"}'", &[])
@@ -817,13 +878,14 @@ simulation_test!(
             .switch_version("version-a".to_string())
             .await
             .unwrap();
+        ensure_file_descriptor(&engine, "version-a", "file-upsert").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"A\"}'\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', NULL, '1', '{\"value\":\"A\"}'\
                  )",
                 &[],
             )
@@ -835,7 +897,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-upsert', 'file-upsert', 'test_state_schema', 'lix', '1', '{\"value\":\"B\"}'\
+                 'entity-upsert', 'file-upsert', 'test_state_schema', NULL, '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id) DO NOTHING", &[])
             .await
@@ -879,7 +941,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, file_id, schema_key, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-x', 'file-x', 'test_state_schema', 'version-b', 'lix', '1', '{\"value\":\"x\"}'\
+                 'entity-x', 'file-x', 'test_state_schema', 'version-b', NULL, '1', '{\"value\":\"x\"}'\
                  )", &[])
             .await
             .expect_err("lix_state insert with version_id should fail");

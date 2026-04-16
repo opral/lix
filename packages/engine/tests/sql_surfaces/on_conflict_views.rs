@@ -1,6 +1,7 @@
 use crate::support;
 
 use lix_engine::Value;
+use serde_json::json;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -16,6 +17,61 @@ async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
                 "{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}",
             )
             .unwrap(),
+        )
+        .await
+        .unwrap();
+}
+
+async fn ensure_file_descriptor(
+    engine: &support::simulation_test::SimulatedLix,
+    version_id: &str,
+    file_id: &str,
+) {
+    let existing = engine
+        .execute(
+            "SELECT entity_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND entity_id = $1 \
+               AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    if !existing.statements[0].rows.is_empty() {
+        return;
+    }
+
+    let (name, extension) = file_id
+        .rsplit_once('.')
+        .map(|(name, extension)| (name, Some(extension)))
+        .unwrap_or((file_id, None));
+    let snapshot = json!({
+        "id": file_id,
+        "directory_id": null,
+        "name": name,
+        "extension": extension,
+        "metadata": null,
+        "hidden": false
+    })
+    .to_string();
+
+    engine
+        .execute(
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+             ) VALUES (\
+             $1, 'lix_file_descriptor', NULL, $2, NULL, '1', $3\
+             )",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(snapshot),
+            ],
         )
         .await
         .unwrap();
@@ -120,13 +176,14 @@ simulation_test!(
             .switch_version("version-a".to_string())
             .await
             .unwrap();
+        ensure_file_descriptor(&engine, "version-a", "test-file").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'oc-state', 'test_state_schema', 'test-file', 'lix', '1', '{\"value\":\"A\"}'\
+                 'oc-state', 'test_state_schema', 'test-file', NULL, '1', '{\"value\":\"A\"}'\
                  )",
                 &[],
             )
@@ -138,7 +195,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'oc-state', 'test_state_schema', 'test-file', 'lix', '1', '{\"value\":\"B\"}'\
+                 'oc-state', 'test_state_schema', 'test-file', NULL, '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id) DO UPDATE \
                  SET snapshot_content = '{\"value\":\"B\"}'",
@@ -173,13 +230,14 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         engine.create_named_version("version-a").await.unwrap();
+        ensure_file_descriptor(&engine, "version-a", "test-file").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'oc-state-bv', 'test_state_schema', 'test-file', 'version-a', 'lix', '1', '{\"value\":\"A\"}'\
+                 'oc-state-bv', 'test_state_schema', 'test-file', 'version-a', NULL, '1', '{\"value\":\"A\"}'\
                  )", &[])
             .await
             .unwrap();
@@ -189,7 +247,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'oc-state-bv', 'test_state_schema', 'test-file', 'version-a', 'lix', '1', '{\"value\":\"B\"}'\
+                 'oc-state-bv', 'test_state_schema', 'test-file', 'version-a', NULL, '1', '{\"value\":\"B\"}'\
                  ) \
                  ON CONFLICT (entity_id, schema_key, file_id, version_id) DO UPDATE \
                  SET snapshot_content = '{\"value\":\"B\"}'", &[])

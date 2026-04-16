@@ -31,6 +31,7 @@ pub struct PendingFilesystemFileView {
     pub untracked: bool,
     pub descriptor: Option<PendingFilesystemDescriptorView>,
     pub metadata_patch: OptionalTextPatch,
+    pub data: Option<Vec<u8>>,
     pub deleted: bool,
 }
 
@@ -46,12 +47,4 @@ pub trait PendingOverlay {
     fn visible_directory_rows(&self, untracked: bool, schema_key: &str) -> Vec<PendingSemanticRow>;
 
     fn visible_files(&self) -> Vec<PendingFilesystemFileView>;
-
-    fn writer_key_annotation_for_state_row(
-        &self,
-        version_id: &str,
-        schema_key: &str,
-        entity_id: &str,
-        file_id: Option<&str>,
-    ) -> Option<Option<String>>;
 }
