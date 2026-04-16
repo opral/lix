@@ -1,20 +1,33 @@
 use super::context::AppContext;
+use super::welcome;
 use crate::cli::root::{Cli, Command};
 use crate::commands;
 use crate::error::CliError;
 use crate::hints;
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use std::io::Write;
 
 pub fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let no_hints = cli.no_hints;
+    let lix_path = cli.path;
+
+    let command = match cli.command {
+        Some(command) => command,
+        None => {
+            welcome::print_banner(lix_path.as_deref());
+            Cli::command().print_help().ok();
+            println!();
+            return Ok(());
+        }
+    };
+
     let context = AppContext {
-        lix_path: cli.path,
+        lix_path,
         no_hints,
     };
 
-    let result = match cli.command {
+    let result = match command {
         Command::Exp(exp_command) => commands::exp::run(&context, exp_command),
         Command::Init(init_command) => commands::init::run(init_command),
         Command::Redo(redo_command) => commands::redo::run(&context, redo_command),
