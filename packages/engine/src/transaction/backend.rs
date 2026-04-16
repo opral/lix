@@ -21,7 +21,6 @@ pub(crate) async fn lookup_directory_id_by_path_in_transaction(
     let backend = crate::backend::transaction_backend_view(transaction);
     lookup_directory_id_by_path(&backend, version_id, path, scope)
         .await
-        .map_err(|error| LixError::new("LIX_ERROR_UNKNOWN", error.message))
 }
 
 pub(crate) struct TransactionExecutionBackend<'a> {

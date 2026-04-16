@@ -31,7 +31,7 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     if let Err(errors) = validator.validate(schema) {
         let details = format_validation_errors(errors);
         return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: format!("Invalid Lix schema definition: {details}"),
             hint: None,
         });
@@ -122,7 +122,7 @@ fn detect_missing_pointer_slash(schema: &JsonValue) -> Option<LixError> {
     );
     Some(
         LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description,
             hint: None,
         }
@@ -137,7 +137,7 @@ pub fn validate_lix_schema(schema: &JsonValue, data: &JsonValue) -> Result<(), L
     if let Err(errors) = validator.validate(data) {
         let details = format_validation_errors(errors);
         return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_VALIDATION.to_string(),
             description: format!("Data validation failed: {details}"),
             hint: None,
         });
@@ -151,7 +151,7 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
     match result {
         Ok(schema) => Ok(schema),
         Err(err) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: err.description.clone(),
             hint: None,
         }),
@@ -165,7 +165,7 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
     options.with_format("cel", is_cel_expression);
 
     options.compile(schema).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
+        code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
         description: format!("Failed to compile Lix schema definition: {err}"),
         hint: None,
     })
@@ -185,7 +185,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
     }
     if !pointer.starts_with('/') {
         return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: "Invalid JSON pointer".to_string(),
             hint: None,
         });
@@ -208,7 +208,7 @@ fn unescape_pointer_segment(segment: &str) -> Result<String, LixError> {
                 Some('1') => out.push('/'),
                 _ => {
                     return Err(LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                         description: "Invalid JSON pointer".to_string(),
                         hint: None,
                     })
@@ -235,7 +235,7 @@ fn assert_primary_key_pointers(schema: &JsonValue) -> Result<(), LixError> {
         };
         let segments = parse_json_pointer(pointer)?;
         if segments.is_empty() || !schema_has_property(schema, &segments) {
-            return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
+            return Err(LixError { code: LixError::CODE_SCHEMA_DEFINITION.to_string(), description: format!(
                     "Invalid Lix schema definition: x-lix-primary-key references missing property \"{}\".",
                     pointer
                 ),
@@ -265,7 +265,7 @@ fn assert_unique_pointers(schema: &JsonValue) -> Result<(), LixError> {
             };
             let segments = parse_json_pointer(pointer)?;
             if segments.is_empty() || !schema_has_property(schema, &segments) {
-                return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
+                return Err(LixError { code: LixError::CODE_SCHEMA_DEFINITION.to_string(), description: format!(
                         "Invalid Lix schema definition: x-lix-unique references missing property \"{}\".",
                         pointer
                     ),
@@ -299,7 +299,7 @@ fn assert_non_aliased_lix_foreign_key_references(schema: &JsonValue) -> Result<(
             continue;
         };
 
-        return Err(LixError { code: "LIX_ERROR_UNKNOWN".to_string(), description: format!(
+        return Err(LixError { code: LixError::CODE_SCHEMA_DEFINITION.to_string(), description: format!(
                 "Invalid Lix schema definition: x-lix-foreign-keys references.schemaKey uses deprecated alias \"{schema_key}\"; use \"{replacement}\"."
             ),
             hint: None,
@@ -330,7 +330,7 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
 
         if !known {
             return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                 description: format!(
                     "Invalid Lix schema definition: unknown x-lix field '{}'.",
                     key
@@ -431,6 +431,11 @@ mod pointer_slash_detection_tests {
     fn primary_key_without_slash_emits_targeted_hint() {
         let schema = minimal_schema_with(json!({ "x-lix-primary-key": ["id"] }));
         let err = err_for(&schema);
+        assert_eq!(
+            err.code,
+            LixError::CODE_SCHEMA_DEFINITION,
+            "schema-definition errors should carry the categorized code"
+        );
         assert!(
             err.description.contains("must begin with '/'"),
             "unexpected description: {}",

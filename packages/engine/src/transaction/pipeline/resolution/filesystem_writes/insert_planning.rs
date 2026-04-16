@@ -3,7 +3,7 @@ use crate::catalog::{
     load_file_descriptors_by_directory_name_extension_triplets,
     lookup_directory_id_by_path_with_pending_overlay,
     lookup_directory_path_by_id_with_pending_overlay, lookup_file_id_by_path_with_pending_overlay,
-    FilesystemProjectionScope, FilesystemQueryError,
+    FilesystemProjectionScope,
 };
 use crate::common::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
@@ -15,24 +15,9 @@ use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::{
     DirectoryInsertAssignments, FileInsertAssignments,
 };
-use crate::LixBackend;
+use crate::{LixBackend, LixError};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::{BTreeMap, BTreeSet};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FilesystemPlanningError {
-    pub(super) message: String,
-    pub(super) hint: Option<String>,
-}
-
-impl From<FilesystemQueryError> for FilesystemPlanningError {
-    fn from(error: FilesystemQueryError) -> Self {
-        Self {
-            message: error.message,
-            hint: error.hint,
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(super) struct PlannedDirectoryInsertTarget {
@@ -127,13 +112,24 @@ struct PendingFileInsert {
     data: Option<Vec<u8>>,
 }
 
+fn planning_error(message: impl Into<String>) -> LixError {
+    LixError::new("LIX_ERROR_UNKNOWN", message)
+}
+
+fn planning_error_with_hint(
+    message: impl Into<String>,
+    hint: impl Into<String>,
+) -> LixError {
+    planning_error(message).with_hint(hint)
+}
+
 pub(super) async fn build_directory_insert_snapshot(
     backend: &dyn LixBackend,
     pending_write_overlay: Option<&dyn PendingOverlay>,
     assignments: &[DirectoryInsertAssignments],
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<FilesystemInsertSnapshot, FilesystemPlanningError> {
+) -> Result<FilesystemInsertSnapshot, LixError> {
     let requested_directory_ids = collect_requested_parent_directory_ids(assignments);
     let existing_directory_paths_by_id = resolve_visible_directory_paths_by_id(
         backend,
@@ -164,7 +160,7 @@ pub(super) async fn build_file_insert_snapshot(
     assignments: &[FileInsertAssignments],
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<FilesystemInsertSnapshot, FilesystemPlanningError> {
+) -> Result<FilesystemInsertSnapshot, LixError> {
     let (requested_directory_paths, requested_file_paths) =
         collect_file_insert_requests(assignments);
     build_insert_snapshot(
@@ -183,7 +179,7 @@ pub(super) fn plan_directory_insert_batch(
     assignments: &[DirectoryInsertAssignments],
     version_id: &str,
     functions: SharedFunctionProvider<impl LixFunctionProvider + Send + 'static>,
-) -> Result<PlannedDirectoryInsertBatch, FilesystemPlanningError> {
+) -> Result<PlannedDirectoryInsertBatch, LixError> {
     let mut batch = PendingFilesystemInsertBatch::default();
     for assignments in assignments {
         let computed = resolve_directory_insert_target(
@@ -205,7 +201,7 @@ pub(super) fn plan_file_insert_batch(
     assignments: &[FileInsertAssignments],
     version_id: &str,
     functions: SharedFunctionProvider<impl LixFunctionProvider + Send + 'static>,
-) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
+) -> Result<PlannedFileInsertBatch, LixError> {
     let mut batch = PendingFilesystemInsertBatch::default();
     for assignments in assignments {
         let computed = resolve_file_insert_target(
@@ -249,7 +245,7 @@ impl PendingFilesystemInsertBatch {
         &mut self,
         path: &str,
         functions: SharedFunctionProvider<P>,
-    ) -> Result<(), FilesystemPlanningError>
+    ) -> Result<(), LixError>
     where
         P: LixFunctionProvider + Send + 'static,
     {
@@ -277,18 +273,16 @@ impl PendingFilesystemInsertBatch {
     fn register_directory_target(
         &mut self,
         target: ResolvedDirectoryInsertTarget,
-    ) -> Result<(), FilesystemPlanningError> {
+    ) -> Result<(), LixError> {
         let file_collision_path = target.path.trim_end_matches('/').to_string();
         if self.files_by_path.contains_key(&file_collision_path) {
-            return Err(FilesystemPlanningError {
-                message: format!(
+            return Err(planning_error_with_hint(
+                format!(
                     "Directory path collides with file path already inserted in this statement: {}",
                     file_collision_path
                 ),
-                hint: Some(
-                    "directory paths must end with '/', while file paths must not".to_string(),
-                ),
-            });
+                "directory paths must end with '/', while file paths must not",
+            ));
         }
 
         match self.directories_by_path.entry(target.path.clone()) {
@@ -300,13 +294,10 @@ impl PendingFilesystemInsertBatch {
             }
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 if entry.get().explicit {
-                    return Err(FilesystemPlanningError {
-                        message: format!(
-                            "Unique constraint violation: directory path '{}' already exists in this INSERT",
-                            target.path
-                        ),
-                        hint: None,
-                    });
+                    return Err(planning_error(format!(
+                        "Unique constraint violation: directory path '{}' already exists in this INSERT",
+                        target.path
+                    )));
                 }
                 entry.insert(PendingDirectoryInsert {
                     explicit: true,
@@ -321,70 +312,59 @@ impl PendingFilesystemInsertBatch {
         &mut self,
         target: ResolvedFileInsertTarget,
         data: Option<Vec<u8>>,
-    ) -> Result<(), FilesystemPlanningError> {
+    ) -> Result<(), LixError> {
         let directory_collision_path = format!("{}/", target.path.trim_end_matches('/'));
         if self
             .directories_by_path
             .contains_key(&directory_collision_path)
         {
-            return Err(FilesystemPlanningError {
-                message: format!(
+            return Err(planning_error_with_hint(
+                format!(
                     "File path collides with directory path already inserted in this statement: {}",
                     directory_collision_path
                 ),
-                hint: Some(
-                    "file paths must not end with '/', while directory paths must".to_string(),
-                ),
-            });
+                "file paths must not end with '/', while directory paths must",
+            ));
         }
         if self.files_by_path.contains_key(&target.path) {
-            return Err(FilesystemPlanningError {
-                message: format!(
-                    "Unique constraint violation: file path '{}' already exists in this INSERT",
-                    target.path
-                ),
-                hint: None,
-            });
+            return Err(planning_error(format!(
+                "Unique constraint violation: file path '{}' already exists in this INSERT",
+                target.path
+            )));
         }
         self.files_by_path
             .insert(target.path.clone(), PendingFileInsert { target, data });
         self.ensure_unique_file_ids()
     }
 
-    fn ensure_unique_directory_ids(&self) -> Result<(), FilesystemPlanningError> {
+    fn ensure_unique_directory_ids(&self) -> Result<(), LixError> {
         let mut ids = BTreeMap::<String, String>::new();
         for pending in self.directories_by_path.values() {
             if let Some(existing_path) =
                 ids.insert(pending.target.id.clone(), pending.target.path.clone())
             {
                 if existing_path != pending.target.path {
-                    return Err(FilesystemPlanningError {
-                        message: format!(
-                            "public filesystem directory insert produced duplicate id '{}' for paths '{}' and '{}'",
-                            pending.target.id, existing_path, pending.target.path
-                        ),
-                        hint: None,
-                    });
+                    return Err(planning_error(format!(
+                        "public filesystem directory insert produced duplicate id '{}' for paths '{}' and '{}'",
+                        pending.target.id, existing_path, pending.target.path
+                    )));
                 }
             }
         }
         Ok(())
     }
 
-    fn ensure_unique_file_ids(&self) -> Result<(), FilesystemPlanningError> {
+    fn ensure_unique_file_ids(&self) -> Result<(), LixError> {
         let mut ids = BTreeMap::<String, String>::new();
         for pending in self.files_by_path.values() {
             if let Some(existing_path) =
                 ids.insert(pending.target.id.clone(), pending.target.path.clone())
             {
                 if existing_path != pending.target.path {
-                    return Err(FilesystemPlanningError {
-                        message: format!(
-                            "public filesystem file insert produced duplicate id '{}' for paths '{}' and '{}'",
-                            pending.target.id, existing_path, pending.target.path
-                        ),
-                        hint: None,
-                    });
+                    return Err(planning_error(format!(
+                        "public filesystem file insert produced duplicate id '{}' for paths '{}' and '{}'",
+                        pending.target.id, existing_path, pending.target.path
+                    )));
                 }
             }
         }
@@ -404,7 +384,7 @@ fn collect_requested_parent_directory_ids(
 fn collect_directory_insert_requests(
     assignments: &[DirectoryInsertAssignments],
     existing_directory_paths_by_id: &BTreeMap<String, String>,
-) -> Result<(BTreeSet<String>, BTreeSet<String>), FilesystemPlanningError> {
+) -> Result<(BTreeSet<String>, BTreeSet<String>), LixError> {
     let mut requested_directory_paths = BTreeSet::new();
     let mut requested_file_paths = BTreeSet::new();
 
@@ -501,7 +481,7 @@ async fn build_insert_snapshot(
     requested_directory_paths: &BTreeSet<String>,
     requested_file_paths: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<FilesystemInsertSnapshot, FilesystemPlanningError> {
+) -> Result<FilesystemInsertSnapshot, LixError> {
     let committed_directory_ids_by_path = resolve_committed_directory_ids_by_path(
         backend,
         version_id,
@@ -547,7 +527,7 @@ async fn resolve_visible_directory_paths_by_id(
     version_id: &str,
     directory_ids: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+) -> Result<BTreeMap<String, String>, LixError> {
     let mut resolved = BTreeMap::new();
     for directory_id in directory_ids {
         if let Some(path) = lookup_directory_path_by_id_with_pending_overlay(
@@ -572,7 +552,7 @@ async fn merge_visible_directory_ids_by_path(
     requested_paths: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
     committed_directory_ids_by_path: BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+) -> Result<BTreeMap<String, String>, LixError> {
     if !pending_write_overlay.is_some_and(|view| view.has_overlays()) {
         return Ok(committed_directory_ids_by_path);
     }
@@ -601,7 +581,7 @@ async fn merge_visible_file_ids_by_path(
     requested_paths: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
     committed_file_ids_by_path: BTreeMap<String, String>,
-) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+) -> Result<BTreeMap<String, String>, LixError> {
     if !pending_write_overlay.is_some_and(|view| view.has_overlays()) {
         return Ok(committed_file_ids_by_path);
     }
@@ -631,7 +611,7 @@ fn resolve_file_insert_target<P>(
     version_id: &str,
     batch: &mut PendingFilesystemInsertBatch,
     functions: SharedFunctionProvider<P>,
-) -> Result<ResolvedFileInsertTarget, FilesystemPlanningError>
+) -> Result<ResolvedFileInsertTarget, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -647,27 +627,21 @@ where
 
     if let Some(existing_id) = batch.pending_file_id_by_path(parsed.normalized_path.as_str()) {
         if explicit_id != Some(existing_id.as_str()) {
-            return Err(FilesystemPlanningError {
-                message: format!(
-                    "Unique constraint violation: file path '{}' already exists in this INSERT",
-                    parsed.normalized_path.as_str()
-                ),
-                hint: None,
-            });
+            return Err(planning_error(format!(
+                "Unique constraint violation: file path '{}' already exists in this INSERT",
+                parsed.normalized_path.as_str()
+            )));
         }
     } else if let Some(existing_id) = snapshot.file_id_by_path(parsed.normalized_path.as_str()) {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
             .unwrap_or(false);
         if !same_id {
-            return Err(FilesystemPlanningError {
-                message: format!(
-                    "Unique constraint violation: file path '{}' already exists in version '{}'",
-                    parsed.normalized_path.as_str(),
-                    version_id
-                ),
-                hint: None,
-            });
+            return Err(planning_error(format!(
+                "Unique constraint violation: file path '{}' already exists in version '{}'",
+                parsed.normalized_path.as_str(),
+                version_id
+            )));
         }
     }
 
@@ -691,7 +665,7 @@ fn resolve_directory_insert_target<P>(
     version_id: &str,
     batch: &mut PendingFilesystemInsertBatch,
     functions: SharedFunctionProvider<P>,
-) -> Result<ResolvedDirectoryInsertTarget, FilesystemPlanningError>
+) -> Result<ResolvedDirectoryInsertTarget, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -702,11 +676,8 @@ where
 
     let (parent_path, name, normalized_path) = if let Some(raw_path) = explicit_path {
         let normalized_path = raw_path.as_str().to_string();
-        let derived_name =
-            directory_name_from_path(&normalized_path).ok_or_else(|| FilesystemPlanningError {
-                message: "Directory name must be provided".to_string(),
-                hint: None,
-            })?;
+        let derived_name = directory_name_from_path(&normalized_path)
+            .ok_or_else(|| planning_error("Directory name must be provided"))?;
         let derived_parent_path = ensure_parent_directories_for_insert_batch(
             parent_directory_path(&normalized_path)
                 .map(NormalizedDirectoryPath::from_normalized)
@@ -723,39 +694,27 @@ where
         };
 
         if explicit_parent_id != derived_parent_id.as_deref() && explicit_parent_id.is_some() {
-            return Err(FilesystemPlanningError {
-                message: format!(
-                    "Provided parent_id does not match parent derived from path {}",
-                    normalized_path
-                ),
-                hint: None,
-            });
+            return Err(planning_error(format!(
+                "Provided parent_id does not match parent derived from path {}",
+                normalized_path
+            )));
         }
         if let Some(name) = explicit_name {
             if name != derived_name {
-                return Err(FilesystemPlanningError {
-                    message: format!(
-                        "Provided directory name '{}' does not match path '{}'",
-                        name, normalized_path
-                    ),
-                    hint: None,
-                });
+                return Err(planning_error(format!(
+                    "Provided directory name '{}' does not match path '{}'",
+                    name, normalized_path
+                )));
             }
         }
         (derived_parent_path, derived_name, normalized_path)
     } else {
         let name = explicit_name
-            .ok_or_else(|| FilesystemPlanningError {
-                message: "Directory name must be provided".to_string(),
-                hint: None,
-            })?
+            .ok_or_else(|| planning_error("Directory name must be provided"))?
             .to_string();
         let parent_path = match explicit_parent_id {
             Some(parent_id) => lookup_directory_path_by_id_in_snapshot(parent_id, snapshot, batch)
-                .ok_or_else(|| FilesystemPlanningError {
-                    message: format!("Parent directory does not exist for id {parent_id}"),
-                    hint: None,
-                })?,
+                .ok_or_else(|| planning_error(format!("Parent directory does not exist for id {parent_id}")))?,
             None => "/".to_string(),
         };
         let computed_path =
@@ -767,26 +726,20 @@ where
         if batch.directory_is_explicit(&normalized_path)
             && explicit_id != Some(existing_id.as_str())
         {
-            return Err(FilesystemPlanningError {
-                message: format!(
-                    "Unique constraint violation: directory path '{}' already exists in this INSERT",
-                    normalized_path
-                ),
-                hint: None,
-            });
+            return Err(planning_error(format!(
+                "Unique constraint violation: directory path '{}' already exists in this INSERT",
+                normalized_path
+            )));
         }
     } else if let Some(existing_id) = snapshot.directory_id_by_path(&normalized_path) {
         let same_id = explicit_id
             .map(|value| value == existing_id.as_str())
             .unwrap_or(false);
         if !same_id {
-            return Err(FilesystemPlanningError {
-                message: format!(
-                    "Unique constraint violation: directory path '{}' already exists in version '{}'",
-                    normalized_path, version_id
-                ),
-                hint: None,
-            });
+            return Err(planning_error(format!(
+                "Unique constraint violation: directory path '{}' already exists in version '{}'",
+                normalized_path, version_id
+            )));
         }
     }
     ensure_no_file_at_directory_path_in_snapshot(&normalized_path, snapshot, batch)?;
@@ -809,7 +762,7 @@ fn ensure_parent_directories_for_insert_batch<P>(
     snapshot: &FilesystemInsertSnapshot,
     batch: &mut PendingFilesystemInsertBatch,
     functions: SharedFunctionProvider<P>,
-) -> Result<Option<String>, FilesystemPlanningError>
+) -> Result<Option<String>, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -869,7 +822,7 @@ fn ensure_parent_directories_for_file_insert_batch<P>(
     snapshot: &FilesystemInsertSnapshot,
     batch: &mut PendingFilesystemInsertBatch,
     functions: SharedFunctionProvider<P>,
-) -> Result<Option<String>, FilesystemPlanningError>
+) -> Result<Option<String>, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -900,7 +853,7 @@ where
 fn finalize_pending_file_insert_batch(
     snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-) -> Result<PlannedFileInsertBatch, FilesystemPlanningError> {
+) -> Result<PlannedFileInsertBatch, LixError> {
     Ok(PlannedFileInsertBatch {
         directories: finalize_file_insert_directories(snapshot, batch),
         files: finalize_file_insert_files(snapshot, batch),
@@ -967,7 +920,7 @@ async fn resolve_committed_directory_ids_by_path(
     version_id: &str,
     requested_paths: &BTreeSet<String>,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+) -> Result<BTreeMap<String, String>, LixError> {
     let mut resolved: BTreeMap<String, String> = BTreeMap::new();
     let mut by_depth = BTreeMap::<usize, Vec<String>>::new();
     for path in requested_paths {
@@ -1023,7 +976,7 @@ async fn resolve_committed_file_ids_by_path(
     requested_paths: &BTreeSet<String>,
     directory_ids_by_path: &BTreeMap<String, String>,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<BTreeMap<String, String>, FilesystemPlanningError> {
+) -> Result<BTreeMap<String, String>, LixError> {
     let mut requests = BTreeSet::new();
     let mut request_paths = BTreeMap::new();
     for path in requested_paths {
@@ -1093,7 +1046,7 @@ fn ensure_no_file_at_directory_path_in_snapshot(
     directory_path: &str,
     snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-) -> Result<(), FilesystemPlanningError> {
+) -> Result<(), LixError> {
     let file_path =
         ParsedFilePath::from_normalized_path(directory_path.trim_end_matches('/').to_string())
             .map_err(filesystem_path_error)?;
@@ -1101,25 +1054,25 @@ fn ensure_no_file_at_directory_path_in_snapshot(
         .pending_file_id_by_path(file_path.normalized_path.as_str())
         .is_some()
     {
-        return Err(FilesystemPlanningError {
-            message: format!(
+        return Err(planning_error_with_hint(
+            format!(
                 "Directory path collides with existing file path: {}",
                 file_path.normalized_path.as_str()
             ),
-            hint: Some("directory paths must end with '/', while file paths must not".to_string()),
-        });
+            "directory paths must end with '/', while file paths must not",
+        ));
     }
     if snapshot
         .file_id_by_path(file_path.normalized_path.as_str())
         .is_some()
     {
-        return Err(FilesystemPlanningError {
-            message: format!(
+        return Err(planning_error_with_hint(
+            format!(
                 "Directory path collides with existing file path: {}",
                 file_path.normalized_path.as_str()
             ),
-            hint: Some("directory paths must end with '/', while file paths must not".to_string()),
-        });
+            "directory paths must end with '/', while file paths must not",
+        ));
     }
     Ok(())
 }
@@ -1128,7 +1081,7 @@ fn ensure_no_directory_at_file_path_in_snapshot(
     file_path: &str,
     snapshot: &FilesystemInsertSnapshot,
     batch: &PendingFilesystemInsertBatch,
-) -> Result<(), FilesystemPlanningError> {
+) -> Result<(), LixError> {
     let file_path = ParsedFilePath::from_normalized_path(file_path.to_string())
         .map_err(filesystem_path_error)?;
     let directory_path = NormalizedDirectoryPath::from_normalized(format!(
@@ -1139,25 +1092,25 @@ fn ensure_no_directory_at_file_path_in_snapshot(
         .pending_directory_id_by_path(directory_path.as_str())
         .is_some()
     {
-        return Err(FilesystemPlanningError {
-            message: format!(
+        return Err(planning_error_with_hint(
+            format!(
                 "File path collides with existing directory path: {}",
                 directory_path.as_str()
             ),
-            hint: Some("file paths must not end with '/', while directory paths must".to_string()),
-        });
+            "file paths must not end with '/', while directory paths must",
+        ));
     }
     if snapshot
         .directory_id_by_path(directory_path.as_str())
         .is_some()
     {
-        return Err(FilesystemPlanningError {
-            message: format!(
+        return Err(planning_error_with_hint(
+            format!(
                 "File path collides with existing directory path: {}",
                 directory_path.as_str()
             ),
-            hint: Some("file paths must not end with '/', while directory paths must".to_string()),
-        });
+            "file paths must not end with '/', while directory paths must",
+        ));
     }
     Ok(())
 }
@@ -1168,7 +1121,7 @@ fn pending_directory_insert_sort_key(path: &str) -> (usize, String) {
 
 fn generated_directory_insert_id<P>(
     functions: SharedFunctionProvider<P>,
-) -> Result<String, FilesystemPlanningError>
+) -> Result<String, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -1177,7 +1130,7 @@ where
 
 fn generated_file_insert_id<P>(
     functions: SharedFunctionProvider<P>,
-) -> Result<String, FilesystemPlanningError>
+) -> Result<String, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -1187,22 +1140,22 @@ where
 fn generated_schema_default_id<P>(
     functions: SharedFunctionProvider<P>,
     schema_key: &str,
-) -> Result<String, FilesystemPlanningError>
+) -> Result<String, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let schema = builtin_schema_definition(schema_key).ok_or_else(|| FilesystemPlanningError {
-        message: format!("public filesystem insert missing builtin schema '{schema_key}'"),
-        hint: None,
+    let schema = builtin_schema_definition(schema_key).ok_or_else(|| {
+        planning_error(format!(
+            "public filesystem insert missing builtin schema '{schema_key}'"
+        ))
     })?;
     let schema_version = schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| FilesystemPlanningError {
-            message: format!(
+        .ok_or_else(|| {
+            planning_error(format!(
                 "public filesystem insert requires string x-lix-version for '{schema_key}'"
-            ),
-            hint: None,
+            ))
         })?;
     let mut snapshot = JsonMap::new();
     apply_schema_defaults_with_shared_runtime(
@@ -1217,19 +1170,15 @@ where
         .get("id")
         .and_then(JsonValue::as_str)
         .map(ToString::to_string)
-        .ok_or_else(|| FilesystemPlanningError {
-            message: format!(
+        .ok_or_else(|| {
+            planning_error(format!(
                 "public filesystem insert default id for '{schema_key}' must resolve to text"
-            ),
-            hint: None,
+            ))
         })
 }
 
-fn filesystem_path_error(error: crate::LixError) -> FilesystemPlanningError {
-    FilesystemPlanningError {
-        message: error.description,
-        hint: error.hint,
-    }
+fn filesystem_path_error(error: crate::LixError) -> LixError {
+    error
 }
 
 #[cfg(test)]
@@ -1287,11 +1236,11 @@ mod tests {
             .expect_err("duplicate path should be rejected");
 
         assert!(
-            err.message.contains(
+            err.description.contains(
                 "Unique constraint violation: directory path '/docs:root/guide:alpha@beta/' already exists in this INSERT"
             ),
             "unexpected error: {}",
-            err.message
+            err.description
         );
     }
 

@@ -298,7 +298,7 @@ async fn load_file_descriptors(
             FilesystemProjectionScope::ExplicitVersion,
         )
         .await
-        .map_err(|error| LixError::new("LIX_ERROR_UNKNOWN", error.message))?;
+        ?;
         let Some(row) = row else {
             continue;
         };

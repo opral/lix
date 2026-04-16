@@ -1,6 +1,7 @@
 {
   "x-lix-key": "lix_version_descriptor",
   "x-lix-version": "1",
+  "description": "User-facing version metadata (name and visibility) for a branch-like version. The stable identity of a version; the matching `lix_version_ref` carries the moving head pointer. The catalog's `lix_version` surface joins this descriptor with its ref to present a single user-visible version row.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -8,14 +9,17 @@
   "properties": {
     "id": {
       "type": "string",
-      "x-lix-default": "lix_uuid_v7()"
+      "x-lix-default": "lix_uuid_v7()",
+      "description": "Stable version identifier (UUIDv7). Referenced by `lix_version_ref.id` and `lix_active_version.version_id`."
     },
     "name": {
-      "type": "string"
+      "type": "string",
+      "description": "Human-readable version name (e.g. `main`, `feature-x`) shown in version listings and CLI output."
     },
     "hidden": {
       "type": "boolean",
-      "default": false
+      "default": false,
+      "description": "When true, the version is filtered from default listings (CLI, catalog views); operations by explicit id still succeed."
     }
   },
   "required": [

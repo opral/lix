@@ -1,7 +1,6 @@
 pub(crate) mod effective_state;
 pub(crate) mod prepared_artifacts;
 
-use crate::catalog::FilesystemQueryError;
 use crate::catalog::SurfaceFamily;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
@@ -36,12 +35,6 @@ use filesystem_writes::resolve_filesystem_write;
 use hydration::{HydratedVersionAdminRow as VersionAdminRow, PublicWriteHydrator};
 use state_backed_writes::{resolve_entity_write, resolve_state_write};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WriteResolveError {
-    pub(crate) message: String,
-    pub(crate) hint: Option<String>,
-}
-
 #[async_trait(?Send)]
 pub(crate) trait WriteSelectorResolver {
     async fn load_text_selector_values(
@@ -49,26 +42,17 @@ pub(crate) trait WriteSelectorResolver {
         planned_write: &PlannedWrite,
         selector_column: &str,
         error_message: &str,
-    ) -> Result<Vec<String>, WriteResolveError>;
+    ) -> Result<Vec<String>, crate::LixError>;
 
     async fn load_entity_selector_rows(
         &self,
         planned_write: &PlannedWrite,
-    ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError>;
+    ) -> Result<Vec<CanonicalStateRowKey>, crate::LixError>;
 
     async fn load_state_selector_rows(
         &self,
         planned_write: &PlannedWrite,
-    ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError>;
-}
-
-impl From<FilesystemQueryError> for WriteResolveError {
-    fn from(error: FilesystemQueryError) -> Self {
-        Self {
-            message: error.message,
-            hint: error.hint,
-        }
-    }
+    ) -> Result<Vec<CanonicalStateRowKey>, crate::LixError>;
 }
 
 #[derive(Default, Clone)]
@@ -205,7 +189,7 @@ pub(crate) async fn resolve_write_plan_with_functions<P>(
     pending_write_overlay: Option<&dyn PendingOverlay>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -243,8 +227,9 @@ where
             )
             .await
         }
-        SurfaceFamily::Change => Err(WriteResolveError {
-            message: format!(
+        SurfaceFamily::Change => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public write resolver does not support '{}' writes",
                 planned_write.command.target.descriptor.public_name
             ),
@@ -259,7 +244,7 @@ async fn resolve_admin_write(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     match admin_write_behavior(&planned_write.command.target)? {
         CatalogAdminWriteBehavior::Version => match planned_write.command.operation_kind {
             WriteOperationKind::Insert => {
@@ -274,13 +259,14 @@ async fn resolve_admin_write(
 
 fn admin_write_behavior(
     target: &crate::catalog::ResolvedRelation,
-) -> Result<CatalogAdminWriteBehavior, WriteResolveError> {
+) -> Result<CatalogAdminWriteBehavior, crate::LixError> {
     let Some(semantics) = builtin_catalog_compiler_facade()
         .write_surface_semantics(target)
         .map_err(write_resolve_backend_error)?
     else {
-        return Err(WriteResolveError {
-            message: format!(
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public write resolver does not yet support '{}' writes",
                 target.descriptor.public_name
             ),
@@ -288,8 +274,9 @@ fn admin_write_behavior(
         });
     };
 
-    semantics.admin_behavior.ok_or_else(|| WriteResolveError {
-        message: format!(
+    semantics.admin_behavior.ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
             "public write resolver does not yet support '{}' writes",
             target.descriptor.public_name
         ),
@@ -300,7 +287,7 @@ fn admin_write_behavior(
 async fn resolve_version_insert_write_plan(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     let rows = payload_maps(planned_write)?;
     let mut partitions = ResolvedWritePlanBuilder::default();
 
@@ -357,7 +344,7 @@ async fn resolve_existing_version_write(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     let version_ids = selector_resolver
         .load_text_selector_values(
             planned_write,
@@ -391,14 +378,16 @@ async fn resolve_existing_version_write(
     match planned_write.command.operation_kind {
         WriteOperationKind::Update => {
             let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
-                return Err(WriteResolveError {
-                    message: "public version update resolver requires a patch payload".to_string(),
+                return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "public version update resolver requires a patch payload".to_string(),
                     hint: None,
                 });
             };
             if payload.contains_key("id") {
-                return Err(WriteResolveError {
-                    message: "public version update cannot modify id".to_string(),
+                return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "public version update cannot modify id".to_string(),
                     hint: None,
                 });
             }
@@ -410,8 +399,9 @@ async fn resolve_existing_version_write(
                     .and_then(text_from_value)
                     .unwrap_or_else(|| current_row.name.clone());
                 if next_name.is_empty() {
-                    return Err(WriteResolveError {
-                        message: "public version update cannot set empty name".to_string(),
+                    return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                        description: "public version update cannot set empty name".to_string(),
                         hint: None,
                     });
                 }
@@ -424,8 +414,9 @@ async fn resolve_existing_version_write(
                     .and_then(text_from_value)
                     .unwrap_or_else(|| current_row.commit_id.clone());
                 if next_commit_id.is_empty() {
-                    return Err(WriteResolveError {
-                        message: "public version update cannot set empty commit_id".to_string(),
+                    return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                        description: "public version update cannot set empty commit_id".to_string(),
                         hint: None,
                     });
                 }
@@ -511,8 +502,9 @@ async fn resolve_existing_version_write(
             }
             Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
-        WriteOperationKind::Insert => Err(WriteResolveError {
-            message: "public version existing-row resolver does not handle inserts".to_string(),
+        WriteOperationKind::Insert => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public version existing-row resolver does not handle inserts".to_string(),
             hint: None,
         }),
     }
@@ -548,12 +540,13 @@ fn version_ref_tombstone_refs(row: &VersionAdminRow) -> Vec<ResolvedRowRef> {
 
 fn version_admin_id_from_payload_map(
     payload: &BTreeMap<String, Value>,
-) -> Result<String, WriteResolveError> {
+) -> Result<String, crate::LixError> {
     payload
         .get("id")
         .and_then(text_from_value)
-        .ok_or_else(|| WriteResolveError {
-            message: "public version insert requires column 'id'".to_string(),
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public version insert requires column 'id'".to_string(),
             hint: None,
         })
 }
@@ -561,17 +554,19 @@ fn version_admin_id_from_payload_map(
 fn version_admin_required_text_from_payload_map(
     payload: &BTreeMap<String, Value>,
     key: &str,
-) -> Result<String, WriteResolveError> {
+) -> Result<String, crate::LixError> {
     let value = payload
         .get(key)
         .and_then(text_from_value)
-        .ok_or_else(|| WriteResolveError {
-            message: format!("public version insert requires column '{key}'"),
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("public version insert requires column '{key}'"),
             hint: None,
         })?;
     if value.is_empty() {
-        return Err(WriteResolveError {
-            message: format!("public version insert cannot set empty {key}"),
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("public version insert cannot set empty {key}"),
             hint: None,
         });
     }
@@ -580,7 +575,7 @@ fn version_admin_required_text_from_payload_map(
 
 fn version_admin_hidden_from_payload_map(
     payload: &BTreeMap<String, Value>,
-) -> Result<bool, WriteResolveError> {
+) -> Result<bool, crate::LixError> {
     Ok(payload
         .get("hidden")
         .and_then(value_as_bool)
@@ -740,19 +735,21 @@ fn resolve_execution_mode_for_untracked_flag(
     untracked: bool,
     tracked_error: &str,
     untracked_error: &str,
-) -> Result<WriteMode, WriteResolveError> {
+) -> Result<WriteMode, crate::LixError> {
     let execution_mode = if untracked {
         WriteMode::Untracked
     } else {
         WriteMode::Tracked
     };
     match (requested_mode, execution_mode) {
-        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(WriteResolveError {
-            message: tracked_error.to_string(),
+        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: tracked_error.to_string(),
             hint: None,
         }),
-        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
-            message: untracked_error.to_string(),
+        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: untracked_error.to_string(),
             hint: None,
         }),
         _ => Ok(execution_mode),
@@ -762,18 +759,20 @@ fn resolve_execution_mode_for_untracked_flag(
 fn resolve_execution_mode_for_effective_row(
     requested_mode: WriteModeRequest,
     current_row: &ExactEffectiveStateRow,
-) -> Result<WriteMode, WriteResolveError> {
+) -> Result<WriteMode, crate::LixError> {
     let execution_mode = execution_mode_for_overlay_lane(current_row.overlay_lane);
     match (requested_mode, execution_mode) {
-        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(WriteResolveError {
-            message: format!(
+        (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public tracked write requires a tracked effective-state winner, found {:?}",
                 current_row.overlay_lane
             ),
             hint: None,
         }),
-        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
-            message: format!(
+        (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public untracked write requires an untracked effective-state winner, found {:?}",
                 current_row.overlay_lane
             ),
@@ -787,7 +786,7 @@ fn target_write_lane_for_effective_row(
     planned_write: &PlannedWrite,
     execution_mode: WriteMode,
     current_row: &ExactEffectiveStateRow,
-) -> Result<Option<WriteLane>, WriteResolveError> {
+) -> Result<Option<WriteLane>, crate::LixError> {
     target_write_lane_for_version(
         planned_write,
         execution_mode,
@@ -799,7 +798,7 @@ fn target_write_lane_for_planned_row(
     planned_write: &PlannedWrite,
     execution_mode: WriteMode,
     version_id: Option<&str>,
-) -> Result<Option<WriteLane>, WriteResolveError> {
+) -> Result<Option<WriteLane>, crate::LixError> {
     target_write_lane_for_version(planned_write, execution_mode, version_id)
 }
 
@@ -807,7 +806,7 @@ fn target_write_lane_for_version(
     planned_write: &PlannedWrite,
     _execution_mode: WriteMode,
     version_id: Option<&str>,
-) -> Result<Option<WriteLane>, WriteResolveError> {
+) -> Result<Option<WriteLane>, crate::LixError> {
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => Ok(Some(WriteLane::ActiveVersion)),
         ScopeProof::SingleVersion(version_id) => Ok(Some(WriteLane::SingleVersion(
@@ -815,8 +814,9 @@ fn target_write_lane_for_version(
         ))),
         ScopeProof::FiniteVersionSet(_) => version_id
             .map(|version_id| Some(WriteLane::SingleVersion(version_id.to_string())))
-            .ok_or_else(|| WriteResolveError {
-                message:
+            .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
                     "public tracked write could not determine a concrete version lane for a selected row"
                         .to_string(),
                         hint: None,
@@ -824,14 +824,15 @@ fn target_write_lane_for_version(
         ScopeProof::GlobalAdmin => Ok(Some(WriteLane::GlobalAdmin)),
         ScopeProof::Unknown | ScopeProof::Unbounded => version_id
             .map(|version_id| Some(WriteLane::SingleVersion(version_id.to_string())))
-            .ok_or_else(|| WriteResolveError {
-                message: "public tracked write requires a bounded version lane".to_string(),
+            .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "public tracked write requires a bounded version lane".to_string(),
                 hint: None,
             }),
     }
 }
 
-fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, crate::LixError> {
     if let Some(TargetSetProof::Exact(entity_ids)) = &planned_write.target_set_proof {
         if entity_ids.len() == 1 {
             return Ok(entity_ids
@@ -842,28 +843,30 @@ fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, WriteResol
         }
     }
 
-    payload_text_value(planned_write, "entity_id").ok_or_else(|| WriteResolveError {
-        message: "public write resolver requires an exact entity target".to_string(),
+    payload_text_value(planned_write, "entity_id").ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "public write resolver requires an exact entity target".to_string(),
         hint: None,
     })
 }
 
-fn resolved_schema_key(planned_write: &PlannedWrite) -> Result<String, WriteResolveError> {
+fn resolved_schema_key(planned_write: &PlannedWrite) -> Result<String, crate::LixError> {
     match &planned_write.schema_proof {
         SchemaProof::Exact(schema_keys) if schema_keys.len() == 1 => Ok(schema_keys
             .iter()
             .next()
             .expect("singleton exact schema proof")
             .clone()),
-        _ => payload_text_value(planned_write, "schema_key").ok_or_else(|| WriteResolveError {
-            message: "public write resolver requires an exact schema proof or schema_key literal"
+        _ => payload_text_value(planned_write, "schema_key").ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public write resolver requires an exact schema proof or schema_key literal"
                 .to_string(),
             hint: None,
         }),
     }
 }
 
-fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, WriteResolveError> {
+fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, crate::LixError> {
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => planned_write
             .command
@@ -871,8 +874,9 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
             .requested_version_id
             .clone()
             .map(Some)
-            .ok_or_else(|| WriteResolveError {
-                message:
+            .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
                 hint: None,
@@ -882,24 +886,27 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
             Ok(version_ids.iter().next().cloned())
         }
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
-            Err(WriteResolveError {
-                message: "public write resolver requires a concrete version_id".to_string(),
+            Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "public write resolver requires a concrete version_id".to_string(),
                 hint: None,
             })
         }
-        ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
-            message: "public write resolver cannot resolve multi-version writes".to_string(),
+        ScopeProof::FiniteVersionSet(_) => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public write resolver cannot resolve multi-version writes".to_string(),
             hint: None,
         }),
         ScopeProof::GlobalAdmin => Ok(Some(GLOBAL_VERSION_ID.to_string())),
-        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
-            message: "public write resolver requires a bounded scope proof".to_string(),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public write resolver requires a bounded scope proof".to_string(),
             hint: None,
         }),
     }
 }
 
-fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, WriteResolveError> {
+fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, crate::LixError> {
     match &planned_write.scope_proof {
         ScopeProof::ActiveVersion => planned_write
             .command
@@ -907,23 +914,26 @@ fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, Wri
             .requested_version_id
             .clone()
             .map(|version_id| vec![version_id])
-            .ok_or_else(|| WriteResolveError {
-                message:
+            .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
                 hint: None,
             }),
         ScopeProof::SingleVersion(version_id) => Ok(vec![version_id.clone()]),
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
-            Err(WriteResolveError {
-                message: "public write resolver requires a concrete version_id".to_string(),
+            Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "public write resolver requires a concrete version_id".to_string(),
                 hint: None,
             })
         }
         ScopeProof::FiniteVersionSet(version_ids) => Ok(version_ids.iter().cloned().collect()),
         ScopeProof::GlobalAdmin => Ok(vec![GLOBAL_VERSION_ID.to_string()]),
-        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
-            message: "public write resolver requires a bounded scope proof".to_string(),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public write resolver requires a bounded scope proof".to_string(),
             hint: None,
         }),
     }
@@ -943,7 +953,7 @@ pub(super) fn write_mode_request_for_insert_payload(
 pub(super) fn resolved_version_id_for_insert_payload(
     planned_write: &PlannedWrite,
     payload: &BTreeMap<String, Value>,
-) -> Result<Option<String>, WriteResolveError> {
+) -> Result<Option<String>, crate::LixError> {
     if payload.get("global").and_then(bool_from_value) == Some(true) {
         return Ok(Some(GLOBAL_VERSION_ID.to_string()));
     }
@@ -955,8 +965,9 @@ pub(super) fn resolved_version_id_for_insert_payload(
             .requested_version_id
             .clone()
             .map(Some)
-            .ok_or_else(|| WriteResolveError {
-                message:
+            .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
                 hint: None,
@@ -965,16 +976,18 @@ pub(super) fn resolved_version_id_for_insert_payload(
             .get("version_id")
             .and_then(text_from_value)
             .map(Some)
-            .ok_or_else(|| WriteResolveError {
-                message: "public write resolver requires a concrete version_id".to_string(),
+            .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "public write resolver requires a concrete version_id".to_string(),
                 hint: None,
             }),
         crate::catalog::DefaultScopeSemantics::GlobalAdmin => {
             Ok(Some(GLOBAL_VERSION_ID.to_string()))
         }
         crate::catalog::DefaultScopeSemantics::History
-        | crate::catalog::DefaultScopeSemantics::WorkingChanges => Err(WriteResolveError {
-            message: "public write resolver requires a bounded scope proof".to_string(),
+        | crate::catalog::DefaultScopeSemantics::WorkingChanges => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public write resolver requires a bounded scope proof".to_string(),
             hint: None,
         }),
     }
@@ -983,7 +996,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
 async fn resolved_existing_version_ids(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-) -> Result<Vec<String>, WriteResolveError> {
+) -> Result<Vec<String>, crate::LixError> {
     let version_ids = resolved_version_ids(planned_write)?;
     let mut validated = BTreeSet::new();
 
@@ -1002,7 +1015,7 @@ async fn resolved_existing_version_ids(
 pub(super) async fn resolved_insert_version_ids(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-) -> Result<Vec<Option<String>>, WriteResolveError> {
+) -> Result<Vec<Option<String>>, crate::LixError> {
     let payloads = payload_maps(planned_write)?;
     let mut validated = BTreeSet::new();
     let mut version_ids = Vec::with_capacity(payloads.len());
@@ -1026,7 +1039,7 @@ pub(super) async fn resolved_insert_version_ids(
 fn finalize_resolved_write_plan(
     planned_write: &PlannedWrite,
     mut resolved: ResolvedWritePlan,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     resolved.partitions.retain(|partition| {
         !partition.intended_post_state.is_empty() || !partition.filesystem_state.files.is_empty()
     });
@@ -1053,7 +1066,7 @@ fn noop_resolved_write_plan(execution_mode: WriteMode) -> ResolvedWritePlan {
     )
 }
 
-fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, WriteResolveError> {
+fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, crate::LixError> {
     match scope_proof {
         ScopeProof::ActiveVersion => Ok(WriteLane::ActiveVersion),
         ScopeProof::SingleVersion(version_id) => Ok(WriteLane::SingleVersion(version_id.clone())),
@@ -1066,13 +1079,15 @@ fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, WriteRes
                     .clone(),
             ))
         }
-        ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
-            message: "public tracked writes require exactly one write lane".to_string(),
+        ScopeProof::FiniteVersionSet(_) => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public tracked writes require exactly one write lane".to_string(),
             hint: None,
         }),
         ScopeProof::GlobalAdmin => Ok(WriteLane::GlobalAdmin),
-        ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
-            message: "public tracked writes require a bounded write lane".to_string(),
+        ScopeProof::Unknown | ScopeProof::Unbounded => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public tracked writes require a bounded write lane".to_string(),
             hint: None,
         }),
     }
@@ -1088,15 +1103,6 @@ fn value_as_bool(value: &Value) -> Option<bool> {
             _ => None,
         },
         _ => None,
-    }
-}
-
-fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
-    let err = crate::LixError::new("LIX_ERROR_UNKNOWN", error.message);
-    if let Some(hint) = error.hint {
-        err.with_hint(hint)
-    } else {
-        err
     }
 }
 
@@ -1122,11 +1128,12 @@ fn payload_text_value(planned_write: &PlannedWrite, key: &str) -> Option<String>
 
 fn payload_maps(
     planned_write: &PlannedWrite,
-) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError> {
+) -> Result<Vec<BTreeMap<String, Value>>, crate::LixError> {
     match &planned_write.command.payload {
         MutationPayload::InsertRows(payloads) => Ok(payloads.clone()),
-        MutationPayload::UpdatePatch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
-            message: "public resolver expected insert payload rows".to_string(),
+        MutationPayload::UpdatePatch(_) | MutationPayload::Tombstone => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public resolver expected insert payload rows".to_string(),
             hint: None,
         }),
     }
@@ -1155,17 +1162,15 @@ fn bool_from_value(value: &Value) -> Option<bool> {
     }
 }
 
-fn write_resolve_backend_error(error: crate::LixError) -> WriteResolveError {
-    WriteResolveError {
-        message: error.description,
-        hint: error.hint,
-    }
+fn write_resolve_backend_error(error: crate::LixError) -> crate::LixError {
+    error
 }
 
-fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteResolveError {
-    WriteResolveError {
-        message: error.message,
-        hint: error.hint,
+fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> crate::LixError {
+    let err = crate::LixError::new("LIX_ERROR_UNKNOWN", error.message);
+    match error.hint {
+        Some(hint) => err.with_hint(hint),
+        None => err,
     }
 }
 

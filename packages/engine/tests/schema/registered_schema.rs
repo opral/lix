@@ -424,6 +424,10 @@ simulation_test!(
             .await;
 
         let err = result.expect_err("inserting via SQLite json() should fail");
+        assert_eq!(
+            err.code, "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION",
+            "SQLite json() rejection should carry the categorized code"
+        );
         assert!(
             !err.description.contains("day-1"),
             "error must not leak internal 'day-1' phrasing, got: {}",
@@ -436,6 +440,50 @@ simulation_test!(
         assert!(
             hint.contains("lix_json"),
             "hint should mention lix_json; got: {hint}"
+        );
+        assert!(
+            !hint.contains("--params"),
+            "engine hint must not reference CLI flags; got: {hint}"
+        );
+    }
+);
+
+simulation_test!(
+    boolean_field_integer_rejection_hints_at_true_false_literals,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json('{\"x-lix-key\":\"todo\",\"x-lix-version\":\"1\",\"type\":\"object\",\"x-lix-primary-key\":[\"/id\"],\"properties\":{\"id\":{\"type\":\"string\"},\"done\":{\"type\":\"boolean\"}},\"required\":[\"id\",\"done\"],\"additionalProperties\":false}'))",
+                &[],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        let result = engine
+            .execute("INSERT INTO todo (id, done) VALUES ('todo-1', 0)", &[])
+            .await;
+
+        let err = result.expect_err("inserting integer 0 for boolean field should fail");
+        assert!(
+            err.description.contains("is not of type") && err.description.contains("boolean"),
+            "expected boolean-type validation error, got: {}",
+            err.description
+        );
+        let hint = err
+            .hint
+            .as_deref()
+            .expect("boolean-type mismatch should attach a hint");
+        assert!(
+            hint.contains("true") && hint.contains("false"),
+            "hint should suggest true/false literals; got: {hint}"
         );
         assert!(
             !hint.contains("--params"),

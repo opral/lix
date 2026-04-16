@@ -20,24 +20,20 @@ use crate::Value;
 use sqlparser::ast::{BinaryOperator, Expr};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct WriteAnalysisError {
-    pub(crate) message: String,
-}
-
 pub(crate) fn analyze_write(
     canonicalized: &CanonicalizedWrite,
     functions: &DynFunctionProvider,
-) -> Result<PlannedWrite, WriteAnalysisError> {
+) -> Result<PlannedWrite, crate::LixError> {
     let scope_proof = analyze_write_scope(canonicalized)?;
     if !matches!(
         canonicalized.write_command.requested_mode,
         WriteModeRequest::ForceUntracked
     ) && matches!(scope_proof, ScopeProof::Unknown | ScopeProof::Unbounded)
     {
-        return Err(WriteAnalysisError {
-            message: "tracked public writes require a bounded scope analysis".to_string(),
-        });
+        return Err(crate::LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "tracked public writes require a bounded scope analysis",
+        ));
     }
 
     let schema_proof = derive_write_schema_facts(canonicalized);
@@ -72,7 +68,7 @@ pub(crate) fn analyze_write(
 fn analyze_filesystem_write_intent(
     canonicalized: &CanonicalizedWrite,
     functions: &DynFunctionProvider,
-) -> Result<Option<FilesystemWriteIntent>, WriteAnalysisError> {
+) -> Result<Option<FilesystemWriteIntent>, crate::LixError> {
     let filesystem_kind = filesystem_surface_kind(&canonicalized.resolved_relation)?;
     match (
         filesystem_kind,
@@ -137,7 +133,7 @@ fn analyze_filesystem_write_intent(
 
 fn analyze_write_scope(
     canonicalized: &CanonicalizedWrite,
-) -> Result<ScopeProof, WriteAnalysisError> {
+) -> Result<ScopeProof, crate::LixError> {
     if let Some(scope_proof) = insert_scope_proof(canonicalized) {
         return Ok(scope_proof);
     }
@@ -519,12 +515,10 @@ fn filesystem_write_schema_key(canonicalized: &CanonicalizedWrite) -> Option<Str
 
 fn filesystem_surface_binding(
     resolved_relation: &ResolvedRelation,
-) -> Result<Option<FilesystemRelationBinding>, WriteAnalysisError> {
+) -> Result<Option<FilesystemRelationBinding>, crate::LixError> {
     let Some(binding) = builtin_catalog_compiler_facade()
         .bind_surface_runtime_relation(resolved_relation, RelationBindContext::default())
-        .map_err(|error| WriteAnalysisError {
-            message: error.description,
-        })?
+        .map_err(|error| error)?
     else {
         return Ok(None);
     };
@@ -537,7 +531,7 @@ fn filesystem_surface_binding(
 
 fn filesystem_surface_kind(
     resolved_relation: &ResolvedRelation,
-) -> Result<Option<FilesystemRelationKind>, WriteAnalysisError> {
+) -> Result<Option<FilesystemRelationKind>, crate::LixError> {
     Ok(filesystem_surface_binding(resolved_relation)?.map(|binding| binding.kind))
 }
 
@@ -625,11 +619,9 @@ fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<
 }
 
 fn write_analysis_filesystem_assignments_error(
-    error: crate::sql::semantic_ir::semantics::filesystem_assignments::FilesystemAssignmentsError,
-) -> WriteAnalysisError {
-    WriteAnalysisError {
-        message: error.message,
-    }
+    error: crate::LixError,
+) -> crate::LixError {
+    error
 }
 
 #[cfg(test)]

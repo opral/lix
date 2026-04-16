@@ -1187,9 +1187,21 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     let mut write_analysis = match analyze_public_write_semantics(&semantics, &functions) {
         Ok(write_analysis) => write_analysis,
         Err(error) => {
-            if let Some(error) =
-                public_write_preparation_error(&semantics.canonicalized, &error.message)
-            {
+            let mapped_error = if error.code != "LIX_ERROR_UNKNOWN" {
+                let err = LixError::new(error.code, error.description);
+                Some(match error.hint {
+                    Some(hint) => err.with_hint(hint),
+                    None => err,
+                })
+            } else {
+                public_write_preparation_error(&semantics.canonicalized, &error.description).map(
+                    |err| match error.hint {
+                        Some(hint) => err.with_hint(hint),
+                        None => err,
+                    },
+                )
+            };
+            if let Some(error) = mapped_error {
                 return Err(error);
             }
             return Ok(None);
@@ -1570,7 +1582,7 @@ fn public_write_preparation_error_for_surface(
     }
     if message.contains("does not support ON CONFLICT DO NOTHING") {
         return Some(LixError::new(
-            "LIX_ERROR_UNKNOWN",
+            LixError::CODE_UNSUPPORTED_WRITE_EXPRESSION,
             "ON CONFLICT DO NOTHING is not supported",
         ));
     }
@@ -1590,22 +1602,50 @@ fn public_write_preparation_error_for_surface(
             WriteOperationKind::Delete => "delete requires a version_id predicate",
         };
         return Some(LixError::new(
-            "LIX_ERROR_UNKNOWN",
+            LixError::CODE_UNSUPPORTED_WRITE_EXPRESSION,
             format!("{public_name} {action}"),
         ));
     }
 
     match resolved_relation.descriptor.surface_family {
         SurfaceFamily::Filesystem => Some(public_filesystem_write_error(public_name, message)),
-        SurfaceFamily::State | SurfaceFamily::Entity => {
-            Some(LixError::new("LIX_ERROR_UNKNOWN", message))
-        }
-        SurfaceFamily::Admin => Some(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            normalize_admin_public_write_message(resolved_relation, message),
+        SurfaceFamily::State | SurfaceFamily::Entity => Some(LixError::new(
+            classify_public_write_error_code(message),
+            message,
         )),
+        SurfaceFamily::Admin => {
+            let normalized = normalize_admin_public_write_message(resolved_relation, message);
+            Some(LixError::new(
+                classify_public_write_error_code(&normalized),
+                normalized,
+            ))
+        }
         _ => None,
     }
+}
+
+/// Classify a public-write error message into a categorized code. Falls
+/// back to `LIX_ERROR_UNKNOWN` for messages that don't match a known
+/// categorized shape. Categories covered so far:
+///   - `CODE_UNSUPPORTED_WRITE_EXPRESSION`: canonicalize/binder rejections
+///     (`json(...)` instead of `lix_json`, arbitrary VALUES expressions,
+///     unsupported ON CONFLICT variants).
+///   - `CODE_SCHEMA_VALIDATION`: primary-key derivation failures — the
+///     user's row data does not satisfy the schema's `x-lix-primary-key`.
+fn classify_public_write_error_code(message: &str) -> &'static str {
+    if message.starts_with("primary-key field")
+        || message.starts_with("could not extract primary-key field")
+    {
+        return LixError::CODE_SCHEMA_VALIDATION;
+    }
+    if message.contains("canonicalizer")
+        || message.contains("INSERT VALUES")
+        || message.contains("ON CONFLICT")
+        || message.contains("is not supported in INSERT VALUES")
+    {
+        return LixError::CODE_UNSUPPORTED_WRITE_EXPRESSION;
+    }
+    LixError::CODE_UNKNOWN
 }
 
 fn normalize_admin_public_write_message<'a>(

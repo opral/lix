@@ -70,20 +70,12 @@ impl NormalizedDirectoryPath {
         normalize_directory_path(path).map(Self)
     }
 
-    pub(crate) fn root() -> Self {
-        Self("/".to_string())
-    }
-
     pub(crate) fn from_normalized(path: String) -> Self {
         Self(path)
     }
 
     pub(crate) fn as_str(&self) -> &str {
         self.0.as_str()
-    }
-
-    pub(crate) fn is_root(&self) -> bool {
-        self.as_str() == "/"
     }
 }
 
@@ -399,10 +391,6 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
     true
 }
 
-pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
-    normalize_file_path_impl(path).map_err(PathError::into_lix_error)
-}
-
 fn normalize_file_path_impl(path: &str) -> PathResult<String> {
     let normalized = path.nfc().collect::<String>();
     if !normalized.starts_with('/') {
@@ -631,10 +619,16 @@ mod tests {
 
     fn normalize_with_kind(kind: NormalizationKind, input: &str) -> Result<String, LixError> {
         match kind {
-            NormalizationKind::File => normalize_file_path(input),
+            NormalizationKind::File => {
+                normalize_file_path_impl(input).map_err(PathError::into_lix_error)
+            }
             NormalizationKind::Directory => normalize_directory_path(input),
             NormalizationKind::Segment => normalize_path_segment(input),
         }
+    }
+
+    fn normalize_file_path(path: &str) -> Result<String, LixError> {
+        normalize_file_path_impl(path).map_err(PathError::into_lix_error)
     }
 
     fn assert_lix_profile_fixture(fixture: LixProfileFixture) {
@@ -1063,8 +1057,7 @@ mod tests {
     fn represents_root_as_a_normalized_directory_path() {
         let root = NormalizedDirectoryPath::try_from_path("/").expect("root path");
         assert_eq!(root.as_str(), "/");
-        assert!(root.is_root());
-        assert_eq!(NormalizedDirectoryPath::root(), root);
+        assert_eq!(root, NormalizedDirectoryPath::from_normalized("/".to_string()));
     }
 
     #[test]

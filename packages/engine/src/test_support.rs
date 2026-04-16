@@ -13,7 +13,7 @@ use crate::live_state::{write_live_rows, LiveRow};
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::{
-    resolve_write_plan_with_functions, TransactionWriteSelectorResolver, WriteResolveError,
+    resolve_write_plan_with_functions, TransactionWriteSelectorResolver,
 };
 use crate::wasm::NoopWasmRuntime;
 use crate::{
@@ -313,7 +313,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     projection_registry: &CatalogProjectionRegistry,
     planned_write: &PlannedWrite,
     pending_write_overlay: Option<&dyn PendingOverlay>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, LixError> {
     let selector_functions = crate::functions::clone_boxed_function_provider(
         &SharedFunctionProvider::new(SystemFunctionProvider),
     );
@@ -323,11 +323,7 @@ pub(crate) async fn resolve_write_plan_for_test(
         pending_write_overlay,
         &selector_functions,
     )
-    .await
-    .map_err(|error| WriteResolveError {
-        message: error.description,
-        hint: None,
-    })?;
+    .await?;
     resolve_write_plan_with_functions(
         backend,
         planned_write,
