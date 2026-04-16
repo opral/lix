@@ -59,6 +59,28 @@ fn normalize_global_projection_rows(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
         .collect()
 }
 
+fn normalize_text_row_order(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    let mut normalized = rows.to_vec();
+    normalized.sort_by(|left, right| {
+        let left_key = left
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let right_key = right
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        left_key.cmp(&right_key)
+    });
+    normalized
+}
+
 async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     register_registered_schema_snapshot(
         engine,
@@ -578,27 +600,24 @@ simulation_test!(
             .execute(
                 "SELECT write_lane, commit_id \
                  FROM lix_internal_commit_idempotency \
-                 WHERE write_lane = 'version:version-a' \
-                 ORDER BY write_lane, idempotency_key",
+                 WHERE write_lane = 'version:version-a'",
                 &[],
             )
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        sim.assert_deterministic(normalize_text_row_order(&rows.statements[0].rows));
         let before_count = match idempotency_before.statements[0].rows[0][0].clone() {
             Value::Integer(value) => value,
             other => panic!("expected integer idempotency count, got {other:?}"),
         };
         assert_eq!(rows.statements[0].rows.len() as i64, before_count + 1);
-        let latest = rows.statements[0]
-            .rows
-            .last()
-            .expect("expected at least one idempotency row");
-        assert_text(&latest[0], "version:version-a");
-        match &latest[1] {
-            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
-            other => panic!("expected text commit_id, got {other:?}"),
+        for row in &rows.statements[0].rows {
+            assert_text(&row[0], "version:version-a");
+            match &row[1] {
+                Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
+                other => panic!("expected text commit_id, got {other:?}"),
+            }
         }
     }
 );
@@ -1200,7 +1219,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         let matched = rows.statements[0]
             .rows
             .iter()
@@ -1546,7 +1566,8 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         let matched = rows.statements[0]
             .rows
             .iter()

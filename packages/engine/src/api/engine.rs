@@ -129,8 +129,15 @@ impl Engine {
         self.state_commit_stream_bus.subscribe(filter)
     }
 
-    pub(crate) fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.state_commit_stream_bus.emit(changes);
+    pub(crate) fn latest_state_commit_sequence(&self) -> Option<u64> {
+        self.state_commit_stream_bus.latest_sequence()
+    }
+
+    pub(crate) fn emit_state_commit_stream_changes(
+        &self,
+        changes: Vec<StateCommitStreamChange>,
+    ) -> Option<u64> {
+        self.state_commit_stream_bus.emit(changes)
     }
 
     pub(crate) fn deterministic_boot_pending(&self) -> bool {
@@ -323,8 +330,15 @@ impl crate::session::SessionHost for EngineSessionHost {
         self.engine.state_commit_stream(filter)
     }
 
-    fn emit_state_commit_stream_changes(&self, changes: Vec<StateCommitStreamChange>) {
-        self.engine.emit_state_commit_stream_changes(changes);
+    fn latest_state_commit_sequence(&self) -> Option<u64> {
+        self.engine.latest_state_commit_sequence()
+    }
+
+    fn emit_state_commit_stream_changes(
+        &self,
+        changes: Vec<StateCommitStreamChange>,
+    ) -> Option<u64> {
+        self.engine.emit_state_commit_stream_changes(changes)
     }
 
     fn invalidate_deterministic_settings_cache(&self) {

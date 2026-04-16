@@ -475,7 +475,7 @@ pub(crate) struct ExplainFilesystemRelationBindingSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct DependencyWriterFilterSnapshot {
+pub(crate) struct DependencyOriginFilterSnapshot {
     pub(crate) include: Vec<String>,
     pub(crate) exclude: Vec<String>,
 }
@@ -488,7 +488,7 @@ pub(crate) struct DependencySpecSnapshot {
     pub(crate) file_ids: Vec<String>,
     pub(crate) version_ids: Vec<String>,
     pub(crate) query_dependencies: Vec<QueryDependency>,
-    pub(crate) writer_filter: DependencyWriterFilterSnapshot,
+    pub(crate) origin_filter: DependencyOriginFilterSnapshot,
     pub(crate) include_untracked: bool,
     pub(crate) depends_on_active_version: bool,
     pub(crate) precision: ExplainDependencyPrecision,
@@ -569,7 +569,7 @@ pub(crate) struct DirectStatementsSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct StatementContextSnapshot {
     pub(crate) dialect: Option<ExplainSqlDialect>,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) requested_version_id: Option<String>,
     pub(crate) active_account_ids: Vec<String>,
 }
@@ -822,7 +822,7 @@ pub(crate) struct PublicChangeSnapshot {
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) version_id: String,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -835,7 +835,7 @@ pub(crate) struct SemanticEffectSnapshot {
 pub(crate) struct ChangeBatchSnapshot {
     pub(crate) changes: Vec<PublicChangeSnapshot>,
     pub(crate) write_lane: ExplainWriteLaneKind,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) semantic_effects: Vec<SemanticEffectSnapshot>,
 }
 
@@ -5076,7 +5076,7 @@ fn statement_context_snapshot(
 ) -> StatementContextSnapshot {
     StatementContextSnapshot {
         dialect: context.dialect.map(sql_dialect_snapshot),
-        writer_key: context.writer_key.clone(),
+        origin_key: context.origin_key.clone(),
         requested_version_id: context.requested_version_id.clone(),
         active_account_ids: context.active_account_ids.clone(),
     }
@@ -5271,7 +5271,7 @@ fn change_batch_snapshot(batch: &ChangeBatch) -> ChangeBatchSnapshot {
     ChangeBatchSnapshot {
         changes: batch.changes.iter().map(public_change_snapshot).collect(),
         write_lane: write_lane_kind_snapshot(&batch.write_lane),
-        writer_key: batch.writer_key.clone(),
+        origin_key: batch.origin_key.clone(),
         semantic_effects: batch
             .semantic_effects
             .iter()
@@ -5290,7 +5290,7 @@ fn public_change_snapshot(change: &PublicChange) -> PublicChangeSnapshot {
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
         version_id: change.version_id.clone(),
-        writer_key: change.writer_key.clone(),
+        origin_key: change.origin_key.clone(),
     }
 }
 
@@ -5701,9 +5701,9 @@ fn dependency_spec_snapshot(spec: &DependencySpec) -> DependencySpecSnapshot {
         file_ids: spec.file_ids.iter().cloned().collect(),
         version_ids: spec.version_ids.iter().cloned().collect(),
         query_dependencies: spec.query_dependencies.iter().cloned().collect(),
-        writer_filter: DependencyWriterFilterSnapshot {
-            include: spec.writer_filter.include.iter().cloned().collect(),
-            exclude: spec.writer_filter.exclude.iter().cloned().collect(),
+        origin_filter: DependencyOriginFilterSnapshot {
+            include: spec.origin_filter.include.iter().cloned().collect(),
+            exclude: spec.origin_filter.exclude.iter().cloned().collect(),
         },
         include_untracked: spec.include_untracked,
         depends_on_active_version: spec.depends_on_active_version,

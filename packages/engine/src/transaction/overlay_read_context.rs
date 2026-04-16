@@ -4,14 +4,14 @@
 //! transaction-side materialization and write-state tests can resolve
 //! overlay-aware effective rows.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 
 use async_trait::async_trait;
 
 use crate::live_state::{
     matches_constraints, BatchRowRequest, LiveReadContext, RowIdentity, ScanRequest,
     TrackedReadView, TrackedRow, TrackedTombstoneMarker, TrackedTombstoneView, UntrackedReadView,
-    UntrackedRow, WriterKeyReadView,
+    UntrackedRow,
 };
 use crate::LixError;
 
@@ -31,10 +31,9 @@ impl<'a> OverlayReadContext<'a> {
     pub(crate) fn new(
         tracked: &'a dyn TrackedReadView,
         untracked: &'a dyn UntrackedReadView,
-        writer_keys: &'a dyn WriterKeyReadView,
     ) -> Self {
         Self {
-            base: LiveReadContext::new(tracked, untracked, writer_keys),
+            base: LiveReadContext::new(tracked, untracked),
         }
     }
 
@@ -64,10 +63,6 @@ impl<'a> OverlayReadContext<'a> {
                 base: self.base.tracked_tombstones,
                 pending,
             },
-            writer_keys: PendingWriterKeyReadView {
-                base: self.base.writer_keys,
-                pending,
-            },
         }
     }
 }
@@ -76,12 +71,11 @@ pub(crate) struct PendingOverlayReadContext<'a> {
     tracked: PendingTrackedReadView<'a>,
     untracked: PendingUntrackedReadView<'a>,
     tracked_tombstones: PendingTrackedTombstoneView<'a>,
-    writer_keys: PendingWriterKeyReadView<'a>,
 }
 
 impl<'a> PendingOverlayReadContext<'a> {
     pub(crate) fn effective_state_context(&'a self) -> LiveReadContext<'a> {
-        let context = LiveReadContext::new(&self.tracked, &self.untracked, &self.writer_keys);
+        let context = LiveReadContext::new(&self.tracked, &self.untracked);
         if self.tracked_tombstones.has_source() {
             context.with_tracked_tombstones(&self.tracked_tombstones)
         } else {
@@ -105,40 +99,9 @@ struct PendingTrackedTombstoneView<'a> {
     pending: &'a PendingRowOverlay,
 }
 
-struct PendingWriterKeyReadView<'a> {
-    base: &'a dyn WriterKeyReadView,
-    pending: &'a PendingRowOverlay,
-}
-
 impl PendingTrackedTombstoneView<'_> {
     fn has_source(&self) -> bool {
         self.base.is_some() || self.pending.has_tombstones()
-    }
-}
-
-#[async_trait(?Send)]
-impl WriterKeyReadView for PendingWriterKeyReadView<'_> {
-    async fn load_annotation(
-        &self,
-        row_identity: &RowIdentity,
-    ) -> Result<Option<String>, LixError> {
-        if let Some(annotation) = pending_writer_key_annotation(self.pending, row_identity) {
-            return Ok(annotation);
-        }
-        self.base.load_annotation(row_identity).await
-    }
-
-    async fn load_annotations(
-        &self,
-        row_identities: &BTreeSet<RowIdentity>,
-    ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
-        let mut annotations = self.base.load_annotations(row_identities).await?;
-        for row_identity in row_identities {
-            if let Some(annotation) = pending_writer_key_annotation(self.pending, row_identity) {
-                annotations.insert(row_identity.clone(), annotation);
-            }
-        }
-        Ok(annotations)
     }
 }
 
@@ -362,17 +325,4 @@ fn sort_tracked_rows(rows: &mut [TrackedRow]) {
 
 fn sort_untracked_rows(rows: &mut [UntrackedRow]) {
     rows.sort_by_key(RowIdentity::from_untracked_row);
-}
-
-fn pending_writer_key_annotation(
-    pending: &PendingRowOverlay,
-    row_identity: &RowIdentity,
-) -> Option<Option<String>> {
-    if let Some(row) = pending.tracked_rows().get(row_identity) {
-        return Some(row.writer_key.clone());
-    }
-    pending
-        .tracked_tombstones()
-        .get(row_identity)
-        .map(|row| row.writer_key.clone())
 }

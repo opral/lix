@@ -64,7 +64,7 @@ pub(crate) async fn install_plugin_in_session(
         ),
         context.public_surface_registry.clone(),
         context.active_account_ids.clone(),
-        context.writer_key.clone(),
+        context.origin_key.clone(),
     );
 
     let install_result = {

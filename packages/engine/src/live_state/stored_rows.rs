@@ -108,7 +108,6 @@ mod tests {
             plugin_key: Some("plug".to_string()),
             metadata: None,
             change_id: Some("chg-1".to_string()),
-            writer_key: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             values: BTreeMap::from([("name".to_string(), Value::Text("Ada".to_string()))]),
@@ -123,7 +122,6 @@ mod tests {
             plugin_key: Some("plug".to_string()),
             metadata: None,
             change_id: "chg-u1".to_string(),
-            writer_key: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             values: BTreeMap::from([("name".to_string(), Value::Text("Bea".to_string()))]),
@@ -132,7 +130,6 @@ mod tests {
         match tracked {
             StoredRow::Tracked(row) => {
                 assert_eq!(row.change_id.as_deref(), Some("chg-1"));
-                assert!(row.writer_key.is_none());
             }
             StoredRow::Untracked(_) => panic!("expected tracked row"),
         }
@@ -157,7 +154,6 @@ mod tests {
             plugin_key: Some("plug".to_string()),
             metadata: None,
             change_id: None,
-            writer_key: None,
             created_at: "2026-01-01T00:00:00Z".to_string(),
             updated_at: "2026-01-01T00:00:00Z".to_string(),
             values: BTreeMap::from([("name".to_string(), Value::Text("Ada".to_string()))]),

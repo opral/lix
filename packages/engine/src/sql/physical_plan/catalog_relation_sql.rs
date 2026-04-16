@@ -6,9 +6,9 @@ use crate::catalog::{
     FilesystemProjectionScope, FilesystemRelationBinding, FilesystemRelationKind,
     StoredVersionHeadSourceBinding, VersionHeadSourceBinding, VersionRelationBinding,
 };
-use crate::common::{escape_sql_string, STORAGE_SCOPE_KEY_COLUMN};
+use crate::common::escape_sql_string;
+use crate::live_state::payload_column_name_for_schema;
 use crate::live_state::tracked_relation_name;
-use crate::live_state::{payload_column_name_for_schema, WRITER_KEY_TABLE};
 use crate::{LixError, SqlDialect};
 
 pub(crate) fn build_version_relation_sql(
@@ -260,7 +260,6 @@ fn build_filesystem_file_projection_sql(
                c.change_id AS change_id, \
                c.commit_id AS commit_id, \
                c.untracked AS untracked, \
-               c.writer_key AS writer_key, \
                c.metadata AS metadata, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY c.version_id, c.entity_id, c.schema_key, c.file_id \
@@ -322,7 +321,6 @@ fn build_filesystem_file_projection_sql(
                c.change_id AS change_id, \
                c.commit_id AS commit_id, \
                c.untracked AS untracked, \
-               c.writer_key AS writer_key, \
                c.metadata AS metadata, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY c.version_id, c.entity_id, c.schema_key, c.file_id \
@@ -353,7 +351,6 @@ fn build_filesystem_file_projection_sql(
                created_at AS lixcol_created_at, \
                updated_at AS lixcol_updated_at, \
                commit_id AS lixcol_commit_id, \
-               writer_key AS lixcol_writer_key, \
                untracked AS lixcol_untracked, \
                metadata AS lixcol_metadata \
              FROM file_descriptor_ranked \
@@ -425,7 +422,6 @@ fn build_filesystem_file_projection_sql(
            f.lixcol_created_at, \
            f.lixcol_updated_at, \
            {commit_id_projection} AS lixcol_commit_id, \
-           f.lixcol_writer_key, \
            f.lixcol_untracked, \
            f.lixcol_metadata \
          FROM file_descriptor_rows f \
@@ -499,7 +495,6 @@ fn build_filesystem_directory_projection_sql(
                c.change_id AS change_id, \
                c.commit_id AS commit_id, \
                c.untracked AS untracked, \
-               c.writer_key AS writer_key, \
                c.metadata AS metadata, \
                ROW_NUMBER() OVER ( \
                  PARTITION BY c.version_id, c.entity_id, c.schema_key, c.file_id \
@@ -696,13 +691,11 @@ fn effective_state_candidates_sql(
            t.change_id AS change_id, \
            cc.commit_id AS commit_id, \
            false AS untracked, \
-           wk.writer_key AS writer_key, \
            t.metadata AS metadata, \
            2 AS precedence \
          FROM {table_name} t \
          JOIN target_versions tv \
            ON tv.version_id = t.version_id \
-         {tracked_writer_key_join_sql} \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
          WHERE t.untracked = false \
@@ -721,14 +714,12 @@ fn effective_state_candidates_sql(
            t.change_id AS change_id, \
            cc.commit_id AS commit_id, \
            false AS untracked, \
-           wk_global.writer_key AS writer_key, \
            t.metadata AS metadata, \
            4 AS precedence \
          FROM {table_name} t \
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND t.version_id = '{global_version}' \
-         {tracked_global_writer_key_join_sql} \
          LEFT JOIN change_commit_by_change_id cc \
            ON cc.change_id = t.change_id \
          WHERE t.version_id = '{global_version}' \
@@ -748,13 +739,11 @@ fn effective_state_candidates_sql(
            u.change_id AS change_id, \
            NULL AS commit_id, \
            true AS untracked, \
-           uwk.writer_key AS writer_key, \
            u.metadata AS metadata, \
            1 AS precedence \
          FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id = u.version_id \
-         {untracked_writer_key_join_sql} \
          WHERE u.untracked = true \
          UNION ALL \
          SELECT \
@@ -771,24 +760,18 @@ fn effective_state_candidates_sql(
            u.change_id AS change_id, \
            NULL AS commit_id, \
            true AS untracked, \
-           uwk_global.writer_key AS writer_key, \
            u.metadata AS metadata, \
            3 AS precedence \
          FROM {untracked_table} u \
          JOIN target_versions tv \
            ON tv.version_id <> '{global_version}' \
           AND u.version_id = '{global_version}' \
-         {untracked_global_writer_key_join_sql} \
          WHERE u.version_id = '{global_version}' \
            AND u.untracked = true",
         table_name = table_name,
         untracked_table = untracked_table,
         tracked_payload_projection = tracked_payload_projection,
         untracked_payload_projection = untracked_payload_projection,
-        tracked_writer_key_join_sql = tracked_writer_key_join_sql("t", "wk"),
-        tracked_global_writer_key_join_sql = tracked_writer_key_join_sql("t", "wk_global"),
-        untracked_writer_key_join_sql = tracked_writer_key_join_sql("u", "uwk"),
-        untracked_global_writer_key_join_sql = tracked_writer_key_join_sql("u", "uwk_global"),
         global_version = escape_sql_string(global_version_id),
     )
 }
@@ -974,20 +957,6 @@ fn json_boolean_extract_sql(dialect: SqlDialect, json_column: &str, field: &str)
 
 fn quote_ident(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
-}
-
-fn tracked_writer_key_join_sql(row_alias: &str, writer_alias: &str) -> String {
-    format!(
-        "LEFT JOIN {writer_key_table} {writer_alias} \
-           ON {writer_alias}.version_id = {row_alias}.version_id \
-          AND {writer_alias}.schema_key = {row_alias}.schema_key \
-          AND {writer_alias}.entity_id = {row_alias}.entity_id \
-          AND {writer_alias}.{storage_scope_key} = {row_alias}.{storage_scope_key}",
-        writer_key_table = WRITER_KEY_TABLE,
-        row_alias = quote_ident(row_alias),
-        writer_alias = quote_ident(writer_alias),
-        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
-    )
 }
 
 fn active_version_commit_id_sql(

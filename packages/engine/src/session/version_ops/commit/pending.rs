@@ -139,7 +139,6 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
     changes: &[StagedChange],
     binary_blob_writes: &[BinaryBlobWrite],
     active_account_ids: &[String],
-    writer_key: Option<&str>,
     functions: &mut dyn LixFunctionProvider,
     timestamp: &str,
 ) -> Result<CanonicalCommitProjectionReceipt, LixError> {
@@ -190,7 +189,7 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
                 )?
                 .map(|value| value.as_str().to_string()),
                 version_id: VersionId::new(change.version_id.to_string())?,
-                writer_key: change.writer_key.clone(),
+                origin_key: change.origin_key.clone(),
                 created_at: Some(timestamp.to_string()),
             })
         })
@@ -243,7 +242,7 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
         staged_changes.len(),
         timestamp,
     )?;
-    let tracked_live_rows = tracked_live_rows_from_staged_changes(&staged_changes, writer_key)?;
+    let tracked_live_rows = tracked_live_rows_from_staged_changes(&staged_changes)?;
     execute_generated_commit_result(
         transaction,
         rewritten,

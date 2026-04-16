@@ -73,7 +73,7 @@ pub(crate) struct WritePreparationContext {
     active_history_root_commit_id: Option<String>,
     active_version_id: String,
     active_account_ids: Vec<String>,
-    writer_key: Option<String>,
+    origin_key: Option<String>,
 }
 
 impl WritePreparationContext {
@@ -101,8 +101,8 @@ impl WritePreparationContext {
         &self.active_account_ids
     }
 
-    fn writer_key(&self) -> Option<&str> {
-        self.writer_key.as_deref()
+    fn origin_key(&self) -> Option<&str> {
+        self.origin_key.as_deref()
     }
 }
 
@@ -110,7 +110,7 @@ struct WriteCommandSeed {
     dialect: crate::SqlDialect,
     statement_kind: PreparedWriteStatementKind,
     diagnostic_context: WriteDiagnosticContext,
-    writer_key: Option<String>,
+    origin_key: Option<String>,
     compiled_execution: CompiledExecution,
     function_bindings: PreparedWriteFunctionBindings,
 }
@@ -157,7 +157,7 @@ pub(crate) async fn build_write_preparation_context(
         active_history_root_commit_id,
         active_version_id: context.active_version_id.clone(),
         active_account_ids: context.active_account_ids.clone(),
-        writer_key: context.writer_key.clone(),
+        origin_key: context.origin_key.clone(),
     })
 }
 
@@ -262,7 +262,7 @@ async fn compile_write_command(
     let diagnostic_context = WriteDiagnosticContext::new(collect_statement_relation_names(
         bound_statement.statement(),
     ));
-    let writer_key = prepared_context.writer_key.clone();
+    let origin_key = prepared_context.origin_key.clone();
     let function_bindings = context
         .function_bindings()
         .expect("write execution should install function bindings before preparation");
@@ -290,7 +290,7 @@ async fn compile_write_command(
         bound_statement,
         prepared_context.active_version_id(),
         prepared_context.active_account_ids(),
-        prepared_context.writer_key(),
+        prepared_context.origin_key(),
         allow_internal_relations,
         CompilePolicy {
             skip_side_effect_collection,
@@ -314,7 +314,7 @@ async fn compile_write_command(
             dialect,
             statement_kind,
             diagnostic_context,
-            writer_key,
+            origin_key,
             compiled_execution,
             function_bindings: prepared_write_function_bindings_for_execution(function_bindings),
         },
@@ -403,7 +403,7 @@ fn assemble_write_command(
         dialect,
         statement_kind,
         diagnostic_context,
-        writer_key,
+        origin_key,
         compiled_execution,
         function_bindings,
     } = materialized.payload;
@@ -412,7 +412,7 @@ fn assemble_write_command(
         statement_kind,
         compiled_execution,
         diagnostic_context,
-        writer_key,
+        origin_key,
     )?;
     WriteCommand::build(prepared_statement, &function_bindings)
 }
@@ -605,7 +605,7 @@ fn prepared_write_statement_from_compiled_execution(
     statement_kind: PreparedWriteStatementKind,
     compiled: CompiledExecution,
     mut diagnostic_context: WriteDiagnosticContext,
-    writer_key: Option<String>,
+    origin_key: Option<String>,
 ) -> Result<PreparedWriteStatement, LixError> {
     let explain_diagnostics = compiled_explain_diagnostics(&compiled)?;
     diagnostic_context.plain_explain_template = explain_diagnostics.plain_template;
@@ -630,7 +630,7 @@ fn prepared_write_statement_from_compiled_execution(
             read_only_query: compiled.read_only_query,
             filesystem_state: compiled.filesystem_intent.filesystem_state.clone(),
             effects: compiled.effects.clone(),
-            writer_key,
+            origin_key,
         })
     } else {
         return Err(LixError::new(
@@ -773,11 +773,11 @@ fn prepared_public_write_artifact_from_prepared_public_write(
                 .statement_context
                 .active_account_ids
                 .clone(),
-            writer_key: public_write
+            origin_key: public_write
                 .planned_write
                 .command
                 .statement_context
-                .writer_key
+                .origin_key
                 .clone(),
             resolved_write_plan: public_write
                 .planned_write
@@ -840,7 +840,6 @@ fn prepared_resolved_write_plan_from_sql(
                 execution_mode: partition.execution_mode,
                 authoritative_pre_state_rows: partition.authoritative_pre_state_rows.clone(),
                 intended_post_state: partition.intended_post_state.clone(),
-                writer_key_updates: partition.writer_key_updates.clone(),
                 filesystem_state: partition.filesystem_state.clone(),
             })
             .collect(),

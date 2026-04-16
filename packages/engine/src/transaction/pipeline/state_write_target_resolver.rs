@@ -56,7 +56,6 @@ struct CandidateWriteTargetRow {
     untracked: bool,
     plugin_key: Option<String>,
     metadata: Option<String>,
-    writer_key: Option<String>,
     snapshot_content: Option<String>,
     values: BTreeMap<String, Value>,
 }
@@ -132,7 +131,6 @@ pub(crate) async fn try_resolve_state_write_targets_with_backend(
             version_id: expose_version_id.then_some(row.version_id),
             global: Some(row.global),
             untracked: Some(row.untracked),
-            writer_key: row.writer_key,
         };
         if !row_keys.iter().any(|existing| existing == &row_key) {
             row_keys.push(row_key);
@@ -225,8 +223,8 @@ async fn scan_selector_lane(
             continue;
         }
 
-        let row = candidate_row_from_live_row(backend, row, requested_version_id, lane, None, None)
-            .await?;
+        let row =
+            candidate_row_from_live_row(backend, row, requested_version_id, lane, None).await?;
         lane_rows.insert(row.identity(), LaneSelectorResult::Visible(row));
     }
 
@@ -261,12 +259,6 @@ async fn scan_selector_lane(
             continue;
         }
 
-        let writer_key = pending_overlay.writer_key_annotation_for_state_row(
-            &pending.version_id,
-            &pending.schema_key,
-            &pending.entity_id,
-            pending.file_id.as_deref(),
-        );
         let values = LiveStateQueryBackend::normalize_live_snapshot_values(
             backend,
             &pending.schema_key,
@@ -287,7 +279,6 @@ async fn scan_selector_lane(
             untracked: lane.is_untracked(),
             plugin_key: pending.plugin_key,
             metadata: pending.metadata,
-            writer_key: writer_key.flatten(),
             snapshot_content: pending.snapshot_content,
             values,
         };
@@ -303,7 +294,6 @@ async fn candidate_row_from_live_row(
     requested_version_id: &str,
     lane: WriteTargetOverlayLane,
     snapshot_content: Option<String>,
-    writer_key_override: Option<String>,
 ) -> Result<CandidateWriteTargetRow, LixError> {
     let LiveRow {
         entity_id,
@@ -313,7 +303,6 @@ async fn candidate_row_from_live_row(
         version_id,
         plugin_key,
         metadata,
-        writer_key,
         global,
         snapshot_content: row_snapshot_content,
         ..
@@ -336,7 +325,6 @@ async fn candidate_row_from_live_row(
         untracked: lane.is_untracked(),
         plugin_key,
         metadata,
-        writer_key: writer_key_override.or(writer_key),
         snapshot_content,
         values,
     })
@@ -639,12 +627,6 @@ fn selector_row_value(row: &CandidateWriteTargetRow, column: &str) -> Option<Val
         "metadata" | "lixcol_metadata" => {
             Some(row.metadata.clone().map(Value::Text).unwrap_or(Value::Null))
         }
-        "writer_key" => Some(
-            row.writer_key
-                .clone()
-                .map(Value::Text)
-                .unwrap_or(Value::Null),
-        ),
         "snapshot_content" => Some(
             row.snapshot_content
                 .clone()

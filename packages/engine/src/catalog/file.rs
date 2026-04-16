@@ -122,7 +122,6 @@ struct DerivedFileRow {
     created_at: Option<String>,
     updated_at: Option<String>,
     commit_id: Option<String>,
-    writer_key: Option<String>,
     untracked: bool,
     lixcol_metadata: Option<String>,
 }
@@ -268,7 +267,6 @@ fn derive_file_rows_for_versions(
                 created_at: descriptor.created_at().map(str::to_string),
                 updated_at: descriptor.updated_at().map(str::to_string),
                 commit_id,
-                writer_key: descriptor.writer_key().map(str::to_string),
                 untracked: descriptor.storage() == CatalogProjectionStorageKind::Untracked,
                 lixcol_metadata: descriptor.metadata_text().map(str::to_string),
             });
@@ -510,10 +508,6 @@ fn file_row_to_surface(
             (
                 "lixcol_commit_id".to_string(),
                 commit_id.map(Value::Text).unwrap_or(Value::Null),
-            ),
-            (
-                "lixcol_writer_key".to_string(),
-                row.writer_key.map(Value::Text).unwrap_or(Value::Null),
             ),
             (
                 "lixcol_untracked".to_string(),
@@ -759,7 +753,6 @@ mod tests {
                         None,
                         None,
                         Some("change-1".to_string()),
-                        None,
                         false,
                         Some("2026-04-10T00:00:00Z".to_string()),
                         Some("2026-04-10T00:00:00Z".to_string()),
@@ -863,7 +856,6 @@ mod tests {
                         None,
                         None,
                         Some("change-untracked-1".to_string()),
-                        None,
                         false,
                         Some("2026-04-10T00:00:00Z".to_string()),
                         Some("2026-04-10T00:00:00Z".to_string()),
@@ -948,7 +940,6 @@ mod tests {
         )
         .with_live_metadata(
             "1",
-            None,
             None,
             None,
             None,

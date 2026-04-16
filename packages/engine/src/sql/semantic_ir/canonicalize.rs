@@ -1277,7 +1277,6 @@ fn selector_column_is_supported(resolved_relation: &ResolvedRelation, column: &s
                 | "schema_version"
                 | "global"
                 | "untracked"
-                | "writer_key"
         ),
         SurfaceFamily::Entity | SurfaceFamily::Admin | SurfaceFamily::Filesystem => {
             write_surface_supports_column(resolved_relation, column, column)
@@ -1337,7 +1336,6 @@ fn candidate_column_key(candidate: &str) -> String {
         "lixcol_plugin_key" => "plugin_key",
         "lixcol_schema_version" => "schema_version",
         "lixcol_global" => "global",
-        "lixcol_writer_key" => "writer_key",
         "lixcol_untracked" => "untracked",
         "lixcol_metadata" => "metadata",
         other => other,

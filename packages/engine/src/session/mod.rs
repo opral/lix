@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use futures_util::FutureExt;
 use sqlparser::ast::Statement;
+use uuid::Uuid;
 
 use crate::backend::TransactionBeginMode;
 use crate::catalog::SurfaceRegistry;
@@ -45,6 +46,7 @@ use crate::sql::{
     transaction_control_statement_denied_error, CommittedReadContext, QueryDependency,
     StatementBatch,
 };
+use crate::streams::{StateCommitStream, StateCommitStreamFilter};
 use crate::transaction::{
     ensure_function_bindings_for_write_scope, execute_parsed_statements_in_write_transaction,
     execute_statement_batch_with_write_transaction, prepared_write_function_bindings_for_execution,
@@ -54,7 +56,7 @@ use crate::transaction::{
     PendingCommitState, SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
     TransactionCommitOutcome,
 };
-use crate::{ExecuteResult, LixError, Value};
+use crate::{ExecuteResult, LixError, Value, WriteReceipt};
 pub(crate) use host::{
     opened_workspace_session, prepare_function_bindings_with_host, require_workspace_session,
     sql_compiler_seed_from_host, SessionExecutionContext, SessionHost,
@@ -125,6 +127,11 @@ pub struct AdditionalSessionOptions {
     /// Ephemeral workspace account-selector override for the additional scoped
     /// session.
     pub active_account_ids: Option<Vec<String>>,
+    #[serde(default)]
+    /// Optional write-origin override for the additional scoped session.
+    ///
+    /// When omitted, additional sessions inherit the parent's origin.
+    pub origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +152,7 @@ pub struct Session {
     // through `crate::session::workspace`; extra sessions keep them ephemeral.
     active_version_id: RwLock<String>,
     active_account_ids: RwLock<Vec<String>>,
+    origin_key: String,
     public_surface_registry: RwLock<SurfaceRegistry>,
     compiler_cache: SessionCompilerCacheHandle,
     #[allow(dead_code)]
@@ -164,6 +172,10 @@ pub struct SessionTransaction<'a> {
 }
 
 impl Session {
+    fn generate_origin_key() -> String {
+        Uuid::now_v7().to_string()
+    }
+
     pub(crate) async fn open_workspace(
         session_host: Arc<dyn SessionHost>,
     ) -> Result<Self, LixError> {
@@ -178,6 +190,7 @@ impl Session {
             session_host,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
+            origin_key: Self::generate_origin_key(),
             public_surface_registry: RwLock::new(registry),
             compiler_cache: SessionCompilerCache::new(),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
@@ -203,10 +216,14 @@ impl Session {
         let active_account_ids = options
             .active_account_ids
             .unwrap_or_else(|| self.active_account_ids());
+        let origin_key = options
+            .origin_key
+            .unwrap_or_else(|| self.origin_key.clone());
         Ok(Self {
             session_host: Arc::clone(&self.session_host),
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
+            origin_key,
             public_surface_registry: RwLock::new(self.public_surface_registry()),
             compiler_cache: SessionCompilerCache::new(),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
@@ -228,6 +245,7 @@ impl Session {
             session_host,
             active_version_id: RwLock::new(active_version_id),
             active_account_ids: RwLock::new(active_account_ids),
+            origin_key: Self::generate_origin_key(),
             compiler_cache: SessionCompilerCache::new(),
             observe_shared_sources: Mutex::new(BTreeMap::new()),
             active_version_generation: AtomicU64::new(0),
@@ -257,6 +275,41 @@ impl Session {
             .read()
             .expect("session active account ids lock poisoned")
             .clone()
+    }
+
+    pub fn origin_key(&self) -> &str {
+        &self.origin_key
+    }
+
+    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> StateCommitStream {
+        self.session_host
+            .state_commit_stream(filter.resolved_for_origin_key(self.origin_key()))
+    }
+
+    pub async fn wait_for_write_receipt(&self, receipt: &WriteReceipt) -> Result<(), LixError> {
+        let Some(target_sequence) = receipt.state_commit_sequence else {
+            return Ok(());
+        };
+
+        if self
+            .session_host
+            .latest_state_commit_sequence()
+            .is_some_and(|current| current >= target_sequence)
+        {
+            return Ok(());
+        }
+
+        let stream = self.state_commit_stream(StateCommitStreamFilter::default());
+        loop {
+            let Some(batch) = stream.next().await else {
+                return Err(LixError::unknown(
+                    "state commit stream closed before the write receipt was observed",
+                ));
+            };
+            if batch.sequence >= target_sequence {
+                return Ok(());
+            }
+        }
     }
 
     #[allow(dead_code)]
@@ -385,7 +438,7 @@ impl Session {
             .begin_transaction_with_options(ExecuteOptions::default())
             .await?;
         transaction.register_schema(schema).await?;
-        transaction.commit().await
+        transaction.commit().await.map(|_| ())
     }
 
     pub async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
@@ -394,7 +447,7 @@ impl Session {
 
     pub(crate) fn new_compiler_state(&self, options: ExecuteOptions) -> SessionCompilerState {
         SessionCompilerState::new(
-            options.writer_key,
+            options.origin_key.or_else(|| Some(self.origin_key.clone())),
             self.public_surface_registry(),
             Arc::clone(&self.compiler_cache),
             self.active_version_id(),
@@ -644,12 +697,13 @@ impl Session {
                 .await;
 
                 match result {
-                    Ok(result) => {
+                    Ok(mut result) => {
                         context.clear_function_bindings();
                         let outcome = write_transaction
                             .commit(&execution_context, context.buffered_write_execution_input())
                             .await?;
-                        self.apply_transaction_commit_outcome(outcome).await?;
+                        result.write_receipt =
+                            self.apply_transaction_commit_outcome(outcome).await?;
                         Ok(result)
                     }
                     Err(error) => {
@@ -795,7 +849,7 @@ impl Session {
     pub(crate) async fn apply_transaction_commit_outcome(
         &self,
         mut outcome: TransactionCommitOutcome,
-    ) -> Result<(), LixError> {
+    ) -> Result<Option<WriteReceipt>, LixError> {
         let persist_workspace =
             self.should_persist_workspace_selectors() || outcome.session_delta.persist_workspace;
         self.apply_selector_changes(
@@ -813,11 +867,18 @@ impl Session {
         if outcome.refresh_public_surface_registry {
             self.refresh_public_surface_registry().await?;
         }
-        self.session_host
+        let emitted_sequence = self
+            .session_host
             .emit_state_commit_stream_changes(std::mem::take(
                 &mut outcome.state_commit_stream_changes,
             ));
-        Ok(())
+        let mut write_receipt = outcome.write_receipt.take();
+        if let Some(sequence) = emitted_sequence {
+            write_receipt
+                .get_or_insert_with(WriteReceipt::default)
+                .state_commit_sequence = Some(sequence);
+        }
+        Ok(write_receipt.filter(|receipt| !receipt.is_empty()))
     }
 }
 
@@ -847,7 +908,7 @@ fn committed_read_context<'a>(
     CommittedReadContext {
         active_version_id: context.active_version_id.as_str(),
         active_account_ids: &context.active_account_ids,
-        writer_key: context.writer_key.as_deref(),
+        origin_key: context.origin_key.as_deref(),
         compiler_seed: sql_compiler_seed_from_host(
             session_host,
             function_bindings.provider(),
@@ -941,7 +1002,7 @@ impl<'a> SessionTransaction<'a> {
             ),
             self.context.public_surface_registry.clone(),
             self.context.active_account_ids.clone(),
-            self.context.writer_key.clone(),
+            self.context.origin_key.clone(),
         );
         let statement = prepare_registered_schema_write_statement(schema, &plugin_install_context)?;
         let write_transaction = self
@@ -980,7 +1041,7 @@ impl<'a> SessionTransaction<'a> {
         .await
     }
 
-    pub async fn commit(mut self) -> Result<(), LixError> {
+    pub async fn commit(mut self) -> Result<Option<WriteReceipt>, LixError> {
         let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),

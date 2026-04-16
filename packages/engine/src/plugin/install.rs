@@ -49,7 +49,7 @@ pub(crate) struct PluginInstallWriteContext {
     function_bindings: PreparedWriteFunctionBindings,
     public_surface_registry: SurfaceRegistry,
     active_account_ids: Vec<String>,
-    writer_key: Option<String>,
+    origin_key: Option<String>,
 }
 
 impl PluginInstallWriteContext {
@@ -57,13 +57,13 @@ impl PluginInstallWriteContext {
         function_bindings: PreparedWriteFunctionBindings,
         public_surface_registry: SurfaceRegistry,
         active_account_ids: Vec<String>,
-        writer_key: Option<String>,
+        origin_key: Option<String>,
     ) -> Self {
         Self {
             function_bindings,
             public_surface_registry,
             active_account_ids,
-            writer_key,
+            origin_key,
         }
     }
 }
@@ -170,7 +170,7 @@ fn prepare_registered_schema_write_statement_from_schemas(
             snapshot_content: Some(row.snapshot.to_string()),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.to_string(),
-            writer_key: context.writer_key.clone(),
+            origin_key: context.origin_key.clone(),
         })
         .collect::<Vec<_>>();
     let schema_live_table_requirements = schema_rows
@@ -297,7 +297,7 @@ fn registered_schema_planned_row(row: &RegisteredSchemaRowSpec) -> PlannedStateR
         schema_key: REGISTERED_SCHEMA_STORAGE_SCHEMA_KEY.to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
-        writer_key: None,
+        origin_key: None,
         tombstone: false,
     }
 }
@@ -340,7 +340,7 @@ fn plugin_archive_file_descriptor_row(
         schema_key: FILESYSTEM_DESCRIPTOR_SCHEMA_KEY.to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
-        writer_key: None,
+        origin_key: None,
         tombstone: false,
     }
 }
@@ -389,7 +389,7 @@ fn plugin_archive_binary_blob_ref_row(
         schema_key: FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY.to_string(),
         version_id: Some(GLOBAL_VERSION_ID.to_string()),
         values,
-        writer_key: None,
+        origin_key: None,
         tombstone: false,
     })
 }
@@ -406,7 +406,7 @@ fn prepare_public_tracked_write_statement(
     idempotency_purpose: &str,
 ) -> Result<WriteCommand, LixError> {
     let semantic_effects =
-        semantic_plan_effects_from_changes(&changes, context.writer_key.as_deref())?;
+        semantic_plan_effects_from_changes(&changes, context.origin_key.as_deref())?;
     let write_payload = json!({
         "rows": intended_post_state.iter().map(summarize_planned_row).collect::<Vec<_>>(),
         "changes": changes.iter().map(summarize_change).collect::<Vec<_>>(),
@@ -423,13 +423,12 @@ fn prepare_public_tracked_write_statement(
                     on_conflict_action: None,
                     requested_version_id: Some(GLOBAL_VERSION_ID.to_string()),
                     active_account_ids: context.active_account_ids.clone(),
-                    writer_key: context.writer_key.clone(),
+                    origin_key: context.origin_key.clone(),
                     resolved_write_plan: Some(PreparedResolvedWritePlan {
                         partitions: vec![PreparedResolvedWritePartition {
                             execution_mode: WriteMode::Tracked,
                             authoritative_pre_state_rows: Vec::new(),
                             intended_post_state,
-                            writer_key_updates: BTreeMap::new(),
                             filesystem_state,
                         }],
                     }),
@@ -442,7 +441,7 @@ fn prepare_public_tracked_write_statement(
                                 change_batch: Some(ChangeBatch {
                                     changes: changes.clone(),
                                     write_lane: WriteLane::GlobalAdmin,
-                                    writer_key: context.writer_key.clone(),
+                                    origin_key: context.origin_key.clone(),
                                     semantic_effects: semantic_effect_markers_from_changes(
                                         &changes,
                                     ),
@@ -470,13 +469,13 @@ fn prepare_public_tracked_write_statement(
 
 fn semantic_plan_effects_from_changes(
     changes: &[PublicChange],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             StateCommitStreamOperation::Insert,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(origin_key),
         )?,
         ..PlanEffects::default()
     })
@@ -518,7 +517,7 @@ fn planned_row_to_public_change(row: &PlannedStateRow) -> Result<PublicChange, L
                     "semantic tracked write requires a concrete version_id",
                 )
             })?,
-        writer_key: row.writer_key.clone(),
+        origin_key: row.origin_key.clone(),
     })
 }
 
@@ -566,7 +565,7 @@ fn summarize_change(change: &PublicChange) -> JsonValue {
         "file_id": change.file_id,
         "plugin_key": change.plugin_key,
         "version_id": change.version_id,
-        "writer_key": change.writer_key,
+        "origin_key": change.origin_key,
         "snapshot_content": change.snapshot_content.as_ref().map(|snapshot| {
             stable_content_fingerprint_hex(snapshot.as_bytes())
         }),
