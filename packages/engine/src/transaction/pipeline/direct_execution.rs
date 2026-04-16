@@ -37,9 +37,9 @@ pub(crate) async fn execute_direct_execution_with_transaction(
     direct: &PreparedDirectWriteArtifact,
     result_contract: ResultContract,
     functions: &dyn crate::functions::LixFunctionProvider,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<WriteExecutionOutcome, LixError> {
-    let _ = (functions, writer_key, direct.should_refresh_file_cache);
+    let _ = (functions, origin_key, direct.should_refresh_file_cache);
     let direct_result =
         execute_prepared_with_transaction(transaction, &direct.prepared_batch).await?;
     let public_result = public_result_from_contract(result_contract, &direct_result);

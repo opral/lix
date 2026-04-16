@@ -39,7 +39,6 @@ pub struct UntrackedRow {
     pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub change_id: String,
-    pub writer_key: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     pub values: BTreeMap<String, Value>,

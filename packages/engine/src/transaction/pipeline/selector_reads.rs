@@ -70,7 +70,7 @@ impl<'a> TransactionWriteSelectorResolver<'a> {
             planned_write
                 .command
                 .statement_context
-                .writer_key
+                .origin_key
                 .as_deref(),
         )
         .await?;
@@ -198,7 +198,6 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
                     .transpose()?,
                 global: None,
                 untracked: None,
-                writer_key: None,
             };
             if !selector_rows
                 .iter()
@@ -264,7 +263,6 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
                     5 + version_offset,
                     "untracked",
                 )?),
-                writer_key: None,
             };
             if !selector_rows
                 .iter()
@@ -285,12 +283,11 @@ struct ReadPreparationContext {
 async fn build_read_preparation_context(
     backend: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
-    functions: &DynFunctionProvider,
+    _functions: &DynFunctionProvider,
 ) -> Result<ReadPreparationContext, LixError> {
     let registry = crate::transaction::build_public_read_surface_registry_with_pending_overlay(
         backend,
         pending_overlay,
-        functions,
     )
     .await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;
@@ -306,7 +303,7 @@ async fn prepare_required_active_public_read_artifact_with_backend(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<PreparedPublicRead, LixError> {
     let mut metadata_reader = backend;
     prepare_required_active_public_read_artifact_with_reader(
@@ -316,7 +313,7 @@ async fn prepare_required_active_public_read_artifact_with_backend(
         parsed_statements,
         params,
         active_version_id,
-        writer_key,
+        origin_key,
     )
     .await
 }
@@ -328,7 +325,7 @@ async fn prepare_required_active_public_read_artifact_with_reader(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<PreparedPublicRead, LixError> {
     let active_history_root_commit_id = metadata_reader
         .load_active_history_root_commit_id_for_preparation(active_version_id)
@@ -341,7 +338,7 @@ async fn prepare_required_active_public_read_artifact_with_reader(
         params,
         active_version_id,
         active_history_root_commit_id.as_deref(),
-        writer_key,
+        origin_key,
         false,
         None,
     )

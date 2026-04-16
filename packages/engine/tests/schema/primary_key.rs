@@ -1,5 +1,6 @@
 use crate::support;
 
+use lix_engine::Value;
 use serde_json::json;
 
 async fn register_pk_schema(engine: &support::simulation_test::SimulatedLix, schema_key: &str) {
@@ -42,6 +43,42 @@ async fn register_composite_pk_schema(
         .unwrap();
 }
 
+async fn seed_file_descriptor(
+    engine: &support::simulation_test::SimulatedLix,
+    version_id: &str,
+    file_id: &str,
+) {
+    let (name, extension) = file_id
+        .rsplit_once('.')
+        .map(|(name, extension)| (name, Some(extension)))
+        .unwrap_or((file_id, None));
+    let snapshot = json!({
+        "id": file_id,
+        "directory_id": null,
+        "name": name,
+        "extension": extension,
+        "metadata": null,
+        "hidden": false
+    })
+    .to_string();
+
+    engine
+        .execute(
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
+             ) VALUES (\
+             $1, 'lix_file_descriptor', NULL, $2, NULL, '1', $3\
+             )",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(snapshot),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
 simulation_test!(
     primary_key_conflicts_within_same_version_and_file,
     simulations = [sqlite],
@@ -54,13 +91,14 @@ simulation_test!(
 
         register_pk_schema(&engine, "pk_scope_same_file").await;
         engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'row-1', 'pk_scope_same_file', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"row-1\",\"name\":\"first\"}'\
+                 'row-1', 'pk_scope_same_file', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"row-1\",\"name\":\"first\"}'\
                  )",
                 &[],
             )
@@ -72,7 +110,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'row-1', 'pk_scope_same_file', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"row-1\",\"name\":\"second\"}'\
+                 'row-1', 'pk_scope_same_file', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"row-1\",\"name\":\"second\"}'\
                  )",
                 &[],
             )
@@ -97,13 +135,14 @@ simulation_test!(
 
         register_pk_schema(&engine, "pk_entity_id_insert").await;
         engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
 
         let result = engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-1', 'pk_entity_id_insert', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"entity-2\",\"name\":\"Ada\"}'\
+                 'entity-1', 'pk_entity_id_insert', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"entity-2\",\"name\":\"Ada\"}'\
                  )",
                 &[],
             )
@@ -131,13 +170,14 @@ simulation_test!(
 
         register_pk_schema(&engine, "pk_empty_primary_key").await;
         engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
 
         let result = engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 '', 'pk_empty_primary_key', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"\",\"name\":\"Ada\"}'\
+                 '', 'pk_empty_primary_key', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"\",\"name\":\"Ada\"}'\
                  )",
                 &[],
             )
@@ -163,13 +203,14 @@ simulation_test!(
 
         register_pk_schema(&engine, "pk_entity_id_update").await;
         engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-1', 'pk_entity_id_update', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"entity-1\",\"name\":\"Ada\"}'\
+                 'entity-1', 'pk_entity_id_update', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"entity-1\",\"name\":\"Ada\"}'\
                  )",
                 &[],
             )
@@ -210,13 +251,15 @@ simulation_test!(
 
         register_pk_schema(&engine, "pk_scope_per_file").await;
         engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+        seed_file_descriptor(&engine, "version-a", "beta.md").await;
 
         engine
         .execute(
             "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
              ) VALUES (\
-             'row-1', 'pk_scope_per_file', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"row-1\",\"name\":\"alpha\"}'\
+             'row-1', 'pk_scope_per_file', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"row-1\",\"name\":\"alpha\"}'\
              )",
             &[],
         )
@@ -228,7 +271,7 @@ simulation_test!(
             "INSERT INTO lix_state_by_version (\
              entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
              ) VALUES (\
-             'row-1', 'pk_scope_per_file', 'beta.md', 'version-a', 'lix', '1', '{\"id\":\"row-1\",\"name\":\"beta\"}'\
+             'row-1', 'pk_scope_per_file', 'beta.md', 'version-a', NULL, '1', '{\"id\":\"row-1\",\"name\":\"beta\"}'\
              )",
             &[],
         )
@@ -249,13 +292,14 @@ simulation_test!(
 
         register_composite_pk_schema(&engine, "pk_scope_composite").await;
         engine.create_named_version("version-a").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
 
         let insert_result = engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-1~en', 'pk_scope_composite', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"entity-1\",\"locale\":\"en\",\"name\":\"Ada\"}'\
+                 'entity-1~en', 'pk_scope_composite', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"entity-1\",\"locale\":\"en\",\"name\":\"Ada\"}'\
                  )",
                 &[],
             )
@@ -290,13 +334,15 @@ simulation_test!(
         register_pk_schema(&engine, "pk_scope_per_version").await;
         engine.create_named_version("version-a").await.unwrap();
         engine.create_named_version("version-b").await.unwrap();
+        seed_file_descriptor(&engine, "version-a", "alpha.md").await;
+        seed_file_descriptor(&engine, "version-b", "alpha.md").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'row-1', 'pk_scope_per_version', 'alpha.md', 'version-a', 'lix', '1', '{\"id\":\"row-1\",\"name\":\"v1\"}'\
+                 'row-1', 'pk_scope_per_version', 'alpha.md', 'version-a', NULL, '1', '{\"id\":\"row-1\",\"name\":\"v1\"}'\
                  )",
                 &[],
             )
@@ -308,7 +354,7 @@ simulation_test!(
                 "INSERT INTO lix_state_by_version (\
                  entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'row-1', 'pk_scope_per_version', 'alpha.md', 'version-b', 'lix', '1', '{\"id\":\"row-1\",\"name\":\"v2\"}'\
+                 'row-1', 'pk_scope_per_version', 'alpha.md', 'version-b', NULL, '1', '{\"id\":\"row-1\",\"name\":\"v2\"}'\
                  )",
                 &[],
             )

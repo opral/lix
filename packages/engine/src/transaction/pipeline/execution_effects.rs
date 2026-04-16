@@ -120,7 +120,7 @@ pub(crate) async fn complete_sql_command_execution(
                 compile_filesystem_finalization_from_state_in_transaction(
                     transaction,
                     &filesystem_state,
-                    execution_input.writer_key(),
+                    execution_input.origin_key(),
                     step.prepared()
                         .direct_write()
                         .map(|internal| internal.mutations.as_slice())

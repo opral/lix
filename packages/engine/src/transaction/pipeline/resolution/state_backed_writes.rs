@@ -1,14 +1,12 @@
 use super::*;
-use crate::functions::{
-    clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
-};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::{
     decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
     scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
-    collect_state_column_overrides_with_shared_runtime, schema_from_registered_snapshot, SchemaKey,
+    schema_from_registered_snapshot, SchemaKey,
 };
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
@@ -184,12 +182,6 @@ fn assign_state_row_key_value(
                 "public state row key requires text-compatible 'version_id'",
             )?);
         }
-        "writer_key" => {
-            row_key.writer_key = Some(exact_text_value(
-                value,
-                "public state row key requires text-compatible 'writer_key'",
-            )?);
-        }
         "global" => {
             row_key.global = Some(exact_bool_value(
                 value,
@@ -243,7 +235,7 @@ fn authoritative_pre_state_row_for_effective_row(
     current_row: &ExactEffectiveStateRow,
     authoritative_version_id: &str,
 ) -> PlannedStateRow {
-    let mut values = state_values_without_writer_key(&current_row.values);
+    let mut values = current_row.values.clone();
     values.insert(
         "version_id".to_string(),
         Value::Text(authoritative_version_id.to_string()),
@@ -253,10 +245,7 @@ fn authoritative_pre_state_row_for_effective_row(
         schema_key: current_row.schema_key.clone(),
         version_id: Some(authoritative_version_id.to_string()),
         values,
-        writer_key: current_row
-            .values
-            .get("writer_key")
-            .and_then(text_from_value),
+        origin_key: None,
         tombstone: false,
     }
 }
@@ -378,7 +367,7 @@ impl StateBackedSurface<'_> {
                 )
                 .map_err(write_resolve_state_assignments_error)?;
                 for row in &mut rows {
-                    row.writer_key = planned_write.command.statement_context.writer_key.clone();
+                    row.origin_key = planned_write.command.statement_context.origin_key.clone();
                 }
                 Ok(rows)
             }
@@ -401,10 +390,7 @@ impl StateBackedSurface<'_> {
     ) -> Result<(BTreeMap<String, Value>, Option<String>), WriteResolveError> {
         match self {
             Self::State(_) => {
-                let values = apply_state_assignments(
-                    &state_values_without_writer_key(&current_row.values),
-                    &state_assignments_without_writer_key(assignments),
-                );
+                let values = apply_state_assignments(&current_row.values, assignments);
                 ensure_identity_columns_preserved(
                     &current_row.entity_id,
                     &current_row.schema_key,
@@ -415,15 +401,7 @@ impl StateBackedSurface<'_> {
                 .map_err(write_resolve_state_assignments_error)?;
                 Ok((
                     values,
-                    state_writer_key_from_assignments(
-                        assignments,
-                        planned_write
-                            .command
-                            .statement_context
-                            .writer_key
-                            .as_deref(),
-                        self.update_context(),
-                    )?,
+                    planned_write.command.statement_context.origin_key.clone(),
                 ))
             }
             Self::Entity(entity_schema) => apply_entity_state_assignments(
@@ -437,7 +415,7 @@ impl StateBackedSurface<'_> {
             .map(|values| {
                 (
                     values,
-                    planned_write.command.statement_context.writer_key.clone(),
+                    planned_write.command.statement_context.origin_key.clone(),
                 )
             })
             .map_err(write_resolve_state_assignments_error),
@@ -668,7 +646,7 @@ fn resolve_state_backed_existing_write_from_rows(
                     source_change_id: current_row.source_change_id.clone(),
                     source_commit_id: None,
                 };
-                let (mut values, writer_key) =
+                let (mut values, origin_key) =
                     surface.apply_update_assignments(planned_write, assignments, &current_row)?;
                 values.insert(
                     "version_id".to_string(),
@@ -692,7 +670,7 @@ fn resolve_state_backed_existing_write_from_rows(
                     schema_key: current_row.schema_key.clone(),
                     version_id: Some(target_version_id),
                     values,
-                    writer_key,
+                    origin_key,
                     tombstone: false,
                 });
                 partition.lineage.push(RowLineage {
@@ -730,8 +708,8 @@ fn resolve_state_backed_existing_write_from_rows(
                     entity_id: current_row.entity_id.clone(),
                     schema_key: current_row.schema_key.clone(),
                     version_id: Some(target_version_id),
-                    values: state_values_without_writer_key(&current_row.values),
-                    writer_key: planned_write.command.statement_context.writer_key.clone(),
+                    values: current_row.values.clone(),
+                    origin_key: planned_write.command.statement_context.origin_key.clone(),
                     tombstone: true,
                 });
                 partition.tombstones.push(row_ref.clone());
@@ -770,7 +748,7 @@ where
     let schema_key = resolved_schema_key(planned_write)?;
     let mut rows = Vec::with_capacity(payloads.len());
 
-    for (mut payload, version_id) in payloads.into_iter().zip(row_version_ids.iter()) {
+    for (payload, version_id) in payloads.into_iter().zip(row_version_ids.iter()) {
         let entity_id = payload
             .get("entity_id")
             .and_then(text_from_value)
@@ -784,83 +762,16 @@ where
             .ok_or_else(|| WriteResolveError {
                 message: "public write resolver requires an exact entity target".to_string(),
             })?;
-        let writer_key = state_writer_key_from_values(
-            &mut payload,
-            planned_write
-                .command
-                .statement_context
-                .writer_key
-                .as_deref(),
-            "public state insert resolver",
-        )?;
         rows.push(build_state_insert_row(
             entity_id,
             schema_key.clone(),
             version_id.clone(),
             payload,
-            writer_key,
+            planned_write.command.statement_context.origin_key.clone(),
         ));
     }
 
     Ok(rows)
-}
-
-fn state_values_without_writer_key(values: &BTreeMap<String, Value>) -> BTreeMap<String, Value> {
-    values
-        .iter()
-        .filter(|(key, _)| key.as_str() != "writer_key")
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
-
-fn state_assignments_without_writer_key(
-    assignments: &CanonicalStateAssignments,
-) -> CanonicalStateAssignments {
-    CanonicalStateAssignments {
-        columns: assignments
-            .columns
-            .iter()
-            .filter(|(key, _)| key.as_str() != "writer_key")
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect(),
-    }
-}
-
-fn state_writer_key_from_assignments(
-    assignments: &CanonicalStateAssignments,
-    default_writer_key: Option<&str>,
-    context: &str,
-) -> Result<Option<String>, WriteResolveError> {
-    match assignments.columns.get("writer_key") {
-        Some(value) => state_writer_key_value(value, context),
-        None => Ok(default_writer_key.map(str::to_string)),
-    }
-}
-
-fn state_writer_key_from_values(
-    values: &mut BTreeMap<String, Value>,
-    default_writer_key: Option<&str>,
-    context: &str,
-) -> Result<Option<String>, WriteResolveError> {
-    match values.remove("writer_key") {
-        Some(value) => state_writer_key_value(&value, context),
-        None => Ok(default_writer_key.map(str::to_string)),
-    }
-}
-
-fn state_writer_key_value(
-    value: &Value,
-    context: &str,
-) -> Result<Option<String>, WriteResolveError> {
-    match value {
-        Value::Text(text) => Ok(Some(text.clone())),
-        Value::Null => Ok(None),
-        other => Err(WriteResolveError {
-            message: format!(
-                "{context} treats 'writer_key' as workspace annotation text or null, got {other:?}"
-            ),
-        }),
-    }
 }
 
 fn apply_state_insert_schema_annotations<P>(
@@ -957,7 +868,6 @@ fn exact_selector_row_key(
         version_id: None,
         global: None,
         untracked: None,
-        writer_key: None,
     };
 
     for (column, value) in &planned_write.command.selector.exact_filters {
@@ -1001,7 +911,6 @@ fn state_insert_row_key(row: &PlannedStateRow) -> CanonicalStateRowKey {
         version_id: row.version_id.clone(),
         global: row.values.get("global").and_then(bool_from_value),
         untracked: row.values.get("untracked").and_then(bool_from_value),
-        writer_key: None,
     }
 }
 
@@ -1183,12 +1092,11 @@ where
 fn load_annotation_schema_from_json<P>(
     schema_key: String,
     schema: JsonValue,
-    functions: SharedFunctionProvider<P>,
+    _functions: SharedFunctionProvider<P>,
 ) -> Result<LoadedAnnotationSchema, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let functions = clone_boxed_function_provider(&functions);
     let schema_version = schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
@@ -1202,11 +1110,6 @@ where
         "schema_version".to_string(),
         Value::Text(schema_version.clone()),
     );
-    state_defaults.extend(collect_state_column_overrides_with_shared_runtime(
-        &schema,
-        &schema_key,
-        &functions,
-    )?);
     Ok(LoadedAnnotationSchema {
         schema,
         schema_key,
@@ -1228,7 +1131,6 @@ fn entity_state_row_key(
         version_id: None,
         global: None,
         untracked: None,
-        writer_key: None,
     };
     for key in [
         "file_id",
@@ -1260,7 +1162,6 @@ fn entity_insert_row_key(
         version_id: row.version_id.clone(),
         global: None,
         untracked: None,
-        writer_key: None,
     };
     for key in [
         "file_id",

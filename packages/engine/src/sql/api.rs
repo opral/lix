@@ -83,7 +83,7 @@ pub(crate) async fn prepare_public_plan(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicPlan>, LixError> {
@@ -97,7 +97,7 @@ pub(crate) async fn prepare_public_plan(
         active_version_id,
         active_history_root_commit_id,
         active_account_ids,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         parse_duration,
     )
@@ -116,7 +116,7 @@ pub(crate) async fn prepare_public_read(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -128,7 +128,7 @@ pub(crate) async fn prepare_public_read(
         params,
         active_version_id,
         active_history_root_commit_id,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         parse_duration,
     )
@@ -146,7 +146,7 @@ pub(crate) async fn prepare_public_write(
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicWritePlan>, LixError> {
     super::prepare::public_surface::try_prepare_public_write_with_registry_and_functions(
@@ -157,7 +157,7 @@ pub(crate) async fn prepare_public_write(
         params,
         active_version_id,
         active_account_ids,
-        writer_key,
+        origin_key,
         parse_duration,
     )
     .await

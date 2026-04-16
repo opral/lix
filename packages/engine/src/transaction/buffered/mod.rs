@@ -25,8 +25,8 @@ pub(crate) use live_state_write_state::prepare_materialization_plan;
 pub(crate) use live_state_write_state::LiveStateWriteState;
 pub(crate) use planned_write::{
     build_transaction_write_delta, BufferedWriteJournal, PendingFilesystemOverlay,
-    PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PendingWriterKeyOverlay,
-    PlannedDirectWriteUnit, PublicWriteTxnUnit, TransactionWriteDelta, TransactionWriteUnit,
+    PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PlannedDirectWriteUnit,
+    PublicWriteTxnUnit, TransactionWriteDelta, TransactionWriteUnit,
 };
 pub(crate) use registered_schema_mirror::{
     upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,

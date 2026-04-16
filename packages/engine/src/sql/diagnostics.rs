@@ -13,12 +13,6 @@ fn build_error(code: &str, description: impl Into<String>) -> LixError {
     LixError::new(code, description.into())
 }
 
-fn system_functions() -> crate::functions::DynFunctionProvider {
-    crate::functions::clone_boxed_function_provider(&crate::functions::SharedFunctionProvider::new(
-        crate::functions::SystemFunctionProvider,
-    ))
-}
-
 pub(crate) fn table_not_found_read_error() -> LixError {
     let available_tables = crate::sql::protected_builtin_public_surface_names().join(", ");
     build_error(
@@ -355,31 +349,18 @@ async fn resolve_available_columns(
         return Vec::new();
     };
 
-    let registry = match crate::catalog::load_public_surface_registry_with_backend(
-        backend,
-        None,
-        crate::cel::shared_runtime(),
-        &system_functions(),
-    )
-    .await
-    {
-        Ok(registry) => registry,
-        Err(_) => return Vec::new(),
-    };
+    let registry =
+        match crate::catalog::load_public_surface_registry_with_backend(backend, None).await {
+            Ok(registry) => registry,
+            Err(_) => return Vec::new(),
+        };
     registry
         .public_surface_columns(table_name)
         .unwrap_or_default()
 }
 
 async fn resolve_available_tables(backend: &dyn LixBackend) -> Vec<String> {
-    match crate::catalog::load_public_surface_registry_with_backend(
-        backend,
-        None,
-        crate::cel::shared_runtime(),
-        &system_functions(),
-    )
-    .await
-    {
+    match crate::catalog::load_public_surface_registry_with_backend(backend, None).await {
         Ok(registry) => registry.public_surface_names(),
         Err(_) => builtin_public_surface_names(),
     }
@@ -390,21 +371,15 @@ async fn public_surfaces_in_relation_names_with_backend(
     relation_names: &[String],
     fallback_statements: Option<&[Statement]>,
 ) -> Vec<String> {
-    let registry = match crate::catalog::load_public_surface_registry_with_backend(
-        backend,
-        None,
-        crate::cel::shared_runtime(),
-        &system_functions(),
-    )
-    .await
-    {
-        Ok(registry) => registry,
-        Err(_) => {
-            return fallback_statements
-                .map(builtin_public_surfaces_in_statements)
-                .unwrap_or_default()
-        }
-    };
+    let registry =
+        match crate::catalog::load_public_surface_registry_with_backend(backend, None).await {
+            Ok(registry) => registry,
+            Err(_) => {
+                return fallback_statements
+                    .map(builtin_public_surfaces_in_statements)
+                    .unwrap_or_default()
+            }
+        };
     relation_names
         .iter()
         .filter(|name| registry.bind_relation_name(name).is_some())

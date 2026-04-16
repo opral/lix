@@ -36,7 +36,6 @@ pub fn validate_lix_schema_definition(schema: &JsonValue) -> Result<(), LixError
     assert_unique_pointers(schema)?;
     assert_non_aliased_lix_foreign_key_references(schema)?;
     assert_known_x_lix_top_level_fields(schema)?;
-    assert_removed_legacy_lixcol_scope_overrides_absent(schema)?;
 
     Ok(())
 }
@@ -212,57 +211,6 @@ fn assert_non_aliased_lix_foreign_key_references(schema: &JsonValue) -> Result<(
     Ok(())
 }
 
-fn assert_removed_legacy_lixcol_scope_overrides_absent(schema: &JsonValue) -> Result<(), LixError> {
-    let Some(overrides) = schema
-        .get("x-lix-override-lixcols")
-        .and_then(|value| value.as_object())
-    else {
-        return Ok(());
-    };
-
-    if overrides.contains_key("lixcol_version_id") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_version_id is no longer supported.".to_string(),
-        });
-    }
-
-    if overrides.contains_key("lixcol_file_id") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_file_id is no longer supported.".to_string(),
-        });
-    }
-
-    if overrides.contains_key("lixcol_plugin_key") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_plugin_key is no longer supported.".to_string(),
-        });
-    }
-
-    if overrides.contains_key("lixcol_global") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_global is no longer supported.".to_string(),
-        });
-    }
-
-    if overrides.contains_key("lixcol_untracked") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "Invalid Lix schema definition: x-lix-override-lixcols.lixcol_untracked is no longer supported.".to_string(),
-        });
-    }
-
-    Ok(())
-}
-
 fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixError> {
     let Some(object) = schema.as_object() else {
         return Ok(());
@@ -280,7 +228,6 @@ fn assert_known_x_lix_top_level_fields(schema: &JsonValue) -> Result<(), LixErro
                 | "x-lix-primary-key"
                 | "x-lix-unique"
                 | "x-lix-foreign-keys"
-                | "x-lix-override-lixcols"
         );
 
         if !known {

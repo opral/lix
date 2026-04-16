@@ -24,7 +24,7 @@ pub(crate) struct StagedChange {
     pub(crate) snapshot_content: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) version_id: VersionId,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) created_at: Option<String>,
 }
 
@@ -57,14 +57,13 @@ impl StateChangeRecord for StagedChange {
         self.version_id.as_str()
     }
 
-    fn writer_key(&self) -> Option<&str> {
-        self.writer_key.as_deref()
+    fn origin_key(&self) -> Option<&str> {
+        self.origin_key.as_deref()
     }
 }
 
 pub(crate) fn tracked_live_rows_from_staged_changes(
     changes: &[StagedChange],
-    execution_writer_key: Option<&str>,
 ) -> Result<Vec<LiveRow>, LixError> {
     changes
         .iter()
@@ -106,10 +105,6 @@ pub(crate) fn tracked_live_rows_from_staged_changes(
                 plugin_key: change.plugin_key.as_ref().map(ToString::to_string),
                 metadata: change.metadata.clone(),
                 change_id: Some(change_id),
-                writer_key: change
-                    .writer_key
-                    .clone()
-                    .or_else(|| execution_writer_key.map(str::to_string)),
                 global: change.version_id.as_str() == GLOBAL_VERSION_ID,
                 untracked: false,
                 created_at: Some(created_at.clone()),
@@ -134,7 +129,6 @@ pub(crate) fn untracked_live_rows_from_updated_version_refs(
             plugin_key: None,
             metadata: None,
             change_id: Some(update.change_id.clone()),
-            writer_key: None,
             global: true,
             untracked: true,
             created_at: Some(update.created_at.clone()),

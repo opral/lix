@@ -613,6 +613,50 @@ fn open_additional_session_inherits_workspace_session_defaults_without_overrides
 }
 
 #[test]
+fn open_additional_session_inherits_origin_key_and_allows_override() {
+    run_with_large_stack(|| async move {
+        let path = temp_sqlite_path("additional-session-origin-key");
+        let _ = std::fs::File::create(&path).expect("sqlite test file should be creatable");
+
+        Lix::init(lix_config(&path))
+            .await
+            .expect("init should succeed");
+        let lix = Lix::open(lix_config(&path))
+            .await
+            .expect("open should succeed");
+
+        let workspace_origin = lix
+            .origin_key()
+            .expect("workspace origin_key should be available")
+            .to_string();
+        assert!(
+            !workspace_origin.is_empty(),
+            "workspace origin_key should not be empty"
+        );
+
+        let inherited = lix
+            .open_additional_session(AdditionalSessionOptions::default())
+            .await
+            .expect("open_additional_session should inherit origin_key");
+        assert_eq!(inherited.origin_key(), workspace_origin);
+
+        let overridden = lix
+            .open_additional_session(AdditionalSessionOptions {
+                origin_key: Some("origin:override".to_string()),
+                ..Default::default()
+            })
+            .await
+            .expect("open_additional_session should accept origin override");
+        assert_eq!(overridden.origin_key(), "origin:override");
+
+        drop(overridden);
+        drop(inherited);
+        drop(lix);
+        cleanup_sqlite_path(&path);
+    });
+}
+
+#[test]
 fn create_version_uses_the_calling_sessions_active_version_by_default() {
     run_with_large_stack(|| async move {
         let path = temp_sqlite_path("create-version-source");

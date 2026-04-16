@@ -90,7 +90,6 @@ pub struct LiveWriteRow {
     pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub change_id: String,
-    pub writer_key: Option<String>,
     pub snapshot_content: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: String,
@@ -364,10 +363,6 @@ pub struct RowIdentity {
 }
 
 impl RowIdentity {
-    pub(crate) fn storage_scope_key(&self) -> String {
-        crate::common::storage_scope_key_for_file_id(self.file_id.as_deref())
-    }
-
     #[cfg(test)]
     pub fn from_live_write(row: &LiveWriteRow) -> Self {
         Self {

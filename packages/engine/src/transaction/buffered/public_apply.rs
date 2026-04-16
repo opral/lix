@@ -64,7 +64,7 @@ async fn execute_public_commit_member_write_with_transaction(
                     .contract
                     .operation_kind
                     .state_commit_stream_operation(),
-                unit.writer_key.as_deref(),
+                unit.origin_key.as_deref(),
                 commit_write_outcome.next_active_version_id.clone(),
             )?
         } else {
@@ -103,11 +103,8 @@ async fn execute_public_immediate_write_with_transaction(
         // descriptor visibility in the untracked live tables owned here.
     }
 
-    let rows = live_rows_from_planned_rows(
-        &unit.execution.intended_post_state,
-        &unit.canonical_changes,
-        unit.writer_key.as_deref(),
-    )?;
+    let rows =
+        live_rows_from_planned_rows(&unit.execution.intended_post_state, &unit.canonical_changes)?;
     let visibility_rows =
         canonical_untracked_visibility_rows_from_live_rows(&rows, &unit.canonical_changes)?;
     append_changes(transaction, &unit.canonical_changes, &mut runtime_functions).await?;
@@ -127,7 +124,7 @@ async fn execute_public_immediate_write_with_transaction(
     let filesystem_finalization = compile_filesystem_finalization_from_state_in_transaction(
         transaction,
         &unit.filesystem_state,
-        unit.writer_key.as_deref(),
+        unit.origin_key.as_deref(),
         &[],
     )
     .await?;
@@ -182,14 +179,14 @@ async fn execute_public_immediate_write_with_transaction(
 fn plan_effects_from_commit_changes<Change: StateChangeRecord>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     next_active_version_id: Option<String>,
 ) -> Result<PlanEffects, LixError> {
     Ok(PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             stream_operation,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(origin_key),
         )?,
         session_delta: SessionStateDelta {
             next_active_version_id,
@@ -219,7 +216,6 @@ fn file_cache_refresh_targets_from_changes<Change: StateChangeRecord>(
 fn live_rows_from_planned_rows(
     rows: &[PlannedStateRow],
     canonical_changes: &[crate::canonical::CanonicalChangeWrite],
-    execution_writer_key: Option<&str>,
 ) -> Result<Vec<LiveRow>, LixError> {
     if rows.len() != canonical_changes.len() {
         return Err(LixError::new(
@@ -234,7 +230,7 @@ fn live_rows_from_planned_rows(
 
     rows.iter()
         .zip(canonical_changes.iter())
-        .map(|(row, change)| live_row_from_planned_row(row, change, execution_writer_key))
+        .map(|(row, change)| live_row_from_planned_row(row, change))
         .collect()
 }
 
@@ -270,7 +266,6 @@ fn canonical_untracked_visibility_rows_from_live_rows(
 fn live_row_from_planned_row(
     row: &PlannedStateRow,
     change: &crate::canonical::CanonicalChangeWrite,
-    execution_writer_key: Option<&str>,
 ) -> Result<LiveRow, LixError> {
     let file_id = planned_row_optional_text_value(row, "file_id").map(ToString::to_string);
     let plugin_key = planned_row_optional_text_value(row, "plugin_key").map(ToString::to_string);
@@ -294,11 +289,6 @@ fn live_row_from_planned_row(
         plugin_key,
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
         change_id: Some(change.id.clone()),
-        writer_key: row
-            .writer_key
-            .as_deref()
-            .or(execution_writer_key)
-            .map(ToString::to_string),
         untracked: true,
         created_at: Some(change.created_at.clone()),
         updated_at: Some(change.created_at.clone()),

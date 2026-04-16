@@ -13,5 +13,5 @@ pub(crate) trait StateChangeRecord {
     fn plugin_key(&self) -> Option<&str>;
     fn snapshot_content(&self) -> Option<&str>;
     fn version_id(&self) -> &str;
-    fn writer_key(&self) -> Option<&str>;
+    fn origin_key(&self) -> Option<&str>;
 }

@@ -1,12 +1,10 @@
-use std::collections::BTreeMap;
-
 use serde_json::Value as JsonValue;
 
 use crate::backend::PreparedBatch;
 use crate::catalog::ResolvedRelation;
 use crate::sql::{
     ChangeBatch, CommitPreconditions, MutationRow, PlanEffects, PlannedFilesystemState,
-    PlannedRowIdentity, PlannedStateRow, PreparedInsertOnConflictAction, PreparedPublicRead,
+    PlannedStateRow, PreparedInsertOnConflictAction, PreparedPublicRead,
     PreparedWriteOperationKind, PreparedWriteStatementKind, ResultContract,
     SchemaLiveTableRequirement, WriteDiagnosticContext, WriteMode,
 };
@@ -39,7 +37,6 @@ pub struct PreparedResolvedWritePartition {
     pub execution_mode: WriteMode,
     pub authoritative_pre_state_rows: Vec<PlannedStateRow>,
     pub intended_post_state: Vec<PlannedStateRow>,
-    pub writer_key_updates: BTreeMap<PlannedRowIdentity, Option<String>>,
     pub filesystem_state: PlannedFilesystemState,
 }
 
@@ -80,7 +77,7 @@ pub struct PreparedPublicWriteContract {
     pub on_conflict_action: Option<PreparedInsertOnConflictAction>,
     pub requested_version_id: Option<String>,
     pub active_account_ids: Vec<String>,
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
     pub resolved_write_plan: Option<PreparedResolvedWritePlan>,
 }
 
@@ -137,7 +134,7 @@ pub struct PreparedDirectWriteArtifact {
     pub read_only_query: bool,
     pub filesystem_state: PlannedFilesystemState,
     pub effects: PlanEffects,
-    pub writer_key: Option<String>,
+    pub origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -44,7 +44,6 @@ pub(crate) async fn resolve_exact_effective_state_row_with_pending_overlay(
             file_id: request.row_key.file_id.clone(),
             schema_version: request.row_key.schema_version.clone(),
             plugin_key: request.row_key.plugin_key.clone(),
-            writer_key: request.row_key.writer_key.clone(),
             global: requested_global,
             untracked: requested_untracked,
             include_tombstones: false,
@@ -93,7 +92,6 @@ fn row_key_text_value<'a>(row_key: &'a CanonicalStateRowKey, column: &str) -> Op
         "file_id" => row_key.file_id.as_value().map(String::as_str),
         "plugin_key" => row_key.plugin_key.as_value().map(String::as_str),
         "schema_version" => row_key.schema_version.as_deref(),
-        "writer_key" => row_key.writer_key.as_deref(),
         _ => None,
     }
 }
@@ -145,7 +143,6 @@ async fn load_exact_pending_effective_row(
 
         let row = exact_effective_state_row_from_pending(
             backend,
-            pending_overlay,
             &pending,
             &request.version_id,
             overlay_lane,
@@ -187,7 +184,6 @@ fn pending_row_matches_exact_request(
 
 async fn exact_effective_state_row_from_pending(
     backend: &dyn LixBackend,
-    pending_overlay: Option<&dyn PendingOverlay>,
     row: &PendingSemanticRow,
     requested_version_id: &str,
     overlay_lane: OverlayLane,
@@ -239,19 +235,6 @@ async fn exact_effective_state_row_from_pending(
         "metadata".to_string(),
         row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
     );
-    let writer_key = pending_writer_key_annotation(
-        pending_overlay,
-        &row.version_id,
-        &row.schema_key,
-        &row.entity_id,
-        row.file_id.as_deref(),
-    )
-    .flatten();
-    values.insert(
-        "writer_key".to_string(),
-        writer_key.map(Value::Text).unwrap_or(Value::Null),
-    );
-
     Ok(ExactEffectiveStateRow {
         entity_id: row.entity_id.clone(),
         schema_key: row.schema_key.clone(),
@@ -270,24 +253,8 @@ fn pending_effective_row_matches_row_key(
     row: &ExactEffectiveStateRow,
     row_key: &CanonicalStateRowKey,
 ) -> bool {
-    row_key.writer_key.as_deref().is_none_or(|writer_key| {
-        matches!(
-            row.values.get("writer_key"),
-            Some(Value::Text(actual)) if actual == writer_key
-        )
-    })
-}
-
-fn pending_writer_key_annotation(
-    pending_overlay: Option<&dyn PendingOverlay>,
-    version_id: &str,
-    schema_key: &str,
-    entity_id: &str,
-    file_id: Option<&str>,
-) -> Option<Option<String>> {
-    pending_overlay.and_then(|view| {
-        view.writer_key_annotation_for_state_row(version_id, schema_key, entity_id, file_id)
-    })
+    let _ = (row, row_key);
+    true
 }
 
 async fn exact_effective_state_row_from_live_row(
@@ -338,13 +305,6 @@ async fn exact_effective_state_row_from_live_row(
     values.insert(
         "metadata".to_string(),
         row.metadata.clone().map(Value::Text).unwrap_or(Value::Null),
-    );
-    values.insert(
-        "writer_key".to_string(),
-        row.writer_key
-            .clone()
-            .map(Value::Text)
-            .unwrap_or(Value::Null),
     );
     values.insert("global".to_string(), Value::Boolean(row.global));
     values.insert("untracked".to_string(), Value::Boolean(row.untracked));

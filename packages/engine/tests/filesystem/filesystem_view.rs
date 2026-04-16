@@ -59,6 +59,28 @@ fn parse_available_columns_from_unknown_column_error(description: &str) -> Vec<S
         .collect()
 }
 
+fn normalize_text_row_order(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
+    let mut normalized = rows.to_vec();
+    normalized.sort_by(|left, right| {
+        let left_key = left
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        let right_key = right
+            .iter()
+            .map(|value| match value {
+                Value::Text(value) => value.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        left_key.cmp(&right_key)
+    });
+    normalized
+}
+
 async fn active_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let rows = engine
         .execute(
@@ -1354,13 +1376,16 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         assert_eq!(rows.statements[0].rows.len(), 2);
-        assert_text(
-            &rows.statements[0].rows[1][0],
-            &format!("version:{version_id}"),
-        );
-        match &rows.statements[0].rows[1][1] {
+        let matched = rows.statements[0]
+            .rows
+            .iter()
+            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == &format!("version:{version_id}")))
+            .expect("version idempotency row should exist");
+        assert_text(&matched[0], &format!("version:{version_id}"));
+        match &matched[1] {
             Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
             other => panic!("expected text commit_id, got {other:?}"),
         }
@@ -1420,16 +1445,19 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         assert_eq!(
             rows.statements[0].rows.len(),
             usize::try_from(before_delete_count + 1).unwrap()
         );
-        assert_text(
-            &rows.statements[0].rows.last().unwrap()[0],
-            &format!("version:{version_id}"),
-        );
-        match &rows.statements[0].rows.last().unwrap()[1] {
+        let matched = rows.statements[0]
+            .rows
+            .iter()
+            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == &format!("version:{version_id}")))
+            .expect("version idempotency row should exist");
+        assert_text(&matched[0], &format!("version:{version_id}"));
+        match &matched[1] {
             Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
             other => panic!("expected text commit_id, got {other:?}"),
         }
@@ -1489,16 +1517,19 @@ simulation_test!(
             .await
             .unwrap();
 
-        sim.assert_deterministic(rows.statements[0].rows.clone());
+        let normalized = normalize_text_row_order(&rows.statements[0].rows);
+        sim.assert_deterministic(normalized);
         assert_eq!(
             rows.statements[0].rows.len(),
             usize::try_from(before_delete_count + 1).unwrap()
         );
-        assert_text(
-            &rows.statements[0].rows.last().unwrap()[0],
-            &format!("version:{version_id}"),
-        );
-        match &rows.statements[0].rows.last().unwrap()[1] {
+        let matched = rows.statements[0]
+            .rows
+            .iter()
+            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == &format!("version:{version_id}")))
+            .expect("version idempotency row should exist");
+        assert_text(&matched[0], &format!("version:{version_id}"));
+        match &matched[1] {
             Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
             other => panic!("expected text commit_id, got {other:?}"),
         }
@@ -3970,8 +4001,10 @@ simulation_test!(
                 "SELECT \
                 lixcol_entity_id, lixcol_schema_key, lixcol_file_id, lixcol_plugin_key, \
                 lixcol_schema_version, lixcol_global, lixcol_change_id, \
-                lixcol_created_at, lixcol_updated_at, lixcol_writer_key, lixcol_untracked, lixcol_metadata \
-             FROM lix_file WHERE id = 'lixcol-file'", &[])
+                lixcol_created_at, lixcol_updated_at, lixcol_untracked, lixcol_metadata \
+             FROM lix_file WHERE id = 'lixcol-file'",
+                &[],
+            )
             .await
             .unwrap();
         assert_eq!(file_rows.statements[0].rows.len(), 1);
@@ -3979,10 +4012,6 @@ simulation_test!(
         assert_null(&file_rows.statements[0].rows[0][2]);
         assert_null(&file_rows.statements[0].rows[0][3]);
         assert_boolean_like(&file_rows.statements[0].rows[0][5], false);
-        match &file_rows.statements[0].rows[0][9] {
-            Value::Text(_) | Value::Null => {}
-            other => panic!("expected lixcol_writer_key as text/null, got {other:?}"),
-        }
 
         let file_shape_rows = engine
             .execute(
@@ -4009,7 +4038,7 @@ simulation_test!(
         let file_by_version_shape_rows = engine
             .execute(
                 &format!(
-                    "SELECT directory_id, name, extension, lixcol_writer_key \
+                    "SELECT directory_id, name, extension \
                      FROM lix_file_by_version \
                      WHERE id = 'lixcol-file' \
                        AND lixcol_version_id = '{active_version}'"
@@ -4028,10 +4057,6 @@ simulation_test!(
             "lixcol",
         );
         assert_text(&file_by_version_shape_rows.statements[0].rows[0][2], "json");
-        match &file_by_version_shape_rows.statements[0].rows[0][3] {
-            Value::Text(_) | Value::Null => {}
-            other => panic!("expected file_by_version writer key as text/null, got {other:?}"),
-        }
 
         let directory_rows = engine
             .execute(

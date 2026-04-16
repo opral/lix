@@ -195,7 +195,6 @@ fn active_version_helper_live_row(entity_id: &str, version_id: &str, timestamp: 
         global: true,
         plugin_key: None,
         metadata: None,
-        writer_key: None,
         snapshot_content: Some(
             serde_json::to_string(&LixActiveVersion {
                 id: entity_id.to_string(),
@@ -369,7 +368,6 @@ async fn live_untracked_state_delete_removes_rows() {
             plugin_key: None,
             metadata: None,
             change_id: Some("change-delete-version-ref-main".to_string()),
-            writer_key: None,
             untracked: true,
             snapshot_content: None,
             created_at: None,

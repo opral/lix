@@ -8,7 +8,7 @@ use crate::streams::{
     latest_durable_state_commit_cursor, load_durable_state_commit_catch_up,
     DurableStateCommitCursor, StateCommitStream, StateCommitStreamFilter,
 };
-use crate::{LixError, QueryResult, Value};
+use crate::{LixError, QueryResult, Value, WriteReceipt};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -37,6 +37,40 @@ impl ObserveQuery {
     }
 }
 
+/// Delivery policy for reactive observe subscriptions.
+///
+/// These filters apply to delivery metadata carried on state-commit batches and
+/// observe ticks. They do not inspect row-visible columns or require query SQL
+/// to reference `origin_key`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveOptions {
+    /// Suppress changes authored by this session's effective `origin_key`.
+    #[serde(default)]
+    pub exclude_self: bool,
+    /// Only deliver batches whose delivery metadata carries one of these
+    /// origin keys.
+    #[serde(default)]
+    pub include_origin_keys: Vec<String>,
+    /// Drop batches whose delivery metadata carries one of these origin keys.
+    #[serde(default)]
+    pub exclude_origin_keys: Vec<String>,
+}
+
+impl ObserveOptions {
+    pub fn exclude_self() -> Self {
+        Self {
+            exclude_self: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Observe result event.
+///
+/// `state_commit_sequence` is the matching delivery-sequence fence from the
+/// underlying state-commit stream when the event was caused by a committed
+/// state change. Pure session-state or external tick re-executions leave it
+/// as `None`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveEvent {
     pub sequence: u64,
@@ -68,15 +102,21 @@ struct PollingGuard {
 }
 
 #[derive(Clone, Default)]
-struct ObserveWriterKeyFilter {
+struct ObserveOriginFilter {
     include: BTreeSet<String>,
     exclude: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+struct ResolvedObserveOptions {
+    include_origin_keys: Vec<String>,
+    exclude_origin_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
 struct ObserveTickRow {
     tick_seq: i64,
-    writer_key: Option<String>,
+    origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -96,7 +136,7 @@ pub(crate) struct SharedObserveSource {
     query: ObserveQuery,
     state_commits: StateCommitStream,
     state_commit_filter: StateCommitStreamFilter,
-    writer_key_filter: ObserveWriterKeyFilter,
+    origin_filter: ObserveOriginFilter,
     query_dependencies: BTreeSet<QueryDependency>,
     last_seen_tick_seq: Option<i64>,
     last_seen_state_commit_cursor: Option<DurableStateCommitCursor>,
@@ -131,7 +171,7 @@ enum PollWork {
         last_seen_tick_seq: Option<i64>,
         last_seen_state_commit_cursor: Option<DurableStateCommitCursor>,
         state_commit_filter: StateCommitStreamFilter,
-        writer_key_filter: ObserveWriterKeyFilter,
+        origin_filter: ObserveOriginFilter,
         query_dependency_generations: BTreeMap<QueryDependency, u64>,
     },
 }
@@ -149,14 +189,14 @@ impl SharedObserveSource {
         query: ObserveQuery,
         state_commits: StateCommitStream,
         state_commit_filter: StateCommitStreamFilter,
-        writer_key_filter: ObserveWriterKeyFilter,
+        origin_filter: ObserveOriginFilter,
         query_dependencies: BTreeSet<QueryDependency>,
     ) -> Self {
         Self {
             query,
             state_commits,
             state_commit_filter,
-            writer_key_filter,
+            origin_filter,
             query_dependencies,
             last_seen_tick_seq: None,
             last_seen_state_commit_cursor: None,
@@ -315,6 +355,31 @@ impl ObserveEvents<'_> {
         self.state.next_with_session(self.session).await
     }
 
+    /// Waits until this subscription observes the matching write receipt.
+    ///
+    /// This is the preferred optimistic-UI acknowledgement path for callers
+    /// that want the concrete observe update, not just the global fence.
+    pub async fn wait_for_write_receipt(
+        &mut self,
+        receipt: &WriteReceipt,
+    ) -> Result<Option<ObserveEvent>, LixError> {
+        let Some(target_sequence) = receipt.state_commit_sequence else {
+            return Ok(None);
+        };
+
+        loop {
+            let Some(event) = self.next().await? else {
+                return Ok(None);
+            };
+            if event
+                .state_commit_sequence
+                .is_some_and(|sequence| sequence >= target_sequence)
+            {
+                return Ok(Some(event));
+            }
+        }
+    }
+
     pub fn close(&mut self) {
         self.state.close_with_session(self.session);
     }
@@ -329,6 +394,28 @@ impl Drop for ObserveEvents<'_> {
 impl ObserveEventsOwned {
     pub async fn next(&mut self) -> Result<Option<ObserveEvent>, LixError> {
         self.state.next_with_session(self.session.as_ref()).await
+    }
+
+    /// Owned-session variant of [`ObserveEvents::wait_for_write_receipt`].
+    pub async fn wait_for_write_receipt(
+        &mut self,
+        receipt: &WriteReceipt,
+    ) -> Result<Option<ObserveEvent>, LixError> {
+        let Some(target_sequence) = receipt.state_commit_sequence else {
+            return Ok(None);
+        };
+
+        loop {
+            let Some(event) = self.next().await? else {
+                return Ok(None);
+            };
+            if event
+                .state_commit_sequence
+                .is_some_and(|sequence| sequence >= target_sequence)
+            {
+                return Ok(Some(event));
+            }
+        }
     }
 
     pub fn close(&mut self) {
@@ -426,7 +513,7 @@ impl ObserveState {
                     last_seen_tick_seq: source.last_seen_tick_seq,
                     last_seen_state_commit_cursor: source.last_seen_state_commit_cursor.clone(),
                     state_commit_filter: source.state_commit_filter.clone(),
-                    writer_key_filter: source.writer_key_filter.clone(),
+                    origin_filter: source.origin_filter.clone(),
                     query_dependency_generations,
                 }
             }
@@ -492,7 +579,7 @@ impl ObserveState {
                 last_seen_tick_seq,
                 last_seen_state_commit_cursor,
                 state_commit_filter,
-                writer_key_filter,
+                origin_filter,
                 query_dependency_generations,
             } => {
                 observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
@@ -513,31 +600,19 @@ impl ObserveState {
                         mark_initialized: true,
                     }
                 } else {
-                    let (next_last_seen_tick_seq, should_reexecute) =
-                        if writer_key_filter.has_constraints() {
-                            let observed_ticks = observe_ticks_since(
-                                session.session_host().backend().as_ref(),
-                                last_seen_tick_seq,
-                            )
-                            .await?;
-                            if observed_ticks.is_empty() {
-                                (last_seen_tick_seq, true)
-                            } else {
-                                let mut next_last_seen_tick_seq = last_seen_tick_seq;
-                                let mut should_reexecute = false;
-                                for tick in observed_ticks {
-                                    next_last_seen_tick_seq = Some(tick.tick_seq);
-                                    if writer_key_filter
-                                        .matches_external_tick(tick.writer_key.as_deref())
-                                    {
-                                        should_reexecute = true;
-                                    }
-                                }
-                                (next_last_seen_tick_seq, should_reexecute)
-                            }
-                        } else {
-                            (last_seen_tick_seq, true)
-                        };
+                    let observed_ticks = observe_ticks_since(
+                        session.session_host().backend().as_ref(),
+                        last_seen_tick_seq,
+                    )
+                    .await?;
+                    let mut next_last_seen_tick_seq = last_seen_tick_seq;
+                    let mut should_reexecute = observed_ticks.is_empty();
+                    for tick in observed_ticks {
+                        next_last_seen_tick_seq = Some(tick.tick_seq);
+                        if origin_filter.matches_external_tick(tick.origin_key.as_deref()) {
+                            should_reexecute = true;
+                        }
+                    }
 
                     if !should_reexecute {
                         PollOutcome {
@@ -651,23 +726,19 @@ impl Drop for PollingGuard {
     }
 }
 
-impl ObserveWriterKeyFilter {
-    fn has_constraints(&self) -> bool {
-        !self.include.is_empty() || !self.exclude.is_empty()
-    }
-
-    fn matches_external_tick(&self, writer_key: Option<&str>) -> bool {
+impl ObserveOriginFilter {
+    fn matches_external_tick(&self, origin_key: Option<&str>) -> bool {
         if !self.include.is_empty() {
-            let Some(writer_key) = writer_key else {
+            let Some(origin_key) = origin_key else {
                 return false;
             };
-            if !self.include.contains(writer_key) {
+            if !self.include.contains(origin_key) {
                 return false;
             }
         }
 
-        if let Some(writer_key) = writer_key {
-            if self.exclude.contains(writer_key) {
+        if let Some(origin_key) = origin_key {
+            if self.exclude.contains(origin_key) {
                 return false;
             }
         }
@@ -699,7 +770,15 @@ fn extract_single_observe_query_result(
 
 impl Session {
     pub fn observe(&self, query: ObserveQuery) -> Result<ObserveEvents<'_>, LixError> {
-        let state = build_observe_state(self, query)?;
+        self.observe_with_options(query, ObserveOptions::default())
+    }
+
+    pub fn observe_with_options(
+        &self,
+        query: ObserveQuery,
+        options: ObserveOptions,
+    ) -> Result<ObserveEvents<'_>, LixError> {
+        let state = build_observe_state(self, query, options)?;
         Ok(ObserveEvents {
             session: self,
             state,
@@ -710,14 +789,27 @@ impl Session {
         session: Arc<Self>,
         query: ObserveQuery,
     ) -> Result<ObserveEventsOwned, LixError> {
-        let state = build_observe_state(session.as_ref(), query)?;
+        Self::observe_owned_with_options(session, query, ObserveOptions::default())
+    }
+
+    pub(crate) fn observe_owned_with_options(
+        session: Arc<Self>,
+        query: ObserveQuery,
+        options: ObserveOptions,
+    ) -> Result<ObserveEventsOwned, LixError> {
+        let state = build_observe_state(session.as_ref(), query, options)?;
         Ok(ObserveEventsOwned { session, state })
     }
 }
 
-fn build_observe_state(session: &Session, query: ObserveQuery) -> Result<ObserveState, LixError> {
-    let source_key = observe_source_key_for_session(session, &query)?;
-    let source = acquire_or_create_shared_source(session, &source_key, query)?;
+fn build_observe_state(
+    session: &Session,
+    query: ObserveQuery,
+    options: ObserveOptions,
+) -> Result<ObserveState, LixError> {
+    let resolved_options = resolve_observe_options(session, &options);
+    let source_key = observe_source_key_for_session(session, &query, &resolved_options)?;
+    let source = acquire_or_create_shared_source(session, &source_key, query, resolved_options)?;
     let subscriber_id = {
         let mut shared = lock_shared_source(&source)?;
         if shared.closed {
@@ -741,12 +833,47 @@ fn build_observe_state(session: &Session, query: ObserveQuery) -> Result<Observe
 fn observe_source_key_for_session(
     session: &Session,
     query: &ObserveQuery,
+    options: &ResolvedObserveOptions,
 ) -> Result<String, LixError> {
+    let options = serde_json::to_string(options).map_err(|error| LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!("failed to serialize observe options for dedup key: {error}"),
+    })?;
     Ok(format!(
-        "{}\n--runtime:{}",
+        "{}\n--runtime:{}\n--observe-options:{options}",
         observe_source_key(query)?,
         session_runtime_namespace(session),
     ))
+}
+
+fn resolve_observe_options(session: &Session, options: &ObserveOptions) -> ResolvedObserveOptions {
+    let mut include_origin_keys = BTreeSet::new();
+    for origin_key in &options.include_origin_keys {
+        let origin_key = origin_key.trim();
+        if !origin_key.is_empty() {
+            include_origin_keys.insert(origin_key.to_string());
+        }
+    }
+
+    let mut exclude_origin_keys = BTreeSet::new();
+    for origin_key in &options.exclude_origin_keys {
+        let origin_key = origin_key.trim();
+        if !origin_key.is_empty() {
+            exclude_origin_keys.insert(origin_key.to_string());
+        }
+    }
+
+    if options.exclude_self {
+        let origin_key = session.origin_key().trim();
+        if !origin_key.is_empty() {
+            exclude_origin_keys.insert(origin_key.to_string());
+        }
+    }
+
+    ResolvedObserveOptions {
+        include_origin_keys: include_origin_keys.into_iter().collect(),
+        exclude_origin_keys: exclude_origin_keys.into_iter().collect(),
+    }
 }
 
 fn observe_source_key(query: &ObserveQuery) -> Result<String, LixError> {
@@ -766,6 +893,7 @@ fn acquire_or_create_shared_source(
     session: &Session,
     source_key: &str,
     query: ObserveQuery,
+    options: ResolvedObserveOptions,
 ) -> Result<Arc<Mutex<SharedObserveSource>>, LixError> {
     loop {
         if let Some(existing_source) = lock_observe_registry(session)?.get(source_key).cloned() {
@@ -786,6 +914,7 @@ fn acquire_or_create_shared_source(
         let new_source = Arc::new(Mutex::new(build_shared_observe_source(
             session,
             query.clone(),
+            options.clone(),
         )?));
         let mut registry = lock_observe_registry(session)?;
         if let std::collections::btree_map::Entry::Vacant(entry) =
@@ -800,6 +929,7 @@ fn acquire_or_create_shared_source(
 fn build_shared_observe_source(
     session: &Session,
     query: ObserveQuery,
+    options: ResolvedObserveOptions,
 ) -> Result<SharedObserveSource, LixError> {
     let statements = parse_sql_statements(&query.sql)?;
     if statements.is_empty()
@@ -814,10 +944,16 @@ fn build_shared_observe_source(
     }
 
     let dependency_spec = derive_dependency_spec(&statements, &query.params)?;
-    let filter = dependency_spec_to_state_commit_stream_filter(&dependency_spec);
-    let writer_key_filter = ObserveWriterKeyFilter {
-        include: filter.writer_keys.iter().cloned().collect(),
-        exclude: filter.exclude_writer_keys.iter().cloned().collect(),
+    let mut filter = dependency_spec_to_state_commit_stream_filter(&dependency_spec);
+    filter
+        .include_origin_keys
+        .extend(options.include_origin_keys.iter().cloned());
+    filter
+        .exclude_origin_keys
+        .extend(options.exclude_origin_keys.iter().cloned());
+    let origin_filter = ObserveOriginFilter {
+        include: filter.include_origin_keys.iter().cloned().collect(),
+        exclude: filter.exclude_origin_keys.iter().cloned().collect(),
     };
     let state_commits = session.session_host().state_commit_stream(filter.clone());
 
@@ -825,7 +961,7 @@ fn build_shared_observe_source(
         query,
         state_commits,
         filter,
-        writer_key_filter,
+        origin_filter,
         dependency_spec.query_dependencies,
     ))
 }
@@ -925,7 +1061,7 @@ async fn observe_ticks_since(
 ) -> Result<Vec<ObserveTickRow>, LixError> {
     let result = if let Some(last_seen) = last_seen_tick_seq {
         Box::pin(backend.execute(
-            "SELECT tick_seq, writer_key \
+            "SELECT tick_seq, origin_key \
              FROM lix_internal_observe_tick \
              WHERE tick_seq > $1 \
              ORDER BY tick_seq ASC",
@@ -934,7 +1070,7 @@ async fn observe_ticks_since(
         .await?
     } else {
         Box::pin(backend.execute(
-            "SELECT tick_seq, writer_key \
+            "SELECT tick_seq, origin_key \
              FROM lix_internal_observe_tick \
              ORDER BY tick_seq ASC",
             &[],
@@ -950,19 +1086,19 @@ async fn observe_ticks_since(
                 "failed to read observe tick sequence: row has no tick_seq column".to_string(),
         })?)?;
 
-        let writer_key =
-            parse_observe_tick_writer_key(
+        let origin_key =
+            parse_observe_tick_origin_key(
                 row.get(1).ok_or(LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description:
-                        "failed to read observe tick writer key: row has no writer_key column"
+                        "failed to read observe tick origin key: row has no origin_key column"
                             .to_string(),
                 })?,
             )?;
 
         ticks.push(ObserveTickRow {
             tick_seq,
-            writer_key,
+            origin_key,
         });
     }
     Ok(ticks)
@@ -983,13 +1119,13 @@ fn parse_observe_tick_seq(value: &Value) -> Result<i64, LixError> {
     }
 }
 
-fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixError> {
+fn parse_observe_tick_origin_key(value: &Value) -> Result<Option<String>, LixError> {
     match value {
         Value::Null => Ok(None),
         Value::Text(value) => Ok(Some(value.clone())),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse observe tick writer key value: {other:?}"),
+            description: format!("failed to parse observe tick origin key value: {other:?}"),
         }),
     }
 }
@@ -997,8 +1133,8 @@ fn parse_observe_tick_writer_key(value: &Value) -> Result<Option<String>, LixErr
 #[cfg(test)]
 mod tests {
     use super::{
-        build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveQuery,
-        OBSERVE_TICK_POLL_INTERVAL,
+        build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveOptions,
+        ObserveQuery, OBSERVE_TICK_POLL_INTERVAL,
     };
     use crate::wasm::NoopWasmRuntime;
     use crate::{
@@ -1070,7 +1206,7 @@ mod tests {
             if sql.contains("FROM lix_internal_observe_tick") {
                 return Ok(QueryResult {
                     rows: Vec::new(),
-                    columns: vec!["tick_seq".to_string(), "writer_key".to_string()],
+                    columns: vec!["tick_seq".to_string(), "origin_key".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -1124,7 +1260,7 @@ mod tests {
             if sql.contains("FROM lix_internal_observe_tick") {
                 return Ok(QueryResult {
                     rows: Vec::new(),
-                    columns: vec!["tick_seq".to_string(), "writer_key".to_string()],
+                    columns: vec!["tick_seq".to_string(), "origin_key".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -1179,6 +1315,47 @@ mod tests {
                 observe_query_hits.load(Ordering::SeqCst),
                 1,
                 "identical observe subscribers should share initial query execution"
+            );
+        });
+    }
+
+    #[test]
+    fn observe_does_not_dedup_across_distinct_origin_filters() {
+        run_observe_test_with_large_stack(|| async move {
+            let observe_query_hits = Arc::new(AtomicUsize::new(0));
+            let lix = Arc::new(Lix::boot(LixConfig::new(
+                Box::new(CountingObserveBackend {
+                    observe_query_hits: Arc::clone(&observe_query_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            )));
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
+
+            let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+            let mut observed_a = session
+                .observe(query.clone())
+                .expect("observe should succeed");
+            let mut observed_b = session
+                .observe_with_options(
+                    query,
+                    ObserveOptions {
+                        exclude_origin_keys: vec!["worker-a".to_string()],
+                        ..ObserveOptions::default()
+                    },
+                )
+                .expect("observe should succeed");
+
+            let _event_a = next_observe_event(&mut observed_a, "observe_a").await;
+            let _event_b = next_observe_event(&mut observed_b, "observe_b").await;
+
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                2,
+                "observe subscribers with distinct origin filters should not share a dedup key"
             );
         });
     }
@@ -1311,6 +1488,7 @@ mod tests {
                     "SELECT 'observe-shared-sentinel' AS marker, lix_active_version_id() AS version_id",
                     vec![],
                 ),
+                ObserveOptions::default(),
             )
             .expect("observe state should build");
 
@@ -1358,6 +1536,7 @@ mod tests {
                     "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
                     vec![],
                 ),
+                ObserveOptions::default(),
             )
             .expect("observe state should build");
 

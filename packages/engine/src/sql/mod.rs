@@ -7,9 +7,8 @@
 //! Post-Plan-20 dependency rules:
 //!
 //! - compiler-core SQL may depend on owner-owned contracts from
-//!   `canonical/read/*`, `session/version_ops/*`,
-//!   root-level `live_state`, and `live_state::writer_key::*` where
-//!   row-serving writer-key facts are required
+//!   `canonical/read/*`, `session/version_ops/*`, and root-level
+//!   `live_state`
 //! - compiler-core SQL must not depend on `commit/*`
 //! - compiler-core SQL must not depend on `canonical/journal/*` or
 //!   `canonical/graph/*` implementation details
@@ -103,8 +102,8 @@ pub(crate) use prepare::{
 pub(crate) use prepared_artifacts::*;
 pub(crate) use write_artifacts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch, PlanEffects,
-    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedRowIdentity,
-    PlannedStateRow, PublicChange, SemanticEffect, SessionStateDelta, WriteLane, WriteMode,
+    PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,
+    PublicChange, SemanticEffect, SessionStateDelta, WriteLane, WriteMode,
 };
 
 // Existing root helpers used outside the compiler stages.

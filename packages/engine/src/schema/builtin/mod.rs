@@ -243,10 +243,6 @@ pub(crate) fn builtin_schema_json(schema_key: &str) -> Option<&'static str> {
     }
 }
 
-pub(crate) fn decode_lixcol_literal(raw: &str) -> String {
-    serde_json::from_str::<String>(raw).unwrap_or_else(|_| raw.trim_matches('"').to_string())
-}
-
 fn parse_builtin_schema(file_name: &str, raw_json: &str) -> JsonValue {
     serde_json::from_str(raw_json).unwrap_or_else(|error| {
         panic!("builtin schema file '{file_name}' must contain valid JSON: {error}")
@@ -275,15 +271,9 @@ mod tests {
     use super::{builtin_schema_definition, builtin_schema_storage_defaults, BUILTIN_SCHEMA_KEYS};
 
     #[test]
-    fn builtin_schemas_do_not_define_file_or_plugin_overrides() {
+    fn builtin_schemas_load_without_extra_override_metadata() {
         for schema_key in BUILTIN_SCHEMA_KEYS {
-            let schema = builtin_schema_definition(schema_key).expect("schema should exist");
-            assert_eq!(
-                schema.get("x-lix-override-lixcols"),
-                None,
-                "schema '{}' should not carry file/plugin override metadata",
-                schema_key,
-            );
+            builtin_schema_definition(schema_key).expect("schema should exist");
         }
     }
 

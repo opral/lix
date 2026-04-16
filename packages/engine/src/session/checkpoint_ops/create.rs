@@ -144,7 +144,6 @@ async fn ensure_checkpoint_label_on_commit(
             plugin_key: None,
             metadata: None,
             change_id: Some(change_id.clone()),
-            writer_key: None,
             global: true,
             untracked: false,
             created_at: Some(timestamp.clone()),

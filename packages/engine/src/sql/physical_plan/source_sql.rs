@@ -2,11 +2,11 @@
 
 use crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::catalog::{RelationBinding, ResolvedRelation, SurfaceVariant};
-use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
+use crate::common::storage_scope_key_for_file_id;
 use crate::live_state::tracked_relation_name;
 use crate::live_state::{
     normalized_projection_sql_for_schema, payload_column_name_for_schema,
-    snapshot_select_expr_for_schema, WRITER_KEY_TABLE,
+    snapshot_select_expr_for_schema,
 };
 use crate::sql::physical_plan::catalog_relation_sql::{
     build_filesystem_relation_sql, build_version_relation_sql,
@@ -162,7 +162,6 @@ pub(crate) fn build_direct_canonical_commit_source_sql(dialect: SqlDialect) -> S
             ch.id AS change_id, \
             ch.entity_id AS commit_id, \
             false AS untracked, \
-            NULL AS writer_key, \
             ch.metadata AS metadata, \
             ch.entity_id AS id, \
             {change_set_id_expr} AS change_set_id, \
@@ -195,7 +194,6 @@ pub(crate) fn build_direct_canonical_change_set_source_sql() -> String {
         ch.id AS change_id, \
         ch.entity_id AS commit_id, \
         false AS untracked, \
-        NULL AS writer_key, \
         ch.metadata AS metadata, \
         ch.entity_id AS id, \
         NULL AS change_set_id, \
@@ -733,40 +731,13 @@ fn schema_key_requires_global_target_version(schema_key: &str) -> bool {
     )
 }
 
-fn tracked_writer_key_join_sql(row_alias: &str, writer_alias: &str) -> String {
-    format!(
-        "LEFT JOIN {writer_key_table} {writer_alias} \
-           ON {writer_alias}.version_id = {row_alias}.version_id \
-          AND {writer_alias}.schema_key = {row_alias}.schema_key \
-          AND {writer_alias}.entity_id = {row_alias}.entity_id \
-          AND {writer_alias}.{storage_scope_key} = {row_alias}.{storage_scope_key}",
-        writer_key_table = WRITER_KEY_TABLE,
-        row_alias = quote_ident(row_alias),
-        writer_alias = quote_ident(writer_alias),
-        storage_scope_key = quote_ident(STORAGE_SCOPE_KEY_COLUMN),
-    )
-}
-
 fn render_overlay_where_clause_sql(
     predicates: &[Expr],
     prefix: &str,
     row_alias: &str,
-    writer_alias: &str,
+    _writer_alias: &str,
 ) -> String {
-    let mut rendered = render_qualified_where_clause_sql(predicates, prefix, row_alias);
-    let row_writer_key = format!("{}.{}", quote_ident(row_alias), quote_ident("writer_key"));
-    let row_lixcol_writer_key = format!(
-        "{}.{}",
-        quote_ident(row_alias),
-        quote_ident("lixcol_writer_key")
-    );
-    let overlay_writer_key = format!(
-        "{}.{}",
-        quote_ident(writer_alias),
-        quote_ident("writer_key")
-    );
-    rendered = rendered.replace(&row_writer_key, &overlay_writer_key);
-    rendered.replace(&row_lixcol_writer_key, &overlay_writer_key)
+    render_qualified_where_clause_sql(predicates, prefix, row_alias)
 }
 
 fn effective_state_schema_winner_rows_sql(
@@ -922,7 +893,6 @@ fn effective_state_schema_winner_rows_sql(
                    ranked.effective_change_id AS change_id, \
                    ranked.effective_commit_id AS commit_id, \
                    ranked.effective_untracked AS untracked, \
-                   ranked.effective_writer_key AS writer_key, \
                    ranked.effective_metadata AS metadata{ranked_payload_projection} \
                  FROM ( \
                    SELECT \
@@ -945,14 +915,12 @@ fn effective_state_schema_winner_rows_sql(
                        t.change_id AS effective_change_id, \
                        cc.commit_id AS effective_commit_id, \
                        false AS effective_untracked, \
-                       wk.writer_key AS effective_writer_key, \
                        t.metadata AS effective_metadata, \
                        t.is_tombstone AS is_tombstone{tracked_full_projection}, \
                        2 AS precedence \
                      FROM {table_name} t \
                      JOIN target_versions tv \
                        ON tv.version_id = t.version_id \
-                     {tracked_writer_key_join_sql} \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
                      WHERE t.untracked = false{tracked_predicates} \
@@ -970,7 +938,6 @@ fn effective_state_schema_winner_rows_sql(
                        t.change_id AS effective_change_id, \
                        cc.commit_id AS effective_commit_id, \
                        false AS effective_untracked, \
-                       wk_global.writer_key AS effective_writer_key, \
                        t.metadata AS effective_metadata, \
                        t.is_tombstone AS is_tombstone{tracked_full_projection}, \
                        4 AS precedence \
@@ -978,7 +945,6 @@ fn effective_state_schema_winner_rows_sql(
                      JOIN target_versions tv \
                        ON tv.version_id <> '{global_version}' \
                       AND t.version_id = '{global_version}' \
-                     {tracked_global_writer_key_join_sql} \
                      LEFT JOIN change_commit_by_change_id cc \
                        ON cc.change_id = t.change_id \
                      WHERE t.version_id = '{global_version}' \
@@ -997,14 +963,12 @@ fn effective_state_schema_winner_rows_sql(
                        u.change_id AS effective_change_id, \
                        NULL AS effective_commit_id, \
                        true AS effective_untracked, \
-                       uwk.writer_key AS effective_writer_key, \
                        u.metadata AS effective_metadata, \
                        0 AS is_tombstone{untracked_full_projection}, \
                        1 AS precedence \
                      FROM {untracked_table} u \
                      JOIN target_versions tv \
                        ON tv.version_id = u.version_id \
-                     {untracked_writer_key_join_sql} \
                      WHERE u.untracked = true{untracked_predicates} \
                      UNION ALL \
                      SELECT \
@@ -1020,7 +984,6 @@ fn effective_state_schema_winner_rows_sql(
                        u.change_id AS effective_change_id, \
                        NULL AS effective_commit_id, \
                        true AS effective_untracked, \
-                       uwk_global.writer_key AS effective_writer_key, \
                        u.metadata AS effective_metadata, \
                        0 AS is_tombstone{untracked_full_projection}, \
                        3 AS precedence \
@@ -1028,7 +991,6 @@ fn effective_state_schema_winner_rows_sql(
                      JOIN target_versions tv \
                        ON tv.version_id <> '{global_version}' \
                       AND u.version_id = '{global_version}' \
-                     {untracked_global_writer_key_join_sql} \
                      WHERE u.version_id = '{global_version}' \
                        AND u.untracked = true{untracked_global_predicates} \
                    ) AS c \
@@ -1041,14 +1003,9 @@ fn effective_state_schema_winner_rows_sql(
                 tracked_full_projection = tracked_full_projection,
                 tracked_predicates = tracked_predicates,
                 tracked_global_predicates = tracked_global_predicates,
-                tracked_writer_key_join_sql = tracked_writer_key_join_sql("t", "wk"),
-                tracked_global_writer_key_join_sql = tracked_writer_key_join_sql("t", "wk_global"),
                 untracked_full_projection = untracked_full_projection,
                 untracked_predicates = untracked_predicates,
                 untracked_global_predicates = untracked_global_predicates,
-                untracked_writer_key_join_sql = tracked_writer_key_join_sql("u", "uwk"),
-                untracked_global_writer_key_join_sql =
-                    tracked_writer_key_join_sql("u", "uwk_global"),
                 table_name = table_name,
                 untracked_table = untracked_table,
             )
@@ -1121,7 +1078,6 @@ fn build_direct_canonical_header_state_rows_sql(
             direct_rows.change_id AS change_id, \
             direct_rows.commit_id AS commit_id, \
             direct_rows.untracked AS untracked, \
-            direct_rows.writer_key AS writer_key, \
             direct_rows.metadata AS metadata{payload_projection} \
          FROM ( \
            SELECT \
@@ -1138,7 +1094,6 @@ fn build_direct_canonical_header_state_rows_sql(
              base.change_id AS change_id, \
              base.commit_id AS commit_id, \
              base.untracked AS untracked, \
-             base.writer_key AS writer_key, \
              base.metadata AS metadata, \
              base.id AS {id_column}{header_payload_projection} \
            FROM ({base_source_sql}) AS base \
@@ -1312,7 +1267,6 @@ fn build_change_set_element_state_rows_sql(
                 direct_rows.change_id AS change_id, \
                 direct_rows.commit_id AS commit_id, \
                 direct_rows.untracked AS untracked, \
-                direct_rows.writer_key AS writer_key, \
                 direct_rows.metadata AS metadata{payload_projection} \
          FROM ( \
              WITH {commit_rows_cte_sql}, \
@@ -1350,7 +1304,6 @@ fn build_change_set_element_state_rows_sql(
                  change_rows.change_id AS change_id, \
                  commit_members.commit_id AS commit_id, \
                  false AS untracked, \
-                 NULL AS writer_key, \
                  change_rows.member_metadata AS metadata, \
                  commit_members.change_set_id AS {change_set_id_column}, \
                  change_rows.change_id AS {change_id_column}, \
@@ -1432,7 +1385,6 @@ fn build_commit_edge_state_rows_sql(
                 direct_rows.change_id AS change_id, \
                 direct_rows.commit_id AS commit_id, \
                 direct_rows.untracked AS untracked, \
-                direct_rows.writer_key AS writer_key, \
                 direct_rows.metadata AS metadata{payload_projection} \
          FROM ( \
              WITH {commit_rows_cte_sql}, \
@@ -1460,7 +1412,6 @@ fn build_commit_edge_state_rows_sql(
                  NULL AS change_id, \
                  commit_edges.child_id AS commit_id, \
                  false AS untracked, \
-                 NULL AS writer_key, \
                  commit_edges.metadata AS metadata, \
                  commit_edges.parent_id AS {parent_id_column}, \
                  commit_edges.child_id AS {child_id_column} \
@@ -1540,7 +1491,6 @@ fn build_change_author_state_rows_sql(
                 direct_rows.change_id AS change_id, \
                 direct_rows.commit_id AS commit_id, \
                 direct_rows.untracked AS untracked, \
-                direct_rows.writer_key AS writer_key, \
                 direct_rows.metadata AS metadata{payload_projection} \
          FROM ( \
              WITH {commit_rows_cte_sql}, \
@@ -1571,7 +1521,6 @@ fn build_change_author_state_rows_sql(
                  change_authors.member_change_id AS change_id, \
                  change_authors.commit_id AS commit_id, \
                  false AS untracked, \
-                 NULL AS writer_key, \
                  change_authors.metadata AS metadata, \
                  change_authors.member_change_id AS {change_id_column}, \
                  change_authors.account_id AS {account_id_column} \
@@ -1631,7 +1580,6 @@ fn is_live_state_envelope_column(column: &str) -> bool {
             | "change_id"
             | "commit_id"
             | "untracked"
-            | "writer_key"
             | "lixcol_entity_id"
             | "lixcol_schema_key"
             | "lixcol_file_id"
@@ -1644,7 +1592,6 @@ fn is_live_state_envelope_column(column: &str) -> bool {
             | "lixcol_updated_at"
             | "lixcol_global"
             | "lixcol_untracked"
-            | "lixcol_writer_key"
             | "lixcol_metadata"
             | "snapshot_content"
             | "commit_created_at"

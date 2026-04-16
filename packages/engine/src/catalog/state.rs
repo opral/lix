@@ -146,7 +146,6 @@ fn state_columns() -> Vec<String> {
         "change_id".to_string(),
         "commit_id".to_string(),
         "untracked".to_string(),
-        "writer_key".to_string(),
     ]
 }
 
@@ -189,7 +188,6 @@ fn state_column_types() -> BTreeMap<String, SurfaceColumnType> {
         ("change_id".to_string(), SurfaceColumnType::String),
         ("commit_id".to_string(), SurfaceColumnType::String),
         ("untracked".to_string(), SurfaceColumnType::Boolean),
-        ("writer_key".to_string(), SurfaceColumnType::String),
         ("version_id".to_string(), SurfaceColumnType::String),
         ("commit_created_at".to_string(), SurfaceColumnType::String),
         ("root_commit_id".to_string(), SurfaceColumnType::String),

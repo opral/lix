@@ -10,5 +10,3 @@ mod file_materialization;
 mod filesystem_view;
 #[path = "filesystem/materialization.rs"]
 mod materialization;
-#[path = "filesystem/writer_key.rs"]
-mod writer_key;

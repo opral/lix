@@ -1,6 +1,7 @@
 use crate::support;
 
 use lix_engine::Value;
+use serde_json::json;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
@@ -51,6 +52,69 @@ async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
         .unwrap();
 }
 
+async fn ensure_file_descriptor(
+    engine: &support::simulation_test::SimulatedLix,
+    version_id: &str,
+    file_id: &str,
+) {
+    let existing = engine
+        .execute(
+            "SELECT entity_id \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_file_descriptor' \
+               AND entity_id = $1 \
+               AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await
+        .unwrap();
+    if !existing.statements[0].rows.is_empty() {
+        return;
+    }
+
+    let (name, extension) = file_id
+        .rsplit_once('.')
+        .map(|(name, extension)| (name, Some(extension)))
+        .unwrap_or((file_id, None));
+    let snapshot = json!({
+        "id": file_id,
+        "directory_id": null,
+        "name": name,
+        "extension": extension,
+        "metadata": null,
+        "hidden": false
+    })
+    .to_string();
+
+    engine
+        .execute(
+            "INSERT INTO lix_state_by_version (\
+             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+             ) VALUES (\
+             $1, 'lix_file_descriptor', NULL, $2, NULL, $3, '1'\
+             )",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+                Value::Text(snapshot),
+            ],
+        )
+        .await
+        .unwrap();
+}
+
+async fn ensure_active_file_descriptor(
+    engine: &support::simulation_test::SimulatedLix,
+    file_id: &str,
+) {
+    let version_id = engine.active_version_id().await.unwrap();
+    ensure_file_descriptor(engine, &version_id, file_id).await;
+}
+
 async fn active_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
     let version_id = engine.active_version_id().await.unwrap();
     let result = engine
@@ -79,13 +143,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'paragraph0', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
+                 'paragraph0', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"initial\"}'\
                  )", &[])
             .await
             .unwrap();
@@ -126,13 +191,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'paragraph0', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
+                 'paragraph0', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"value0\"}'\
                  )", &[])
             .await
             .unwrap();
@@ -193,13 +259,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'history-created-at', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
+                 'history-created-at', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"value0\"}'\
                  )", &[])
             .await
             .unwrap();
@@ -252,13 +319,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'history-diagnostic-state', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"value0\"}'\
+                 'history-diagnostic-state', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"value0\"}'\
                  )", &[])
             .await
             .unwrap();
@@ -321,14 +389,17 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity1', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"initial\"}'\
-                 )", &[])
+                 'entity1', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"initial\"}'\
+                 )",
+                &[],
+            )
             .await
             .unwrap();
         let insert_commit_id = active_commit_id(&engine).await;
@@ -439,13 +510,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-a', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"a0\"}'\
+                 'entity-a', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"a0\"}'\
                  )",
                 &[],
             )
@@ -458,7 +530,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-b', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"b0\"}'\
+                 'entity-b', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"b0\"}'\
                  )",
                 &[],
             )
@@ -510,13 +582,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-a', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"a0\"}'\
+                 'entity-a', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"a0\"}'\
                  )",
                 &[],
             )
@@ -527,7 +600,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-b', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"b0\"}'\
+                 'entity-b', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"b0\"}'\
                  )",
                 &[],
             )
@@ -606,13 +679,14 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.unwrap();
         register_test_schema(&engine).await;
+        ensure_active_file_descriptor(&engine, "f0").await;
 
         engine
             .execute(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-a', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"a0\"}'\
+                 'entity-a', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"a0\"}'\
                  )",
                 &[],
             )
@@ -623,7 +697,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'entity-b', 'test_state_history_schema', 'f0', 'lix', '1', '{\"value\":\"b0\"}'\
+                 'entity-b', 'test_state_history_schema', 'f0', NULL, '1', '{\"value\":\"b0\"}'\
                  )",
                 &[],
             )

@@ -112,7 +112,7 @@ pub(super) async fn undo_in_session_transaction(
                         plugin_key: effect.forward_change.plugin_key.clone(),
                         snapshot_content: None,
                         untracked: false,
-                        writer_key: None,
+                        origin_key: None,
                     });
                 }
                 StateCommitStreamOperation::Update => {
@@ -146,7 +146,7 @@ pub(super) async fn undo_in_session_transaction(
                                 ))
                             })?,
                         untracked: false,
-                        writer_key: None,
+                        origin_key: None,
                     });
                     inverse_changes.push(restored);
                 }
@@ -181,7 +181,7 @@ pub(super) async fn undo_in_session_transaction(
                                 ))
                             })?,
                         untracked: false,
-                        writer_key: None,
+                        origin_key: None,
                     });
                     inverse_changes.push(restored);
                 }
@@ -264,7 +264,7 @@ pub(super) async fn redo_in_session_transaction(
                         LixError::unknown(format!("redo snapshot_content is invalid JSON: {error}"))
                     })?,
                 untracked: false,
-                writer_key: None,
+                origin_key: None,
             });
             forward_changes.push(proposed);
         }
@@ -339,8 +339,8 @@ async fn append_undo_redo_commit_in_transaction(
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
             should_emit_observe_tick: false,
-            observe_tick_writer_key: None,
-            writer_key: None,
+            observe_tick_origin_key: None,
+            origin_key: None,
         },
         &mut functions,
         None,
@@ -680,7 +680,7 @@ fn build_forward_proposed_change(
         snapshot_content: change.snapshot_content.clone(),
         metadata: change.metadata.clone(),
         version_id: require_identity(version_id.to_string(), "undo forward version_id")?,
-        writer_key: None,
+        origin_key: None,
         created_at: None,
     })
 }
@@ -710,7 +710,7 @@ fn build_restore_proposed_change(
         snapshot_content: Some(row.snapshot_content.clone()),
         metadata: row.metadata.clone(),
         version_id: require_identity(version_id.to_string(), "undo restore version_id")?,
-        writer_key: None,
+        origin_key: None,
         created_at: None,
     })
 }
@@ -740,7 +740,7 @@ fn build_tombstone_proposed_change(
         snapshot_content: None,
         metadata: None,
         version_id: require_identity(version_id.to_string(), "undo tombstone version_id")?,
-        writer_key: None,
+        origin_key: None,
         created_at: None,
     })
 }

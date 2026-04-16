@@ -57,7 +57,6 @@ pub(crate) mod tracked;
 mod types;
 pub(crate) mod untracked;
 mod visible_rows;
-pub(crate) mod writer_key;
 use crate::catalog::SurfaceReadFreshness;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
 use async_trait::async_trait;
@@ -137,12 +136,6 @@ pub(crate) use untracked::UntrackedReadView;
 pub(crate) use untracked::{ExactUntrackedRowRequest, UntrackedRow};
 pub(crate) use visible_rows::{
     scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
-};
-#[cfg(test)]
-pub(crate) use writer_key::WriterKeyReadView;
-pub(crate) use writer_key::WRITER_KEY_TABLE;
-pub(crate) use writer_key::{
-    apply_writer_key_annotations_with_executor, tracked_writer_key_annotations_from_changes,
 };
 
 pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;

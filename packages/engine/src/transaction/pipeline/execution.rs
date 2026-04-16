@@ -127,6 +127,7 @@ async fn execute_statement_batch_with_buffered_write_scope(
 
     Ok(ExecuteResult {
         statements: results,
+        write_receipt: None,
     })
 }
 
@@ -375,7 +376,7 @@ async fn execute_direct_write_command(
         direct,
         command.prepared().result_contract,
         command.function_bindings().provider(),
-        direct.writer_key.as_deref(),
+        direct.origin_key.as_deref(),
     )
     .await
     .map_err(LixError::from)
@@ -449,26 +450,17 @@ async fn apply_prepared_write_context_invalidation(
     let registry = match invalidation {
         PreparedWriteContextInvalidation::None => return Ok(()),
         PreparedWriteContextInvalidation::RegenerateFromPendingOverlay => {
-            let function_bindings = context.function_bindings().expect(
-                "prepared write context invalidation requires initialized function bindings",
-            );
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::transaction::build_public_read_surface_registry_with_pending_overlay(
                 &backend,
                 pending_write_overlay.map(|view| view as &dyn PendingOverlay),
-                function_bindings.provider(),
             )
             .await?
         }
         PreparedWriteContextInvalidation::RegenerateFromCommittedState => {
-            let function_bindings = context.function_bindings().expect(
-                "prepared write context invalidation requires initialized function bindings",
-            );
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::transaction::build_public_read_surface_registry_with_pending_overlay(
-                &backend,
-                None,
-                function_bindings.provider(),
+                &backend, None,
             )
             .await?
         }

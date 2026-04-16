@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn canonical_exact_state_rows_do_not_carry_writer_key_annotation() {
+    async fn canonical_exact_state_rows_do_not_carry_origin_annotation() {
         let backend = init_state_source_backend().await;
         seed_committed_history_fixture(&backend, true)
             .await

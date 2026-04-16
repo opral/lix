@@ -9,7 +9,7 @@ use sqlparser::ast::{Visit, Visitor};
 
 use crate::catalog::{builtin_catalog_compiler_facade, CatalogCompilerApi};
 use crate::sql::binder::bind_sql_with_state;
-use crate::sql::dependency::DependencyWriterFilter;
+use crate::sql::dependency::DependencyOriginFilter;
 use crate::sql::is_untracked_live_table;
 use crate::sql::parser::parse_sql_statements;
 use crate::sql::parser::placeholders::PlaceholderState;
@@ -71,7 +71,7 @@ pub(crate) fn derive_dependency_spec_from_statements(
                 spec.version_ids.clear();
             }
         }
-        collect_writer_filters_from_query(&query, &bound.params, &mut spec.writer_filter);
+        collect_origin_filters_from_query(&query, &mut spec.origin_filter);
     }
 
     finalize_dependency_spec(spec)
@@ -87,9 +87,10 @@ pub(crate) fn dependency_spec_to_state_commit_stream_filter(
         entity_ids: spec.entity_ids.iter().cloned().collect(),
         file_ids: spec.file_ids.iter().cloned().collect(),
         version_ids: spec.version_ids.iter().cloned().collect(),
-        writer_keys: spec.writer_filter.include.iter().cloned().collect(),
-        exclude_writer_keys: spec.writer_filter.exclude.iter().cloned().collect(),
+        include_origin_keys: spec.origin_filter.include.iter().cloned().collect(),
+        exclude_origin_keys: spec.origin_filter.exclude.iter().cloned().collect(),
         include_untracked: spec.include_untracked,
+        exclude_self: false,
     }
 }
 
@@ -281,29 +282,21 @@ fn collect_literal_filters_from_query(
     collector.representable
 }
 
-fn collect_writer_filters_from_query(
-    query: &Query,
-    params: &[Value],
-    writer_filter: &mut DependencyWriterFilter,
-) {
+fn collect_origin_filters_from_query(query: &Query, origin_filter: &mut DependencyOriginFilter) {
     struct Collector<'a> {
-        params: &'a [Value],
-        writer_filter: &'a mut DependencyWriterFilter,
+        origin_filter: &'a mut DependencyOriginFilter,
     }
 
     impl Visitor for Collector<'_> {
         type Break = ();
 
         fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
-            collect_writer_filters_from_expr(expr, self.params, self.writer_filter);
+            collect_origin_filters_from_expr(expr, self.origin_filter);
             ControlFlow::Continue(())
         }
     }
 
-    let mut collector = Collector {
-        params,
-        writer_filter,
-    };
+    let mut collector = Collector { origin_filter };
     let _ = query.visit(&mut collector);
 }
 
@@ -411,34 +404,16 @@ fn collect_literal_filters_from_expr(
     }
 }
 
-fn collect_writer_filters_from_expr(
-    expr: &Expr,
-    params: &[Value],
-    writer_filter: &mut DependencyWriterFilter,
-) {
+fn collect_origin_filters_from_expr(expr: &Expr, _origin_filter: &mut DependencyOriginFilter) {
     match expr {
         Expr::BinaryOp {
-            left,
             op: BinaryOperator::Eq,
-            right,
-        } => {
-            if let Some(value) = extract_writer_key_literal(left, right, params)
-                .or_else(|| extract_writer_key_literal(right, left, params))
-            {
-                writer_filter.include.insert(value);
-            }
-        }
+            ..
+        } => {}
         Expr::BinaryOp {
-            left,
             op: BinaryOperator::Or,
-            right,
-        } => {
-            if let Some(value) = extract_writer_key_exclusion(left, right, params)
-                .or_else(|| extract_writer_key_exclusion(right, left, params))
-            {
-                writer_filter.exclude.insert(value);
-            }
-        }
+            ..
+        } => {}
         _ => {}
     }
 }
@@ -539,55 +514,6 @@ fn add_filter_literal(
             version_ids.insert(value);
         }
     }
-}
-
-fn extract_writer_key_column(expr: &Expr) -> bool {
-    let column = match expr {
-        Expr::Identifier(identifier) => Some(identifier.value.as_str()),
-        Expr::CompoundIdentifier(identifiers) => identifiers
-            .last()
-            .map(|identifier| identifier.value.as_str()),
-        Expr::Nested(inner) => return extract_writer_key_column(inner),
-        _ => None,
-    };
-
-    matches!(
-        column.map(|value| value.to_ascii_lowercase()),
-        Some(ref value) if value == "writer_key" || value == "lixcol_writer_key"
-    )
-}
-
-fn extract_writer_key_literal(
-    column_expr: &Expr,
-    value_expr: &Expr,
-    params: &[Value],
-) -> Option<String> {
-    extract_writer_key_column(column_expr).then(|| extract_filter_literal(value_expr, params))?
-}
-
-fn extract_writer_key_exclusion(
-    null_expr: &Expr,
-    compare_expr: &Expr,
-    params: &[Value],
-) -> Option<String> {
-    let Expr::IsNull(null_inner) = null_expr else {
-        return None;
-    };
-    if !extract_writer_key_column(null_inner) {
-        return None;
-    }
-
-    let Expr::BinaryOp {
-        left,
-        op: BinaryOperator::NotEq,
-        right,
-    } = compare_expr
-    else {
-        return None;
-    };
-
-    extract_writer_key_literal(left, right, params)
-        .or_else(|| extract_writer_key_literal(right, left, params))
 }
 
 #[cfg(test)]
@@ -833,24 +759,5 @@ mod tests {
         let a = derive_dependency_spec_from_statements(&statements, &params).expect("derive a");
         let b = derive_dependency_spec_from_statements(&statements, &params).expect("derive b");
         assert_eq!(a, b);
-    }
-
-    #[test]
-    fn derive_dependency_spec_collects_writer_key_exclusion_from_null_or_not_eq_guard() {
-        let statements = parse_sql_statements(
-            "SELECT path \
-             FROM lix_file \
-             WHERE path = '/observe-writer.md' \
-               AND (lixcol_writer_key IS NULL OR lixcol_writer_key <> ?1)",
-        )
-        .expect("parse sql");
-        let spec = derive_dependency_spec_from_statements(
-            &statements,
-            &[Value::Text("writer-a".to_string())],
-        )
-        .expect("derive spec");
-
-        let filter = dependency_spec_to_state_commit_stream_filter(&spec);
-        assert_eq!(filter.exclude_writer_keys, vec!["writer-a".to_string()]);
     }
 }
