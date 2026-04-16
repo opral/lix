@@ -427,6 +427,7 @@ export type LixObserveEvents = {
                     js_error(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "observe events lock poisoned".to_string(),
+                        hint: None,
                     })
                 })?;
                 guard.take()
@@ -441,6 +442,7 @@ export type LixObserveEvents = {
                     js_error(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "observe events abort lock poisoned".to_string(),
+                        hint: None,
                     })
                 })?;
                 if self.closed.load(Ordering::SeqCst) {
@@ -456,6 +458,7 @@ export type LixObserveEvents = {
                     js_error(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "observe events abort lock poisoned".to_string(),
+                        hint: None,
                     })
                 })?;
                 guard.take();
@@ -468,6 +471,7 @@ export type LixObserveEvents = {
                         js_error(LixError {
                             code: "LIX_ERROR_JS_SDK".to_string(),
                             description: "observe events lock poisoned".to_string(),
+                            hint: None,
                         })
                     })?;
                     if self.closed.load(Ordering::SeqCst) {
@@ -493,6 +497,7 @@ export type LixObserveEvents = {
                     js_error(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "observe events lock poisoned".to_string(),
+                        hint: None,
                     })
                 })?;
                 if self.closed.load(Ordering::SeqCst) {
@@ -517,6 +522,7 @@ export type LixObserveEvents = {
                     js_error(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "observe events abort lock poisoned".to_string(),
+                        hint: None,
                     })
                 })?;
                 if let Some(abort) = guard.take() {
@@ -527,6 +533,7 @@ export type LixObserveEvents = {
                 js_error(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "observe events lock poisoned".to_string(),
+                    hint: None,
                 })
             })?;
             if let Some(mut events) = guard.take() {
@@ -653,6 +660,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "initLix keyValues must be an array".to_string(),
+                hint: None,
             });
         }
 
@@ -663,6 +671,7 @@ export type LixObserveEvents = {
                 return Err(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "initLix keyValues entries must be objects".to_string(),
+                    hint: None,
                 });
             }
 
@@ -677,7 +686,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'versionId'"
                             .to_string(),
-                });
+                            hint: None,
+                        });
             }
             if Reflect::has(&entry, &JsValue::from_str("version_id")).map_err(js_to_lix_error)? {
                 return Err(LixError {
@@ -685,7 +695,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'version_id'"
                             .to_string(),
-                });
+                            hint: None,
+                        });
             }
             if Reflect::has(&entry, &JsValue::from_str("lixcol_version_id"))
                 .map_err(js_to_lix_error)?
@@ -695,7 +706,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'lixcol_version_id'"
                             .to_string(),
-                });
+                            hint: None,
+                        });
             }
             if Reflect::has(&entry, &JsValue::from_str("global")).map_err(js_to_lix_error)? {
                 return Err(LixError {
@@ -703,7 +715,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'global'"
                             .to_string(),
-                });
+                            hint: None,
+                        });
             }
             if Reflect::has(&entry, &JsValue::from_str("untracked")).map_err(js_to_lix_error)? {
                 return Err(LixError {
@@ -711,7 +724,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_untracked' instead of 'untracked'"
                             .to_string(),
-                });
+                            hint: None,
+                        });
             }
 
             let lixcol_global = read_optional_bool_property_with_context(
@@ -744,6 +758,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "createVersion options must be an object".to_string(),
+                hint: None,
             });
         }
 
@@ -790,6 +805,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "observe query must be an object".to_string(),
+                hint: None,
             });
         }
         let sql = read_required_string_property(&input, "sql", "observe query")?;
@@ -806,6 +822,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "observe query.params must be an array".to_string(),
+                hint: None,
             });
         };
         Ok(EngineObserveQuery { sql, params })
@@ -825,6 +842,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: format!("{context} options must be an object"),
+                hint: None,
             });
         }
         if Reflect::has(&input, &JsValue::from_str("writer_key")).map_err(js_to_lix_error)? {
@@ -833,6 +851,7 @@ export type LixObserveEvents = {
                 description: format!(
                     "{context} options must use 'writerKey' instead of 'writer_key'"
                 ),
+                hint: None,
             });
         }
 
@@ -854,6 +873,7 @@ export type LixObserveEvents = {
             .ok_or_else(|| LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: format!("{context}.{key} must be a boolean"),
+                hint: None,
             })
             .map(Some)
     }
@@ -965,6 +985,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: format!("{context}.{key} must be a non-empty string"),
+                hint: None,
             });
         }
         Ok(text)
@@ -982,6 +1003,7 @@ export type LixObserveEvents = {
         let text = value.as_string().ok_or_else(|| LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: format!("{context}.{key} must be a string"),
+            hint: None,
         })?;
         if text.trim().is_empty() {
             return Ok(None);
@@ -998,11 +1020,13 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: format!("{context} must be JSON-serializable"),
+                hint: None,
             });
         };
         serde_json::from_str(&json_text).map_err(|error| LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: format!("{context} invalid JSON value: {error}"),
+            hint: None,
         })
     }
 
@@ -1010,6 +1034,7 @@ export type LixObserveEvents = {
         let json_text = serde_json::to_string(value).map_err(|error| LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: format!("failed to serialize JSON value for wasm bridge: {error}"),
+            hint: None,
         })?;
         js_sys::JSON::parse(&json_text).map_err(js_to_lix_error)
     }
@@ -1039,6 +1064,7 @@ export type LixObserveEvents = {
                 return Err(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "plugin wasm bytes are empty".to_string(),
+                    hint: None,
                 });
             }
 
@@ -1057,7 +1083,8 @@ export type LixObserveEvents = {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "wasmRuntime.initComponent returned no component instance"
                         .to_string(),
-                });
+                        hint: None,
+                    });
             }
 
             Ok(Arc::new(JsHostWasmComponentInstance {
@@ -1101,6 +1128,7 @@ export type LixObserveEvents = {
         JsBackend::get_optional_method(target, name)?.ok_or_else(|| LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: format!("{context} is required"),
+            hint: None,
         })
     }
 
@@ -1149,6 +1177,7 @@ export type LixObserveEvents = {
         Err(LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: format!("{context} must be Uint8Array or ArrayBuffer"),
+            hint: None,
         })
     }
 
@@ -1205,6 +1234,7 @@ export type LixObserveEvents = {
             let func = Self::get_optional_method(target, "execute")?.ok_or_else(|| LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "backend.execute is required".to_string(),
+                hint: None,
             })?;
             let js_params = Array::new();
             for param in params {
@@ -1268,7 +1298,8 @@ export type LixObserveEvents = {
                     description:
                         "backend.beginTransaction is required; raw SQL transaction control is not supported"
                             .to_string(),
-                })?;
+                            hint: None,
+                        })?;
             let transaction = begin_transaction
                 .call1(
                     &self.backend,
@@ -1284,6 +1315,7 @@ export type LixObserveEvents = {
                 return Err(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "beginTransaction() returned no transaction object".to_string(),
+                    hint: None,
                 });
             }
             Ok(Box::new(JsTransaction {
@@ -1315,6 +1347,7 @@ export type LixObserveEvents = {
                 .ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "backend.export_image is required for export_image".to_string(),
+                    hint: None,
                 })?;
             let result = export_image.call0(&self.backend).map_err(js_to_lix_error)?;
             let resolved = Self::await_if_promise(result).await?;
@@ -1348,6 +1381,7 @@ export type LixObserveEvents = {
                 return Err(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "transaction is already closed".to_string(),
+                    hint: None,
                 });
             }
             match &self.kind {
@@ -1368,6 +1402,7 @@ export type LixObserveEvents = {
                         .ok_or_else(|| LixError {
                             code: "LIX_ERROR_JS_SDK".to_string(),
                             description: "transaction.commit is required".to_string(),
+                            hint: None,
                         })?;
                     let result = commit.call0(transaction).map_err(js_to_lix_error)?;
                     JsBackend::await_if_promise(result).await?;
@@ -1392,6 +1427,7 @@ export type LixObserveEvents = {
                         .ok_or_else(|| LixError {
                             code: "LIX_ERROR_JS_SDK".to_string(),
                             description: "transaction.rollback is required".to_string(),
+                            hint: None,
                         })?;
                     let result = rollback.call0(transaction).map_err(js_to_lix_error)?;
                     JsBackend::await_if_promise(result).await?;
@@ -1419,6 +1455,7 @@ export type LixObserveEvents = {
         LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: js_value_to_string(&value),
+            hint: None,
         }
     }
 
@@ -1427,6 +1464,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "query result must be an object".to_string(),
+                hint: None,
             });
         }
 
@@ -1441,6 +1479,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "query result 'rows' must be an array".to_string(),
+                hint: None,
             });
         }
 
@@ -1451,6 +1490,7 @@ export type LixObserveEvents = {
                 return Err(LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "query result rows must be arrays".to_string(),
+                    hint: None,
                 });
             }
             let row_array = Array::from(&row);
@@ -1472,6 +1512,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "query result 'columns' must be an array of strings".to_string(),
+                hint: None,
             });
         }
 
@@ -1480,6 +1521,7 @@ export type LixObserveEvents = {
             columns.push(column.as_string().ok_or_else(|| LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "query result 'columns' must be an array of strings".to_string(),
+                hint: None,
             })?);
         }
 
@@ -1495,6 +1537,7 @@ export type LixObserveEvents = {
             return Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: "SQL value must be a canonical LixValue object".to_string(),
+                hint: None,
             });
         }
 
@@ -1503,6 +1546,7 @@ export type LixObserveEvents = {
         let kind = kind_value.as_string().ok_or_else(|| LixError {
             code: "LIX_ERROR_JS_SDK".to_string(),
             description: "SQL value kind must be a string".to_string(),
+            hint: None,
         })?;
 
         match kind.as_str() {
@@ -1515,6 +1559,7 @@ export type LixObserveEvents = {
                     Err(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "LixValue 'null' must contain value: null".to_string(),
+                        hint: None,
                     })
                 }
             }
@@ -1524,6 +1569,7 @@ export type LixObserveEvents = {
                 let parsed = raw.as_bool().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'bool' must contain a boolean 'value'".to_string(),
+                    hint: None,
                 })?;
                 Ok(WireValue::Bool { value: parsed })
             }
@@ -1533,17 +1579,20 @@ export type LixObserveEvents = {
                 let parsed = raw.as_f64().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'int' must contain a numeric 'value'".to_string(),
+                    hint: None,
                 })?;
                 if !parsed.is_finite() || parsed.fract() != 0.0 {
                     return Err(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "LixValue 'int' must be a finite integer number".to_string(),
+                        hint: None,
                     });
                 }
                 if parsed < i64::MIN as f64 || parsed > i64::MAX as f64 {
                     return Err(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "LixValue 'int' is outside i64 range".to_string(),
+                        hint: None,
                     });
                 }
                 Ok(WireValue::Int {
@@ -1556,11 +1605,13 @@ export type LixObserveEvents = {
                 let parsed = raw.as_f64().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'float' must contain a numeric 'value'".to_string(),
+                    hint: None,
                 })?;
                 if !parsed.is_finite() {
                     return Err(LixError {
                         code: "LIX_ERROR_JS_SDK".to_string(),
                         description: "LixValue 'float' must be a finite number".to_string(),
+                        hint: None,
                     });
                 }
                 Ok(WireValue::Float { value: parsed })
@@ -1571,6 +1622,7 @@ export type LixObserveEvents = {
                 let parsed = raw.as_string().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'text' must contain a string 'value'".to_string(),
+                    hint: None,
                 })?;
                 Ok(WireValue::Text { value: parsed })
             }
@@ -1587,12 +1639,14 @@ export type LixObserveEvents = {
                 let base64 = raw.as_string().ok_or_else(|| LixError {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "LixValue 'blob' must contain a string 'base64'".to_string(),
+                    hint: None,
                 })?;
                 Ok(WireValue::Blob { base64 })
             }
             _ => Err(LixError {
                 code: "LIX_ERROR_JS_SDK".to_string(),
                 description: format!("unsupported LixValue kind '{kind}'"),
+                hint: None,
             }),
         }
     }
@@ -1686,8 +1740,31 @@ export type LixObserveEvents = {
         Ok(obj.into())
     }
 
-    fn js_error(value: impl std::fmt::Display) -> JsValue {
-        JsValue::from_str(&value.to_string())
+    /// Convert a [`LixError`] into a JS-side `Error` instance that carries
+    /// structured fields alongside the textual message.
+    ///
+    /// Fields exposed on the thrown `Error`:
+    /// - `message` — the error's `description` (conventional `Error.message`)
+    /// - `code` — the engine's machine-readable error code (e.g.
+    ///   `"LIX_ERROR_UNKNOWN"`)
+    /// - `hint` — an actionable recovery suggestion when the engine produced
+    ///   one, otherwise absent. Consumers render this alongside the message
+    ///   (e.g. as `hint: <text>` in a CLI, secondary text in a UI).
+    fn js_error(error: LixError) -> JsValue {
+        let js_err = js_sys::Error::new(&error.description);
+        let _ = Reflect::set(
+            &js_err,
+            &JsValue::from_str("code"),
+            &JsValue::from_str(&error.code),
+        );
+        if let Some(hint) = error.hint.as_deref() {
+            let _ = Reflect::set(
+                &js_err,
+                &JsValue::from_str("hint"),
+                &JsValue::from_str(hint),
+            );
+        }
+        js_err.into()
     }
 
     fn js_value_to_string(value: &JsValue) -> String {

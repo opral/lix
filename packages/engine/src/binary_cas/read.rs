@@ -92,6 +92,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                 "binary CAS read: invalid negative manifest values for blob hash '{}'",
                 blob_hash
             ),
+            hint: None,
         });
     }
 
@@ -116,6 +117,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
             "binary CAS read: chunk count out of range for blob hash '{}'",
             blob_hash
         ),
+        hint: None,
     })?;
     if chunk_rows.rows.len() != expected_chunk_count {
         return Err(LixError {
@@ -126,6 +128,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                 expected_chunk_count,
                 chunk_rows.rows.len()
             ),
+            hint: None,
         });
     }
 
@@ -141,6 +144,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                     "binary CAS read: unexpected chunk order for blob hash '{}': expected index {}, got {}",
                     blob_hash, expected_index, chunk_index
                 ),
+                hint: None,
             });
         }
         if chunk_size < 0 {
@@ -150,6 +154,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                     "binary CAS read: invalid negative chunk size for blob hash '{}' chunk '{}'",
                     blob_hash, chunk_hash
                 ),
+                hint: None,
             });
         }
         let chunk_data =
@@ -159,6 +164,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                     "binary CAS read: missing chunk payload for blob hash '{}' chunk '{}'",
                     blob_hash, chunk_hash
                 ),
+                hint: None,
             })?;
         let codec = nullable_text(row, 4, "codec", "binary CAS read chunk row")?;
         let expected_chunk_size = usize::try_from(chunk_size).map_err(|_| LixError {
@@ -167,6 +173,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                 "binary CAS read: chunk size out of range for blob hash '{}' chunk '{}': {}",
                 blob_hash, chunk_hash, chunk_size
             ),
+            hint: None,
         })?;
         let decoded_chunk_data = decode_binary_chunk_payload(
             &chunk_data,
@@ -186,6 +193,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                     chunk_size,
                     decoded_chunk_data.len()
                 ),
+                hint: None,
             });
         }
         reconstructed.extend_from_slice(&decoded_chunk_data);
@@ -200,6 +208,7 @@ pub(crate) async fn load_binary_blob_data_by_hash(
                 manifest_size_bytes,
                 reconstructed.len()
             ),
+            hint: None,
         });
     }
 
@@ -216,6 +225,7 @@ fn text_required(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{context}: row missing column '{column}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -225,6 +235,7 @@ fn text_required(
             description: format!(
                 "{context}: expected text column '{column}' at index {index}, got {other:?}"
             ),
+            hint: None,
         }),
     }
 }
@@ -239,6 +250,7 @@ fn nullable_text(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{context}: row missing column '{column}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -249,6 +261,7 @@ fn nullable_text(
             description: format!(
                 "{context}: expected nullable text column '{column}' at index {index}, got {other:?}"
             ),
+            hint: None,
         }),
     }
 }
@@ -258,6 +271,7 @@ fn i64_required(row: &[Value], index: usize, column: &str, context: &str) -> Res
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{context}: row missing column '{column}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -267,6 +281,7 @@ fn i64_required(row: &[Value], index: usize, column: &str, context: &str) -> Res
             description: format!(
                 "{context}: expected integer column '{column}' at index {index}, got {other:?}"
             ),
+            hint: None,
         }),
     }
 }
@@ -281,6 +296,7 @@ fn blob_required(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("{context}: row missing column '{column}' at index {index}"),
+            hint: None,
         });
     };
     match value {
@@ -290,6 +306,7 @@ fn blob_required(
             description: format!(
                 "{context}: expected blob column '{column}' at index {index}, got {other:?}"
             ),
+            hint: None,
         }),
     }
 }

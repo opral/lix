@@ -1,6 +1,5 @@
 fn main() {
-    if let Err(error) = lix_cli::run() {
-        eprintln!("{error}");
+    if lix_cli::run().is_err() {
         std::process::exit(1);
     }
 }

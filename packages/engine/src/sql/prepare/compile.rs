@@ -188,6 +188,7 @@ async fn compile_execution_with_context(
                 "compile_execution filesystem effect collection failed: {}",
                 error.description
             ),
+            hint: None,
         })?
     };
 
@@ -206,6 +207,7 @@ async fn compile_execution_with_context(
                     "compile_execution public execution finalization failed: {}",
                     error.description
                 ),
+                hint: None,
             })?;
         }
     }
@@ -241,6 +243,7 @@ async fn compile_execution_with_context(
                 "compile_execution direct compilation failed: {}",
                 error.description
             ),
+            hint: None,
         })?;
         let direct_logical_planning_duration = direct_logical_planning_started.elapsed();
         let preprocess: PlannedStatementSet =

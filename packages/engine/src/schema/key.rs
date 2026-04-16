@@ -29,6 +29,7 @@ pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixEr
     let object = schema.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "schema definition must be a JSON object".to_string(),
+        hint: None,
     })?;
     let schema_key = object
         .get("x-lix-key")
@@ -36,6 +37,7 @@ pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixEr
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "schema definition must include string x-lix-key".to_string(),
+            hint: None,
         })?;
     let schema_version = object
         .get("x-lix-version")
@@ -43,6 +45,7 @@ pub fn schema_key_from_definition(schema: &JsonValue) -> Result<SchemaKey, LixEr
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "schema definition must include string x-lix-version".to_string(),
+            hint: None,
         })?;
 
     Ok(SchemaKey::new(
@@ -57,10 +60,12 @@ pub fn schema_from_registered_snapshot(
     let value = snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "registered schema snapshot_content missing value".to_string(),
+        hint: None,
     })?;
     let value = value.as_object().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "registered schema snapshot_content value must be an object".to_string(),
+        hint: None,
     })?;
 
     let schema_key = value
@@ -69,6 +74,7 @@ pub fn schema_from_registered_snapshot(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "registered schema value.x-lix-key must be string".to_string(),
+            hint: None,
         })?;
     let schema_version = value
         .get("x-lix-version")
@@ -76,6 +82,7 @@ pub fn schema_from_registered_snapshot(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "registered schema value.x-lix-version must be string".to_string(),
+            hint: None,
         })?;
 
     Ok((

@@ -1062,6 +1062,7 @@ fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
     crate::LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
+        hint: None,
     }
 }
 

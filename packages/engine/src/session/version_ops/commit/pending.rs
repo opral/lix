@@ -437,5 +437,6 @@ pub(crate) fn create_commit_error_to_lix_error(error: CreateCommitError) -> LixE
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.message,
+        hint: None,
     }
 }

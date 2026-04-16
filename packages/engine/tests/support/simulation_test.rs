@@ -290,11 +290,13 @@ pub fn build_test_plugin_archive(
         serde_json::from_str(manifest_json).map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("test plugin manifest must be valid JSON: {error}"),
+            hint: None,
         })?;
     {
         let manifest_object = manifest_value.as_object_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "test plugin manifest must be a JSON object".to_string(),
+            hint: None,
         })?;
 
         if !manifest_object.contains_key("entry") {
@@ -316,6 +318,7 @@ pub fn build_test_plugin_archive(
     let normalized_manifest = serde_json::to_vec(&manifest_value).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("failed to normalize test plugin manifest JSON: {error}"),
+        hint: None,
     })?;
     let schemas = manifest_value
         .get("schemas")
@@ -323,12 +326,14 @@ pub fn build_test_plugin_archive(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "test plugin manifest schemas must be an array".to_string(),
+            hint: None,
         })?
         .iter()
         .map(|value| {
             value.as_str().map(str::to_string).ok_or_else(|| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "test plugin manifest schemas must contain string paths".to_string(),
+                hint: None,
             })
         })
         .collect::<Result<Vec<_>, LixError>>()?;
@@ -340,12 +345,14 @@ pub fn build_test_plugin_archive(
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to start manifest.json in test plugin archive: {error}"),
+            hint: None,
         })?;
     writer
         .write_all(&normalized_manifest)
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to write manifest.json in test plugin archive: {error}"),
+            hint: None,
         })?;
 
     writer
@@ -353,10 +360,12 @@ pub fn build_test_plugin_archive(
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to start plugin.wasm in test plugin archive: {error}"),
+            hint: None,
         })?;
     writer.write_all(wasm_bytes).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("failed to write plugin.wasm in test plugin archive: {error}"),
+        hint: None,
     })?;
 
     for schema_path in &schemas {
@@ -367,6 +376,7 @@ pub fn build_test_plugin_archive(
                 description: format!(
                     "failed to start schema '{schema_path}' in test plugin archive: {error}"
                 ),
+                hint: None,
             })?;
         writer
             .write_all(DEFAULT_TEST_SCHEMA_JSON.as_bytes())
@@ -375,6 +385,7 @@ pub fn build_test_plugin_archive(
                 description: format!(
                     "failed to write schema '{schema_path}' in test plugin archive: {error}"
                 ),
+                hint: None,
             })?;
     }
 
@@ -384,6 +395,7 @@ pub fn build_test_plugin_archive(
         .map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to finish test plugin archive: {error}"),
+            hint: None,
         })
 }
 

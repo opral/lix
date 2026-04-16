@@ -123,6 +123,7 @@ pub(crate) async fn rebuild_file_payloads_with_plugins(
                         dedupe_key.0,
                         dedupe_key.1
                     ),
+                    hint: None,
                 });
             }
 
@@ -157,6 +158,7 @@ pub(crate) async fn rebuild_file_payloads_with_plugins(
                             "plugin materialization: missing builtin binary blob payload for hash '{}' (file_id='{}' version_id='{}')",
                             blob_ref.blob_hash, descriptor.file_id, descriptor.version_id
                         ),
+                        hint: None,
                     })?;
                 crate::live_state::upsert_file_payload_cache_data(
                     backend,
@@ -196,6 +198,7 @@ pub(crate) async fn rebuild_file_payloads_with_plugins(
             description: format!(
                 "plugin materialization: failed to encode apply-changes payload: {error}"
             ),
+            hint: None,
         })?;
         let output = plugin_materializer
             .apply_plugin_changes(plugin, &payload)
@@ -241,6 +244,7 @@ fn parse_builtin_binary_blob_ref_snapshot(
         description: format!(
             "plugin materialization: builtin binary fallback snapshot_content is invalid JSON: {error}"
         ),
+        hint: None,
     })
 }
 
@@ -259,6 +263,7 @@ fn builtin_binary_blob_ref_from_changes(
                     "plugin materialization: builtin binary fallback schema version mismatch for file '{}' (got '{}', expected '{}')",
                     file_id, change.schema_version, BUILTIN_BINARY_BLOB_REF_SCHEMA_VERSION
                 ),
+                hint: None,
             });
         }
         let Some(raw_snapshot) = change.snapshot_content.as_deref() else {
@@ -272,6 +277,7 @@ fn builtin_binary_blob_ref_from_changes(
                     "plugin materialization: builtin binary fallback snapshot id '{}' does not match file_id '{}'",
                     parsed.id, file_id
                 ),
+                hint: None,
             });
         }
         return Ok(Some(parsed));

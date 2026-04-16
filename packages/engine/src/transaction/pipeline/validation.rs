@@ -655,6 +655,7 @@ async fn validate_prepared_public_write(
         .ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "planned write validation requires a resolved write plan".to_string(),
+            hint: None,
         })?;
     let mut schema_provider = WriteValidationSchemaLookup::from_backend(backend);
     schema_provider.remember_pending_registered_schemas_from_view(pending_overlay)?;
@@ -1368,6 +1369,7 @@ async fn validate_snapshot_content(
                 "snapshot_content does not match schema '{}' ({}): {details}",
                 key.schema_key, key.schema_version
             ),
+            hint: None,
         });
     }
 
@@ -1407,18 +1409,21 @@ async fn validate_planned_row(
                     "registered schema entity_id '{}' must match '{}'",
                     row.entity_id, expected_entity_id
                 ),
+                hint: None,
             });
         }
         if actual_file_id.is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "registered schema file_id must be NULL".to_string(),
+                hint: None,
             });
         }
         if actual_plugin_key.is_some() {
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "registered schema plugin_key must be NULL".to_string(),
+                hint: None,
             });
         }
         if actual_schema_version != key.schema_version {
@@ -1428,6 +1433,7 @@ async fn validate_planned_row(
                     "registered schema row schema_version '{}' must match '{}'",
                     actual_schema_version, key.schema_version
                 ),
+                hint: None,
             });
         }
         provider.remember_pending_schema(key, schema);
@@ -1475,6 +1481,7 @@ fn extract_registered_schema_value(snapshot: &JsonValue) -> Result<&JsonValue, L
     snapshot.get("value").ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "registered schema snapshot_content missing value".to_string(),
+        hint: None,
     })
 }
 
@@ -1541,6 +1548,7 @@ async fn validate_filesystem_snapshot_integrity(
             description:
                 "lix_binary_blob_ref integrity violation: snapshot_content missing blob_hash"
                     .to_string(),
+            hint: None,
         })?;
 
     let is_planned_blob = planned_binary_blob_hashes
@@ -1555,6 +1563,7 @@ async fn validate_filesystem_snapshot_integrity(
                 "lix_binary_blob_ref integrity violation: blob_hash '{}' is missing from binary CAS",
                 blob_hash
             ),
+            hint: None,
         });
     }
 
@@ -1585,6 +1594,7 @@ async fn validate_registered_schema_insert(
     let snapshot = row.snapshot_content.as_ref().ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "registered schema insert requires snapshot_content".to_string(),
+        hint: None,
     })?;
     validate_registered_schema_snapshot(provider, snapshot, &row.version_id).await?;
 
@@ -1609,6 +1619,7 @@ async fn validate_foreign_key_reference_targets(
                 description: format!(
                     "foreign key at index {index} missing references object in schema definition"
                 ),
+                hint: None,
             })?;
         let referenced_key = references
             .get("schemaKey")
@@ -1618,6 +1629,7 @@ async fn validate_foreign_key_reference_targets(
                 description: format!(
                     "foreign key at index {index} references.schemaKey must be a string"
                 ),
+                hint: None,
             })?;
         let referenced_properties = references
             .get("properties")
@@ -1627,6 +1639,7 @@ async fn validate_foreign_key_reference_targets(
                 description: format!(
                     "foreign key at index {index} references.properties must be an array"
                 ),
+                hint: None,
             })?;
 
         let referenced_properties: Vec<String> = referenced_properties
@@ -1649,6 +1662,7 @@ async fn validate_foreign_key_reference_targets(
                     "foreign key at index {index} references properties that are not a primary key or unique key on schema '{}'",
                     referenced_key
                 ),
+                hint: None,
             });
         }
     }
@@ -2567,6 +2581,7 @@ async fn load_compiled_schema(
             "failed to compile schema '{}' ({}): {err}",
             key.schema_key, key.schema_version
         ),
+        hint: None,
     })?;
     let compiled = Arc::new(compiled);
 
@@ -2616,6 +2631,7 @@ fn planned_row_required_text(row: &PlannedStateRow, name: &str) -> Result<String
     value.ok_or_else(|| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("planned write validation requires text-compatible '{name}'"),
+        hint: None,
     })
 }
 
@@ -2656,6 +2672,7 @@ fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixE
                     "snapshot_content for schema '{}' is not valid JSON during planned write validation: {err}",
                     row.schema_key
                 ),
+                hint: None,
             }),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -2663,6 +2680,7 @@ fn planned_row_snapshot(row: &PlannedStateRow) -> Result<Option<JsonValue>, LixE
                 "snapshot_content for schema '{}' must be JSON, text, or null during planned write validation, got {other:?}",
                 row.schema_key
             ),
+            hint: None,
         }),
     }
 }
@@ -2704,6 +2722,7 @@ fn apply_snapshot_patch(
             "snapshot_content for schema '{}' must be a JSON object for property update validation",
             schema_key
         ),
+        hint: None,
     })?;
     for (property, value) in patch {
         object.insert(property.clone(), value.clone());
@@ -2738,6 +2757,7 @@ async fn validate_entity_id_matches_primary_key(
                 "schema '{}' ({}) has non-string x-lix-primary-key entry",
                 key.schema_key, key.schema_version
             ),
+            hint: None,
         })?;
         let pointer_path = parse_json_pointer(pointer)?;
         if pointer_path.is_empty() {
@@ -2747,6 +2767,7 @@ async fn validate_entity_id_matches_primary_key(
                     "schema '{}' ({}) has invalid empty x-lix-primary-key pointer",
                     key.schema_key, key.schema_version
                 ),
+                hint: None,
             });
         }
         pointer_labels.push(pointer.to_string());
@@ -2782,6 +2803,7 @@ async fn validate_entity_id_matches_primary_key(
                 "entity_id '{}' is inconsistent for schema '{}' ({}): expected '{}'",
                 entity_id, key.schema_key, key.schema_version, expected
             ),
+            hint: None,
         });
     }
 
@@ -2796,6 +2818,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("invalid JSON pointer '{pointer}'"),
+            hint: None,
         });
     }
     pointer[1..]
@@ -2816,6 +2839,7 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                     return Err(LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("invalid JSON pointer segment '{segment}'"),
+                        hint: None,
                     });
                 }
             }

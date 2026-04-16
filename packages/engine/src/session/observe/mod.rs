@@ -816,6 +816,7 @@ fn build_observe_state(
             return Err(LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "observe shared source is closed".to_string(),
+                hint: None,
             });
         }
         shared.register_subscriber()
@@ -838,6 +839,7 @@ fn observe_source_key_for_session(
     let options = serde_json::to_string(options).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("failed to serialize observe options for dedup key: {error}"),
+        hint: None,
     })?;
     Ok(format!(
         "{}\n--runtime:{}\n--observe-options:{options}",
@@ -885,6 +887,7 @@ fn observe_source_key(query: &ObserveQuery) -> Result<String, LixError> {
     let params = serde_json::to_string(&wire_params).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("failed to serialize observe wire params for dedup key: {error}"),
+        hint: None,
     })?;
     Ok(format!("{}\n--params:{params}", query.sql))
 }
@@ -940,6 +943,7 @@ fn build_shared_observe_source(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "observe requires one or more SELECT statements".to_string(),
+            hint: None,
         });
     }
 
@@ -1010,6 +1014,7 @@ fn lock_observe_registry<'a>(
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "observe shared source registry lock poisoned".to_string(),
+            hint: None,
         })
 }
 
@@ -1023,6 +1028,7 @@ fn lock_shared_source<'a>(
     source.lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "observe shared source lock poisoned".to_string(),
+        hint: None,
     })
 }
 
@@ -1084,6 +1090,7 @@ async fn observe_ticks_since(
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description:
                 "failed to read observe tick sequence: row has no tick_seq column".to_string(),
+            hint: None,
         })?)?;
 
         let origin_key =
@@ -1093,6 +1100,7 @@ async fn observe_ticks_since(
                     description:
                         "failed to read observe tick origin key: row has no origin_key column"
                             .to_string(),
+                    hint: None,
                 })?,
             )?;
 
@@ -1111,10 +1119,12 @@ fn parse_observe_tick_seq(value: &Value) -> Result<i64, LixError> {
         Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to parse observe tick sequence text: {error}"),
+            hint: None,
         }),
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to parse observe tick sequence value: {other:?}"),
+            hint: None,
         }),
     }
 }
@@ -1126,6 +1136,7 @@ fn parse_observe_tick_origin_key(value: &Value) -> Result<Option<String>, LixErr
         other => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("failed to parse observe tick origin key value: {other:?}"),
+            hint: None,
         }),
     }
 }
