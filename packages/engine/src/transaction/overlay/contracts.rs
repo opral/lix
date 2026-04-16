@@ -31,6 +31,7 @@ pub struct PendingFilesystemFileView {
     pub untracked: bool,
     pub descriptor: Option<PendingFilesystemDescriptorView>,
     pub metadata_patch: OptionalTextPatch,
+    pub data: Option<Vec<u8>>,
     pub deleted: bool,
 }
 

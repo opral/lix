@@ -2,6 +2,19 @@ use crate::support;
 
 use futures_util::FutureExt;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Value};
+use std::io::{Cursor, Write};
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipWriter};
+
+const DEFAULT_PLUGIN_SCHEMA_PATH: &str = "schema/plugin_json_schema.json";
+const DEFAULT_PLUGIN_SCHEMA_JSON: &str = r#"{
+  "x-lix-key":"plugin_json_schema",
+  "x-lix-version":"1",
+  "type":"object",
+  "properties":{"value":{"type":"string"}},
+  "required":["value"],
+  "additionalProperties":false
+}"#;
 
 fn deterministic_uuid(counter: i64) -> String {
     let counter_bits = (counter as u64) & 0x0000_FFFF_FFFF_FFFF;
@@ -94,6 +107,79 @@ async fn register_state_history_test_schema(engine: &support::simulation_test::S
         )
         .await
         .unwrap();
+}
+
+async fn register_tx_file_owner_schema(engine: &support::simulation_test::SimulatedLix) {
+    engine
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"tx_file_owner_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+async fn register_tx_plugin_owner_schema(engine: &support::simulation_test::SimulatedLix) {
+    engine
+        .execute(
+            "INSERT INTO lix_registered_schema (value) VALUES (\
+             lix_json('{\"x-lix-key\":\"tx_plugin_owner_schema\",\"x-lix-version\":\"1\",\"x-lix-primary-key\":[\"/id\"],\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}')\
+             )",
+            &[],
+        )
+        .await
+        .unwrap();
+}
+
+fn build_archive(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let cursor = Cursor::new(Vec::new());
+    let mut writer = ZipWriter::new(cursor);
+    for (path, bytes) in entries {
+        writer
+            .start_file(*path, options)
+            .expect("archive start_file should succeed");
+        writer
+            .write_all(bytes)
+            .expect("archive entry write should succeed");
+    }
+    writer
+        .finish()
+        .expect("archive finish should succeed")
+        .into_inner()
+}
+
+fn build_plugin_archive(
+    manifest_json: &str,
+    wasm_bytes: &[u8],
+    schema_entries: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut entries = Vec::<(&str, Vec<u8>)>::new();
+    entries.push(("manifest.json", manifest_json.as_bytes().to_vec()));
+    entries.push(("plugin.wasm", wasm_bytes.to_vec()));
+    for (path, schema_json) in schema_entries {
+        entries.push((path, schema_json.as_bytes().to_vec()));
+    }
+    let owned_entries = entries
+        .iter()
+        .map(|(path, bytes)| (*path, bytes.as_slice()))
+        .collect::<Vec<_>>();
+    build_archive(&owned_entries)
+}
+
+fn plugin_manifest_json(key: &str) -> String {
+    format!(
+        r#"{{
+  "key":"{key}",
+  "runtime":"wasm-component-v1",
+  "api_version":"0.1.0",
+  "match":{{"path_glob":"*.json"}},
+  "entry":"plugin.wasm",
+  "schemas":["{DEFAULT_PLUGIN_SCHEMA_PATH}"]
+}}"#
+    )
 }
 
 async fn active_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
@@ -266,7 +352,7 @@ simulation_test!(
                         "INSERT INTO lix_state_by_version (\
                          entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                          ) VALUES (\
-                         'entity-1', 'tx_validation_schema', 'file-1', lix_active_version_id(), NULL, '{\"missing\":\"field\"}', '1'\
+                         'entity-1', 'tx_validation_schema', NULL, lix_active_version_id(), NULL, '{\"missing\":\"field\"}', '1'\
                          )",
                         &[],
                     )
@@ -288,6 +374,220 @@ simulation_test!(
 );
 
 simulation_test!(
+    transaction_path_rejects_missing_file_owner_reference,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+        register_tx_file_owner_schema(&engine).await;
+
+        let error = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-1', 'tx_file_owner_schema', 'missing-owner-file', lix_active_version_id(), NULL, '{\"id\":\"entity-1\",\"name\":\"hello\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("missing file owner reference should fail validation");
+
+        assert!(
+            error
+                .description
+                .contains("file ownership validation failed for schema 'tx_file_owner_schema'"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            error.description.contains("missing-owner-file"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            !error
+                .description
+                .to_ascii_lowercase()
+                .contains("foreign key"),
+            "owner validation should fail before backend FK errors: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_accepts_file_owner_reference_created_earlier_in_same_transaction,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+        register_tx_file_owner_schema(&engine).await;
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_file (id, path, data) \
+                         VALUES ('tx-owned-file', '/tx-owned-file.md', lix_text_encode('hello'))",
+                        &[],
+                    )
+                    .await?;
+                    tx.execute(
+                        "INSERT INTO lix_state_by_version (\
+                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                         ) VALUES (\
+                         'entity-1', 'tx_file_owner_schema', 'tx-owned-file', lix_active_version_id(), NULL, '{\"id\":\"entity-1\",\"name\":\"hello\"}', '1'\
+                         )",
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .expect("same-transaction file owner reference should validate");
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, file_id \
+                 FROM lix_state_by_version \
+                 WHERE entity_id = 'entity-1' \
+                   AND schema_key = 'tx_file_owner_schema'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            rows.statements[0].rows[0],
+            vec![
+                Value::Text("entity-1".to_string()),
+                Value::Text("tx-owned-file".to_string())
+            ]
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_rejects_missing_plugin_owner_reference,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+        register_tx_plugin_owner_schema(&engine).await;
+
+        let error = engine
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'entity-1', 'tx_plugin_owner_schema', NULL, lix_active_version_id(), 'missing-plugin', '{\"id\":\"entity-1\",\"name\":\"hello\"}', '1'\
+                 )",
+                &[],
+            )
+            .await
+            .expect_err("missing plugin owner reference should fail validation");
+
+        assert!(
+            error
+                .description
+                .contains("plugin ownership validation failed for schema 'tx_plugin_owner_schema'"),
+            "unexpected error: {}",
+            error.description
+        );
+        assert!(
+            error.description.contains("missing-plugin"),
+            "unexpected error: {}",
+            error.description
+        );
+        let lowered = error.description.to_ascii_lowercase();
+        assert!(
+            !lowered.contains("foreign key"),
+            "owner validation should fail before backend FK errors: {}",
+            error.description
+        );
+        assert!(
+            !lowered.contains("plugin materialization"),
+            "owner validation should fail before plugin runtime/materialization errors: {}",
+            error.description
+        );
+    }
+);
+
+simulation_test!(
+    transaction_path_accepts_plugin_owner_reference_created_earlier_in_same_transaction,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+        register_tx_plugin_owner_schema(&engine).await;
+
+        let archive = build_plugin_archive(
+            &plugin_manifest_json("plugin_json"),
+            &[0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00],
+            &[(DEFAULT_PLUGIN_SCHEMA_PATH, DEFAULT_PLUGIN_SCHEMA_JSON)],
+        );
+
+        engine
+            .transaction(ExecuteOptions::default(), |tx| {
+                let archive = archive.clone();
+                Box::pin(async move {
+                    tx.execute(
+                        "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                         VALUES ('lix_plugin_archive::plugin_json', '/.lix/plugins/plugin_json.lixplugin', $1, 'global')",
+                        &[Value::Blob(archive)],
+                    )
+                    .await?;
+                    tx.execute(
+                        "INSERT INTO lix_state_by_version (\
+                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                         ) VALUES (\
+                         'entity-1', 'tx_plugin_owner_schema', NULL, lix_active_version_id(), 'plugin_json', '{\"id\":\"entity-1\",\"name\":\"hello\"}', '1'\
+                         )",
+                        &[],
+                    )
+                    .await?;
+                    Ok::<_, lix_engine::LixError>(())
+                })
+            })
+            .await
+            .expect("same-transaction plugin owner reference should validate");
+
+        let rows = engine
+            .execute(
+                "SELECT entity_id, plugin_key \
+                 FROM lix_state_by_version \
+                 WHERE entity_id = 'entity-1' \
+                   AND schema_key = 'tx_plugin_owner_schema'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 1);
+        assert_eq!(
+            rows.statements[0].rows[0],
+            vec![
+                Value::Text("entity-1".to_string()),
+                Value::Text("plugin_json".to_string())
+            ]
+        );
+    }
+);
+
+simulation_test!(
     transaction_path_executes_direct_state_history_reads,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -303,7 +603,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'tx-history-entity', 'tx_state_history_schema', 'f0', NULL, '1', '{\"value\":\"initial\"}'\
+                 'tx-history-entity', 'tx_state_history_schema', NULL, NULL, '1', '{\"value\":\"initial\"}'\
                  )",
                 &[],
             )
@@ -906,7 +1206,7 @@ simulation_test!(
                 "INSERT INTO lix_state (\
                  entity_id, schema_key, file_id, plugin_key, schema_version, snapshot_content\
                  ) VALUES (\
-                 'tx-history-midpoint', 'tx_state_history_schema', 'f0', NULL, '1', '{\"value\":\"initial\"}'\
+                 'tx-history-midpoint', 'tx_state_history_schema', NULL, NULL, '1', '{\"value\":\"initial\"}'\
                  )",
                 &[],
             )

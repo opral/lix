@@ -459,6 +459,25 @@ pub(crate) async fn load_file_row_by_id_without_path_with_pending_overlay(
     Ok(None)
 }
 
+#[allow(dead_code)]
+pub(crate) async fn file_id_resolves_in_scope(
+    backend: &dyn LixBackend,
+    pending_write_overlay: Option<&dyn PendingOverlay>,
+    version_id: &str,
+    file_id: &str,
+    scope: FilesystemProjectionScope,
+) -> Result<bool, FilesystemQueryError> {
+    Ok(load_file_row_by_id_without_path_with_pending_overlay(
+        backend,
+        pending_write_overlay,
+        version_id,
+        file_id,
+        scope,
+    )
+    .await?
+    .is_some())
+}
+
 pub(crate) async fn lookup_directory_id_by_path_with_pending_overlay(
     backend: &dyn LixBackend,
     pending_write_overlay: Option<&dyn PendingOverlay>,
@@ -1553,5 +1572,31 @@ mod tests {
         assert_eq!(row.directory_id.as_deref(), Some("dir-nested"));
         assert_eq!(row.path, "/bench/nested/file.json");
         assert_eq!(row.change_id.as_deref(), Some("change-file"));
+    }
+
+    #[tokio::test]
+    async fn file_id_resolves_in_scope_uses_effective_lookup_rules() {
+        let backend = DirectFilesystemLookupBackend {
+            projection_seen: Arc::new(AtomicBool::new(false)),
+        };
+
+        assert!(file_id_resolves_in_scope(
+            &backend,
+            None,
+            "v1",
+            "file-1",
+            FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .expect("existing file id should resolve"));
+        assert!(!file_id_resolves_in_scope(
+            &backend,
+            None,
+            "v1",
+            "missing-file",
+            FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .expect("missing file id lookup should succeed"));
     }
 }

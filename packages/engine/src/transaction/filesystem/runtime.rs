@@ -94,6 +94,7 @@ impl From<&FilesystemTransactionFileState> for PendingFilesystemFileView {
                 .as_ref()
                 .map(PendingFilesystemDescriptorView::from),
             metadata_patch: value.metadata_patch.clone(),
+            data: value.data.clone(),
             deleted: value.deleted,
         }
     }

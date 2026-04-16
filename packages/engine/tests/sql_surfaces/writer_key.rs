@@ -51,7 +51,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, writer_key\
                      ) VALUES (\
-                     'wk-explicit-insert', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"insert\"}}', '1', 'editor:explicit-insert'\
+                     'wk-explicit-insert', 'wk_writer_key_schema', NULL, '{version_id}', NULL, '{{\"key\":\"insert\"}}', '1', 'editor:explicit-insert'\
                      )"
                 ),
                 &[],
@@ -66,7 +66,7 @@ simulation_test!(
                      FROM lix_state_by_version \
                      WHERE schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-explicit-insert' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                        AND version_id = '{version_id}'"
                 ),
                 &[],
@@ -87,7 +87,7 @@ simulation_test!(
                      WHERE version_id = '{version_id}' \
                        AND schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-explicit-insert' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                      LIMIT 1"
                 ),
                 &[],
@@ -120,7 +120,7 @@ simulation_test!(
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'wk-annotation-only', 'wk_writer_key_schema', 'file-1', '{version_id}', 'lix', '{{\"key\":\"before\"}}', '1'\
+                     'wk-annotation-only', 'wk_writer_key_schema', NULL, '{version_id}', NULL, '{{\"key\":\"before\"}}', '1'\
                      )"
                 ),
                 &[],
@@ -157,7 +157,7 @@ simulation_test!(
                              SET writer_key = 'editor:annotation-only' \
                              WHERE schema_key = 'wk_writer_key_schema' \
                                AND entity_id = 'wk-annotation-only' \
-                               AND file_id = 'file-1' \
+                               AND file_id IS NULL \
                                AND version_id = '{transaction_version_id}'"
                         ),
                         &[],
@@ -171,7 +171,7 @@ simulation_test!(
                                  FROM lix_state_by_version \
                                  WHERE schema_key = 'wk_writer_key_schema' \
                                    AND entity_id = 'wk-annotation-only' \
-                                   AND file_id = 'file-1' \
+                                   AND file_id IS NULL \
                                    AND version_id = '{transaction_version_id}'"
                             ),
                             &[],
@@ -205,7 +205,7 @@ simulation_test!(
                      FROM lix_state_by_version \
                      WHERE schema_key = 'wk_writer_key_schema' \
                        AND entity_id = 'wk-annotation-only' \
-                       AND file_id = 'file-1' \
+                       AND file_id IS NULL \
                        AND version_id = '{version_id}'"
                 ),
                 &[],
