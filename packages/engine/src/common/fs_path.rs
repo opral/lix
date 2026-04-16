@@ -146,59 +146,136 @@ impl ParsedFilePath {
     }
 }
 
+type PathResult<T> = Result<T, PathError>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathError {
+    MissingLeadingSlash,
+    UnexpectedTrailingSlashOnFilePath,
+    MissingTrailingSlashOnDirectoryPath,
+    EmptySegment,
+    DotSegment,
+    SlashInSegment,
+    Backslash,
+    InvalidPercentEncoding,
+    InvalidIriCodePoint,
+    NulByte,
+    InvalidRootUsage,
+    InvalidDirectoryParentPath,
+}
+
+impl PathError {
+    fn into_lix_error(self) -> LixError {
+        let (code, description, hint) = match self {
+            Self::MissingLeadingSlash => (
+                "LIX_ERROR_PATH_MISSING_LEADING_SLASH",
+                "path must start with '/'",
+                Some("prefix the path with '/'"),
+            ),
+            Self::UnexpectedTrailingSlashOnFilePath => (
+                "LIX_ERROR_PATH_UNEXPECTED_TRAILING_SLASH_ON_FILE",
+                "file path must not end with '/'",
+                Some("remove the trailing slash or use a directory path instead"),
+            ),
+            Self::MissingTrailingSlashOnDirectoryPath => (
+                "LIX_ERROR_PATH_MISSING_TRAILING_SLASH_ON_DIRECTORY",
+                "directory path must end with '/'",
+                Some("append a trailing slash or use a file path instead"),
+            ),
+            Self::EmptySegment => (
+                "LIX_ERROR_PATH_EMPTY_SEGMENT",
+                "path must not contain empty segments",
+                Some("remove duplicate slashes like '//'"),
+            ),
+            Self::DotSegment => (
+                "LIX_ERROR_PATH_DOT_SEGMENT",
+                "path segment cannot be '.' or '..'",
+                Some("use a real segment name instead of '.' or '..'"),
+            ),
+            Self::SlashInSegment => (
+                "LIX_ERROR_PATH_SLASH_IN_SEGMENT",
+                "path segment must not contain '/'",
+                Some("pass a single segment name, not a full path"),
+            ),
+            Self::Backslash => (
+                "LIX_ERROR_PATH_BACKSLASH",
+                "path must not contain '\\'",
+                Some("use '/' separators instead of '\\'"),
+            ),
+            Self::InvalidPercentEncoding => (
+                "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING",
+                "path contains invalid percent encoding",
+                Some("use percent triplets like %20 and escape '%' as %25"),
+            ),
+            Self::InvalidIriCodePoint => (
+                "LIX_ERROR_PATH_INVALID_IRI_CODE_POINT",
+                "path contains characters outside the RFC 3987 path grammar",
+                Some("remove the disallowed character or percent-encode it at the boundary"),
+            ),
+            Self::NulByte => (
+                "LIX_ERROR_PATH_NUL_BYTE",
+                "path must not contain a NUL byte",
+                Some("remove the NUL byte from the path"),
+            ),
+            Self::InvalidRootUsage => (
+                "LIX_ERROR_PATH_INVALID_ROOT_USAGE",
+                "root '/' is only valid as a directory path",
+                Some("use '/' as a directory path, never as a file path"),
+            ),
+            Self::InvalidDirectoryParentPath => (
+                "LIX_ERROR_PATH_INVALID_DIRECTORY_PARENT",
+                "directory parent path must be a normalized directory path",
+                Some("pass '/' or a path ending with '/' as the parent directory"),
+            ),
+        };
+
+        let err = LixError::new(code, description);
+        match hint {
+            Some(hint) => err.with_hint(hint),
+            None => err,
+        }
+    }
+}
+
 pub(crate) fn normalize_path_segment(raw: &str) -> Result<String, LixError> {
+    normalize_path_segment_impl(raw).map_err(PathError::into_lix_error)
+}
+
+fn normalize_path_segment_impl(raw: &str) -> PathResult<String> {
     let normalized = raw.nfc().collect::<String>();
     let canonical = normalize_validated_path_segment(&normalized)?;
     if canonical == "." || canonical == ".." {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "path segment cannot be '.' or '..'".to_string(),
-            hint: None,
-        });
+        return Err(PathError::DotSegment);
     }
     Ok(canonical)
 }
 
-fn validate_path_segment_chars(normalized: &str) -> Result<(), LixError> {
+fn validate_path_segment_chars(normalized: &str) -> PathResult<()> {
     if normalized.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "path segment must not be empty".to_string(),
-            hint: None,
-        });
+        return Err(PathError::EmptySegment);
     }
-    if normalized.contains('/') || normalized.contains('\\') {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "path segment must not contain slashes".to_string(),
-            hint: None,
-        });
+    if normalized.contains('\0') {
+        return Err(PathError::NulByte);
+    }
+    if normalized.contains('/') {
+        return Err(PathError::SlashInSegment);
+    }
+    if normalized.contains('\\') {
+        return Err(PathError::Backslash);
     }
     if !segment_has_valid_percent_encoding(&normalized) {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "path segment contains invalid percent encoding".to_string(),
-            hint: None,
-        });
+        return Err(PathError::InvalidPercentEncoding);
     }
     if normalized.chars().any(is_disallowed_bidi_formatting_char) {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "path segment contains disallowed bidi formatting characters".to_string(),
-            hint: None,
-        });
+        return Err(PathError::InvalidIriCodePoint);
     }
     if !normalized.chars().all(is_allowed_segment_char) {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "path segment contains unsupported characters".to_string(),
-            hint: None,
-        });
+        return Err(PathError::InvalidIriCodePoint);
     }
     Ok(())
 }
 
-fn normalize_validated_path_segment(normalized: &str) -> Result<String, LixError> {
+fn normalize_validated_path_segment(normalized: &str) -> PathResult<String> {
     validate_path_segment_chars(normalized)?;
     Ok(canonicalize_percent_encoding(normalized))
 }
@@ -329,77 +406,60 @@ fn segment_has_valid_percent_encoding(segment: &str) -> bool {
 }
 
 pub(crate) fn normalize_file_path(path: &str) -> Result<String, LixError> {
+    normalize_file_path_impl(path).map_err(PathError::into_lix_error)
+}
+
+fn normalize_file_path_impl(path: &str) -> PathResult<String> {
     let normalized = path.nfc().collect::<String>();
     if !normalized.starts_with('/') {
-        return Err(LixError {
-            code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
-            description: format!(
-                "file paths must start with '/'. Got '{path}', use '/{path}' instead"
-            ),
-            hint: None,
-        });
+        return Err(PathError::MissingLeadingSlash);
     }
-    if normalized.ends_with('/') || normalized == "/" {
-        return Err(LixError {
-            code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
-            description: format!("lix_file_descriptor: Invalid file path {path}"),
-            hint: None,
-        });
+    if normalized == "/" {
+        return Err(PathError::InvalidRootUsage);
     }
-    if normalized.contains('\\') || normalized.contains("//") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_file_descriptor: Invalid file path {path}"),
-            hint: None,
-        });
+    if normalized.ends_with('/') {
+        return Err(PathError::UnexpectedTrailingSlashOnFilePath);
+    }
+    if normalized.contains('\\') {
+        return Err(PathError::Backslash);
+    }
+    if normalized.contains("//") {
+        return Err(PathError::EmptySegment);
     }
     let segments = normalized
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
     if segments.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_file_descriptor: Invalid file path {path}"),
-            hint: None,
-        });
+        return Err(PathError::EmptySegment);
     }
     let canonical_segments = canonicalize_path_segments(&segments)?;
     if canonical_segments.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_INVALID_FILE_PATH".to_string(),
-            description: format!("lix_file_descriptor: Invalid file path {path}"),
-            hint: None,
-        });
+        return Err(PathError::InvalidRootUsage);
     }
     Ok(format!("/{}", canonical_segments.join("/")))
 }
 
 pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
+    normalize_directory_path_impl(path).map_err(PathError::into_lix_error)
+}
+
+fn normalize_directory_path_impl(path: &str) -> PathResult<String> {
     let normalized = path.nfc().collect::<String>();
     if !normalized.starts_with('/') {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_directory_descriptor: Invalid directory path {path}"),
-            hint: None,
-        });
+        return Err(PathError::MissingLeadingSlash);
     }
-    if normalized.contains('\\') || normalized.contains("//") {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_directory_descriptor: Invalid directory path {path}"),
-            hint: None,
-        });
+    if normalized.contains('\\') {
+        return Err(PathError::Backslash);
+    }
+    if normalized.contains("//") {
+        return Err(PathError::EmptySegment);
     }
     if normalized == "/" {
         return Ok("/".to_string());
     }
     if !normalized.ends_with('/') {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_directory_descriptor: Invalid directory path {path}"),
-            hint: None,
-        });
+        return Err(PathError::MissingTrailingSlashOnDirectoryPath);
     }
     let segments = normalized
         .split('/')
@@ -407,16 +467,12 @@ pub(crate) fn normalize_directory_path(path: &str) -> Result<String, LixError> {
         .collect::<Vec<_>>();
     let normalized_segments = canonicalize_path_segments(&segments)?;
     if normalized_segments.is_empty() {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("lix_directory_descriptor: Invalid directory path {path}"),
-            hint: None,
-        });
+        return Ok("/".to_string());
     }
     Ok(format!("/{}/", normalized_segments.join("/")))
 }
 
-fn canonicalize_path_segments(segments: &[&str]) -> Result<Vec<String>, LixError> {
+fn canonicalize_path_segments(segments: &[&str]) -> PathResult<Vec<String>> {
     let mut canonical_segments = Vec::with_capacity(segments.len());
 
     for segment in segments {
@@ -434,16 +490,16 @@ fn canonicalize_path_segments(segments: &[&str]) -> Result<Vec<String>, LixError
 }
 
 pub(crate) fn parse_file_path(path: &str) -> Result<ParsedFilePath, LixError> {
-    let normalized_path = normalize_file_path(path)?;
+    parse_file_path_impl(path).map_err(PathError::into_lix_error)
+}
+
+fn parse_file_path_impl(path: &str) -> PathResult<ParsedFilePath> {
+    let normalized_path = normalize_file_path_impl(path)?;
     let segments = normalized_path
         .split('/')
         .filter(|segment| !segment.is_empty())
         .collect::<Vec<_>>();
-    let file_name = segments.last().ok_or_else(|| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: format!("Invalid file path {path}"),
-        hint: None,
-    })?;
+    let file_name = segments.last().ok_or(PathError::InvalidRootUsage)?;
     let directory_path = if segments.len() > 1 {
         Some(NormalizedDirectoryPath::from_normalized(format!(
             "/{}/",
@@ -520,23 +576,330 @@ pub(crate) fn directory_name_from_path(path: &str) -> Option<String> {
 }
 
 pub(crate) fn compose_directory_path(parent_path: &str, name: &str) -> Result<String, LixError> {
-    let normalized_name = normalize_path_segment(name)?;
+    let normalized_name = normalize_path_segment_impl(name).map_err(PathError::into_lix_error)?;
     if parent_path == "/" {
         Ok(format!("/{normalized_name}/"))
     } else if parent_path.starts_with('/') && parent_path.ends_with('/') {
         Ok(format!("{parent_path}{normalized_name}/"))
     } else {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("Invalid directory parent path {parent_path}"),
-            hint: None,
-        })
+        Err(PathError::InvalidDirectoryParentPath.into_lix_error())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use iref::iri::Path as IriPath;
+
+    #[derive(Clone, Copy, Debug)]
+    enum NormalizationKind {
+        File,
+        Directory,
+        Segment,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    enum LixFixtureKind {
+        File,
+        Directory,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct RfcFixture {
+        label: &'static str,
+        input: &'static str,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct LixProfileFixture {
+        label: &'static str,
+        kind: LixFixtureKind,
+        input: &'static str,
+        oracle_accepts: bool,
+        expected: Result<&'static str, PathError>,
+    }
+
+    #[derive(Clone, Copy, Debug)]
+    struct NormalizationFixture {
+        label: &'static str,
+        kind: NormalizationKind,
+        input: &'static str,
+        expected: &'static str,
+    }
+
+    fn assert_path_error<T: fmt::Debug>(result: PathResult<T>, expected: PathError) {
+        assert_eq!(result.unwrap_err(), expected);
+    }
+
+    fn iri_oracle_accepts(path: &str) -> bool {
+        IriPath::new(path).is_ok()
+    }
+
+    fn normalize_with_kind(kind: NormalizationKind, input: &str) -> Result<String, LixError> {
+        match kind {
+            NormalizationKind::File => normalize_file_path(input),
+            NormalizationKind::Directory => normalize_directory_path(input),
+            NormalizationKind::Segment => normalize_path_segment(input),
+        }
+    }
+
+    fn assert_lix_profile_fixture(fixture: LixProfileFixture) {
+        assert_eq!(
+            iri_oracle_accepts(fixture.input),
+            fixture.oracle_accepts,
+            "iref oracle mismatch for {} ({})",
+            fixture.label,
+            fixture.input
+        );
+
+        match fixture.kind {
+            LixFixtureKind::File => match fixture.expected {
+                Ok(expected) => assert_eq!(
+                    normalize_file_path(fixture.input).as_deref(),
+                    Ok(expected),
+                    "unexpected file result for {} ({})",
+                    fixture.label,
+                    fixture.input
+                ),
+                Err(expected) => assert_path_error(
+                    normalize_file_path_impl(fixture.input),
+                    expected,
+                ),
+            },
+            LixFixtureKind::Directory => match fixture.expected {
+                Ok(expected) => assert_eq!(
+                    normalize_directory_path(fixture.input).as_deref(),
+                    Ok(expected),
+                    "unexpected directory result for {} ({})",
+                    fixture.label,
+                    fixture.input
+                ),
+                Err(expected) => assert_path_error(
+                    normalize_directory_path_impl(fixture.input),
+                    expected,
+                ),
+            },
+        }
+    }
+
+    const RFC_POSITIVE_FIXTURES: &[RfcFixture] = &[
+        RfcFixture {
+            label: "absolute unicode file path",
+            input: "/unicodé/段落.md",
+        },
+        RfcFixture {
+            label: "absolute path with pct-encoded space",
+            input: "/docs/%20notes.md",
+        },
+        RfcFixture {
+            label: "path with pchar punctuation",
+            input: "/docs/hello:world@x!$&'()*+,;=.md",
+        },
+        RfcFixture {
+            label: "path with dot segments is still valid syntax",
+            input: "/docs/../guide.md",
+        },
+    ];
+
+    const RFC_NEGATIVE_FIXTURES: &[RfcFixture] = &[
+        RfcFixture {
+            label: "invalid percent triplet",
+            input: "/docs/%zz.md",
+        },
+        RfcFixture {
+            label: "truncated percent triplet",
+            input: "/docs/%2",
+        },
+        RfcFixture {
+            label: "raw space is not allowed in an ipath",
+            input: "/docs/file name.md",
+        },
+        RfcFixture {
+            label: "raw fragment delimiter is not part of the path grammar",
+            input: "/docs/#hash",
+        },
+        RfcFixture {
+            label: "private use code point is excluded from ucschar",
+            input: "/docs/\u{E000}.md",
+        },
+    ];
+
+    const LIX_PROFILE_POSITIVE_FIXTURES: &[LixProfileFixture] = &[
+        LixProfileFixture {
+            label: "root directory is representable",
+            kind: LixFixtureKind::Directory,
+            input: "/",
+            oracle_accepts: true,
+            expected: Ok("/"),
+        },
+        LixProfileFixture {
+            label: "directory paths require trailing slash",
+            kind: LixFixtureKind::Directory,
+            input: "/docs/",
+            oracle_accepts: true,
+            expected: Ok("/docs/"),
+        },
+        LixProfileFixture {
+            label: "file paths stay slashless at the end",
+            kind: LixFixtureKind::File,
+            input: "/docs/readme.md",
+            oracle_accepts: true,
+            expected: Ok("/docs/readme.md"),
+        },
+    ];
+
+    const LIX_PROFILE_NEGATIVE_FIXTURES: &[LixProfileFixture] = &[
+        LixProfileFixture {
+            label: "relative-looking path is valid RFC syntax but not a Lix path",
+            kind: LixFixtureKind::File,
+            input: "docs/readme.md",
+            oracle_accepts: true,
+            expected: Err(PathError::MissingLeadingSlash),
+        },
+        LixProfileFixture {
+            label: "file paths reject trailing slash even though RFC syntax allows it",
+            kind: LixFixtureKind::File,
+            input: "/docs/",
+            oracle_accepts: true,
+            expected: Err(PathError::UnexpectedTrailingSlashOnFilePath),
+        },
+        LixProfileFixture {
+            label: "directory paths reject missing trailing slash even though RFC syntax allows it",
+            kind: LixFixtureKind::Directory,
+            input: "/docs",
+            oracle_accepts: true,
+            expected: Err(PathError::MissingTrailingSlashOnDirectoryPath),
+        },
+        LixProfileFixture {
+            label: "empty segments are valid RFC paths but banned by the Lix profile",
+            kind: LixFixtureKind::File,
+            input: "/docs//guide.md",
+            oracle_accepts: true,
+            expected: Err(PathError::EmptySegment),
+        },
+        LixProfileFixture {
+            label: "root is not a valid file path",
+            kind: LixFixtureKind::File,
+            input: "/",
+            oracle_accepts: true,
+            expected: Err(PathError::InvalidRootUsage),
+        },
+        LixProfileFixture {
+            label: "bidi formatting is rejected by the Lix validator even though iref accepts it",
+            kind: LixFixtureKind::File,
+            input: "/docs/\u{202E}.md",
+            oracle_accepts: true,
+            expected: Err(PathError::InvalidIriCodePoint),
+        },
+    ];
+
+    const NORMALIZATION_FIXTURES: &[NormalizationFixture] = &[
+        NormalizationFixture {
+            label: "nfc composition happens before validation",
+            kind: NormalizationKind::File,
+            input: "/Cafe\u{0301}.md",
+            expected: "/Café.md",
+        },
+        NormalizationFixture {
+            label: "dot segments are removed in file paths",
+            kind: NormalizationKind::File,
+            input: "/docs/./../guide.md",
+            expected: "/guide.md",
+        },
+        NormalizationFixture {
+            label: "percent triplets are uppercased when preserved",
+            kind: NormalizationKind::Directory,
+            input: "/docs/%2fkept/",
+            expected: "/docs/%2Fkept/",
+        },
+        NormalizationFixture {
+            label: "unreserved percent encoding is decoded",
+            kind: NormalizationKind::File,
+            input: "/docs/%7e%41.md",
+            expected: "/docs/~A.md",
+        },
+        NormalizationFixture {
+            label: "root survives directory normalization",
+            kind: NormalizationKind::Directory,
+            input: "/",
+            expected: "/",
+        },
+        NormalizationFixture {
+            label: "directory trailing slash typing is preserved",
+            kind: NormalizationKind::Directory,
+            input: "/docs/%2e/guide/",
+            expected: "/docs/guide/",
+        },
+        NormalizationFixture {
+            label: "segment normalization decodes unreserved percent triplets",
+            kind: NormalizationKind::Segment,
+            input: "%7ehello",
+            expected: "~hello",
+        },
+    ];
+
+    #[test]
+    fn rfc_positive_path_fixtures_agree_with_iref() {
+        for fixture in RFC_POSITIVE_FIXTURES {
+            assert!(
+                iri_oracle_accepts(fixture.input),
+                "iref should accept {} ({})",
+                fixture.label,
+                fixture.input
+            );
+            assert!(
+                normalize_file_path_impl(fixture.input).is_ok(),
+                "lix should accept {} ({})",
+                fixture.label,
+                fixture.input
+            );
+        }
+    }
+
+    #[test]
+    fn rfc_negative_path_fixtures_agree_with_iref() {
+        for fixture in RFC_NEGATIVE_FIXTURES {
+            assert!(
+                !iri_oracle_accepts(fixture.input),
+                "iref should reject {} ({})",
+                fixture.label,
+                fixture.input
+            );
+            assert!(
+                normalize_file_path_impl(fixture.input).is_err(),
+                "lix should reject {} ({})",
+                fixture.label,
+                fixture.input
+            );
+        }
+    }
+
+    #[test]
+    fn lix_profile_positive_fixtures_are_pinned() {
+        for fixture in LIX_PROFILE_POSITIVE_FIXTURES {
+            assert_lix_profile_fixture(*fixture);
+        }
+    }
+
+    #[test]
+    fn lix_profile_negative_fixtures_document_divergence_from_the_oracle() {
+        for fixture in LIX_PROFILE_NEGATIVE_FIXTURES {
+            assert_lix_profile_fixture(*fixture);
+        }
+    }
+
+    #[test]
+    fn normalization_fixture_table_covers_canonicalization_rules() {
+        for fixture in NORMALIZATION_FIXTURES {
+            assert_eq!(
+                normalize_with_kind(fixture.kind, fixture.input).as_deref(),
+                Ok(fixture.expected),
+                "unexpected normalized value for {} ({})",
+                fixture.label,
+                fixture.input
+            );
+        }
+    }
 
     #[test]
     fn accepts_normalized_file_paths_with_unicode_and_percent_encoding() {
@@ -557,12 +920,16 @@ mod tests {
 
     #[test]
     fn rejects_structural_file_path_anomalies() {
-        for path in ["/", "/trailing/", "no-leading", "/bad//double"] {
-            assert!(
-                normalize_file_path(path).is_err(),
-                "expected invalid path {path}"
-            );
-        }
+        assert_path_error(normalize_file_path_impl("/"), PathError::InvalidRootUsage);
+        assert_path_error(
+            normalize_file_path_impl("/trailing/"),
+            PathError::UnexpectedTrailingSlashOnFilePath,
+        );
+        assert_path_error(
+            normalize_file_path_impl("no-leading"),
+            PathError::MissingLeadingSlash,
+        );
+        assert_path_error(normalize_file_path_impl("/bad//double"), PathError::EmptySegment);
     }
 
     #[test]
@@ -578,39 +945,39 @@ mod tests {
     #[test]
     fn rejects_file_paths_with_invalid_characters() {
         for path in ["/docs/file?.md", "/docs/#hash", "/docs/file name.md"] {
-            assert!(
-                normalize_file_path(path).is_err(),
-                "expected invalid character path {path}"
-            );
+            assert_path_error(normalize_file_path_impl(path), PathError::InvalidIriCodePoint);
         }
     }
 
     #[test]
     fn rejects_file_paths_with_private_use_and_noncharacter_code_points() {
         for path in ["/docs/\u{E000}.md", "/docs/\u{FDD0}.md"] {
-            assert!(
-                normalize_file_path(path).is_err(),
-                "expected invalid RFC3987 code point path {path}"
-            );
+            assert_path_error(normalize_file_path_impl(path), PathError::InvalidIriCodePoint);
         }
     }
 
     #[test]
     fn rejects_file_paths_with_bidi_formatting_characters() {
         for path in ["/docs/\u{200E}.md", "/docs/\u{202E}.md"] {
-            assert!(
-                normalize_file_path(path).is_err(),
-                "expected invalid bidi-formatting path {path}"
-            );
+            assert_path_error(normalize_file_path_impl(path), PathError::InvalidIriCodePoint);
         }
     }
 
     #[test]
     fn validates_percent_encoding_in_file_paths() {
         assert!(normalize_file_path("/docs/%20notes.md").is_ok());
-        assert!(normalize_file_path("/docs/%zz.md").is_err());
-        assert!(normalize_file_path("/docs/abc%.md").is_err());
-        assert!(normalize_file_path("/docs/abc%2.md").is_err());
+        assert_path_error(
+            normalize_file_path_impl("/docs/%zz.md"),
+            PathError::InvalidPercentEncoding,
+        );
+        assert_path_error(
+            normalize_file_path_impl("/docs/abc%.md"),
+            PathError::InvalidPercentEncoding,
+        );
+        assert_path_error(
+            normalize_file_path_impl("/docs/abc%2.md"),
+            PathError::InvalidPercentEncoding,
+        );
     }
 
     #[test]
@@ -644,12 +1011,30 @@ mod tests {
                 "expected valid directory path {path}"
             );
         }
-        for path in ["/file.md", "/docs", "/docs/ ", "no-leading", "/docs/%zz/"] {
-            assert!(
-                normalize_directory_path(path).is_err(),
-                "expected invalid directory path {path}"
-            );
-        }
+        assert_path_error(
+            normalize_directory_path_impl("/file.md"),
+            PathError::MissingTrailingSlashOnDirectoryPath,
+        );
+        assert_path_error(
+            normalize_directory_path_impl("/docs"),
+            PathError::MissingTrailingSlashOnDirectoryPath,
+        );
+        assert_path_error(
+            normalize_directory_path_impl("/docs/ "),
+            PathError::MissingTrailingSlashOnDirectoryPath,
+        );
+        assert_path_error(
+            normalize_directory_path_impl("/docs/ /"),
+            PathError::InvalidIriCodePoint,
+        );
+        assert_path_error(
+            normalize_directory_path_impl("no-leading"),
+            PathError::MissingLeadingSlash,
+        );
+        assert_path_error(
+            normalize_directory_path_impl("/docs/%zz/"),
+            PathError::InvalidPercentEncoding,
+        );
     }
 
     #[test]
@@ -683,6 +1068,33 @@ mod tests {
         assert_eq!(
             compose_directory_path("/", "docs").as_deref(),
             Ok("/docs/")
+        );
+    }
+
+    #[test]
+    fn exposes_stable_lix_errors_with_hints() {
+        let missing_leading = normalize_file_path("docs/readme.md").expect_err("leading slash");
+        assert_eq!(
+            missing_leading.code,
+            "LIX_ERROR_PATH_MISSING_LEADING_SLASH"
+        );
+        assert_eq!(missing_leading.hint(), Some("prefix the path with '/'"));
+
+        let bad_percent = normalize_file_path("/docs/%zz.md").expect_err("bad percent");
+        assert_eq!(
+            bad_percent.code,
+            "LIX_ERROR_PATH_INVALID_PERCENT_ENCODING"
+        );
+        assert_eq!(
+            bad_percent.hint(),
+            Some("use percent triplets like %20 and escape '%' as %25")
+        );
+
+        let root_file = normalize_file_path("/").expect_err("root as file");
+        assert_eq!(root_file.code, "LIX_ERROR_PATH_INVALID_ROOT_USAGE");
+        assert_eq!(
+            root_file.hint(),
+            Some("use '/' as a directory path, never as a file path")
         );
     }
 }

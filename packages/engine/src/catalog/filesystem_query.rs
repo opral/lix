@@ -1456,6 +1456,26 @@ mod tests {
                     columns: Vec::new(),
                 });
             }
+            if sql.contains(&tracked_relation_name(FILESYSTEM_FILE_SCHEMA_KEY))
+                && sql.contains("entity_id = 'file-2'")
+            {
+                return Ok(crate::QueryResult {
+                    rows: vec![vec![
+                        Value::Text("file-2".to_string()),
+                        Value::Null,
+                        Value::Text("dir-special-nested".to_string()),
+                        Value::Text("report:summary@v1".to_string()),
+                        Value::Text("txt".to_string()),
+                        Value::Boolean(false),
+                        Value::Null,
+                        Value::Text("change-file-2".to_string()),
+                        Value::Boolean(false),
+                        Value::Integer(2),
+                        Value::Boolean(false),
+                    ]],
+                    columns: Vec::new(),
+                });
+            }
             if sql.contains(&tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
                 && sql.contains("entity_id = 'dir-nested'")
             {
@@ -1477,6 +1497,26 @@ mod tests {
                 });
             }
             if sql.contains(&tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+                && sql.contains("entity_id = 'dir-special-nested'")
+            {
+                return Ok(crate::QueryResult {
+                    rows: vec![vec![
+                        Value::Text("dir-special-nested".to_string()),
+                        Value::Text("dir-special-root".to_string()),
+                        Value::Null,
+                        Value::Text("nested!$&()*+,;=".to_string()),
+                        Value::Null,
+                        Value::Boolean(false),
+                        Value::Null,
+                        Value::Text("change-dir-special-2".to_string()),
+                        Value::Boolean(false),
+                        Value::Integer(2),
+                        Value::Boolean(false),
+                    ]],
+                    columns: Vec::new(),
+                });
+            }
+            if sql.contains(&tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
                 && sql.contains("entity_id = 'dir-bench'")
             {
                 return Ok(crate::QueryResult {
@@ -1489,6 +1529,68 @@ mod tests {
                         Value::Boolean(false),
                         Value::Null,
                         Value::Text("change-dir-1".to_string()),
+                        Value::Boolean(false),
+                        Value::Integer(2),
+                        Value::Boolean(false),
+                    ]],
+                    columns: Vec::new(),
+                });
+            }
+            if sql.contains(&tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+                && sql.contains("entity_id = 'dir-special-root'")
+            {
+                return Ok(crate::QueryResult {
+                    rows: vec![vec![
+                        Value::Text("dir-special-root".to_string()),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text("bench:alpha@beta".to_string()),
+                        Value::Null,
+                        Value::Boolean(false),
+                        Value::Null,
+                        Value::Text("change-dir-special-1".to_string()),
+                        Value::Boolean(false),
+                        Value::Integer(2),
+                        Value::Boolean(false),
+                    ]],
+                    columns: Vec::new(),
+                });
+            }
+            if sql.contains(&tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+                && sql.contains("parent_id IS NULL")
+                && sql.contains("name = 'bench:alpha@beta'")
+            {
+                return Ok(crate::QueryResult {
+                    rows: vec![vec![
+                        Value::Text("dir-special-root".to_string()),
+                        Value::Null,
+                        Value::Null,
+                        Value::Text("bench:alpha@beta".to_string()),
+                        Value::Null,
+                        Value::Boolean(false),
+                        Value::Null,
+                        Value::Text("change-dir-special-1".to_string()),
+                        Value::Boolean(false),
+                        Value::Integer(2),
+                        Value::Boolean(false),
+                    ]],
+                    columns: Vec::new(),
+                });
+            }
+            if sql.contains(&tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY))
+                && sql.contains("parent_id = 'dir-special-root'")
+                && sql.contains("name = 'nested!$&()*+,;='")
+            {
+                return Ok(crate::QueryResult {
+                    rows: vec![vec![
+                        Value::Text("dir-special-nested".to_string()),
+                        Value::Text("dir-special-root".to_string()),
+                        Value::Null,
+                        Value::Text("nested!$&()*+,;=".to_string()),
+                        Value::Null,
+                        Value::Boolean(false),
+                        Value::Null,
+                        Value::Text("change-dir-special-2".to_string()),
                         Value::Boolean(false),
                         Value::Integer(2),
                         Value::Boolean(false),
@@ -1599,5 +1701,41 @@ mod tests {
         )
         .await
         .expect("missing file id lookup should succeed"));
+    }
+
+    #[tokio::test]
+    async fn lookup_and_reconstruct_paths_with_widened_rfc_segments() {
+        let backend = DirectFilesystemLookupBackend {
+            projection_seen: Arc::new(AtomicBool::new(false)),
+        };
+        let directory_path = NormalizedDirectoryPath::try_from_path(
+            "/bench:alpha@beta/nested!$&()*+,;=/",
+        )
+        .expect("normalized directory path");
+
+        let directory_id = lookup_directory_id_by_path(
+            &backend,
+            "v1",
+            &directory_path,
+            FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .expect("directory lookup should succeed");
+        assert_eq!(directory_id.as_deref(), Some("dir-special-nested"));
+
+        let file_row = load_file_row_by_id(
+            &backend,
+            "v1",
+            "file-2",
+            FilesystemProjectionScope::ExplicitVersion,
+        )
+        .await
+        .expect("file lookup should succeed")
+        .expect("file row should exist");
+
+        assert_eq!(
+            file_row.path,
+            "/bench:alpha@beta/nested!$&()*+,;=/report:summary@v1.txt"
+        );
     }
 }

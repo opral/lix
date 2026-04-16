@@ -1202,3 +1202,69 @@ fn filesystem_path_error(error: crate::LixError) -> FilesystemPlanningError {
         message: error.description,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collect_directory_insert_requests_uses_composed_canonical_paths() {
+        let assignments = vec![DirectoryInsertAssignments {
+            id: None,
+            parent_id: Some("parent-1".to_string()),
+            name: Some("guide:alpha@beta".to_string()),
+            path: None,
+            hidden: false,
+            metadata: None,
+        }];
+        let existing_directory_paths_by_id = BTreeMap::from([(
+            "parent-1".to_string(),
+            "/docs:root/".to_string(),
+        )]);
+
+        let (requested_directory_paths, requested_file_paths) =
+            collect_directory_insert_requests(&assignments, &existing_directory_paths_by_id)
+                .expect("request collection should succeed");
+
+        assert!(requested_directory_paths.contains("/docs:root/"));
+        assert!(requested_directory_paths.contains("/docs:root/guide:alpha@beta/"));
+        assert!(requested_file_paths.contains("/docs:root/guide:alpha@beta"));
+    }
+
+    #[test]
+    fn pending_directory_batch_detects_duplicate_paths_with_widened_segments() {
+        let mut batch = PendingFilesystemInsertBatch::default();
+        let special_path = "/docs:root/guide:alpha@beta/";
+        let first = ResolvedDirectoryInsertTarget {
+            id: "dir-1".to_string(),
+            path: special_path.to_string(),
+            parent_path: Some("/docs:root/".to_string()),
+            name: "guide:alpha@beta".to_string(),
+            hidden: false,
+            metadata: None,
+        };
+        let duplicate = ResolvedDirectoryInsertTarget {
+            id: "dir-2".to_string(),
+            path: special_path.to_string(),
+            parent_path: Some("/docs:root/".to_string()),
+            name: "guide:alpha@beta".to_string(),
+            hidden: false,
+            metadata: None,
+        };
+
+        batch
+            .register_directory_target(first)
+            .expect("first target should register");
+        let err = batch
+            .register_directory_target(duplicate)
+            .expect_err("duplicate path should be rejected");
+
+        assert!(
+            err.message.contains(
+                "Unique constraint violation: directory path '/docs:root/guide:alpha@beta/' already exists in this INSERT"
+            ),
+            "unexpected error: {}",
+            err.message
+        );
+    }
+}
