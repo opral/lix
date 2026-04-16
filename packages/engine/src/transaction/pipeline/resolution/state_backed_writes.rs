@@ -1,14 +1,12 @@
 use super::*;
-use crate::functions::{
-    clone_boxed_function_provider, LixFunctionProvider, SharedFunctionProvider,
-};
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::{
     decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
     scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
-    collect_state_column_overrides_with_shared_runtime, schema_from_registered_snapshot, SchemaKey,
+    schema_from_registered_snapshot, SchemaKey,
 };
 use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::pipeline::resolution::prepared_artifacts::build_entity_insert_rows_with_functions;
@@ -1183,12 +1181,11 @@ where
 fn load_annotation_schema_from_json<P>(
     schema_key: String,
     schema: JsonValue,
-    functions: SharedFunctionProvider<P>,
+    _functions: SharedFunctionProvider<P>,
 ) -> Result<LoadedAnnotationSchema, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let functions = clone_boxed_function_provider(&functions);
     let schema_version = schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
@@ -1202,11 +1199,6 @@ where
         "schema_version".to_string(),
         Value::Text(schema_version.clone()),
     );
-    state_defaults.extend(collect_state_column_overrides_with_shared_runtime(
-        &schema,
-        &schema_key,
-        &functions,
-    )?);
     Ok(LoadedAnnotationSchema {
         schema,
         schema_key,

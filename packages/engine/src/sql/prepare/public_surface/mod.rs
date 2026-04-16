@@ -291,14 +291,10 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     let functions = crate::functions::clone_boxed_function_provider(
         &crate::functions::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
     );
-    let registry = crate::catalog::load_public_surface_registry_with_backend(
-        backend,
-        Some(active_version_id),
-        crate::cel::shared_runtime(),
-        &functions,
-    )
-    .await
-    .map_err(|error| LixError::new(error.code, error.description))?;
+    let registry =
+        crate::catalog::load_public_surface_registry_with_backend(backend, Some(active_version_id))
+            .await
+            .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata =
         crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
     prepare_public_plan_with_registry_context_and_functions(

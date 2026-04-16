@@ -3566,17 +3566,10 @@ pub(super) async fn try_prepare_public_read(
     active_history_root_commit_id: Option<&str>,
     writer_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
-    let functions = crate::functions::clone_boxed_function_provider(
-        &crate::functions::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
-    );
-    let registry = crate::catalog::load_public_surface_registry_with_backend(
-        backend,
-        Some(active_version_id),
-        crate::cel::shared_runtime(),
-        &functions,
-    )
-    .await
-    .map_err(|error| LixError::new(error.code, error.description))?;
+    let registry =
+        crate::catalog::load_public_surface_registry_with_backend(backend, Some(active_version_id))
+            .await
+            .map_err(|error| LixError::new(error.code, error.description))?;
     let compiler_metadata =
         crate::sql::prepare::load_sql_compiler_metadata(backend, &registry).await?;
     try_prepare_public_read_with_registry_and_internal_access(
