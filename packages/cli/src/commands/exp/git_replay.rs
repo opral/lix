@@ -4,8 +4,8 @@ use crate::error::CliError;
 use async_trait::async_trait;
 use lix_rs_sdk::{
     BootKeyValue, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
-    PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend, TransactionMode,
-    Value, WasmtimeRuntime,
+    PreparedBatch as EnginePreparedBatch, QueryResult, SqlDialect, SqliteBackend,
+    TransactionBeginMode, Value, WasmtimeRuntime,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -292,7 +292,7 @@ impl LixBackend for TracingSqliteBackend {
 
     async fn begin_transaction(
         &self,
-        mode: TransactionMode,
+        mode: TransactionBeginMode,
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         let started = Instant::now();
         let result = self.inner.begin_transaction(mode).await;
@@ -301,9 +301,9 @@ impl LixBackend for TracingSqliteBackend {
                 self.collector.record_operation(
                     "begin_transaction",
                     Some(match mode {
-                        TransactionMode::Read => "read",
-                        TransactionMode::Write => "write",
-                        TransactionMode::Deferred => "deferred",
+                        TransactionBeginMode::Read => "read",
+                        TransactionBeginMode::Write => "write",
+                        TransactionBeginMode::Deferred => "deferred",
                     }),
                     &[],
                     started.elapsed(),
@@ -342,7 +342,7 @@ impl LixBackendTransaction for TracingSqliteTransaction<'_> {
         self.inner.dialect()
     }
 
-    fn mode(&self) -> TransactionMode {
+    fn mode(&self) -> TransactionBeginMode {
         self.inner.mode()
     }
 
@@ -688,16 +688,13 @@ fn init_and_open_lix_at_path(
         None => Box::new(backend),
     };
 
-    let config = LixConfig {
-        backend,
-        wasm_runtime: default_wasm_runtime()?,
-        key_values: vec![BootKeyValue {
+    let mut config = LixConfig::new(backend, default_wasm_runtime()?);
+    config.key_values = vec![BootKeyValue {
             key: "lix_deterministic_mode".to_string(),
             value: json!({ "enabled": true }),
             lixcol_global: Some(true),
             lixcol_untracked: None,
-        }],
-    };
+        }];
 
     pollster::block_on(Lix::open(config)).map_err(|err| {
         CliError::msg(format!(
