@@ -22,13 +22,20 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CanonicalizeError {
     pub(crate) message: String,
+    pub(crate) hint: Option<String>,
 }
 
 impl CanonicalizeError {
     fn unsupported(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            hint: None,
         }
+    }
+
+    fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
     }
 }
 
@@ -1435,10 +1442,41 @@ fn expr_to_value(
                 )),
             }
         }
+        Expr::Function(function)
+            if function_name(function)
+                .is_some_and(sqlite_json_builder_function_name) =>
+        {
+            let name = function_name(function).unwrap_or("json");
+            Err(CanonicalizeError::unsupported(format!(
+                "SQLite's {name}(…) is not supported in INSERT VALUES"
+            ))
+            .with_hint("use lix_json('…') to wrap a JSON literal instead"))
+        }
         _ => Err(CanonicalizeError::unsupported(
-            "public day-1 write canonicalizer only supports literal and placeholder insert row expressions",
+            "INSERT VALUES must be literals, parameter placeholders, or lix_json(...)",
+        )
+        .with_hint(
+            "for inline JSON, wrap with lix_json('{…}'); arbitrary SQL expressions and subqueries are not supported in VALUES",
         )),
     }
+}
+
+/// Returns true if the function name matches one of SQLite's JSON builder
+/// functions (`json`, `json_object`, `json_array`, `json_quote`, etc.).
+/// Users often reach for these when writing to lix-JSON columns; the fix
+/// is always to use `lix_json(...)` instead.
+fn sqlite_json_builder_function_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "json"
+            | "jsonb"
+            | "json_object"
+            | "jsonb_object"
+            | "json_array"
+            | "jsonb_array"
+            | "json_quote"
+    )
 }
 
 fn value_to_json_value(value: Value) -> Result<Value, CanonicalizeError> {

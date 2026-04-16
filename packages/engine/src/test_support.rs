@@ -326,6 +326,7 @@ pub(crate) async fn resolve_write_plan_for_test(
     .await
     .map_err(|error| WriteResolveError {
         message: error.description,
+        hint: None,
     })?;
     resolve_write_plan_with_functions(
         backend,

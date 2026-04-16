@@ -12,6 +12,21 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StateAssignmentsError {
     pub(crate) message: String,
+    pub(crate) hint: Option<String>,
+}
+
+impl StateAssignmentsError {
+    pub(crate) fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            hint: None,
+        }
+    }
+
+    pub(crate) fn with_hint(mut self, hint: impl Into<String>) -> Self {
+        self.hint = Some(hint.into());
+        self
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +52,7 @@ pub(crate) fn assignments_from_payload(
     let MutationPayload::UpdatePatch(columns) = payload else {
         return Err(StateAssignmentsError {
             message: format!("{context} requires a patch payload"),
+            hint: None,
         });
     };
     Ok(CanonicalStateAssignments {
@@ -85,6 +101,7 @@ where
         return Err(StateAssignmentsError {
             message: "public entity insert resolver requires one version target per payload row"
                 .to_string(),
+            hint: None,
         });
     }
 
@@ -128,6 +145,7 @@ where
                         message: format!(
                             "public entity insert resolver could not serialize snapshot: {error}"
                         ),
+                        hint: None,
                     }
                 })?,
             ),
@@ -175,6 +193,7 @@ pub(crate) fn ensure_identity_columns_preserved(
         if actual != expected {
             return Err(StateAssignmentsError {
                 message: format!("public update resolver does not support changing '{column}'"),
+                hint: None,
             });
         }
     }
@@ -199,6 +218,7 @@ pub(crate) fn apply_entity_state_assignments(
                 message:
                     "public entity live slice does not yet support primary-key property updates"
                         .to_string(),
+                hint: None,
             });
         }
         if semantics
@@ -217,6 +237,7 @@ pub(crate) fn apply_entity_state_assignments(
                 "public entity live slice does not yet support updating state column '{}'",
                 key
             ),
+            hint: None,
         });
     }
 
@@ -225,12 +246,14 @@ pub(crate) fn apply_entity_state_assignments(
             message:
                 "public entity update resolver requires a stable primary-key-derived entity_id"
                     .to_string(),
+            hint: None,
         })?;
     if expected_entity_id != current_row.entity_id {
         return Err(StateAssignmentsError {
             message:
                 "public entity live slice does not yet support updates that change entity identity"
                     .to_string(),
+            hint: None,
         });
     }
 
@@ -242,6 +265,7 @@ pub(crate) fn apply_entity_state_assignments(
                     message: format!(
                         "public entity update resolver could not serialize snapshot: {error}"
                     ),
+                    hint: None,
                 }
             })?,
         ),
@@ -261,34 +285,90 @@ pub(crate) fn derive_entity_id_from_snapshot(
     primary_key_paths: &[Vec<String>],
 ) -> Result<String, StateAssignmentsError> {
     if primary_key_paths.is_empty() {
-        return Err(StateAssignmentsError {
-            message: "public entity resolver requires x-lix-primary-key for entity writes"
-                .to_string(),
-        });
+        return Err(StateAssignmentsError::new(
+            "schema is missing x-lix-primary-key; entity writes require a primary key",
+        )
+        .with_hint(
+            "add `x-lix-primary-key` to the schema definition with one or more JSON Pointers, e.g. `\"x-lix-primary-key\": [\"/id\"]`",
+        ));
     }
 
-    let snapshot = JsonValue::Object(snapshot.clone());
-    derive_entity_id_from_json_paths(&snapshot, primary_key_paths)
+    let snapshot_value = JsonValue::Object(snapshot.clone());
+    derive_entity_id_from_json_paths(&snapshot_value, primary_key_paths)
         .map(|entity_id| entity_id.into_inner())
-        .map_err(|error| StateAssignmentsError {
-            message: match error {
-                EntityIdDerivationError::EmptyPrimaryKeyPath { .. } => {
-                    "public entity resolver does not support empty primary-key pointers".to_string()
-                }
-                EntityIdDerivationError::MissingPrimaryKeyValue { .. } => {
-                    "public entity resolver could not derive entity_id from the primary-key fields"
-                        .to_string()
-                }
-                EntityIdDerivationError::NullPrimaryKeyValue { .. } => {
-                    "public entity resolver cannot derive entity_id from null primary-key values"
-                        .to_string()
-                }
-                EntityIdDerivationError::EmptyPrimaryKeyValue { .. } => {
-                    "public entity resolver cannot derive entity_id from empty primary-key values"
-                        .to_string()
-                }
-            },
+        .map_err(|error| match error {
+            EntityIdDerivationError::EmptyPrimaryKeyPath { .. } => {
+                StateAssignmentsError::new(
+                    "x-lix-primary-key contains an empty JSON Pointer",
+                )
+                .with_hint(
+                    "each entry in x-lix-primary-key must be a JSON Pointer to a property, e.g. `\"/id\"`",
+                )
+            }
+            EntityIdDerivationError::MissingPrimaryKeyValue { index } => {
+                let pointer = format_json_pointer(&primary_key_paths[index]);
+                missing_primary_key_error(snapshot, &primary_key_paths[index], &pointer)
+            }
+            EntityIdDerivationError::NullPrimaryKeyValue { index } => {
+                let pointer = format_json_pointer(&primary_key_paths[index]);
+                StateAssignmentsError::new(format!(
+                    "primary-key field `{pointer}` is null; cannot derive entity_id"
+                ))
+                .with_hint(
+                    "provide a non-null value for the primary-key field, or adjust the schema so the field is not part of x-lix-primary-key",
+                )
+            }
+            EntityIdDerivationError::EmptyPrimaryKeyValue { index } => {
+                let pointer = format_json_pointer(&primary_key_paths[index]);
+                StateAssignmentsError::new(format!(
+                    "primary-key field `{pointer}` is empty; cannot derive entity_id"
+                ))
+                .with_hint("provide a non-empty value for the primary-key field")
+            }
         })
+}
+
+fn format_json_pointer(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return String::from("/");
+    }
+    let mut s = String::new();
+    for segment in segments {
+        s.push('/');
+        s.push_str(segment);
+    }
+    s
+}
+
+/// Contextualize the "missing primary-key field" error. If the missing pointer
+/// starts with `value` and the snapshot's `value` field is a string (not an
+/// object), this is the archetypal `lix_registered_schema` write where the
+/// user passed raw JSON text instead of wrapping with `lix_json(...)`.
+fn missing_primary_key_error(
+    snapshot: &JsonMap<String, JsonValue>,
+    path: &[String],
+    pointer: &str,
+) -> StateAssignmentsError {
+    let value_is_string = snapshot
+        .get("value")
+        .is_some_and(|v| matches!(v, JsonValue::String(_)));
+    let navigates_into_value = path
+        .first()
+        .is_some_and(|head| head.eq_ignore_ascii_case("value"));
+
+    let err = StateAssignmentsError::new(format!(
+        "could not extract primary-key field `{pointer}` from the inserted row"
+    ));
+
+    if value_is_string && navigates_into_value {
+        err.with_hint(
+            "the `value` column expects a JSON object, not a string. Wrap the JSON with lix_json('{…}'), e.g. `INSERT INTO lix_registered_schema (value) VALUES (lix_json('{\"x-lix-key\":\"…\", …}'))`",
+        )
+    } else {
+        err.with_hint(format!(
+            "ensure the inserted row includes a value at JSON pointer `{pointer}` matching the schema's x-lix-primary-key"
+        ))
+    }
 }
 
 pub(crate) fn engine_value_to_json_value(
@@ -304,9 +384,11 @@ pub(crate) fn engine_value_to_json_value(
             .map(JsonValue::Number)
             .ok_or_else(|| StateAssignmentsError {
                 message: "public entity resolver cannot represent NaN/inf JSON numbers".to_string(),
+                hint: None,
             }),
         Value::Blob(_) => Err(StateAssignmentsError {
             message: "public entity resolver does not support blob entity properties".to_string(),
+            hint: None,
         }),
     }
 }
@@ -318,6 +400,7 @@ fn parse_snapshot_object(
         return Err(StateAssignmentsError {
             message: "public entity resolver requires snapshot_content in authoritative pre-state"
                 .to_string(),
+            hint: None,
         });
     };
     let JsonValue::Object(object) =
@@ -326,11 +409,13 @@ fn parse_snapshot_object(
                 message: format!(
                     "public entity resolver could not parse snapshot_content JSON: {error}"
                 ),
+                hint: None,
             }
         })?
     else {
         return Err(StateAssignmentsError {
             message: "public entity resolver requires object snapshot_content".to_string(),
+            hint: None,
         });
     };
     Ok(object)
@@ -359,6 +444,7 @@ where
     )
     .map_err(|error| StateAssignmentsError {
         message: error.description,
+        hint: None,
     })?;
     Ok(snapshot)
 }
@@ -373,6 +459,7 @@ fn apply_entity_state_column_assignment(
             let Some(text) = text_from_value(value) else {
                 return Err(StateAssignmentsError {
                     message: format!("public entity resolver expected text {key}, got {value:?}"),
+                    hint: None,
                 });
             };
             values.insert(key.to_string(), Value::Text(text.to_string()));
@@ -389,6 +476,7 @@ fn apply_entity_state_column_assignment(
             }
             other => Err(StateAssignmentsError {
                 message: format!("public entity resolver expected text/null {key}, got {other:?}"),
+                hint: None,
             }),
         },
         _ => Ok(false),
@@ -407,6 +495,7 @@ fn resolved_entity_state_text(
                 "public entity resolver requires a concrete '{}' value or schema override",
                 key
             ),
+            hint: None,
         })
 }
 
@@ -423,6 +512,7 @@ fn resolved_entity_state_nullable_text(
                 "public entity resolver expected text/null {} value, got {:?}",
                 key, other
             ),
+            hint: None,
         }),
     }
 }

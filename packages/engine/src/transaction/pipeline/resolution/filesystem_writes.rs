@@ -45,6 +45,7 @@ const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> WriteResolveError {
     WriteResolveError {
         message: error.message,
+        hint: None,
     }
 }
 
@@ -98,6 +99,7 @@ fn filesystem_write_lookup_scope(
                 "public filesystem write '{}' is missing catalog-owned filesystem scope",
                 planned_write.command.target.descriptor.public_name
             ),
+            hint: None,
         })
     })
 }
@@ -119,6 +121,7 @@ async fn resolved_filesystem_version_id(
 ) -> Result<String, WriteResolveError> {
     resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "public filesystem write requires a concrete version_id".to_string(),
+        hint: None,
     })
 }
 
@@ -133,6 +136,7 @@ fn filesystem_write_intent(
                 "public filesystem write '{}' is missing compiler-owned filesystem intent",
                 planned_write.command.target.descriptor.public_name
             ),
+            hint: None,
         })
 }
 
@@ -144,6 +148,7 @@ fn directory_insert_assignments_batch(
         _ => Err(WriteResolveError {
             message: "public filesystem directory insert expected typed directory-insert intent"
                 .to_string(),
+            hint: None,
         }),
     }
 }
@@ -155,6 +160,7 @@ fn file_insert_assignments_batch(
         FilesystemWriteIntent::FileInsert(rows) => Ok(rows.as_slice()),
         _ => Err(WriteResolveError {
             message: "public filesystem file insert expected typed file-insert intent".to_string(),
+            hint: None,
         }),
     }
 }
@@ -167,6 +173,7 @@ fn directory_update_assignments(
         _ => Err(WriteResolveError {
             message: "public filesystem directory update expected typed directory-update intent"
                 .to_string(),
+            hint: None,
         }),
     }
 }
@@ -178,6 +185,7 @@ fn file_update_assignments(
         FilesystemWriteIntent::FileUpdate(assignments) => Ok(assignments),
         _ => Err(WriteResolveError {
             message: "public filesystem file update expected typed file-update intent".to_string(),
+            hint: None,
         }),
     }
 }
@@ -197,6 +205,7 @@ where
         return Err(WriteResolveError {
             message: "public filesystem directory insert compiler/runtime row count mismatch"
                 .to_string(),
+            hint: None,
         });
     }
     let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
@@ -205,6 +214,7 @@ where
             message:
                 "public filesystem directory insert requires one version target per payload row"
                     .to_string(),
+            hint: None,
         });
     }
 
@@ -216,6 +226,7 @@ where
     {
         let version_id = version_id.ok_or_else(|| WriteResolveError {
             message: "public filesystem write requires a concrete version_id".to_string(),
+            hint: None,
         })?;
         let execution_mode = default_execution_mode_for_request(
             write_mode_request_for_insert_payload(planned_write, &payload),
@@ -518,6 +529,7 @@ async fn resolve_existing_directory_write(
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public filesystem directory existing-row resolver does not handle inserts"
                 .to_string(),
+            hint: None,
         }),
     }
 }
@@ -537,6 +549,7 @@ where
         return Err(WriteResolveError {
             message: "public filesystem file insert compiler/runtime row count mismatch"
                 .to_string(),
+            hint: None,
         });
     }
     let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
@@ -544,6 +557,7 @@ where
         return Err(WriteResolveError {
             message: "public filesystem file insert requires one version target per payload row"
                 .to_string(),
+            hint: None,
         });
     }
 
@@ -555,6 +569,7 @@ where
     {
         let version_id = version_id.ok_or_else(|| WriteResolveError {
             message: "public filesystem write requires a concrete version_id".to_string(),
+            hint: None,
         })?;
         let execution_mode = default_execution_mode_for_request(
             write_mode_request_for_insert_payload(planned_write, &payload),
@@ -696,6 +711,7 @@ async fn resolve_existing_file_write(
                             .expect("path checked above")
                             .normalized_path
                     ),
+                    hint: None,
                 });
             }
 
@@ -896,6 +912,7 @@ async fn resolve_existing_file_write(
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public filesystem existing-row resolver does not handle inserts".to_string(),
+            hint: None,
         }),
     }
 }
@@ -911,6 +928,7 @@ fn filesystem_write_semantics(
                 "public filesystem live slice does not have catalog-owned write semantics for '{}'",
                 planned_write.command.target.descriptor.public_name
             ),
+            hint: None,
         })
 }
 
@@ -923,6 +941,7 @@ fn filesystem_write_kind(
                 "public filesystem write '{}' is missing catalog-owned filesystem kind",
                 planned_write.command.target.descriptor.public_name
             ),
+            hint: None,
         })
     })
 }
@@ -1168,6 +1187,7 @@ async fn resolve_file_update_target(
                         "Unique constraint violation: file path '{}' already exists in version '{}'",
                         next_path, version_id
                     ),
+                    hint: None,
                 });
             }
         }
@@ -1212,6 +1232,7 @@ async fn resolve_directory_update_target(
     {
         let name = directory_name_from_path(normalized_path).ok_or_else(|| WriteResolveError {
             message: "Directory name must be provided".to_string(),
+            hint: None,
         })?;
         let parent_id = match parent_directory_path(normalized_path) {
             Some(parent_path) => lookup_directory_id_by_path(
@@ -1223,6 +1244,7 @@ async fn resolve_directory_update_target(
             .await?
             .ok_or_else(|| WriteResolveError {
                 message: format!("Parent directory does not exist for path {}", parent_path),
+                hint: None,
             })?,
             None => String::new(),
         };
@@ -1247,6 +1269,7 @@ async fn resolve_directory_update_target(
                     .await?
                     .ok_or_else(|| WriteResolveError {
                         message: format!("Parent directory does not exist for id {}", parent_id),
+                        hint: None,
                     })?
             }
             None => "/".to_string(),
@@ -1259,6 +1282,7 @@ async fn resolve_directory_update_target(
     if resolved_parent_id.as_deref() == Some(current_row.id.as_str()) {
         return Err(WriteResolveError {
             message: "Directory cannot be its own parent".to_string(),
+            hint: None,
         });
     }
     if let Some(parent_id) = resolved_parent_id.as_deref() {
@@ -1285,6 +1309,7 @@ async fn resolve_directory_update_target(
                     "Unique constraint violation: directory path '{}' already exists in version '{}'",
                     resolved_path, version_id
                 ),
+                hint: None,
             });
         }
     }
@@ -1331,6 +1356,7 @@ async fn resolve_directory_update_targets_batch(
                 "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
                 normalized_path
             ),
+            hint: None,
         });
     }
 
@@ -1343,6 +1369,7 @@ async fn resolve_directory_update_targets_batch(
         if parent_id.as_deref() == Some(row.id.as_str()) {
             return Err(WriteResolveError {
                 message: "Directory cannot be its own parent".to_string(),
+                hint: None,
             });
         }
         let name = assignments.name.clone().unwrap_or_else(|| row.name.clone());
@@ -1374,6 +1401,7 @@ async fn resolve_directory_update_targets_batch(
             .await?
             .ok_or_else(|| WriteResolveError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
+                hint: None,
             })?;
         external_parent_paths.insert(parent_id.to_string(), parent_path);
     }
@@ -1385,6 +1413,7 @@ async fn resolve_directory_update_targets_batch(
             if !seen.insert(parent_id.clone()) {
                 return Err(WriteResolveError {
                     message: "Directory parent would create a cycle".to_string(),
+                    hint: None,
                 });
             }
             cursor = proposed_by_id
@@ -1423,6 +1452,7 @@ async fn resolve_directory_update_targets_batch(
                         "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
                         path
                     ),
+                    hint: None,
                 });
             }
         }
@@ -1443,6 +1473,7 @@ async fn resolve_directory_update_targets_batch(
                         "Unique constraint violation: directory path '{}' already exists in version '{}'",
                         path, version_id
                     ),
+                    hint: None,
                 });
             };
             if other_path != &path {
@@ -1453,6 +1484,7 @@ async fn resolve_directory_update_targets_batch(
                     "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
                     path
                 ),
+                hint: None,
             });
         }
     }
@@ -1506,6 +1538,7 @@ fn resolve_proposed_directory_path(
             .cloned()
             .ok_or_else(|| WriteResolveError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
+                hint: None,
             })?,
         None => "/".to_string(),
     };
@@ -1858,11 +1891,13 @@ async fn assert_no_directory_cycle(
         if parent_id == directory_id {
             return Err(WriteResolveError {
                 message: "Directory parent would create a cycle".to_string(),
+                hint: None,
             });
         }
         if safety > 1024 {
             return Err(WriteResolveError {
                 message: "Directory hierarchy appears to be cyclic".to_string(),
+                hint: None,
             });
         }
         safety += 1;
@@ -1871,6 +1906,7 @@ async fn assert_no_directory_cycle(
         else {
             return Err(WriteResolveError {
                 message: format!("Parent directory does not exist for id {}", parent_id),
+                hint: None,
             });
         };
         current_parent = parent_row.parent_id;
@@ -2025,6 +2061,7 @@ fn binary_blob_ref_row(
             "binary blob size exceeds supported range for file '{}' version '{}'",
             file_id, version_id
         ),
+        hint: None,
     })?;
     let snapshot_content = json!({
         "id": file_id,
