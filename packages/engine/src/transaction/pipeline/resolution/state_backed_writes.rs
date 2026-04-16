@@ -222,12 +222,14 @@ fn exact_filter_text(
 fn exact_text_value(value: &Value, error_message: &str) -> Result<String, WriteResolveError> {
     text_from_value(value).ok_or_else(|| WriteResolveError {
         message: error_message.to_string(),
+        hint: None,
     })
 }
 
 fn exact_bool_value(value: &Value, error_message: &str) -> Result<bool, WriteResolveError> {
     bool_from_value(value).ok_or_else(|| WriteResolveError {
         message: error_message.to_string(),
+        hint: None,
     })
 }
 
@@ -433,6 +435,7 @@ impl StateBackedSurface<'_> {
                 let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
                     message: "public state insert resolver requires a concrete version_id"
                         .to_string(),
+                    hint: None,
                 })?;
                 hydrator
                     .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
@@ -449,6 +452,7 @@ impl StateBackedSurface<'_> {
                 let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
                     message: "public entity insert resolver requires a concrete version_id"
                         .to_string(),
+                    hint: None,
                 })?;
                 hydrator
                     .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
@@ -523,6 +527,7 @@ where
     if rows.len() != payloads.len() {
         return Err(WriteResolveError {
             message: "public insert resolver requires one planned row per payload row".to_string(),
+            hint: None,
         });
     }
     let mut partitions = ResolvedWritePlanBuilder::default();
@@ -723,6 +728,7 @@ fn resolve_state_backed_existing_write_from_rows(
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public existing-row resolver does not handle inserts".to_string(),
+            hint: None,
         }),
     }
 }
@@ -742,6 +748,7 @@ where
         return Err(WriteResolveError {
             message: "public state insert resolver requires one version target per payload row"
                 .to_string(),
+            hint: None,
         });
     }
     let single_row = payloads.len() == 1;
@@ -761,6 +768,7 @@ where
             })
             .ok_or_else(|| WriteResolveError {
                 message: "public write resolver requires an exact entity target".to_string(),
+                hint: None,
             })?;
         rows.push(build_state_insert_row(
             entity_id,
@@ -797,6 +805,7 @@ where
                 message: format!(
                     "public state insert resolver could not parse snapshot_content JSON: {error}"
                 ),
+                hint: None,
             })?
         else {
             return Err(WriteResolveError {
@@ -804,6 +813,7 @@ where
                     "public state insert resolver requires object snapshot_content for schema '{}'",
                     schema.schema_key
                 ),
+                hint: None,
             });
         };
 
@@ -824,6 +834,7 @@ where
                         message: format!(
                             "public state insert resolver could not serialize snapshot_content: {error}"
                         ),
+                        hint: None,
                     }
                 })?,
             ),
@@ -858,6 +869,7 @@ fn exact_selector_row_key(
     )?
     .ok_or_else(|| WriteResolveError {
         message: "public state selector requires an exact 'entity_id'".to_string(),
+        hint: None,
     })?;
 
     let mut row_key = CanonicalStateRowKey {
@@ -884,6 +896,7 @@ async fn resolve_exact_state_target_rows(
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "public existing-row write resolver requires a concrete version_id".to_string(),
+        hint: None,
     })?;
     let current_row = hydrator
         .resolve_exact_effective_state_row(&ExactEffectiveStateRowRequest {
@@ -987,6 +1000,7 @@ fn selector_row_version_id(
     resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
         message: "public write resolver requires a concrete version_id for the selected row"
             .to_string(),
+        hint: None,
     })
 }
 

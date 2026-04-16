@@ -62,6 +62,10 @@ name = "state_insert_history"
 harness = false
 
 [[bench]]
+name = "live_state_rebuild"
+harness = false
+
+[[bench]]
 name = "version_create"
 harness = false
 

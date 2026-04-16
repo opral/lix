@@ -909,8 +909,14 @@ where
     )
     .await
     .map_err(|error| {
-        public_authoritative_write_error(&public_write.canonicalized, error.message.clone())
-            .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", error.message))
+        let hint = error.hint.clone();
+        let lix_err =
+            public_authoritative_write_error(&public_write.canonicalized, error.message.clone())
+                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", error.message));
+        match hint {
+            Some(hint) => lix_err.with_hint(hint),
+            None => lix_err,
+        }
     })?;
 
     public_write.planned_write.resolved_write_plan = Some(resolved_write_plan);
