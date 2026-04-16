@@ -427,4 +427,62 @@ mod tests {
         assert_eq!(insert.path, update.path);
         assert_eq!(insert.name, update.name);
     }
+
+    #[test]
+    fn assignment_parsers_accept_rfc_pchar_segments() {
+        let special_directory_name = "guide:alpha@beta!$&()*+,;=";
+        let special_file_path = "/docs:alpha@beta/report:summary@v1.txt";
+
+        let mut directory_payload = BTreeMap::new();
+        directory_payload.insert(
+            "path".to_string(),
+            Value::Text(format!("/docs:alpha@beta/{special_directory_name}/")),
+        );
+        directory_payload.insert(
+            "name".to_string(),
+            Value::Text(special_directory_name.to_string()),
+        );
+
+        let directory_insert =
+            parse_directory_insert_assignments(&directory_payload, &system_functions())
+                .expect("directory insert parse should succeed");
+        let directory_update = parse_directory_update_assignments(&directory_payload)
+            .expect("directory update parse should succeed");
+
+        assert_eq!(
+            directory_insert.name.as_deref(),
+            Some(special_directory_name)
+        );
+        assert_eq!(
+            directory_insert
+                .path
+                .as_ref()
+                .expect("directory path")
+                .as_str(),
+            format!("/docs:alpha@beta/{special_directory_name}/")
+        );
+        assert_eq!(directory_insert.path, directory_update.path);
+        assert_eq!(directory_insert.name, directory_update.name);
+
+        let mut file_payload = BTreeMap::new();
+        file_payload.insert("path".to_string(), Value::Text(special_file_path.to_string()));
+
+        let file_insert =
+            parse_file_insert_assignments(&file_payload, &system_functions())
+                .expect("file insert parse should succeed");
+        let file_update =
+            parse_file_update_assignments(&file_payload).expect("file update parse should succeed");
+
+        assert_eq!(file_insert.path.normalized_path.as_str(), special_file_path);
+        assert_eq!(file_insert.path.name, "report:summary@v1");
+        assert_eq!(file_insert.path.extension.as_deref(), Some("txt"));
+        assert_eq!(
+            file_update
+                .path
+                .expect("file update path should exist")
+                .normalized_path
+                .as_str(),
+            special_file_path
+        );
+    }
 }
