@@ -174,7 +174,7 @@ pub(crate) async fn prepare_public_plan(
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<Option<PublicPlan>, LixError> {
     let mut metadata_reader = backend;
     let active_history_root_commit_id: Option<String> = metadata_reader
@@ -187,7 +187,7 @@ pub(crate) async fn prepare_public_plan(
         active_version_id,
         active_history_root_commit_id.as_deref(),
         active_account_ids,
-        writer_key,
+        origin_key,
         false,
     )
     .await
@@ -203,7 +203,7 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicPlan>, LixError> {
@@ -228,7 +228,7 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
                 params,
                 active_version_id,
                 active_account_ids,
-                writer_key,
+                origin_key,
                 parse_duration,
             )
             .await?;
@@ -260,7 +260,7 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
                 params,
                 active_version_id,
                 active_history_root_commit_id,
-                writer_key,
+                origin_key,
                 allow_internal_relations,
                 parse_duration,
             )
@@ -285,7 +285,7 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
 ) -> Result<Option<PublicPlan>, LixError> {
     let functions = crate::functions::clone_boxed_function_provider(
@@ -307,7 +307,7 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
         active_version_id,
         active_history_root_commit_id,
         active_account_ids,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         None,
     )
@@ -322,7 +322,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     params: &[Value],
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -334,7 +334,7 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
         params,
         active_version_id,
         active_history_root_commit_id,
-        writer_key,
+        origin_key,
         allow_internal_relations,
         parse_duration,
     )
@@ -482,7 +482,7 @@ pub(crate) async fn prepare_public_read(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Option<PublicReadPlan> {
     let mut metadata_reader = backend;
     let active_history_root_commit_id: Option<String> = metadata_reader
@@ -496,7 +496,7 @@ pub(crate) async fn prepare_public_read(
         params,
         active_version_id,
         active_history_root_commit_id.as_deref(),
-        writer_key,
+        origin_key,
     )
     .await
 }
@@ -507,7 +507,7 @@ pub(crate) async fn prepare_public_read_strict(
     parsed_statements: &[Statement],
     params: &[Value],
     active_version_id: &str,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     let mut metadata_reader = backend;
     let active_history_root_commit_id: Option<String> = metadata_reader
@@ -519,7 +519,7 @@ pub(crate) async fn prepare_public_read_strict(
         params,
         active_version_id,
         active_history_root_commit_id.as_deref(),
-        writer_key,
+        origin_key,
     )
     .await
 }
@@ -1130,7 +1130,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
     params: &[Value],
     active_version_id: &str,
     active_account_ids: &[String],
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicWritePlan>, LixError> {
     if parsed_statements.len() != 1 {
@@ -1146,7 +1146,7 @@ pub(crate) async fn try_prepare_public_write_with_registry_and_functions(
         params.to_vec(),
         StatementContext {
             dialect: Some(dialect),
-            writer_key: writer_key.map(ToString::to_string),
+            origin_key: origin_key.map(ToString::to_string),
             requested_version_id: Some(active_version_id.to_string()),
             active_account_ids: active_account_ids.to_vec(),
         },
@@ -1281,7 +1281,7 @@ pub(crate) fn build_public_write_execution(
                     semantic_effects: semantic_plan_effects_from_changes(
                         &change_batch.changes,
                         state_commit_stream_operation(planned_write.command.operation_kind),
-                        change_batch.writer_key.as_deref(),
+                        change_batch.origin_key.as_deref(),
                     )?,
                     change_batch: Some(change_batch),
                 }));
@@ -1430,11 +1430,11 @@ fn semantic_plan_effects_from_untracked_public_write(
             intended_post_state,
             state_commit_stream_operation(planned_write.command.operation_kind),
             true,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(
                 planned_write
                     .command
                     .statement_context
-                    .writer_key
+                    .origin_key
                     .as_deref(),
             ),
         )?,
@@ -1457,13 +1457,13 @@ fn semantic_plan_effects_from_untracked_public_write(
 pub(crate) fn semantic_plan_effects_from_changes<Change: StateChangeRecord>(
     changes: &[Change],
     stream_operation: StateCommitStreamOperation,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<PlanEffects, LixError> {
     let mut effects = PlanEffects {
         state_commit_stream_changes: state_commit_stream_changes_from_changes(
             changes,
             stream_operation,
-            StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+            StateCommitStreamRuntimeMetadata::from_runtime_origin_key(origin_key),
         )?,
         file_cache_refresh_targets: file_cache_refresh_targets_from_changes(changes),
         ..PlanEffects::default()
@@ -3779,7 +3779,7 @@ mod tests {
             Vec::new(),
             StatementContext {
                 dialect: Some(SqlDialect::Sqlite),
-                writer_key: None,
+                origin_key: None,
                 requested_version_id: Some("main".to_string()),
                 active_account_ids: Vec::new(),
             },
@@ -4210,7 +4210,6 @@ mod tests {
                     plugin_key: version_descriptor_plugin_key().map(str::to_string),
                     metadata: None,
                     change_id: Some(format!("change-public-{}", descriptor.id)),
-                    writer_key: None,
                     global: true,
                     untracked: false,
                     created_at: Some(timestamp.clone()),
@@ -4233,7 +4232,6 @@ mod tests {
                         plugin_key: version_ref_plugin_key().map(str::to_string),
                         metadata: None,
                         change_id: Some(format!("change-public-ref-{}", descriptor.id)),
-                        writer_key: None,
                         global: true,
                         untracked: true,
                         created_at: Some(ref_timestamp.clone()),

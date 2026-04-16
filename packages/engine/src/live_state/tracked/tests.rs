@@ -185,7 +185,6 @@ fn tracked_row(entity_id: &str, child_id: &str, change_id: &str, timestamp: &str
         plugin_key: None,
         metadata: Some("{\"kind\":\"module-test\"}".to_string()),
         change_id: change_id.to_string(),
-        writer_key: Some("writer-a".to_string()),
         snapshot_content: Some(format!(
             "{{\"child_id\":\"{child_id}\",\"parent_id\":\"parent-{entity_id}\"}}"
         )),
@@ -199,7 +198,7 @@ async fn commit_tracked_rows(
     backend: &SqliteBackend,
     rows: Vec<LiveWriteRow>,
 ) -> Result<(), LixError> {
-    let read_context = OverlayReadContext::new(backend, backend, backend);
+    let read_context = OverlayReadContext::new(backend, backend);
     let backend_txn = backend
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
@@ -246,7 +245,6 @@ async fn live_tracked_state_roundtrips_rows() {
             file_id: NullableKeyFilter::Null,
             schema_version: None,
             plugin_key: NullableKeyFilter::Any,
-            writer_key: None,
             global: None,
             untracked: None,
             include_tombstones: false,
@@ -258,7 +256,6 @@ async fn live_tracked_state_roundtrips_rows() {
     .expect("exact tracked lookup should succeed")
     .expect("tracked row should exist");
     assert_eq!(exact.change_id.as_deref(), Some("change-1"));
-    assert_eq!(exact.writer_key.as_deref(), Some("writer-a"));
     let snapshot: serde_json::Value = serde_json::from_str(
         exact
             .snapshot_content
@@ -358,7 +355,6 @@ async fn live_tracked_state_tombstones_hide_rows() {
             plugin_key: None,
             metadata: Some("{\"kind\":\"module-test\"}".to_string()),
             change_id: "change-2".to_string(),
-            writer_key: Some("writer-a".to_string()),
             snapshot_content: None,
             created_at: Some(tombstone_time.to_string()),
             updated_at: tombstone_time.to_string(),

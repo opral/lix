@@ -25,6 +25,7 @@ pub(crate) async fn execute_prepared_read_batch_in_committed_read_transaction(
 
     Ok(ExecuteResult {
         statements: results,
+        write_receipt: None,
     })
 }
 

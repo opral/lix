@@ -3,8 +3,7 @@
 /// This seam is shared on purpose: `streams/*` converts tracked changes into
 /// commit-stream payloads, while `sql/*`, `transaction/*`, and `live_state/*`
 /// reuse the same row-shaped metadata to derive adjacent runtime effects such
-/// as session-selector updates, file-cache refresh targets, and writer-key
-/// annotations.
+/// as session-selector updates and file-cache refresh targets.
 pub(crate) trait StateChangeRecord {
     fn entity_id(&self) -> &str;
     fn schema_key(&self) -> &str;
@@ -13,5 +12,5 @@ pub(crate) trait StateChangeRecord {
     fn plugin_key(&self) -> Option<&str>;
     fn snapshot_content(&self) -> Option<&str>;
     fn version_id(&self) -> &str;
-    fn writer_key(&self) -> Option<&str>;
+    fn origin_key(&self) -> Option<&str>;
 }

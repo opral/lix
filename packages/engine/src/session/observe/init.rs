@@ -7,7 +7,7 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
             "CREATE TABLE IF NOT EXISTS {} (\
              tick_seq INTEGER PRIMARY KEY AUTOINCREMENT,\
              created_at TEXT NOT NULL,\
-             writer_key TEXT\
+             origin_key TEXT\
              )",
             super::OBSERVE_TICK_TABLE
         ),
@@ -15,7 +15,7 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
             "CREATE TABLE IF NOT EXISTS {} (\
              tick_seq BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,\
              created_at TEXT NOT NULL,\
-             writer_key TEXT\
+             origin_key TEXT\
              )",
             super::OBSERVE_TICK_TABLE
         ),

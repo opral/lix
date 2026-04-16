@@ -18,8 +18,8 @@ use crate::wasm::WasmRuntime;
 use crate::{
     AdditionalSessionOptions, CreateCheckpointResult, CreateVersionOptions, CreateVersionResult,
     ExecuteOptions, ExecuteResult, LixBackend, LixError, MergeVersionOptions, MergeVersionResult,
-    ObserveEventsOwned, ObserveQuery, RedoOptions, RedoResult, Session, SessionTransaction,
-    UndoOptions, UndoResult, Value,
+    ObserveEventsOwned, ObserveOptions, ObserveQuery, RedoOptions, RedoResult, Session,
+    SessionTransaction, UndoOptions, UndoResult, Value, WriteReceipt,
 };
 
 use super::deterministic_settings::{
@@ -207,6 +207,27 @@ impl Lix {
         )
     }
 
+    /// Returns the workspace session's default delivery origin.
+    ///
+    /// This is the origin used by `exclude_self()` and inherited write
+    /// execution, not a row-level metadata field.
+    pub fn origin_key(&self) -> Result<&str, LixError> {
+        Ok(crate::session::require_workspace_session(&self.workspace_session)?.origin_key())
+    }
+
+    /// Waits until the receipt's state-commit fence has been emitted.
+    ///
+    /// This is the engine-level optimistic-ack path. It uses the receipt
+    /// returned by write execution and does not inspect row-visible origin
+    /// metadata.
+    pub async fn wait_for_write_receipt(&self, receipt: &WriteReceipt) -> Result<(), LixError> {
+        let session_host = self.engine.session_host();
+        crate::session::opened_workspace_session(&session_host, &self.workspace_session)
+            .await?
+            .wait_for_write_receipt(receipt)
+            .await
+    }
+
     pub async fn execute_with_options(
         &self,
         sql: &str,
@@ -227,6 +248,36 @@ impl Lix {
             )?),
             query,
         )
+    }
+
+    /// Observes a query with explicit delivery filters.
+    ///
+    /// `ObserveOptions` filters on delivery metadata such as `origin_key`; it
+    /// does not require the query itself to project origin columns.
+    pub fn observe_with_options(
+        &self,
+        query: ObserveQuery,
+        options: ObserveOptions,
+    ) -> Result<ObserveEventsOwned, LixError> {
+        Session::observe_owned_with_options(
+            Arc::clone(crate::session::require_workspace_session(
+                &self.workspace_session,
+            )?),
+            query,
+            options,
+        )
+    }
+
+    /// Subscribes to committed semantic change batches.
+    ///
+    /// Origin filters operate on delivery metadata attached to each batch, not
+    /// on durable row columns.
+    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> PublicStateCommitStream {
+        if let Some(session) = self.workspace_session.get() {
+            return session.state_commit_stream(filter);
+        }
+        self.engine
+            .state_commit_stream(filter.resolved_without_session_origin())
     }
 
     /// Opens an additional scoped [`Session`].
@@ -406,10 +457,6 @@ impl Lix {
                     .await?;
         }
         Ok(())
-    }
-
-    pub fn state_commit_stream(&self, filter: StateCommitStreamFilter) -> PublicStateCommitStream {
-        self.engine.state_commit_stream(filter)
     }
 
     pub async fn live_state_projection_status(&self) -> Result<ProjectionStatus, LixError> {

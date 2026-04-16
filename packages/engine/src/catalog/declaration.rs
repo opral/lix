@@ -125,7 +125,6 @@ pub(crate) struct CatalogProjectionSourceRow {
     pub(crate) plugin_key: Option<String>,
     pub(crate) metadata: Option<String>,
     pub(crate) change_id: Option<String>,
-    pub(crate) writer_key: Option<String>,
     pub(crate) global: Option<bool>,
     pub(crate) created_at: Option<String>,
     pub(crate) updated_at: Option<String>,
@@ -150,7 +149,6 @@ impl CatalogProjectionSourceRow {
             plugin_key: None,
             metadata: None,
             change_id: None,
-            writer_key: None,
             global: None,
             created_at: None,
             updated_at: None,
@@ -164,7 +162,6 @@ impl CatalogProjectionSourceRow {
         plugin_key: Option<String>,
         metadata: Option<String>,
         change_id: Option<String>,
-        writer_key: Option<String>,
         global: bool,
         created_at: Option<String>,
         updated_at: Option<String>,
@@ -173,7 +170,6 @@ impl CatalogProjectionSourceRow {
         self.plugin_key = plugin_key;
         self.metadata = metadata;
         self.change_id = change_id;
-        self.writer_key = writer_key;
         self.global = Some(global);
         self.created_at = created_at;
         self.updated_at = updated_at;
@@ -183,10 +179,6 @@ impl CatalogProjectionSourceRow {
     pub(crate) fn with_tombstone(mut self, tombstone: bool) -> Self {
         self.tombstone = tombstone;
         self
-    }
-
-    pub(crate) fn set_writer_key(&mut self, writer_key: Option<String>) {
-        self.writer_key = writer_key;
     }
 
     pub(crate) fn storage(&self) -> CatalogProjectionStorageKind {
@@ -225,10 +217,6 @@ impl CatalogProjectionSourceRow {
 
     pub(crate) fn change_id(&self) -> Option<&str> {
         self.change_id.as_deref()
-    }
-
-    pub(crate) fn writer_key(&self) -> Option<&str> {
-        self.writer_key.as_deref()
     }
 
     pub(crate) fn global(&self) -> Option<bool> {

@@ -80,8 +80,8 @@ pub(crate) struct CreateCommitArgs {
     pub(crate) lane_parent_commit_ids_override: Option<Vec<String>>,
     pub(crate) allow_empty_commit: bool,
     pub(crate) should_emit_observe_tick: bool,
-    pub(crate) observe_tick_writer_key: Option<String>,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) observe_tick_origin_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -112,7 +112,7 @@ pub(crate) struct CommitIdempotencyWrite {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ObserveTickWrite {
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,7 +282,7 @@ pub(crate) async fn create_commit(
         &args.changes,
         &preflight,
         &args.filesystem_state,
-        args.writer_key.as_deref(),
+        args.origin_key.as_deref(),
     )?;
     let applied_changes = {
         let mut executor = TransactionCommitExecutor { transaction };
@@ -394,7 +394,7 @@ pub(crate) async fn create_commit(
         created_at: timestamp.clone(),
     };
     let observe_tick = args.should_emit_observe_tick.then(|| ObserveTickWrite {
-        writer_key: args.observe_tick_writer_key.clone(),
+        origin_key: args.observe_tick_origin_key.clone(),
     });
     let pending_public_commit_seed = build_pending_public_commit_seed(&canonical_changes)?;
     append_changes(transaction, &canonical_changes, functions)
@@ -411,7 +411,7 @@ pub(crate) async fn create_commit(
     }
     if let Some(observe_tick) = observe_tick.as_ref() {
         write_batch.push_statement(
-            build_observe_tick_insert_sql(observe_tick.writer_key.as_deref()),
+            build_observe_tick_insert_sql(observe_tick.origin_key.as_deref()),
             Vec::new(),
         );
     }
@@ -503,14 +503,14 @@ fn build_pending_public_commit_seed(
     }))
 }
 
-fn build_observe_tick_insert_sql(writer_key: Option<&str>) -> String {
-    match writer_key {
-        Some(writer_key) => format!(
-            "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+fn build_observe_tick_insert_sql(origin_key: Option<&str>) -> String {
+    match origin_key {
+        Some(origin_key) => format!(
+            "INSERT INTO lix_internal_observe_tick (created_at, origin_key) \
              VALUES (CURRENT_TIMESTAMP, '{}')",
-            escape_sql_string(writer_key)
+            escape_sql_string(origin_key)
         ),
-        None => "INSERT INTO lix_internal_observe_tick (created_at, writer_key) \
+        None => "INSERT INTO lix_internal_observe_tick (created_at, origin_key) \
                   VALUES (CURRENT_TIMESTAMP, NULL)"
             .to_string(),
     }
@@ -552,12 +552,12 @@ fn resolve_staged_changes(
     changes: &[StagedChange],
     preflight: &CreateCommitPreflightState,
     filesystem_state: &FilesystemTransactionState,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<(Vec<StagedChange>, CompiledTrackedFilesystemState), CreateCommitError> {
     let hydrated = with_exact_filesystem_descriptors(filesystem_state, &preflight.file_descriptors);
     let compiled_filesystem = compile_filesystem_transaction_state_from_state(
         &hydrated,
-        writer_key,
+        origin_key,
         &[] as &[MutationRow],
     )
     .map_err(backend_error)?;
@@ -577,8 +577,8 @@ fn resolve_staged_changes(
         let identity = staged_change_identity(&compiled_change);
         if let Some(index) = index_by_identity.get(&identity).copied() {
             let mut merged = compiled_change;
-            if merged.writer_key.is_none() {
-                merged.writer_key = resolved[index].writer_key.clone();
+            if merged.origin_key.is_none() {
+                merged.origin_key = resolved[index].origin_key.clone();
             }
             resolved[index] = merged;
         } else {
@@ -711,7 +711,7 @@ fn staged_change_from_filesystem_semantic_change(
             change.version_id.clone(),
             "filesystem semantic change version_id",
         )?,
-        writer_key: change.writer_key.clone(),
+        origin_key: change.origin_key.clone(),
         created_at: None,
     })
 }
@@ -786,7 +786,7 @@ fn materialize_staged_changes(
                     "metadata",
                 )?
                 .map(|value| value.as_str().to_string()),
-                writer_key: change.writer_key.clone(),
+                origin_key: change.origin_key.clone(),
                 created_at: Some(timestamp.to_string()),
             })
         })
@@ -1386,8 +1386,8 @@ mod tests {
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
             should_emit_observe_tick: false,
-            observe_tick_writer_key: None,
-            writer_key: None,
+            observe_tick_origin_key: None,
+            origin_key: None,
         }
     }
 
@@ -1432,7 +1432,7 @@ mod tests {
             snapshot_content: Some("{\"key\":\"hello\"}".to_string()),
             metadata: None,
             version_id: "version-a".try_into().unwrap(),
-            writer_key: Some("writer-a".to_string()),
+            origin_key: Some("writer-a".to_string()),
             created_at: None,
         }
     }
@@ -1454,7 +1454,7 @@ mod tests {
             )),
             metadata: None,
             version_id: GLOBAL_VERSION_ID.try_into().unwrap(),
-            writer_key: Some("writer-a".to_string()),
+            origin_key: Some("writer-a".to_string()),
             created_at: None,
         }
     }

@@ -141,7 +141,6 @@ async fn append_runtime_sequence_row_in_transaction(
             plugin_key: None,
             metadata: None,
             change_id: Some(change_id),
-            writer_key: None,
             global: true,
             untracked: true,
             created_at: Some(created_at.clone()),

@@ -25,7 +25,7 @@ pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) filesystem_state: FilesystemTransactionState,
     pub(crate) preconditions: CreateCommitPreconditions,
     pub(crate) active_account_ids: Vec<String>,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) should_emit_observe_tick: bool,
 }
 
@@ -57,16 +57,12 @@ async fn append_tracked_unchecked(
     // canonical commit facts, replica-local version-head state, and
     // derived live-state rows. The owners
     // remain distinct even though the write unit commits them together.
-    let execution_writer_key = args.writer_key.clone();
     let result = create_commit(transaction, args, functions, invariant_checker)
         .await
         .map_err(create_commit_error_to_lix_error)?;
 
     if let Some(receipt) = result.receipt.as_ref() {
-        let tracked_live_rows = tracked_live_rows_from_staged_changes(
-            &result.applied_changes,
-            execution_writer_key.as_deref(),
-        )?;
+        let tracked_live_rows = tracked_live_rows_from_staged_changes(&result.applied_changes)?;
         let untracked_live_rows = untracked_live_rows_from_updated_version_refs(
             &receipt.canonical_receipt.updated_version_refs,
         );
@@ -117,7 +113,6 @@ pub(crate) async fn append_tracked_with_pending_public_session(
                 &args.changes,
                 &binary_blob_writes,
                 &args.active_account_ids,
-                args.writer_key.as_deref(),
                 functions,
                 &timestamp,
             )
@@ -144,8 +139,8 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
             should_emit_observe_tick: args.should_emit_observe_tick,
-            observe_tick_writer_key: args.writer_key.clone(),
-            writer_key: args.writer_key,
+            observe_tick_origin_key: args.origin_key.clone(),
+            origin_key: args.origin_key,
         },
         functions,
         invariant_checker,
@@ -273,7 +268,7 @@ mod tests {
             snapshot_content: Some("{\"key\":\"hello\"}".to_string()),
             metadata: None,
             version_id: "version-a".try_into().unwrap(),
-            writer_key: Some("writer-a".to_string()),
+            origin_key: Some("writer-a".to_string()),
             created_at: None,
         }
     }
@@ -300,8 +295,8 @@ mod tests {
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
                 should_emit_observe_tick: false,
-                observe_tick_writer_key: None,
-                writer_key: None,
+                observe_tick_origin_key: None,
+                origin_key: None,
             },
             &mut functions,
             None,
@@ -341,7 +336,7 @@ mod tests {
                     idempotency_key: CreateCommitIdempotencyKey::Exact("idem-1".to_string()),
                 },
                 active_account_ids: Vec::new(),
-                writer_key: None,
+                origin_key: None,
                 should_emit_observe_tick: false,
             },
             &mut functions,

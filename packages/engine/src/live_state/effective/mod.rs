@@ -63,7 +63,6 @@ pub struct EffectiveRow {
     pub untracked: bool,
     pub plugin_key: Option<String>,
     pub metadata: Option<String>,
-    pub writer_key: Option<String>,
     pub created_at: Option<String>,
     pub updated_at: Option<String>,
     pub source_change_id: Option<String>,

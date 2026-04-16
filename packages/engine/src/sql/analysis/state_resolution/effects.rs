@@ -8,11 +8,11 @@ use std::collections::BTreeSet;
 
 pub(crate) fn derive_effects_from_state_resolution(
     preprocess: &PlannedStatementSet,
-    writer_key: Option<&str>,
+    origin_key: Option<&str>,
 ) -> Result<PlanEffects, PlannerError> {
     let state_commit_stream_changes = state_commit_stream_changes_from_mutations(
         &preprocess.mutations,
-        StateCommitStreamRuntimeMetadata::from_runtime_writer_key(writer_key),
+        StateCommitStreamRuntimeMetadata::from_runtime_origin_key(origin_key),
     );
     let file_cache_refresh_targets = direct_state_file_cache_refresh_targets(&preprocess.mutations);
 

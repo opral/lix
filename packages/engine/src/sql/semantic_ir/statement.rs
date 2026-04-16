@@ -14,7 +14,7 @@ pub(crate) enum StatementKind {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct StatementContext {
     pub(crate) dialect: Option<SqlDialect>,
-    pub(crate) writer_key: Option<String>,
+    pub(crate) origin_key: Option<String>,
     pub(crate) requested_version_id: Option<String>,
     pub(crate) active_account_ids: Vec<String>,
 }

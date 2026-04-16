@@ -52,6 +52,13 @@ impl<'a> BufferedWriteTransaction<'a> {
             outcome.session_delta.next_active_account_ids =
                 Some(execution_input.active_account_ids().to_vec());
         }
+        outcome.write_receipt = self
+            .latest_canonical_commit_receipt
+            .as_ref()
+            .map(|receipt| crate::WriteReceipt {
+                state_commit_sequence: None,
+                canonical_commit: Some(receipt.canonical_receipt.clone()),
+            });
         self.finalize_live_state_for_commit().await?;
         self.coordinator.commit().await?;
         Ok(outcome)
@@ -146,7 +153,7 @@ impl<'a> BufferedWriteTransaction<'a> {
         {
             append_observe_tick_in_transaction(
                 self.coordinator.backend_transaction_mut()?,
-                execution_input.writer_key(),
+                execution_input.origin_key(),
             )
             .await?;
             self.buffered_write_state.mark_observe_tick_emitted();
@@ -234,6 +241,13 @@ fn apply_buffered_write_execution_outcome(
             &state_commit_stream_changes,
         ),
         invalidate_installed_plugins_cache: write_outcome.plugin_changes_committed,
+        write_receipt: write_outcome
+            .canonical_commit_receipt
+            .as_ref()
+            .map(|receipt| crate::WriteReceipt {
+                state_commit_sequence: None,
+                canonical_commit: Some(receipt.canonical_receipt.clone()),
+            }),
         state_commit_stream_changes,
         ..TransactionCommitOutcome::default()
     });

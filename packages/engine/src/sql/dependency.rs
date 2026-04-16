@@ -22,7 +22,7 @@ pub(crate) enum DependencyPrecision {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct DependencyWriterFilter {
+pub(crate) struct DependencyOriginFilter {
     pub(crate) include: BTreeSet<String>,
     pub(crate) exclude: BTreeSet<String>,
 }
@@ -35,7 +35,7 @@ pub(crate) struct DependencySpec {
     pub(crate) file_ids: BTreeSet<String>,
     pub(crate) version_ids: BTreeSet<String>,
     pub(crate) query_dependencies: BTreeSet<QueryDependency>,
-    pub(crate) writer_filter: DependencyWriterFilter,
+    pub(crate) origin_filter: DependencyOriginFilter,
     pub(crate) include_untracked: bool,
     pub(crate) depends_on_active_version: bool,
     pub(crate) precision: DependencyPrecision,
@@ -50,7 +50,7 @@ impl Default for DependencySpec {
             file_ids: BTreeSet::new(),
             version_ids: BTreeSet::new(),
             query_dependencies: BTreeSet::new(),
-            writer_filter: DependencyWriterFilter::default(),
+            origin_filter: DependencyOriginFilter::default(),
             include_untracked: true,
             depends_on_active_version: false,
             precision: DependencyPrecision::Precise,

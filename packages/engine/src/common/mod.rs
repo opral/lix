@@ -40,6 +40,6 @@ pub(crate) use text::escape_sql_string;
 #[allow(unused_imports)]
 pub(crate) use types::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 #[allow(unused_imports)]
-pub use types::{ExecuteResult, NullableKeyFilter, QueryResult, Value};
+pub use types::{ExecuteResult, NullableKeyFilter, QueryResult, Value, WriteReceipt};
 #[allow(unused_imports)]
 pub use wire::{WireQueryResult, WireValue};

@@ -24,7 +24,7 @@ use super::untracked::{
 use super::{
     load_exact_tracked_row_with_backend, load_exact_tracked_tombstone_with_executor,
     load_exact_untracked_row_with_executor, scan_tracked_rows_with_backend,
-    scan_tracked_tombstones_with_executor, LiveWriteOperation, LiveWriteRow, RowIdentity,
+    scan_tracked_tombstones_with_executor, LiveWriteOperation, LiveWriteRow,
 };
 use crate::schema::{schema_key_from_definition, SchemaKey};
 use crate::version::GLOBAL_VERSION_ID;
@@ -63,8 +63,6 @@ pub struct ExactLiveRowQuery {
     #[serde(default)]
     pub plugin_key: NullableKeyFilter<String>,
     #[serde(default)]
-    pub writer_key: Option<String>,
-    #[serde(default)]
     pub global: Option<bool>,
     #[serde(default)]
     pub untracked: Option<bool>,
@@ -86,7 +84,6 @@ pub struct LiveRow {
     pub plugin_key: Option<String>,
     pub metadata: Option<String>,
     pub change_id: Option<String>,
-    pub writer_key: Option<String>,
     pub global: bool,
     pub untracked: bool,
     pub created_at: Option<String>,
@@ -153,26 +150,6 @@ pub async fn write_live_rows(
     transaction: &mut dyn LixBackendTransaction,
     rows: &[LiveRow],
 ) -> Result<(), LixError> {
-    if !rows.is_empty() {
-        let annotations = rows
-            .iter()
-            .map(|row| {
-                (
-                    RowIdentity {
-                        schema_key: row.schema_key.clone(),
-                        version_id: row.version_id.clone(),
-                        entity_id: row.entity_id.clone(),
-                        file_id: row.file_id.clone(),
-                    },
-                    row.writer_key.clone(),
-                )
-            })
-            .collect::<BTreeMap<_, _>>();
-        let mut executor = &mut *transaction;
-        super::writer_key::apply_writer_key_annotations_with_executor(&mut executor, &annotations)
-            .await?;
-    }
-
     let (tracked, untracked) = partition_live_rows_for_write(rows)?;
 
     if !tracked.is_empty() {
@@ -236,7 +213,6 @@ async fn scan_tracked_rows(
         rows.extend(tombstones.into_iter().map(tracked_tombstone_to_row));
     }
 
-    overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
     rows.sort_by(row_sort_key);
     Ok(rows)
 }
@@ -280,11 +256,7 @@ async fn load_exact_tracked_row(
     )
     .await?
     {
-        let mut rows = vec![tracked_row_to_row(row, &contract)?];
-        overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
-        let row = rows
-            .pop()
-            .expect("tracked exact read overlay should preserve single row");
+        let row = tracked_row_to_row(row, &contract)?;
         return Ok(exact_live_row_matches_query(&row, request).then_some(row));
     }
 
@@ -304,11 +276,7 @@ async fn load_exact_tracked_row(
     )
     .await?;
     if let Some(tombstone) = tombstone {
-        let mut rows = vec![tracked_tombstone_to_row(tombstone)];
-        overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
-        let row = rows
-            .pop()
-            .expect("tracked tombstone overlay should preserve single row");
+        let row = tracked_tombstone_to_row(tombstone);
         return Ok(exact_live_row_matches_query(&row, request).then_some(row));
     }
 
@@ -594,15 +562,6 @@ async fn canonical_effective_lane_outcome_from_visible_row(
                 row.source_change_id
             ))
         })?;
-    let writer_key = super::writer_key::load_writer_key_annotation_for_state_row(
-        backend,
-        &storage_version_id,
-        &row.schema_key,
-        &row.entity_id,
-        row.file_id.as_deref(),
-    )
-    .await?;
-
     let row = LiveRow {
         entity_id: row.entity_id,
         file_id: row.file_id,
@@ -612,7 +571,6 @@ async fn canonical_effective_lane_outcome_from_visible_row(
         plugin_key: row.plugin_key,
         metadata: row.metadata,
         change_id: Some(change.id),
-        writer_key,
         global: lane.is_global(),
         untracked: false,
         created_at: Some(change.created_at.clone()),
@@ -732,47 +690,7 @@ async fn scan_lane_rows(
         row
     }));
 
-    overlay_writer_key_annotations_on_tracked_live_rows(backend, &mut rows).await?;
     Ok(rows)
-}
-
-async fn overlay_writer_key_annotations_on_tracked_live_rows(
-    backend: &dyn LixBackend,
-    rows: &mut [LiveRow],
-) -> Result<(), LixError> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let row_identities = rows
-        .iter()
-        .map(|row| RowIdentity {
-            schema_key: row.schema_key.clone(),
-            version_id: row.version_id.clone(),
-            entity_id: row.entity_id.clone(),
-            file_id: row.file_id.clone(),
-        })
-        .collect::<BTreeSet<_>>();
-
-    if row_identities.is_empty() {
-        return Ok(());
-    }
-
-    let annotations =
-        super::writer_key::load_writer_key_annotations(backend, &row_identities).await?;
-    for row in rows.iter_mut() {
-        row.writer_key = annotations
-            .get(&RowIdentity {
-                schema_key: row.schema_key.clone(),
-                version_id: row.version_id.clone(),
-                entity_id: row.entity_id.clone(),
-                file_id: row.file_id.clone(),
-            })
-            .cloned()
-            .unwrap_or(None);
-    }
-
-    Ok(())
 }
 
 fn tracked_row_to_row(
@@ -789,7 +707,6 @@ fn tracked_row_to_row(
         plugin_key: row.plugin_key,
         metadata: row.metadata,
         change_id: row.change_id,
-        writer_key: row.writer_key,
         global: row.global,
         untracked: false,
         created_at: Some(row.created_at),
@@ -812,7 +729,6 @@ fn untracked_row_to_row(
         plugin_key: row.plugin_key,
         metadata: row.metadata,
         change_id: Some(row.change_id),
-        writer_key: row.writer_key,
         global: row.global,
         untracked: true,
         created_at: Some(row.created_at),
@@ -831,7 +747,6 @@ fn tracked_tombstone_to_row(tombstone: super::TrackedTombstoneMarker) -> LiveRow
         plugin_key: tombstone.plugin_key,
         metadata: tombstone.metadata,
         change_id: tombstone.change_id,
-        writer_key: tombstone.writer_key,
         global: tombstone.global,
         untracked: false,
         created_at: tombstone.created_at,
@@ -866,10 +781,6 @@ fn exact_live_row_matches_query(row: &LiveRow, request: &ExactLiveRowQuery) -> b
             .as_deref()
             .is_none_or(|schema_version| row.schema_version == schema_version)
         && request.plugin_key.matches(row.plugin_key.as_ref())
-        && request
-            .writer_key
-            .as_deref()
-            .is_none_or(|writer_key| row.writer_key.as_deref() == Some(writer_key))
         && request.global.is_none_or(|global| row.global == global)
         && request
             .untracked
@@ -911,7 +822,6 @@ fn live_write_from_live_row(row: &LiveRow) -> Result<LiveWriteRow, LixError> {
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
         change_id,
-        writer_key: row.writer_key.clone(),
         snapshot_content: row.snapshot_content.clone(),
         created_at: row.created_at.clone(),
         updated_at,
@@ -954,7 +864,6 @@ mod tests {
             plugin_key: None,
             metadata: None,
             change_id: Some("chg_schema".to_string()),
-            writer_key: None,
             global: true,
             untracked: false,
             created_at: None,
@@ -973,7 +882,6 @@ mod tests {
             plugin_key: None,
             metadata: Some("{\"kind\":\"state\"}".to_string()),
             change_id: Some("chg_123".to_string()),
-            writer_key: Some("writer-a".to_string()),
             global: false,
             untracked,
             created_at: Some("2026-01-01T00:00:00Z".to_string()),
@@ -991,7 +899,6 @@ mod tests {
             file_id: NullableKeyFilter::Null,
             schema_version: None,
             plugin_key: NullableKeyFilter::Any,
-            writer_key: None,
             global: None,
             untracked: None,
             include_tombstones: false,
@@ -1091,23 +998,13 @@ mod tests {
     }
 
     #[test]
-    fn exact_live_row_query_matches_optional_schema_version_plugin_key_and_writer_key() {
+    fn exact_live_row_query_matches_optional_schema_version_and_plugin_key() {
         let row = writable_live_row(false, Some(r#"{"key":"theme","value":"dark"}"#));
         let mut query = exact_live_row_query();
         query.schema_version = Some("1".to_string());
         query.plugin_key = NullableKeyFilter::Null;
-        query.writer_key = Some("writer-a".to_string());
 
         assert!(exact_live_row_matches_query(&row, &query));
-    }
-
-    #[test]
-    fn exact_live_row_query_rejects_writer_key_mismatch() {
-        let row = writable_live_row(false, Some(r#"{"key":"theme","value":"dark"}"#));
-        let mut query = exact_live_row_query();
-        query.writer_key = Some("writer-b".to_string());
-
-        assert!(!exact_live_row_matches_query(&row, &query));
     }
 
     #[tokio::test]
@@ -1204,7 +1101,6 @@ mod tests {
                 file_id: NullableKeyFilter::Null,
                 schema_version: Some("1".to_string()),
                 plugin_key: NullableKeyFilter::Null,
-                writer_key: None,
                 global: Some(false),
                 untracked: Some(false),
                 include_tombstones: false,

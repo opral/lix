@@ -1,16 +1,15 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use crate::live_state::constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::effective::{
     EffectiveRowRequest, EffectiveRowState, EffectiveRowsRequest, OverlayLane,
 };
-use crate::live_state::shared::identity::RowIdentity;
 use crate::live_state::tracked::{
     BatchTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
 use crate::live_state::untracked::{BatchUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 use crate::live_state::{
-    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView, WriterKeyReadView,
+    LiveReadContext, TrackedReadView, TrackedTombstoneView, UntrackedReadView,
 };
 use crate::{LixError, NullableKeyFilter, Value};
 use async_trait::async_trait;
@@ -30,11 +29,6 @@ struct MockUntrackedView {
 #[derive(Default)]
 struct MockTrackedTombstones {
     rows: Vec<TrackedTombstoneMarker>,
-}
-
-#[derive(Default)]
-struct MockWriterKeys {
-    annotations: BTreeMap<RowIdentity, Option<String>>,
 }
 
 #[async_trait(?Send)]
@@ -113,30 +107,6 @@ impl TrackedTombstoneView for MockTrackedTombstones {
     }
 }
 
-#[async_trait(?Send)]
-impl WriterKeyReadView for MockWriterKeys {
-    async fn load_annotation(
-        &self,
-        row_identity: &RowIdentity,
-    ) -> Result<Option<String>, LixError> {
-        Ok(self.annotations.get(row_identity).cloned().unwrap_or(None))
-    }
-
-    async fn load_annotations(
-        &self,
-        row_identities: &BTreeSet<RowIdentity>,
-    ) -> Result<BTreeMap<RowIdentity, Option<String>>, LixError> {
-        Ok(row_identities
-            .iter()
-            .cloned()
-            .map(|row_identity| {
-                let annotation = self.annotations.get(&row_identity).cloned().unwrap_or(None);
-                (row_identity, annotation)
-            })
-            .collect())
-    }
-}
-
 fn tracked_row(entity_id: &str, version_id: &str, global: bool, child_id: &str) -> TrackedRow {
     TrackedRow {
         entity_id: entity_id.to_string(),
@@ -148,7 +118,6 @@ fn tracked_row(entity_id: &str, version_id: &str, global: bool, child_id: &str) 
         plugin_key: None,
         metadata: Some("{\"kind\":\"tracked\"}".to_string()),
         change_id: Some(format!("chg-{entity_id}-{version_id}")),
-        writer_key: Some("writer-a".to_string()),
         created_at: "2026-03-24T00:00:00Z".to_string(),
         updated_at: "2026-03-24T00:00:00Z".to_string(),
         values: BTreeMap::from([
@@ -172,7 +141,6 @@ fn untracked_row(entity_id: &str, version_id: &str, global: bool, child_id: &str
         plugin_key: None,
         metadata: Some("{\"kind\":\"untracked\"}".to_string()),
         change_id: format!("change-{entity_id}"),
-        writer_key: Some("writer-b".to_string()),
         created_at: "2026-03-24T00:00:00Z".to_string(),
         updated_at: "2026-03-24T00:00:00Z".to_string(),
         values: BTreeMap::from([
@@ -195,19 +163,9 @@ fn tombstone(entity_id: &str, version_id: &str, global: bool) -> TrackedTombston
         schema_version: Some("1".to_string()),
         plugin_key: None,
         metadata: Some("{\"kind\":\"tombstone\"}".to_string()),
-        writer_key: Some("writer-a".to_string()),
         created_at: Some("2026-03-24T00:05:00Z".to_string()),
         updated_at: Some("2026-03-24T00:05:00Z".to_string()),
         change_id: Some(format!("tomb-{entity_id}-{version_id}")),
-    }
-}
-
-fn writer_keys(rows: &[TrackedRow]) -> MockWriterKeys {
-    MockWriterKeys {
-        annotations: rows
-            .iter()
-            .map(|row| (RowIdentity::from_tracked_row(row), row.writer_key.clone()))
-            .collect(),
     }
 }
 
@@ -225,8 +183,6 @@ async fn effective_state_exact_prefers_local_untracked_first() {
             untracked_row("edge-1", "global", true, "untracked-global"),
         ],
     };
-    let writer_keys = writer_keys(&tracked.rows);
-
     let resolved = resolve_effective_row(
         &EffectiveRowRequest {
             schema_key: "lix_commit_edge".to_string(),
@@ -236,7 +192,7 @@ async fn effective_state_exact_prefers_local_untracked_first() {
             include_global: true,
             include_untracked: true,
         },
-        &LiveReadContext::new(&tracked, &untracked, &writer_keys),
+        &LiveReadContext::new(&tracked, &untracked),
     )
     .await
     .expect("effective exact lookup should succeed")
@@ -260,8 +216,6 @@ async fn effective_state_exact_tombstone_hides_global_fallback() {
     let tombstones = MockTrackedTombstones {
         rows: vec![tombstone("edge-1", "main", false)],
     };
-    let writer_keys = writer_keys(&tracked.rows);
-
     let resolved = resolve_effective_row(
         &EffectiveRowRequest {
             schema_key: "lix_commit_edge".to_string(),
@@ -271,8 +225,7 @@ async fn effective_state_exact_tombstone_hides_global_fallback() {
             include_global: true,
             include_untracked: true,
         },
-        &LiveReadContext::new(&tracked, &untracked, &writer_keys)
-            .with_tracked_tombstones(&tombstones),
+        &LiveReadContext::new(&tracked, &untracked).with_tracked_tombstones(&tombstones),
     )
     .await
     .expect("effective exact lookup should succeed");
@@ -294,8 +247,6 @@ async fn effective_state_scan_merges_lanes_and_projects_global_versions() {
             untracked_row("edge-c", "global", true, "untracked-global"),
         ],
     };
-    let writer_keys = writer_keys(&tracked.rows);
-
     let resolved = resolve_effective_rows(
         &EffectiveRowsRequest {
             schema_key: "lix_commit_edge".to_string(),
@@ -318,7 +269,7 @@ async fn effective_state_scan_merges_lanes_and_projects_global_versions() {
             include_untracked: true,
             include_tombstones: false,
         },
-        &LiveReadContext::new(&tracked, &untracked, &writer_keys),
+        &LiveReadContext::new(&tracked, &untracked),
     )
     .await
     .expect("effective scan should succeed");
@@ -346,8 +297,6 @@ async fn effective_state_scan_can_return_tombstones_when_requested() {
     let tombstones = MockTrackedTombstones {
         rows: vec![tombstone("edge-a", "main", false)],
     };
-    let writer_keys = writer_keys(&tracked.rows);
-
     let resolved = resolve_effective_rows(
         &EffectiveRowsRequest {
             schema_key: "lix_commit_edge".to_string(),
@@ -358,8 +307,7 @@ async fn effective_state_scan_can_return_tombstones_when_requested() {
             include_untracked: true,
             include_tombstones: true,
         },
-        &LiveReadContext::new(&tracked, &untracked, &writer_keys)
-            .with_tracked_tombstones(&tombstones),
+        &LiveReadContext::new(&tracked, &untracked).with_tracked_tombstones(&tombstones),
     )
     .await
     .expect("effective scan with tombstones should succeed");
@@ -378,37 +326,6 @@ fn effective_state_global_version_skips_duplicate_global_lanes() {
         overlay_lanes_for_version("global", true, true),
         vec![OverlayLane::LocalUntracked, OverlayLane::LocalTracked]
     );
-}
-
-#[tokio::test]
-async fn effective_state_exact_overlays_writer_key_annotation() {
-    let mut row = tracked_row("edge-1", "main", false, "tracked-local");
-    row.writer_key = Some("raw-stale".to_string());
-    let tracked = MockTrackedView { rows: vec![row] };
-    let untracked = MockUntrackedView::default();
-    let writer_keys = MockWriterKeys {
-        annotations: BTreeMap::from([(
-            RowIdentity::from_tracked_row(&tracked.rows[0]),
-            Some("writer-overlay".to_string()),
-        )]),
-    };
-
-    let resolved = resolve_effective_row(
-        &EffectiveRowRequest {
-            schema_key: "lix_commit_edge".to_string(),
-            version_id: "main".to_string(),
-            entity_id: "edge-1".to_string(),
-            file_id: NullableKeyFilter::Null,
-            include_global: false,
-            include_untracked: false,
-        },
-        &LiveReadContext::new(&tracked, &untracked, &writer_keys),
-    )
-    .await
-    .expect("effective exact lookup should succeed")
-    .expect("winner should exist");
-
-    assert_eq!(resolved.writer_key.as_deref(), Some("writer-overlay"));
 }
 
 fn tracked_row_matches_scan(row: &TrackedRow, request: &TrackedScanRequest) -> bool {

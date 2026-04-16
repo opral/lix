@@ -249,7 +249,6 @@ fn decode_tracked_row(
         plugin_key,
         metadata,
         change_id,
-        writer_key: None,
         created_at,
         updated_at,
         values,
@@ -299,7 +298,6 @@ fn decode_tracked_tombstone(
         plugin_key: row.get(6).and_then(text_from_value),
         metadata: row.get(7).and_then(text_from_value),
         change_id: row.get(8).and_then(text_from_value),
-        writer_key: None,
         created_at: row.get(9).and_then(text_from_value),
         updated_at: row.get(10).and_then(text_from_value),
     })

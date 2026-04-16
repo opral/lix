@@ -145,7 +145,6 @@ fn tracked_row_from_write(row: &LiveWriteRow) -> Result<TrackedRow, LixError> {
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
         change_id: Some(row.change_id.clone()),
-        writer_key: row.writer_key.clone(),
         created_at: row
             .created_at
             .clone()
@@ -165,7 +164,6 @@ fn tracked_tombstone_from_write(row: &LiveWriteRow) -> TrackedTombstoneMarker {
         schema_version: Some(row.schema_version.clone()),
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
-        writer_key: row.writer_key.clone(),
         created_at: row.created_at.clone(),
         updated_at: Some(row.updated_at.clone()),
         change_id: Some(row.change_id.clone()),
@@ -183,7 +181,6 @@ fn untracked_row_from_write(row: &LiveWriteRow) -> Result<UntrackedRow, LixError
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
         change_id: row.change_id.clone(),
-        writer_key: row.writer_key.clone(),
         created_at: row
             .created_at
             .clone()
