@@ -170,6 +170,7 @@ fn sqlite_error(error: rusqlite::Error) -> LixError {
     LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: error.to_string(),
+        hint: None,
     }
 }
 

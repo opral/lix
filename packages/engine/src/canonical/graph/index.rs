@@ -106,6 +106,7 @@ fn parse_commit_snapshot_parent_ids(raw: &str) -> Result<BTreeSet<String>, LixEr
     let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!("commit snapshot invalid JSON: {error}"),
+        hint: None,
     })?;
     let Some(parent_commit_ids) = parsed
         .get("parent_commit_ids")
@@ -149,6 +150,7 @@ async fn load_commit_graph_generation_with_executor(
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "commit graph generation must be integer".to_string(),
+            hint: None,
         }),
     }
 }
@@ -167,6 +169,7 @@ fn resolve_commit_generation(
         return Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "commit graph contains a cycle".to_string(),
+            hint: None,
         });
     }
 

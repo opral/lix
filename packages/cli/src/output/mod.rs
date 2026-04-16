@@ -163,6 +163,7 @@ mod tests {
                     rows: vec![],
                 },
             ],
+            write_receipt: None,
         };
 
         assert_eq!(

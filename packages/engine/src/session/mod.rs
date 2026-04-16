@@ -1030,6 +1030,7 @@ impl<'a> SessionTransaction<'a> {
         let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
+            hint: None,
         })?;
         execute_parsed_statements_in_write_transaction(
             &execution_context,
@@ -1047,6 +1048,7 @@ impl<'a> SessionTransaction<'a> {
         let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
+            hint: None,
         })?;
         let execution_context = self.execution_context();
         let outcome = write_transaction
@@ -1062,6 +1064,7 @@ impl<'a> SessionTransaction<'a> {
         let write_transaction = self.write_transaction.take().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "transaction is no longer active".to_string(),
+            hint: None,
         })?;
         write_transaction.rollback().await
     }

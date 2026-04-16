@@ -41,6 +41,7 @@ fn validate_plugin_key_segment(plugin_key: &str) -> Result<(), LixError> {
                 "plugin key '{}' must be a single relative path segment",
                 plugin_key
             ),
+            hint: None,
         });
     }
     Ok(())

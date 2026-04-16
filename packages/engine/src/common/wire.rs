@@ -33,6 +33,7 @@ impl WireValue {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "cannot encode non-finite float value to wire format"
                             .to_string(),
+                        hint: None,
                     });
                 }
                 Ok(Self::Float { value: *value })
@@ -60,6 +61,7 @@ impl WireValue {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "cannot decode non-finite float value from wire format"
                             .to_string(),
+                        hint: None,
                     });
                 }
                 Ok(Value::Real(value))
@@ -72,6 +74,7 @@ impl WireValue {
                     .map_err(|error| LixError {
                         code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: format!("failed to decode wire blob base64: {error}"),
+                        hint: None,
                     })?;
                 Ok(Value::Blob(decoded))
             }

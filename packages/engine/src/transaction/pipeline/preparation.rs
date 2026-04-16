@@ -337,6 +337,7 @@ async fn validate_compiled_write_command(
                         "prepare_buffered_write_execution_step insert validation failed: {}",
                         error.description
                     ),
+                    hint: None,
                 })?;
         }
         if !internal.update_validations.is_empty() {
@@ -354,6 +355,7 @@ async fn validate_compiled_write_command(
                     "prepare_buffered_write_execution_step update validation failed: {}",
                     error.description
                 ),
+                hint: None,
             })?;
         }
     }
@@ -431,6 +433,7 @@ async fn validate_write_command(
                     "prepare_buffered_write_execution_step public batch-local validation failed: {}",
                     error.description
                 ),
+                hint: None,
             })?;
     }
     Ok(())
@@ -595,6 +598,7 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
         _ => Err(LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: format!("expected text value for {name}"),
+            hint: None,
         }),
     }
 }

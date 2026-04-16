@@ -52,6 +52,7 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "installed plugin cache lock poisoned".to_string(),
+            hint: None,
         })?
         .clone()
     {
@@ -65,6 +66,7 @@ pub(crate) async fn load_installed_plugins_with_runtime_cache(
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "installed plugin cache lock poisoned".to_string(),
+            hint: None,
         })?;
     *guard = Some(plugins.clone());
     Ok(plugins)
@@ -100,6 +102,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
                 "plugin materialization: unsupported plugin archive path '{}'",
                 archive_ref.path
             ),
+            hint: None,
         });
     };
     let archive_bytes = load_blob_data_by_hash(backend, &archive_ref.blob_hash)
@@ -110,6 +113,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
                 "plugin materialization: missing plugin archive blob '{}' for file '{}' ({})",
                 archive_ref.blob_hash, archive_ref.path, archive_ref.file_id
             ),
+            hint: None,
         })?;
     if archive_bytes.is_empty() {
         return Err(LixError {
@@ -118,6 +122,7 @@ pub(crate) async fn load_installed_plugin_from_archive_ref_with_backend(
                 "plugin materialization: archive '{}' is empty",
                 archive_ref.path
             ),
+            hint: None,
         });
     }
     load_installed_plugin_from_archive_bytes(&plugin_key, &archive_ref.path, &archive_bytes)
@@ -152,11 +157,13 @@ pub(crate) fn invalidate_installed_plugins_cache(
         .map_err(|_| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "installed plugin cache lock poisoned".to_string(),
+            hint: None,
         })?;
     *guard = None;
     let mut component_guard = host.plugin_component_cache().lock().map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "plugin component cache lock poisoned".to_string(),
+        hint: None,
     })?;
     component_guard.clear();
     Ok(())

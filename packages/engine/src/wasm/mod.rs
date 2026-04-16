@@ -53,6 +53,7 @@ impl WasmRuntime for NoopWasmRuntime {
             code: "LIX_ERROR_UNKNOWN".to_string(),
             description: "wasm runtime is required to execute plugins; provide a non-noop runtime"
                 .to_string(),
+            hint: None,
         })
     }
 }

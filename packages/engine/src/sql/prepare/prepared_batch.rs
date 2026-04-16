@@ -105,11 +105,13 @@ fn engine_value_to_sql_expr(value: &Value, dialect: SqlDialect) -> Result<Expr, 
                 .map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: error.to_string(),
+                    hint: None,
                 })?
                 .parse_expr()
                 .map_err(|error| LixError {
                     code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: error.to_string(),
+                    hint: None,
                 })
         }
         _ => Ok(Expr::value(engine_value_to_sql_literal(value, dialect)?)),
