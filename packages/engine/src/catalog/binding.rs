@@ -3,8 +3,8 @@
 use std::collections::BTreeMap;
 
 use crate::catalog::{
-    DefaultScopeSemantics, ResolvedRelation, SurfaceColumnType, SurfaceFamily,
-    SurfaceOverridePredicate, SurfaceRegistry, SurfaceVariant,
+    DefaultScopeSemantics, ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceRegistry,
+    SurfaceVariant,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::version::{
@@ -41,7 +41,6 @@ pub(crate) struct SchemaRelationBinding {
     pub(crate) expose_version_id: bool,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
-    pub(crate) predicate_overrides: Vec<SurfaceOverridePredicate>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,10 +114,6 @@ pub(crate) fn bind_schema_relation(
         expose_version_id: resolved_relation.implicit_overrides.expose_version_id,
         visible_columns: resolved_relation.exposed_columns.clone(),
         column_types: resolved_relation.column_types.clone(),
-        predicate_overrides: resolved_relation
-            .implicit_overrides
-            .predicate_overrides
-            .clone(),
     }))
 }
 

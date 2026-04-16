@@ -745,10 +745,6 @@ simulation_test!(init_seeds_builtin_schema_definitions, |sim| async move {
             .and_then(serde_json::Value::as_str)
             .expect("schema must include x-lix-version");
         assert_eq!(schema_version, "1");
-        assert!(
-            schema.get("x-lix-override-lixcols").is_none(),
-            "builtin schema bootstrap should not carry removed file/plugin overrides"
-        );
         assert_eq!(entity_id, format!("{schema_key}~{schema_version}"));
         seen_schema_keys.insert(schema_key.to_string());
     }

@@ -1,8 +1,7 @@
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemProjectionScope,
     FilesystemRelationBinding, FilesystemRelationKind, RelationBindContext, RelationBinding,
-    ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceOverridePredicate,
-    SurfaceOverrideValue, SurfaceRegistry, SurfaceVariant,
+    ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::diagnostics::sql_unknown_column_error;
@@ -17,7 +16,7 @@ use crate::sql::physical_plan::plan::{
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_has_live_payload_collisions, entity_surface_payload_alias,
-    entity_surface_uses_payload_alias, escape_sql_string, render_identifier,
+    entity_surface_uses_payload_alias, render_identifier,
 };
 use crate::sql::physical_plan::source_sql::{
     build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
@@ -1101,19 +1100,7 @@ fn build_entity_source_sql(
     let Some(state_source_sql) = state_source_sql else {
         return Ok(None);
     };
-    let mut predicates = Vec::new();
-    for predicate in &resolved_relation.implicit_overrides.predicate_overrides {
-        predicates.push(render_override_predicate(predicate));
-    }
-
-    let sql = if predicates.is_empty() {
-        format!("SELECT {projection} FROM ({state_source_sql}) AS state_source")
-    } else {
-        format!(
-            "SELECT {projection} FROM ({state_source_sql}) AS state_source WHERE {}",
-            predicates.join(" AND ")
-        )
-    };
+    let sql = format!("SELECT {projection} FROM ({state_source_sql}) AS state_source");
     Ok(Some(sql))
 }
 
@@ -1268,28 +1255,6 @@ fn entity_hidden_alias_source_column(alias: &str, variant: SurfaceVariant) -> Op
         "lixcol_metadata" => Some("metadata"),
         "lixcol_version_id" if variant == SurfaceVariant::ByVersion => Some("version_id"),
         _ => None,
-    }
-}
-
-fn render_override_predicate(predicate: &SurfaceOverridePredicate) -> String {
-    match &predicate.value {
-        SurfaceOverrideValue::Null => {
-            format!("{} IS NULL", render_identifier(&predicate.column))
-        }
-        value => format!(
-            "{} = {}",
-            render_identifier(&predicate.column),
-            render_override_value(value)
-        ),
-    }
-}
-
-fn render_override_value(value: &SurfaceOverrideValue) -> String {
-    match value {
-        SurfaceOverrideValue::Null => "NULL".to_string(),
-        SurfaceOverrideValue::Boolean(value) => value.to_string(),
-        SurfaceOverrideValue::Number(value) => value.clone(),
-        SurfaceOverrideValue::String(value) => format!("'{}'", escape_sql_string(value)),
     }
 }
 
@@ -2016,7 +1981,7 @@ mod tests {
     }
 
     #[test]
-    fn lowers_dynamic_entity_reads_with_scalar_override_predicates() {
+    fn lowers_dynamic_entity_reads_without_schema_owned_override_predicates() {
         let mut registry = crate::catalog::build_builtin_surface_registry();
         crate::catalog::register_dynamic_entity_surface_spec(
             &mut registry,
@@ -2024,22 +1989,6 @@ mod tests {
                 schema_key: "message".to_string(),
                 visible_columns: vec!["body".to_string(), "id".to_string()],
                 column_types: BTreeMap::new(),
-                predicate_overrides: vec![
-                    crate::catalog::SurfaceOverridePredicate {
-                        column: "file_id".to_string(),
-                        value: crate::catalog::SurfaceOverrideValue::String("inlang".to_string()),
-                    },
-                    crate::catalog::SurfaceOverridePredicate {
-                        column: "plugin_key".to_string(),
-                        value: crate::catalog::SurfaceOverrideValue::String(
-                            "inlang_sdk".to_string(),
-                        ),
-                    },
-                    crate::catalog::SurfaceOverridePredicate {
-                        column: "global".to_string(),
-                        value: crate::catalog::SurfaceOverrideValue::Boolean(true),
-                    },
-                ],
             },
         );
 
@@ -2069,9 +2018,9 @@ mod tests {
             .expect("lowered statement should render");
 
         assert!(lowered_sql.contains("lix_internal_live_v1_message"));
-        assert!(lowered_sql.contains("file_id = 'inlang'"));
-        assert!(lowered_sql.contains("plugin_key = 'inlang_sdk'"));
-        assert!(lowered_sql.contains("global = true"));
+        assert!(!lowered_sql.contains("file_id = 'inlang'"));
+        assert!(!lowered_sql.contains("plugin_key = 'inlang_sdk'"));
+        assert!(!lowered_sql.contains("global = true"));
     }
 
     #[test]
