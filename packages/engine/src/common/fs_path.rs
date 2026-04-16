@@ -69,7 +69,6 @@ impl NormalizedDirectoryPath {
     pub(crate) fn try_from_path(path: &str) -> Result<Self, LixError> {
         normalize_directory_path(path).map(Self)
     }
-
     pub(crate) fn from_normalized(path: String) -> Self {
         Self(path)
     }
