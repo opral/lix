@@ -2,8 +2,8 @@ pub(crate) mod dialect;
 pub(crate) mod error;
 pub(crate) mod errors;
 pub(crate) mod fingerprint;
+pub(crate) mod fs_path;
 pub(crate) mod identity;
-pub(crate) mod paths;
 pub(crate) mod text;
 pub(crate) mod types;
 pub(crate) mod wire;
@@ -30,7 +30,7 @@ pub use identity::{
     CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId, FileId, VersionId,
 };
 #[allow(unused_imports)]
-pub(crate) use paths::filesystem::{
+pub(crate) use fs_path::{
     compose_directory_path, directory_ancestor_paths, directory_name_from_path,
     normalize_directory_path, normalize_file_path, normalize_path_segment, parent_directory_path,
     NormalizedDirectoryPath, NormalizedFilePath, ParsedFilePath,
