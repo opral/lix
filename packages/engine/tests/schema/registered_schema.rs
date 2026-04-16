@@ -364,3 +364,82 @@ simulation_test!(
         );
     }
 );
+
+simulation_test!(
+    registered_schema_raw_string_insert_hints_at_lix_json_wrapper,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES ('{\"x-lix-key\":\"book\",\"x-lix-version\":\"1\",\"type\":\"object\",\"x-lix-primary-key\":[\"/id\"],\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}')",
+                &[],
+            )
+            .await;
+
+        let err = result.expect_err("inserting a raw JSON string should fail");
+        assert!(
+            err.description
+                .contains("could not extract primary-key field"),
+            "expected primary-key extraction error, got: {}",
+            err.description
+        );
+        let hint = err
+            .hint
+            .as_deref()
+            .expect("raw-string insert should attach a hint");
+        assert!(
+            hint.contains("lix_json"),
+            "hint should mention lix_json; got: {hint}"
+        );
+        assert!(
+            !hint.contains("--params"),
+            "engine hint must not reference CLI flags; got: {hint}"
+        );
+    }
+);
+
+simulation_test!(
+    registered_schema_sqlite_json_hints_at_lix_json_wrapper,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let result = engine
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (json('{\"x-lix-key\":\"book\",\"x-lix-version\":\"1\",\"type\":\"object\",\"x-lix-primary-key\":[\"/id\"],\"properties\":{\"id\":{\"type\":\"string\"}},\"required\":[\"id\"],\"additionalProperties\":false}'))",
+                &[],
+            )
+            .await;
+
+        let err = result.expect_err("inserting via SQLite json() should fail");
+        assert!(
+            !err.description.contains("day-1"),
+            "error must not leak internal 'day-1' phrasing, got: {}",
+            err.description
+        );
+        let hint = err
+            .hint
+            .as_deref()
+            .expect("SQLite json() insert should attach a hint");
+        assert!(
+            hint.contains("lix_json"),
+            "hint should mention lix_json; got: {hint}"
+        );
+        assert!(
+            !hint.contains("--params"),
+            "engine hint must not reference CLI flags; got: {hint}"
+        );
+    }
+);

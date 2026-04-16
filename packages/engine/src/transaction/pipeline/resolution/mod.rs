@@ -39,6 +39,7 @@ use state_backed_writes::{resolve_entity_write, resolve_state_write};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WriteResolveError {
     pub(crate) message: String,
+    pub(crate) hint: Option<String>,
 }
 
 #[async_trait(?Send)]
@@ -65,6 +66,7 @@ impl From<FilesystemQueryError> for WriteResolveError {
     fn from(error: FilesystemQueryError) -> Self {
         Self {
             message: error.message,
+            hint: error.hint,
         }
     }
 }
@@ -246,6 +248,7 @@ where
                 "public write resolver does not support '{}' writes",
                 planned_write.command.target.descriptor.public_name
             ),
+            hint: None,
         }),
     }?;
 
@@ -281,6 +284,7 @@ fn admin_write_behavior(
                 "public write resolver does not yet support '{}' writes",
                 target.descriptor.public_name
             ),
+            hint: None,
         });
     };
 
@@ -289,6 +293,7 @@ fn admin_write_behavior(
             "public write resolver does not yet support '{}' writes",
             target.descriptor.public_name
         ),
+        hint: None,
     })
 }
 
@@ -388,11 +393,13 @@ async fn resolve_existing_version_write(
             let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
                 return Err(WriteResolveError {
                     message: "public version update resolver requires a patch payload".to_string(),
+                    hint: None,
                 });
             };
             if payload.contains_key("id") {
                 return Err(WriteResolveError {
                     message: "public version update cannot modify id".to_string(),
+                    hint: None,
                 });
             }
             let mut partitions = ResolvedWritePlanBuilder::default();
@@ -405,6 +412,7 @@ async fn resolve_existing_version_write(
                 if next_name.is_empty() {
                     return Err(WriteResolveError {
                         message: "public version update cannot set empty name".to_string(),
+                        hint: None,
                     });
                 }
                 let next_hidden = payload
@@ -418,6 +426,7 @@ async fn resolve_existing_version_write(
                 if next_commit_id.is_empty() {
                     return Err(WriteResolveError {
                         message: "public version update cannot set empty commit_id".to_string(),
+                        hint: None,
                     });
                 }
 
@@ -504,6 +513,7 @@ async fn resolve_existing_version_write(
         }
         WriteOperationKind::Insert => Err(WriteResolveError {
             message: "public version existing-row resolver does not handle inserts".to_string(),
+            hint: None,
         }),
     }
 }
@@ -544,6 +554,7 @@ fn version_admin_id_from_payload_map(
         .and_then(text_from_value)
         .ok_or_else(|| WriteResolveError {
             message: "public version insert requires column 'id'".to_string(),
+            hint: None,
         })
 }
 
@@ -556,10 +567,12 @@ fn version_admin_required_text_from_payload_map(
         .and_then(text_from_value)
         .ok_or_else(|| WriteResolveError {
             message: format!("public version insert requires column '{key}'"),
+            hint: None,
         })?;
     if value.is_empty() {
         return Err(WriteResolveError {
             message: format!("public version insert cannot set empty {key}"),
+            hint: None,
         });
     }
     Ok(value)
@@ -736,9 +749,11 @@ fn resolve_execution_mode_for_untracked_flag(
     match (requested_mode, execution_mode) {
         (WriteModeRequest::ForceTracked, WriteMode::Untracked) => Err(WriteResolveError {
             message: tracked_error.to_string(),
+            hint: None,
         }),
         (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
             message: untracked_error.to_string(),
+            hint: None,
         }),
         _ => Ok(execution_mode),
     }
@@ -755,12 +770,14 @@ fn resolve_execution_mode_for_effective_row(
                 "public tracked write requires a tracked effective-state winner, found {:?}",
                 current_row.overlay_lane
             ),
+            hint: None,
         }),
         (WriteModeRequest::ForceUntracked, WriteMode::Tracked) => Err(WriteResolveError {
             message: format!(
                 "public untracked write requires an untracked effective-state winner, found {:?}",
                 current_row.overlay_lane
             ),
+            hint: None,
         }),
         _ => Ok(execution_mode),
     }
@@ -802,12 +819,14 @@ fn target_write_lane_for_version(
                 message:
                     "public tracked write could not determine a concrete version lane for a selected row"
                         .to_string(),
-            }),
+                        hint: None,
+                    }),
         ScopeProof::GlobalAdmin => Ok(Some(WriteLane::GlobalAdmin)),
         ScopeProof::Unknown | ScopeProof::Unbounded => version_id
             .map(|version_id| Some(WriteLane::SingleVersion(version_id.to_string())))
             .ok_or_else(|| WriteResolveError {
                 message: "public tracked write requires a bounded version lane".to_string(),
+                hint: None,
             }),
     }
 }
@@ -825,6 +844,7 @@ fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, WriteResol
 
     payload_text_value(planned_write, "entity_id").ok_or_else(|| WriteResolveError {
         message: "public write resolver requires an exact entity target".to_string(),
+        hint: None,
     })
 }
 
@@ -838,6 +858,7 @@ fn resolved_schema_key(planned_write: &PlannedWrite) -> Result<String, WriteReso
         _ => payload_text_value(planned_write, "schema_key").ok_or_else(|| WriteResolveError {
             message: "public write resolver requires an exact schema proof or schema_key literal"
                 .to_string(),
+            hint: None,
         }),
     }
 }
@@ -854,6 +875,7 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
                 message:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
+                hint: None,
             }),
         ScopeProof::SingleVersion(version_id) => Ok(Some(version_id.clone())),
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.len() == 1 => {
@@ -862,14 +884,17 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, W
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
             Err(WriteResolveError {
                 message: "public write resolver requires a concrete version_id".to_string(),
+                hint: None,
             })
         }
         ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
             message: "public write resolver cannot resolve multi-version writes".to_string(),
+            hint: None,
         }),
         ScopeProof::GlobalAdmin => Ok(Some(GLOBAL_VERSION_ID.to_string())),
         ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
             message: "public write resolver requires a bounded scope proof".to_string(),
+            hint: None,
         }),
     }
 }
@@ -886,17 +911,20 @@ fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, Wri
                 message:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
+                hint: None,
             }),
         ScopeProof::SingleVersion(version_id) => Ok(vec![version_id.clone()]),
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
             Err(WriteResolveError {
                 message: "public write resolver requires a concrete version_id".to_string(),
+                hint: None,
             })
         }
         ScopeProof::FiniteVersionSet(version_ids) => Ok(version_ids.iter().cloned().collect()),
         ScopeProof::GlobalAdmin => Ok(vec![GLOBAL_VERSION_ID.to_string()]),
         ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
             message: "public write resolver requires a bounded scope proof".to_string(),
+            hint: None,
         }),
     }
 }
@@ -931,6 +959,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
                 message:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
+                hint: None,
             }),
         crate::catalog::DefaultScopeSemantics::ExplicitVersion => payload
             .get("version_id")
@@ -938,6 +967,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
             .map(Some)
             .ok_or_else(|| WriteResolveError {
                 message: "public write resolver requires a concrete version_id".to_string(),
+                hint: None,
             }),
         crate::catalog::DefaultScopeSemantics::GlobalAdmin => {
             Ok(Some(GLOBAL_VERSION_ID.to_string()))
@@ -945,6 +975,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
         crate::catalog::DefaultScopeSemantics::History
         | crate::catalog::DefaultScopeSemantics::WorkingChanges => Err(WriteResolveError {
             message: "public write resolver requires a bounded scope proof".to_string(),
+            hint: None,
         }),
     }
 }
@@ -1037,10 +1068,12 @@ fn write_lane_from_scope(scope_proof: &ScopeProof) -> Result<WriteLane, WriteRes
         }
         ScopeProof::FiniteVersionSet(_) => Err(WriteResolveError {
             message: "public tracked writes require exactly one write lane".to_string(),
+            hint: None,
         }),
         ScopeProof::GlobalAdmin => Ok(WriteLane::GlobalAdmin),
         ScopeProof::Unknown | ScopeProof::Unbounded => Err(WriteResolveError {
             message: "public tracked writes require a bounded write lane".to_string(),
+            hint: None,
         }),
     }
 }
@@ -1059,10 +1092,11 @@ fn value_as_bool(value: &Value) -> Option<bool> {
 }
 
 fn write_resolve_to_lix_error(error: WriteResolveError) -> crate::LixError {
-    crate::LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: error.message,
-        hint: None,
+    let err = crate::LixError::new("LIX_ERROR_UNKNOWN", error.message);
+    if let Some(hint) = error.hint {
+        err.with_hint(hint)
+    } else {
+        err
     }
 }
 
@@ -1093,6 +1127,7 @@ fn payload_maps(
         MutationPayload::InsertRows(payloads) => Ok(payloads.clone()),
         MutationPayload::UpdatePatch(_) | MutationPayload::Tombstone => Err(WriteResolveError {
             message: "public resolver expected insert payload rows".to_string(),
+            hint: None,
         }),
     }
 }
@@ -1123,12 +1158,14 @@ fn bool_from_value(value: &Value) -> Option<bool> {
 fn write_resolve_backend_error(error: crate::LixError) -> WriteResolveError {
     WriteResolveError {
         message: error.description,
+        hint: error.hint,
     }
 }
 
 fn write_resolve_state_assignments_error(error: StateAssignmentsError) -> WriteResolveError {
     WriteResolveError {
         message: error.message,
+        hint: error.hint,
     }
 }
 
