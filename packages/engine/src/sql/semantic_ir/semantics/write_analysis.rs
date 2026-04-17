@@ -131,9 +131,7 @@ fn analyze_filesystem_write_intent(
     }
 }
 
-fn analyze_write_scope(
-    canonicalized: &CanonicalizedWrite,
-) -> Result<ScopeProof, crate::LixError> {
+fn analyze_write_scope(canonicalized: &CanonicalizedWrite) -> Result<ScopeProof, crate::LixError> {
     if let Some(scope_proof) = insert_scope_proof(canonicalized) {
         return Ok(scope_proof);
     }
@@ -618,9 +616,7 @@ fn selector_bool_value(canonicalized: &CanonicalizedWrite, key: &str) -> Option<
     None
 }
 
-fn write_analysis_filesystem_assignments_error(
-    error: crate::LixError,
-) -> crate::LixError {
+fn write_analysis_filesystem_assignments_error(error: crate::LixError) -> crate::LixError {
     error
 }
 

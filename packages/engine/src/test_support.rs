@@ -12,9 +12,7 @@ use crate::functions::SystemFunctionProvider;
 use crate::live_state::{write_live_rows, LiveRow};
 use crate::sql::{PlannedWrite, ResolvedWritePlan};
 use crate::transaction::overlay::PendingOverlay;
-use crate::transaction::{
-    resolve_write_plan_with_functions, TransactionWriteSelectorResolver,
-};
+use crate::transaction::{resolve_write_plan_with_functions, TransactionWriteSelectorResolver};
 use crate::wasm::NoopWasmRuntime;
 use crate::{
     CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,

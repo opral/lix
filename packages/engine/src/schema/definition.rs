@@ -1,5 +1,5 @@
 use cel::Program;
-use jsonschema::JSONSchema;
+use jsonschema::{Draft, JSONSchema};
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
 
@@ -161,6 +161,10 @@ fn lix_schema_validator() -> Result<&'static JSONSchema, LixError> {
 fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
     let mut options = JSONSchema::options();
     options.with_meta_schemas();
+    if schema_uses_draft_2020_12_without_fragment(schema) {
+        options.with_draft(Draft::Draft202012);
+    }
+    options.should_validate_formats(true);
     options.with_format("json-pointer", is_json_pointer);
     options.with_format("cel", is_cel_expression);
 
@@ -169,6 +173,13 @@ fn compile_schema(schema: &JsonValue) -> Result<JSONSchema, LixError> {
         description: format!("Failed to compile Lix schema definition: {err}"),
         hint: None,
     })
+}
+
+fn schema_uses_draft_2020_12_without_fragment(schema: &JsonValue) -> bool {
+    schema
+        .get("$schema")
+        .and_then(JsonValue::as_str)
+        .is_some_and(|url| url == "https://json-schema.org/draft/2020-12/schema")
 }
 
 fn is_json_pointer(value: &str) -> bool {
@@ -530,5 +541,24 @@ mod pointer_slash_detection_tests {
             }]
         }));
         assert!(detect_missing_pointer_slash(&schema).is_none());
+    }
+
+    #[test]
+    fn draft_2020_12_json_pointer_format_still_asserts() {
+        let schema = json!({
+            "$schema": "https://json-schema.org/draft/2020-12/schema",
+            "type": "object",
+            "properties": {
+                "pointer": {
+                    "type": "string",
+                    "format": "json-pointer"
+                }
+            }
+        });
+
+        let validator = compile_schema(&schema).expect("2020-12 schema should compile");
+
+        assert!(validator.is_valid(&json!({ "pointer": "/id" })));
+        assert!(!validator.is_valid(&json!({ "pointer": "id" })));
     }
 }

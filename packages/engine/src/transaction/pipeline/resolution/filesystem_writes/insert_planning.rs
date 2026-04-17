@@ -116,10 +116,7 @@ fn planning_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_ERROR_UNKNOWN", message)
 }
 
-fn planning_error_with_hint(
-    message: impl Into<String>,
-    hint: impl Into<String>,
-) -> LixError {
+fn planning_error_with_hint(message: impl Into<String>, hint: impl Into<String>) -> LixError {
     planning_error(message).with_hint(hint)
 }
 
@@ -714,7 +711,11 @@ where
             .to_string();
         let parent_path = match explicit_parent_id {
             Some(parent_id) => lookup_directory_path_by_id_in_snapshot(parent_id, snapshot, batch)
-                .ok_or_else(|| planning_error(format!("Parent directory does not exist for id {parent_id}")))?,
+                .ok_or_else(|| {
+                    planning_error(format!(
+                        "Parent directory does not exist for id {parent_id}"
+                    ))
+                })?,
             None => "/".to_string(),
         };
         let computed_path =
@@ -1128,9 +1129,7 @@ where
     generated_schema_default_id(functions, "lix_directory_descriptor")
 }
 
-fn generated_file_insert_id<P>(
-    functions: SharedFunctionProvider<P>,
-) -> Result<String, LixError>
+fn generated_file_insert_id<P>(functions: SharedFunctionProvider<P>) -> Result<String, LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {

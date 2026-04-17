@@ -1,7 +1,7 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Lix Schema Definition",
-  "description": "A Lix schema is a JSON Schema draft-07 document augmented with `x-lix-*` extensions that identify, version, and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions), `x-lix-version` (string-as-integer, e.g. `\"1\"`), and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers) to make the schema writable — Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
+  "description": "A Lix schema is a JSON Schema draft 2020-12 document augmented with `x-lix-*` extensions that identify, version, and constrain an entity type. Every schema must declare `x-lix-key` (snake_case identifier, preferably prefixed with a plugin or domain namespace such as `library_book` to avoid collisions), `x-lix-version` (string-as-integer, e.g. `\"1\"`), and `additionalProperties: false`; add `x-lix-primary-key` (array of JSON Pointers) to make the schema writable — Lix will auto-materialize a public virtual table named after `x-lix-key` with an `INSERT/UPDATE/DELETE` surface. See the `examples` field for a minimal working schema.",
   "examples": [
     {
       "x-lix-key": "library_book",
@@ -19,7 +19,7 @@
   ],
   "allOf": [
     {
-      "$ref": "http://json-schema.org/draft-07/schema#"
+      "$ref": "https://json-schema.org/draft/2020-12/schema"
     },
     {
       "type": "object",
@@ -125,7 +125,7 @@
           "additionalProperties": {
             "allOf": [
               {
-                "$ref": "http://json-schema.org/draft-07/schema#"
+                "$ref": "https://json-schema.org/draft/2020-12/schema"
               },
               {
                 "type": "object",

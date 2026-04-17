@@ -531,7 +531,8 @@ where
     if rows.len() != payloads.len() {
         return Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public insert resolver requires one planned row per payload row".to_string(),
+            description: "public insert resolver requires one planned row per payload row"
+                .to_string(),
             hint: None,
         });
     }
@@ -908,7 +909,8 @@ async fn resolve_exact_state_target_rows(
     let schema_key = resolved_schema_key(planned_write)?;
     let version_id = resolved_version_id(planned_write)?.ok_or_else(|| crate::LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: "public existing-row write resolver requires a concrete version_id".to_string(),
+        description: "public existing-row write resolver requires a concrete version_id"
+            .to_string(),
         hint: None,
     })?;
     let current_row = hydrator

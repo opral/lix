@@ -84,8 +84,7 @@ pub(crate) use pipeline::resolution::resolve_write_plan_with_functions;
 pub(crate) use pipeline::{
     ensure_function_bindings_for_write_scope, execute_parsed_statements_in_write_transaction,
     execute_statement_batch_with_write_transaction, prepared_write_function_bindings_for_execution,
-    validate_commit_time_write, TransactionWriteSelectorResolver,
-    WriteSelectorResolver,
+    validate_commit_time_write, TransactionWriteSelectorResolver, WriteSelectorResolver,
 };
 pub(crate) use prepared_artifacts::{
     PreparedDirectWriteArtifact, PreparedPublicSurfaceRegistryEffect,
