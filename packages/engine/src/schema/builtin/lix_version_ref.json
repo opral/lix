@@ -1,7 +1,7 @@
 {
   "x-lix-key": "lix_version_ref",
   "x-lix-version": "1",
-  "description": "Version head pointer. This row records which commit a version should currently resolve to in the local runtime. It is intentionally not part of canonical commit membership, because refs may be reset client-side after sync to the resolved head without introducing content conflicts.",
+  "description": "Version head pointer. Records which commit a version should currently resolve to in the local runtime. Intentionally not part of canonical commit membership: refs may be reset client-side after sync without introducing content conflicts. Each `lix_version_descriptor.id` has exactly one `lix_version_ref` row.",
   "x-lix-primary-key": [
     "/id"
   ],
@@ -23,11 +23,11 @@
     "id": {
       "type": "string",
       "x-lix-default": "lix_uuid_v7()",
-      "description": "Version identifier whose head pointer is being stored."
+      "description": "Version identifier whose head pointer is being stored; matches `lix_version_descriptor.id`."
     },
     "commit_id": {
       "type": "string",
-      "description": "Commit that the version should currently resolve to in the local runtime."
+      "description": "Commit the version should currently resolve to in the local runtime (references `lix_commit.id`)."
     }
   },
   "required": [

@@ -1,14 +1,9 @@
 use crate::common::{normalize_path_segment, NormalizedDirectoryPath, ParsedFilePath};
 use crate::functions::DynFunctionProvider;
 use crate::schema::{apply_schema_defaults_with_shared_runtime, builtin_schema_definition};
-use crate::Value;
+use crate::{LixError, Value};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::BTreeMap;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FilesystemAssignmentsError {
-    pub(crate) message: String,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum OptionalTextAssignment {
@@ -92,15 +87,17 @@ pub(crate) struct FileInsertAssignments {
     pub(crate) data: Option<Vec<u8>>,
 }
 
+fn assignment_error(message: impl Into<String>) -> LixError {
+    LixError::new("LIX_ERROR_UNKNOWN", message)
+}
+
 pub(crate) fn parse_directory_update_assignments(
     payload: &BTreeMap<String, Value>,
-) -> Result<DirectoryUpdateAssignments, FilesystemAssignmentsError> {
+) -> Result<DirectoryUpdateAssignments, LixError> {
     if payload.contains_key("id") {
-        return Err(FilesystemAssignmentsError {
-            message:
-                "lix_directory id is immutable; create a new row and delete the old row instead"
-                    .to_string(),
-        });
+        return Err(assignment_error(
+            "lix_directory id is immutable; create a new row and delete the old row instead",
+        ));
     }
 
     Ok(DirectoryUpdateAssignments {
@@ -126,12 +123,11 @@ pub(crate) fn parse_directory_update_assignments(
 
 pub(crate) fn parse_file_update_assignments(
     payload: &BTreeMap<String, Value>,
-) -> Result<FileUpdateAssignments, FilesystemAssignmentsError> {
+) -> Result<FileUpdateAssignments, LixError> {
     if payload.contains_key("id") {
-        return Err(FilesystemAssignmentsError {
-            message: "lix_file id is immutable; create a new row and delete the old row instead"
-                .to_string(),
-        });
+        return Err(assignment_error(
+            "lix_file id is immutable; create a new row and delete the old row instead",
+        ));
     }
 
     Ok(FileUpdateAssignments {
@@ -154,7 +150,7 @@ const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 pub(crate) fn parse_directory_insert_assignments(
     payload: &BTreeMap<String, Value>,
     functions: &DynFunctionProvider,
-) -> Result<DirectoryInsertAssignments, FilesystemAssignmentsError> {
+) -> Result<DirectoryInsertAssignments, LixError> {
     let defaults = filesystem_insert_defaults(FILESYSTEM_DIRECTORY_SCHEMA_KEY, functions)?;
     Ok(DirectoryInsertAssignments {
         id: payload
@@ -188,23 +184,21 @@ pub(crate) fn parse_directory_insert_assignments(
 pub(crate) fn parse_file_insert_assignments(
     payload: &BTreeMap<String, Value>,
     functions: &DynFunctionProvider,
-) -> Result<FileInsertAssignments, FilesystemAssignmentsError> {
+) -> Result<FileInsertAssignments, LixError> {
     if !payload
         .keys()
         .any(|key| !matches!(key.as_str(), "data" | "version_id" | "untracked"))
     {
-        return Err(FilesystemAssignmentsError {
-            message: "file insert requires at least one non-data column".to_string(),
-        });
+        return Err(assignment_error(
+            "file insert requires at least one non-data column",
+        ));
     }
 
     let raw_path = payload
         .get("path")
         .map(|value| text_value_required(value, "public filesystem file insert", "path"))
         .transpose()?
-        .ok_or_else(|| FilesystemAssignmentsError {
-            message: "public filesystem file insert requires column 'path'".to_string(),
-        })?;
+        .ok_or_else(|| assignment_error("public filesystem file insert requires column 'path'"))?;
 
     let defaults = filesystem_insert_defaults(FILESYSTEM_FILE_SCHEMA_KEY, functions)?;
 
@@ -228,32 +222,33 @@ fn optional_text_assignment(
     payload: &BTreeMap<String, Value>,
     key: &str,
     context: &str,
-) -> Result<OptionalTextAssignment, FilesystemAssignmentsError> {
+) -> Result<OptionalTextAssignment, LixError> {
     match payload.get(key) {
         None => Ok(OptionalTextAssignment::Unchanged),
         Some(Value::Null) => Ok(OptionalTextAssignment::Set(None)),
         Some(Value::Text(value)) => Ok(OptionalTextAssignment::Set(Some(value.clone()))),
-        Some(other) => Err(FilesystemAssignmentsError {
-            message: format!("{context} expected text/null {key}, got {other:?}"),
-        }),
+        Some(other) => Err(assignment_error(format!(
+            "{context} expected text/null {key}, got {other:?}"
+        ))),
     }
 }
 
 fn filesystem_insert_defaults(
     schema_key: &str,
     functions: &DynFunctionProvider,
-) -> Result<BTreeMap<String, Value>, FilesystemAssignmentsError> {
-    let schema =
-        builtin_schema_definition(schema_key).ok_or_else(|| FilesystemAssignmentsError {
-            message: format!("public filesystem resolver missing builtin schema '{schema_key}'"),
-        })?;
+) -> Result<BTreeMap<String, Value>, LixError> {
+    let schema = builtin_schema_definition(schema_key).ok_or_else(|| {
+        assignment_error(format!(
+            "public filesystem resolver missing builtin schema '{schema_key}'"
+        ))
+    })?;
     let schema_version = schema
         .get("x-lix-version")
         .and_then(JsonValue::as_str)
-        .ok_or_else(|| FilesystemAssignmentsError {
-            message: format!(
+        .ok_or_else(|| {
+            assignment_error(format!(
                 "public filesystem resolver requires string x-lix-version for '{schema_key}'"
-            ),
+            ))
         })?;
     let mut snapshot = JsonMap::new();
     apply_schema_defaults_with_shared_runtime(
@@ -269,7 +264,7 @@ fn filesystem_insert_defaults(
         .map(|(key, value)| {
             json_value_to_engine_value(value)
                 .map(|value| (key, value))
-                .map_err(|message| FilesystemAssignmentsError { message })
+                .map_err(assignment_error)
         })
         .collect()
 }
@@ -295,32 +290,32 @@ fn json_value_to_engine_value(value: JsonValue) -> Result<Value, String> {
 fn blob_assignment(
     payload: &BTreeMap<String, Value>,
     key: &str,
-) -> Result<BlobAssignment, FilesystemAssignmentsError> {
+) -> Result<BlobAssignment, LixError> {
     match payload.get(key) {
         None => Ok(BlobAssignment::Unchanged),
         Some(Value::Blob(bytes)) => Ok(BlobAssignment::Set(bytes.clone())),
-        Some(Value::Text(_)) => Err(FilesystemAssignmentsError {
-            message: crate::sql::diagnostics::FILE_DATA_EXPECTS_BYTES_MESSAGE.to_string(),
-        }),
-        Some(other) => Err(FilesystemAssignmentsError {
-            message: format!("public filesystem resolver expected blob {key}, got {other:?}"),
-        }),
+        Some(Value::Text(_)) => Err(assignment_error(
+            crate::sql::diagnostics::FILE_DATA_EXPECTS_BYTES_MESSAGE,
+        )),
+        Some(other) => Err(assignment_error(format!(
+            "public filesystem resolver expected blob {key}, got {other:?}"
+        ))),
     }
 }
 
 fn insert_blob_value(
     payload: &BTreeMap<String, Value>,
     key: &str,
-) -> Result<Option<Vec<u8>>, FilesystemAssignmentsError> {
+) -> Result<Option<Vec<u8>>, LixError> {
     match payload.get(key) {
         None => Ok(None),
         Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
-        Some(Value::Text(_)) => Err(FilesystemAssignmentsError {
-            message: crate::sql::diagnostics::FILE_DATA_EXPECTS_BYTES_MESSAGE.to_string(),
-        }),
-        Some(other) => Err(FilesystemAssignmentsError {
-            message: format!("public filesystem resolver expected blob {key}, got {other:?}"),
-        }),
+        Some(Value::Text(_)) => Err(assignment_error(
+            crate::sql::diagnostics::FILE_DATA_EXPECTS_BYTES_MESSAGE,
+        )),
+        Some(other) => Err(assignment_error(format!(
+            "public filesystem resolver expected blob {key}, got {other:?}"
+        ))),
     }
 }
 
@@ -328,31 +323,22 @@ fn optional_insert_text(
     payload: &BTreeMap<String, Value>,
     key: &str,
     context: &str,
-) -> Result<Option<String>, FilesystemAssignmentsError> {
+) -> Result<Option<String>, LixError> {
     match payload.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(value) => text_from_value(value)
-            .map(Some)
-            .ok_or_else(|| FilesystemAssignmentsError {
-                message: format!("{context} expected text/null {key}, got {value:?}"),
-            }),
+        Some(value) => text_from_value(value).map(Some).ok_or_else(|| {
+            assignment_error(format!("{context} expected text/null {key}, got {value:?}"))
+        }),
     }
 }
 
-fn text_value_required(
-    value: &Value,
-    context: &str,
-    key: &str,
-) -> Result<String, FilesystemAssignmentsError> {
-    text_from_value(value).ok_or_else(|| FilesystemAssignmentsError {
-        message: format!("{context} requires column '{key}'"),
-    })
+fn text_value_required(value: &Value, context: &str, key: &str) -> Result<String, LixError> {
+    text_from_value(value)
+        .ok_or_else(|| assignment_error(format!("{context} requires column '{key}'")))
 }
 
-fn filesystem_path_error(error: crate::LixError) -> FilesystemAssignmentsError {
-    FilesystemAssignmentsError {
-        message: error.description_with_hint(),
-    }
+fn filesystem_path_error(error: crate::LixError) -> LixError {
+    error
 }
 
 fn text_from_value(value: &Value) -> Option<String> {
@@ -499,7 +485,8 @@ mod tests {
         let error = parse_file_insert_assignments(&payload, &system_functions())
             .expect_err("invalid path should fail");
 
-        assert!(error.message.contains("path must start with '/'"));
-        assert!(error.message.contains("hint: prefix the path with '/'"));
+        assert_eq!(error.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+        assert_eq!(error.description, "path must start with '/'");
+        assert_eq!(error.hint.as_deref(), Some("prefix the path with '/'"));
     }
 }

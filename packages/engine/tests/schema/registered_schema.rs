@@ -1,6 +1,6 @@
 use crate::support;
 
-use lix_engine::Value;
+use lix_engine::{ExecuteOptions, LixError, Value};
 use serde_json::json;
 use support::simulation_test::assert_boolean_like;
 
@@ -196,6 +196,105 @@ simulation_test!(
 );
 
 simulation_test!(
+    register_schema_helper_accepts_explicit_draft_2020_12_schema,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .register_schema(&json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "x-lix-key": "helper_registered_schema_2020_12",
+                "x-lix-version": "1",
+                "x-lix-primary-key": ["/id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" },
+                    "name": { "type": "string" }
+                },
+                "required": ["id", "name"],
+                "additionalProperties": false
+            }))
+            .await
+            .unwrap();
+
+        let registered = engine
+            .execute(
+                "SELECT COUNT(*) \
+                 FROM lix_registered_schema \
+                 WHERE lixcol_entity_id = 'helper_registered_schema_2020_12~1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        assert_eq!(registered.statements[0].rows, vec![vec![Value::Integer(1)]]);
+
+        let live_table = engine
+            .execute("SELECT COUNT(*) FROM helper_registered_schema_2020_12", &[])
+            .await
+            .unwrap();
+        assert_eq!(live_table.statements[0].rows, vec![vec![Value::Integer(0)]]);
+    }
+);
+
+simulation_test!(
+    register_schema_helper_rejects_missing_pointer_slash_with_targeted_hint,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin_transaction_with_options should succeed");
+
+        let err = tx
+            .register_schema(&json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "x-lix-key": "helper_registered_schema_bad_pointer",
+                "x-lix-version": "1",
+                "x-lix-primary-key": ["id"],
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }))
+            .await
+            .expect_err("missing pointer slash should be rejected");
+        tx.rollback().await.unwrap();
+
+        assert_eq!(err.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            err.description.contains("must begin with '/'"),
+            "unexpected description: {}",
+            err.description
+        );
+        assert!(
+            err.description
+                .contains("x-lix-primary-key: \"id\" → \"/id\""),
+            "unexpected description: {}",
+            err.description
+        );
+        let hint = err
+            .hint
+            .as_deref()
+            .expect("missing-slash error should carry a hint");
+        assert!(hint.contains("/id"), "unexpected hint: {hint}");
+        assert!(hint.contains("RFC 6901"), "unexpected hint: {hint}");
+    }
+);
+
+simulation_test!(
     register_schema_helper_ignores_duplicate_registration_like_direct_insert,
     simulations = [sqlite],
     |sim| async move {
@@ -234,6 +333,58 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(registered.statements[0].rows, vec![vec![Value::Integer(1)]]);
+    }
+);
+
+simulation_test!(
+    register_schema_helper_rejects_invalid_cel_default_under_draft_2020_12,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        let mut tx = engine
+            .begin_transaction_with_options(ExecuteOptions::default())
+            .await
+            .expect("begin_transaction_with_options should succeed");
+
+        let err = tx
+            .register_schema(&json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "x-lix-key": "helper_registered_schema_bad_cel",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "x-lix-default": "lix_uuid_v7("
+                    }
+                },
+                "additionalProperties": false
+            }))
+            .await
+            .expect_err("invalid CEL default should be rejected");
+        tx.rollback().await.unwrap();
+
+        assert_eq!(err.code, LixError::CODE_SCHEMA_DEFINITION);
+        assert!(
+            err.description.contains("Invalid Lix schema definition"),
+            "unexpected description: {}",
+            err.description
+        );
+        assert!(
+            err.description.contains("x-lix-default"),
+            "unexpected description: {}",
+            err.description
+        );
+        assert!(
+            err.description.contains("cel"),
+            "unexpected description: {}",
+            err.description
+        );
     }
 );
 
@@ -424,6 +575,10 @@ simulation_test!(
             .await;
 
         let err = result.expect_err("inserting via SQLite json() should fail");
+        assert_eq!(
+            err.code, "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION",
+            "SQLite json() rejection should carry the categorized code"
+        );
         assert!(
             !err.description.contains("day-1"),
             "error must not leak internal 'day-1' phrasing, got: {}",
@@ -436,6 +591,50 @@ simulation_test!(
         assert!(
             hint.contains("lix_json"),
             "hint should mention lix_json; got: {hint}"
+        );
+        assert!(
+            !hint.contains("--params"),
+            "engine hint must not reference CLI flags; got: {hint}"
+        );
+    }
+);
+
+simulation_test!(
+    boolean_field_integer_rejection_hints_at_true_false_literals,
+    simulations = [sqlite],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                "INSERT INTO lix_registered_schema (value) VALUES (lix_json('{\"x-lix-key\":\"todo\",\"x-lix-version\":\"1\",\"type\":\"object\",\"x-lix-primary-key\":[\"/id\"],\"properties\":{\"id\":{\"type\":\"string\"},\"done\":{\"type\":\"boolean\"}},\"required\":[\"id\",\"done\"],\"additionalProperties\":false}'))",
+                &[],
+            )
+            .await
+            .expect("schema registration should succeed");
+
+        let result = engine
+            .execute("INSERT INTO todo (id, done) VALUES ('todo-1', 0)", &[])
+            .await;
+
+        let err = result.expect_err("inserting integer 0 for boolean field should fail");
+        assert!(
+            err.description.contains("is not of type") && err.description.contains("boolean"),
+            "expected boolean-type validation error, got: {}",
+            err.description
+        );
+        let hint = err
+            .hint
+            .as_deref()
+            .expect("boolean-type mismatch should attach a hint");
+        assert!(
+            hint.contains("true") && hint.contains("false"),
+            "hint should suggest true/false literals; got: {hint}"
         );
         assert!(
             !hint.contains("--params"),

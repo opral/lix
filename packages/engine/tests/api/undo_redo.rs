@@ -195,11 +195,9 @@ simulation_test!(
             )
             .await
             .expect_err("empty key insert should fail");
-        assert!(
-            empty_insert.to_string().contains("empty primary-key value")
-                || empty_insert.to_string().contains("non-empty entity_id")
-                || empty_insert.to_string().contains("non-empty key"),
-            "unexpected error: {empty_insert}"
+        assert_eq!(
+            empty_insert.code, "LIX_ERROR_SCHEMA_VALIDATION",
+            "empty primary-key insert should surface a schema-validation error, got: {empty_insert}"
         );
 
         let undo = engine.undo().await.expect("undo should still succeed");

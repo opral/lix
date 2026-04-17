@@ -18,7 +18,7 @@ use crate::sql::logical_plan::{
 };
 use crate::sql::semantic_ir::semantics::dependency_spec::derive_dependency_spec_from_structured_public_read;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::build_effective_state;
-use crate::sql::semantic_ir::semantics::write_analysis::{analyze_write, WriteAnalysisError};
+use crate::sql::semantic_ir::semantics::write_analysis::analyze_write;
 use crate::sql::DependencySpec;
 use crate::LixError;
 use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement, TableFactor};
@@ -239,7 +239,7 @@ impl PublicWriteAnalysis {
 pub(crate) fn analyze_public_write_semantics(
     semantics: &PublicWriteSemantics,
     functions: &DynFunctionProvider,
-) -> Result<PublicWriteAnalysis, WriteAnalysisError> {
+) -> Result<PublicWriteAnalysis, LixError> {
     analyze_write(&semantics.canonicalized, functions).map(|planned_write| PublicWriteAnalysis {
         semantics: semantics.clone(),
         planned_write,

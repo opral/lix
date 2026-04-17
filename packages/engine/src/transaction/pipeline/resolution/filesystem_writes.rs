@@ -33,8 +33,6 @@ use serde_json::json;
 use sqlparser::ast::{BinaryOperator, Expr, Value as SqlValue, ValueWithSpan};
 use std::collections::{BTreeMap, BTreeSet};
 
-use self::insert_planning::FilesystemPlanningError;
-
 const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const FILESYSTEM_DIRECTORY_SCHEMA_VERSION: &str = "1";
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -42,11 +40,8 @@ const FILESYSTEM_FILE_SCHEMA_VERSION: &str = "1";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const FILESYSTEM_BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 
-fn write_resolve_filesystem_planning_error(error: FilesystemPlanningError) -> WriteResolveError {
-    WriteResolveError {
-        message: error.message,
-        hint: error.hint,
-    }
+fn write_resolve_filesystem_planning_error(error: crate::LixError) -> crate::LixError {
+    error.into()
 }
 
 pub(super) async fn resolve_filesystem_write<P>(
@@ -54,7 +49,7 @@ pub(super) async fn resolve_filesystem_write<P>(
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -92,10 +87,11 @@ where
 
 fn filesystem_write_lookup_scope(
     planned_write: &PlannedWrite,
-) -> Result<FilesystemProjectionScope, WriteResolveError> {
+) -> Result<FilesystemProjectionScope, crate::LixError> {
     filesystem_write_semantics(planned_write).and_then(|semantics| {
-        semantics.filesystem_scope.ok_or_else(|| WriteResolveError {
-            message: format!(
+        semantics.filesystem_scope.ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public filesystem write '{}' is missing catalog-owned filesystem scope",
                 planned_write.command.target.descriptor.public_name
             ),
@@ -108,7 +104,7 @@ fn filesystem_projection_sql(
     backend: &dyn LixBackend,
     kind: FilesystemRelationKind,
     scope: FilesystemProjectionScope,
-) -> Result<String, WriteResolveError> {
+) -> Result<String, crate::LixError> {
     let binding = builtin_catalog_compiler_facade()
         .bind_filesystem_runtime_relation(kind, scope, None)
         .map_err(write_resolve_backend_error)?;
@@ -118,21 +114,23 @@ fn filesystem_projection_sql(
 
 async fn resolved_filesystem_version_id(
     planned_write: &PlannedWrite,
-) -> Result<String, WriteResolveError> {
-    resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "public filesystem write requires a concrete version_id".to_string(),
+) -> Result<String, crate::LixError> {
+    resolved_version_id(planned_write)?.ok_or_else(|| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "public filesystem write requires a concrete version_id".to_string(),
         hint: None,
     })
 }
 
 fn filesystem_write_intent(
     planned_write: &PlannedWrite,
-) -> Result<&FilesystemWriteIntent, WriteResolveError> {
+) -> Result<&FilesystemWriteIntent, crate::LixError> {
     planned_write
         .filesystem_write_intent
         .as_ref()
-        .ok_or_else(|| WriteResolveError {
-            message: format!(
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public filesystem write '{}' is missing compiler-owned filesystem intent",
                 planned_write.command.target.descriptor.public_name
             ),
@@ -142,12 +140,14 @@ fn filesystem_write_intent(
 
 fn directory_insert_assignments_batch(
     planned_write: &PlannedWrite,
-) -> Result<&[DirectoryInsertAssignments], WriteResolveError> {
+) -> Result<&[DirectoryInsertAssignments], crate::LixError> {
     match filesystem_write_intent(planned_write)? {
         FilesystemWriteIntent::DirectoryInsert(rows) => Ok(rows.as_slice()),
-        _ => Err(WriteResolveError {
-            message: "public filesystem directory insert expected typed directory-insert intent"
-                .to_string(),
+        _ => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "public filesystem directory insert expected typed directory-insert intent"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -155,11 +155,13 @@ fn directory_insert_assignments_batch(
 
 fn file_insert_assignments_batch(
     planned_write: &PlannedWrite,
-) -> Result<&[FileInsertAssignments], WriteResolveError> {
+) -> Result<&[FileInsertAssignments], crate::LixError> {
     match filesystem_write_intent(planned_write)? {
         FilesystemWriteIntent::FileInsert(rows) => Ok(rows.as_slice()),
-        _ => Err(WriteResolveError {
-            message: "public filesystem file insert expected typed file-insert intent".to_string(),
+        _ => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem file insert expected typed file-insert intent"
+                .to_string(),
             hint: None,
         }),
     }
@@ -167,12 +169,14 @@ fn file_insert_assignments_batch(
 
 fn directory_update_assignments(
     planned_write: &PlannedWrite,
-) -> Result<&DirectoryUpdateAssignments, WriteResolveError> {
+) -> Result<&DirectoryUpdateAssignments, crate::LixError> {
     match filesystem_write_intent(planned_write)? {
         FilesystemWriteIntent::DirectoryUpdate(assignments) => Ok(assignments),
-        _ => Err(WriteResolveError {
-            message: "public filesystem directory update expected typed directory-update intent"
-                .to_string(),
+        _ => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "public filesystem directory update expected typed directory-update intent"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -180,11 +184,13 @@ fn directory_update_assignments(
 
 fn file_update_assignments(
     planned_write: &PlannedWrite,
-) -> Result<&FileUpdateAssignments, WriteResolveError> {
+) -> Result<&FileUpdateAssignments, crate::LixError> {
     match filesystem_write_intent(planned_write)? {
         FilesystemWriteIntent::FileUpdate(assignments) => Ok(assignments),
-        _ => Err(WriteResolveError {
-            message: "public filesystem file update expected typed file-update intent".to_string(),
+        _ => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem file update expected typed file-update intent"
+                .to_string(),
             hint: None,
         }),
     }
@@ -194,7 +200,7 @@ async fn resolve_directory_insert_write_plan<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -202,16 +208,18 @@ where
     let payloads = payload_maps(planned_write)?;
     let assignments_rows = directory_insert_assignments_batch(planned_write)?;
     if payloads.len() != assignments_rows.len() {
-        return Err(WriteResolveError {
-            message: "public filesystem directory insert compiler/runtime row count mismatch"
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem directory insert compiler/runtime row count mismatch"
                 .to_string(),
             hint: None,
         });
     }
     let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     if payloads.len() != row_version_ids.len() {
-        return Err(WriteResolveError {
-            message:
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
                 "public filesystem directory insert requires one version target per payload row"
                     .to_string(),
             hint: None,
@@ -224,8 +232,9 @@ where
         .zip(row_version_ids.into_iter())
         .zip(assignments_rows.iter().cloned())
     {
-        let version_id = version_id.ok_or_else(|| WriteResolveError {
-            message: "public filesystem write requires a concrete version_id".to_string(),
+        let version_id = version_id.ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem write requires a concrete version_id".to_string(),
             hint: None,
         })?;
         let execution_mode = default_execution_mode_for_request(
@@ -293,7 +302,7 @@ async fn resolve_existing_directory_write(
     planned_write: &PlannedWrite,
     pending_write_overlay: Option<&dyn PendingOverlay>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     let current_rows = load_target_directory_rows_for_selector(
@@ -526,9 +535,11 @@ async fn resolve_existing_directory_write(
 
             Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
-        WriteOperationKind::Insert => Err(WriteResolveError {
-            message: "public filesystem directory existing-row resolver does not handle inserts"
-                .to_string(),
+        WriteOperationKind::Insert => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "public filesystem directory existing-row resolver does not handle inserts"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -538,7 +549,7 @@ async fn resolve_file_insert_write_plan<P>(
     hydrator: &mut PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
     functions: SharedFunctionProvider<P>,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -546,17 +557,20 @@ where
     let payloads = payload_maps(planned_write)?;
     let assignments_rows = file_insert_assignments_batch(planned_write)?;
     if payloads.len() != assignments_rows.len() {
-        return Err(WriteResolveError {
-            message: "public filesystem file insert compiler/runtime row count mismatch"
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem file insert compiler/runtime row count mismatch"
                 .to_string(),
             hint: None,
         });
     }
     let row_version_ids = resolved_insert_version_ids(hydrator, planned_write).await?;
     if payloads.len() != row_version_ids.len() {
-        return Err(WriteResolveError {
-            message: "public filesystem file insert requires one version target per payload row"
-                .to_string(),
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description:
+                "public filesystem file insert requires one version target per payload row"
+                    .to_string(),
             hint: None,
         });
     }
@@ -567,8 +581,9 @@ where
         .zip(row_version_ids.into_iter())
         .zip(assignments_rows.iter().cloned())
     {
-        let version_id = version_id.ok_or_else(|| WriteResolveError {
-            message: "public filesystem write requires a concrete version_id".to_string(),
+        let version_id = version_id.ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem write requires a concrete version_id".to_string(),
             hint: None,
         })?;
         let execution_mode = default_execution_mode_for_request(
@@ -680,7 +695,7 @@ async fn resolve_existing_file_write(
     planned_write: &PlannedWrite,
     pending_write_overlay: Option<&dyn PendingOverlay>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     let version_id = resolved_filesystem_version_id(planned_write).await?;
     let lookup_scope = filesystem_write_lookup_scope(planned_write)?;
     match planned_write.command.operation_kind {
@@ -702,8 +717,9 @@ async fn resolve_existing_file_write(
                 ));
             }
             if current_rows.len() > 1 && assignments.path.is_some() {
-                return Err(WriteResolveError {
-                    message: format!(
+                return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
                         "Unique constraint violation: file path '{}' would be assigned to multiple rows",
                         assignments
                             .path
@@ -910,8 +926,10 @@ async fn resolve_existing_file_write(
             }
             Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
-        WriteOperationKind::Insert => Err(WriteResolveError {
-            message: "public filesystem existing-row resolver does not handle inserts".to_string(),
+        WriteOperationKind::Insert => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public filesystem existing-row resolver does not handle inserts"
+                .to_string(),
             hint: None,
         }),
     }
@@ -919,12 +937,13 @@ async fn resolve_existing_file_write(
 
 fn filesystem_write_semantics(
     planned_write: &PlannedWrite,
-) -> Result<CatalogWriteSurfaceSemantics, WriteResolveError> {
+) -> Result<CatalogWriteSurfaceSemantics, crate::LixError> {
     builtin_catalog_compiler_facade()
         .write_surface_semantics(&planned_write.command.target)
         .map_err(write_resolve_backend_error)?
-        .ok_or_else(|| WriteResolveError {
-            message: format!(
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public filesystem live slice does not have catalog-owned write semantics for '{}'",
                 planned_write.command.target.descriptor.public_name
             ),
@@ -934,10 +953,11 @@ fn filesystem_write_semantics(
 
 fn filesystem_write_kind(
     planned_write: &PlannedWrite,
-) -> Result<FilesystemRelationKind, WriteResolveError> {
+) -> Result<FilesystemRelationKind, crate::LixError> {
     filesystem_write_semantics(planned_write).and_then(|semantics| {
-        semantics.filesystem_kind.ok_or_else(|| WriteResolveError {
-            message: format!(
+        semantics.filesystem_kind.ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "public filesystem write '{}' is missing catalog-owned filesystem kind",
                 planned_write.command.target.descriptor.public_name
             ),
@@ -953,7 +973,7 @@ async fn resolve_parent_directory_target(
     directory_path: Option<&str>,
     untracked: bool,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<(Option<String>, Vec<DirectoryFilesystemRow>), WriteResolveError> {
+) -> Result<(Option<String>, Vec<DirectoryFilesystemRow>), crate::LixError> {
     let Some(directory_path) = directory_path else {
         return Ok((None, Vec::new()));
     };
@@ -1065,7 +1085,7 @@ async fn resolve_missing_directory_rows(
     directory_path: &str,
     untracked: bool,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
+) -> Result<Vec<DirectoryFilesystemRow>, crate::LixError> {
     let mut missing = Vec::new();
     let mut known_ids = BTreeMap::<String, String>::new();
     let mut paths = directory_ancestor_paths(directory_path);
@@ -1137,7 +1157,7 @@ async fn resolve_file_update_target(
     assignments: &FileUpdateAssignments,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<(FileFilesystemRow, Vec<DirectoryFilesystemRow>), WriteResolveError> {
+) -> Result<(FileFilesystemRow, Vec<DirectoryFilesystemRow>), crate::LixError> {
     let next_hidden = assignments.hidden.unwrap_or(current_row.hidden);
     let next_metadata = assignments.metadata.apply(current_row.metadata.clone());
 
@@ -1182,8 +1202,9 @@ async fn resolve_file_update_target(
         .await?
         {
             if existing_id != current_row.id {
-                return Err(WriteResolveError {
-                    message: format!(
+                return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
                         "Unique constraint violation: file path '{}' already exists in version '{}'",
                         next_path, version_id
                     ),
@@ -1223,15 +1244,16 @@ async fn resolve_directory_update_target(
     assignments: &DirectoryUpdateAssignments,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<DirectoryFilesystemRow, WriteResolveError> {
+) -> Result<DirectoryFilesystemRow, crate::LixError> {
     let next_hidden = assignments.hidden.unwrap_or(current_row.hidden);
     let next_metadata = assignments.metadata.apply(current_row.metadata.clone());
 
     let (resolved_parent_id, resolved_name, resolved_path) = if let Some(normalized_path) =
         assignments.path.as_ref()
     {
-        let name = directory_name_from_path(normalized_path).ok_or_else(|| WriteResolveError {
-            message: "Directory name must be provided".to_string(),
+        let name = directory_name_from_path(normalized_path).ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "Directory name must be provided".to_string(),
             hint: None,
         })?;
         let parent_id = match parent_directory_path(normalized_path) {
@@ -1242,8 +1264,9 @@ async fn resolve_directory_update_target(
                 lookup_scope,
             )
             .await?
-            .ok_or_else(|| WriteResolveError {
-                message: format!("Parent directory does not exist for path {}", parent_path),
+            .ok_or_else(|| crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("Parent directory does not exist for path {}", parent_path),
                 hint: None,
             })?,
             None => String::new(),
@@ -1267,8 +1290,12 @@ async fn resolve_directory_update_target(
             Some(parent_id) => {
                 lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
                     .await?
-                    .ok_or_else(|| WriteResolveError {
-                        message: format!("Parent directory does not exist for id {}", parent_id),
+                    .ok_or_else(|| crate::LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        description: format!(
+                            "Parent directory does not exist for id {}",
+                            parent_id
+                        ),
                         hint: None,
                     })?
             }
@@ -1280,8 +1307,9 @@ async fn resolve_directory_update_target(
     };
 
     if resolved_parent_id.as_deref() == Some(current_row.id.as_str()) {
-        return Err(WriteResolveError {
-            message: "Directory cannot be its own parent".to_string(),
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "Directory cannot be its own parent".to_string(),
             hint: None,
         });
     }
@@ -1304,8 +1332,9 @@ async fn resolve_directory_update_target(
     .await?
     {
         if existing_id != current_row.id {
-            return Err(WriteResolveError {
-                message: format!(
+            return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
                     "Unique constraint violation: directory path '{}' already exists in version '{}'",
                     resolved_path, version_id
                 ),
@@ -1349,10 +1378,11 @@ async fn resolve_directory_update_targets_batch(
     assignments: &DirectoryUpdateAssignments,
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
+) -> Result<Vec<DirectoryFilesystemRow>, crate::LixError> {
     if let Some(normalized_path) = assignments.path.as_ref() {
-        return Err(WriteResolveError {
-            message: format!(
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!(
                 "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
                 normalized_path
             ),
@@ -1367,8 +1397,9 @@ async fn resolve_directory_update_targets_batch(
             .clone()
             .or_else(|| row.parent_id.clone());
         if parent_id.as_deref() == Some(row.id.as_str()) {
-            return Err(WriteResolveError {
-                message: "Directory cannot be its own parent".to_string(),
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "Directory cannot be its own parent".to_string(),
                 hint: None,
             });
         }
@@ -1399,8 +1430,9 @@ async fn resolve_directory_update_targets_batch(
             .await?;
         let parent_path = lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
             .await?
-            .ok_or_else(|| WriteResolveError {
-                message: format!("Parent directory does not exist for id {}", parent_id),
+            .ok_or_else(|| crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("Parent directory does not exist for id {}", parent_id),
                 hint: None,
             })?;
         external_parent_paths.insert(parent_id.to_string(), parent_path);
@@ -1411,8 +1443,9 @@ async fn resolve_directory_update_targets_batch(
         let mut cursor = proposal.parent_id.clone();
         while let Some(parent_id) = cursor {
             if !seen.insert(parent_id.clone()) {
-                return Err(WriteResolveError {
-                    message: "Directory parent would create a cycle".to_string(),
+                return Err(crate::LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "Directory parent would create a cycle".to_string(),
                     hint: None,
                 });
             }
@@ -1447,8 +1480,9 @@ async fn resolve_directory_update_targets_batch(
             .clone();
         if let Some(existing_id) = path_to_id.insert(path.clone(), row.id.clone()) {
             if existing_id != row.id {
-                return Err(WriteResolveError {
-                    message: format!(
+                return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
                         "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
                         path
                     ),
@@ -1468,8 +1502,9 @@ async fn resolve_directory_update_targets_batch(
                 continue;
             }
             let Some(other_path) = resolved_paths.get(&existing_id) else {
-                return Err(WriteResolveError {
-                    message: format!(
+                return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!(
                         "Unique constraint violation: directory path '{}' already exists in version '{}'",
                         path, version_id
                     ),
@@ -1479,8 +1514,9 @@ async fn resolve_directory_update_targets_batch(
             if other_path != &path {
                 continue;
             }
-            return Err(WriteResolveError {
-                message: format!(
+            return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
                     "Unique constraint violation: directory path '{}' would be assigned to multiple rows",
                     path
                 ),
@@ -1517,7 +1553,7 @@ fn resolve_proposed_directory_path(
     proposed_by_id: &BTreeMap<String, ProposedDirectoryUpdate>,
     external_parent_paths: &BTreeMap<String, String>,
     resolved_paths: &mut BTreeMap<String, String>,
-) -> Result<String, WriteResolveError> {
+) -> Result<String, crate::LixError> {
     if let Some(path) = resolved_paths.get(directory_id) {
         return Ok(path.clone());
     }
@@ -1536,8 +1572,9 @@ fn resolve_proposed_directory_path(
         Some(parent_id) => external_parent_paths
             .get(parent_id)
             .cloned()
-            .ok_or_else(|| WriteResolveError {
-                message: format!("Parent directory does not exist for id {}", parent_id),
+            .ok_or_else(|| crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("Parent directory does not exist for id {}", parent_id),
                 hint: None,
             })?,
         None => "/".to_string(),
@@ -1555,7 +1592,7 @@ async fn load_target_directory_rows_for_selector(
     version_id: &str,
     lookup_scope: FilesystemProjectionScope,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<Vec<DirectoryFilesystemRow>, WriteResolveError> {
+) -> Result<Vec<DirectoryFilesystemRow>, crate::LixError> {
     if let Some(directory_id) = exact_id_selector_value(planned_write) {
         return Ok(load_directory_row_by_id_with_pending_overlay(
             backend,
@@ -1594,7 +1631,7 @@ async fn load_target_file_rows_for_selector(
     lookup_scope: FilesystemProjectionScope,
     require_paths: bool,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<Vec<FileFilesystemRow>, WriteResolveError> {
+) -> Result<Vec<FileFilesystemRow>, crate::LixError> {
     if let Some(file_id) = exact_id_selector_value(planned_write) {
         let row = if require_paths {
             load_file_row_by_id_with_pending_overlay(
@@ -1884,19 +1921,21 @@ async fn assert_no_directory_cycle(
     directory_id: &str,
     parent_id: &str,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<(), WriteResolveError> {
+) -> Result<(), crate::LixError> {
     let mut safety = 0usize;
     let mut current_parent: Option<String> = Some(parent_id.to_string());
     while let Some(parent_id) = current_parent {
         if parent_id == directory_id {
-            return Err(WriteResolveError {
-                message: "Directory parent would create a cycle".to_string(),
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "Directory parent would create a cycle".to_string(),
                 hint: None,
             });
         }
         if safety > 1024 {
-            return Err(WriteResolveError {
-                message: "Directory hierarchy appears to be cyclic".to_string(),
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "Directory hierarchy appears to be cyclic".to_string(),
                 hint: None,
             });
         }
@@ -1904,8 +1943,9 @@ async fn assert_no_directory_cycle(
         let Some(parent_row) =
             load_directory_row_by_id(backend, version_id, &parent_id, lookup_scope).await?
         else {
-            return Err(WriteResolveError {
-                message: format!("Parent directory does not exist for id {}", parent_id),
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("Parent directory does not exist for id {}", parent_id),
                 hint: None,
             });
         };
@@ -2055,9 +2095,10 @@ fn binary_blob_ref_row(
     file_id: &str,
     version_id: &str,
     data: &[u8],
-) -> Result<PlannedStateRow, WriteResolveError> {
-    let size_bytes = u64::try_from(data.len()).map_err(|_| WriteResolveError {
-        message: format!(
+) -> Result<PlannedStateRow, crate::LixError> {
+    let size_bytes = u64::try_from(data.len()).map_err(|_| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: format!(
             "binary blob size exceeds supported range for file '{}' version '{}'",
             file_id, version_id
         ),
