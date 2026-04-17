@@ -1,9 +1,9 @@
 use crate::canonical::load_commit as load_canonical_commit;
-use crate::canonical::{
-    checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot,
-    CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
-};
+use crate::canonical::{checkpoint_commit_label_entity_id, CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY};
 use crate::functions::FunctionBindings;
+use crate::transaction::{
+    append_checkpoint_commit_label_fact_in_transaction, CheckpointCommitLabelWrite,
+};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
@@ -132,76 +132,20 @@ async fn ensure_checkpoint_label_on_commit(
         return Ok(());
     }
 
-    let snapshot_content = checkpoint_commit_label_snapshot(commit_id);
-    let change_id = generate_runtime_uuid(tx).await?;
-    let timestamp = generate_runtime_timestamp(tx).await?;
-    crate::live_state::write_live_rows(
+    let function_bindings = checkpoint_function_bindings(tx).await?;
+    let change_id = function_bindings.provider().call_uuid_v7();
+    let timestamp = function_bindings.provider().call_timestamp();
+    let mut functions = function_bindings.provider().clone();
+    append_checkpoint_commit_label_fact_in_transaction(
         tx.backend_transaction_mut()?,
-        &[crate::live_state::LiveRow {
-            entity_id: state_entity_id.clone(),
-            file_id: None,
-            schema_key: CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string(),
-            schema_version: "1".to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            plugin_key: None,
-            metadata: None,
-            change_id: Some(change_id.clone()),
-            global: true,
-            untracked: false,
-            created_at: Some(timestamp.clone()),
-            updated_at: Some(timestamp.clone()),
-            snapshot_content: Some(snapshot_content.clone()),
-        }],
+        &mut functions,
+        &CheckpointCommitLabelWrite {
+            commit_id: commit_id.to_string(),
+            change_id,
+            created_at: timestamp,
+        },
     )
     .await?;
-    insert_canonical_checkpoint_label_change(
-        tx,
-        &state_entity_id,
-        &snapshot_content,
-        &change_id,
-        &timestamp,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn insert_canonical_checkpoint_label_change(
-    tx: &mut SessionTransaction<'_>,
-    entity_id: &str,
-    snapshot_content: &str,
-    change_id: &str,
-    created_at: &str,
-) -> Result<(), LixError> {
-    let snapshot_id = format!("{change_id}~snapshot");
-    tx.backend_transaction_mut()?
-        .execute(
-            "INSERT INTO lix_internal_snapshot (id, content) \
-             SELECT $1, $2 \
-             WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
-            &[
-                Value::Text(snapshot_id.clone()),
-                Value::Text(snapshot_content.to_string()),
-            ],
-        )
-        .await?;
-    tx.backend_transaction_mut()?
-        .execute(
-            &format!(
-                "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
-             ) \
-             SELECT $1, $2, '{schema_key}', '1', NULL, NULL, $3, NULL, $4 \
-             WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
-                schema_key = CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
-            ),
-            &[
-                Value::Text(change_id.to_string()),
-                Value::Text(entity_id.to_string()),
-                Value::Text(snapshot_id),
-                Value::Text(created_at.to_string()),
-            ],
-        )
-        .await?;
     Ok(())
 }
 
@@ -224,18 +168,4 @@ async fn checkpoint_function_bindings(
     .await?;
     tx.context.set_function_bindings(function_bindings.clone());
     Ok(function_bindings)
-}
-
-async fn generate_runtime_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
-    Ok(checkpoint_function_bindings(tx)
-        .await?
-        .provider()
-        .call_uuid_v7())
-}
-
-async fn generate_runtime_timestamp(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
-    Ok(checkpoint_function_bindings(tx)
-        .await?
-        .provider()
-        .call_timestamp())
 }

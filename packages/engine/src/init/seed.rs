@@ -19,7 +19,9 @@ use crate::session::{
     untracked_live_rows_from_updated_version_refs,
 };
 use crate::transaction::{
-    upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,
+    append_checkpoint_commit_label_fact_in_transaction,
+    upsert_registered_schema_mirror_row_in_transaction, CheckpointCommitLabelWrite,
+    RegisteredSchemaMirrorRow,
 };
 use crate::transaction::{SessionCompilerCache, SessionCompilerState};
 use crate::version::GLOBAL_VERSION_ID;
@@ -780,19 +782,22 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
                 format!("unexpected checkpoint label id '{label_id}'"),
             ));
         }
-        let snapshot_content =
-            crate::canonical::checkpoint_commit_label_snapshot(bootstrap_commit_id);
-        self.insert_bootstrap_tracked_row(
-            Some(bootstrap_commit_id),
-            &entity_label_id,
-            crate::canonical::CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
-            "1",
-            None,
-            "global",
-            None,
-            &snapshot_content,
+        let change_id = self.generate_runtime_uuid().await?;
+        let timestamp = self.generate_runtime_timestamp().await?;
+        let function_bindings = self.ensure_function_bindings().await?;
+        let mut functions = function_bindings.provider().clone();
+        append_checkpoint_commit_label_fact_in_transaction(
+            self.backend_transaction_mut()?,
+            &mut functions,
+            &CheckpointCommitLabelWrite {
+                commit_id: bootstrap_commit_id.to_string(),
+                change_id: change_id.clone(),
+                created_at: timestamp,
+            },
         )
         .await?;
+        self.add_change_id_to_commit(bootstrap_commit_id, &change_id)
+            .await?;
 
         Ok(())
     }

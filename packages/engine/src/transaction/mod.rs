@@ -8,6 +8,7 @@
 mod backend;
 pub(crate) mod buffered;
 mod buffered_write_transaction;
+mod checkpoint_labels;
 mod commit_artifacts;
 mod compiler_state;
 mod contracts;
@@ -38,6 +39,9 @@ pub(crate) use buffered::{
     RegisteredSchemaMirrorRow, TransactionWriteDelta,
 };
 pub(crate) use buffered_write_transaction::BufferedWriteTransaction;
+pub(crate) use checkpoint_labels::{
+    append_checkpoint_commit_label_fact_in_transaction, CheckpointCommitLabelWrite,
+};
 pub(crate) use commit_artifacts::{PendingCommitLane, PendingCommitState};
 pub(crate) use compiler_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
