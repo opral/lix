@@ -3,8 +3,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::backend::QueryExecutor;
 use crate::canonical::{
     append_changes, append_untracked_change_visibility_rows,
-    compact_untracked_changes_for_touched_rows_in_transaction, CanonicalCommitReceipt,
-    UpdatedVersionRef,
+    compact_untracked_changes_for_touched_rows_in_transaction,
+    replace_snapshot_content_in_transaction, CanonicalCommitReceipt, UpdatedVersionRef,
 };
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
@@ -229,17 +229,12 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
         active_accounts.iter().cloned(),
     );
 
-    transaction
-        .execute(
-            "UPDATE lix_internal_snapshot \
-             SET content = $1 \
-             WHERE id = $2",
-            &[
-                Value::Text(session.commit_snapshot.to_string()),
-                Value::Text(session.commit_change_snapshot_id.clone()),
-            ],
-        )
-        .await?;
+    replace_snapshot_content_in_transaction(
+        transaction,
+        &session.commit_change_snapshot_id,
+        &session.commit_snapshot.to_string(),
+    )
+    .await?;
 
     let rewritten = rewrite_generated_commit_result_for_pending_session(
         session,

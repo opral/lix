@@ -72,7 +72,9 @@ pub(crate) use filesystem::runtime::{
 pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
 #[cfg(test)]
 pub(crate) use live_state_write_transaction::LiveStateWriteTransaction;
-pub(crate) use observe_tick::append_observe_tick_in_transaction;
+pub(crate) use observe_tick::{
+    append_observe_tick_in_transaction, append_observe_tick_to_write_batch,
+};
 pub(crate) use overlay::{
     PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingWriteOverlay,
 };

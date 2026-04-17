@@ -3,7 +3,8 @@ use std::collections::BTreeMap;
 use crate::backend::{transaction_backend_view, QueryExecutor};
 use crate::canonical::{
     append_changes, append_untracked_change_visibility_rows,
-    load_exact_committed_change_from_commit_with_executor, CanonicalUntrackedVisibilityKind,
+    load_exact_committed_change_from_commit_with_executor, replace_snapshot_content_in_transaction,
+    CanonicalChangeWrite, CanonicalJson, CanonicalUntrackedVisibilityKind,
     CanonicalUntrackedVisibilityWrite, ExactCommittedStateRowRequest, UpdatedVersionRef,
 };
 use crate::functions::FunctionBindings;
@@ -251,7 +252,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             })
             .to_string();
             let change_id = self.generate_runtime_uuid().await?;
-            self.insert_change_row_for_snapshot(
+            self.append_canonical_change_for_snapshot(
                 &entity_id,
                 "lix_registered_schema",
                 "1",
@@ -584,7 +585,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         );
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
-        self.insert_change_row_for_snapshot(
+        self.append_canonical_change_for_snapshot(
             entity_id,
             crate::version::version_descriptor_schema_key(),
             crate::version::version_descriptor_schema_version(),
@@ -631,7 +632,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         .to_string();
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
-        self.insert_change_row_for_snapshot(
+        self.append_canonical_change_for_snapshot(
             commit_id,
             "lix_commit",
             "1",
@@ -669,7 +670,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         let snapshot_content = serde_json::json!({ "id": change_set_id }).to_string();
         let change_id = self.generate_runtime_uuid().await?;
         let timestamp = self.generate_runtime_timestamp().await?;
-        self.insert_change_row_for_snapshot(
+        self.append_canonical_change_for_snapshot(
             change_set_id,
             "lix_change_set",
             "1",
@@ -1048,12 +1049,10 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
 
         let updated_snapshot = parsed.to_string();
 
-        self.execute_backend(
-            "UPDATE lix_internal_snapshot SET content = $1 WHERE id = $2",
-            &[
-                Value::Text(updated_snapshot.clone()),
-                Value::Text(snapshot_id),
-            ],
+        replace_snapshot_content_in_transaction(
+            self.backend_transaction_mut()?,
+            &snapshot_id,
+            &updated_snapshot,
         )
         .await?;
 
@@ -1090,7 +1089,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         };
         write_live_rows(self.backend_transaction_mut()?, &[row]).await?;
 
-        self.insert_change_row_for_snapshot(
+        self.append_canonical_change_for_snapshot(
             entity_id,
             schema_key,
             schema_version,
@@ -1136,7 +1135,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
             updated_at: Some(timestamp),
             snapshot_content: Some(snapshot_content.to_string()),
         };
-        self.insert_change_row_for_snapshot(
+        self.append_canonical_change_for_snapshot(
             entity_id,
             schema_key,
             schema_version,
@@ -1174,7 +1173,7 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         Ok(())
     }
 
-    pub(crate) async fn insert_change_row_for_snapshot(
+    pub(crate) async fn append_canonical_change_for_snapshot(
         &mut self,
         entity_id: &str,
         schema_key: &str,
@@ -1185,39 +1184,105 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         change_id: &str,
         created_at: &str,
     ) -> Result<(), LixError> {
-        let snapshot_id = format!("{change_id}~snapshot");
-        self.execute_backend(
-            "INSERT INTO lix_internal_snapshot (id, content) \
-             SELECT $1, $2 \
-             WHERE NOT EXISTS (SELECT 1 FROM lix_internal_snapshot WHERE id = $1)",
-            &[
-                Value::Text(snapshot_id.clone()),
-                Value::Text(snapshot_content.to_string()),
-            ],
-        )
-        .await?;
-        self.execute_backend(
-            "INSERT INTO lix_internal_change (\
-             id, entity_id, schema_key, schema_version, file_id, plugin_key, snapshot_id, metadata, created_at\
-             ) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, NULL, $8 \
-             WHERE NOT EXISTS (SELECT 1 FROM lix_internal_change WHERE id = $1)",
-            &[
-                Value::Text(change_id.to_string()),
-                Value::Text(entity_id.to_string()),
-                Value::Text(schema_key.to_string()),
-                Value::Text(schema_version.to_string()),
-                file_id.map(|value| Value::Text(value.to_string())).unwrap_or(Value::Null),
-                plugin_key
-                    .map(|value| Value::Text(value.to_string()))
-                    .unwrap_or(Value::Null),
-                Value::Text(snapshot_id),
-                Value::Text(created_at.to_string()),
-            ],
+        let canonical_change = canonical_change_write_for_snapshot(
+            entity_id,
+            schema_key,
+            schema_version,
+            file_id,
+            plugin_key,
+            snapshot_content,
+            change_id,
+            created_at,
+        )?;
+        let function_bindings = self.ensure_function_bindings().await?;
+        let mut functions = function_bindings.provider().clone();
+        append_changes(
+            self.backend_transaction_mut()?,
+            std::slice::from_ref(&canonical_change),
+            &mut functions,
         )
         .await?;
         Ok(())
     }
+}
+
+fn canonical_change_write_for_snapshot(
+    entity_id: &str,
+    schema_key: &str,
+    schema_version: &str,
+    file_id: Option<&str>,
+    plugin_key: Option<&str>,
+    snapshot_content: &str,
+    change_id: &str,
+    created_at: &str,
+) -> Result<CanonicalChangeWrite, LixError> {
+    Ok(CanonicalChangeWrite {
+        id: change_id.to_string(),
+        entity_id: entity_id.to_string().try_into().map_err(|error: LixError| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "init canonical append entity_id '{entity_id}' is invalid: {}",
+                    error.description
+                ),
+            )
+        })?,
+        schema_key: schema_key.to_string().try_into().map_err(|error: LixError| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "init canonical append schema_key '{schema_key}' is invalid: {}",
+                    error.description
+                ),
+            )
+        })?,
+        schema_version: schema_version
+            .to_string()
+            .try_into()
+            .map_err(|error: LixError| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "init canonical append schema_version '{schema_version}' is invalid: {}",
+                        error.description
+                    ),
+                )
+            })?,
+        file_id: file_id
+            .map(str::to_string)
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|error: LixError| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("init canonical append file_id {:?} is invalid: {}", file_id, error.description),
+                )
+            })?,
+        plugin_key: plugin_key
+            .map(str::to_string)
+            .map(TryInto::try_into)
+            .transpose()
+            .map_err(|error: LixError| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "init canonical append plugin_key {:?} is invalid: {}",
+                        plugin_key, error.description
+                    ),
+                )
+            })?,
+        snapshot_content: Some(CanonicalJson::from_text(snapshot_content).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "init canonical append snapshot for schema_key '{schema_key}' is invalid canonical JSON: {}",
+                    error.description
+                ),
+            )
+        })?),
+        metadata: None,
+        created_at: created_at.to_string(),
+    })
 }
 
 async fn find_version_id_by_name_with_executor(

@@ -66,12 +66,13 @@ pub(crate) use api::{
     compact_stale_untracked_changes_in_transaction,
     compact_untracked_changes_for_touched_rows_in_transaction, load_change, load_commit,
     load_commit_member_change, load_exact_row_at_commit, load_history, load_visible_state,
-    resolve_merge_base, CanonicalAppendSummary, CanonicalChange, CanonicalChangeWrite,
-    CanonicalCommit, CanonicalContentMode, CanonicalHistoryContentMode, CanonicalHistoryRequest,
-    CanonicalHistoryRootSelection, CanonicalHistoryRow, CanonicalRootCommit,
-    CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode,
-    CanonicalUntrackedVisibilityKind, CanonicalUntrackedVisibilityWrite, CanonicalVisibility,
-    CanonicalVisibleStateFilter, CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
+    replace_snapshot_content_in_transaction, resolve_merge_base, CanonicalAppendSummary,
+    CanonicalChange, CanonicalChangeWrite, CanonicalCommit, CanonicalContentMode,
+    CanonicalHistoryContentMode, CanonicalHistoryRequest, CanonicalHistoryRootSelection,
+    CanonicalHistoryRow, CanonicalRootCommit, CanonicalStateIdentity, CanonicalStateRow,
+    CanonicalTombstoneMode, CanonicalUntrackedVisibilityKind, CanonicalUntrackedVisibilityWrite,
+    CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
+    CanonicalVisibleStateRow,
 };
 #[allow(unused_imports)]
 pub(crate) use checkpoint_labels::{
