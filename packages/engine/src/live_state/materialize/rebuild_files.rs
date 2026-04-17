@@ -297,8 +297,7 @@ async fn load_file_descriptors(
             file_id,
             FilesystemProjectionScope::ExplicitVersion,
         )
-        .await
-        ?;
+        .await?;
         let Some(row) = row else {
             continue;
         };

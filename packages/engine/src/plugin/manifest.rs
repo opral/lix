@@ -1,7 +1,7 @@
 use std::sync::OnceLock;
 
 use globset::{Glob, GlobBuilder};
-use jsonschema::JSONSchema;
+use jsonschema::{Draft, JSONSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 
@@ -260,8 +260,17 @@ fn is_catch_all_glob(glob: &str) -> bool {
 
 fn plugin_manifest_validator() -> Result<&'static JSONSchema, LixError> {
     let result = PLUGIN_MANIFEST_VALIDATOR.get_or_init(|| {
-        JSONSchema::options()
-            .with_meta_schemas()
+        let mut options = JSONSchema::options();
+        options.with_meta_schemas();
+        if plugin_manifest_schema()
+            .get("$schema")
+            .and_then(JsonValue::as_str)
+            .is_some_and(|url| url == "https://json-schema.org/draft/2020-12/schema")
+        {
+            options.with_draft(Draft::Draft202012);
+        }
+
+        options
             .compile(plugin_manifest_schema())
             .map_err(|error| LixError {
                 code: "LIX_ERROR_UNKNOWN".to_string(),

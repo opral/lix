@@ -3950,7 +3950,10 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         "unexpected file-path error: {}",
         file_err.format()
     );
-    assert!(file_err.hint.is_some(), "expected recovery hint on file error");
+    assert!(
+        file_err.hint.is_some(),
+        "expected recovery hint on file error"
+    );
 
     let directory_err = engine
         .execute(

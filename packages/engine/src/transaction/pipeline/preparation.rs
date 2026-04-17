@@ -912,8 +912,9 @@ where
         let code = error.code.clone();
         let hint = error.hint.clone();
         let message = error.description.clone();
-        let lix_err = public_authoritative_write_error(&public_write.canonicalized, message.clone())
-            .unwrap_or_else(|| LixError::new(code, message));
+        let lix_err =
+            public_authoritative_write_error(&public_write.canonicalized, message.clone())
+                .unwrap_or_else(|| LixError::new(code, message));
         match hint {
             Some(hint) => lix_err.with_hint(hint),
             None => lix_err,

@@ -275,7 +275,7 @@ fn admin_write_behavior(
     };
 
     semantics.admin_behavior.ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
             "public write resolver does not yet support '{}' writes",
             target.descriptor.public_name
@@ -379,14 +379,15 @@ async fn resolve_existing_version_write(
         WriteOperationKind::Update => {
             let MutationPayload::UpdatePatch(payload) = &planned_write.command.payload else {
                 return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: "public version update resolver requires a patch payload".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "public version update resolver requires a patch payload"
+                        .to_string(),
                     hint: None,
                 });
             };
             if payload.contains_key("id") {
                 return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "public version update cannot modify id".to_string(),
                     hint: None,
                 });
@@ -400,7 +401,7 @@ async fn resolve_existing_version_write(
                     .unwrap_or_else(|| current_row.name.clone());
                 if next_name.is_empty() {
                     return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "public version update cannot set empty name".to_string(),
                         hint: None,
                     });
@@ -415,7 +416,7 @@ async fn resolve_existing_version_write(
                     .unwrap_or_else(|| current_row.commit_id.clone());
                 if next_commit_id.is_empty() {
                     return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
                         description: "public version update cannot set empty commit_id".to_string(),
                         hint: None,
                     });
@@ -844,7 +845,7 @@ fn resolved_entity_id(planned_write: &PlannedWrite) -> Result<String, crate::Lix
     }
 
     payload_text_value(planned_write, "entity_id").ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "public write resolver requires an exact entity target".to_string(),
         hint: None,
     })
@@ -859,8 +860,9 @@ fn resolved_schema_key(planned_write: &PlannedWrite) -> Result<String, crate::Li
             .clone()),
         _ => payload_text_value(planned_write, "schema_key").ok_or_else(|| crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public write resolver requires an exact schema proof or schema_key literal"
-                .to_string(),
+            description:
+                "public write resolver requires an exact schema proof or schema_key literal"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -875,7 +877,7 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, c
             .clone()
             .map(Some)
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
@@ -887,7 +889,7 @@ fn resolved_version_id(planned_write: &PlannedWrite) -> Result<Option<String>, c
         }
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
             Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "public write resolver requires a concrete version_id".to_string(),
                 hint: None,
             })
@@ -915,7 +917,7 @@ fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, cra
             .clone()
             .map(|version_id| vec![version_id])
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
@@ -924,7 +926,7 @@ fn resolved_version_ids(planned_write: &PlannedWrite) -> Result<Vec<String>, cra
         ScopeProof::SingleVersion(version_id) => Ok(vec![version_id.clone()]),
         ScopeProof::FiniteVersionSet(version_ids) if version_ids.is_empty() => {
             Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "public write resolver requires a concrete version_id".to_string(),
                 hint: None,
             })
@@ -966,7 +968,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
             .clone()
             .map(Some)
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description:
                     "public write resolver requires requested_version_id for ActiveVersion writes"
                         .to_string(),
@@ -977,7 +979,7 @@ pub(super) fn resolved_version_id_for_insert_payload(
             .and_then(text_from_value)
             .map(Some)
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "public write resolver requires a concrete version_id".to_string(),
                 hint: None,
             }),

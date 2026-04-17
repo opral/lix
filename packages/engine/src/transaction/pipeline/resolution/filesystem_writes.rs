@@ -116,7 +116,7 @@ async fn resolved_filesystem_version_id(
     planned_write: &PlannedWrite,
 ) -> Result<String, crate::LixError> {
     resolved_version_id(planned_write)?.ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
         description: "public filesystem write requires a concrete version_id".to_string(),
         hint: None,
     })
@@ -145,8 +145,9 @@ fn directory_insert_assignments_batch(
         FilesystemWriteIntent::DirectoryInsert(rows) => Ok(rows.as_slice()),
         _ => Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem directory insert expected typed directory-insert intent"
-                .to_string(),
+            description:
+                "public filesystem directory insert expected typed directory-insert intent"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -159,7 +160,8 @@ fn file_insert_assignments_batch(
         FilesystemWriteIntent::FileInsert(rows) => Ok(rows.as_slice()),
         _ => Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem file insert expected typed file-insert intent".to_string(),
+            description: "public filesystem file insert expected typed file-insert intent"
+                .to_string(),
             hint: None,
         }),
     }
@@ -172,8 +174,9 @@ fn directory_update_assignments(
         FilesystemWriteIntent::DirectoryUpdate(assignments) => Ok(assignments),
         _ => Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem directory update expected typed directory-update intent"
-                .to_string(),
+            description:
+                "public filesystem directory update expected typed directory-update intent"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -186,7 +189,8 @@ fn file_update_assignments(
         FilesystemWriteIntent::FileUpdate(assignments) => Ok(assignments),
         _ => Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem file update expected typed file-update intent".to_string(),
+            description: "public filesystem file update expected typed file-update intent"
+                .to_string(),
             hint: None,
         }),
     }
@@ -533,8 +537,9 @@ async fn resolve_existing_directory_write(
         }
         WriteOperationKind::Insert => Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem directory existing-row resolver does not handle inserts"
-                .to_string(),
+            description:
+                "public filesystem directory existing-row resolver does not handle inserts"
+                    .to_string(),
             hint: None,
         }),
     }
@@ -563,8 +568,9 @@ where
     if payloads.len() != row_version_ids.len() {
         return Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem file insert requires one version target per payload row"
-                .to_string(),
+            description:
+                "public filesystem file insert requires one version target per payload row"
+                    .to_string(),
             hint: None,
         });
     }
@@ -922,7 +928,8 @@ async fn resolve_existing_file_write(
         }
         WriteOperationKind::Insert => Err(crate::LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "public filesystem existing-row resolver does not handle inserts".to_string(),
+            description: "public filesystem existing-row resolver does not handle inserts"
+                .to_string(),
             hint: None,
         }),
     }
@@ -1258,7 +1265,7 @@ async fn resolve_directory_update_target(
             )
             .await?
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Parent directory does not exist for path {}", parent_path),
                 hint: None,
             })?,
@@ -1284,8 +1291,11 @@ async fn resolve_directory_update_target(
                 lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
                     .await?
                     .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-                        description: format!("Parent directory does not exist for id {}", parent_id),
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        description: format!(
+                            "Parent directory does not exist for id {}",
+                            parent_id
+                        ),
                         hint: None,
                     })?
             }
@@ -1388,7 +1398,7 @@ async fn resolve_directory_update_targets_batch(
             .or_else(|| row.parent_id.clone());
         if parent_id.as_deref() == Some(row.id.as_str()) {
             return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "Directory cannot be its own parent".to_string(),
                 hint: None,
             });
@@ -1421,7 +1431,7 @@ async fn resolve_directory_update_targets_batch(
         let parent_path = lookup_directory_path_by_id(backend, version_id, parent_id, lookup_scope)
             .await?
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Parent directory does not exist for id {}", parent_id),
                 hint: None,
             })?;
@@ -1434,7 +1444,7 @@ async fn resolve_directory_update_targets_batch(
         while let Some(parent_id) = cursor {
             if !seen.insert(parent_id.clone()) {
                 return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
                     description: "Directory parent would create a cycle".to_string(),
                     hint: None,
                 });
@@ -1563,7 +1573,7 @@ fn resolve_proposed_directory_path(
             .get(parent_id)
             .cloned()
             .ok_or_else(|| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Parent directory does not exist for id {}", parent_id),
                 hint: None,
             })?,
@@ -1917,14 +1927,14 @@ async fn assert_no_directory_cycle(
     while let Some(parent_id) = current_parent {
         if parent_id == directory_id {
             return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "Directory parent would create a cycle".to_string(),
                 hint: None,
             });
         }
         if safety > 1024 {
             return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: "Directory hierarchy appears to be cyclic".to_string(),
                 hint: None,
             });
@@ -1934,7 +1944,7 @@ async fn assert_no_directory_cycle(
             load_directory_row_by_id(backend, version_id, &parent_id, lookup_scope).await?
         else {
             return Err(crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: "LIX_ERROR_UNKNOWN".to_string(),
                 description: format!("Parent directory does not exist for id {}", parent_id),
                 hint: None,
             });
@@ -2087,7 +2097,7 @@ fn binary_blob_ref_row(
     data: &[u8],
 ) -> Result<PlannedStateRow, crate::LixError> {
     let size_bytes = u64::try_from(data.len()).map_err(|_| crate::LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+        code: "LIX_ERROR_UNKNOWN".to_string(),
         description: format!(
             "binary blob size exceeds supported range for file '{}' version '{}'",
             file_id, version_id

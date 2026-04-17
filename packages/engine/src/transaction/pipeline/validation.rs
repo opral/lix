@@ -424,8 +424,7 @@ async fn collect_backend_visible_plugin_manifest_keys(
             &descriptor.entity_id,
             FilesystemProjectionScope::ExplicitVersion,
         )
-        .await
-        ?
+        .await?
         else {
             continue;
         };
@@ -780,8 +779,7 @@ async fn validate_insert_file_ownership_reference(
         file_id,
         FilesystemProjectionScope::ExplicitVersion,
     )
-    .await
-    ?
+    .await?
     {
         return Ok(());
     }
@@ -835,8 +833,7 @@ async fn validate_planned_file_ownership_reference(
         &file_id,
         FilesystemProjectionScope::ExplicitVersion,
     )
-    .await
-    ?
+    .await?
     {
         return Ok(());
     }
@@ -1068,8 +1065,7 @@ async fn pending_plugin_manifest_key_from_overlay_file(
                     &descriptor.directory_id,
                     FilesystemProjectionScope::ExplicitVersion,
                 )
-                .await
-                ?
+                .await?
                 else {
                     return Ok(None);
                 };
@@ -1089,8 +1085,7 @@ async fn pending_plugin_manifest_key_from_overlay_file(
                 &pending.file_id,
                 FilesystemProjectionScope::ExplicitVersion,
             )
-            .await
-            ?
+            .await?
             .map(|row| row.path) else {
                 return Ok(None);
             };
@@ -1125,8 +1120,7 @@ async fn pending_plugin_manifest_key_from_planned_file(
                     &descriptor.directory_id,
                     FilesystemProjectionScope::ExplicitVersion,
                 )
-                .await
-                ?
+                .await?
                 else {
                     return Ok(None);
                 };
@@ -1146,8 +1140,7 @@ async fn pending_plugin_manifest_key_from_planned_file(
                 &pending.file_id,
                 FilesystemProjectionScope::ExplicitVersion,
             )
-            .await
-            ?
+            .await?
             .map(|row| row.path) else {
                 return Ok(None);
             };

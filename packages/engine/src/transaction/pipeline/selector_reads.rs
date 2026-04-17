@@ -534,11 +534,7 @@ fn build_public_selector_query(planned_write: &PlannedWrite, selector_columns: &
     }
 }
 
-fn required_text_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<String, LixError> {
+fn required_text_value_index(row: &[Value], index: usize, label: &str) -> Result<String, LixError> {
     row.get(index)
         .and_then(text_from_value)
         .ok_or_else(|| crate::LixError {
@@ -548,11 +544,7 @@ fn required_text_value_index(
         })
 }
 
-fn required_bool_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<bool, LixError> {
+fn required_bool_value_index(row: &[Value], index: usize, label: &str) -> Result<bool, LixError> {
     row.get(index)
         .and_then(bool_from_value)
         .ok_or_else(|| crate::LixError {

@@ -65,8 +65,13 @@ pub(crate) async fn resolve_file_id_by_path_in_version(
     path: &str,
 ) -> Result<Option<String>, LixError> {
     let path = ParsedFilePath::from_normalized_path(path.to_string())?;
-    lookup_file_id_by_path(backend, version_id, &path, FilesystemProjectionScope::ExplicitVersion)
-        .await
+    lookup_file_id_by_path(
+        backend,
+        version_id,
+        &path,
+        FilesystemProjectionScope::ExplicitVersion,
+    )
+    .await
 }
 
 pub(crate) async fn lookup_directory_path_by_id(
@@ -98,13 +103,11 @@ pub(crate) async fn ensure_no_file_at_directory_path(
     {
         return Ok(());
     }
-    Err(
-        filesystem_query_error(format!(
-            "Directory path collides with existing file path: {}",
-            file_path.normalized_path.as_str()
-        ))
-        .with_hint("directory paths must end with '/', while file paths must not"),
-    )
+    Err(filesystem_query_error(format!(
+        "Directory path collides with existing file path: {}",
+        file_path.normalized_path.as_str()
+    ))
+    .with_hint("directory paths must end with '/', while file paths must not"))
 }
 
 pub(crate) async fn ensure_no_directory_at_file_path(
@@ -123,12 +126,10 @@ pub(crate) async fn ensure_no_directory_at_file_path(
     {
         return Ok(());
     }
-    Err(
-        filesystem_query_error(format!(
-            "File path collides with existing directory path: {directory_path}"
-        ))
-        .with_hint("file paths must not end with '/', while directory paths must"),
-    )
+    Err(filesystem_query_error(format!(
+        "File path collides with existing directory path: {directory_path}"
+    ))
+    .with_hint("file paths must not end with '/', while directory paths must"))
 }
 
 pub(crate) async fn load_directory_row_by_id(
@@ -693,7 +694,9 @@ async fn build_pending_directory_row(
         return Ok(None);
     };
     let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| {
-        filesystem_query_error(format!("filesystem pending directory snapshot invalid JSON: {error}"))
+        filesystem_query_error(format!(
+            "filesystem pending directory snapshot invalid JSON: {error}"
+        ))
     })?;
     let parent_id = snapshot
         .get("parent_id")
@@ -1284,7 +1287,8 @@ async fn load_effective_descriptor_rows(
             id,
             parent_id: row.get(1).and_then(text_from_value),
             directory_id: row.get(2).and_then(text_from_value),
-            name: name.ok_or_else(|| filesystem_query_error("filesystem descriptor row missing name"))?,
+            name: name
+                .ok_or_else(|| filesystem_query_error("filesystem descriptor row missing name"))?,
             extension: row.get(4).and_then(text_from_value),
             hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
             untracked,
@@ -1345,14 +1349,13 @@ fn required_text_value(row: &[Value], label: &str) -> Result<String, LixError> {
     required_text_value_index(row, 0, label)
 }
 
-fn required_text_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<String, LixError> {
-    row.get(index)
-        .and_then(text_from_value)
-        .ok_or_else(|| filesystem_query_error(format!("public filesystem resolver expected text {}", label)))
+fn required_text_value_index(row: &[Value], index: usize, label: &str) -> Result<String, LixError> {
+    row.get(index).and_then(text_from_value).ok_or_else(|| {
+        filesystem_query_error(format!(
+            "public filesystem resolver expected text {}",
+            label
+        ))
+    })
 }
 
 fn optional_text_value(value: Option<&Value>) -> Option<String> {

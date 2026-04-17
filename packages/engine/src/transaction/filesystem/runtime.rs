@@ -579,8 +579,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
             file_id,
             FilesystemProjectionScope::ExplicitVersion,
         )
-        .await
-        ?;
+        .await?;
         let row = if row.is_some() || version_id == GLOBAL_VERSION_ID {
             row
         } else {
@@ -590,8 +589,7 @@ async fn load_exact_filesystem_descriptors_for_state_in_transaction(
                 file_id,
                 FilesystemProjectionScope::ExplicitVersion,
             )
-            .await
-            ?
+            .await?
         };
         let Some(row) = row else {
             continue;

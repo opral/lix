@@ -1056,7 +1056,10 @@ mod tests {
     fn represents_root_as_a_normalized_directory_path() {
         let root = NormalizedDirectoryPath::try_from_path("/").expect("root path");
         assert_eq!(root.as_str(), "/");
-        assert_eq!(root, NormalizedDirectoryPath::from_normalized("/".to_string()));
+        assert_eq!(
+            root,
+            NormalizedDirectoryPath::from_normalized("/".to_string())
+        );
     }
 
     #[test]

@@ -189,7 +189,9 @@ pub(crate) fn parse_file_insert_assignments(
         .keys()
         .any(|key| !matches!(key.as_str(), "data" | "version_id" | "untracked"))
     {
-        return Err(assignment_error("file insert requires at least one non-data column"));
+        return Err(assignment_error(
+            "file insert requires at least one non-data column",
+        ));
     }
 
     let raw_path = payload
@@ -324,19 +326,13 @@ fn optional_insert_text(
 ) -> Result<Option<String>, LixError> {
     match payload.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(value) => text_from_value(value)
-            .map(Some)
-            .ok_or_else(|| {
-                assignment_error(format!("{context} expected text/null {key}, got {value:?}"))
-            }),
+        Some(value) => text_from_value(value).map(Some).ok_or_else(|| {
+            assignment_error(format!("{context} expected text/null {key}, got {value:?}"))
+        }),
     }
 }
 
-fn text_value_required(
-    value: &Value,
-    context: &str,
-    key: &str,
-) -> Result<String, LixError> {
+fn text_value_required(value: &Value, context: &str, key: &str) -> Result<String, LixError> {
     text_from_value(value)
         .ok_or_else(|| assignment_error(format!("{context} requires column '{key}'")))
 }
