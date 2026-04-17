@@ -300,6 +300,24 @@ pub(crate) async fn append_untracked_change_visibility_rows(
     tx.execute_batch(&prepared).await.map(|_| ())
 }
 
+pub(crate) async fn replace_snapshot_content_in_transaction(
+    tx: &mut dyn LixBackendTransaction,
+    snapshot_id: &str,
+    snapshot_content: &str,
+) -> Result<(), LixError> {
+    tx.execute(
+        "UPDATE lix_internal_snapshot \
+         SET content = $1 \
+         WHERE id = $2",
+        &[
+            Value::Text(snapshot_content.to_string()),
+            Value::Text(snapshot_id.to_string()),
+        ],
+    )
+    .await
+    .map(|_| ())
+}
+
 pub(crate) async fn compact_untracked_changes_for_touched_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     visibility_rows: &[CanonicalUntrackedVisibilityWrite],

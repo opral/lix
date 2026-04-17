@@ -16,7 +16,7 @@ use crate::sql::MutationRow;
 use crate::sql::OptionalTextPatch;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
-    compile_filesystem_transaction_state_from_state,
+    append_observe_tick_to_write_batch, compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors,
     persist_runtime_sequence_highest_seen_in_transaction, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
@@ -420,9 +420,10 @@ pub(crate) async fn create_commit(
             .map_err(backend_error)?;
     }
     if let Some(observe_tick) = observe_tick.as_ref() {
-        write_batch.push_statement(
-            build_observe_tick_insert_sql(observe_tick.origin_key.as_deref()),
-            Vec::new(),
+        append_observe_tick_to_write_batch(
+            &mut write_batch,
+            transaction.dialect(),
+            observe_tick.origin_key.as_deref(),
         );
     }
     let applied_output = CreateCommitAppliedOutput {
@@ -566,19 +567,6 @@ fn validate_commit_membership_rows(
         }
     }
     Ok(())
-}
-
-fn build_observe_tick_insert_sql(origin_key: Option<&str>) -> String {
-    match origin_key {
-        Some(origin_key) => format!(
-            "INSERT INTO lix_internal_observe_tick (created_at, origin_key) \
-             VALUES (CURRENT_TIMESTAMP, '{}')",
-            escape_sql_string(origin_key)
-        ),
-        None => "INSERT INTO lix_internal_observe_tick (created_at, origin_key) \
-                  VALUES (CURRENT_TIMESTAMP, NULL)"
-            .to_string(),
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
