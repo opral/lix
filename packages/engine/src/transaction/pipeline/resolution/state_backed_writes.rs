@@ -144,7 +144,7 @@ fn assign_state_row_key_value(
     row_key: &mut CanonicalStateRowKey,
     column: &str,
     value: &Value,
-) -> Result<(), WriteResolveError> {
+) -> Result<(), crate::LixError> {
     match column {
         "entity_id" => {
             row_key.entity_id = exact_text_value(
@@ -212,23 +212,25 @@ fn exact_filter_text(
     filters: &std::collections::BTreeMap<String, Value>,
     key: &str,
     error_message: &str,
-) -> Result<Option<String>, WriteResolveError> {
+) -> Result<Option<String>, crate::LixError> {
     filters
         .get(key)
         .map(|value| exact_text_value(value, error_message))
         .transpose()
 }
 
-fn exact_text_value(value: &Value, error_message: &str) -> Result<String, WriteResolveError> {
-    text_from_value(value).ok_or_else(|| WriteResolveError {
-        message: error_message.to_string(),
+fn exact_text_value(value: &Value, error_message: &str) -> Result<String, crate::LixError> {
+    text_from_value(value).ok_or_else(|| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error_message.to_string(),
         hint: None,
     })
 }
 
-fn exact_bool_value(value: &Value, error_message: &str) -> Result<bool, WriteResolveError> {
-    bool_from_value(value).ok_or_else(|| WriteResolveError {
-        message: error_message.to_string(),
+fn exact_bool_value(value: &Value, error_message: &str) -> Result<bool, crate::LixError> {
+    bool_from_value(value).ok_or_else(|| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: error_message.to_string(),
         hint: None,
     })
 }
@@ -258,7 +260,7 @@ pub(super) async fn resolve_state_write<P>(
     pending_overlay: Option<&dyn PendingOverlay>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -286,7 +288,7 @@ pub(super) async fn resolve_entity_write<P>(
     pending_overlay: Option<&dyn PendingOverlay>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -342,7 +344,7 @@ impl StateBackedSurface<'_> {
         planned_write: &PlannedWrite,
         row_version_ids: &[Option<String>],
         functions: SharedFunctionProvider<P>,
-    ) -> Result<Vec<PlannedStateRow>, WriteResolveError>
+    ) -> Result<Vec<PlannedStateRow>, crate::LixError>
     where
         P: LixFunctionProvider + Send + 'static,
     {
@@ -379,7 +381,7 @@ impl StateBackedSurface<'_> {
     fn prepare_update_assignments(
         self,
         planned_write: &PlannedWrite,
-    ) -> Result<CanonicalStateAssignments, WriteResolveError> {
+    ) -> Result<CanonicalStateAssignments, crate::LixError> {
         assignments_from_payload(&planned_write.command.payload, self.update_context())
             .map_err(write_resolve_state_assignments_error)
     }
@@ -389,7 +391,7 @@ impl StateBackedSurface<'_> {
         planned_write: &PlannedWrite,
         assignments: &CanonicalStateAssignments,
         current_row: &ExactEffectiveStateRow,
-    ) -> Result<(BTreeMap<String, Value>, Option<String>), WriteResolveError> {
+    ) -> Result<(BTreeMap<String, Value>, Option<String>), crate::LixError> {
         match self {
             Self::State(_) => {
                 let values = apply_state_assignments(&current_row.values, assignments);
@@ -429,11 +431,12 @@ impl StateBackedSurface<'_> {
         hydrator: &PublicWriteHydrator<'_>,
         _planned_write: &PlannedWrite,
         row: &PlannedStateRow,
-    ) -> Result<Option<ExactEffectiveStateRow>, WriteResolveError> {
+    ) -> Result<Option<ExactEffectiveStateRow>, crate::LixError> {
         match self {
             Self::State(_) => {
-                let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
-                    message: "public state insert resolver requires a concrete version_id"
+                let version_id = row.version_id.clone().ok_or_else(|| crate::LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "public state insert resolver requires a concrete version_id"
                         .to_string(),
                     hint: None,
                 })?;
@@ -449,8 +452,9 @@ impl StateBackedSurface<'_> {
                     .map_err(write_resolve_backend_error)
             }
             Self::Entity(entity_schema) => {
-                let version_id = row.version_id.clone().ok_or_else(|| WriteResolveError {
-                    message: "public entity insert resolver requires a concrete version_id"
+                let version_id = row.version_id.clone().ok_or_else(|| crate::LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: "public entity insert resolver requires a concrete version_id"
                         .to_string(),
                     hint: None,
                 })?;
@@ -473,7 +477,7 @@ impl StateBackedSurface<'_> {
         hydrator: &PublicWriteHydrator<'_>,
         planned_write: &PlannedWrite,
         selector_resolver: &dyn WriteSelectorResolver,
-    ) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
+    ) -> Result<Vec<ExactEffectiveStateRow>, crate::LixError> {
         match self {
             Self::State(_) => {
                 resolve_target_state_rows(hydrator, planned_write, selector_resolver).await
@@ -497,7 +501,7 @@ async fn resolve_state_backed_write<P>(
     surface: StateBackedSurface<'_>,
     functions: SharedFunctionProvider<P>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -517,7 +521,7 @@ async fn resolve_state_backed_insert_write<P>(
     planned_write: &PlannedWrite,
     surface: StateBackedSurface<'_>,
     functions: SharedFunctionProvider<P>,
-) -> Result<ResolvedWritePlan, WriteResolveError>
+) -> Result<ResolvedWritePlan, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -525,8 +529,10 @@ where
     let rows = surface.build_insert_rows(planned_write, &row_version_ids, functions)?;
     let payloads = payload_maps(planned_write)?;
     if rows.len() != payloads.len() {
-        return Err(WriteResolveError {
-            message: "public insert resolver requires one planned row per payload row".to_string(),
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public insert resolver requires one planned row per payload row"
+                .to_string(),
             hint: None,
         });
     }
@@ -596,7 +602,7 @@ async fn resolve_state_backed_existing_write(
     planned_write: &PlannedWrite,
     surface: StateBackedSurface<'_>,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     let _ = resolved_existing_version_ids(hydrator, planned_write).await?;
     let current_rows = match surface {
         StateBackedSurface::State(_)
@@ -618,7 +624,7 @@ fn resolve_state_backed_existing_write_from_rows(
     surface: StateBackedSurface<'_>,
     planned_write: &PlannedWrite,
     current_rows: Vec<ExactEffectiveStateRow>,
-) -> Result<ResolvedWritePlan, WriteResolveError> {
+) -> Result<ResolvedWritePlan, crate::LixError> {
     if current_rows.is_empty() {
         return Ok(noop_resolved_write_plan(
             default_execution_mode_for_request(planned_write.command.requested_mode),
@@ -726,8 +732,9 @@ fn resolve_state_backed_existing_write_from_rows(
             }
             Ok(partitions.into_resolved_write_plan(planned_write.command.requested_mode))
         }
-        WriteOperationKind::Insert => Err(WriteResolveError {
-            message: "public existing-row resolver does not handle inserts".to_string(),
+        WriteOperationKind::Insert => Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public existing-row resolver does not handle inserts".to_string(),
             hint: None,
         }),
     }
@@ -738,15 +745,16 @@ fn build_state_insert_rows_with_functions<P>(
     row_version_ids: &[Option<String>],
     schema: Option<&LoadedAnnotationSchema>,
     functions: SharedFunctionProvider<P>,
-) -> Result<Vec<PlannedStateRow>, WriteResolveError>
+) -> Result<Vec<PlannedStateRow>, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
     let payloads =
         apply_state_insert_schema_annotations(payload_maps(planned_write)?, schema, functions)?;
     if payloads.len() != row_version_ids.len() {
-        return Err(WriteResolveError {
-            message: "public state insert resolver requires one version target per payload row"
+        return Err(crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: "public state insert resolver requires one version target per payload row"
                 .to_string(),
             hint: None,
         });
@@ -766,8 +774,9 @@ where
                     .ok()
                     .flatten()
             })
-            .ok_or_else(|| WriteResolveError {
-                message: "public write resolver requires an exact entity target".to_string(),
+            .ok_or_else(|| crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "public write resolver requires an exact entity target".to_string(),
                 hint: None,
             })?;
         rows.push(build_state_insert_row(
@@ -786,7 +795,7 @@ fn apply_state_insert_schema_annotations<P>(
     payloads: Vec<BTreeMap<String, Value>>,
     schema: Option<&LoadedAnnotationSchema>,
     functions: SharedFunctionProvider<P>,
-) -> Result<Vec<BTreeMap<String, Value>>, WriteResolveError>
+) -> Result<Vec<BTreeMap<String, Value>>, crate::LixError>
 where
     P: LixFunctionProvider + Send + 'static,
 {
@@ -801,15 +810,17 @@ where
             continue;
         };
         let JsonValue::Object(mut snapshot) = serde_json::from_str::<JsonValue>(&snapshot_text)
-            .map_err(|error| WriteResolveError {
-                message: format!(
+            .map_err(|error| crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
                     "public state insert resolver could not parse snapshot_content JSON: {error}"
                 ),
                 hint: None,
             })?
         else {
-            return Err(WriteResolveError {
-                message: format!(
+            return Err(crate::LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!(
                     "public state insert resolver requires object snapshot_content for schema '{}'",
                     schema.schema_key
                 ),
@@ -830,8 +841,9 @@ where
             "snapshot_content".to_string(),
             Value::Text(
                 serde_json::to_string(&JsonValue::Object(snapshot)).map_err(|error| {
-                    WriteResolveError {
-                        message: format!(
+                    crate::LixError {
+                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        description: format!(
                             "public state insert resolver could not serialize snapshot_content: {error}"
                         ),
                         hint: None,
@@ -861,14 +873,15 @@ fn state_selector_targets_single_effective_row(planned_write: &PlannedWrite) -> 
 
 fn exact_selector_row_key(
     planned_write: &PlannedWrite,
-) -> Result<CanonicalStateRowKey, WriteResolveError> {
+) -> Result<CanonicalStateRowKey, crate::LixError> {
     let entity_id = exact_filter_text(
         &planned_write.command.selector.exact_filters,
         "entity_id",
         "public state selector requires text-compatible 'entity_id'",
     )?
-    .ok_or_else(|| WriteResolveError {
-        message: "public state selector requires an exact 'entity_id'".to_string(),
+    .ok_or_else(|| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "public state selector requires an exact 'entity_id'".to_string(),
         hint: None,
     })?;
 
@@ -892,10 +905,12 @@ fn exact_selector_row_key(
 async fn resolve_exact_state_target_rows(
     hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
-) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
+) -> Result<Vec<ExactEffectiveStateRow>, crate::LixError> {
     let schema_key = resolved_schema_key(planned_write)?;
-    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "public existing-row write resolver requires a concrete version_id".to_string(),
+    let version_id = resolved_version_id(planned_write)?.ok_or_else(|| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "public existing-row write resolver requires a concrete version_id"
+            .to_string(),
         hint: None,
     })?;
     let current_row = hydrator
@@ -932,7 +947,7 @@ async fn resolve_target_entity_rows(
     planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
+) -> Result<Vec<ExactEffectiveStateRow>, crate::LixError> {
     let selector_rows = selector_resolver
         .load_entity_selector_rows(planned_write)
         .await?;
@@ -963,7 +978,7 @@ async fn resolve_target_state_rows(
     hydrator: &PublicWriteHydrator<'_>,
     planned_write: &PlannedWrite,
     selector_resolver: &dyn WriteSelectorResolver,
-) -> Result<Vec<ExactEffectiveStateRow>, WriteResolveError> {
+) -> Result<Vec<ExactEffectiveStateRow>, crate::LixError> {
     let schema_key = resolved_schema_key(planned_write)?;
     let selector_rows = selector_resolver
         .load_state_selector_rows(planned_write)
@@ -993,12 +1008,13 @@ async fn resolve_target_state_rows(
 fn selector_row_version_id(
     planned_write: &PlannedWrite,
     selector_version_id: Option<&str>,
-) -> Result<String, WriteResolveError> {
+) -> Result<String, crate::LixError> {
     if let Some(version_id) = selector_version_id {
         return Ok(version_id.to_string());
     }
-    resolved_version_id(planned_write)?.ok_or_else(|| WriteResolveError {
-        message: "public write resolver requires a concrete version_id for the selected row"
+    resolved_version_id(planned_write)?.ok_or_else(|| crate::LixError {
+        code: "LIX_ERROR_UNKNOWN".to_string(),
+        description: "public write resolver requires a concrete version_id for the selected row"
             .to_string(),
         hint: None,
     })
@@ -1013,7 +1029,7 @@ async fn load_optional_annotation_schema<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
+    let schema_key = resolved_schema_key(planned_write)?;
     let requested_version_id = requested_registered_schema_version_id(planned_write);
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
@@ -1044,7 +1060,7 @@ async fn load_entity_schema<P>(
 where
     P: LixFunctionProvider + Send + 'static,
 {
-    let schema_key = resolved_schema_key(planned_write).map_err(write_resolve_to_lix_error)?;
+    let schema_key = resolved_schema_key(planned_write)?;
     let requested_version_id = requested_registered_schema_version_id(planned_write);
     let schema = if let Some(schema) = builtin_schema_definition(&schema_key) {
         schema.clone()
@@ -1138,7 +1154,7 @@ fn entity_state_row_key(
     planned_write: &PlannedWrite,
     entity_schema: &EntityWriteSchema,
     entity_id: &str,
-) -> Result<CanonicalStateRowKey, WriteResolveError> {
+) -> Result<CanonicalStateRowKey, crate::LixError> {
     let mut row_key = CanonicalStateRowKey {
         entity_id: entity_id.to_string(),
         file_id: NullableKeyFilter::Any,
@@ -1169,7 +1185,7 @@ fn entity_state_row_key(
 fn entity_insert_row_key(
     entity_schema: &EntityWriteSchema,
     row: &PlannedStateRow,
-) -> Result<CanonicalStateRowKey, WriteResolveError> {
+) -> Result<CanonicalStateRowKey, crate::LixError> {
     let mut row_key = CanonicalStateRowKey {
         entity_id: row.entity_id.clone(),
         file_id: NullableKeyFilter::Any,

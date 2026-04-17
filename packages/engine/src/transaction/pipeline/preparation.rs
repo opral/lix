@@ -337,7 +337,7 @@ async fn validate_compiled_write_command(
                         "prepare_buffered_write_execution_step insert validation failed: {}",
                         error.description
                     ),
-                    hint: None,
+                    hint: error.hint,
                 })?;
         }
         if !internal.update_validations.is_empty() {
@@ -355,7 +355,7 @@ async fn validate_compiled_write_command(
                     "prepare_buffered_write_execution_step update validation failed: {}",
                     error.description
                 ),
-                hint: None,
+                hint: error.hint,
             })?;
         }
     }
@@ -433,7 +433,7 @@ async fn validate_write_command(
                     "prepare_buffered_write_execution_step public batch-local validation failed: {}",
                     error.description
                 ),
-                hint: None,
+                hint: error.hint,
             })?;
     }
     Ok(())
@@ -909,10 +909,12 @@ where
     )
     .await
     .map_err(|error| {
+        let code = error.code.clone();
         let hint = error.hint.clone();
+        let message = error.description.clone();
         let lix_err =
-            public_authoritative_write_error(&public_write.canonicalized, error.message.clone())
-                .unwrap_or_else(|| LixError::new("LIX_ERROR_UNKNOWN", error.message));
+            public_authoritative_write_error(&public_write.canonicalized, message.clone())
+                .unwrap_or_else(|| LixError::new(code, message));
         match hint {
             Some(hint) => lix_err.with_hint(hint),
             None => lix_err,

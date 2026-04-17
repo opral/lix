@@ -3944,14 +3944,15 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
             "INSERT INTO lix_file (id, path, data) VALUES ('invalid-file', 'invalid-path', lix_text_encode('ignored'))", &[])
         .await
         .expect_err("invalid file path should fail");
+    assert_eq!(
+        file_err.code,
+        "LIX_ERROR_PATH_MISSING_LEADING_SLASH",
+        "unexpected file-path error: {}",
+        file_err.format()
+    );
     assert!(
-        file_err.description.contains("lix_file_descriptor")
-            || file_err.description.contains("does not match schema")
-            || file_err
-                .description
-                .contains("file paths must start with '/'"),
-        "unexpected error: {}",
-        file_err.description
+        file_err.hint.is_some(),
+        "expected recovery hint on file error"
     );
 
     let directory_err = engine
@@ -3962,13 +3963,15 @@ simulation_test!(invalid_filesystem_paths_are_rejected, |sim| async move {
         )
         .await
         .expect_err("invalid directory path should fail");
+    assert_eq!(
+        directory_err.code,
+        "LIX_ERROR_PATH_MISSING_TRAILING_SLASH_ON_DIRECTORY",
+        "unexpected directory-path error: {}",
+        directory_err.format()
+    );
     assert!(
-        directory_err
-            .description
-            .contains("lix_directory_descriptor")
-            || directory_err.description.contains("does not match schema"),
-        "unexpected error: {}",
-        directory_err.description
+        directory_err.hint.is_some(),
+        "expected recovery hint on directory error"
     );
 });
 

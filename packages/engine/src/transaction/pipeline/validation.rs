@@ -424,8 +424,7 @@ async fn collect_backend_visible_plugin_manifest_keys(
             &descriptor.entity_id,
             FilesystemProjectionScope::ExplicitVersion,
         )
-        .await
-        .map_err(|error| LixError::unknown(error.message))?
+        .await?
         else {
             continue;
         };
@@ -780,8 +779,7 @@ async fn validate_insert_file_ownership_reference(
         file_id,
         FilesystemProjectionScope::ExplicitVersion,
     )
-    .await
-    .map_err(|error| LixError::unknown(error.message))?
+    .await?
     {
         return Ok(());
     }
@@ -835,8 +833,7 @@ async fn validate_planned_file_ownership_reference(
         &file_id,
         FilesystemProjectionScope::ExplicitVersion,
     )
-    .await
-    .map_err(|error| LixError::unknown(error.message))?
+    .await?
     {
         return Ok(());
     }
@@ -1068,8 +1065,7 @@ async fn pending_plugin_manifest_key_from_overlay_file(
                     &descriptor.directory_id,
                     FilesystemProjectionScope::ExplicitVersion,
                 )
-                .await
-                .map_err(|error| LixError::unknown(error.message))?
+                .await?
                 else {
                     return Ok(None);
                 };
@@ -1089,8 +1085,7 @@ async fn pending_plugin_manifest_key_from_overlay_file(
                 &pending.file_id,
                 FilesystemProjectionScope::ExplicitVersion,
             )
-            .await
-            .map_err(|error| LixError::unknown(error.message))?
+            .await?
             .map(|row| row.path) else {
                 return Ok(None);
             };
@@ -1125,8 +1120,7 @@ async fn pending_plugin_manifest_key_from_planned_file(
                     &descriptor.directory_id,
                     FilesystemProjectionScope::ExplicitVersion,
                 )
-                .await
-                .map_err(|error| LixError::unknown(error.message))?
+                .await?
                 else {
                     return Ok(None);
                 };
@@ -1146,8 +1140,7 @@ async fn pending_plugin_manifest_key_from_planned_file(
                 &pending.file_id,
                 FilesystemProjectionScope::ExplicitVersion,
             )
-            .await
-            .map_err(|error| LixError::unknown(error.message))?
+            .await?
             .map(|row| row.path) else {
                 return Ok(None);
             };
@@ -1345,35 +1338,63 @@ async fn validate_snapshot_content(
     snapshot: &JsonValue,
 ) -> Result<(), LixError> {
     let compiled = load_compiled_schema(provider, cache, key, requested_version_id).await?;
-    let details = match compiled.validate(snapshot) {
-        Ok(()) => None,
+    let (details, hint) = match compiled.validate(snapshot) {
+        Ok(()) => (None, None),
         Err(errors) => {
             let mut parts = Vec::new();
+            let mut hint: Option<String> = None;
             for error in errors {
                 let path = error.instance_path.to_string();
                 let message = error.to_string();
-                if path.is_empty() {
-                    parts.push(message);
+                let combined = if path.is_empty() {
+                    message
                 } else {
-                    parts.push(format!("{path} {message}"));
+                    format!("{path} {message}")
+                };
+                if hint.is_none() {
+                    hint = boolean_type_mismatch_hint(&combined);
                 }
+                parts.push(combined);
             }
-            Some(parts.join("; "))
+            (Some(parts.join("; ")), hint)
         }
     };
 
     if let Some(details) = details {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "snapshot_content does not match schema '{}' ({}): {details}",
-                key.schema_key, key.schema_version
-            ),
-            hint: None,
+        let description = format!(
+            "snapshot_content does not match schema '{}' ({}): {details}",
+            key.schema_key, key.schema_version
+        );
+        let err = LixError::new(LixError::CODE_SCHEMA_VALIDATION, description);
+        return Err(match hint {
+            Some(hint) => err.with_hint(hint),
+            None => err,
         });
     }
 
     Ok(())
+}
+
+/// If a snapshot validation error rejects an integer for a `boolean`-typed
+/// field, return a hint guiding the user to the right literal form.
+///
+/// SQLite has no native boolean type, so `INSERT ... VALUES (0)` is
+/// idiomatic for clients. The JSON Schema validator rejects that with
+/// `is not of type "boolean"` — correct, but agent-unfriendly. Surfacing
+/// the fix directly closes the AX gap flagged in ax_report0.md Tier 2.
+///
+/// Intentionally engine-scoped: the hint does not mention CLI flags or
+/// client-specific APIs. Clients (CLI, JS-SDK) can extend with their
+/// own guidance when they render this hint.
+fn boolean_type_mismatch_hint(combined_message: &str) -> Option<String> {
+    if !combined_message.contains("is not of type") || !combined_message.contains("boolean") {
+        return None;
+    }
+    Some(
+        "use `true` / `false` literals for boolean-typed fields; \
+         SQLite integer 0 / 1 are not auto-coerced to JSON booleans"
+            .to_string(),
+    )
 }
 
 async fn validate_planned_row(
@@ -1615,7 +1636,7 @@ async fn validate_foreign_key_reference_targets(
             .get("references")
             .and_then(|v| v.as_object())
             .ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                 description: format!(
                     "foreign key at index {index} missing references object in schema definition"
                 ),
@@ -1625,7 +1646,7 @@ async fn validate_foreign_key_reference_targets(
             .get("schemaKey")
             .and_then(|v| v.as_str())
             .ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                 description: format!(
                     "foreign key at index {index} references.schemaKey must be a string"
                 ),
@@ -1635,7 +1656,7 @@ async fn validate_foreign_key_reference_targets(
             .get("properties")
             .and_then(|v| v.as_array())
             .ok_or_else(|| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                 description: format!(
                     "foreign key at index {index} references.properties must be an array"
                 ),
@@ -1657,7 +1678,7 @@ async fn validate_foreign_key_reference_targets(
             .any(|group| group == &referenced_properties)
         {
             return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                 description: format!(
                     "foreign key at index {index} references properties that are not a primary key or unique key on schema '{}'",
                     referenced_key
@@ -1804,16 +1825,12 @@ async fn validate_constraint_group_conflict(
             continue;
         };
         if other_tuple == candidate_tuple {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "{label} violation for schema '{}': entity '{}' conflicts with pending row '{}' in version '{}' and file '{}'",
-                    row.identity.schema_key,
-                    row.identity.entity_id,
-                    pending.identity.entity_id,
-                    row.identity.version_id,
-                    format_optional_identity(row.identity.file_id.as_deref())
-                ),
+            return Err(constraint_conflict_error(
+                label,
+                &row.identity.schema_key,
+                pointers,
+                &candidate_tuple,
+                &pending.identity.entity_id,
             ));
         }
     }
@@ -1840,21 +1857,43 @@ async fn validate_constraint_group_conflict(
             continue;
         };
         if other_tuple == candidate_tuple {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "{label} violation for schema '{}': entity '{}' conflicts with existing row '{}' in version '{}' and file '{}'",
-                    row.identity.schema_key,
-                    row.identity.entity_id,
-                    committed.identity.entity_id,
-                    row.identity.version_id,
-                    format_optional_identity(row.identity.file_id.as_deref())
-                ),
+            return Err(constraint_conflict_error(
+                label,
+                &row.identity.schema_key,
+                pointers,
+                &candidate_tuple,
+                &committed.identity.entity_id,
             ));
         }
     }
 
     Ok(())
+}
+
+/// Build a user-facing message for a PK or unique-constraint collision.
+///
+/// Shape: `<label> violation on <schema>.<pointer-tuple>: value(s) <values>
+/// already in use (conflicts with entity '<other>')`. Pointer and value
+/// tuples are rendered in declaration order; single-pointer groups omit
+/// the parentheses.
+fn constraint_conflict_error(
+    label: &str,
+    schema_key: &str,
+    pointers: &[String],
+    values: &[JsonValue],
+    conflicting_entity: &str,
+) -> LixError {
+    let value_word = if values.len() == 1 { "value" } else { "values" };
+    LixError::new(
+        LixError::CODE_UNIQUE,
+        format!(
+            "{label} violation on {}.{}: {value_word} {} already in use (conflicts with entity '{}')",
+            schema_key,
+            format_pointer_tuple(pointers),
+            format_value_tuple(values),
+            conflicting_entity,
+        ),
+    )
 }
 
 async fn validate_foreign_key_constraints(
@@ -1882,7 +1921,7 @@ async fn validate_foreign_key_constraints(
             .and_then(JsonValue::as_array)
             .ok_or_else(|| {
                 LixError::new(
-                    "LIX_ERROR_UNKNOWN",
+                    LixError::CODE_SCHEMA_DEFINITION,
                     format!(
                         "foreign key at index {index} missing properties array in schema '{}'",
                         row.identity.schema_key
@@ -1897,7 +1936,7 @@ async fn validate_foreign_key_constraints(
             .and_then(JsonValue::as_object)
             .ok_or_else(|| {
                 LixError::new(
-                    "LIX_ERROR_UNKNOWN",
+                    LixError::CODE_SCHEMA_DEFINITION,
                     format!(
                         "foreign key at index {index} missing references object in schema '{}'",
                         row.identity.schema_key
@@ -1908,7 +1947,7 @@ async fn validate_foreign_key_constraints(
             .get("schemaKey")
             .and_then(JsonValue::as_str)
             .ok_or_else(|| LixError::new(
-                "LIX_ERROR_UNKNOWN",
+                LixError::CODE_SCHEMA_DEFINITION,
                 format!(
                     "foreign key at index {index} references.schemaKey must be a string in schema '{}'",
                     row.identity.schema_key
@@ -1918,7 +1957,7 @@ async fn validate_foreign_key_constraints(
             .get("properties")
             .and_then(JsonValue::as_array)
             .ok_or_else(|| LixError::new(
-                "LIX_ERROR_UNKNOWN",
+                LixError::CODE_SCHEMA_DEFINITION,
                 format!(
                     "foreign key at index {index} references.properties must be an array in schema '{}'",
                     row.identity.schema_key
@@ -1931,7 +1970,7 @@ async fn validate_foreign_key_constraints(
 
         if local_properties.len() != referenced_properties.len() {
             return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
+                LixError::CODE_SCHEMA_DEFINITION,
                 format!(
                     "foreign key at index {index} in schema '{}' must have the same number of local and referenced properties",
                     row.identity.schema_key
@@ -1975,14 +2014,14 @@ async fn validate_foreign_key_constraints(
         }
 
         return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
+            LixError::CODE_FOREIGN_KEY,
             format!(
-                "foreign key violation for schema '{}': no row in schema '{}' matches constraint {} in version '{}' and file '{}'",
+                "foreign key on {}.{} → {}.{}: no matching row for {}",
                 row.identity.schema_key,
+                format_pointer_tuple(&local_properties),
                 target_schema_key,
-                index,
-                row.identity.version_id,
-                format_optional_identity(target_file_id.as_deref())
+                format_pointer_tuple(&referenced_properties),
+                format_value_tuple(&local_values),
             ),
         ));
     }
@@ -2038,7 +2077,7 @@ async fn validate_delete_constraints_for_row(
                 .and_then(JsonValue::as_array)
                 .ok_or_else(|| {
                     LixError::new(
-                        "LIX_ERROR_UNKNOWN",
+                        LixError::CODE_SCHEMA_DEFINITION,
                         format!(
                             "foreign key at index {index} missing properties array in schema '{}'",
                             source_key.schema_key
@@ -2053,7 +2092,7 @@ async fn validate_delete_constraints_for_row(
                 .and_then(JsonValue::as_object)
                 .ok_or_else(|| {
                     LixError::new(
-                        "LIX_ERROR_UNKNOWN",
+                        LixError::CODE_SCHEMA_DEFINITION,
                         format!(
                             "foreign key at index {index} missing references object in schema '{}'",
                             source_key.schema_key
@@ -2065,7 +2104,7 @@ async fn validate_delete_constraints_for_row(
                 .and_then(JsonValue::as_str)
                 .ok_or_else(|| {
                     LixError::new(
-                        "LIX_ERROR_UNKNOWN",
+                        LixError::CODE_SCHEMA_DEFINITION,
                         format!(
                             "foreign key at index {index} references.schemaKey must be a string in schema '{}'",
                             source_key.schema_key
@@ -2077,7 +2116,7 @@ async fn validate_delete_constraints_for_row(
                 .and_then(JsonValue::as_array)
                 .ok_or_else(|| {
                     LixError::new(
-                        "LIX_ERROR_UNKNOWN",
+                        LixError::CODE_SCHEMA_DEFINITION,
                         format!(
                             "foreign key at index {index} references.properties must be an array in schema '{}'",
                             source_key.schema_key
@@ -2091,7 +2130,7 @@ async fn validate_delete_constraints_for_row(
 
             if local_properties.len() != referenced_properties.len() {
                 return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
+                    LixError::CODE_SCHEMA_DEFINITION,
                     format!(
                         "foreign key at index {index} in schema '{}' must have the same number of local and referenced properties",
                         source_key.schema_key
@@ -2120,13 +2159,15 @@ async fn validate_delete_constraints_for_row(
             .await?
             {
                 return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
+                    LixError::CODE_FOREIGN_KEY,
                     format!(
-                        "foreign key restrict violation for schema '{}': entity '{}' is still referenced in version '{}' and file '{}'",
+                        "foreign key restrict: cannot delete {} entity '{}' — still referenced by {}.{} → {}.{}",
                         deleted_row.identity.schema_key,
                         deleted_row.identity.entity_id,
-                        deleted_row.identity.version_id,
-                        format_optional_identity(deleted_row.identity.file_id.as_deref())
+                        source_key.schema_key,
+                        format_pointer_tuple(&local_properties),
+                        referenced_schema_key,
+                        format_pointer_tuple(&referenced_properties),
                     ),
                 ));
             }
@@ -2512,7 +2553,7 @@ fn json_pointer_group(values: &[JsonValue], label: &str) -> Result<Vec<String>, 
                 .map(|value| value.to_string())
                 .ok_or_else(|| {
                     LixError::new(
-                        "LIX_ERROR_UNKNOWN",
+                        LixError::CODE_SCHEMA_DEFINITION,
                         format!("{label} entries must be strings"),
                     )
                 })
@@ -2528,14 +2569,35 @@ fn json_value_to_optional_string(
         JsonValue::Null => Ok(None),
         JsonValue::String(text) => Ok(Some(text.clone())),
         other => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
+            LixError::CODE_SCHEMA_DEFINITION,
             format!("{label} must be a string or null, got {other}"),
         )),
     }
 }
 
-fn format_optional_identity(value: Option<&str>) -> String {
-    value.unwrap_or("NULL").to_string()
+/// Render a tuple of JSON Pointers for user-facing error messages.
+/// Single pointer: `/id`. Composite: `(/a, /b)`.
+fn format_pointer_tuple(pointers: &[String]) -> String {
+    match pointers {
+        [only] => only.clone(),
+        _ => format!("({})", pointers.join(", ")),
+    }
+}
+
+/// Render a tuple of JSON values as they were looked up in an FK target.
+/// Strings are quoted; other JSON scalars render in their canonical JSON form.
+fn format_value_tuple(values: &[JsonValue]) -> String {
+    let parts: Vec<String> = values
+        .iter()
+        .map(|value| match value {
+            JsonValue::String(s) => format!("\"{s}\""),
+            other => other.to_string(),
+        })
+        .collect();
+    match parts.as_slice() {
+        [only] => only.clone(),
+        _ => format!("({})", parts.join(", ")),
+    }
 }
 
 fn pending_row_is_visible(context: &ConstraintContext, pending: &ConstraintCandidateRow) -> bool {
@@ -2576,7 +2638,7 @@ async fn load_compiled_schema(
 
     let schema = provider.load_schema(key, requested_version_id).await?;
     let compiled = JSONSchema::compile(&schema).map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
+        code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
         description: format!(
             "failed to compile schema '{}' ({}): {err}",
             key.schema_key, key.schema_version
@@ -2752,7 +2814,7 @@ async fn validate_entity_id_matches_primary_key(
     let mut pointer_labels = Vec::with_capacity(primary_key.len());
     for pointer_value in primary_key {
         let pointer = pointer_value.as_str().ok_or_else(|| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: format!(
                 "schema '{}' ({}) has non-string x-lix-primary-key entry",
                 key.schema_key, key.schema_version
@@ -2762,7 +2824,7 @@ async fn validate_entity_id_matches_primary_key(
         let pointer_path = parse_json_pointer(pointer)?;
         if pointer_path.is_empty() {
             return Err(LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
+                code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                 description: format!(
                     "schema '{}' ({}) has invalid empty x-lix-primary-key pointer",
                     key.schema_key, key.schema_version
@@ -2816,7 +2878,7 @@ fn parse_json_pointer(pointer: &str) -> Result<Vec<String>, LixError> {
     }
     if !pointer.starts_with('/') {
         return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
+            code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
             description: format!("invalid JSON pointer '{pointer}'"),
             hint: None,
         });
@@ -2837,7 +2899,7 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
                 Some('1') => out.push('/'),
                 _ => {
                     return Err(LixError {
-                        code: "LIX_ERROR_UNKNOWN".to_string(),
+                        code: LixError::CODE_SCHEMA_DEFINITION.to_string(),
                         description: format!("invalid JSON pointer segment '{segment}'"),
                         hint: None,
                     });
@@ -2853,9 +2915,32 @@ fn decode_json_pointer_segment(segment: &str) -> Result<String, LixError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_checkpoint_label_mutation, CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
+        boolean_type_mismatch_hint, validate_checkpoint_label_mutation, CHECKPOINT_LABEL_NAME,
+        CHECKPOINT_LABEL_SCHEMA_KEY,
     };
     use serde_json::json;
+
+    #[test]
+    fn boolean_mismatch_hint_fires_on_integer_rejected_as_boolean() {
+        let hint = boolean_type_mismatch_hint("/done 0 is not of type \"boolean\"")
+            .expect("integer-for-boolean should produce a hint");
+        assert!(hint.contains("true"));
+        assert!(hint.contains("false"));
+        assert!(hint.contains("SQLite integer"));
+        assert!(
+            !hint.contains("--params"),
+            "engine hint must not reference CLI flags: {hint}"
+        );
+    }
+
+    #[test]
+    fn boolean_mismatch_hint_absent_for_other_type_errors() {
+        assert!(boolean_type_mismatch_hint("/age \"old\" is not of type \"integer\"").is_none());
+        assert!(
+            boolean_type_mismatch_hint("/email does not match pattern \"^[^@]+@[^@]+$\"").is_none()
+        );
+        assert!(boolean_type_mismatch_hint("\"name\" is a required property").is_none());
+    }
 
     #[test]
     fn checkpoint_label_insert_is_rejected() {

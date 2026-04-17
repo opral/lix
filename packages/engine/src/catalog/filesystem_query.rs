@@ -11,12 +11,6 @@ use std::collections::BTreeSet;
 const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
 const FILESYSTEM_DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FilesystemQueryError {
-    pub(crate) message: String,
-    pub(crate) hint: Option<String>,
-}
-
 #[derive(Debug, Clone)]
 pub(crate) struct DirectoryFilesystemRow {
     pub(crate) id: String,
@@ -48,7 +42,7 @@ pub(crate) async fn lookup_directory_id_by_path(
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<String>, FilesystemQueryError> {
+) -> Result<Option<String>, LixError> {
     Ok(load_directory_row_by_path(backend, version_id, path, scope)
         .await?
         .map(|row| row.id))
@@ -59,7 +53,7 @@ pub(crate) async fn lookup_file_id_by_path(
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<String>, FilesystemQueryError> {
+) -> Result<Option<String>, LixError> {
     Ok(load_file_row_by_path(backend, version_id, path, scope)
         .await?
         .map(|row| row.id))
@@ -78,11 +72,6 @@ pub(crate) async fn resolve_file_id_by_path_in_version(
         FilesystemProjectionScope::ExplicitVersion,
     )
     .await
-    .map_err(|error| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: error.message,
-        hint: None,
-    })
 }
 
 pub(crate) async fn lookup_directory_path_by_id(
@@ -90,7 +79,7 @@ pub(crate) async fn lookup_directory_path_by_id(
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<String>, FilesystemQueryError> {
+) -> Result<Option<String>, LixError> {
     Ok(
         load_directory_row_by_id(backend, version_id, directory_id, scope)
             .await?
@@ -103,7 +92,7 @@ pub(crate) async fn ensure_no_file_at_directory_path(
     version_id: &str,
     directory_path: &NormalizedDirectoryPath,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<(), FilesystemQueryError> {
+) -> Result<(), LixError> {
     let file_path = ParsedFilePath::from_normalized_path(
         directory_path.as_str().trim_end_matches('/').to_string(),
     )
@@ -114,13 +103,11 @@ pub(crate) async fn ensure_no_file_at_directory_path(
     {
         return Ok(());
     }
-    Err(FilesystemQueryError {
-        message: format!(
-            "Directory path collides with existing file path: {}",
-            file_path.normalized_path.as_str()
-        ),
-        hint: Some("directory paths must end with '/', while file paths must not".to_string()),
-    })
+    Err(filesystem_query_error(format!(
+        "Directory path collides with existing file path: {}",
+        file_path.normalized_path.as_str()
+    ))
+    .with_hint("directory paths must end with '/', while file paths must not"))
 }
 
 pub(crate) async fn ensure_no_directory_at_file_path(
@@ -128,7 +115,7 @@ pub(crate) async fn ensure_no_directory_at_file_path(
     version_id: &str,
     file_path: &ParsedFilePath,
     lookup_scope: FilesystemProjectionScope,
-) -> Result<(), FilesystemQueryError> {
+) -> Result<(), LixError> {
     let directory_path = NormalizedDirectoryPath::from_normalized(format!(
         "{}/",
         file_path.normalized_path.as_str().trim_end_matches('/')
@@ -139,10 +126,10 @@ pub(crate) async fn ensure_no_directory_at_file_path(
     {
         return Ok(());
     }
-    Err(FilesystemQueryError {
-        message: format!("File path collides with existing directory path: {directory_path}"),
-        hint: Some("file paths must not end with '/', while directory paths must".to_string()),
-    })
+    Err(filesystem_query_error(format!(
+        "File path collides with existing directory path: {directory_path}"
+    ))
+    .with_hint("file paths must not end with '/', while directory paths must"))
 }
 
 pub(crate) async fn load_directory_row_by_id(
@@ -150,7 +137,7 @@ pub(crate) async fn load_directory_row_by_id(
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     let Some(descriptor) =
         load_directory_descriptor_by_id(backend, version_id, directory_id, scope).await?
     else {
@@ -183,7 +170,7 @@ pub(crate) async fn load_directory_row_by_path(
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     let mut current_parent_id = None;
     let mut current_path = "/".to_string();
     let mut current_row = None;
@@ -229,7 +216,7 @@ pub(crate) async fn load_file_row_by_path(
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     let directory_id = match path.directory_path.as_ref() {
         Some(directory_path) => {
             match lookup_directory_id_by_path(backend, version_id, directory_path, scope).await? {
@@ -270,7 +257,7 @@ pub(crate) async fn load_file_row_by_id(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     let Some(descriptor) = load_file_descriptor_by_id(backend, version_id, file_id, scope).await?
     else {
         return Ok(None);
@@ -309,7 +296,7 @@ pub(crate) async fn load_file_row_by_id_without_path(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     let Some(descriptor) = load_file_descriptor_by_id(backend, version_id, file_id, scope).await?
     else {
         return Ok(None);
@@ -334,7 +321,7 @@ pub(crate) async fn load_directory_row_by_id_with_pending_overlay(
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     if let Some(row) = pending_directory_row_by_id(
         backend,
         pending_write_overlay,
@@ -365,7 +352,7 @@ pub(crate) async fn load_directory_row_by_path_with_pending_overlay(
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     if let Some(row) =
         pending_directory_row_by_path(backend, pending_write_overlay, version_id, path, scope)
             .await?
@@ -390,7 +377,7 @@ pub(crate) async fn load_file_row_by_path_with_pending_overlay(
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     if let Some(row) =
         pending_file_row_by_path(backend, pending_write_overlay, version_id, path, scope).await?
     {
@@ -414,7 +401,7 @@ pub(crate) async fn load_file_row_by_id_with_pending_overlay(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     if let Some(row) =
         pending_file_row_by_id(backend, pending_write_overlay, version_id, file_id, scope).await?
     {
@@ -447,7 +434,7 @@ pub(crate) async fn load_file_row_by_id_without_path_with_pending_overlay(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     if let Some(mut row) = load_file_row_by_id_with_pending_overlay(
         backend,
         pending_write_overlay,
@@ -470,7 +457,7 @@ pub(crate) async fn file_id_resolves_in_scope(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<bool, FilesystemQueryError> {
+) -> Result<bool, LixError> {
     Ok(load_file_row_by_id_without_path_with_pending_overlay(
         backend,
         pending_write_overlay,
@@ -488,7 +475,7 @@ pub(crate) async fn lookup_directory_id_by_path_with_pending_overlay(
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<String>, FilesystemQueryError> {
+) -> Result<Option<String>, LixError> {
     Ok(load_directory_row_by_path_with_pending_overlay(
         backend,
         pending_write_overlay,
@@ -506,7 +493,7 @@ pub(crate) async fn lookup_file_id_by_path_with_pending_overlay(
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<String>, FilesystemQueryError> {
+) -> Result<Option<String>, LixError> {
     Ok(load_file_row_by_path_with_pending_overlay(
         backend,
         pending_write_overlay,
@@ -524,7 +511,7 @@ pub(crate) async fn lookup_directory_path_by_id_with_pending_overlay(
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<String>, FilesystemQueryError> {
+) -> Result<Option<String>, LixError> {
     Ok(load_directory_row_by_id_with_pending_overlay(
         backend,
         pending_write_overlay,
@@ -541,7 +528,7 @@ pub(crate) async fn load_directory_rows_under_path(
     projection_sql: &str,
     version_id: &str,
     root_path: &str,
-) -> Result<Vec<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Vec<DirectoryFilesystemRow>, LixError> {
     let prefix_length = root_path.chars().count();
     let sql = format!(
         "SELECT id, parent_id, name, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
@@ -562,7 +549,7 @@ pub(crate) async fn load_file_rows_under_path(
     projection_sql: &str,
     version_id: &str,
     root_path: &str,
-) -> Result<Vec<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Vec<FileFilesystemRow>, LixError> {
     let prefix_length = root_path.chars().count();
     let sql = format!(
         "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id \
@@ -584,7 +571,7 @@ async fn pending_directory_row_by_id(
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     let Some(pending) = pending_write_overlay
         .into_iter()
         .flat_map(|view| view.visible_directory_rows(false, FILESYSTEM_DIRECTORY_SCHEMA_KEY))
@@ -605,7 +592,7 @@ async fn pending_directory_row_by_path(
     version_id: &str,
     path: &NormalizedDirectoryPath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     for pending in pending_write_overlay
         .into_iter()
         .flat_map(|view| view.visible_directory_rows(false, FILESYSTEM_DIRECTORY_SCHEMA_KEY))
@@ -631,7 +618,7 @@ async fn pending_file_row_by_id(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     let Some(pending) = pending_write_overlay
         .into_iter()
         .flat_map(PendingOverlay::visible_files)
@@ -651,7 +638,7 @@ async fn pending_file_row_by_path(
     version_id: &str,
     path: &ParsedFilePath,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     for pending in pending_write_overlay
         .into_iter()
         .flat_map(PendingOverlay::visible_files)
@@ -702,15 +689,15 @@ async fn build_pending_directory_row(
     pending_write_overlay: Option<&dyn PendingOverlay>,
     row: &PendingSemanticRow,
     scope: FilesystemProjectionScope,
-) -> Result<Option<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<DirectoryFilesystemRow>, LixError> {
     let Some(snapshot_content) = row.snapshot_content.as_deref() else {
         return Ok(None);
     };
-    let snapshot: JsonValue =
-        serde_json::from_str(snapshot_content).map_err(|error| FilesystemQueryError {
-            message: format!("filesystem pending directory snapshot invalid JSON: {error}"),
-            hint: None,
-        })?;
+    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|error| {
+        filesystem_query_error(format!(
+            "filesystem pending directory snapshot invalid JSON: {error}"
+        ))
+    })?;
     let parent_id = snapshot
         .get("parent_id")
         .and_then(|value| value.as_str())
@@ -760,7 +747,7 @@ async fn build_pending_file_row(
     pending_write_overlay: Option<&dyn PendingOverlay>,
     row: &PendingFilesystemFileView,
     scope: FilesystemProjectionScope,
-) -> Result<Option<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Option<FileFilesystemRow>, LixError> {
     let Some(descriptor) = row.descriptor.as_ref() else {
         return Ok(None);
     };
@@ -803,7 +790,7 @@ async fn build_pending_file_row(
 async fn load_directory_rows_from_sql(
     backend: &dyn LixBackend,
     sql: &str,
-) -> Result<Vec<DirectoryFilesystemRow>, FilesystemQueryError> {
+) -> Result<Vec<DirectoryFilesystemRow>, LixError> {
     let lowered_sql = lower_internal_sql_for_backend(backend, sql)?;
     let result = backend
         .execute(&lowered_sql, &[])
@@ -831,7 +818,7 @@ async fn load_directory_rows_from_sql(
 async fn load_file_rows_from_sql(
     backend: &dyn LixBackend,
     sql: &str,
-) -> Result<Vec<FileFilesystemRow>, FilesystemQueryError> {
+) -> Result<Vec<FileFilesystemRow>, LixError> {
     let lowered_sql = lower_internal_sql_for_backend(backend, sql)?;
     let result = backend
         .execute(&lowered_sql, &[])
@@ -859,7 +846,7 @@ async fn load_file_rows_from_sql(
 fn lower_internal_sql_for_backend(
     _backend: &dyn LixBackend,
     sql: &str,
-) -> Result<String, FilesystemQueryError> {
+) -> Result<String, LixError> {
     Ok(sql.to_string())
 }
 
@@ -881,7 +868,7 @@ pub(crate) async fn load_directory_descriptors_by_parent_name_pairs(
     version_id: &str,
     pairs: &BTreeSet<(Option<String>, String)>,
     scope: FilesystemProjectionScope,
-) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Vec<EffectiveDescriptorRow>, LixError> {
     if pairs.is_empty() {
         return Ok(Vec::new());
     }
@@ -907,7 +894,7 @@ pub(crate) async fn load_file_descriptors_by_directory_name_extension_triplets(
     version_id: &str,
     triplets: &BTreeSet<(Option<String>, String, Option<String>)>,
     scope: FilesystemProjectionScope,
-) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Vec<EffectiveDescriptorRow>, LixError> {
     if triplets.is_empty() {
         return Ok(Vec::new());
     }
@@ -934,7 +921,7 @@ async fn load_directory_descriptor_by_id(
     version_id: &str,
     directory_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     load_scoped_descriptor_row(
         backend,
         &tracked_relation_name(FILESYSTEM_DIRECTORY_SCHEMA_KEY),
@@ -953,7 +940,7 @@ async fn load_directory_descriptor_by_parent_and_name(
     parent_id: Option<&str>,
     name: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     let parent_predicate_tracked = match parent_id {
         Some(parent_id) => format!("parent_id = '{}'", escape_sql_string(parent_id)),
         None => "parent_id IS NULL".to_string(),
@@ -981,7 +968,7 @@ async fn load_file_descriptor_by_id(
     version_id: &str,
     file_id: &str,
     scope: FilesystemProjectionScope,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     load_scoped_descriptor_row(
         backend,
         &tracked_relation_name(FILESYSTEM_FILE_SCHEMA_KEY),
@@ -1001,7 +988,7 @@ async fn load_file_descriptor_by_path_components(
     name: &str,
     extension: Option<&str>,
     scope: FilesystemProjectionScope,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     let directory_predicate_tracked = match directory_id {
         Some(directory_id) => format!("directory_id = '{}'", escape_sql_string(directory_id)),
         None => "directory_id IS NULL".to_string(),
@@ -1044,7 +1031,7 @@ async fn load_scoped_descriptor_row(
     untracked_base_predicate: &str,
     version_id: &str,
     _scope: FilesystemProjectionScope,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     if version_id == GLOBAL_VERSION_ID {
         return load_visible_descriptor_row_for_version(
             backend,
@@ -1105,7 +1092,7 @@ async fn load_visible_descriptor_row_for_version(
     tracked_base_predicate: &str,
     untracked_base_predicate: &str,
     version_id: &str,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     let sql = visible_descriptor_sql(
         backend.dialect(),
         tracked_table,
@@ -1123,7 +1110,7 @@ async fn version_has_tombstone_for_entity(
     schema_key: &str,
     version_id: &str,
     entity_id: &str,
-) -> Result<bool, FilesystemQueryError> {
+) -> Result<bool, LixError> {
     let sql = version_shadow_sql(tracked_table, schema_key, version_id, entity_id);
     let result = backend
         .execute(&sql, &[])
@@ -1266,7 +1253,7 @@ fn version_shadow_sql(
 async fn load_effective_descriptor_row(
     backend: &dyn LixBackend,
     sql: &str,
-) -> Result<Option<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Option<EffectiveDescriptorRow>, LixError> {
     Ok(load_effective_descriptor_rows(backend, sql)
         .await?
         .into_iter()
@@ -1276,7 +1263,7 @@ async fn load_effective_descriptor_row(
 async fn load_effective_descriptor_rows(
     backend: &dyn LixBackend,
     sql: &str,
-) -> Result<Vec<EffectiveDescriptorRow>, FilesystemQueryError> {
+) -> Result<Vec<EffectiveDescriptorRow>, LixError> {
     let result = backend
         .execute(sql, &[])
         .await
@@ -1300,10 +1287,8 @@ async fn load_effective_descriptor_rows(
             id,
             parent_id: row.get(1).and_then(text_from_value),
             directory_id: row.get(2).and_then(text_from_value),
-            name: name.ok_or_else(|| FilesystemQueryError {
-                message: "filesystem descriptor row missing name".to_string(),
-                hint: None,
-            })?,
+            name: name
+                .ok_or_else(|| filesystem_query_error("filesystem descriptor row missing name"))?,
             extension: row.get(4).and_then(text_from_value),
             hidden: row.get(5).and_then(value_as_bool).unwrap_or(false),
             untracked,
@@ -1321,7 +1306,7 @@ async fn build_directory_path_from_descriptor(
     parent_id: Option<&str>,
     name: &str,
     scope: FilesystemProjectionScope,
-) -> Result<String, FilesystemQueryError> {
+) -> Result<String, LixError> {
     let mut segments = vec![name.to_string()];
     let mut current_parent_id = parent_id.map(ToOwned::to_owned);
     let mut safety = 0usize;
@@ -1329,22 +1314,18 @@ async fn build_directory_path_from_descriptor(
         let Some(parent) =
             load_directory_descriptor_by_id(backend, version_id, &parent_id, scope).await?
         else {
-            return Err(FilesystemQueryError {
-                message: format!(
-                    "filesystem directory '{}' references missing parent '{}'",
-                    directory_id, parent_id
-                ),
-                hint: None,
-            });
+            return Err(filesystem_query_error(format!(
+                "filesystem directory '{}' references missing parent '{}'",
+                directory_id, parent_id
+            )));
         };
         segments.push(parent.name.clone());
         current_parent_id = parent.parent_id;
         safety += 1;
         if safety > 1024 {
-            return Err(FilesystemQueryError {
-                message: "filesystem directory parent chain appears cyclic".to_string(),
-                hint: None,
-            });
+            return Err(filesystem_query_error(
+                "filesystem directory parent chain appears cyclic",
+            ));
         }
     }
 
@@ -1364,21 +1345,17 @@ fn quote_ident(value: &str) -> String {
     format!("\"{}\"", escaped)
 }
 
-fn required_text_value(row: &[Value], label: &str) -> Result<String, FilesystemQueryError> {
+fn required_text_value(row: &[Value], label: &str) -> Result<String, LixError> {
     required_text_value_index(row, 0, label)
 }
 
-fn required_text_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<String, FilesystemQueryError> {
-    row.get(index)
-        .and_then(text_from_value)
-        .ok_or_else(|| FilesystemQueryError {
-            message: format!("public filesystem resolver expected text {}", label),
-            hint: None,
-        })
+fn required_text_value_index(row: &[Value], index: usize, label: &str) -> Result<String, LixError> {
+    row.get(index).and_then(text_from_value).ok_or_else(|| {
+        filesystem_query_error(format!(
+            "public filesystem resolver expected text {}",
+            label
+        ))
+    })
 }
 
 fn optional_text_value(value: Option<&Value>) -> Option<String> {
@@ -1408,11 +1385,12 @@ fn value_as_bool(value: &Value) -> Option<bool> {
     }
 }
 
-fn filesystem_query_backend_error(error: crate::LixError) -> FilesystemQueryError {
-    FilesystemQueryError {
-        message: error.description,
-        hint: error.hint,
-    }
+fn filesystem_query_backend_error(error: crate::LixError) -> LixError {
+    error
+}
+
+fn filesystem_query_error(message: impl Into<String>) -> LixError {
+    LixError::new("LIX_ERROR_UNKNOWN", message)
 }
 
 #[cfg(test)]
@@ -1757,7 +1735,8 @@ mod tests {
             .with_hint("prefix the path with '/'"),
         );
 
-        assert_eq!(wrapped.message, "path must start with '/'");
+        assert_eq!(wrapped.code, "LIX_ERROR_PATH_MISSING_LEADING_SLASH");
+        assert_eq!(wrapped.description, "path must start with '/'");
         assert_eq!(wrapped.hint.as_deref(), Some("prefix the path with '/'"));
     }
 }

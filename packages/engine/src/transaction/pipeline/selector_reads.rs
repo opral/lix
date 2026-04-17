@@ -21,7 +21,7 @@ use crate::sql::{
     public_selector_version_column, CanonicalStateRowKey, PlannedWrite, PreparedPublicRead,
     PublicReadSource, ScopeProof, SqlCompilerMetadata, SqlPreparationMetadataReader,
 };
-use crate::transaction::{PendingOverlay, WriteResolveError, WriteSelectorResolver};
+use crate::transaction::{PendingOverlay, WriteSelectorResolver};
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, QueryResult, Value};
 
@@ -151,7 +151,7 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
         planned_write: &PlannedWrite,
         selector_column: &str,
         error_message: &str,
-    ) -> Result<Vec<String>, WriteResolveError> {
+    ) -> Result<Vec<String>, LixError> {
         let query_result = self
             .execute_public_selector_query(planned_write, &[selector_column])
             .await
@@ -159,8 +159,9 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
         let mut values = Vec::new();
         for row in query_result.rows {
             let Some(value) = row.first().and_then(text_from_value) else {
-                return Err(WriteResolveError {
-                    message: error_message.to_string(),
+                return Err(crate::LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: error_message.to_string(),
                     hint: None,
                 });
             };
@@ -174,7 +175,7 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
     async fn load_entity_selector_rows(
         &self,
         planned_write: &PlannedWrite,
-    ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
+    ) -> Result<Vec<CanonicalStateRowKey>, LixError> {
         let selector = canonical_state_selector(planned_write);
         let mut selector_columns = vec!["lixcol_entity_id"];
         if let Some(version_column) = selector.version_column.as_deref() {
@@ -213,7 +214,7 @@ impl WriteSelectorResolver for TransactionWriteSelectorResolver<'_> {
     async fn load_state_selector_rows(
         &self,
         planned_write: &PlannedWrite,
-    ) -> Result<Vec<CanonicalStateRowKey>, WriteResolveError> {
+    ) -> Result<Vec<CanonicalStateRowKey>, LixError> {
         if let Some(rows) = try_resolve_state_write_targets_with_backend(
             self.backend,
             self.pending_overlay,
@@ -533,28 +534,22 @@ fn build_public_selector_query(planned_write: &PlannedWrite, selector_columns: &
     }
 }
 
-fn required_text_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<String, WriteResolveError> {
+fn required_text_value_index(row: &[Value], index: usize, label: &str) -> Result<String, LixError> {
     row.get(index)
         .and_then(text_from_value)
-        .ok_or_else(|| WriteResolveError {
-            message: format!("public selector resolver expected text {}", label),
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("public selector resolver expected text {}", label),
             hint: None,
         })
 }
 
-fn required_bool_value_index(
-    row: &[Value],
-    index: usize,
-    label: &str,
-) -> Result<bool, WriteResolveError> {
+fn required_bool_value_index(row: &[Value], index: usize, label: &str) -> Result<bool, LixError> {
     row.get(index)
         .and_then(bool_from_value)
-        .ok_or_else(|| WriteResolveError {
-            message: format!("public selector resolver expected bool {}", label),
+        .ok_or_else(|| crate::LixError {
+            code: "LIX_ERROR_UNKNOWN".to_string(),
+            description: format!("public selector resolver expected bool {}", label),
             hint: None,
         })
 }
@@ -582,9 +577,10 @@ fn bool_from_value(value: &Value) -> Option<bool> {
     }
 }
 
-fn write_resolve_backend_error(error: LixError) -> WriteResolveError {
-    WriteResolveError {
-        message: error.description,
+fn write_resolve_backend_error(error: LixError) -> crate::LixError {
+    crate::LixError {
+        code: error.code,
+        description: error.description,
         hint: error.hint,
     }
 }

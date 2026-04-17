@@ -70,6 +70,10 @@ simulation_test!(rejects_invalid_snapshot, |sim| async move {
             .await;
 
     let err = result.expect_err("expected validation error");
+    assert_eq!(
+        err.code, "LIX_ERROR_SCHEMA_VALIDATION",
+        "snapshot_content validation failures should carry the categorized code"
+    );
     assert!(
         err.to_string()
             .contains("snapshot_content does not match schema 'test_schema' (1)"),
