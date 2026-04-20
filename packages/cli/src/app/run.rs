@@ -22,10 +22,7 @@ pub fn run() -> Result<(), CliError> {
         }
     };
 
-    let context = AppContext {
-        lix_path,
-        no_hints,
-    };
+    let context = AppContext { lix_path, no_hints };
 
     let result = match command {
         Command::Exp(exp_command) => commands::exp::run(&context, exp_command),

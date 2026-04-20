@@ -11,9 +11,8 @@ use crate::transaction::buffered::{
 };
 use crate::transaction::pipeline::WriteExecutionOutcome;
 use crate::transaction::{
-    append_observe_tick_in_transaction, BufferedWriteExecutionInput, PendingCommitState,
-    PendingWriteOverlay, PreparedWriteStatementStager, TransactionCommitOutcome,
-    WriteExecutionContext,
+    BufferedWriteExecutionInput, PendingCommitState, PendingWriteOverlay,
+    PreparedWriteStatementStager, TransactionCommitOutcome, WriteExecutionContext,
 };
 use crate::{LixBackendTransaction, LixError};
 
@@ -142,23 +141,7 @@ impl<'a> BufferedWriteTransaction<'a> {
         execution_context: &dyn WriteExecutionContext,
         execution_input: &mut BufferedWriteExecutionInput,
     ) -> Result<(), LixError> {
-        self.flush_journal(execution_context, execution_input)
-            .await?;
-        if !self.buffered_write_state.observe_tick_emitted()
-            && !self
-                .buffered_write_state
-                .commit_outcome()
-                .state_commit_stream_changes
-                .is_empty()
-        {
-            append_observe_tick_in_transaction(
-                self.coordinator.backend_transaction_mut()?,
-                execution_input.origin_key(),
-            )
-            .await?;
-            self.buffered_write_state.mark_observe_tick_emitted();
-        }
-        Ok(())
+        self.flush_journal(execution_context, execution_input).await
     }
 
     pub(crate) fn mark_public_surface_registry_refresh_pending(&mut self) {
@@ -254,5 +237,4 @@ fn apply_buffered_write_execution_outcome(
     if let Some(receipt) = write_outcome.canonical_commit_receipt {
         record_latest_canonical_commit_receipt(latest_canonical_commit_receipt, receipt);
     }
-    state.absorb_observe_tick_emitted(write_outcome.observe_tick_emitted);
 }

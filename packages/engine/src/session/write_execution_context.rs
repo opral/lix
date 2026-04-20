@@ -275,7 +275,6 @@ pub(crate) async fn execute_public_commit_write(
             preconditions: canonical_preconditions,
             active_account_ids: unit.public_write.contract.active_account_ids.clone(),
             origin_key: unit.origin_key.clone(),
-            should_emit_observe_tick: unit.should_emit_observe_tick(),
         },
         &mut create_commit_functions,
         invariant_checker,

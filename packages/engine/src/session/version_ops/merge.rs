@@ -332,8 +332,6 @@ async fn merge_version_in_transaction(
                     source_head.clone(),
                 ]),
                 allow_empty_commit: true,
-                should_emit_observe_tick: false,
-                observe_tick_origin_key: None,
                 origin_key: None,
             },
             &mut functions,

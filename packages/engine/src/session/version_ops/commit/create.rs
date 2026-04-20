@@ -16,7 +16,7 @@ use crate::sql::MutationRow;
 use crate::sql::OptionalTextPatch;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
-    append_observe_tick_to_write_batch, compile_filesystem_transaction_state_from_state,
+    compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors,
     persist_runtime_sequence_highest_seen_in_transaction, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
@@ -82,8 +82,6 @@ pub(crate) struct CreateCommitArgs {
     pub(crate) active_account_ids: Vec<String>,
     pub(crate) lane_parent_commit_ids_override: Option<Vec<String>>,
     pub(crate) allow_empty_commit: bool,
-    pub(crate) should_emit_observe_tick: bool,
-    pub(crate) observe_tick_origin_key: Option<String>,
     pub(crate) origin_key: Option<String>,
 }
 
@@ -114,15 +112,9 @@ pub(crate) struct CommitIdempotencyWrite {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ObserveTickWrite {
-    pub(crate) origin_key: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct OperationalCommitApplyInput {
     pub(crate) idempotency_write: CommitIdempotencyWrite,
     pub(crate) deterministic_sequence_highest_seen: Option<i64>,
-    pub(crate) observe_tick: Option<ObserveTickWrite>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,9 +389,6 @@ pub(crate) async fn create_commit(
         commit_id: committed_head.clone(),
         created_at: timestamp.clone(),
     };
-    let observe_tick = args.should_emit_observe_tick.then(|| ObserveTickWrite {
-        origin_key: args.observe_tick_origin_key.clone(),
-    });
     let pending_public_commit_seed = build_pending_public_commit_seed(&canonical_changes)?;
     let visibility_rows =
         canonical_untracked_visibility_rows_from_updated_version_refs(&updated_version_refs)
@@ -419,19 +408,11 @@ pub(crate) async fn create_commit(
             .await
             .map_err(backend_error)?;
     }
-    if let Some(observe_tick) = observe_tick.as_ref() {
-        append_observe_tick_to_write_batch(
-            &mut write_batch,
-            transaction.dialect(),
-            observe_tick.origin_key.as_deref(),
-        );
-    }
     let applied_output = CreateCommitAppliedOutput {
         canonical_changes,
         operational_apply_input: OperationalCommitApplyInput {
             idempotency_write,
             deterministic_sequence_highest_seen,
-            observe_tick,
         },
         pending_public_commit_seed,
     };
@@ -1437,8 +1418,6 @@ mod tests {
             active_account_ids: Vec::new(),
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
-            should_emit_observe_tick: false,
-            observe_tick_origin_key: None,
             origin_key: None,
         }
     }

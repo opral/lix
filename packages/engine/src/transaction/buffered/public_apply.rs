@@ -84,8 +84,6 @@ async fn execute_public_commit_member_write_with_transaction(
         canonical_commit_receipt: commit_write_outcome.receipt,
         plan_effects_override: Some(plan_effects_override),
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: commit_write_outcome.plugin_changes_committed
-            && unit.should_emit_observe_tick(),
     }))
 }
 
@@ -174,7 +172,6 @@ async fn execute_public_immediate_write_with_transaction(
         canonical_commit_receipt: None,
         plan_effects_override: Some(unit.execution.semantic_effects.clone()),
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: false,
     }))
 }
 

@@ -16,7 +16,6 @@ mod deterministic_sequence;
 pub(crate) mod filesystem;
 #[cfg(test)]
 mod live_state_write_transaction;
-mod observe_tick;
 pub(crate) mod overlay;
 #[cfg(test)]
 mod overlay_read_context;
@@ -72,9 +71,6 @@ pub(crate) use filesystem::runtime::{
 pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
 #[cfg(test)]
 pub(crate) use live_state_write_transaction::LiveStateWriteTransaction;
-pub(crate) use observe_tick::{
-    append_observe_tick_in_transaction, append_observe_tick_to_write_batch,
-};
 pub(crate) use overlay::{
     PendingFilesystemFileView, PendingOverlay, PendingSemanticRow, PendingWriteOverlay,
 };

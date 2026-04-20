@@ -338,8 +338,6 @@ async fn append_undo_redo_commit_in_transaction(
             active_account_ids,
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
-            should_emit_observe_tick: false,
-            observe_tick_origin_key: None,
             origin_key: None,
         },
         &mut functions,

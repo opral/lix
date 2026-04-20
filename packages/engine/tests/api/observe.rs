@@ -3,8 +3,6 @@ use crate::support;
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Lix, LixConfig};
 use lix_engine::{ObserveOptions, ObserveQuery, Value};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::Executor;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,6 +33,50 @@ fn insert_key_value_entity_sql(key: &str, value: &str) -> String {
 }
 
 simulation_test!(
+    observe_initial_snapshot_reads_existing_visible_rows,
+    simulations = [sqlite, postgres],
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix(None)
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
+
+        engine
+            .execute(
+                &insert_key_value_entity_sql("observe-existing-visible", "v0"),
+                &[],
+            )
+            .await
+            .expect("seed insert should succeed");
+
+        let mut observed = engine
+            .observe(ObserveQuery::new(
+                "SELECT key, value \
+                 FROM lix_key_value \
+                 WHERE key = ?1",
+                vec![Value::Text("observe-existing-visible".to_string())],
+            ))
+            .expect("observe should succeed");
+
+        let initial = observed
+            .next()
+            .await
+            .expect("initial observe poll should succeed")
+            .expect("initial observe event should exist");
+        assert_eq!(initial.sequence, 0);
+        assert!(initial.frontier.is_some());
+        assert_eq!(
+            initial.rows.rows,
+            vec![vec![
+                Value::Text("observe-existing-visible".to_string()),
+                Value::Text("v0".to_string())
+            ]]
+        );
+    }
+);
+
+simulation_test!(
     observe_emits_initial_and_followup_rows,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -60,7 +102,6 @@ simulation_test!(
             .expect("initial observe event should exist");
         assert_eq!(initial.sequence, 0);
         assert!(initial.rows.rows.is_empty());
-        assert_eq!(initial.state_commit_sequence, None);
 
         engine
             .execute(&insert_key_value_sql("observe-key", "\"v0\""), &[])
@@ -73,7 +114,7 @@ simulation_test!(
             .expect("follow-up observe poll should succeed")
             .expect("follow-up observe event should exist");
         assert_eq!(update.sequence, 1);
-        assert!(update.state_commit_sequence.is_some());
+        assert!(update.frontier.is_some());
         assert_eq!(update.rows.rows.len(), 1);
         assert_eq!(
             update.rows.rows[0][0],
@@ -177,7 +218,7 @@ simulation_test!(
             .unwrap();
 
         let update = observed.next().await.unwrap().unwrap();
-        assert!(update.state_commit_sequence.is_some());
+        assert!(update.frontier.is_some());
         assert_eq!(update.rows.rows.len(), 1);
         assert_eq!(
             update.rows.rows[0],
@@ -406,10 +447,10 @@ simulation_test!(
         assert_eq!(second.rows.rows.len(), 2);
         assert!(
             first
-                .state_commit_sequence
-                .zip(second.state_commit_sequence)
+                .frontier
+                .zip(second.frontier)
                 .is_some_and(|(left, right)| right > left),
-            "expected monotonic state commit sequence order"
+            "expected monotonic observe frontier order"
         );
     }
 );
@@ -539,6 +580,12 @@ simulation_test!(
             update.rows.rows,
             vec![vec![Value::Text("branch".to_string())]]
         );
+
+        let timed = tokio::time::timeout(Duration::from_millis(300), observed.next()).await;
+        assert!(
+            timed.is_err(),
+            "global-to-local shadow switch should emit exactly one visible change"
+        );
     }
 );
 
@@ -606,6 +653,12 @@ simulation_test!(
             .expect("observe update event should exist");
         assert_eq!(update.sequence, 1);
         assert_eq!(update.rows.rows, vec![vec![Value::Blob(vec![2])]]);
+
+        let timed = tokio::time::timeout(Duration::from_millis(300), observed.next()).await;
+        assert!(
+            timed.is_err(),
+            "global-to-local file shadow switch should emit exactly one visible change"
+        );
     }
 );
 
@@ -720,6 +773,12 @@ simulation_test!(
             vec![vec![Value::Text(format!(
                 r#"{{"key":"{entity_id}","value":"branch-v2"}}"#
             ))]]
+        );
+
+        let timed = tokio::time::timeout(Duration::from_millis(300), observed.next()).await;
+        assert!(
+            timed.is_err(),
+            "mixed tracked/untracked visibility switch should emit exactly one visible change"
         );
     }
 );
@@ -1087,7 +1146,7 @@ fn observe_postgres_detects_external_insert_without_local_commit_stream_event() 
                 update.rows.rows[0][0],
                 Value::Text("/observe-external.md".to_string())
             );
-            assert_eq!(update.state_commit_sequence, None);
+            assert!(update.frontier.is_some());
         },
     );
 }
@@ -1155,13 +1214,13 @@ fn observe_postgres_detects_external_untracked_state_insert() {
                 update.rows.rows[0][0],
                 Value::Text("observe-untracked-external".to_string())
             );
-            assert_eq!(update.state_commit_sequence, None);
+            assert!(update.frontier.is_some());
         },
     );
 }
 
 #[test]
-fn observe_postgres_detects_external_untracked_state_insert_without_observe_tick() {
+fn observe_postgres_detects_external_untracked_state_insert_with_frontier_poll_only() {
     run_local_observe_postgres_case("observe-external-untracked-no-tick", || async {
         let connection_string = support::simulations::create_postgres_test_database_url(
             "observe-external-untracked-no-tick",
@@ -1212,8 +1271,6 @@ fn observe_postgres_detects_external_untracked_state_insert_without_observe_tick
                 )
                 .await
                 .expect("external untracked insert should succeed");
-        clear_observe_ticks_direct_postgres(&connection_string).await;
-
         let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
             .await
             .expect("observe next should not time out")
@@ -1224,12 +1281,12 @@ fn observe_postgres_detects_external_untracked_state_insert_without_observe_tick
             update.rows.rows[0][0],
             Value::Text("observe-untracked-external-no-tick".to_string())
         );
-        assert_eq!(update.state_commit_sequence, None);
+        assert!(update.frontier.is_some());
     });
 }
 
 #[test]
-fn observe_external_same_origin_is_suppressed_by_exclude_self() {
+fn observe_external_same_origin_emits_with_exclude_self_when_polled_durably() {
     run_local_observe_postgres_case(
         "observe_external_same_origin_is_suppressed_by_exclude_self",
         || async {
@@ -1284,11 +1341,13 @@ fn observe_external_same_origin_is_suppressed_by_exclude_self() {
             .await
             .expect("external insert should succeed");
 
-            let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
-            assert!(
-                timed.is_err(),
-                "same origin should suppress observe emission"
-            );
+            let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+                .await
+                .expect("observe next should not time out")
+                .expect("observe next should succeed")
+                .expect("observe update event should exist");
+            assert_eq!(update.rows.rows.len(), 1);
+            assert!(update.frontier.is_some());
         },
     );
 }
@@ -1351,13 +1410,13 @@ fn observe_external_different_origin_emits_with_exclude_self() {
                 .expect("observe next should succeed")
                 .expect("observe update event should exist");
             assert_eq!(update.rows.rows.len(), 1);
-            assert_eq!(update.state_commit_sequence, None);
+            assert!(update.frontier.is_some());
         },
     );
 }
 
 #[test]
-fn observe_external_explicitly_excluded_origin_is_suppressed() {
+fn observe_external_excluded_origin_emits_when_detected_by_frontier_poll() {
     run_local_observe_postgres_case(
         "observe_external_explicitly_excluded_origin_is_suppressed",
         || async {
@@ -1412,11 +1471,13 @@ fn observe_external_explicitly_excluded_origin_is_suppressed() {
             .await
             .expect("external insert should succeed");
 
-            let timed = tokio::time::timeout(Duration::from_millis(800), observed.next()).await;
-            assert!(
-                timed.is_err(),
-                "explicitly excluded origin should suppress observe emission"
-            );
+            let update = tokio::time::timeout(Duration::from_secs(2), observed.next())
+                .await
+                .expect("observe next should not time out")
+                .expect("observe next should succeed")
+                .expect("observe update event should exist");
+            assert_eq!(update.rows.rows.len(), 1);
+            assert!(update.frontier.is_some());
         },
     );
 }
@@ -1535,7 +1596,7 @@ fn observe_external_mutating_transaction_emits_once_for_result_delta() {
                 .expect("observe update event should exist");
             assert_eq!(update.rows.rows.len(), 1);
             assert_eq!(update.rows.rows[0][0], Value::Text("after".to_string()));
-            assert_eq!(update.state_commit_sequence, None);
+            assert!(update.frontier.is_some());
 
             let timed = tokio::time::timeout(Duration::from_millis(600), observed.next()).await;
             assert!(
@@ -1626,18 +1687,6 @@ fn boot_postgres_engine_at_url(connection_string: String) -> Arc<Lix> {
         support::simulations::postgres_backend_with_connection_string(connection_string),
         Arc::new(NoopWasmRuntime),
     )))
-}
-
-async fn clear_observe_ticks_direct_postgres(connection_string: &str) {
-    let pool = PgPoolOptions::new()
-        .max_connections(1)
-        .connect(connection_string)
-        .await
-        .expect("postgres test pool should connect");
-    pool.execute("DELETE FROM lix_internal_observe_tick")
-        .await
-        .expect("direct postgres tick cleanup should succeed");
-    pool.close().await;
 }
 
 fn temp_sqlite_observe_path(label: &str) -> PathBuf {

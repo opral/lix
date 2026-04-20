@@ -64,7 +64,6 @@ fn merge_write_execution_outcome(
     existing_write_outcome
         .state_commit_stream_changes
         .extend(write_outcome.state_commit_stream_changes);
-    existing_write_outcome.observe_tick_emitted |= write_outcome.observe_tick_emitted;
     merge_plan_effects_override(
         &mut existing_write_outcome.plan_effects_override,
         write_outcome.plan_effects_override,
