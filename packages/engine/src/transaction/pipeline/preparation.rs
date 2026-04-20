@@ -190,7 +190,6 @@ pub(crate) async fn prepare_buffered_write_execution_step(
     pending_write_overlay: Option<&PendingWriteOverlay>,
     bound_statement: &BoundStatementInstance,
     prepared_context: &WritePreparationContext,
-    allow_internal_relations: bool,
     context: &SessionCompilerState,
     skip_side_effect_collection: bool,
 ) -> Result<WriteCommand, LixError> {
@@ -199,7 +198,6 @@ pub(crate) async fn prepare_buffered_write_execution_step(
         transaction,
         bound_statement,
         prepared_context,
-        allow_internal_relations,
         context,
         skip_side_effect_collection,
     )
@@ -253,7 +251,6 @@ async fn compile_write_command(
     transaction: &mut dyn LixBackendTransaction,
     bound_statement: &BoundStatementInstance,
     prepared_context: &WritePreparationContext,
-    allow_internal_relations: bool,
     context: &SessionCompilerState,
     skip_side_effect_collection: bool,
 ) -> Result<CompiledWriteCommand, LixError> {
@@ -290,7 +287,6 @@ async fn compile_write_command(
         prepared_context.active_version_id(),
         prepared_context.active_account_ids(),
         prepared_context.origin_key(),
-        allow_internal_relations,
         CompilePolicy {
             skip_side_effect_collection,
         },

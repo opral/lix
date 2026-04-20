@@ -58,75 +58,6 @@ async fn global_version_commit_id(engine: &support::simulation_test::SimulatedLi
     )
 }
 
-async fn bootstrap_visible_state_rows(
-    engine: &support::simulation_test::SimulatedLix,
-) -> Vec<Vec<Value>> {
-    engine
-        .execute(
-            "SELECT schema_key, entity_id, schema_version, file_id, version_id, change_id, untracked, snapshot_content \
-             FROM lix_state_by_version \
-             WHERE schema_key IN (\
-               'lix_registered_schema', \
-               'lix_key_value', \
-               'lix_version_ref', \
-               'lix_version_descriptor', \
-               'lix_directory_descriptor', \
-               'lix_label', \
-               'lix_entity_label'\
-             ) \
-               AND snapshot_content IS NOT NULL \
-             ORDER BY schema_key, entity_id, schema_version, file_id, version_id, untracked, change_id",
-            &[],
-        )
-        .await
-        .expect("bootstrap visible-state query should succeed")
-        .statements[0]
-        .rows
-        .clone()
-}
-
-async fn live_storage_table_names(engine: &support::simulation_test::SimulatedLix) -> Vec<String> {
-    let sqlite_query = engine
-        .execute(
-            "SELECT name \
-             FROM sqlite_master \
-             WHERE type = 'table' \
-               AND name LIKE 'lix_internal_live_v1_%' \
-             ORDER BY name",
-            &[],
-        )
-        .await;
-    let result = match sqlite_query {
-        Ok(result) => result,
-        Err(_) => engine
-            .execute(
-                "SELECT table_name \
-                 FROM information_schema.tables \
-                 WHERE table_schema = current_schema() \
-                   AND table_name LIKE 'lix_internal_live_v1_%' \
-                 ORDER BY table_name",
-                &[],
-            )
-            .await
-            .expect("live storage table discovery query should succeed"),
-    };
-
-    result.statements[0]
-        .rows
-        .iter()
-        .map(|row| text_value(&row[0], "live storage table name"))
-        .collect()
-}
-
-async fn delete_all_live_storage_rows(engine: &support::simulation_test::SimulatedLix) {
-    for table_name in live_storage_table_names(engine).await {
-        engine
-            .execute(&format!("DELETE FROM {table_name}"), &[])
-            .await
-            .unwrap_or_else(|error| panic!("failed to clear live table '{table_name}': {error}"));
-    }
-}
-
 fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Lix> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).expect("sqlite test parent directory should be creatable");
@@ -140,8 +71,7 @@ fn boot_sqlite_engine_at_path(path: &Path) -> Arc<lix_engine::Lix> {
     let config = LixConfig::new(
         support::simulations::sqlite_backend_with_filename(format!("sqlite://{}", path.display())),
         Arc::new(NoopWasmRuntime),
-    )
-    .with_access_to_internal(true);
+    );
     Arc::new(Lix::boot(config))
 }
 
@@ -509,75 +439,6 @@ fn reopen_after_bare_multi_statement_write_succeeds_sqlite() {
     }
 }
 
-simulation_test!(init_creates_active_version_live_table, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix(None)
-        .await
-        .expect("boot_simulated_lix should succeed");
-
-    engine.initialize().await.unwrap();
-
-    let result = engine
-        .execute(
-            "SELECT 1 FROM lix_internal_live_v1_lix_active_version WHERE untracked = true LIMIT 1",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    sim.assert_deterministic(result.statements[0].rows.clone());
-});
-
-simulation_test!(
-    init_does_not_seed_runtime_active_version_rows,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-
-        engine.initialize().await.unwrap();
-
-        let result = engine
-        .execute(
-            "SELECT COUNT(*) FROM lix_internal_live_v1_lix_active_version WHERE untracked = true",
-            &[],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            i64_value(&result.statements[0].rows[0][0], "active_version_row_count"),
-            0
-        );
-    }
-);
-
-simulation_test!(
-    init_does_not_seed_runtime_active_account_rows,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-
-        engine.initialize().await.unwrap();
-
-        let result = engine
-        .execute(
-            "SELECT COUNT(*) FROM lix_internal_live_v1_lix_active_account WHERE untracked = true",
-            &[],
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            i64_value(&result.statements[0].rows[0][0], "active_account_row_count"),
-            0
-        );
-    }
-);
-
 simulation_test!(init_does_not_seed_lix_account_rows, |sim| async move {
     let engine = sim
         .boot_simulated_lix(None)
@@ -602,59 +463,6 @@ simulation_test!(init_does_not_seed_lix_account_rows, |sim| async move {
         i64_value(&result.statements[0].rows[0][0], "lix_account_row_count"),
         0
     );
-});
-
-simulation_test!(init_creates_snapshot_table, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix(None)
-        .await
-        .expect("boot_simulated_lix should succeed");
-
-    engine.initialize().await.unwrap();
-
-    let result = engine
-        .execute("SELECT 1 FROM lix_internal_snapshot LIMIT 1", &[])
-        .await
-        .unwrap();
-
-    sim.assert_deterministic(result.statements[0].rows.clone());
-});
-
-simulation_test!(init_creates_change_table, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix(None)
-        .await
-        .expect("boot_simulated_lix should succeed");
-
-    engine.initialize().await.unwrap();
-
-    let result = engine
-        .execute("SELECT 1 FROM lix_internal_change LIMIT 1", &[])
-        .await
-        .unwrap();
-
-    sim.assert_deterministic(result.statements[0].rows.clone());
-});
-
-simulation_test!(init_inserts_no_content_snapshot, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix(None)
-        .await
-        .expect("boot_simulated_lix should succeed");
-
-    engine.initialize().await.unwrap();
-
-    let result = engine
-        .execute(
-            "SELECT content FROM lix_internal_snapshot WHERE id = 'no-content'",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    sim.assert_deterministic(result.statements[0].rows.clone());
-    assert_eq!(result.statements[0].rows.len(), 1);
-    assert_eq!(result.statements[0].rows[0][0], lix_engine::Value::Null);
 });
 
 simulation_test!(
@@ -1015,52 +823,6 @@ simulation_test!(
                 "bootstrap registered_schema state row should point at journaled change"
             );
         }
-
-        let bootstrap_rows = engine
-            .execute(
-                "SELECT entity_id, change_id, untracked \
-                 FROM lix_internal_registered_schema_bootstrap \
-                 WHERE schema_key = 'lix_registered_schema' \
-                   AND file_id IS NULL \
-                   AND version_id = 'global' \
-                   AND untracked = true \
-                   AND entity_id IN (\
-                     'lix_registered_schema~1', \
-                     'lix_key_value~1', \
-                     'lix_change~1', \
-                     'lix_change_author~1', \
-                     'lix_change_set~1', \
-                     'lix_commit~1', \
-                     'lix_version_ref~1', \
-                     'lix_change_set_element~1', \
-                     'lix_commit_edge~1'\
-                   ) \
-                 ORDER BY entity_id",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(
-            bootstrap_rows.statements[0].rows.len(),
-            state_change_ids.len()
-        );
-
-        for row in &bootstrap_rows.statements[0].rows {
-            let entity_id = text_value(&row[0], "registered_schema_bootstrap.entity_id");
-            let change_id = text_value(&row[1], "registered_schema_bootstrap.change_id");
-            match &row[2] {
-                Value::Boolean(true) | Value::Integer(1) => {}
-                other => {
-                    panic!("expected truthy registered_schema bootstrap untracked, got {other:?}")
-                }
-            }
-            assert_eq!(
-                state_change_ids.get(&entity_id).map(String::as_str),
-                Some(change_id.as_str()),
-                "bootstrap registered_schema mirror row should point at journaled change"
-            );
-        }
     }
 );
 
@@ -1145,106 +907,6 @@ simulation_test!(
             change_set_id, "00000000-0000-7000-8000-000000000001",
             "bootstrap change set id must not use the old sentinel"
         );
-    }
-);
-
-simulation_test!(
-    init_seeds_main_version_and_global_checkpoint_pointers,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix_deterministic()
-            .await
-            .expect("boot_simulated_lix_deterministic should succeed");
-
-        engine.initialize().await.unwrap();
-
-        let main_version_id = engine.active_version_id().await.unwrap();
-        assert_ne!(main_version_id, "global");
-
-        let main_version = engine
-            .execute(
-                "SELECT id, commit_id \
-                 FROM lix_version \
-                 WHERE id = $1 \
-                 LIMIT 1",
-                &[lix_engine::Value::Text(main_version_id.clone())],
-            )
-            .await
-            .unwrap();
-        sim.assert_deterministic(main_version.statements[0].rows.clone());
-        assert_eq!(
-            main_version.statements[0].rows.len(),
-            1,
-            "expected exactly one public main version row"
-        );
-        let main_commit_id = text_value(&main_version.statements[0].rows[0][1], "commit_id");
-        let global_commit_id = global_version_commit_id(&engine).await;
-
-        let baselines = engine
-            .execute(
-                "SELECT version_id, checkpoint_commit_id \
-                 FROM lix_internal_last_checkpoint \
-                 WHERE version_id IN ('global', $1) \
-                 ORDER BY version_id",
-                &[lix_engine::Value::Text(main_version_id.clone())],
-            )
-            .await
-            .unwrap();
-        sim.assert_deterministic(baselines.statements[0].rows.clone());
-        assert_eq!(
-            baselines.statements[0].rows.len(),
-            2,
-            "expected baseline pointer rows for global + main"
-        );
-
-        let version_records = [
-            (main_version_id.clone(), main_commit_id),
-            ("global".to_string(), global_commit_id),
-        ];
-        for (version_id, commit_id) in version_records {
-            assert!(
-                !commit_id.is_empty(),
-                "version '{version_id}' must have commit_id"
-            );
-
-            let baseline_commit_id = baselines.statements[0]
-                .rows
-                .iter()
-                .find_map(|row| {
-                    if text_value(&row[0], "version_id") == version_id {
-                        Some(text_value(&row[1], "checkpoint_commit_id"))
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| panic!("missing baseline pointer for version '{version_id}'"));
-
-            assert_eq!(
-                baseline_commit_id, commit_id,
-                "seeded baseline must point to seeded tip commit for version '{version_id}'"
-            );
-
-            let commit_exists = engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_commit \
-                     WHERE id = $1",
-                    &[lix_engine::Value::Text(commit_id.clone())],
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                i64_value(&commit_exists.statements[0].rows[0][0], "commit_count"),
-                1,
-                "commit '{commit_id}' must exist exactly once"
-            );
-        }
-
-        let second_init_err = engine
-            .initialize()
-            .await
-            .expect_err("second init should return already initialized");
-        assert_eq!(second_init_err.code, "LIX_ERROR_ALREADY_INITIALIZED");
     }
 );
 
@@ -1474,75 +1136,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    fresh_engine_initialization_populates_subsystem_owned_bootstrap_state,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.expect("init should succeed");
-
-        let commit_graph_count = scalar_count(
-            &engine
-                .execute("SELECT COUNT(*) FROM lix_internal_commit_graph_node", &[])
-                .await
-                .expect("commit graph query should succeed"),
-        );
-        assert!(
-            commit_graph_count >= 1,
-            "expected bootstrap commit graph rows, got {commit_graph_count}"
-        );
-
-        let checkpoint_count = scalar_count(
-            &engine
-                .execute("SELECT COUNT(*) FROM lix_internal_last_checkpoint", &[])
-                .await
-                .expect("last checkpoint query should succeed"),
-        );
-        assert!(
-            checkpoint_count >= 1,
-            "expected checkpoint rows after init, got {checkpoint_count}"
-        );
-
-        let builtin_schema_count = scalar_count(
-            &engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_registered_schema",
-                    &[],
-                )
-                .await
-                .expect("registered schema query should succeed"),
-        );
-        assert!(
-            builtin_schema_count >= 1,
-            "expected builtin registered schema rows, got {builtin_schema_count}"
-        );
-
-        let checkpoint_label = engine
-            .execute(
-                "SELECT s.content \
-                 FROM lix_internal_change c \
-                 JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-                 WHERE c.entity_id = 'lix_label_checkpoint' \
-                   AND c.schema_key = 'lix_label' \
-                 ORDER BY c.created_at DESC \
-                 LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("checkpoint label query should succeed");
-        assert_eq!(
-            first_result_rows(&checkpoint_label).as_slice(),
-            vec![vec![Value::Text(
-                "{\"id\":\"lix_label_checkpoint\",\"name\":\"checkpoint\"}".to_string(),
-            )]]
-        );
-    }
-);
-
-simulation_test!(
     initialize_if_needed_preserves_subsystem_seed_rows,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -1579,20 +1172,6 @@ simulation_test!(
                 )
                 .await
                 .expect("version_ref journal count query should succeed"),
-        );
-        let registered_schema_bootstrap_count_before = scalar_count(
-            &engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_internal_registered_schema_bootstrap \
-                     WHERE schema_key = 'lix_registered_schema' \
-                       AND file_id IS NULL \
-                       AND version_id = 'global' \
-                       AND untracked = true",
-                    &[],
-                )
-                .await
-                .expect("registered schema bootstrap count query should succeed"),
         );
         let checkpoint_link_count_before = scalar_count(
             &engine
@@ -1664,20 +1243,6 @@ simulation_test!(
                 .await
                 .expect("version_ref journal count query should succeed after re-init"),
         );
-        let registered_schema_bootstrap_count_after = scalar_count(
-            &engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_internal_registered_schema_bootstrap \
-                     WHERE schema_key = 'lix_registered_schema' \
-                       AND file_id IS NULL \
-                       AND version_id = 'global' \
-                       AND untracked = true",
-                    &[],
-                )
-                .await
-                .expect("registered schema bootstrap count query should succeed after re-init"),
-        );
         let checkpoint_link_count_after = scalar_count(
             &engine
                 .execute(
@@ -1712,73 +1277,12 @@ simulation_test!(
             "repeated init must not duplicate journaled version refs"
         );
         assert_eq!(
-            registered_schema_bootstrap_count_after, registered_schema_bootstrap_count_before,
-            "repeated init must not duplicate registered schema bootstrap rows"
-        );
-        assert_eq!(
             checkpoint_link_count_after, checkpoint_link_count_before,
             "repeated init must not duplicate checkpoint label links"
         );
         assert_eq!(
             system_directory_count_after, system_directory_count_before,
             "repeated init must not duplicate seeded system directories"
-        );
-    }
-);
-
-simulation_test!(
-    fresh_init_full_rebuild_restores_bootstrap_visible_state_from_journal,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                key_values: vec![BootKeyValue {
-                    key: "rebuild_boot_key".to_string(),
-                    value: json!("seeded"),
-                    lixcol_global: Some(true),
-                    lixcol_untracked: Some(false),
-                }],
-                ..support::simulation_test::SimulatedLixBootArgs::default()
-            }))
-            .await
-            .expect("boot_simulated_lix should succeed");
-
-        engine
-            .initialize()
-            .await
-            .expect("initialize should succeed");
-
-        let before_rows = bootstrap_visible_state_rows(&engine).await;
-        assert!(
-            !before_rows.is_empty(),
-            "fresh init should expose bootstrap visible state before rebuild"
-        );
-
-        delete_all_live_storage_rows(&engine).await;
-
-        let after_delete = bootstrap_visible_state_rows(&engine).await;
-        assert!(
-            after_delete.is_empty(),
-            "deleting all live storage rows should clear bootstrap visible state before rebuild"
-        );
-
-        let report = engine
-            .rebuild_live_state(&lix_engine::LiveStateRebuildRequest {
-                scope: lix_engine::LiveStateRebuildScope::Full,
-                debug: lix_engine::LiveStateRebuildDebugMode::Off,
-                debug_row_limit: 0,
-            })
-            .await
-            .expect("full rebuild after fresh init should succeed");
-        assert!(
-            report.apply.rows_written > 0,
-            "fresh-init rebuild should write restored live-state rows"
-        );
-
-        let after_rows = bootstrap_visible_state_rows(&engine).await;
-        assert_eq!(
-            after_rows, before_rows,
-            "full rebuild should restore the same bootstrap-visible state from the journal"
         );
     }
 );

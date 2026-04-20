@@ -48,7 +48,6 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
     write_transaction: &mut BufferedWriteTransaction<'_>,
     parsed_statements: Vec<Statement>,
     params: &[Value],
-    allow_internal_relations: bool,
     context: &mut SessionCompilerState,
     parse_duration: Option<Duration>,
 ) -> Result<ExecuteResult, LixError> {
@@ -72,7 +71,6 @@ pub(crate) async fn execute_parsed_statements_in_write_transaction(
         execution_context,
         &mut scope,
         &statement_batch,
-        allow_internal_relations,
         context,
     )
     .await
@@ -82,7 +80,6 @@ pub(crate) async fn execute_statement_batch_with_write_transaction(
     execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut BufferedWriteTransaction<'_>,
     statement_batch: &StatementBatch,
-    allow_internal_relations: bool,
     context: &mut SessionCompilerState,
 ) -> Result<ExecuteResult, LixError> {
     let mut scope = SqlBufferedWriteScope::Owned(write_transaction);
@@ -90,7 +87,6 @@ pub(crate) async fn execute_statement_batch_with_write_transaction(
         execution_context,
         &mut scope,
         statement_batch,
-        allow_internal_relations,
         context,
     )
     .await
@@ -100,7 +96,6 @@ async fn execute_statement_batch_with_buffered_write_scope(
     execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut SqlBufferedWriteScope<'_, '_>,
     statement_batch: &StatementBatch,
-    allow_internal_relations: bool,
     context: &mut SessionCompilerState,
 ) -> Result<ExecuteResult, LixError> {
     let mut results = Vec::new();
@@ -110,7 +105,6 @@ async fn execute_statement_batch_with_buffered_write_scope(
             execution_context,
             write_transaction,
             step,
-            allow_internal_relations,
             context,
             None,
             false,
@@ -135,7 +129,6 @@ async fn execute_bound_statement_in_buffered_write_scope(
     execution_context: &dyn WriteExecutionContext,
     write_transaction: &mut SqlBufferedWriteScope<'_, '_>,
     bound_statement: &BoundStatementInstance,
-    allow_internal_relations: bool,
     context: &mut SessionCompilerState,
     deferred_commit_effects: Option<&mut DeferredCommitEffects>,
     skip_side_effect_collection: bool,
@@ -155,7 +148,6 @@ async fn execute_bound_statement_in_buffered_write_scope(
                 pending_write_overlay.as_ref(),
                 bound_statement,
                 &prepared_context,
-                allow_internal_relations,
                 context,
                 skip_side_effect_collection,
             )
@@ -505,7 +497,6 @@ fn bind_single_statement_template(
     transaction: &mut dyn LixBackendTransaction,
     sql: &str,
     params: &[Value],
-    allow_internal_relations: bool,
     context: &mut SessionCompilerState,
 ) -> Result<BoundStatementInstance, LixError> {
     let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
@@ -521,12 +512,8 @@ fn bind_single_statement_template(
     }
 
     let dialect = transaction.dialect();
-    let cache_key = StatementTemplateCacheKey::new(
-        sql,
-        dialect,
-        allow_internal_relations,
-        context.public_surface_registry_generation(),
-    );
+    let cache_key =
+        StatementTemplateCacheKey::new(sql, dialect, context.public_surface_registry_generation());
     let template = match context.cached_statement_template(&cache_key) {
         Some(template) => template,
         None => {
@@ -767,7 +754,7 @@ mod tests {
         let lix = test_lix();
         let session = test_session(&lix);
         let sql = "SELECT 1";
-        let cache_key = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 0);
+        let cache_key = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, 0);
         let mut transaction = NoopTransaction;
 
         let mut first_context = session.new_compiler_state(ExecuteOptions::default());
@@ -778,7 +765,7 @@ mod tests {
             "cache should start empty for a fresh session runtime"
         );
 
-        bind_single_statement_template(&mut transaction, sql, &[], false, &mut first_context)
+        bind_single_statement_template(&mut transaction, sql, &[], &mut first_context)
             .expect("first template bind should succeed");
         assert!(
             first_context
@@ -802,12 +789,12 @@ mod tests {
         let session_a = test_session(&lix);
         let session_b = test_session(&lix);
         let sql = "SELECT 1";
-        let cache_key_v0 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 0);
-        let cache_key_v1 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, false, 1);
+        let cache_key_v0 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, 0);
+        let cache_key_v1 = StatementTemplateCacheKey::new(sql, SqlDialect::Sqlite, 1);
         let mut transaction = NoopTransaction;
 
         let mut initial_context = session_a.new_compiler_state(ExecuteOptions::default());
-        bind_single_statement_template(&mut transaction, sql, &[], false, &mut initial_context)
+        bind_single_statement_template(&mut transaction, sql, &[], &mut initial_context)
             .expect("initial template bind should succeed");
         assert!(
             initial_context
@@ -834,14 +821,8 @@ mod tests {
                 .is_none(),
             "new registry generations should start with a fresh cache namespace"
         );
-        bind_single_statement_template(
-            &mut transaction,
-            sql,
-            &[],
-            false,
-            &mut session_a_after_bump,
-        )
-        .expect("template bind after generation bump should succeed");
+        bind_single_statement_template(&mut transaction, sql, &[], &mut session_a_after_bump)
+            .expect("template bind after generation bump should succeed");
         assert!(
             session_a_after_bump
                 .cached_statement_template(&cache_key_v1)

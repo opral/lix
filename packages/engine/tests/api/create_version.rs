@@ -80,21 +80,6 @@ simulation_test!(create_version_defaults_to_active_parent, |sim| async move {
     assert!(!value_as_bool(&row[2]));
     assert_eq!(value_as_text(&row[3]), active_commit_id);
 
-    let baseline_row = engine
-        .execute(
-            "SELECT checkpoint_commit_id \
-             FROM lix_internal_last_checkpoint \
-             WHERE version_id = $1",
-            &[Value::Text(created.id.clone())],
-        )
-        .await
-        .expect("baseline pointer query should succeed");
-    assert_eq!(baseline_row.statements[0].rows.len(), 1);
-    assert_eq!(
-        value_as_text(&baseline_row.statements[0].rows[0][0]),
-        active_commit_id
-    );
-
     let active_after = engine
         .execute("SELECT lix_active_version_id()", &[])
         .await

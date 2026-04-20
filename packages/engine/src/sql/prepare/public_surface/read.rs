@@ -3581,7 +3581,6 @@ pub(super) async fn try_prepare_public_read(
         active_version_id,
         active_history_root_commit_id,
         origin_key,
-        false,
         None,
     )
     .await
@@ -3596,7 +3595,6 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     if let Some(surface_name) = first_removed_builtin_surface_reference(parsed_statements) {
@@ -3612,7 +3610,6 @@ pub(super) async fn try_prepare_public_read_with_registry_and_internal_access(
         active_version_id,
         active_history_root_commit_id,
         origin_key,
-        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -3627,7 +3624,6 @@ async fn try_prepare_public_read_with_internal_access(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     // Public-read stage ownership starts here after `parse` has already
@@ -3659,11 +3655,6 @@ async fn try_prepare_public_read_with_internal_access(
             "public read preparation failed: direct-only history surfaces cannot participate in broad surface lowering",
         ));
     }
-    if !allow_internal_relations && !read_summary.internal_relations.is_empty() {
-        return Err(mixed_public_internal_query_error(
-            &read_summary.internal_relations,
-        ));
-    }
     let bind_started = Instant::now();
     let bound_public_read = bind_public_read_statement(
         statement,
@@ -3690,7 +3681,6 @@ async fn try_prepare_public_read_with_internal_access(
             broad_statement.clone(),
             explain_request.as_ref(),
             &registry,
-            allow_internal_relations,
             public_output_columns.clone(),
             stage_timings.clone(),
         )
@@ -3724,7 +3714,6 @@ async fn try_prepare_public_read_with_internal_access(
                     broad_statement,
                     explain_request.as_ref(),
                     &registry,
-                    allow_internal_relations,
                     public_output_columns,
                     stage_timings,
                 )
@@ -3753,7 +3742,6 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     broad_statement: Option<BroadPublicReadStatement>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
     registry: &SurfaceRegistry,
-    allow_internal_relations: bool,
     public_output_columns: Option<Vec<String>>,
     mut stage_timings: ExplainTimingCollector,
 ) -> Result<Option<PublicReadPlan>, LixError> {
@@ -3780,11 +3768,6 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     }
     if read_summary.bound_surface_bindings.is_empty() {
         return Ok(None);
-    }
-    if !allow_internal_relations && !read_summary.internal_relations.is_empty() {
-        return Err(mixed_public_internal_query_error(
-            &read_summary.internal_relations,
-        ));
     }
     let broad_statement = broad_statement.ok_or_else(|| {
         LixError::new(

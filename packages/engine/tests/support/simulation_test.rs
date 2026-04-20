@@ -51,7 +51,6 @@ pub struct SimulationArgs {
 pub struct SimulatedLixBootArgs {
     pub key_values: Vec<BootKeyValue>,
     pub wasm_runtime: Arc<dyn WasmRuntime>,
-    pub access_to_internal: bool,
 }
 
 impl Default for SimulatedLixBootArgs {
@@ -419,8 +418,7 @@ impl SimulationArgs {
         if self.behavior == SimulationBehavior::TimestampShuffle {
             enable_timestamp_shuffle_mode(&mut args.key_values);
         }
-        let mut config = LixConfig::new((self.backend_factory)(), args.wasm_runtime)
-            .with_access_to_internal(args.access_to_internal);
+        let mut config = LixConfig::new((self.backend_factory)(), args.wasm_runtime);
         config.key_values = args.key_values;
         Ok(SimulatedLix {
             lix: Arc::new(Lix::boot(config)),
@@ -440,7 +438,6 @@ impl SimulationArgs {
                 lixcol_untracked: None,
             }],
             wasm_runtime: default_simulation_wasm_runtime(),
-            access_to_internal: true,
         }))
         .await
     }
@@ -461,7 +458,6 @@ fn default_simulated_lix_boot_args() -> SimulatedLixBootArgs {
     SimulatedLixBootArgs {
         key_values: Vec::new(),
         wasm_runtime: default_simulation_wasm_runtime(),
-        access_to_internal: true,
     }
 }
 

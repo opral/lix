@@ -1,4 +1,4 @@
-use crate::common::unexpected_statement_count_error;
+use crate::functions::FunctionBindings;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
 
@@ -80,44 +80,31 @@ async fn create_version_in_transaction(
 }
 
 async fn generate_uuid(tx: &mut SessionTransaction<'_>) -> Result<String, LixError> {
-    let generated = tx.execute("SELECT lix_uuid_v7()", &[]).await?;
-    let [statement] = generated.statements.as_slice() else {
-        return Err(unexpected_statement_count_error(
-            "generated uuid query",
-            1,
-            generated.statements.len(),
-        ));
-    };
-    let [row] = statement.rows.as_slice() else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "missing generated uuid row".to_string(),
-            hint: None,
-        });
-    };
-    text_at(row, 0, "lix_uuid_v7()")
+    Ok(version_create_function_bindings(tx)
+        .await?
+        .provider()
+        .call_uuid_v7())
 }
 
-fn text_at(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
-    match row.get(index) {
-        Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
-        Some(Value::Text(_)) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("{field} is empty"),
-            hint: None,
-        }),
-        Some(Value::Integer(value)) => Ok(value.to_string()),
-        Some(other) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("expected text-like value for {field}, got {other:?}"),
-            hint: None,
-        }),
-        None => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("missing {field}"),
-            hint: None,
-        }),
+async fn version_create_function_bindings(
+    tx: &mut SessionTransaction<'_>,
+) -> Result<FunctionBindings, LixError> {
+    if let Some(function_bindings) = tx.context.function_bindings().cloned() {
+        return Ok(function_bindings);
     }
+
+    let session_host = tx.session_host();
+    let backend = crate::backend::transaction_backend_view(tx.backend_transaction_mut()?);
+    let function_bindings =
+        crate::session::host::prepare_function_bindings_with_host(session_host, &backend).await?;
+    let mut runtime_functions = function_bindings.provider().clone();
+    crate::transaction::ensure_runtime_sequence_initialized_in_transaction(
+        tx.backend_transaction_mut()?,
+        &mut runtime_functions,
+    )
+    .await?;
+    tx.context.set_function_bindings(function_bindings.clone());
+    Ok(function_bindings)
 }
 
 fn normalize_optional_non_empty_text(

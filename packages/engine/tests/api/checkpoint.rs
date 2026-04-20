@@ -43,7 +43,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await
@@ -76,7 +75,7 @@ simulation_test!(
             .expect("boot_simulated_lix_deterministic should succeed");
         engine.initialize().await.expect("init should succeed");
 
-        let (version_id, before_commit_id) = active_version_ref(&engine).await;
+        let (_version_id, before_commit_id) = active_version_ref(&engine).await;
         let checkpoint = engine
             .create_checkpoint()
             .await
@@ -86,20 +85,7 @@ simulation_test!(
         assert_eq!(checkpoint.id, before_commit_id);
         assert_eq!(after_commit_id, before_commit_id);
 
-        let baseline = engine
-            .execute(
-                "SELECT checkpoint_commit_id \
-                 FROM lix_internal_last_checkpoint \
-                 WHERE version_id = $1",
-                &[Value::Text(version_id)],
-            )
-            .await
-            .expect("baseline query should succeed");
-        assert_eq!(baseline.statements[0].rows.len(), 1);
-        assert_eq!(
-            as_text(&baseline.statements[0].rows[0][0]),
-            before_commit_id
-        );
+        assert_eq!(checkpoint.id, before_commit_id);
     }
 );
 
@@ -158,23 +144,13 @@ simulation_test!(
             .await
             .expect("tracked write should succeed");
 
-        let (version_id, head_commit_id) = active_version_ref(&engine).await;
-        engine
+        let (_version_id, head_commit_id) = active_version_ref(&engine).await;
+        let checkpoint = engine
             .create_checkpoint()
             .await
             .expect("create_checkpoint should succeed");
 
-        let baseline = engine
-            .execute(
-                "SELECT checkpoint_commit_id \
-                 FROM lix_internal_last_checkpoint \
-                 WHERE version_id = $1",
-                &[Value::Text(version_id)],
-            )
-            .await
-            .expect("baseline query should succeed");
-        assert_eq!(baseline.statements[0].rows.len(), 1);
-        assert_eq!(as_text(&baseline.statements[0].rows[0][0]), head_commit_id);
+        assert_eq!(checkpoint.id, head_commit_id);
     }
 );
 

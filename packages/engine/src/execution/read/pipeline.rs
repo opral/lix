@@ -1,10 +1,9 @@
 use std::time::Instant;
 
 use crate::execution::{render_analyzed_explain_result, render_plain_explain_result};
-use crate::sql::ResultContract;
 use crate::sql::{
-    normalize_sql_error_with_read_diagnostic_context, PreparedDirectReadArtifact,
-    PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
+    normalize_sql_error_with_read_diagnostic_context, PreparedReadArtifact, PreparedReadBatch,
+    PreparedReadStatement,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult};
 
@@ -44,8 +43,12 @@ async fn execute_prepared_read_statement_in_transaction(
         PreparedReadArtifact::Public(public) => {
             execute_prepared_public_read_artifact_in_transaction(transaction, host, public).await
         }
-        PreparedReadArtifact::Direct(direct) => {
-            execute_prepared_direct_read_artifact_in_transaction(transaction, direct).await
+        PreparedReadArtifact::Scalar(artifact) => {
+            execute_prepared_scalar_read_artifact_in_transaction(
+                transaction,
+                &artifact.prepared_batch,
+            )
+            .await
         }
     };
 
@@ -66,36 +69,18 @@ async fn execute_prepared_read_statement_in_transaction(
     Ok(result)
 }
 
-async fn execute_prepared_direct_read_artifact_in_transaction(
+async fn execute_prepared_scalar_read_artifact_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
-    direct: &PreparedDirectReadArtifact,
+    batch: &crate::backend::PreparedBatch,
 ) -> Result<QueryResult, LixError> {
-    let mut direct_result = QueryResult {
+    let mut result = QueryResult {
         rows: Vec::new(),
         columns: Vec::new(),
     };
-    for statement in &direct.prepared_batch.steps {
-        direct_result = transaction
+    for statement in &batch.steps {
+        result = transaction
             .execute(&statement.sql, &statement.params)
             .await?;
     }
-    Ok(public_result_from_contract(
-        direct.result_contract,
-        &direct_result,
-    ))
-}
-
-fn public_result_from_contract(
-    contract: ResultContract,
-    direct_result: &QueryResult,
-) -> QueryResult {
-    match contract {
-        ResultContract::DmlNoReturning => QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        },
-        ResultContract::Select | ResultContract::DmlReturning | ResultContract::Nothing => {
-            direct_result.clone()
-        }
-    }
+    Ok(result)
 }

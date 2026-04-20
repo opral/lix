@@ -254,7 +254,7 @@ simulation_test!(
 
         let mut observed = engine
             .observe(ObserveQuery::new(
-                "SELECT json_extract(value, '$.value') FROM lix_key_value WHERE key = ?1",
+                "SELECT lix_json_extract(value, 'value') FROM lix_key_value WHERE key = ?1",
                 vec![Value::Text(key.to_string())],
             ))
             .expect("observe should succeed");

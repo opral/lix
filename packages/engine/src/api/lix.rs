@@ -38,7 +38,6 @@ pub struct LixConfig {
     pub backend: Box<dyn LixBackend + Send + Sync>,
     pub wasm_runtime: Arc<dyn WasmRuntime>,
     pub key_values: Vec<BootKeyValue>,
-    access_to_internal: bool,
 }
 
 impl LixConfig {
@@ -50,14 +49,7 @@ impl LixConfig {
             backend,
             wasm_runtime,
             key_values: Vec::new(),
-            access_to_internal: false,
         }
-    }
-
-    #[doc(hidden)]
-    pub fn with_access_to_internal(mut self, access_to_internal: bool) -> Self {
-        self.access_to_internal = access_to_internal;
-        self
     }
 }
 
@@ -124,7 +116,6 @@ impl Lix {
             engine: Arc::new(Engine::new(
                 config.backend,
                 config.wasm_runtime,
-                config.access_to_internal,
                 boot_deterministic_settings,
                 crate::catalog::build_builtin_surface_registry(),
                 catalog_projection_registry,
@@ -702,45 +693,6 @@ mod tests {
         assert!(!is_query_only_sql(
             "UPDATE lix_file SET path = '/x' WHERE id = 'f'"
         ));
-    }
-
-    #[test]
-    fn unknown_read_query_returns_unknown_table_error() {
-        std::thread::Builder::new()
-            .name("unknown-read-query-test".to_string())
-            .stack_size(32 * 1024 * 1024)
-            .spawn(|| {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("build tokio runtime");
-                runtime.block_on(async {
-                    let commit_called = Arc::new(AtomicBool::new(false));
-                    let rollback_called = Arc::new(AtomicBool::new(false));
-                    let lix = Arc::new(Lix::boot(LixConfig::new(
-                        Box::new(TestBackend {
-                            commit_called,
-                            rollback_called,
-                        }),
-                        Arc::new(NoopWasmRuntime),
-                    )));
-                    let session = Session::new_for_test(
-                        lix.engine().session_host(),
-                        "version-test".to_string(),
-                        Vec::new(),
-                    );
-
-                    let error = session
-                        .execute("SELECT * FROM unknown_table", &[])
-                        .await
-                        .expect_err("unknown relation query should fail");
-
-                    assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
-                });
-            })
-            .expect("spawn unknown read query test thread")
-            .join()
-            .expect("unknown read query test thread should succeed");
     }
 
     #[test]

@@ -341,7 +341,6 @@ async fn prepare_required_active_public_read_artifact_with_reader(
         active_version_id,
         active_history_root_commit_id.as_deref(),
         origin_key,
-        false,
         None,
     )
     .await?;

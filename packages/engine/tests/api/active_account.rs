@@ -15,30 +15,6 @@ fn first_string_vec(result: &lix_engine::ExecuteResult) -> Vec<String> {
         .unwrap_or_else(|error| panic!("expected JSON array text, got parse error: {error}"))
 }
 
-async fn workspace_metadata_value(
-    engine: &support::simulation_test::SimulatedLix,
-    key: &str,
-) -> Option<String> {
-    let result = engine
-        .execute(
-            "SELECT value \
-             FROM lix_internal_workspace_metadata \
-             WHERE key = $1 \
-             LIMIT 1",
-            &[Value::Text(key.to_string())],
-        )
-        .await
-        .expect("workspace metadata query should succeed");
-    result.statements[0]
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .map(|value| match value {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text metadata value, got {other:?}"),
-        })
-}
-
 simulation_test!(
     active_account_ids_function_defaults_to_empty_selection,
     simulations = [sqlite, materialization],
@@ -80,11 +56,13 @@ simulation_test!(
             first_string_vec(&result),
             vec!["acct-first".to_string(), "acct-second".to_string()]
         );
-
-        let persisted = workspace_metadata_value(&engine, "active_account_ids")
-            .await
-            .expect("workspace metadata should persist active account ids");
-        assert_eq!(persisted, r#"["acct-first","acct-second"]"#);
+        assert_eq!(
+            engine
+                .active_account_ids()
+                .await
+                .expect("public active_account_ids API should succeed"),
+            vec!["acct-first".to_string(), "acct-second".to_string()]
+        );
     }
 );
 
@@ -112,11 +90,13 @@ simulation_test!(
             .await
             .expect("active account ids query should succeed");
         assert_eq!(first_string_vec(&result), Vec::<String>::new());
-
-        let persisted = workspace_metadata_value(&engine, "active_account_ids")
-            .await
-            .expect("workspace metadata should persist cleared active account ids");
-        assert_eq!(persisted, "[]");
+        assert_eq!(
+            engine
+                .active_account_ids()
+                .await
+                .expect("public active_account_ids API should succeed"),
+            Vec::<String>::new()
+        );
     }
 );
 

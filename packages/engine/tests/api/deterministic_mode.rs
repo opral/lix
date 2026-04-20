@@ -31,10 +31,9 @@ async fn read_highest_uuid_shaped_canonical_counter(
 ) -> i64 {
     let changes = engine
         .execute(
-            "SELECT id, snapshot_id \
-             FROM lix_internal_change \
-             WHERE id LIKE '01920000-0000-7000-8000-%' \
-                OR snapshot_id LIKE '01920000-0000-7000-8000-%'",
+            "SELECT id \
+             FROM lix_change \
+             WHERE id LIKE '01920000-0000-7000-8000-%'",
             &[],
         )
         .await
@@ -141,11 +140,9 @@ simulation_test!(
 
         let mode_metadata = engine
             .execute(
-                "SELECT created_at, updated_at \
-                 FROM lix_internal_live_v1_lix_key_value \
-                 WHERE entity_id = 'lix_deterministic_mode' \
-                   AND version_id = 'global' \
-                   AND untracked = true \
+                "SELECT lixcol_created_at, lixcol_updated_at \
+                 FROM lix_key_value \
+                 WHERE key = 'lix_deterministic_mode' \
                  LIMIT 1",
                 &[],
             )
@@ -274,8 +271,8 @@ simulation_test!(
 
         let changes = engine
             .execute(
-                "SELECT id, snapshot_id, created_at \
-                 FROM lix_internal_change \
+                "SELECT id, created_at \
+                 FROM lix_change \
                  WHERE entity_id = 'tracked' AND schema_key = 'test_schema' \
                  LIMIT 1",
                 &[],
@@ -288,16 +285,8 @@ simulation_test!(
             changes.statements[0].rows[0][0],
             Value::Text(deterministic_uuid(1))
         );
-        let snapshot_id = match &changes.statements[0].rows[0][1] {
-            Value::Text(value) => value,
-            other => panic!("expected text snapshot_id, got {other:?}"),
-        };
-        assert!(
-            deterministic_counter_from_uuid(snapshot_id).is_some(),
-            "canonical snapshot ids should remain deterministic when deterministic mode is enabled"
-        );
         assert_eq!(
-            changes.statements[0].rows[0][2],
+            changes.statements[0].rows[0][1],
             Value::Text("1970-01-01T00:00:00.000Z".to_string())
         );
 
@@ -486,20 +475,7 @@ simulation_test!(
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_eq!(rows.statements[0].rows[0][0], Value::Integer(1));
 
-        let scope_rows = engine
-            .execute(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_untracked_change_visibility \
-                 WHERE change_id = $1 \
-                   AND version_id = 'global' \
-                   AND visibility_kind = 'global'",
-                &[Value::Text(change_id)],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(scope_rows.statements[0].rows.len(), 1);
-        assert_eq!(scope_rows.statements[0].rows[0][0], Value::Integer(1));
+        assert_eq!(read_sequence_value(&engine).await, 0);
     }
 );
 

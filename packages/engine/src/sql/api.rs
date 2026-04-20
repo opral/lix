@@ -66,8 +66,7 @@ pub(crate) use super::semantic_ir::semantics::surface_semantics::{
 };
 pub(crate) use super::support::{
     bind_sql, bind_sql_with_state, parse_sql_script_with_timing, parse_sql_statements_with_timing,
-    reject_internal_table_writes, reject_public_create_table, resolve_placeholder_index, BoundSql,
-    ParsedSql, PlaceholderState,
+    reject_public_create_table, resolve_placeholder_index, BoundSql, ParsedSql, PlaceholderState,
 };
 
 /// Prepare either a public read or a public write from already-parsed SQL
@@ -84,7 +83,6 @@ pub(crate) async fn prepare_public_plan(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicPlan>, LixError> {
     super::prepare::public_surface::prepare_public_plan_with_registry_context_and_functions(
@@ -98,7 +96,6 @@ pub(crate) async fn prepare_public_plan(
         active_history_root_commit_id,
         active_account_ids,
         origin_key,
-        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -117,7 +114,6 @@ pub(crate) async fn prepare_public_read(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     super::prepare::try_prepare_public_read_with_registry_and_internal_access(
@@ -129,7 +125,6 @@ pub(crate) async fn prepare_public_read(
         active_version_id,
         active_history_root_commit_id,
         origin_key,
-        allow_internal_relations,
         parse_duration,
     )
     .await

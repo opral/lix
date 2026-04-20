@@ -105,47 +105,10 @@ pub(crate) fn sql_unknown_column_error(
     )
 }
 
-pub(crate) fn internal_table_access_denied_error() -> LixError {
-    let inventory = crate::sql::builtin_relation_inventory();
-    let available_tables = inventory.protected_builtin_public_surfaces.join(", ");
-    let internal_relation_namespaces = inventory
-        .internal_relation_families
-        .iter()
-        .map(|family| format!("`{}*`", family.prefix))
-        .collect::<Vec<_>>()
-        .join(", ");
-    build_error(
-        "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
-        format!(
-            "Direct writes against internal storage relations can lead to data corruption. {policy_choice} Protected internal storage includes exact built-in tables plus managed relation families such as {internal_relation_namespaces}. DDL against internal storage and protected Lix system relations is also denied. Public SQL tables remain writable, including `lix_state` and `lix_state_by_version`. Public SQL tables: {available_tables}.",
-            policy_choice = crate::sql::relation_policy_choice_summary(),
-        ),
-    )
-}
-
 pub(crate) fn public_create_table_denied_error() -> LixError {
     build_error(
         "LIX_ERROR_PUBLIC_CREATE_TABLE_DENIED",
         "CREATE TABLE is not supported in public Lix SQL. Instead, store a schema definition in `lix_registered_schema`; registered schemas become queryable entity views.",
-    )
-}
-
-pub(crate) fn mixed_public_internal_query_error(internal_tables: &[String]) -> LixError {
-    let available_tables = crate::sql::protected_builtin_public_surface_names().join(", ");
-    let internal_tables = if internal_tables.is_empty() {
-        "`lix_internal_*`".to_string()
-    } else {
-        internal_tables
-            .iter()
-            .map(|table| format!("`{table}`"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    build_error(
-        "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED",
-        format!(
-            "Queries that reference public Lix tables must not also access internal engine tables in the same statement. Internal tables referenced: {internal_tables}. Public SQL tables: {available_tables}."
-        ),
     )
 }
 

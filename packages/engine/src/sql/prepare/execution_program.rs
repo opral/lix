@@ -7,6 +7,7 @@ use crate::sql::binder::{
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::prepare::script::coalesce_state_surface_inserts_in_transactions;
 use crate::sql::prepare::StatementEffects;
+use crate::sql::support::reject_backend_implementation_functions;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
 
@@ -115,7 +116,6 @@ impl BoundStatementInstance {
 pub(crate) struct StatementTemplateCacheKey {
     sql: String,
     dialect: u8,
-    allow_internal_relations: bool,
     public_surface_registry_generation: u64,
 }
 
@@ -124,7 +124,6 @@ impl StatementTemplateCacheKey {
     pub(crate) fn new(
         sql: &str,
         dialect: SqlDialect,
-        allow_internal_relations: bool,
         public_surface_registry_generation: u64,
     ) -> Self {
         Self {
@@ -133,7 +132,6 @@ impl StatementTemplateCacheKey {
                 SqlDialect::Sqlite => 1,
                 SqlDialect::Postgres => 2,
             },
-            allow_internal_relations,
             public_surface_registry_generation,
         }
     }
@@ -149,6 +147,7 @@ impl StatementBatch {
     ) -> Result<Self, LixError> {
         let source_statements =
             coalesce_state_surface_inserts_in_transactions(original_statements)?;
+        reject_backend_implementation_functions(&source_statements)?;
         let single_statement_parse_duration = (source_statements.len() == 1)
             .then_some(parse_duration)
             .flatten();

@@ -59,28 +59,6 @@ fn normalize_global_projection_rows(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn normalize_text_row_order(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
-    let mut normalized = rows.to_vec();
-    normalized.sort_by(|left, right| {
-        let left_key = left
-            .iter()
-            .map(|value| match value {
-                Value::Text(value) => value.clone(),
-                other => format!("{other:?}"),
-            })
-            .collect::<Vec<_>>();
-        let right_key = right
-            .iter()
-            .map(|value| match value {
-                Value::Text(value) => value.clone(),
-                other => format!("{other:?}"),
-            })
-            .collect::<Vec<_>>();
-        left_key.cmp(&right_key)
-    });
-    normalized
-}
-
 async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     register_registered_schema_snapshot(
         engine,
@@ -563,66 +541,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    lix_state_by_version_insert_records_append_idempotency,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix_deterministic()
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-
-        register_test_schema(&engine).await;
-        engine.create_named_version("version-a").await.unwrap();
-        ensure_file_descriptor(&engine, "version-a", "test-file").await;
-        let idempotency_before = engine
-            .execute(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_commit_idempotency \
-                 WHERE write_lane = 'version:version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        engine
-            .execute(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, schema_version, snapshot_content\
-                 ) VALUES (\
-                 'entity-ins-idem', 'test_state_schema', 'test-file', 'version-a', NULL, '1', '{\"value\":\"inserted\"}'\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let rows = engine
-            .execute(
-                "SELECT write_lane, commit_id \
-                 FROM lix_internal_commit_idempotency \
-                 WHERE write_lane = 'version:version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        sim.assert_deterministic(normalize_text_row_order(&rows.statements[0].rows));
-        let before_count = match idempotency_before.statements[0].rows[0][0].clone() {
-            Value::Integer(value) => value,
-            other => panic!("expected integer idempotency count, got {other:?}"),
-        };
-        assert_eq!(rows.statements[0].rows.len() as i64, before_count + 1);
-        for row in &rows.statements[0].rows {
-            assert_text(&row[0], "version:version-a");
-            match &row[1] {
-                Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
-                other => panic!("expected text commit_id, got {other:?}"),
-            }
-        }
-    }
-);
-
-simulation_test!(
     lix_state_by_version_insert_supports_placeholders,
     |sim| async move {
         let engine = sim
@@ -1075,11 +993,6 @@ simulation_test!(
             "{\"value\":\"before\"}",
         )
         .await;
-        let idempotency_before = engine
-            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
-            .await
-            .unwrap();
-
         engine
             .execute(
                 "UPDATE lix_state_by_version \
@@ -1108,15 +1021,6 @@ simulation_test!(
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "entity-existing-noop");
         assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
-
-        let idempotency = engine
-            .execute("SELECT COUNT(*) FROM lix_internal_commit_idempotency", &[])
-            .await
-            .unwrap();
-        assert_eq!(
-            idempotency.statements[0].rows[0][0],
-            idempotency_before.statements[0].rows[0][0]
-        );
     }
 );
 
@@ -1174,62 +1078,6 @@ simulation_test!(
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "test-file");
         assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
-    }
-);
-
-simulation_test!(
-    lix_state_by_version_update_records_append_idempotency,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix_deterministic()
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-
-        register_test_schema(&engine).await;
-        engine.create_named_version("version-a").await.unwrap();
-        insert_state_row(
-            &engine,
-            "entity-upd-idem",
-            "version-a",
-            "{\"value\":\"before\"}",
-        )
-        .await;
-
-        engine
-            .execute(
-                "UPDATE lix_state_by_version \
-                 SET snapshot_content = '{\"value\":\"after\"}' \
-                 WHERE schema_key = 'test_state_schema' \
-                   AND entity_id = 'entity-upd-idem' \
-                   AND file_id = 'test-file' \
-                   AND version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let rows = engine
-            .execute(
-                "SELECT write_lane, commit_id \
-                 FROM lix_internal_commit_idempotency \
-                 ORDER BY write_lane, idempotency_key",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let normalized = normalize_text_row_order(&rows.statements[0].rows);
-        sim.assert_deterministic(normalized);
-        let matched = rows.statements[0]
-            .rows
-            .iter()
-            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == "version:version-a"))
-            .expect("version idempotency row should exist");
-        match &matched[1] {
-            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
-            other => panic!("expected text commit_id, got {other:?}"),
-        }
     }
 );
 
@@ -1345,26 +1193,6 @@ simulation_test!(
         assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"after\"}");
         assert_text(&rows.statements[0].rows[1][0], "version-b");
         assert_text(&rows.statements[0].rows[1][1], "{\"value\":\"after\"}");
-
-        let idempotency_rows = engine
-            .execute(
-                "SELECT DISTINCT write_lane \
-                 FROM lix_internal_commit_idempotency \
-                 WHERE write_lane IN ('version:version-a', 'version:version-b') \
-                 ORDER BY write_lane",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        sim.assert_deterministic(idempotency_rows.statements[0].rows.clone());
-        assert_eq!(
-            idempotency_rows.statements[0].rows,
-            vec![
-                vec![Value::Text("version:version-a".to_string())],
-                vec![Value::Text("version:version-b".to_string())],
-            ]
-        );
     }
 );
 
@@ -1522,61 +1350,6 @@ simulation_test!(
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "test-file");
         assert_text(&rows.statements[0].rows[0][1], "{\"value\":\"before\"}");
-    }
-);
-
-simulation_test!(
-    lix_state_by_version_delete_records_append_idempotency,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix_deterministic()
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-
-        register_test_schema(&engine).await;
-        engine.create_named_version("version-a").await.unwrap();
-        insert_state_row(
-            &engine,
-            "entity-del-idem",
-            "version-a",
-            "{\"value\":\"before\"}",
-        )
-        .await;
-
-        engine
-            .execute(
-                "DELETE FROM lix_state_by_version \
-                 WHERE schema_key = 'test_state_schema' \
-                   AND entity_id = 'entity-del-idem' \
-                   AND file_id = 'test-file' \
-                   AND version_id = 'version-a'",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let rows = engine
-            .execute(
-                "SELECT write_lane, commit_id \
-                 FROM lix_internal_commit_idempotency \
-                 ORDER BY write_lane, idempotency_key",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let normalized = normalize_text_row_order(&rows.statements[0].rows);
-        sim.assert_deterministic(normalized);
-        let matched = rows.statements[0]
-            .rows
-            .iter()
-            .find(|row| matches!(row.first(), Some(Value::Text(value)) if value == "version:version-a"))
-            .expect("version idempotency row should exist");
-        match &matched[1] {
-            Value::Text(value) => assert!(!value.is_empty(), "commit_id should not be empty"),
-            other => panic!("expected text commit_id, got {other:?}"),
-        }
     }
 );
 
