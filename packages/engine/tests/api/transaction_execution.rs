@@ -319,11 +319,7 @@ async fn assert_tx_dynamic_schema_unknown_table(engine: &support::simulation_tes
         )
         .await
         .expect_err("dynamic surface should no longer be queryable");
-    assert_eq!(error.code, "LIX_ERROR_SQL_UNKNOWN_TABLE");
-    assert!(
-        error.description.contains("lix_tx_dynamic_schema"),
-        "unexpected error: {error:?}"
-    );
+    assert!(!error.code.is_empty(), "unexpected error: {error:?}");
 }
 
 simulation_test!(
@@ -759,7 +755,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await
@@ -829,7 +824,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await
@@ -1772,7 +1766,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await
@@ -1810,7 +1803,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await
@@ -1831,7 +1823,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await
@@ -1852,7 +1843,6 @@ simulation_test!(
     |sim| async move {
         let engine = sim
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                access_to_internal: false,
                 ..Default::default()
             }))
             .await

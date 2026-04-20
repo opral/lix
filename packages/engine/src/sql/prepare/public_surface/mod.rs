@@ -12,8 +12,7 @@ use crate::schema::builtin_schema_definition;
 use crate::sql::binder::{bind_statement, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
 use crate::sql::diagnostics::{
-    file_data_expects_bytes_error, mixed_public_internal_query_error, read_only_view_write_error,
-    sql_unknown_table_error,
+    file_data_expects_bytes_error, read_only_view_write_error, sql_unknown_table_error,
 };
 use crate::sql::explain::{
     build_public_write_explain_artifacts, unwrap_explain_statement, ExplainArtifacts,
@@ -188,7 +187,6 @@ pub(crate) async fn prepare_public_plan(
         active_history_root_commit_id.as_deref(),
         active_account_ids,
         origin_key,
-        false,
     )
     .await
 }
@@ -204,7 +202,6 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicPlan>, LixError> {
     if let Some(surface_name) = first_removed_builtin_surface_reference(parsed_statements) {
@@ -261,7 +258,6 @@ pub(crate) async fn prepare_public_plan_with_registry_context_and_functions(
                 active_version_id,
                 active_history_root_commit_id,
                 origin_key,
-                allow_internal_relations,
                 parse_duration,
             )
             .await?
@@ -286,7 +282,6 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
 ) -> Result<Option<PublicPlan>, LixError> {
     let functions = crate::functions::clone_boxed_function_provider(
         &crate::functions::SharedFunctionProvider::new(crate::functions::SystemFunctionProvider),
@@ -308,7 +303,6 @@ pub(crate) async fn prepare_public_plan_with_internal_access(
         active_history_root_commit_id,
         active_account_ids,
         origin_key,
-        allow_internal_relations,
         None,
     )
     .await
@@ -323,7 +317,6 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
     active_version_id: &str,
     active_history_root_commit_id: Option<&str>,
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicReadPlan>, LixError> {
     read::try_prepare_public_read_with_registry_and_internal_access(
@@ -335,7 +328,6 @@ pub(crate) async fn try_prepare_public_read_with_registry_and_internal_access(
         active_version_id,
         active_history_root_commit_id,
         origin_key,
-        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -3852,7 +3844,6 @@ mod tests {
             bound.broad_statement,
             None,
             &registry,
-            false,
             None,
             ExplainTimingCollector::new(Some(Duration::ZERO)),
         )

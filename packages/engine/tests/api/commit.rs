@@ -2,10 +2,7 @@ use crate::support;
 
 use std::collections::BTreeSet;
 
-use lix_engine::{
-    ExecuteOptions, LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
-    Value,
-};
+use lix_engine::{ExecuteOptions, Value};
 use serde_json::Value as JsonValue;
 use support::simulation_test::SimulatedLix;
 
@@ -87,53 +84,39 @@ async fn matching_commit_change_set_ids(
     engine: &SimulatedLix,
     change_ids: &BTreeSet<String>,
 ) -> Vec<String> {
-    let commit_snapshot_ids = engine
+    let cse_rows = engine
         .execute(
-            "SELECT snapshot_id \
-             FROM lix_internal_change \
-             WHERE schema_key = 'lix_commit'",
+            "SELECT snapshot_content \
+             FROM lix_state_by_version \
+             WHERE schema_key = 'lix_change_set_element'",
             &[],
         )
         .await
         .unwrap();
 
-    let mut matching_change_set_ids = Vec::new();
-    for row in &commit_snapshot_ids.statements[0].rows {
-        let snapshot_id = as_text(&row[0]);
-        let snapshot = engine
-            .execute(
-                &format!(
-                    "SELECT content FROM lix_internal_snapshot WHERE id = '{}'",
-                    snapshot_id
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        if snapshot.statements[0].rows.is_empty() {
-            continue;
-        }
-        let commit_json = parse_json(&snapshot.statements[0].rows[0][0]);
-        let Some(commit_snapshot_change_ids) =
-            commit_json.get("change_ids").and_then(|v| v.as_array())
-        else {
+    let mut grouped = std::collections::BTreeMap::<String, BTreeSet<String>>::new();
+    for row in &cse_rows.statements[0].rows {
+        let cse_json = parse_json(&row[0]);
+        let Some(change_set_id) = cse_json.get("change_set_id").and_then(|v| v.as_str()) else {
             continue;
         };
-        let commit_change_ids = commit_snapshot_change_ids
-            .iter()
-            .filter_map(|value| value.as_str().map(ToString::to_string))
-            .collect::<BTreeSet<_>>();
-        if change_ids.is_subset(&commit_change_ids) {
-            let change_set_id = commit_json
-                .get("change_set_id")
-                .and_then(|v| v.as_str())
-                .expect("commit snapshot must include change_set_id")
-                .to_string();
-            matching_change_set_ids.push(change_set_id);
-        }
+        let Some(change_id) = cse_json.get("change_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        grouped
+            .entry(change_set_id.to_string())
+            .or_default()
+            .insert(change_id.to_string());
     }
 
-    matching_change_set_ids
+    grouped
+        .into_iter()
+        .filter_map(|(change_set_id, grouped_change_ids)| {
+            change_ids
+                .is_subset(&grouped_change_ids)
+                .then_some(change_set_id)
+        })
+        .collect()
 }
 
 async fn change_set_element_change_ids_for_change_set(
@@ -163,20 +146,6 @@ async fn change_set_element_change_ids_for_change_set(
     }
 
     change_ids
-}
-
-async fn drop_commit_family_live_mirrors(engine: &SimulatedLix) {
-    for table in [
-        "lix_internal_live_v1_lix_commit",
-        "lix_internal_live_v1_lix_change_set_element",
-        "lix_internal_live_v1_lix_commit_edge",
-        "lix_internal_live_v1_lix_change_author",
-    ] {
-        engine
-            .execute(&format!("DROP TABLE IF EXISTS {table}"), &[])
-            .await
-            .unwrap();
-    }
 }
 
 simulation_test!(
@@ -218,8 +187,8 @@ simulation_test!(
 
         let change = engine
             .execute(
-                "SELECT id, snapshot_id \
-                 FROM lix_internal_change \
+                "SELECT id, snapshot_content \
+                 FROM lix_change \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id = 'para-1' \
                  LIMIT 1",
@@ -229,20 +198,8 @@ simulation_test!(
             .unwrap();
         assert_eq!(change.statements[0].rows.len(), 1);
 
-        let snapshot_id = as_text(&change.statements[0].rows[0][1]);
-        let snapshot = engine
-            .execute(
-                &format!(
-                    "SELECT content FROM lix_internal_snapshot WHERE id = '{}'",
-                    snapshot_id
-                ),
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(snapshot.statements[0].rows.len(), 1);
         assert_eq!(
-            snapshot.statements[0].rows[0][0],
+            change.statements[0].rows[0][1],
             Value::Text("{\"key\":\"v1\"}".to_string())
         );
 
@@ -253,7 +210,7 @@ simulation_test!(
             .execute(
                 &format!(
                     "SELECT COUNT(*) \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key = 'lix_commit_edge' \
                    AND entity_id = '{}'",
                     edge_entity_id
@@ -292,164 +249,6 @@ simulation_test!(
             edge_snapshot["child_id"].as_str(),
             Some(new_commit_id.as_str())
         );
-
-        // Verify snapshot FK integrity for generated changes.
-        let snapshot_fks = engine
-            .execute(
-                "SELECT snapshot_id \
-                 FROM lix_internal_change \
-                 WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref')",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert!(snapshot_fks.statements[0].rows.len() >= 3);
-        for row in &snapshot_fks.statements[0].rows {
-            let id = as_text(&row[0]);
-            let exists = engine
-                .execute(
-                    &format!(
-                        "SELECT COUNT(*) FROM lix_internal_snapshot WHERE id = '{}'",
-                        id
-                    ),
-                    &[],
-                )
-                .await
-                .unwrap();
-            assert_eq!(exists.statements[0].rows[0][0], Value::Integer(1));
-        }
-    }
-);
-
-simulation_test!(
-    commit_family_rows_remain_visible_through_state_without_live_mirrors,
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-
-        engine.initialize().await.unwrap();
-        register_test_schema(&engine).await;
-        engine
-            .set_active_account_ids(vec!["acct-runtime".to_string()])
-            .await
-            .expect("set_active_account_ids should succeed");
-        engine.create_named_version("version-main").await.unwrap();
-
-        let previous_commit_id = read_version_ref_commit_id(&engine, "version-main").await;
-
-        engine
-            .execute(
-                "INSERT INTO lix_state_by_version (\
-                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
-                 ) VALUES (\
-                 'mirrorless-entity', 'test_schema', NULL, 'version-main', NULL, '{\"key\":\"value\"}', '1'\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let new_commit_id = read_version_ref_commit_id(&engine, "version-main").await;
-        assert_ne!(new_commit_id, previous_commit_id);
-
-        let changes = engine
-            .execute(
-                "SELECT id \
-                 FROM lix_internal_change \
-                 WHERE schema_key = 'test_schema' \
-                   AND entity_id = 'mirrorless-entity'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(changes.statements[0].rows.len(), 1);
-        let change_id = as_text(&changes.statements[0].rows[0][0]);
-
-        drop_commit_family_live_mirrors(&engine).await;
-
-        let commit_row = engine
-            .execute(
-                "SELECT snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_commit' \
-                   AND entity_id = $1 \
-                   AND version_id = 'version-main' \
-                 LIMIT 1",
-                &[Value::Text(new_commit_id.clone())],
-            )
-            .await
-            .unwrap();
-        assert_eq!(commit_row.statements[0].rows.len(), 1);
-        let commit_snapshot = parse_json(&commit_row.statements[0].rows[0][0]);
-        let change_set_id = commit_snapshot["change_set_id"]
-            .as_str()
-            .expect("commit state snapshot should include change_set_id")
-            .to_string();
-
-        let cse_rows = engine
-            .execute(
-                "SELECT snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_change_set_element' \
-                   AND version_id = 'version-main'",
-                &[],
-            )
-            .await
-            .unwrap();
-        let mut cse_contains_change = false;
-        for row in &cse_rows.statements[0].rows {
-            let parsed = parse_json(&row[0]);
-            if parsed["change_set_id"] == change_set_id && parsed["change_id"] == change_id {
-                cse_contains_change = true;
-                break;
-            }
-        }
-        assert!(cse_contains_change);
-
-        let edge_row = engine
-            .execute(
-                "SELECT snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_commit_edge' \
-                   AND entity_id = $1 \
-                   AND version_id = 'version-main' \
-                 LIMIT 1",
-                &[Value::Text(format!("{previous_commit_id}~{new_commit_id}"))],
-            )
-            .await
-            .unwrap();
-        assert_eq!(edge_row.statements[0].rows.len(), 1);
-        let edge_snapshot = parse_json(&edge_row.statements[0].rows[0][0]);
-        assert_eq!(
-            edge_snapshot["parent_id"].as_str(),
-            Some(previous_commit_id.as_str())
-        );
-        assert_eq!(
-            edge_snapshot["child_id"].as_str(),
-            Some(new_commit_id.as_str())
-        );
-
-        let author_row = engine
-            .execute(
-                "SELECT snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'lix_change_author' \
-                   AND entity_id = $1 \
-                   AND version_id = 'version-main' \
-                 LIMIT 1",
-                &[Value::Text(format!("{change_id}~acct-runtime"))],
-            )
-            .await
-            .unwrap();
-        assert_eq!(author_row.statements[0].rows.len(), 1);
-        let author_snapshot = parse_json(&author_row.statements[0].rows[0][0]);
-        assert_eq!(
-            author_snapshot["change_id"].as_str(),
-            Some(change_id.as_str())
-        );
-        assert_eq!(author_snapshot["account_id"].as_str(), Some("acct-runtime"));
     }
 );
 
@@ -467,7 +266,7 @@ simulation_test!(
         let before = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
@@ -486,7 +285,7 @@ simulation_test!(
         let after = engine
             .execute(
                 "SELECT COUNT(*) \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key IN ('test_schema', 'lix_commit', 'lix_version_ref', 'lix_change_set_element', 'lix_commit_edge')", &[])
             .await
             .unwrap();
@@ -546,7 +345,7 @@ simulation_test!(
         let changes = engine
             .execute(
                 "SELECT id \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id IN ('entity-a', 'entity-b')",
                 &[],
@@ -607,7 +406,7 @@ simulation_test!(
         let changes = engine
             .execute(
                 "SELECT id \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key = 'test_schema' \
                    AND entity_id IN ('entity-c', 'entity-d')",
                 &[],
@@ -709,7 +508,7 @@ simulation_test!(
         let changes = engine
             .execute(
                 "SELECT id \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_id IN ('tx-kv-a', 'tx-kv-b')",
                 &[],
@@ -809,7 +608,7 @@ simulation_test!(
         let changes = engine
             .execute(
                 "SELECT id \
-                 FROM lix_internal_change \
+                 FROM lix_change \
                  WHERE schema_key = 'lix_key_value' \
                    AND entity_id IN ('tx-handle-kv-a', 'tx-handle-kv-b')",
                 &[],
@@ -903,22 +702,6 @@ simulation_test!(
             other => panic!("expected text version_ref change_id, got {other:?}"),
         };
 
-        let version_ref_scope_count = as_i64(
-            &engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_internal_untracked_change_visibility \
-                     WHERE change_id = $1 \
-                       AND visibility_kind = 'global'",
-                    &[Value::Text(version_ref_change_id.clone())],
-                )
-                .await
-                .unwrap()
-                .statements[0]
-                .rows[0][0],
-        );
-        assert_eq!(version_ref_scope_count, 1);
-
         let commit_snapshot = engine
             .execute(
                 "SELECT snapshot_content \
@@ -946,164 +729,6 @@ simulation_test!(
         assert!(
             version_ref_change_id != before_version_ref_change_id,
             "content commit should rotate the visible journaled version_ref row"
-        );
-    }
-);
-
-simulation_test!(
-    per_version_untracked_state_rebuilds_from_canonical_visibility_after_compaction,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-        register_test_schema(&engine).await;
-
-        engine.create_named_version("version-a").await.unwrap();
-        engine
-            .switch_version("version-a".to_string())
-            .await
-            .unwrap();
-
-        engine
-            .execute(
-                "INSERT INTO lix_state (\
-                 entity_id, file_id, schema_key, plugin_key, schema_version, snapshot_content, untracked\
-                 ) VALUES (\
-                 'entity-untracked-rebuild', NULL, 'test_schema', NULL, '1', '{\"key\":\"value-v1\"}', true\
-                 )",
-                &[],
-            )
-            .await
-            .unwrap();
-        engine
-            .execute(
-                "UPDATE lix_state \
-                 SET snapshot_content = '{\"key\":\"value-v2\"}' \
-                 WHERE entity_id = 'entity-untracked-rebuild' \
-                   AND schema_key = 'test_schema' \
-                   AND file_id IS NULL \
-                   AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let visible_before = engine
-            .execute(
-                "SELECT change_id, snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'test_schema' \
-                   AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id IS NULL \
-                   AND version_id = 'version-a' \
-                   AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(visible_before.statements[0].rows.len(), 1);
-        let change_id_before = as_text(&visible_before.statements[0].rows[0][0]);
-        assert_eq!(
-            visible_before.statements[0].rows[0][1],
-            Value::Text("{\"key\":\"value-v2\"}".to_string())
-        );
-
-        let visibility_count = as_i64(
-            &engine
-                .execute(
-                    "SELECT COUNT(*) \
-                     FROM lix_internal_untracked_change_visibility \
-                     WHERE change_id = $1 \
-                       AND version_id = 'version-a' \
-                       AND visibility_kind = 'version'",
-                    &[Value::Text(change_id_before.clone())],
-                )
-                .await
-                .unwrap()
-                .statements[0]
-                .rows[0][0],
-        );
-        assert_eq!(visibility_count, 1);
-
-        let compacted = engine
-            .compact_untracked_change_journal()
-            .await
-            .expect("compaction should succeed");
-        assert!(
-            compacted <= 1,
-            "expected at most one stale untracked visibility row to be removed, got {compacted}"
-        );
-
-        engine
-            .execute(
-                "DELETE FROM lix_internal_live_v1_test_schema \
-                 WHERE schema_key = 'test_schema' \
-                   AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id IS NULL \
-                   AND version_id = 'version-a' \
-                   AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        let missing_before_rebuild = engine
-            .execute(
-                "SELECT COUNT(*) \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'test_schema' \
-                   AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id IS NULL \
-                   AND version_id = 'version-a' \
-                   AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(as_i64(&missing_before_rebuild.statements[0].rows[0][0]), 0);
-
-        let report = engine
-            .rebuild_live_state(&LiveStateRebuildRequest {
-                scope: LiveStateRebuildScope::Full,
-                debug: LiveStateRebuildDebugMode::Summary,
-                debug_row_limit: 128,
-            })
-            .await
-            .unwrap();
-        assert!(
-            report.plan.writes.iter().any(|write| {
-                write.schema_key.to_string() == "test_schema"
-                    && write.entity_id.to_string() == "entity-untracked-rebuild"
-                    && write.version_id.to_string() == "version-a"
-                    && write.untracked
-            }),
-            "expected rebuild plan to restore the per-version untracked row"
-        );
-
-        let visible_after = engine
-            .execute(
-                "SELECT change_id, snapshot_content \
-                 FROM lix_state_by_version \
-                 WHERE schema_key = 'test_schema' \
-                   AND entity_id = 'entity-untracked-rebuild' \
-                   AND file_id IS NULL \
-                   AND version_id = 'version-a' \
-                   AND untracked = true",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(visible_after.statements[0].rows.len(), 1);
-        assert_eq!(
-            visible_after.statements[0].rows[0][0],
-            Value::Text(change_id_before)
-        );
-        assert_eq!(
-            visible_after.statements[0].rows[0][1],
-            Value::Text("{\"key\":\"value-v2\"}".to_string())
         );
     }
 );

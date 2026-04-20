@@ -6,7 +6,8 @@ use crate::sql::explain::{
 };
 use crate::sql::PlanEffects;
 use crate::{LixError, SqlDialect, Value};
-use sqlparser::ast::Statement;
+use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
+use std::ops::ControlFlow;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -109,7 +110,6 @@ async fn compile_execution_with_context(
     active_version_id: &str,
     active_account_ids: &[String],
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     policy: CompilePolicy,
     static_artifacts: StaticCompilationArtifacts<'_>,
 ) -> Result<CompiledExecution, LixError> {
@@ -142,7 +142,6 @@ async fn compile_execution_with_context(
         compiler_context.active_history_root_commit_id(),
         active_account_ids,
         origin_key,
-        allow_internal_relations,
         static_artifacts.parse_duration,
     )
     .await?;
@@ -213,6 +212,15 @@ async fn compile_execution_with_context(
     }
 
     let result_contract = result_contract_for_statements(&statements);
+    let scalar_read_only_query =
+        requirements.read_only_query && statements.iter().all(statement_has_no_relation_references);
+    if !public_write_owns_execution
+        && !public_read_owns_execution
+        && requirements.read_only_query
+        && !scalar_read_only_query
+    {
+        return Err(direct_reads_removed_error());
+    }
     let mut direct_explain = None;
     let (effects, direct_execution) = if public_write_owns_execution || public_read_owns_execution {
         (PlanEffects::default(), None)
@@ -313,6 +321,13 @@ async fn compile_execution_with_context(
     })
 }
 
+fn direct_reads_removed_error() -> LixError {
+    LixError::new(
+        "LIX_ERROR_DIRECT_READS_UNSUPPORTED",
+        "Direct reads are no longer supported. Route read queries through semantic public surfaces instead of backend SQL passthrough.",
+    )
+}
+
 async fn prepare_public_plan_for_compile(
     dialect: SqlDialect,
     functions: DynFunctionProvider,
@@ -324,7 +339,6 @@ async fn prepare_public_plan_for_compile(
     active_history_root_commit_id: Option<&str>,
     active_account_ids: &[String],
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     parse_duration: Option<Duration>,
 ) -> Result<Option<PublicPlan>, LixError> {
     prepare_public_plan_with_registry_context_and_functions(
@@ -338,7 +352,6 @@ async fn prepare_public_plan_for_compile(
         active_history_root_commit_id,
         active_account_ids,
         origin_key,
-        allow_internal_relations,
         parse_duration,
     )
     .await
@@ -350,7 +363,6 @@ pub(crate) async fn compile_execution_from_bound_statement_with_context(
     active_version_id: &str,
     active_account_ids: &[String],
     origin_key: Option<&str>,
-    allow_internal_relations: bool,
     policy: CompilePolicy,
 ) -> Result<CompiledExecution, LixError> {
     compile_execution_with_context(
@@ -360,7 +372,6 @@ pub(crate) async fn compile_execution_from_bound_statement_with_context(
         active_version_id,
         active_account_ids,
         origin_key,
-        allow_internal_relations,
         policy,
         StaticCompilationArtifacts {
             parse_duration: bound_statement.parse_duration(),
@@ -422,6 +433,23 @@ fn validate_compiled_direct_execution(
     Ok(())
 }
 
+fn statement_has_no_relation_references(statement: &Statement) -> bool {
+    let mut found_relation = false;
+    let _ = visit_relations(statement, |relation| {
+        found_relation = relation
+            .0
+            .last()
+            .and_then(ObjectNamePart::as_ident)
+            .is_some();
+        if found_relation {
+            ControlFlow::<()>::Break(())
+        } else {
+            ControlFlow::<()>::Continue(())
+        }
+    });
+    !found_relation
+}
+
 #[cfg(test)]
 pub(crate) fn top_level_write_target_name(statement: &Statement) -> Option<String> {
     match statement {
@@ -449,7 +477,7 @@ pub(crate) fn top_level_write_target_name(statement: &Statement) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::top_level_write_target_name;
+    use super::{direct_reads_removed_error, top_level_write_target_name};
     use crate::sql::parser::parse_sql_statements;
 
     #[test]
@@ -483,5 +511,18 @@ mod tests {
         let statements =
             parse_sql_statements("SELECT * FROM lix_file WHERE id = 'f1'").expect("parse");
         assert_eq!(top_level_write_target_name(&statements[0]), None);
+    }
+
+    #[test]
+    fn direct_reads_are_explicitly_reported_as_unsupported() {
+        let error = direct_reads_removed_error();
+        assert_eq!(error.code, "LIX_ERROR_DIRECT_READS_UNSUPPORTED");
+        assert!(
+            error
+                .description
+                .contains("Direct reads are no longer supported"),
+            "unexpected description: {}",
+            error.description
+        );
     }
 }

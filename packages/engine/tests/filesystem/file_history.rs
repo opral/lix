@@ -214,7 +214,6 @@ async fn boot_engine_with_json_plugin(
         .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
-            access_to_internal: true,
         }))
         .await
         .expect("boot_simulated_lix should succeed");

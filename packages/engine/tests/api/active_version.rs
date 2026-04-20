@@ -63,45 +63,6 @@ fn first_text(result: &lix_engine::ExecuteResult) -> String {
     }
 }
 
-async fn workspace_metadata_value(
-    engine: &support::simulation_test::SimulatedLix,
-    key: &str,
-) -> Option<String> {
-    let result = engine
-        .execute(
-            "SELECT value \
-             FROM lix_internal_workspace_metadata \
-             WHERE key = $1 \
-             LIMIT 1",
-            &[Value::Text(key.to_string())],
-        )
-        .await
-        .expect("workspace metadata query should succeed");
-    result.statements[0]
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .map(first_text_value)
-}
-
-async fn workspace_metadata_value_lix(lix: &Lix, key: &str) -> Option<String> {
-    let result = lix
-        .execute(
-            "SELECT value \
-             FROM lix_internal_workspace_metadata \
-             WHERE key = $1 \
-             LIMIT 1",
-            &[Value::Text(key.to_string())],
-        )
-        .await
-        .expect("workspace metadata query should succeed");
-    result.statements[0]
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .map(first_text_value)
-}
-
 fn first_text_value(value: &Value) -> String {
     match value {
         Value::Text(value) => value.clone(),
@@ -173,11 +134,12 @@ async fn run_init_seeds_default_active_version_deterministic(sim: SimulationArgs
     );
     assert_eq!(version_name, "main");
 
-    let persisted = workspace_metadata_value(&engine, "active_version_id")
+    let public_active_version = engine
+        .active_version_id()
         .await
-        .expect("workspace metadata should persist active version id");
-    assert_eq!(persisted, active_version_id);
-    sim.assert_deterministic(persisted);
+        .expect("public active_version_id API should succeed");
+    assert_eq!(public_active_version, active_version_id);
+    sim.assert_deterministic(public_active_version);
 }
 
 simulation_test!(
@@ -276,10 +238,13 @@ simulation_test!(
         );
         assert_eq!(active_version_id, "version-switch-target");
 
-        let persisted = workspace_metadata_value(&engine, "active_version_id")
-            .await
-            .expect("workspace metadata should persist active version id");
-        assert_eq!(persisted, "version-switch-target");
+        assert_eq!(
+            engine
+                .active_version_id()
+                .await
+                .expect("public active_version_id API should succeed"),
+            "version-switch-target"
+        );
     }
 );
 
@@ -319,10 +284,13 @@ simulation_test!(
             );
             assert_eq!(active_version_id, expected);
 
-            let persisted = workspace_metadata_value(&engine, "active_version_id")
-                .await
-                .expect("workspace metadata should persist active version id");
-            assert_eq!(persisted, expected);
+            assert_eq!(
+                engine
+                    .active_version_id()
+                    .await
+                    .expect("public active_version_id API should succeed"),
+                expected
+            );
         }
     }
 );
@@ -498,8 +466,10 @@ fn additional_session_switch_does_not_mutate_workspace_active_version() {
         assert_eq!(first_text(&workspace_active), version.id);
         assert_eq!(first_text(&worker_active), "global");
         assert_eq!(
-            workspace_metadata_value_lix(&lix, "active_version_id").await,
-            Some(version.id.clone())
+            lix.active_version_id()
+                .await
+                .expect("public active_version_id API should succeed"),
+            version.id
         );
 
         drop(worker);

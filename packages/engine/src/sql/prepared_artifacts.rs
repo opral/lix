@@ -9,7 +9,6 @@ use crate::backend::TransactionBeginMode;
 use crate::catalog::{CatalogReadTimeProjectionRequest, ResolvedRelation, SurfaceReadFreshness};
 use crate::common::Value;
 use crate::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
-use crate::sql::logical_plan::ResultContract;
 use crate::streams::StateCommitStreamOperation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -462,13 +461,6 @@ pub struct PreparedPublicRead {
     pub execution: PreparedPublicReadPlanArtifact,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedDirectReadArtifact {
-    pub prepared_batch: PreparedBatch,
-    pub result_contract: ResultContract,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum PreparedExplainMode {
@@ -516,7 +508,7 @@ pub struct ReadDiagnosticContext {
 #[allow(dead_code)]
 pub enum PreparedReadArtifact {
     Public(PreparedPublicRead),
-    Direct(PreparedDirectReadArtifact),
+    Scalar(PreparedBatchReadArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq)]

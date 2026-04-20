@@ -69,11 +69,10 @@ pub(crate) use api::{
     prepare_plain_explain_template, prepare_public_plan, prepare_public_read,
     prepare_public_read_artifact, prepare_public_write, public_authoritative_write_error,
     public_selector_column_name, public_selector_version_column, public_write_preparation_error,
-    refresh_materialized_public_write_explain, reject_internal_table_writes,
-    reject_public_create_table, resolve_placeholder_index,
-    should_invalidate_installed_plugins_cache_for_statements, BoundSql, BoundStatementInstance,
-    CanonicalStateAssignments, CanonicalStateRowKey, CommittedReadContext, CompilePolicy,
-    CompiledExecution, CompiledExplainDiagnostics, DirectoryInsertAssignments,
+    refresh_materialized_public_write_explain, reject_public_create_table,
+    resolve_placeholder_index, should_invalidate_installed_plugins_cache_for_statements, BoundSql,
+    BoundStatementInstance, CanonicalStateAssignments, CanonicalStateRowKey, CommittedReadContext,
+    CompilePolicy, CompiledExecution, CompiledExplainDiagnostics, DirectoryInsertAssignments,
     DirectoryUpdateAssignments, EntityAssignmentsSemantics, EntityInsertSemantics,
     ExactEffectiveStateRow, ExactEffectiveStateRowRequest, FileInsertAssignments,
     FileUpdateAssignments, FilesystemWriteIntent, InsertOnConflictAction, MutationPayload,
@@ -109,7 +108,6 @@ pub(crate) use write_artifacts::{
 // Existing root helpers used outside the compiler stages.
 pub(crate) use physical_plan::source_sql::lower_catalog_relation_binding_to_source_sql;
 pub(crate) use relation_policy::{
-    builtin_relation_inventory, classify_builtin_relation_name, classify_relation_name,
-    object_name_is_internal_relation, object_name_is_protected_builtin_ddl_target,
-    protected_builtin_public_surface_names, relation_policy_choice_summary, RelationPolicy,
+    classify_builtin_relation_name, classify_relation_name, protected_builtin_public_surface_names,
+    RelationPolicy,
 };

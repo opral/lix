@@ -32,8 +32,7 @@ fn boot_sqlite_engine_at_path(path: &Path, wasm_runtime: Arc<dyn WasmRuntime>) -
     let config = LixConfig::new(
         Box::new(backend) as Box<dyn LixBackend + Send + Sync>,
         wasm_runtime,
-    )
-    .with_access_to_internal(true);
+    );
     Arc::new(Lix::boot(config))
 }
 

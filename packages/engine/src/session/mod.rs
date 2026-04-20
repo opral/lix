@@ -42,9 +42,8 @@ use crate::sql::parse_sql_statements;
 use crate::sql::{
     extract_explicit_transaction_script, parse_sql_with_timing,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
-    reject_internal_table_writes, reject_public_create_table,
-    transaction_control_statement_denied_error, CommittedReadContext, QueryDependency,
-    StatementBatch,
+    reject_public_create_table, transaction_control_statement_denied_error, CommittedReadContext,
+    QueryDependency, StatementBatch,
 };
 use crate::streams::{StateCommitStream, StateCommitStreamFilter};
 use crate::transaction::{
@@ -509,7 +508,7 @@ impl Session {
         params: &[Value],
         options: ExecuteOptions,
     ) -> Result<ExecuteResult, LixError> {
-        self.execute_impl_sql(sql, params, options, false).await
+        self.execute_impl_sql(sql, params, options).await
     }
 
     pub(crate) async fn execute_impl_sql(
@@ -517,20 +516,13 @@ impl Session {
         sql: &str,
         params: &[Value],
         options: ExecuteOptions,
-        allow_internal_relations: bool,
     ) -> Result<ExecuteResult, LixError> {
-        let allow_internal_sql = allow_internal_relations || self.session_host.access_to_internal();
-
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
-        if !allow_internal_sql {
-            reject_public_create_table(&parsed_statements)?;
-            reject_internal_table_writes(&parsed_statements)?;
-        }
+        reject_public_create_table(&parsed_statements)?;
         let explicit_transaction_script =
             extract_explicit_transaction_script(&parsed_statements, params)?.is_some();
-        if !allow_internal_sql
-            && contains_transaction_control_statement(&parsed_statements)
+        if contains_transaction_control_statement(&parsed_statements)
             && !explicit_transaction_script
         {
             return Err(transaction_control_statement_denied_error());
@@ -566,7 +558,6 @@ impl Session {
                 let prepared_read_batch = prepare_committed_read_batch_with_backend(
                     self.session_host.backend().as_ref(),
                     &statement_batch,
-                    allow_internal_sql,
                     &committed_read_context,
                 )
                 .await?;
@@ -608,7 +599,6 @@ impl Session {
                     let prepared_read_batch = prepare_committed_read_batch_with_backend(
                         self.session_host.backend().as_ref(),
                         &statement_batch,
-                        allow_internal_sql,
                         &committed_read_context,
                     )
                     .await?;
@@ -655,7 +645,6 @@ impl Session {
                         prepare_committed_read_batch_in_transaction(
                             transaction.as_mut(),
                             &statement_batch,
-                            allow_internal_sql,
                             &committed_read_context,
                         )
                         .await?
@@ -693,7 +682,6 @@ impl Session {
                     &execution_context,
                     &mut write_transaction,
                     &statement_batch,
-                    allow_internal_sql,
                     &mut context,
                 )
                 .await;
@@ -1022,10 +1010,7 @@ impl<'a> SessionTransaction<'a> {
     ) -> Result<crate::ExecuteResult, LixError> {
         let parsed = parse_sql_with_timing(sql).map_err(LixError::from)?;
         let parsed_statements = parsed.statements;
-        if !self.session_host.access_to_internal() {
-            reject_public_create_table(&parsed_statements)?;
-            reject_internal_table_writes(&parsed_statements)?;
-        }
+        reject_public_create_table(&parsed_statements)?;
         let execution_context = self.execution_context();
         let write_transaction = self.write_transaction.as_mut().ok_or_else(|| LixError {
             code: "LIX_ERROR_UNKNOWN".to_string(),
@@ -1037,7 +1022,6 @@ impl<'a> SessionTransaction<'a> {
             write_transaction,
             parsed_statements,
             params,
-            self.session_host.access_to_internal(),
             &mut self.context,
             Some(parsed.parse_duration),
         )
@@ -1348,26 +1332,6 @@ mod tests {
     }
 
     #[test]
-    fn plain_reads_use_read_transaction_mode() {
-        run_with_large_stack(|| async move {
-            let backend = RecordingBackend::new();
-            let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                lix.engine().session_host(),
-                "version-test".to_string(),
-                Vec::new(),
-            );
-
-            let result = session
-                .execute("SELECT 1", &[])
-                .await
-                .expect("plain read should succeed");
-            assert_eq!(result.statements[0].rows[0][0], crate::Value::Integer(1));
-            assert_eq!(backend.modes(), vec![TransactionBeginMode::Read]);
-        });
-    }
-
-    #[test]
     fn deterministic_reads_classify_as_committed_runtime_mutation() {
         run_with_large_stack(|| async move {
             let backend = RecordingBackend::new();
@@ -1482,37 +1446,6 @@ mod tests {
                     "lowered committed-only read should stay on TransactionBeginMode::Read for `{sql}`",
                 );
             }
-        });
-    }
-
-    #[test]
-    fn parser_stage_internal_relation_guard_rejects_before_backend_execution() {
-        run_with_large_stack(|| async move {
-            let backend = RecordingBackend::new();
-            let lix = test_lix(backend.clone());
-            let session = Session::new_for_test(
-                lix.engine().session_host(),
-                "version-test".to_string(),
-                Vec::new(),
-            );
-
-            let error = session
-                .execute(
-                    "INSERT INTO lix_internal_snapshot (id, content) VALUES ('x', NULL)",
-                    &[],
-                )
-                .await
-                .expect_err("internal storage write should be rejected before execution");
-
-            assert_eq!(error.code, "LIX_ERROR_INTERNAL_TABLE_ACCESS_DENIED");
-            assert!(
-                backend.modes().is_empty(),
-                "parser-stage guard should reject before opening a transaction"
-            );
-            assert!(
-                backend.executed_sql().is_empty(),
-                "parser-stage guard should reject before reaching backend execution"
-            );
         });
     }
 

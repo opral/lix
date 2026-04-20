@@ -2947,87 +2947,6 @@ simulation_test!(
 );
 
 simulation_test!(
-    explain_analyze_direct_read_only_query_reports_runtime_metrics,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let engine = sim
-            .boot_simulated_lix(None)
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine.initialize().await.unwrap();
-
-        let result = engine
-            .execute("EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 AS value", &[])
-            .await
-            .unwrap();
-
-        assert_explain_request_json(&result, "analyze", "json");
-        let explain_json = explain_json_payload(&result);
-        assert_eq!(
-            explain_json
-                .get("semantic_statement")
-                .and_then(|value| value.get("kind"))
-                .and_then(JsonValue::as_str),
-            Some("direct")
-        );
-        assert_eq!(
-            explain_json
-                .get("logical_plan")
-                .and_then(|value| value.get("kind"))
-                .and_then(JsonValue::as_str),
-            Some("direct")
-        );
-        assert_eq!(
-            explain_json
-                .get("optimized_logical_plan")
-                .and_then(|value| value.get("kind"))
-                .and_then(JsonValue::as_str),
-            Some("direct")
-        );
-        assert!(
-            explain_json.get("physical_plan").is_none(),
-            "direct analyzed explain should not invent a physical_plan section"
-        );
-        assert_stage_timings_contract(explain_json, &["parse", "logical_planning"]);
-        assert_missing_stage_names(
-            explain_json,
-            &[
-                "bind",
-                "semantic_analysis",
-                "routing",
-                "capability_resolution",
-                "physical_planning",
-                "artifact_preparation",
-            ],
-        );
-        let analyzed_runtime = explain_json
-            .get("analyzed_runtime")
-            .and_then(|value| value.as_object())
-            .expect("internal EXPLAIN ANALYZE should expose analyzed_runtime");
-        assert_eq!(
-            analyzed_runtime
-                .get("output_row_count")
-                .and_then(|value| value.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            analyzed_runtime
-                .get("output_column_count")
-                .and_then(|value| value.as_u64()),
-            Some(1)
-        );
-        assert_eq!(
-            analyzed_runtime
-                .get("output_columns")
-                .and_then(|value| value.as_array())
-                .cloned(),
-            Some(vec![serde_json::Value::String("value".to_string())])
-        );
-        assert_no_rust_debug_leaks(explain_json);
-    }
-);
-
-simulation_test!(
     plain_explain_omits_analyzed_runtime,
     simulations = [sqlite, postgres],
     |sim| async move {
@@ -3075,37 +2994,37 @@ simulation_test!(
 
         let cases = [
             AcceptedCase {
-                sql: "EXPLAIN SELECT 1 AS value",
+                sql: "EXPLAIN SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "plan",
                 expected_format: "text",
             },
             AcceptedCase {
-                sql: "EXPLAIN ANALYZE SELECT 1 AS value",
+                sql: "EXPLAIN ANALYZE SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "analyze",
                 expected_format: "text",
             },
             AcceptedCase {
-                sql: "EXPLAIN (FORMAT JSON) SELECT 1 AS value",
+                sql: "EXPLAIN (FORMAT JSON) SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "plan",
                 expected_format: "json",
             },
             AcceptedCase {
-                sql: "EXPLAIN (ANALYZE, FORMAT JSON) SELECT 1 AS value",
+                sql: "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "analyze",
                 expected_format: "json",
             },
             AcceptedCase {
-                sql: "EXPLAIN (ANALYZE FALSE, FORMAT JSON) SELECT 1 AS value",
+                sql: "EXPLAIN (ANALYZE FALSE, FORMAT JSON) SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "plan",
                 expected_format: "json",
             },
             AcceptedCase {
-                sql: "EXPLAIN (FORMAT JSON, ANALYZE FALSE) SELECT 1 AS value",
+                sql: "EXPLAIN (FORMAT JSON, ANALYZE FALSE) SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "plan",
                 expected_format: "json",
             },
             AcceptedCase {
-                sql: "EXPLAIN (ANALYZE TRUE, FORMAT TEXT) SELECT 1 AS value",
+                sql: "EXPLAIN (ANALYZE TRUE, FORMAT TEXT) SELECT id FROM lix_version ORDER BY id LIMIT 1",
                 expected_mode: "analyze",
                 expected_format: "text",
             },

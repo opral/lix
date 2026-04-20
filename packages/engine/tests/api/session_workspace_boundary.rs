@@ -156,27 +156,6 @@ async fn assert_no_owned_observe_event(observed: &mut ObserveEventsOwned, label:
     assert!(result.is_err(), "{label} should not emit another event");
 }
 
-async fn workspace_metadata_value_lix(lix: &Lix, key: &str) -> Option<String> {
-    let result = lix
-        .execute(
-            "SELECT value \
-             FROM lix_internal_workspace_metadata \
-             WHERE key = $1 \
-             LIMIT 1",
-            &[Value::Text(key.to_string())],
-        )
-        .await
-        .expect("workspace metadata query should succeed");
-    result.statements[0]
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .map(|value| match value {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected workspace metadata text value, got {other:?}"),
-        })
-}
-
 #[test]
 fn booted_lix_uses_workspace_backed_root_session() {
     run_with_large_stack(|| async move {
@@ -204,12 +183,18 @@ fn booted_lix_uses_workspace_backed_root_session() {
             .expect("set_active_account_ids should succeed");
 
         assert_eq!(
-            workspace_metadata_value_lix(workspace.as_ref(), "active_version_id").await,
-            Some(version.id.clone())
+            workspace
+                .active_version_id()
+                .await
+                .expect("workspace active_version_id should load"),
+            version.id.clone()
         );
         assert_eq!(
-            workspace_metadata_value_lix(workspace.as_ref(), "active_account_ids").await,
-            Some(r#"["acct-root"]"#.to_string())
+            workspace
+                .active_account_ids()
+                .await
+                .expect("workspace active_account_ids should load"),
+            vec!["acct-root".to_string()]
         );
 
         drop(workspace);
@@ -775,20 +760,11 @@ fn create_checkpoint_uses_the_calling_sessions_active_version() {
             .expect("worker create_checkpoint should succeed");
 
         let workspace_checkpoint_after = lix
-            .execute(
-                "SELECT checkpoint_commit_id \
-                 FROM lix_internal_last_checkpoint \
-                 WHERE version_id = $1 \
-                 LIMIT 1",
-                &[Value::Text(workspace_version.id.clone())],
-            )
+            .create_checkpoint()
             .await
-            .expect("workspace checkpoint query should succeed");
+            .expect("workspace create_checkpoint should still succeed");
 
-        assert_eq!(
-            first_text(&workspace_checkpoint_after),
-            workspace_checkpoint.id
-        );
+        assert_eq!(workspace_checkpoint_after.id, workspace_checkpoint.id);
 
         drop(worker);
         drop(lix);
@@ -1165,12 +1141,18 @@ fn workspace_reopen_restores_runtime_state_from_workspace_metadata() {
                 .expect("set_active_account_ids should succeed");
 
             assert_eq!(
-                workspace_metadata_value_lix(workspace.as_ref(), "active_version_id").await,
-                Some(version.id.clone())
+                workspace
+                    .active_version_id()
+                    .await
+                    .expect("workspace active_version_id should load"),
+                version.id.clone()
             );
             assert_eq!(
-                workspace_metadata_value_lix(workspace.as_ref(), "active_account_ids").await,
-                Some(r#"["acct-persisted"]"#.to_string())
+                workspace
+                    .active_account_ids()
+                    .await
+                    .expect("workspace active_account_ids should load"),
+                vec!["acct-persisted".to_string()]
             );
 
             version.id
@@ -1196,17 +1178,18 @@ fn workspace_reopen_restores_runtime_state_from_workspace_metadata() {
             vec!["acct-persisted".to_string()]
         );
         assert_eq!(
-            workspace_metadata_value_lix(reopened.as_ref(), "active_version_id").await,
-            Some(
-                reopened
-                    .active_version_id()
-                    .await
-                    .expect("reopened active_version_id should load again"),
-            )
+            reopened
+                .active_version_id()
+                .await
+                .expect("reopened active_version_id should load again"),
+            version_id
         );
         assert_eq!(
-            workspace_metadata_value_lix(reopened.as_ref(), "active_account_ids").await,
-            Some(r#"["acct-persisted"]"#.to_string())
+            reopened
+                .active_account_ids()
+                .await
+                .expect("reopened active_account_ids should load again"),
+            vec!["acct-persisted".to_string()]
         );
 
         drop(reopened);

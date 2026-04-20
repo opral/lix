@@ -1,7 +1,5 @@
 use crate::{LixError, SqlDialect, Value};
-use sqlparser::ast::{
-    Statement, TableFactor, TableObject, Value as SqlValue, VisitMut, VisitorMut,
-};
+use sqlparser::ast::{Expr, Statement, Value as SqlValue, Visit, VisitMut, Visitor, VisitorMut};
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::{Parser, ParserError};
 use std::collections::HashMap;
@@ -40,18 +38,6 @@ pub(crate) fn parse_sql_statements(sql: &str) -> Result<Vec<Statement>, LixError
     parse_sql_statements_with_timing(sql).map(|parsed| parsed.statements)
 }
 
-/// Early safety/UX gate that stops obviously forbidden internal-storage writes
-/// before the session opens a transaction, compiles SQL, or touches backend
-/// execution owners.
-pub(crate) fn reject_internal_table_writes(statements: &[Statement]) -> Result<(), LixError> {
-    for statement in statements {
-        if statement_mutates_protected_lix_relation(statement) {
-            return Err(crate::sql::diagnostics::internal_table_access_denied_error());
-        }
-    }
-    Ok(())
-}
-
 /// Early UX gate for unsupported public DDL. This stays at parser stage so a
 /// user gets a stable product-level error before the request reaches lower SQL
 /// preparation or backend execution layers.
@@ -63,6 +49,72 @@ pub(crate) fn reject_public_create_table(statements: &[Statement]) -> Result<(),
         return Err(crate::sql::diagnostics::public_create_table_denied_error());
     }
     Ok(())
+}
+
+pub(crate) fn reject_backend_implementation_functions(
+    statements: &[Statement],
+) -> Result<(), LixError> {
+    let mut visitor = BackendFunctionVisitor;
+    for statement in statements {
+        if let ControlFlow::Break(error) = statement.visit(&mut visitor) {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+struct BackendFunctionVisitor;
+
+impl Visitor for BackendFunctionVisitor {
+    type Break = LixError;
+
+    fn pre_visit_expr(&mut self, expr: &Expr) -> ControlFlow<Self::Break> {
+        let Expr::Function(function) = expr else {
+            return ControlFlow::Continue(());
+        };
+
+        let Some(function_name) = function
+            .name
+            .0
+            .last()
+            .and_then(|part| part.as_ident())
+            .map(|ident| ident.value.to_ascii_lowercase())
+        else {
+            return ControlFlow::Continue(());
+        };
+
+        if !is_backend_implementation_function_name(&function_name) {
+            return ControlFlow::Continue(());
+        }
+
+        ControlFlow::Break(LixError {
+            code: "LIX_ERROR_SQL_UNSUPPORTED_FUNCTION".to_string(),
+            description: format!(
+                "Function `{function_name}` is not part of Lix SQL. Use the corresponding `lix_*` function instead."
+            ),
+            hint: Some(
+                "backend-specific helper functions are implementation details and are not supported in user-authored SQL"
+                    .to_string(),
+            ),
+        })
+    }
+}
+
+fn is_backend_implementation_function_name(function_name: &str) -> bool {
+    matches!(
+        function_name,
+        "json"
+            | "json_extract"
+            | "json_type"
+            | "json_quote"
+            | "jsonb_extract_path"
+            | "jsonb_extract_path_text"
+            | "jsonb_typeof"
+            | "zeroblob"
+            | "decode"
+            | "convert_to"
+            | "convert_from"
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -273,64 +325,6 @@ fn dense_index_for_source(
     dense_sources.push(source_index);
     source_to_dense.insert(source_index, dense_index);
     dense_index
-}
-
-fn statement_mutates_protected_lix_relation(statement: &Statement) -> bool {
-    match statement {
-        Statement::Insert(insert) => match &insert.table {
-            TableObject::TableName(name) => crate::sql::object_name_is_internal_relation(name),
-            _ => false,
-        },
-        Statement::Update(update) => match &update.table.relation {
-            TableFactor::Table { name, .. } => crate::sql::object_name_is_internal_relation(name),
-            _ => false,
-        },
-        Statement::Delete(delete) => {
-            let tables = match &delete.from {
-                sqlparser::ast::FromTable::WithFromKeyword(tables)
-                | sqlparser::ast::FromTable::WithoutKeyword(tables) => tables,
-            };
-            tables.iter().any(|table| match &table.relation {
-                TableFactor::Table { name, .. } => {
-                    crate::sql::object_name_is_internal_relation(name)
-                }
-                _ => false,
-            })
-        }
-        Statement::AlterTable(alter) => {
-            crate::sql::object_name_is_protected_builtin_ddl_target(&alter.name)
-        }
-        Statement::CreateIndex(create_index) => {
-            crate::sql::object_name_is_protected_builtin_ddl_target(&create_index.table_name)
-        }
-        Statement::CreateTrigger(create_trigger) => {
-            crate::sql::object_name_is_protected_builtin_ddl_target(&create_trigger.table_name)
-                || create_trigger
-                    .referenced_table_name
-                    .as_ref()
-                    .map(crate::sql::object_name_is_protected_builtin_ddl_target)
-                    .unwrap_or(false)
-        }
-        Statement::DropTrigger(drop_trigger) => drop_trigger
-            .table_name
-            .as_ref()
-            .map(crate::sql::object_name_is_protected_builtin_ddl_target)
-            .unwrap_or(false),
-        Statement::Drop { names, table, .. } => {
-            names
-                .iter()
-                .any(crate::sql::object_name_is_protected_builtin_ddl_target)
-                || table
-                    .as_ref()
-                    .map(crate::sql::object_name_is_protected_builtin_ddl_target)
-                    .unwrap_or(false)
-        }
-        Statement::Truncate(truncate) => truncate
-            .table_names
-            .iter()
-            .any(|target| crate::sql::object_name_is_protected_builtin_ddl_target(&target.name)),
-        _ => false,
-    }
 }
 
 fn clone_param_from_sources(

@@ -180,18 +180,6 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(live_table.statements[0].rows, vec![vec![Value::Integer(0)]]);
-
-        let internal_live_table = engine
-            .execute(
-                "SELECT COUNT(*) FROM lix_internal_live_v1_helper_registered_schema",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            internal_live_table.statements[0].rows,
-            vec![vec![Value::Integer(0)]]
-        );
     }
 );
 
@@ -576,12 +564,17 @@ simulation_test!(
 
         let err = result.expect_err("inserting via SQLite json() should fail");
         assert_eq!(
-            err.code, "LIX_ERROR_UNSUPPORTED_WRITE_EXPRESSION",
-            "SQLite json() rejection should carry the categorized code"
+            err.code, "LIX_ERROR_SQL_UNSUPPORTED_FUNCTION",
+            "SQLite json() rejection should carry the unsupported-function code"
         );
         assert!(
             !err.description.contains("day-1"),
             "error must not leak internal 'day-1' phrasing, got: {}",
+            err.description
+        );
+        assert!(
+            err.description.contains("json"),
+            "description should name the rejected backend function; got: {}",
             err.description
         );
         let hint = err
@@ -589,8 +582,8 @@ simulation_test!(
             .as_deref()
             .expect("SQLite json() insert should attach a hint");
         assert!(
-            hint.contains("lix_json"),
-            "hint should mention lix_json; got: {hint}"
+            hint.contains("implementation details"),
+            "hint should explain that backend helpers are not public SQL; got: {hint}"
         );
         assert!(
             !hint.contains("--params"),

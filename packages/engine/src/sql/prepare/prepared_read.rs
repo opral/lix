@@ -19,16 +19,16 @@ use crate::sql::physical_plan::{
 };
 use crate::sql::prepare::SqlPreparationMetadataReader;
 use crate::sql::{
-    PreparedBatchReadArtifact, PreparedDirectReadArtifact, PreparedDirectoryHistoryAggregate,
-    PreparedDirectoryHistoryField, PreparedDirectoryHistoryPredicate,
-    PreparedDirectoryHistoryProjection, PreparedDirectoryHistoryReadPlan,
-    PreparedDirectoryHistorySortKey, PreparedEntityHistoryField, PreparedEntityHistoryPredicate,
-    PreparedEntityHistoryProjection, PreparedEntityHistoryReadPlan, PreparedEntityHistorySortKey,
-    PreparedExplainMode, PreparedFileHistoryAggregate, PreparedFileHistoryField,
-    PreparedFileHistoryPredicate, PreparedFileHistoryProjection, PreparedFileHistoryReadPlan,
-    PreparedFileHistorySortKey, PreparedHistoryReadArtifact, PreparedHistoryReadPlan,
-    PreparedPublicRead, PreparedPublicReadPlanArtifact, PreparedReadArtifact, PreparedReadBatch,
-    PreparedReadStatement, PreparedReadTimeProjectionArtifact, PreparedStateHistoryAggregate,
+    PreparedBatchReadArtifact, PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryField,
+    PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryProjection,
+    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedEntityHistoryField,
+    PreparedEntityHistoryPredicate, PreparedEntityHistoryProjection, PreparedEntityHistoryReadPlan,
+    PreparedEntityHistorySortKey, PreparedExplainMode, PreparedFileHistoryAggregate,
+    PreparedFileHistoryField, PreparedFileHistoryPredicate, PreparedFileHistoryProjection,
+    PreparedFileHistoryReadPlan, PreparedFileHistorySortKey, PreparedHistoryReadArtifact,
+    PreparedHistoryReadPlan, PreparedPublicRead, PreparedPublicReadPlanArtifact,
+    PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
+    PreparedReadTimeProjectionArtifact, PreparedStateHistoryAggregate,
     PreparedStateHistoryAggregatePredicate, PreparedStateHistoryField,
     PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
     PreparedStateHistoryProjectionValue, PreparedStateHistoryReadPlan, PreparedStateHistorySortKey,
@@ -56,39 +56,26 @@ pub(crate) struct CommittedReadContext<'a> {
 pub(crate) async fn prepare_committed_read_batch_with_backend(
     backend: &dyn LixBackend,
     statement_batch: &StatementBatch,
-    allow_internal_relations: bool,
     read_context: &CommittedReadContext<'_>,
 ) -> Result<PreparedReadBatch, LixError> {
     let mut metadata_reader = backend;
-    prepare_committed_read_batch_from_reader(
-        &mut metadata_reader,
-        statement_batch,
-        allow_internal_relations,
-        read_context,
-    )
-    .await
+    prepare_committed_read_batch_from_reader(&mut metadata_reader, statement_batch, read_context)
+        .await
 }
 
 pub(crate) async fn prepare_committed_read_batch_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     statement_batch: &StatementBatch,
-    allow_internal_relations: bool,
     read_context: &CommittedReadContext<'_>,
 ) -> Result<PreparedReadBatch, LixError> {
     let mut metadata_reader = transaction;
-    prepare_committed_read_batch_from_reader(
-        &mut metadata_reader,
-        statement_batch,
-        allow_internal_relations,
-        read_context,
-    )
-    .await
+    prepare_committed_read_batch_from_reader(&mut metadata_reader, statement_batch, read_context)
+        .await
 }
 
 async fn prepare_committed_read_batch_from_reader(
     metadata_reader: &mut dyn SqlPreparationMetadataReader,
     statement_batch: &StatementBatch,
-    allow_internal_relations: bool,
     read_context: &CommittedReadContext<'_>,
 ) -> Result<PreparedReadBatch, LixError> {
     let active_history_root_commit_id = metadata_reader
@@ -103,32 +90,20 @@ async fn prepare_committed_read_batch_from_reader(
         .compiler_seed
         .with_compiler_metadata(&compiler_metadata, active_history_root_commit_id.as_deref());
 
-    compile_committed_read_batch(
-        &compiler_context,
-        statement_batch,
-        allow_internal_relations,
-        read_context,
-    )
-    .await
+    compile_committed_read_batch(&compiler_context, statement_batch, read_context).await
 }
 
 pub(crate) async fn compile_committed_read_batch(
     compiler_context: &dyn SqlCompilerContext,
     statement_batch: &StatementBatch,
-    allow_internal_relations: bool,
     read_context: &CommittedReadContext<'_>,
 ) -> Result<PreparedReadBatch, LixError> {
     let mut mode = read_context.base_transaction_mode;
     let mut statements = Vec::new();
 
     for statement in statement_batch.steps() {
-        let prepared_statement = compile_committed_read_statement(
-            compiler_context,
-            statement,
-            allow_internal_relations,
-            read_context,
-        )
-        .await?;
+        let prepared_statement =
+            compile_committed_read_statement(compiler_context, statement, read_context).await?;
         mode = merge_committed_read_transaction_mode(mode, prepared_statement.transaction_mode);
         statements.push(prepared_statement);
     }
@@ -142,7 +117,6 @@ pub(crate) async fn compile_committed_read_batch(
 async fn compile_committed_read_statement(
     compiler_context: &dyn SqlCompilerContext,
     bound_statement: &BoundStatementInstance,
-    allow_internal_relations: bool,
     read_context: &CommittedReadContext<'_>,
 ) -> Result<PreparedReadStatement, LixError> {
     let source_sql = vec![bound_statement.statement().to_string()];
@@ -153,14 +127,16 @@ async fn compile_committed_read_statement(
         &diagnostic_context,
         compiler_context,
         bound_statement,
-        allow_internal_relations,
         read_context,
     )
     .await?;
+    let is_scalar_read = diagnostic_context.relation_names.is_empty();
     prepared_read_statement_from_compiled_execution(
         compiler_context.dialect(),
         compiled,
         diagnostic_context,
+        is_scalar_read,
+        bound_statement,
     )
 }
 
@@ -168,7 +144,6 @@ async fn compile_committed_execution_step(
     diagnostic_context: &ReadDiagnosticContext,
     compiler_context: &dyn SqlCompilerContext,
     bound_statement: &BoundStatementInstance,
-    allow_internal_relations: bool,
     read_context: &CommittedReadContext<'_>,
 ) -> Result<CompiledExecution, LixError> {
     match compile_execution_from_bound_statement_with_context(
@@ -177,7 +152,6 @@ async fn compile_committed_execution_step(
         read_context.active_version_id,
         read_context.active_account_ids,
         read_context.origin_key,
-        allow_internal_relations,
         CompilePolicy {
             skip_side_effect_collection: false,
         },
@@ -196,8 +170,11 @@ fn prepared_read_statement_from_compiled_execution(
     dialect: crate::SqlDialect,
     compiled: CompiledExecution,
     mut diagnostic_context: ReadDiagnosticContext,
+    is_scalar_read: bool,
+    bound_statement: &BoundStatementInstance,
 ) -> Result<PreparedReadStatement, LixError> {
-    let transaction_mode = transaction_mode_for_committed_read_execution(&compiled)?;
+    let transaction_mode =
+        transaction_mode_for_committed_read_execution(&compiled, is_scalar_read)?;
     diagnostic_context.plain_explain_template = compiled
         .plain_explain()
         .map(prepare_plain_explain_template)
@@ -221,12 +198,19 @@ fn prepared_read_statement_from_compiled_execution(
     let artifact = if let Some(public_read) = compiled.public_read() {
         PreparedReadArtifact::Public(prepare_public_read_artifact(public_read, dialect)?)
     } else if let Some(internal) = compiled.direct_execution() {
-        PreparedReadArtifact::Direct(PreparedDirectReadArtifact {
-            prepared_batch: PreparedBatch {
-                steps: internal.prepared_statements.clone(),
-            },
-            result_contract: compiled.result_contract,
-        })
+        if is_scalar_read {
+            PreparedReadArtifact::Scalar(PreparedBatchReadArtifact {
+                prepared_batch: prepared_batch_for_scalar_read(internal, bound_statement, dialect),
+            })
+        } else {
+            return Err(LixError::new(
+                "LIX_ERROR_DIRECT_READS_UNSUPPORTED",
+                format!(
+                    "committed read routing produced direct execution unexpectedly ({} prepared statement(s)); direct reads are no longer supported",
+                    internal.prepared_statements.len()
+                ),
+            ));
+        }
     } else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
@@ -239,6 +223,16 @@ fn prepared_read_statement_from_compiled_execution(
         artifact,
         diagnostic_context,
     })
+}
+
+fn prepared_batch_for_scalar_read(
+    direct: &super::compiled::CompiledDirectExecution,
+    _bound_statement: &BoundStatementInstance,
+    _dialect: crate::SqlDialect,
+) -> PreparedBatch {
+    PreparedBatch {
+        steps: direct.prepared_statements.clone(),
+    }
 }
 
 fn base_read_diagnostic_context(
@@ -918,6 +912,7 @@ fn merge_committed_read_transaction_mode(
 
 fn transaction_mode_for_committed_read_execution(
     compiled: &CompiledExecution,
+    is_scalar_read: bool,
 ) -> Result<TransactionBeginMode, LixError> {
     if compiled.plain_explain().is_some() {
         return Ok(TransactionBeginMode::Read);
@@ -926,14 +921,13 @@ fn transaction_mode_for_committed_read_execution(
         return Ok(public_read.committed_read_mode().transaction_mode());
     }
     if compiled.direct_execution().is_some() {
-        return if compiled.read_only_query {
-            Ok(TransactionBeginMode::Read)
-        } else {
-            Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "committed read routing compiled a non-read internal step unexpectedly",
-            ))
-        };
+        if is_scalar_read {
+            return Ok(TransactionBeginMode::Read);
+        }
+        return Err(LixError::new(
+            "LIX_ERROR_DIRECT_READS_UNSUPPORTED",
+            "committed read routing produced direct execution unexpectedly; direct reads are no longer supported",
+        ));
     }
     Err(LixError::new(
         "LIX_ERROR_UNKNOWN",

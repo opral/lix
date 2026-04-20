@@ -725,7 +725,6 @@ async fn evaluate_observe_snapshot(
     let transaction_mode = prepare_committed_read_batch_with_backend(
         session.session_host().backend().as_ref(),
         &statement_batch,
-        false,
         &committed_read_context,
     )
     .await?
@@ -739,7 +738,6 @@ async fn evaluate_observe_snapshot(
     let prepared_read_batch = prepare_committed_read_batch_in_transaction(
         transaction.as_mut(),
         &statement_batch,
-        false,
         &committed_read_context,
     )
     .await;
@@ -1329,7 +1327,10 @@ mod tests {
                 Vec::new(),
             );
 
-            let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+            let query = ObserveQuery::new(
+                "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
+                vec![],
+            );
             let mut observed_a = session
                 .observe(query.clone())
                 .expect("observe should succeed");
@@ -1370,7 +1371,10 @@ mod tests {
                 Vec::new(),
             );
 
-            let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+            let query = ObserveQuery::new(
+                "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
+                vec![],
+            );
             let mut observed_a = session
                 .observe(query.clone())
                 .expect("observe should succeed");
@@ -1411,7 +1415,10 @@ mod tests {
                 Vec::new(),
             );
 
-            let query = ObserveQuery::new("SELECT 'observe-shared-sentinel' AS marker", vec![]);
+            let query = ObserveQuery::new(
+                "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
+                vec![],
+            );
             let mut observed_a = session
                 .observe(query.clone())
                 .expect("observe should succeed");
@@ -1437,7 +1444,7 @@ mod tests {
 
             let mut observed_c = session
                 .observe(ObserveQuery::new(
-                    "SELECT 'observe-shared-sentinel' AS marker",
+                    "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
                     vec![],
                 ))
                 .expect("observe should succeed");
@@ -1450,7 +1457,7 @@ mod tests {
             );
 
             let _ = session
-                .execute("SELECT 1", &[])
+                .execute("SELECT id FROM lix_version ORDER BY id LIMIT 1", &[])
                 .await
                 .expect("sanity execute should succeed");
         });
@@ -1520,7 +1527,7 @@ mod tests {
             let mut state = build_observe_state(
                 &session,
                 ObserveQuery::new(
-                    "SELECT 'observe-shared-sentinel' AS marker, lix_active_version_id() AS version_id",
+                    "SELECT 'observe-shared-sentinel' AS marker, lix_active_version_id() AS version_id FROM lix_change LIMIT 1",
                     vec![],
                 ),
                 ObserveOptions::default(),
@@ -1683,7 +1690,10 @@ mod tests {
 
             let mut state = build_observe_state(
                 &session,
-                ObserveQuery::new("SELECT 'observe-snapshot-sentinel' AS marker", vec![]),
+                ObserveQuery::new(
+                    "SELECT 'observe-snapshot-sentinel' AS marker FROM lix_change LIMIT 1",
+                    vec![],
+                ),
                 ObserveOptions::default(),
             )
             .expect("observe state should build");
@@ -1742,7 +1752,10 @@ mod tests {
 
             let mut state = build_observe_state(
                 &session,
-                ObserveQuery::new("SELECT 'observe-snapshot-sentinel' AS marker", vec![]),
+                ObserveQuery::new(
+                    "SELECT 'observe-snapshot-sentinel' AS marker FROM lix_change LIMIT 1",
+                    vec![],
+                ),
                 ObserveOptions::default(),
             )
             .expect("observe state should build");

@@ -301,20 +301,5 @@ simulation_test!(
             )
             .await
             .unwrap();
-
-        let rows = engine
-            .execute(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_registered_schema_bootstrap \
-                 WHERE entity_id = 'on_conflict_schema~1' \
-                   AND file_id IS NULL \
-                   AND version_id = 'global'",
-                &[],
-            )
-            .await
-            .unwrap();
-        sim.assert_deterministic(rows.statements[0].rows.clone());
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_eq!(rows.statements[0].rows[0][0], Value::Integer(1));
     }
 );

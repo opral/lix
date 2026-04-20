@@ -21,8 +21,6 @@ pub(crate) trait SessionHost: Send + Sync {
 
     fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync>;
 
-    fn access_to_internal(&self) -> bool;
-
     async fn begin_write_unit(&self) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
 
     async fn begin_read_unit(

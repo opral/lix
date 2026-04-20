@@ -42,7 +42,6 @@ pub(crate) struct Engine {
     savepoint_counter: AtomicU64,
     public_surface_registry: RwLock<SurfaceRegistry>,
     catalog_projection_registry: Arc<CatalogProjectionRegistry>,
-    access_to_internal: bool,
     installed_plugins_cache: RwLock<Option<Vec<InstalledPlugin>>>,
     plugin_component_cache: Mutex<BTreeMap<String, CachedPluginComponent>>,
     state_commit_stream_bus: Arc<StateCommitStreamBus>,
@@ -52,7 +51,6 @@ impl Engine {
     pub(crate) fn new(
         backend: Box<dyn LixBackend + Send + Sync>,
         wasm_runtime: Arc<dyn WasmRuntime>,
-        access_to_internal: bool,
         boot_deterministic_settings: Option<DeterministicSettings>,
         public_surface_registry: SurfaceRegistry,
         catalog_projection_registry: Arc<CatalogProjectionRegistry>,
@@ -70,7 +68,6 @@ impl Engine {
             savepoint_counter: AtomicU64::new(0),
             public_surface_registry: RwLock::new(public_surface_registry),
             catalog_projection_registry,
-            access_to_internal,
             installed_plugins_cache: RwLock::new(None),
             plugin_component_cache: Mutex::new(BTreeMap::new()),
             state_commit_stream_bus: Arc::new(StateCommitStreamBus::default()),
@@ -83,10 +80,6 @@ impl Engine {
 
     pub(crate) fn schema_cache(&self) -> &SchemaCache {
         &self.schema_cache
-    }
-
-    pub(crate) fn access_to_internal(&self) -> bool {
-        self.access_to_internal
     }
 
     pub(crate) fn public_surface_registry(&self) -> SurfaceRegistry {
@@ -269,10 +262,6 @@ impl crate::session::SessionHost for EngineSessionHost {
 
     fn backend(&self) -> &Arc<dyn LixBackend + Send + Sync> {
         self.engine.backend()
-    }
-
-    fn access_to_internal(&self) -> bool {
-        self.engine.access_to_internal()
     }
 
     async fn begin_write_unit(

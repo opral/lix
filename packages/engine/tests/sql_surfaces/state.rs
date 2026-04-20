@@ -1230,24 +1230,6 @@ simulation_test!(
             "{\"value\":\"effective-updated\"}",
         );
         assert_boolean_like(&visible.statements[0].rows[0][1], true);
-
-        let tracked = engine
-            .execute(
-                "SELECT value \
-                 FROM lix_internal_live_v1_test_state_schema \
-                 WHERE schema_key = 'test_state_schema' \
-                   AND entity_id = 'effective-entity-u' \
-                   AND file_id = 'test-file' \
-                   AND version_id = 'version-a' \
-                   AND untracked = false \
-                   AND is_tombstone = 0",
-                &[],
-            )
-            .await
-            .unwrap();
-
-        assert_eq!(tracked.statements[0].rows.len(), 1);
-        assert_text(&tracked.statements[0].rows[0][0], "tracked-initial");
     }
 );
 

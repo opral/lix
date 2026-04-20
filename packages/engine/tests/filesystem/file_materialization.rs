@@ -406,24 +406,6 @@ async fn main_version_id(engine: &support::simulation_test::SimulatedLix) -> Str
     }
 }
 
-async fn active_version_commit_id(engine: &support::simulation_test::SimulatedLix) -> String {
-    let rows = engine
-        .execute(
-            "SELECT commit_id \
-             FROM lix_version \
-             WHERE id = lix_active_version_id() \
-             LIMIT 1",
-            &[],
-        )
-        .await
-        .expect("active version commit query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    match &rows.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected active version commit id text, got {other:?}"),
-    }
-}
-
 #[cfg(any())]
 async fn boot_engine_with_json_plugin(
     sim: &support::simulation_test::SimulationArgs,
@@ -437,7 +419,6 @@ async fn boot_engine_with_json_plugin(
         .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
-            access_to_internal: true,
         }))
         .await
         .expect("boot_simulated_lix should succeed");
@@ -467,7 +448,6 @@ async fn boot_engine_with_path_echo_plugin(
         .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
-            access_to_internal: true,
         }))
         .await
         .expect("boot_simulated_lix should succeed");
@@ -497,7 +477,6 @@ async fn boot_engine_with_before_aware_plugin(
         .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
-            access_to_internal: true,
         }))
         .await
         .expect("boot_simulated_lix should succeed");
@@ -586,13 +565,6 @@ fn assert_blob_bytes_eq(value: &Value, expected: &[u8]) {
         other => panic!("expected blob value, got {other:?}"),
     };
     assert_eq!(bytes.as_slice(), expected);
-}
-
-fn value_as_i64(value: &Value) -> i64 {
-    match value {
-        Value::Integer(v) => *v,
-        other => panic!("expected integer value, got {other:?}"),
-    }
 }
 
 fn value_as_text(value: &Value) -> String {
@@ -723,142 +695,6 @@ async fn binary_blob_hash_for_file_version(
         .map(|row| value_as_text(&row[0]))
 }
 
-async fn binary_chunk_hash_for_blob(
-    engine: &support::simulation_test::SimulatedLix,
-    blob_hash: &str,
-) -> Option<String> {
-    let rows = engine
-        .execute(
-            &format!(
-                "SELECT chunk_hash \
-                 FROM lix_internal_binary_blob_manifest_chunk \
-                 WHERE blob_hash = '{}' \
-                 ORDER BY chunk_index \
-                 LIMIT 1",
-                blob_hash
-            ),
-            &[],
-        )
-        .await
-        .expect("binary manifest chunk lookup should succeed");
-    rows.statements[0]
-        .rows
-        .first()
-        .map(|row| value_as_text(&row[0]))
-}
-
-async fn binary_manifest_row_count_by_hash(
-    engine: &support::simulation_test::SimulatedLix,
-    blob_hash: &str,
-) -> i64 {
-    let rows = engine
-        .execute(
-            &format!(
-                "SELECT COUNT(*) \
-                 FROM lix_internal_binary_blob_manifest \
-                 WHERE blob_hash = '{}'",
-                blob_hash
-            ),
-            &[],
-        )
-        .await
-        .expect("binary manifest row count query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    value_as_i64(&rows.statements[0].rows[0][0])
-}
-
-async fn orphan_binary_chunk_row_count(engine: &support::simulation_test::SimulatedLix) -> i64 {
-    let rows = engine
-        .execute(
-            "SELECT COUNT(*) \
-             FROM lix_internal_binary_chunk_store c \
-             LEFT JOIN lix_internal_binary_blob_manifest_chunk mc \
-               ON mc.chunk_hash = c.chunk_hash \
-             WHERE mc.chunk_hash IS NULL",
-            &[],
-        )
-        .await
-        .expect("orphan binary chunk count query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    value_as_i64(&rows.statements[0].rows[0][0])
-}
-
-async fn orphan_binary_manifest_chunk_row_count(
-    engine: &support::simulation_test::SimulatedLix,
-) -> i64 {
-    let rows = engine
-        .execute(
-            "SELECT COUNT(*) \
-             FROM lix_internal_binary_blob_manifest_chunk mc \
-             LEFT JOIN lix_internal_binary_blob_manifest m \
-               ON m.blob_hash = mc.blob_hash \
-             WHERE m.blob_hash IS NULL",
-            &[],
-        )
-        .await
-        .expect("orphan binary manifest chunk count query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    value_as_i64(&rows.statements[0].rows[0][0])
-}
-
-async fn binary_codec_counts_for_blob(
-    engine: &support::simulation_test::SimulatedLix,
-    blob_hash: &str,
-) -> (i64, i64, i64) {
-    let rows = engine
-        .execute(
-            &format!(
-                "SELECT \
-                     COALESCE(SUM(CASE WHEN cs.codec = 'raw' THEN 1 ELSE 0 END), 0), \
-                     COALESCE(SUM(CASE WHEN cs.codec = 'zstd' THEN 1 ELSE 0 END), 0), \
-                     COALESCE(SUM(CASE WHEN cs.codec = 'legacy' OR cs.codec IS NULL THEN 1 ELSE 0 END), 0) \
-                 FROM lix_internal_binary_blob_manifest_chunk mc \
-                 JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
-                 WHERE mc.blob_hash = '{}'",
-                blob_hash
-            ), &[])
-        .await
-        .expect("binary codec counts query should succeed");
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    (
-        value_as_i64(&rows.statements[0].rows[0][0]),
-        value_as_i64(&rows.statements[0].rows[0][1]),
-        value_as_i64(&rows.statements[0].rows[0][2]),
-    )
-}
-
-async fn binary_prefixed_chunk_payload_count_for_blob(
-    engine: &support::simulation_test::SimulatedLix,
-    blob_hash: &str,
-) -> i64 {
-    let sqlite_style_query = format!(
-        "SELECT COUNT(*) \
-         FROM lix_internal_binary_blob_manifest_chunk mc \
-         JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
-         WHERE mc.blob_hash = '{}' \
-           AND hex(substr(cs.data, 1, 8)) IN ('4C49585241573031', '4C49585A53544431')",
-        blob_hash
-    );
-    let postgres_style_query = format!(
-        "SELECT COUNT(*) \
-         FROM lix_internal_binary_blob_manifest_chunk mc \
-         JOIN lix_internal_binary_chunk_store cs ON cs.chunk_hash = mc.chunk_hash \
-         WHERE mc.blob_hash = '{}' \
-           AND encode(substring(cs.data from 1 for 8), 'hex') IN ('4c49585241573031', '4c49585a53544431')",
-        blob_hash
-    );
-
-    let rows = match engine.execute(&sqlite_style_query, &[]).await {
-        Ok(rows) => rows,
-        Err(_) => engine
-            .execute(&postgres_style_query, &[])
-            .await
-            .expect("prefixed binary chunk payload count query should succeed"),
-    };
-    assert_eq!(rows.statements[0].rows.len(), 1);
-    value_as_i64(&rows.statements[0].rows[0][0])
-}
-
 #[cfg(any())]
 async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
     sim: &support::simulation_test::SimulationArgs,
@@ -869,7 +705,6 @@ async fn boot_engine_with_json_plugin_and_txt_noop_runtime(
         .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
             key_values: Vec::new(),
             wasm_runtime: runtime,
-            access_to_internal: true,
         }))
         .await
         .expect("boot_simulated_lix should succeed");
@@ -961,7 +796,6 @@ simulation_test!(
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
-                access_to_internal: true,
             }))
             .await
             .expect("boot_simulated_lix should succeed");
@@ -1084,7 +918,6 @@ simulation_test!(
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
-                access_to_internal: true,
             }))
             .await
             .expect("boot_simulated_lix should succeed");
@@ -1143,7 +976,6 @@ simulation_test!(
             .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                 key_values: Vec::new(),
                 wasm_runtime: runtime,
-                access_to_internal: true,
             }))
             .await
             .expect("boot_simulated_lix should succeed");
@@ -1245,7 +1077,6 @@ mod legacy_plugin_and_cache_tests {
                 .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                     key_values: Vec::new(),
                     wasm_runtime: runtime,
-                    access_to_internal: true,
                 }))
                 .await
                 .expect("boot_simulated_lix should succeed");
@@ -1354,7 +1185,6 @@ mod legacy_plugin_and_cache_tests {
                 .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                     key_values: Vec::new(),
                     wasm_runtime: runtime,
-                    access_to_internal: true,
                 }))
                 .await
                 .expect("boot_simulated_lix should succeed");
@@ -1452,7 +1282,6 @@ mod legacy_plugin_and_cache_tests {
                 .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
                     key_values: Vec::new(),
                     wasm_runtime: runtime,
-                    access_to_internal: true,
                 }))
                 .await
                 .expect("boot_simulated_lix should succeed");
@@ -3431,211 +3260,3 @@ mod legacy_plugin_and_cache_tests {
         }
     );
 }
-
-simulation_test!(
-    binary_cas_gc_keeps_history_referenced_rows_after_overwrite,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
-        let engine = sim
-            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                key_values: Vec::new(),
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine
-            .initialize()
-            .await
-            .expect("engine init should succeed");
-        let main_version_id = main_version_id(&engine).await;
-
-        engine
-            .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-gc-overwrite', '/assets/video.mp4', lix_text_encode('AAAA-AAAA-AAAA-AAAA'))", &[])
-            .await
-            .expect("initial binary write should succeed");
-        let old_blob_hash =
-            binary_blob_hash_for_file_version(&engine, "binary-gc-overwrite", &main_version_id)
-                .await
-                .expect("old blob hash should exist");
-
-        engine
-            .execute(
-                "UPDATE lix_file \
-                 SET data = lix_text_encode('BBBB-BBBB-BBBB-BBBB-BBBB-BBBB') \
-                 WHERE id = 'binary-gc-overwrite'",
-                &[],
-            )
-            .await
-            .expect("binary overwrite should succeed");
-        let update_commit_id = active_version_commit_id(&engine).await;
-        let new_blob_hash =
-            binary_blob_hash_for_file_version(&engine, "binary-gc-overwrite", &main_version_id)
-                .await
-                .expect("new blob hash should exist");
-        assert_ne!(old_blob_hash, new_blob_hash);
-
-        assert_eq!(
-            binary_manifest_row_count_by_hash(&engine, &old_blob_hash).await,
-            1
-        );
-
-        let history_rows = engine
-            .execute(
-                &format!(
-                    "SELECT data \
-                 FROM lix_file_history \
-                 WHERE id = 'binary-gc-overwrite' \
-                   AND lixcol_root_commit_id = '{}' \
-                   AND lixcol_depth = 1 \
-                 LIMIT 1",
-                    update_commit_id
-                ),
-                &[],
-            )
-            .await
-            .expect("history read should succeed");
-        assert_eq!(history_rows.statements[0].rows.len(), 1);
-        assert_blob_bytes_eq(
-            &history_rows.statements[0].rows[0][0],
-            b"AAAA-AAAA-AAAA-AAAA",
-        );
-
-        assert_eq!(orphan_binary_manifest_chunk_row_count(&engine).await, 0);
-        assert_eq!(orphan_binary_chunk_row_count(&engine).await, 0);
-    }
-);
-
-simulation_test!(
-    binary_cas_foreign_keys_restrict_live_parent_deletes,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
-        let engine = sim
-            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                key_values: Vec::new(),
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine
-            .initialize()
-            .await
-            .expect("engine init should succeed");
-        let main_version_id = main_version_id(&engine).await;
-        let large_payload = "FK-GUARD-DATA-123456".repeat(4096);
-
-        engine
-            .execute(
-                &format!(
-                    "INSERT INTO lix_file (id, path, data) \
-                     VALUES ('binary-fk-guard', '/assets/blob.mp4', lix_text_encode('{}'))",
-                    large_payload
-                ),
-                &[],
-            )
-            .await
-            .expect("binary write should succeed");
-
-        let blob_hash =
-            binary_blob_hash_for_file_version(&engine, "binary-fk-guard", &main_version_id)
-                .await
-                .expect("blob hash should exist");
-        let chunk_hash = binary_chunk_hash_for_blob(&engine, &blob_hash)
-            .await
-            .expect("chunk hash should exist");
-
-        let delete_manifest = engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_binary_blob_manifest \
-                     WHERE blob_hash = '{}'",
-                    blob_hash
-                ),
-                &[],
-            )
-            .await;
-        assert!(
-            delete_manifest.is_err(),
-            "manifest delete should be rejected while file_version_ref still points to it"
-        );
-
-        let delete_chunk = engine
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_binary_chunk_store \
-                     WHERE chunk_hash = '{}'",
-                    chunk_hash
-                ),
-                &[],
-            )
-            .await;
-        assert!(
-            delete_chunk.is_err(),
-            "chunk delete should be rejected while manifest_chunk still points to it"
-        );
-    }
-);
-
-simulation_test!(
-    binary_chunk_codec_metadata_is_explicit_and_payload_unframed,
-    simulations = [sqlite, postgres],
-    |sim| async move {
-        let runtime = Arc::new(PathEchoRuntime) as Arc<dyn WasmRuntime>;
-        let engine = sim
-            .boot_simulated_lix(Some(support::simulation_test::SimulatedLixBootArgs {
-                key_values: Vec::new(),
-                wasm_runtime: runtime,
-                access_to_internal: true,
-            }))
-            .await
-            .expect("boot_simulated_lix should succeed");
-        engine
-            .initialize()
-            .await
-            .expect("engine init should succeed");
-        let main_version_id = main_version_id(&engine).await;
-
-        let payload = vec![0u8; 300_000];
-        engine
-            .execute(
-                "INSERT INTO lix_file (id, path, data) \
-                 VALUES ('binary-codec-meta', '/assets/video.mp4', $1)",
-                &[Value::Blob(payload.clone())],
-            )
-            .await
-            .expect("binary write should succeed");
-
-        let blob_hash =
-            binary_blob_hash_for_file_version(&engine, "binary-codec-meta", &main_version_id)
-                .await
-                .expect("blob hash should exist");
-
-        let (raw_count, zstd_count, legacy_count) =
-            binary_codec_counts_for_blob(&engine, &blob_hash).await;
-        assert!(raw_count + zstd_count > 0);
-        assert_eq!(legacy_count, 0);
-        assert!(
-            zstd_count >= 1,
-            "compressible payload should produce zstd chunks"
-        );
-        assert_eq!(
-            binary_prefixed_chunk_payload_count_for_blob(&engine, &blob_hash).await,
-            0
-        );
-
-        let rows = engine
-            .execute(
-                "SELECT data FROM lix_file WHERE id = 'binary-codec-meta' LIMIT 1",
-                &[],
-            )
-            .await
-            .expect("binary file read should succeed");
-        assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_blob_bytes_eq(&rows.statements[0].rows[0][0], &payload);
-    }
-);
