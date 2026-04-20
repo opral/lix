@@ -47,16 +47,6 @@ impl PublicWriteTxnUnit {
         self.execution.execution_mode == WriteMode::Untracked
     }
 
-    pub(crate) fn should_emit_observe_tick(&self) -> bool {
-        self.is_commit_member_write()
-            && (self.has_compiler_only_filesystem_changes()
-                || !self
-                    .execution
-                    .semantic_effects
-                    .state_commit_stream_changes
-                    .is_empty())
-    }
-
     pub(crate) fn has_compiler_only_filesystem_changes(&self) -> bool {
         self.is_commit_member_write()
             && self.execution.change_batch.is_none()

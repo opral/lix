@@ -13,6 +13,23 @@ fn first_text(rows: &lix_engine::QueryResult) -> String {
     }
 }
 
+fn latest_canonical_change(receipt: &WriteReceipt) -> (&str, &str) {
+    let canonical = receipt
+        .canonical_commit
+        .as_ref()
+        .expect("write receipt should include canonical commit metadata");
+    let latest = canonical
+        .updated_version_refs
+        .iter()
+        .max_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.change_id.cmp(&right.change_id))
+        })
+        .expect("canonical receipt should include updated version refs");
+    (&latest.change_id, &latest.created_at)
+}
+
 fn assert_write_receipt_shape(receipt: &WriteReceipt) {
     assert!(
         receipt.state_commit_sequence.is_some(),
@@ -110,10 +127,13 @@ simulation_test!(
         .expect("wait_for_write_receipt should succeed")
         .expect("observe stream should emit a matching event");
 
-        assert_eq!(
-            event.state_commit_sequence, receipt.state_commit_sequence,
-            "observe helper should return the matching state commit sequence"
-        );
+        let frontier = event
+            .frontier
+            .as_ref()
+            .expect("matching observe event should include a frontier");
+        let (change_id, created_at) = latest_canonical_change(&receipt);
+        assert_eq!(frontier.change_id, change_id);
+        assert_eq!(frontier.created_at, created_at);
         assert_eq!(first_text(&event.rows), "v0");
     }
 );

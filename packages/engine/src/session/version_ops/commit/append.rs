@@ -27,7 +27,6 @@ pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) preconditions: CreateCommitPreconditions,
     pub(crate) active_account_ids: Vec<String>,
     pub(crate) origin_key: Option<String>,
-    pub(crate) should_emit_observe_tick: bool,
 }
 
 #[derive(Debug)]
@@ -150,8 +149,6 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             active_account_ids: args.active_account_ids,
             lane_parent_commit_ids_override: None,
             allow_empty_commit: false,
-            should_emit_observe_tick: args.should_emit_observe_tick,
-            observe_tick_origin_key: args.origin_key.clone(),
             origin_key: args.origin_key,
         },
         functions,
@@ -306,8 +303,6 @@ mod tests {
                 active_account_ids: Vec::new(),
                 lane_parent_commit_ids_override: None,
                 allow_empty_commit: false,
-                should_emit_observe_tick: false,
-                observe_tick_origin_key: None,
                 origin_key: None,
             },
             &mut functions,
@@ -349,7 +344,6 @@ mod tests {
                 },
                 active_account_ids: Vec::new(),
                 origin_key: None,
-                should_emit_observe_tick: false,
             },
             &mut functions,
             None,

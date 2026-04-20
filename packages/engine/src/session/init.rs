@@ -5,7 +5,6 @@ use crate::{LixBackend, LixError};
 pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
     crate::streams::init(backend).await?;
     super::version_ops::init(backend).await?;
-    super::observe::init(backend).await?;
     super::checkpoint_ops::init(backend).await?;
     super::workspace::init(backend).await
 }

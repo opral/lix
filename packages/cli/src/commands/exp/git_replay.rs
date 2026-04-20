@@ -696,13 +696,8 @@ fn init_and_open_lix_at_path(
         lixcol_untracked: None,
     }];
 
-    pollster::block_on(Lix::open(config)).map_err(|err| {
-        CliError::msg(format!(
-            "failed to open lix at {}: {}",
-            path.display(),
-            err
-        ))
-    })
+    pollster::block_on(Lix::open(config))
+        .map_err(|err| CliError::msg(format!("failed to open lix at {}: {}", path.display(), err)))
 }
 
 fn execute_statements_as_transaction(

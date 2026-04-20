@@ -686,8 +686,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'versionId'"
                             .to_string(),
-                            hint: None,
-                        });
+                    hint: None,
+                });
             }
             if Reflect::has(&entry, &JsValue::from_str("version_id")).map_err(js_to_lix_error)? {
                 return Err(LixError {
@@ -695,8 +695,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'version_id'"
                             .to_string(),
-                            hint: None,
-                        });
+                    hint: None,
+                });
             }
             if Reflect::has(&entry, &JsValue::from_str("lixcol_version_id"))
                 .map_err(js_to_lix_error)?
@@ -715,8 +715,8 @@ export type LixObserveEvents = {
                     description:
                         "initLix keyValues entries must use 'lixcol_global' instead of 'global'"
                             .to_string(),
-                            hint: None,
-                        });
+                    hint: None,
+                });
             }
             if Reflect::has(&entry, &JsValue::from_str("untracked")).map_err(js_to_lix_error)? {
                 return Err(LixError {
@@ -1083,8 +1083,8 @@ export type LixObserveEvents = {
                     code: "LIX_ERROR_JS_SDK".to_string(),
                     description: "wasmRuntime.initComponent returned no component instance"
                         .to_string(),
-                        hint: None,
-                    });
+                    hint: None,
+                });
             }
 
             Ok(Arc::new(JsHostWasmComponentInstance {

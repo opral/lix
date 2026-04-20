@@ -73,19 +73,6 @@ pub(crate) struct DurableStateCommitCursor {
     pub(crate) visibility_append_seq: i64,
 }
 
-impl DurableStateCommitCursor {
-    fn is_newer_than(&self, other: &Self) -> bool {
-        self.created_at > other.created_at
-            || (self.created_at == other.created_at && self.change_id > other.change_id)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct DurableStateCommitCatchUp {
-    pub(crate) latest_cursor: Option<DurableStateCommitCursor>,
-    pub(crate) has_matching_changes: bool,
-}
-
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DurableStateCommitConsumerCursor {
@@ -131,7 +118,21 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
 pub(crate) async fn latest_durable_state_commit_cursor(
     backend: &dyn LixBackend,
 ) -> Result<Option<DurableStateCommitCursor>, LixError> {
-    let result = backend
+    let mut executor = backend;
+    latest_durable_state_commit_cursor_with_executor(&mut executor).await
+}
+
+pub(crate) async fn latest_durable_state_commit_cursor_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<Option<DurableStateCommitCursor>, LixError> {
+    let mut executor = &mut *transaction;
+    latest_durable_state_commit_cursor_with_executor(&mut executor).await
+}
+
+async fn latest_durable_state_commit_cursor_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<DurableStateCommitCursor>, LixError> {
+    let result = executor
         .execute(
             "SELECT id, created_at \
              FROM lix_internal_change \
@@ -143,9 +144,8 @@ pub(crate) async fn latest_durable_state_commit_cursor(
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
-    let mut executor = backend;
     let visibility_append_seq =
-        load_latest_untracked_visibility_append_seq_with_executor(&mut executor).await?;
+        load_latest_untracked_visibility_append_seq_with_executor(executor).await?;
     Ok(Some(DurableStateCommitCursor {
         change_id: required_text_value(row.first(), "lix_internal_change.id")?,
         created_at: required_text_value(row.get(1), "lix_internal_change.created_at")?,
@@ -331,33 +331,6 @@ pub(crate) async fn delete_durable_state_commit_consumer_cursor_in_transaction(
         )
         .await?;
     Ok(())
-}
-
-pub(crate) async fn load_durable_state_commit_catch_up(
-    backend: &dyn LixBackend,
-    after: Option<&DurableStateCommitCursor>,
-    filter: &StateCommitStreamFilter,
-) -> Result<DurableStateCommitCatchUp, LixError> {
-    let latest_cursor = latest_durable_state_commit_cursor(backend).await?;
-    let Some(latest_cursor_ref) = latest_cursor.as_ref() else {
-        return Ok(DurableStateCommitCatchUp {
-            latest_cursor,
-            has_matching_changes: false,
-        });
-    };
-    if after.is_some_and(|cursor| !latest_cursor_ref.is_newer_than(cursor)) {
-        return Ok(DurableStateCommitCatchUp {
-            latest_cursor,
-            has_matching_changes: false,
-        });
-    }
-
-    let has_matching_changes =
-        durable_state_commit_changes_exist_since(backend, after, filter).await?;
-    Ok(DurableStateCommitCatchUp {
-        latest_cursor,
-        has_matching_changes,
-    })
 }
 
 impl StateCommitStreamFilter {
@@ -931,106 +904,6 @@ fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValu
             hint: None,
         }),
     }
-}
-
-async fn durable_state_commit_changes_exist_since(
-    backend: &dyn LixBackend,
-    after: Option<&DurableStateCommitCursor>,
-    filter: &StateCommitStreamFilter,
-) -> Result<bool, LixError> {
-    let dialect = backend.dialect();
-    let mut params = Vec::new();
-    let mut next_placeholder = 1usize;
-    let mut predicates = Vec::new();
-
-    if let Some(after) = after {
-        let created_after = dialect.placeholder(next_placeholder);
-        params.push(Value::Text(after.created_at.clone()));
-        next_placeholder += 1;
-
-        let created_equal = dialect.placeholder(next_placeholder);
-        params.push(Value::Text(after.created_at.clone()));
-        next_placeholder += 1;
-
-        let change_after = dialect.placeholder(next_placeholder);
-        params.push(Value::Text(after.change_id.clone()));
-        next_placeholder += 1;
-
-        predicates.push(format!(
-            "(c.created_at > {created_after} OR (c.created_at = {created_equal} AND c.id > {change_after}))"
-        ));
-    }
-
-    if !filter.include_untracked {
-        predicates.push(
-            "NOT EXISTS ( \
-                 SELECT 1 \
-                 FROM lix_internal_untracked_change_visibility uv \
-                 WHERE uv.change_id = c.id \
-             )"
-            .to_string(),
-        );
-    }
-
-    append_text_in_predicate(
-        &mut predicates,
-        "c.schema_key",
-        &filter.schema_keys,
-        dialect,
-        &mut next_placeholder,
-        &mut params,
-    );
-    append_text_in_predicate(
-        &mut predicates,
-        "c.entity_id",
-        &filter.entity_ids,
-        dialect,
-        &mut next_placeholder,
-        &mut params,
-    );
-    append_text_in_predicate(
-        &mut predicates,
-        "c.file_id",
-        &filter.file_ids,
-        dialect,
-        &mut next_placeholder,
-        &mut params,
-    );
-
-    let where_sql = if predicates.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", predicates.join(" AND "))
-    };
-    let sql = format!(
-        "SELECT 1 \
-         FROM lix_internal_change c \
-         {where_sql} \
-         LIMIT 1"
-    );
-    let result = backend.execute(&sql, &params).await?;
-    Ok(!result.rows.is_empty())
-}
-
-fn append_text_in_predicate(
-    predicates: &mut Vec<String>,
-    column: &str,
-    values: &[String],
-    dialect: crate::SqlDialect,
-    next_placeholder: &mut usize,
-    params: &mut Vec<Value>,
-) {
-    if values.is_empty() {
-        return;
-    }
-
-    let mut placeholders = Vec::with_capacity(values.len());
-    for value in values {
-        placeholders.push(dialect.placeholder(*next_placeholder));
-        params.push(Value::Text(value.clone()));
-        *next_placeholder += 1;
-    }
-    predicates.push(format!("{column} IN ({})", placeholders.join(", ")));
 }
 
 fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {

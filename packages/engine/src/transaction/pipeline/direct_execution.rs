@@ -14,7 +14,6 @@ pub(crate) struct WriteExecutionOutcome {
     pub(crate) canonical_commit_receipt: Option<CanonicalCommitProjectionReceipt>,
     pub(crate) plan_effects_override: Option<PlanEffects>,
     pub(crate) state_commit_stream_changes: Vec<StateCommitStreamChange>,
-    pub(crate) observe_tick_emitted: bool,
 }
 
 pub(crate) fn empty_public_write_execution_outcome() -> WriteExecutionOutcome {
@@ -28,7 +27,6 @@ pub(crate) fn empty_public_write_execution_outcome() -> WriteExecutionOutcome {
         canonical_commit_receipt: None,
         plan_effects_override: Some(PlanEffects::default()),
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: false,
     }
 }
 
@@ -51,7 +49,6 @@ pub(crate) async fn execute_direct_execution_with_transaction(
         canonical_commit_receipt: None,
         plan_effects_override: None,
         state_commit_stream_changes: Vec::new(),
-        observe_tick_emitted: false,
     })
 }
 

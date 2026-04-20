@@ -1,26 +1,26 @@
 use crate::common::{unexpected_statement_count_error, WireValue};
+use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
+use crate::session::prepare_function_bindings_with_host;
 use crate::session::Session;
 use crate::sql::{
     dependency_spec_to_state_commit_stream_filter, derive_dependency_spec, parse_sql_statements,
-    QueryDependency,
+    prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
+    QueryDependency, StatementBatch,
 };
 use crate::streams::{
-    latest_durable_state_commit_cursor, load_durable_state_commit_catch_up,
-    DurableStateCommitCursor, StateCommitStream, StateCommitStreamFilter,
+    latest_durable_state_commit_cursor, latest_durable_state_commit_cursor_in_transaction,
+    DurableStateCommitCursor, StateCommitStream,
 };
-use crate::{LixError, QueryResult, Value, WriteReceipt};
+use crate::{ExecuteOptions, LixError, QueryResult, Value, WriteReceipt};
 use serde::{Deserialize, Serialize};
 use sqlparser::ast::Statement;
+use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 const OBSERVE_TICK_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const OBSERVE_FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(25);
-pub(crate) const OBSERVE_TICK_TABLE: &str = "lix_internal_observe_tick";
-mod init;
-
-pub(crate) use init::init;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveQuery {
@@ -39,9 +39,9 @@ impl ObserveQuery {
 
 /// Delivery policy for reactive observe subscriptions.
 ///
-/// These filters apply to delivery metadata carried on state-commit batches and
-/// observe ticks. They do not inspect row-visible columns or require query SQL
-/// to reference `origin_key`.
+/// These filters apply to delivery metadata carried on in-process
+/// `state_commit_stream` batches. They do not inspect row-visible columns or
+/// require query SQL to reference `origin_key`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ObserveOptions {
     /// Suppress changes authored by this session's effective `origin_key`.
@@ -67,15 +67,71 @@ impl ObserveOptions {
 
 /// Observe result event.
 ///
-/// `state_commit_sequence` is the matching delivery-sequence fence from the
-/// underlying state-commit stream when the event was caused by a committed
-/// state change. Pure session-state or external tick re-executions leave it
-/// as `None`.
+/// `frontier` is the durable snapshot frontier read from the same snapshot
+/// that produced `rows`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ObserveEvent {
     pub sequence: u64,
     pub rows: QueryResult,
-    pub state_commit_sequence: Option<u64>,
+    pub frontier: Option<ObserveFrontier>,
+}
+
+/// Durable frontier attached to an observe snapshot.
+///
+/// This is the canonical snapshot marker for an observe result. It is not an
+/// in-process delivery sequence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveFrontier {
+    pub change_id: String,
+    pub created_at: String,
+    pub visibility_append_seq: i64,
+}
+
+impl ObserveFrontier {
+    fn from_durable_cursor(cursor: DurableStateCommitCursor) -> Self {
+        Self {
+            change_id: cursor.change_id,
+            created_at: cursor.created_at,
+            visibility_append_seq: cursor.visibility_append_seq,
+        }
+    }
+
+    fn from_write_receipt_floor(receipt: &WriteReceipt) -> Option<Self> {
+        let latest_ref = receipt
+            .canonical_commit
+            .as_ref()?
+            .updated_version_refs
+            .iter()
+            .max_by(|left, right| {
+                left.created_at
+                    .cmp(&right.created_at)
+                    .then_with(|| left.change_id.cmp(&right.change_id))
+            })?;
+        Some(Self {
+            change_id: latest_ref.change_id.clone(),
+            created_at: latest_ref.created_at.clone(),
+            visibility_append_seq: 0,
+        })
+    }
+
+    fn is_at_or_after(&self, other: &Self) -> bool {
+        !self.cmp(other).is_lt()
+    }
+}
+
+impl Ord for ObserveFrontier {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.created_at
+            .cmp(&other.created_at)
+            .then_with(|| self.change_id.cmp(&other.change_id))
+            .then_with(|| self.visibility_append_seq.cmp(&other.visibility_append_seq))
+    }
+}
+
+impl PartialOrd for ObserveFrontier {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub struct ObserveEvents<'a> {
@@ -101,12 +157,6 @@ struct PollingGuard {
     armed: bool,
 }
 
-#[derive(Clone, Default)]
-struct ObserveOriginFilter {
-    include: BTreeSet<String>,
-    exclude: BTreeSet<String>,
-}
-
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 struct ResolvedObserveOptions {
     include_origin_keys: Vec<String>,
@@ -114,16 +164,29 @@ struct ResolvedObserveOptions {
 }
 
 #[derive(Debug, Clone)]
-struct ObserveTickRow {
-    tick_seq: i64,
-    origin_key: Option<String>,
+struct ObservePreparedQuery {
+    params: Vec<Value>,
+    statements: Vec<Statement>,
+}
+
+#[derive(Debug, Clone)]
+struct ObserveSnapshotEvaluation {
+    rows: QueryResult,
+    frontier: Option<ObserveFrontier>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ObserveCorrectnessState {
+    last_rows: Option<QueryResult>,
+    last_frontier: Option<ObserveFrontier>,
+    dependency_generations: BTreeMap<QueryDependency, u64>,
 }
 
 #[derive(Debug, Clone)]
 struct SharedObserveEvent {
     generation: u64,
     rows: QueryResult,
-    state_commit_sequence: Option<u64>,
+    frontier: Option<ObserveFrontier>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -133,15 +196,10 @@ struct SharedObserveSubscriberCursor {
 }
 
 pub(crate) struct SharedObserveSource {
-    query: ObserveQuery,
+    prepared_query: ObservePreparedQuery,
     state_commits: StateCommitStream,
-    state_commit_filter: StateCommitStreamFilter,
-    origin_filter: ObserveOriginFilter,
     query_dependencies: BTreeSet<QueryDependency>,
-    last_seen_tick_seq: Option<i64>,
-    last_seen_state_commit_cursor: Option<DurableStateCommitCursor>,
-    last_seen_query_dependency_generations: BTreeMap<QueryDependency, u64>,
-    last_result: Option<QueryResult>,
+    correctness: ObserveCorrectnessState,
     latest_event: Option<SharedObserveEvent>,
     events: VecDeque<SharedObserveEvent>,
     next_generation: u64,
@@ -152,56 +210,30 @@ pub(crate) struct SharedObserveSource {
     subscribers: BTreeMap<u64, SharedObserveSubscriberCursor>,
 }
 
-enum PollWork {
-    Initial {
-        query: ObserveQuery,
-        query_dependency_generations: BTreeMap<QueryDependency, u64>,
-    },
-    SessionState {
-        query: ObserveQuery,
-        query_dependency_generations: BTreeMap<QueryDependency, u64>,
-    },
-    StateCommit {
-        query: ObserveQuery,
-        state_commit_sequence: u64,
-        query_dependency_generations: BTreeMap<QueryDependency, u64>,
-    },
-    External {
-        query: ObserveQuery,
-        last_seen_tick_seq: Option<i64>,
-        last_seen_state_commit_cursor: Option<DurableStateCommitCursor>,
-        state_commit_filter: StateCommitStreamFilter,
-        origin_filter: ObserveOriginFilter,
-        query_dependency_generations: BTreeMap<QueryDependency, u64>,
-    },
+struct PollWork {
+    prepared_query: ObservePreparedQuery,
+    should_reevaluate: bool,
+    query_dependency_generations: BTreeMap<QueryDependency, u64>,
+    mark_initialized: bool,
 }
 
 struct PollOutcome {
-    maybe_rows: Option<(QueryResult, Option<u64>)>,
-    update_last_seen_tick_seq: Option<Option<i64>>,
-    update_last_seen_state_commit_cursor: Option<Option<DurableStateCommitCursor>>,
-    update_last_seen_query_dependency_generations: Option<BTreeMap<QueryDependency, u64>>,
+    maybe_snapshot: Option<ObserveSnapshotEvaluation>,
+    update_dependency_generations: Option<BTreeMap<QueryDependency, u64>>,
     mark_initialized: bool,
 }
 
 impl SharedObserveSource {
     fn new(
-        query: ObserveQuery,
+        prepared_query: ObservePreparedQuery,
         state_commits: StateCommitStream,
-        state_commit_filter: StateCommitStreamFilter,
-        origin_filter: ObserveOriginFilter,
         query_dependencies: BTreeSet<QueryDependency>,
     ) -> Self {
         Self {
-            query,
+            prepared_query,
             state_commits,
-            state_commit_filter,
-            origin_filter,
             query_dependencies,
-            last_seen_tick_seq: None,
-            last_seen_state_commit_cursor: None,
-            last_seen_query_dependency_generations: BTreeMap::new(),
-            last_result: None,
+            correctness: ObserveCorrectnessState::default(),
             latest_event: None,
             events: VecDeque::new(),
             next_generation: 0,
@@ -218,7 +250,8 @@ impl SharedObserveSource {
         query_dependency_generations: &BTreeMap<QueryDependency, u64>,
     ) -> bool {
         self.query_dependencies.iter().any(|dependency| {
-            self.last_seen_query_dependency_generations
+            self.correctness
+                .dependency_generations
                 .get(dependency)
                 .copied()
                 .unwrap_or_default()
@@ -256,13 +289,13 @@ impl SharedObserveSource {
         !self.subscribers.is_empty()
     }
 
-    fn append_event(&mut self, rows: QueryResult, state_commit_sequence: Option<u64>) {
+    fn append_event(&mut self, rows: QueryResult, frontier: Option<ObserveFrontier>) {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let event = SharedObserveEvent {
             generation,
             rows,
-            state_commit_sequence,
+            frontier,
         };
         self.latest_event = Some(event.clone());
         self.events.push_back(event);
@@ -363,7 +396,7 @@ impl ObserveEvents<'_> {
         &mut self,
         receipt: &WriteReceipt,
     ) -> Result<Option<ObserveEvent>, LixError> {
-        let Some(target_sequence) = receipt.state_commit_sequence else {
+        let Some(target_frontier) = ObserveFrontier::from_write_receipt_floor(receipt) else {
             return Ok(None);
         };
 
@@ -372,8 +405,9 @@ impl ObserveEvents<'_> {
                 return Ok(None);
             };
             if event
-                .state_commit_sequence
-                .is_some_and(|sequence| sequence >= target_sequence)
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.is_at_or_after(&target_frontier))
             {
                 return Ok(Some(event));
             }
@@ -401,7 +435,7 @@ impl ObserveEventsOwned {
         &mut self,
         receipt: &WriteReceipt,
     ) -> Result<Option<ObserveEvent>, LixError> {
-        let Some(target_sequence) = receipt.state_commit_sequence else {
+        let Some(target_frontier) = ObserveFrontier::from_write_receipt_floor(receipt) else {
             return Ok(None);
         };
 
@@ -410,8 +444,9 @@ impl ObserveEventsOwned {
                 return Ok(None);
             };
             if event
-                .state_commit_sequence
-                .is_some_and(|sequence| sequence >= target_sequence)
+                .frontier
+                .as_ref()
+                .is_some_and(|frontier| frontier.is_at_or_after(&target_frontier))
             {
                 return Ok(Some(event));
             }
@@ -492,151 +527,68 @@ impl ObserveState {
             }
 
             if !source.initialized {
-                PollWork::Initial {
-                    query: source.query.clone(),
+                PollWork {
+                    prepared_query: source.prepared_query.clone(),
+                    should_reevaluate: true,
                     query_dependency_generations,
+                    mark_initialized: true,
                 }
             } else if source.query_dependency_generations_changed(&query_dependency_generations) {
-                PollWork::SessionState {
-                    query: source.query.clone(),
+                PollWork {
+                    prepared_query: source.prepared_query.clone(),
+                    should_reevaluate: true,
                     query_dependency_generations,
+                    mark_initialized: true,
                 }
-            } else if let Some(batch) = source.state_commits.try_next() {
-                PollWork::StateCommit {
-                    query: source.query.clone(),
-                    state_commit_sequence: batch.sequence,
+            } else if source.state_commits.try_next().is_some() {
+                PollWork {
+                    prepared_query: source.prepared_query.clone(),
+                    should_reevaluate: true,
                     query_dependency_generations,
+                    mark_initialized: true,
                 }
             } else {
-                PollWork::External {
-                    query: source.query.clone(),
-                    last_seen_tick_seq: source.last_seen_tick_seq,
-                    last_seen_state_commit_cursor: source.last_seen_state_commit_cursor.clone(),
-                    state_commit_filter: source.state_commit_filter.clone(),
-                    origin_filter: source.origin_filter.clone(),
+                let prepared_query = source.prepared_query.clone();
+                let last_frontier = source.correctness.last_frontier.clone();
+                drop(source);
+
+                observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
+                let latest_frontier =
+                    latest_durable_state_commit_cursor(session.session_host().backend().as_ref())
+                        .await?;
+                let latest_frontier = latest_frontier.map(ObserveFrontier::from_durable_cursor);
+                let should_reexecute = match (latest_frontier.as_ref(), last_frontier.as_ref()) {
+                    (Some(latest), Some(last)) => latest.is_at_or_after(last) && latest != last,
+                    (Some(_), None) => true,
+                    _ => false,
+                };
+
+                PollWork {
+                    prepared_query,
+                    should_reevaluate: should_reexecute,
                     query_dependency_generations,
+                    mark_initialized: true,
                 }
             }
         };
 
-        let outcome = match work {
-            PollWork::Initial {
-                query,
-                query_dependency_generations,
-            } => {
-                let latest_tick_seq =
-                    latest_observe_tick_seq(session.session_host().backend().as_ref()).await?;
-                let latest_state_commit_cursor =
-                    latest_durable_state_commit_cursor(session.session_host().backend().as_ref())
-                        .await?;
-                let rows = execute_observe_query(session, &query).await?;
-                PollOutcome {
-                    maybe_rows: Some((rows, None)),
-                    update_last_seen_tick_seq: Some(latest_tick_seq),
-                    update_last_seen_state_commit_cursor: Some(latest_state_commit_cursor),
-                    update_last_seen_query_dependency_generations: Some(
-                        query_dependency_generations,
-                    ),
-                    mark_initialized: true,
-                }
-            }
-            PollWork::SessionState {
-                query,
-                query_dependency_generations,
-            } => {
-                let rows = execute_observe_query(session, &query).await?;
-                PollOutcome {
-                    maybe_rows: Some((rows, None)),
-                    update_last_seen_tick_seq: None,
-                    update_last_seen_state_commit_cursor: None,
-                    update_last_seen_query_dependency_generations: Some(
-                        query_dependency_generations,
-                    ),
-                    mark_initialized: true,
-                }
-            }
-            PollWork::StateCommit {
-                query,
-                state_commit_sequence,
-                query_dependency_generations,
-            } => {
-                let latest_state_commit_cursor =
-                    latest_durable_state_commit_cursor(session.session_host().backend().as_ref())
-                        .await?;
-                let rows = execute_observe_query(session, &query).await?;
-                PollOutcome {
-                    maybe_rows: Some((rows, Some(state_commit_sequence))),
-                    update_last_seen_tick_seq: None,
-                    update_last_seen_state_commit_cursor: Some(latest_state_commit_cursor),
-                    update_last_seen_query_dependency_generations: Some(
-                        query_dependency_generations,
-                    ),
-                    mark_initialized: true,
-                }
-            }
-            PollWork::External {
-                query,
-                last_seen_tick_seq,
-                last_seen_state_commit_cursor,
-                state_commit_filter,
-                origin_filter,
-                query_dependency_generations,
-            } => {
-                observe_poll_sleep(OBSERVE_TICK_POLL_INTERVAL).await;
-                let catch_up = load_durable_state_commit_catch_up(
-                    session.session_host().backend().as_ref(),
-                    last_seen_state_commit_cursor.as_ref(),
-                    &state_commit_filter,
-                )
-                .await?;
-                if !catch_up.has_matching_changes {
-                    PollOutcome {
-                        maybe_rows: None,
-                        update_last_seen_tick_seq: None,
-                        update_last_seen_state_commit_cursor: Some(catch_up.latest_cursor),
-                        update_last_seen_query_dependency_generations: Some(
-                            query_dependency_generations,
-                        ),
-                        mark_initialized: true,
-                    }
-                } else {
-                    let observed_ticks = observe_ticks_since(
-                        session.session_host().backend().as_ref(),
-                        last_seen_tick_seq,
-                    )
-                    .await?;
-                    let mut next_last_seen_tick_seq = last_seen_tick_seq;
-                    let mut should_reexecute = observed_ticks.is_empty();
-                    for tick in observed_ticks {
-                        next_last_seen_tick_seq = Some(tick.tick_seq);
-                        if origin_filter.matches_external_tick(tick.origin_key.as_deref()) {
-                            should_reexecute = true;
-                        }
-                    }
+        let maybe_snapshot = if work.should_reevaluate {
+            Some(evaluate_observe_snapshot(session, &work.prepared_query).await?)
+        } else {
+            None
+        };
 
-                    if !should_reexecute {
-                        PollOutcome {
-                            maybe_rows: None,
-                            update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
-                            update_last_seen_state_commit_cursor: Some(catch_up.latest_cursor),
-                            update_last_seen_query_dependency_generations: Some(
-                                query_dependency_generations,
-                            ),
-                            mark_initialized: true,
-                        }
-                    } else {
-                        let rows = execute_observe_query(session, &query).await?;
-                        PollOutcome {
-                            maybe_rows: Some((rows, None)),
-                            update_last_seen_tick_seq: Some(next_last_seen_tick_seq),
-                            update_last_seen_state_commit_cursor: Some(catch_up.latest_cursor),
-                            update_last_seen_query_dependency_generations: Some(
-                                query_dependency_generations,
-                            ),
-                            mark_initialized: true,
-                        }
-                    }
-                }
+        let outcome = if let Some(snapshot) = maybe_snapshot {
+            PollOutcome {
+                maybe_snapshot: Some(snapshot),
+                update_dependency_generations: Some(work.query_dependency_generations),
+                mark_initialized: work.mark_initialized,
+            }
+        } else {
+            PollOutcome {
+                maybe_snapshot: None,
+                update_dependency_generations: Some(work.query_dependency_generations),
+                mark_initialized: work.mark_initialized,
             }
         };
 
@@ -652,26 +604,21 @@ impl ObserveState {
         if outcome.mark_initialized {
             source.initialized = true;
         }
-        if let Some(last_seen_tick_seq) = outcome.update_last_seen_tick_seq {
-            source.last_seen_tick_seq = last_seen_tick_seq;
-        }
-        if let Some(last_seen_state_commit_cursor) = outcome.update_last_seen_state_commit_cursor {
-            source.last_seen_state_commit_cursor = last_seen_state_commit_cursor;
-        }
-        if let Some(last_seen_query_dependency_generations) =
-            outcome.update_last_seen_query_dependency_generations
-        {
-            source.last_seen_query_dependency_generations = last_seen_query_dependency_generations;
+        if let Some(dependency_generations) = outcome.update_dependency_generations {
+            source.correctness.dependency_generations = dependency_generations;
         }
 
-        if let Some((rows, state_commit_sequence)) = outcome.maybe_rows {
+        if let Some(snapshot) = outcome.maybe_snapshot {
+            let ObserveSnapshotEvaluation { rows, frontier } = snapshot;
             let changed = source
-                .last_result
+                .correctness
+                .last_rows
                 .as_ref()
                 .is_none_or(|previous| *previous != rows);
+            source.correctness.last_frontier = frontier.clone();
+            source.correctness.last_rows = Some(rows.clone());
             if changed {
-                source.last_result = Some(rows.clone());
-                source.append_event(rows, state_commit_sequence);
+                source.append_event(rows, frontier);
             }
         }
 
@@ -684,7 +631,7 @@ impl ObserveState {
         ObserveEvent {
             sequence,
             rows: shared_event.rows,
-            state_commit_sequence: shared_event.state_commit_sequence,
+            frontier: shared_event.frontier,
         }
     }
 
@@ -726,33 +673,107 @@ impl Drop for PollingGuard {
     }
 }
 
-impl ObserveOriginFilter {
-    fn matches_external_tick(&self, origin_key: Option<&str>) -> bool {
-        if !self.include.is_empty() {
-            let Some(origin_key) = origin_key else {
-                return false;
-            };
-            if !self.include.contains(origin_key) {
-                return false;
-            }
+impl ObservePreparedQuery {
+    fn new(query: ObserveQuery) -> Result<Self, LixError> {
+        let statements = parse_sql_statements(&query.sql)?;
+        if statements.is_empty()
+            || !statements
+                .iter()
+                .all(|statement| matches!(statement, Statement::Query(_)))
+        {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: "observe requires one or more SELECT statements".to_string(),
+                hint: None,
+            });
         }
 
-        if let Some(origin_key) = origin_key {
-            if self.exclude.contains(origin_key) {
-                return false;
-            }
-        }
-
-        true
+        Ok(Self {
+            params: query.params,
+            statements,
+        })
     }
 }
 
-async fn execute_observe_query(
+async fn evaluate_observe_snapshot(
     session: &Session,
-    query: &ObserveQuery,
-) -> Result<QueryResult, LixError> {
-    let result = Box::pin(session.execute(&query.sql, &query.params)).await?;
-    extract_single_observe_query_result(result)
+    prepared_query: &ObservePreparedQuery,
+) -> Result<ObserveSnapshotEvaluation, LixError> {
+    let mut context = session.new_compiler_state(ExecuteOptions::default());
+    let runtime_bindings = context.runtime_binding_values()?;
+    let statement_batch = StatementBatch::compile(
+        prepared_query.statements.clone(),
+        &prepared_query.params,
+        session.session_host().backend().dialect(),
+        &runtime_bindings,
+        None,
+    )?;
+    let execution_mode = super::classify_session_execution_mode(&statement_batch, false);
+    let function_bindings = prepare_function_bindings_with_host(
+        session.session_host(),
+        session.session_host().backend().as_ref(),
+    )
+    .await?;
+    context.set_function_bindings(function_bindings.clone());
+    let committed_read_context = super::committed_read_context(
+        &context,
+        session.session_host(),
+        &function_bindings,
+        execution_mode,
+    );
+
+    let transaction_mode = prepare_committed_read_batch_with_backend(
+        session.session_host().backend().as_ref(),
+        &statement_batch,
+        false,
+        &committed_read_context,
+    )
+    .await?
+    .transaction_mode;
+
+    let mut transaction = session
+        .session_host()
+        .begin_read_unit(transaction_mode)
+        .await?;
+
+    let prepared_read_batch = prepare_committed_read_batch_in_transaction(
+        transaction.as_mut(),
+        &statement_batch,
+        false,
+        &committed_read_context,
+    )
+    .await;
+    let outcome = match prepared_read_batch {
+        Ok(prepared_read_batch) => {
+            let execute_result = execute_prepared_read_batch_in_committed_read_transaction(
+                transaction.as_mut(),
+                &session.execution_context(),
+                &prepared_read_batch,
+            )
+            .await;
+            match execute_result {
+                Ok(result) => {
+                    let rows = extract_single_observe_query_result(result)?;
+                    let frontier =
+                        latest_durable_state_commit_cursor_in_transaction(transaction.as_mut())
+                            .await?
+                            .map(ObserveFrontier::from_durable_cursor);
+                    transaction.commit().await?;
+                    Ok(ObserveSnapshotEvaluation { rows, frontier })
+                }
+                Err(error) => {
+                    let _ = transaction.rollback().await;
+                    Err(error)
+                }
+            }
+        }
+        Err(error) => {
+            let _ = transaction.rollback().await;
+            Err(error)
+        }
+    };
+    context.clear_function_bindings();
+    outcome
 }
 
 fn extract_single_observe_query_result(
@@ -934,20 +955,9 @@ fn build_shared_observe_source(
     query: ObserveQuery,
     options: ResolvedObserveOptions,
 ) -> Result<SharedObserveSource, LixError> {
-    let statements = parse_sql_statements(&query.sql)?;
-    if statements.is_empty()
-        || !statements
-            .iter()
-            .all(|statement| matches!(statement, Statement::Query(_)))
-    {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "observe requires one or more SELECT statements".to_string(),
-            hint: None,
-        });
-    }
-
-    let dependency_spec = derive_dependency_spec(&statements, &query.params)?;
+    let prepared_query = ObservePreparedQuery::new(query)?;
+    let dependency_spec =
+        derive_dependency_spec(&prepared_query.statements, &prepared_query.params)?;
     let mut filter = dependency_spec_to_state_commit_stream_filter(&dependency_spec);
     filter
         .include_origin_keys
@@ -955,17 +965,11 @@ fn build_shared_observe_source(
     filter
         .exclude_origin_keys
         .extend(options.exclude_origin_keys.iter().cloned());
-    let origin_filter = ObserveOriginFilter {
-        include: filter.include_origin_keys.iter().cloned().collect(),
-        exclude: filter.exclude_origin_keys.iter().cloned().collect(),
-    };
     let state_commits = session.session_host().state_commit_stream(filter.clone());
 
     Ok(SharedObserveSource::new(
-        query,
+        prepared_query,
         state_commits,
-        filter,
-        origin_filter,
         dependency_spec.query_dependencies,
     ))
 }
@@ -1043,109 +1047,12 @@ async fn observe_poll_sleep(duration: Duration) {
     gloo_timers::future::TimeoutFuture::new(millis).await;
 }
 
-async fn latest_observe_tick_seq(backend: &dyn crate::LixBackend) -> Result<Option<i64>, LixError> {
-    let result = Box::pin(backend.execute(
-        "SELECT tick_seq \
-         FROM lix_internal_observe_tick \
-         ORDER BY tick_seq DESC \
-         LIMIT 1",
-        &[],
-    ))
-    .await?;
-    let Some(first_row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(first_value) = first_row.first() else {
-        return Ok(None);
-    };
-    Ok(Some(parse_observe_tick_seq(first_value)?))
-}
-
-async fn observe_ticks_since(
-    backend: &dyn crate::LixBackend,
-    last_seen_tick_seq: Option<i64>,
-) -> Result<Vec<ObserveTickRow>, LixError> {
-    let result = if let Some(last_seen) = last_seen_tick_seq {
-        Box::pin(backend.execute(
-            "SELECT tick_seq, origin_key \
-             FROM lix_internal_observe_tick \
-             WHERE tick_seq > $1 \
-             ORDER BY tick_seq ASC",
-            &[Value::Integer(last_seen)],
-        ))
-        .await?
-    } else {
-        Box::pin(backend.execute(
-            "SELECT tick_seq, origin_key \
-             FROM lix_internal_observe_tick \
-             ORDER BY tick_seq ASC",
-            &[],
-        ))
-        .await?
-    };
-
-    let mut ticks = Vec::with_capacity(result.rows.len());
-    for row in result.rows {
-        let tick_seq = parse_observe_tick_seq(row.first().ok_or(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description:
-                "failed to read observe tick sequence: row has no tick_seq column".to_string(),
-            hint: None,
-        })?)?;
-
-        let origin_key =
-            parse_observe_tick_origin_key(
-                row.get(1).ok_or(LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description:
-                        "failed to read observe tick origin key: row has no origin_key column"
-                            .to_string(),
-                    hint: None,
-                })?,
-            )?;
-
-        ticks.push(ObserveTickRow {
-            tick_seq,
-            origin_key,
-        });
-    }
-    Ok(ticks)
-}
-
-fn parse_observe_tick_seq(value: &Value) -> Result<i64, LixError> {
-    match value {
-        Value::Integer(value) => Ok(*value),
-        Value::Real(value) => Ok(*value as i64),
-        Value::Text(value) => value.parse::<i64>().map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse observe tick sequence text: {error}"),
-            hint: None,
-        }),
-        other => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse observe tick sequence value: {other:?}"),
-            hint: None,
-        }),
-    }
-}
-
-fn parse_observe_tick_origin_key(value: &Value) -> Result<Option<String>, LixError> {
-    match value {
-        Value::Null => Ok(None),
-        Value::Text(value) => Ok(Some(value.clone())),
-        other => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("failed to parse observe tick origin key value: {other:?}"),
-            hint: None,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        build_observe_state, observe_source_key, ObserveEvent, ObserveEvents, ObserveOptions,
-        ObserveQuery, OBSERVE_TICK_POLL_INTERVAL,
+        build_observe_state, lock_shared_source, observe_source_key, ObserveEvent, ObserveEvents,
+        ObserveFrontier, ObserveOptions, ObserveQuery, ObserveSnapshotEvaluation, PollOutcome,
+        OBSERVE_TICK_POLL_INTERVAL,
     };
     use crate::wasm::NoopWasmRuntime;
     use crate::{
@@ -1194,6 +1101,18 @@ mod tests {
         observe_query_hits: Arc<AtomicUsize>,
     }
 
+    struct SnapshotObserveBackend {
+        backend_query_hits: Arc<AtomicUsize>,
+        backend_frontier_hits: Arc<AtomicUsize>,
+        transaction_query_hits: Arc<AtomicUsize>,
+        transaction_frontier_hits: Arc<AtomicUsize>,
+    }
+
+    struct SnapshotObserveTransaction {
+        transaction_query_hits: Arc<AtomicUsize>,
+        transaction_frontier_hits: Arc<AtomicUsize>,
+    }
+
     #[async_trait(?Send)]
     impl LixBackend for CountingObserveBackend {
         fn dialect(&self) -> SqlDialect {
@@ -1212,12 +1131,6 @@ mod tests {
                 return Ok(QueryResult {
                     rows: Vec::new(),
                     columns: vec!["id".to_string(), "created_at".to_string()],
-                });
-            }
-            if sql.contains("FROM lix_internal_observe_tick") {
-                return Ok(QueryResult {
-                    rows: Vec::new(),
-                    columns: vec!["tick_seq".to_string(), "origin_key".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -1268,10 +1181,121 @@ mod tests {
                     columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
-            if sql.contains("FROM lix_internal_observe_tick") {
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn commit(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+
+        async fn rollback(self: Box<Self>) -> Result<(), LixError> {
+            Ok(())
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackend for SnapshotObserveBackend {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("observe-snapshot-sentinel") {
+                self.backend_query_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Text("observe-snapshot-sentinel".to_string())]],
+                    columns: vec!["marker".to_string()],
+                });
+            }
+            if sql.contains("ORDER BY created_at DESC, id DESC") {
+                self.backend_frontier_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("change-1".to_string()),
+                        Value::Text("2026-01-01T00:00:00Z".to_string()),
+                    ]],
+                    columns: vec!["id".to_string(), "created_at".to_string()],
+                });
+            }
+            if sql.contains("COALESCE(MAX(append_seq), 0)") {
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Integer(0)]],
+                    columns: vec!["append_seq".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_change") {
                 return Ok(QueryResult {
                     rows: Vec::new(),
-                    columns: vec!["tick_seq".to_string(), "origin_key".to_string()],
+                    columns: vec!["id".to_string(), "created_at".to_string()],
+                });
+            }
+            Ok(QueryResult {
+                rows: Vec::new(),
+                columns: Vec::new(),
+            })
+        }
+
+        async fn begin_transaction(
+            &self,
+            _mode: crate::backend::TransactionBeginMode,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            Ok(Box::new(SnapshotObserveTransaction {
+                transaction_query_hits: Arc::clone(&self.transaction_query_hits),
+                transaction_frontier_hits: Arc::clone(&self.transaction_frontier_hits),
+            }))
+        }
+
+        async fn begin_savepoint(
+            &self,
+            _name: &str,
+        ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
+            self.begin_transaction(crate::backend::TransactionBeginMode::Write)
+                .await
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl LixBackendTransaction for SnapshotObserveTransaction {
+        fn dialect(&self) -> SqlDialect {
+            SqlDialect::Sqlite
+        }
+
+        fn mode(&self) -> crate::backend::TransactionBeginMode {
+            crate::backend::TransactionBeginMode::Read
+        }
+
+        async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
+            if sql.contains("observe-snapshot-sentinel") {
+                self.transaction_query_hits.fetch_add(1, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Text("observe-snapshot-sentinel".to_string())]],
+                    columns: vec!["marker".to_string()],
+                });
+            }
+            if sql.contains("ORDER BY created_at DESC, id DESC") {
+                self.transaction_frontier_hits
+                    .fetch_add(1, Ordering::SeqCst);
+                return Ok(QueryResult {
+                    rows: vec![vec![
+                        Value::Text("change-1".to_string()),
+                        Value::Text("2026-01-01T00:00:00Z".to_string()),
+                    ]],
+                    columns: vec!["id".to_string(), "created_at".to_string()],
+                });
+            }
+            if sql.contains("COALESCE(MAX(append_seq), 0)") {
+                return Ok(QueryResult {
+                    rows: vec![vec![Value::Integer(0)]],
+                    columns: vec!["append_seq".to_string()],
+                });
+            }
+            if sql.contains("FROM lix_internal_change") {
+                return Ok(QueryResult {
+                    rows: Vec::new(),
+                    columns: vec!["id".to_string(), "created_at".to_string()],
                 });
             }
             Ok(QueryResult {
@@ -1569,6 +1593,208 @@ mod tests {
                 2,
                 "public-surface observes should reexecute when the session registry generation changes",
             );
+
+            state.close_with_session(&session);
+        });
+    }
+
+    #[test]
+    fn observe_session_invalidation_reexecutes_without_emitting_when_rows_do_not_change() {
+        run_observe_test_with_large_stack(|| async move {
+            let observe_query_hits = Arc::new(AtomicUsize::new(0));
+            let lix = Arc::new(Lix::boot(LixConfig::new(
+                Box::new(CountingObserveBackend {
+                    observe_query_hits: Arc::clone(&observe_query_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            )));
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
+
+            let mut state = build_observe_state(
+                &session,
+                ObserveQuery::new(
+                    "SELECT 'observe-shared-sentinel' AS marker FROM lix_change LIMIT 1",
+                    vec![],
+                ),
+                ObserveOptions::default(),
+            )
+            .expect("observe state should build");
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("initial poll should succeed");
+            let initial_generation = {
+                let source = lock_shared_source(&state.source).expect("lock shared source");
+                source
+                    .latest_event
+                    .as_ref()
+                    .expect("initial event should exist")
+                    .generation
+            };
+
+            let mut context = session.new_compiler_state(ExecuteOptions::default());
+            context.bump_public_surface_registry_generation();
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("registry invalidation poll should succeed");
+
+            assert_eq!(
+                observe_query_hits.load(Ordering::SeqCst),
+                2,
+                "session invalidation should reexecute the canonical snapshot path",
+            );
+            let source = lock_shared_source(&state.source).expect("lock shared source");
+            assert_eq!(
+                source.latest_event.as_ref().map(|event| event.generation),
+                Some(initial_generation),
+                "session invalidation should not synthesize a new event when rows are unchanged",
+            );
+        });
+    }
+
+    #[test]
+    fn observe_evaluates_rows_and_frontier_inside_one_transaction_snapshot() {
+        run_observe_test_with_large_stack(|| async move {
+            let backend_query_hits = Arc::new(AtomicUsize::new(0));
+            let backend_frontier_hits = Arc::new(AtomicUsize::new(0));
+            let transaction_query_hits = Arc::new(AtomicUsize::new(0));
+            let transaction_frontier_hits = Arc::new(AtomicUsize::new(0));
+            let lix = Arc::new(Lix::boot(LixConfig::new(
+                Box::new(SnapshotObserveBackend {
+                    backend_query_hits: Arc::clone(&backend_query_hits),
+                    backend_frontier_hits: Arc::clone(&backend_frontier_hits),
+                    transaction_query_hits: Arc::clone(&transaction_query_hits),
+                    transaction_frontier_hits: Arc::clone(&transaction_frontier_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            )));
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
+
+            let mut state = build_observe_state(
+                &session,
+                ObserveQuery::new("SELECT 'observe-snapshot-sentinel' AS marker", vec![]),
+                ObserveOptions::default(),
+            )
+            .expect("observe state should build");
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("initial poll should succeed");
+
+            assert_eq!(
+                backend_query_hits.load(Ordering::SeqCst),
+                0,
+                "observe query should execute inside the read transaction snapshot",
+            );
+            assert_eq!(
+                backend_frontier_hits.load(Ordering::SeqCst),
+                0,
+                "durable frontier should be read inside the same transaction snapshot",
+            );
+            assert_eq!(
+                transaction_query_hits.load(Ordering::SeqCst),
+                1,
+                "observe query should execute exactly once inside the transaction",
+            );
+            assert_eq!(
+                transaction_frontier_hits.load(Ordering::SeqCst),
+                1,
+                "frontier should be loaded exactly once inside the transaction",
+            );
+
+            state.close_with_session(&session);
+        });
+    }
+
+    #[test]
+    fn observe_updates_last_frontier_on_noop_snapshot_without_emitting() {
+        run_observe_test_with_large_stack(|| async move {
+            let backend_query_hits = Arc::new(AtomicUsize::new(0));
+            let backend_frontier_hits = Arc::new(AtomicUsize::new(0));
+            let transaction_query_hits = Arc::new(AtomicUsize::new(0));
+            let transaction_frontier_hits = Arc::new(AtomicUsize::new(0));
+            let lix = Arc::new(Lix::boot(LixConfig::new(
+                Box::new(SnapshotObserveBackend {
+                    backend_query_hits: Arc::clone(&backend_query_hits),
+                    backend_frontier_hits: Arc::clone(&backend_frontier_hits),
+                    transaction_query_hits: Arc::clone(&transaction_query_hits),
+                    transaction_frontier_hits: Arc::clone(&transaction_frontier_hits),
+                }),
+                Arc::new(NoopWasmRuntime),
+            )));
+            let session = Session::new_for_test(
+                lix.engine().session_host(),
+                "version-test".to_string(),
+                Vec::new(),
+            );
+
+            let mut state = build_observe_state(
+                &session,
+                ObserveQuery::new("SELECT 'observe-snapshot-sentinel' AS marker", vec![]),
+                ObserveOptions::default(),
+            )
+            .expect("observe state should build");
+
+            state
+                .poll_shared_source_once(&session)
+                .await
+                .expect("initial poll should succeed");
+
+            let initial_generation = {
+                let source = lock_shared_source(&state.source).expect("lock shared source");
+                source
+                    .latest_event
+                    .as_ref()
+                    .expect("initial event should exist")
+                    .generation
+            };
+
+            let advanced_frontier = Some(ObserveFrontier {
+                change_id: "change-2".to_string(),
+                created_at: "2026-01-02T00:00:00Z".to_string(),
+                visibility_append_seq: 0,
+            });
+
+            state
+                .apply_poll_outcome(PollOutcome {
+                    maybe_snapshot: Some(ObserveSnapshotEvaluation {
+                        rows: QueryResult {
+                            rows: vec![vec![Value::Text("observe-snapshot-sentinel".to_string())]],
+                            columns: vec!["marker".to_string()],
+                        },
+                        frontier: advanced_frontier.clone(),
+                    }),
+                    update_dependency_generations: None,
+                    mark_initialized: true,
+                })
+                .expect("noop snapshot outcome should apply");
+
+            {
+                let source = lock_shared_source(&state.source).expect("lock shared source");
+                assert_eq!(source.correctness.last_frontier, advanced_frontier);
+                assert_eq!(
+                    source.latest_event.as_ref().map(|event| event.generation),
+                    Some(initial_generation),
+                    "noop snapshot should not append a new event",
+                );
+                assert_eq!(
+                    source.events.len(),
+                    1,
+                    "noop snapshot should not queue a new event"
+                );
+            }
 
             state.close_with_session(&session);
         });

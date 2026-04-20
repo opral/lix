@@ -9,7 +9,6 @@ use crate::LixError;
 pub(crate) struct BufferedWriteState {
     journal: BufferedWriteJournal,
     commit_outcome: TransactionCommitOutcome,
-    observe_tick_emitted: bool,
 }
 
 impl BufferedWriteState {
@@ -56,17 +55,5 @@ impl BufferedWriteState {
 
     pub(crate) fn take_staged_delta(&mut self) -> Option<TransactionWriteDelta> {
         self.journal.take_staged_delta()
-    }
-
-    pub(crate) fn observe_tick_emitted(&self) -> bool {
-        self.observe_tick_emitted
-    }
-
-    pub(crate) fn mark_observe_tick_emitted(&mut self) {
-        self.observe_tick_emitted = true;
-    }
-
-    pub(crate) fn absorb_observe_tick_emitted(&mut self, emitted: bool) {
-        self.observe_tick_emitted |= emitted;
     }
 }

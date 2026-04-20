@@ -52,7 +52,7 @@ pub use live_state::{
 };
 pub use session::checkpoint_ops::CreateCheckpointResult;
 pub use session::observe::{
-    ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveOptions, ObserveQuery,
+    ObserveEvent, ObserveEvents, ObserveEventsOwned, ObserveFrontier, ObserveOptions, ObserveQuery,
 };
 pub use session::version_ops::{
     CreateVersionOptions, CreateVersionResult, ExpectedVersionHeads, MergeOutcome,
