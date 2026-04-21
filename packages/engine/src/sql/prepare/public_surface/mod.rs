@@ -72,6 +72,8 @@ use std::time::{Duration, Instant};
 pub(crate) struct PublicReadPlan {
     pub(crate) freshness_contract: SurfaceReadFreshness,
     pub(crate) resolved_relations: Vec<String>,
+    pub(crate) source_statement_sql: String,
+    pub(crate) route_via_sql2: bool,
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PublicReadPhysicalPlan,
     pub(crate) bound_parameters: Vec<Value>,
@@ -3842,6 +3844,7 @@ mod tests {
             &compiler_metadata,
             bound.bound_statement,
             bound.broad_statement,
+            None,
             None,
             &registry,
             None,

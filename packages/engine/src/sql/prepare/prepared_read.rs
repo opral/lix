@@ -28,9 +28,9 @@ use crate::sql::{
     PreparedFileHistoryReadPlan, PreparedFileHistorySortKey, PreparedHistoryReadArtifact,
     PreparedHistoryReadPlan, PreparedPublicRead, PreparedPublicReadPlanArtifact,
     PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
-    PreparedReadTimeProjectionArtifact, PreparedStateHistoryAggregate,
-    PreparedStateHistoryAggregatePredicate, PreparedStateHistoryField,
-    PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
+    PreparedReadTimeProjectionArtifact, PreparedSql2ReadPlanArtifact,
+    PreparedStateHistoryAggregate, PreparedStateHistoryAggregatePredicate,
+    PreparedStateHistoryField, PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
     PreparedStateHistoryProjectionValue, PreparedStateHistoryReadPlan, PreparedStateHistorySortKey,
     PreparedStateHistorySortValue, PublicReadResultColumn, PublicReadResultColumns,
     ReadDiagnosticContext,
@@ -249,14 +249,24 @@ pub(crate) fn prepare_public_read_artifact(
             })
         }
         PublicReadPhysicalPlan::LoweredSql(lowered) => {
-            PreparedPublicReadPlanArtifact::PreparedBatch(PreparedBatchReadArtifact {
-                prepared_batch: prepared_batch_from_lowered_batch(
-                    dialect,
-                    lowered,
-                    &public_read.bound_parameters,
-                    &public_read.runtime_bindings,
-                )?,
-            })
+            if public_read.route_via_sql2 {
+                PreparedPublicReadPlanArtifact::Sql2(PreparedSql2ReadPlanArtifact {
+                    artifact: crate::sql2::PreparedSql2ReadArtifact {
+                        sql: public_read.source_statement_sql.clone(),
+                        active_version_id: public_read.runtime_bindings.active_version_id.clone(),
+                        surface_names: public_read.resolved_relations.clone(),
+                    },
+                })
+            } else {
+                PreparedPublicReadPlanArtifact::PreparedBatch(PreparedBatchReadArtifact {
+                    prepared_batch: prepared_batch_from_lowered_batch(
+                        dialect,
+                        lowered,
+                        &public_read.bound_parameters,
+                        &public_read.runtime_bindings,
+                    )?,
+                })
+            }
         }
         PublicReadPhysicalPlan::HistoryRead(plan) => {
             PreparedPublicReadPlanArtifact::HistoryRead(PreparedHistoryReadArtifact {

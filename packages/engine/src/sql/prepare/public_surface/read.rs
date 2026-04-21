@@ -3035,6 +3035,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     compiler_metadata: &super::super::SqlCompilerMetadata,
     bound_statement: BoundStatement,
     active_history_root_commit_id: Option<&str>,
+    origin_key: Option<&str>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
     registry: &SurfaceRegistry,
     public_output_columns: Option<Vec<String>>,
@@ -3345,6 +3346,16 @@ async fn try_prepare_public_read_via_specialized_optimization(
             .iter()
             .map(|binding| binding.descriptor.public_name.clone())
             .collect(),
+        source_statement_sql: analysis.bound_statement.statement.to_string(),
+        route_via_sql2: crate::sql2::should_route_selected_read(
+            origin_key,
+            &analysis
+                .semantics
+                .resolved_relations
+                .iter()
+                .map(|binding| binding.descriptor.public_name.clone())
+                .collect::<Vec<_>>(),
+        ),
         logical_plan: optimized_logical_plan,
         bound_parameters,
         runtime_bindings,
@@ -3659,6 +3670,7 @@ async fn try_prepare_public_read_with_internal_access(
             compiler_metadata,
             bound_statement.clone(),
             broad_statement.clone(),
+            origin_key,
             explain_request.as_ref(),
             &registry,
             public_output_columns.clone(),
@@ -3674,6 +3686,7 @@ async fn try_prepare_public_read_with_internal_access(
         compiler_metadata,
         bound_statement,
         active_history_root_commit_id,
+        origin_key,
         explain_request.as_ref(),
         &registry,
         public_output_columns.clone(),
@@ -3692,6 +3705,7 @@ async fn try_prepare_public_read_with_internal_access(
                     compiler_metadata,
                     bound_statement,
                     broad_statement,
+                    origin_key,
                     explain_request.as_ref(),
                     &registry,
                     public_output_columns,
@@ -3720,6 +3734,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
     compiler_metadata: &super::super::SqlCompilerMetadata,
     bound_statement: BoundStatement,
     broad_statement: Option<BroadPublicReadStatement>,
+    origin_key: Option<&str>,
     explain_request: Option<&crate::sql::explain::ExplainRequest>,
     registry: &SurfaceRegistry,
     public_output_columns: Option<Vec<String>>,
@@ -3863,7 +3878,7 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
         ExplainStage::ArtifactPreparation,
         artifact_started.elapsed(),
     );
-    let resolved_relations = semantic_read
+    let resolved_relations: Vec<String> = semantic_read
         .resolved_relations
         .iter()
         .map(|binding| binding.descriptor.public_name.clone())
@@ -3884,7 +3899,9 @@ pub(super) async fn prepare_public_read_via_surface_lowering(
 
     Ok(Some(PublicReadPlan {
         freshness_contract,
-        resolved_relations,
+        resolved_relations: resolved_relations.clone(),
+        source_statement_sql: bound_statement.statement.to_string(),
+        route_via_sql2: crate::sql2::should_route_selected_read(origin_key, &resolved_relations),
         logical_plan,
         bound_parameters: bound_statement.bound_parameters.clone(),
         runtime_bindings: runtime_binding_values_from_statement_context(

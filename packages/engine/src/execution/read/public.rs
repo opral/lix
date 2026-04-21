@@ -63,6 +63,9 @@ pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_chec
         PreparedPublicReadPlanArtifact::HistoryRead(artifact) => {
             execute_history_read_plan_with_backend(backend, &artifact.plan).await?
         }
+        PreparedPublicReadPlanArtifact::Sql2(artifact) => {
+            crate::sql2::execute_read_with_backend(backend, &artifact.artifact).await?
+        }
     };
     Ok(finalize_prepared_public_read_result(result, artifact))
 }
