@@ -9,15 +9,15 @@ use super::types::{
     LiveStateWrite, LiveStateWriteOp, StageStat, TraversedCommitDebugRow, TraversedEdgeDebugRow,
     VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
-use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_visible_state, CanonicalContentMode, CanonicalTombstoneMode, CanonicalVisibleStateFilter,
     CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
+use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::live_state::ReplayCursor;
 use crate::schema::LixVersionRef;
 use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
-use crate::{CanonicalJson, LixBackend, LixError};
+use crate::{CanonicalJson, LixError};
 
 type VersionHeadMap = BTreeMap<String, Vec<String>>;
 
@@ -60,7 +60,7 @@ struct BuiltinProjectionSchemaMeta {
 }
 
 pub(crate) async fn live_state_rebuild_plan_internal(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
     let mut executor = backend;
@@ -68,7 +68,7 @@ pub(crate) async fn live_state_rebuild_plan_internal(
 }
 
 pub(crate) async fn live_state_rebuild_plan_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
     let data = load_data_with_executor(executor).await?;
@@ -716,7 +716,7 @@ fn load_version_heads_from_canonical(
 }
 
 async fn load_canonical_visible_state(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     version_refs: &VersionHeadMap,
     target_versions: &BTreeSet<String>,
     stats: &mut Vec<StageStat>,
@@ -1223,7 +1223,6 @@ fn optional_identity(value: Option<&str>, context: &str) -> Result<Option<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::{LixBackend, TransactionBeginMode};
     use crate::canonical::{
         append_untracked_change_visibility_rows, CanonicalUntrackedVisibilityKind,
         CanonicalUntrackedVisibilityWrite,
@@ -1245,7 +1244,7 @@ mod tests {
         created_at: &str,
     ) {
         let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("visibility transaction should open");
         append_untracked_change_visibility_rows(

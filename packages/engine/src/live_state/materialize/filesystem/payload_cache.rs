@@ -1,22 +1,23 @@
-use crate::{LixBackend, LixError, Value};
+use crate::live_state::store::LiveStateBackendRef;
+use crate::{LixError, Value};
 
 pub(crate) async fn load_file_payload_cache_data(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<Vec<u8>, LixError> {
-    let result = backend
-        .execute(
-            "SELECT data \
-             FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2 \
-             LIMIT 1",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
+    let result = crate::live_state::store_sql::execute_query_with_backend(
+        backend,
+        "SELECT data \
+         FROM lix_internal_file_data_cache \
+         WHERE file_id = $1 AND version_id = $2 \
+         LIMIT 1",
+        &[
+            Value::Text(file_id.to_string()),
+            Value::Text(version_id.to_string()),
+        ],
+    )
+    .await?;
 
     let Some(row) = result.rows.first() else {
         return Ok(Vec::new());
@@ -25,42 +26,42 @@ pub(crate) async fn load_file_payload_cache_data(
 }
 
 pub(crate) async fn upsert_file_payload_cache_data(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     file_id: &str,
     version_id: &str,
     data: &[u8],
 ) -> Result<(), LixError> {
-    backend
-        .execute(
-            "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
-             VALUES ($1, $2, $3) \
-             ON CONFLICT (file_id, version_id) DO UPDATE SET \
-             data = EXCLUDED.data",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-                Value::Blob(data.to_vec()),
-            ],
-        )
-        .await?;
+    crate::live_state::store_sql::execute_query_with_backend(
+        backend,
+        "INSERT INTO lix_internal_file_data_cache (file_id, version_id, data) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (file_id, version_id) DO UPDATE SET \
+         data = EXCLUDED.data",
+        &[
+            Value::Text(file_id.to_string()),
+            Value::Text(version_id.to_string()),
+            Value::Blob(data.to_vec()),
+        ],
+    )
+    .await?;
     Ok(())
 }
 
 pub(crate) async fn delete_file_payload_cache_data(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<(), LixError> {
-    backend
-        .execute(
-            "DELETE FROM lix_internal_file_data_cache \
-             WHERE file_id = $1 AND version_id = $2",
-            &[
-                Value::Text(file_id.to_string()),
-                Value::Text(version_id.to_string()),
-            ],
-        )
-        .await?;
+    crate::live_state::store_sql::execute_query_with_backend(
+        backend,
+        "DELETE FROM lix_internal_file_data_cache \
+         WHERE file_id = $1 AND version_id = $2",
+        &[
+            Value::Text(file_id.to_string()),
+            Value::Text(version_id.to_string()),
+        ],
+    )
+    .await?;
     Ok(())
 }
 

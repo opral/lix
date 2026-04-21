@@ -1,19 +1,13 @@
 #![allow(dead_code)]
 
-use crate::backend::add_column_if_missing;
 use crate::common::is_missing_relation_error;
+use crate::live_state::store::{
+    LiveStateLifecycleAdminStore, LiveStateLifecycleReadStore, LiveStateLifecycleWriteStore,
+};
 use crate::live_state::ReplayCursor;
 use crate::live_state::{LiveStateMode, LiveStateProjectionStatus};
-use crate::streams::{
-    delete_durable_state_commit_consumer_cursor_in_transaction,
-    load_latest_untracked_visibility_append_seq,
-    load_latest_untracked_visibility_append_seq_in_transaction,
-    upsert_durable_state_commit_consumer_cursor_in_transaction,
-    upsert_durable_state_commit_consumer_cursor_with_backend, DurableStateCommitCursor,
-    LIVE_STATE_DURABLE_CONSUMER_KEY,
-};
 use crate::version::CommittedVersionFrontier;
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::{LixError, QueryResult, Value};
 
 pub(crate) const LIVE_STATE_SCHEMA_EPOCH: &str = "1";
 pub(crate) const LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
@@ -62,16 +56,16 @@ impl LiveStateMode {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct LiveStateStatusRow {
-    mode: LiveStateMode,
-    schema_epoch: String,
-    replay_cursor: Option<ReplayCursor>,
-    applied_committed_frontier: Option<CommittedVersionFrontier>,
+pub(crate) struct LiveStateStatusRow {
+    pub(crate) mode: LiveStateMode,
+    pub(crate) schema_epoch: String,
+    pub(crate) replay_cursor: Option<ReplayCursor>,
+    pub(crate) applied_committed_frontier: Option<CommittedVersionFrontier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LiveStateSnapshot {
-    status: Option<LiveStateStatusRow>,
+    pub(crate) status: Option<LiveStateStatusRow>,
     pub(crate) latest_replay_cursor: Option<ReplayCursor>,
     pub(crate) current_committed_frontier: CommittedVersionFrontier,
 }
@@ -153,36 +147,25 @@ pub(crate) fn evaluate_live_state_snapshot(snapshot: &LiveStateSnapshot) -> Live
 }
 
 pub(crate) async fn load_live_state_snapshot(
-    backend: &dyn LixBackend,
+    store: &impl LiveStateLifecycleReadStore,
 ) -> Result<LiveStateSnapshot, LixError> {
-    load_live_state_snapshot_with_backend(backend).await
+    store.load_live_state_snapshot().await
 }
 
-pub(crate) async fn load_projection_status_with_backend(
-    backend: &dyn LixBackend,
+pub(crate) async fn load_projection_status(
+    store: &impl LiveStateLifecycleReadStore,
 ) -> Result<LiveStateProjectionStatus, LixError> {
     Ok(projection_status_from_snapshot(
-        load_live_state_snapshot_with_backend(backend).await?,
+        store.load_live_state_snapshot().await?,
     ))
 }
 
-pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    backend
-        .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
-        .await?;
-    add_column_if_missing(
-        backend,
-        LIVE_STATE_STATUS_TABLE,
-        "applied_committed_frontier",
-        "TEXT",
-    )
-    .await?;
-    backend.execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[]).await?;
-    Ok(())
+pub async fn init(store: &impl LiveStateLifecycleAdminStore) -> Result<(), LixError> {
+    store.init_live_state_status_storage().await
 }
 
-pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
-    let snapshot = load_live_state_snapshot(backend).await?;
+pub async fn require_ready(store: &impl LiveStateLifecycleReadStore) -> Result<(), LixError> {
+    let snapshot = load_live_state_snapshot(store).await?;
     match evaluate_live_state_snapshot(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
         LiveStateReadiness::Uninitialized => Err(crate::common::not_initialized_error()),
@@ -191,9 +174,9 @@ pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
 }
 
 pub(crate) async fn require_ready_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
 ) -> Result<(), LixError> {
-    let snapshot = load_live_state_snapshot_in_transaction(transaction).await?;
+    let snapshot = store.load_live_state_snapshot().await?;
     match evaluate_live_state_transaction_eligibility(&snapshot) {
         LiveStateReadiness::Ready => Ok(()),
         LiveStateReadiness::Uninitialized => Err(crate::common::not_initialized_error()),
@@ -202,71 +185,64 @@ pub(crate) async fn require_ready_in_transaction(
 }
 
 pub(crate) async fn mark_live_state_ready_at_latest_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
 ) -> Result<ReplayCursor, LixError> {
-    let cursor = load_latest_replay_cursor_in_transaction(transaction)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "live_state::mark_live_state_ready_at_latest_replay_cursor expected a replay cursor",
-            )
-        })?;
-    let frontier = load_current_committed_frontier_in_transaction(transaction).await?;
-    transaction
-        .execute(&build_mark_live_state_ready_sql(&cursor, &frontier), &[])
+    let cursor = store.load_latest_replay_cursor().await?.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "live_state::mark_live_state_ready_at_latest_replay_cursor expected a replay cursor",
+        )
+    })?;
+    let frontier = store.load_current_committed_frontier().await?;
+    store.mark_live_state_ready(&cursor, &frontier).await?;
+    store
+        .stamp_live_state_durable_consumer_cursor(&cursor)
         .await?;
-    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, &cursor).await?;
     Ok(cursor)
 }
 
 pub(crate) async fn mark_live_state_ready_at_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
     cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
-    let frontier = load_current_committed_frontier_in_transaction(transaction).await?;
-    transaction
-        .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
+    let frontier = store.load_current_committed_frontier().await?;
+    store.mark_live_state_ready(cursor, &frontier).await?;
+    store
+        .stamp_live_state_durable_consumer_cursor(cursor)
         .await?;
-    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, cursor).await?;
     Ok(())
 }
 
 pub(crate) async fn mark_live_state_ready_without_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
 ) -> Result<(), LixError> {
-    let frontier = load_current_committed_frontier_in_transaction(transaction).await?;
-    transaction
-        .execute(
-            &build_mark_live_state_ready_without_cursor_sql(&frontier),
-            &[],
-        )
+    let frontier = store.load_current_committed_frontier().await?;
+    store
+        .mark_live_state_ready_without_cursor(&frontier)
         .await?;
-    clear_live_state_durable_consumer_cursor_in_transaction(transaction).await?;
+    store.clear_live_state_durable_consumer_cursor().await?;
     Ok(())
 }
 
 pub(crate) async fn advance_commit_replay_boundary_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
 ) -> Result<(), LixError> {
-    let cursor = load_latest_replay_cursor_in_transaction(transaction)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "live_state::advance_commit_replay_boundary expected a replay cursor",
-            )
-        })?;
-    advance_commit_replay_boundary_to_cursor_in_transaction(transaction, &cursor).await
+    let cursor = store.load_latest_replay_cursor().await?.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "live_state::advance_commit_replay_boundary expected a replay cursor",
+        )
+    })?;
+    advance_commit_replay_boundary_to_cursor_in_transaction(store, &cursor).await
 }
 
 pub(crate) async fn advance_commit_replay_boundary_to_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
     cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
-    ensure_live_state_status_row_in_transaction(transaction).await?;
+    store.ensure_live_state_status_row().await?;
 
-    let snapshot = load_live_state_snapshot_in_transaction(transaction).await?;
+    let snapshot = store.load_live_state_snapshot().await?;
     let mode = match snapshot.status.as_ref().map(|status| status.mode) {
         Some(LiveStateMode::Ready) => LiveStateMode::Ready,
         _ => LiveStateMode::NeedsRebuild,
@@ -280,213 +256,100 @@ pub(crate) async fn advance_commit_replay_boundary_to_cursor_in_transaction(
             .and_then(|status| status.applied_committed_frontier.clone())
     };
 
-    transaction
-        .execute(
-            &build_set_live_state_mode_with_cursor_and_frontier_sql(
-                mode,
-                cursor,
-                applied_frontier.as_ref(),
-            ),
-            &[],
-        )
+    store
+        .mark_live_state_mode_with_cursor_and_frontier(mode, cursor, applied_frontier.as_ref())
         .await?;
-    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, cursor).await?;
+    store
+        .stamp_live_state_durable_consumer_cursor(cursor)
+        .await?;
     Ok(())
 }
 
 pub(crate) async fn mark_needs_rebuild_at_latest_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
 ) -> Result<ReplayCursor, LixError> {
-    let cursor = load_latest_replay_cursor_in_transaction(transaction)
-        .await?
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "live_state::mark_needs_rebuild expected a replay cursor",
-            )
-        })?;
-    mark_needs_rebuild_at_replay_cursor_in_transaction(transaction, &cursor).await?;
+    let cursor = store.load_latest_replay_cursor().await?.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "live_state::mark_needs_rebuild expected a replay cursor",
+        )
+    })?;
+    mark_needs_rebuild_at_replay_cursor_in_transaction(store, &cursor).await?;
     Ok(cursor)
 }
 
 pub(crate) async fn mark_needs_rebuild_at_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    store: &mut impl LiveStateLifecycleWriteStore,
     cursor: &ReplayCursor,
 ) -> Result<(), LixError> {
-    ensure_live_state_status_row_in_transaction(transaction).await?;
-    let applied_frontier = load_current_applied_frontier_in_transaction(transaction).await?;
-    transaction
-        .execute(
-            &build_set_live_state_mode_with_cursor_and_frontier_sql(
-                LiveStateMode::NeedsRebuild,
-                cursor,
-                applied_frontier.as_ref(),
-            ),
-            &[],
+    store.ensure_live_state_status_row().await?;
+    let applied_frontier = store.load_current_applied_frontier().await?;
+    store
+        .mark_live_state_mode_with_cursor_and_frontier(
+            LiveStateMode::NeedsRebuild,
+            cursor,
+            applied_frontier.as_ref(),
         )
         .await?;
-    stamp_live_state_durable_consumer_cursor_in_transaction(transaction, cursor).await?;
+    store
+        .stamp_live_state_durable_consumer_cursor(cursor)
+        .await?;
     Ok(())
 }
 
-pub(crate) async fn mark_live_state_mode_with_backend(
-    backend: &dyn LixBackend,
+pub(crate) async fn try_claim_live_state_bootstrap_in_transaction(
+    store: &mut impl LiveStateLifecycleWriteStore,
+) -> Result<bool, LixError> {
+    store.try_claim_live_state_bootstrap().await
+}
+
+pub(crate) async fn mark_live_state_mode_in_transaction(
+    store: &mut impl LiveStateLifecycleWriteStore,
     mode: LiveStateMode,
 ) -> Result<(), LixError> {
-    backend
-        .execute(&build_set_live_state_mode_sql(mode), &[])
+    store.mark_live_state_mode(mode).await
+}
+
+pub(crate) async fn mark_live_state_mode(
+    store: &impl LiveStateLifecycleAdminStore,
+    mode: LiveStateMode,
+) -> Result<(), LixError> {
+    store.mark_live_state_mode(mode).await
+}
+
+pub(crate) async fn mark_live_state_ready(
+    store: &impl LiveStateLifecycleAdminStore,
+    cursor: &ReplayCursor,
+) -> Result<(), LixError> {
+    let frontier = store.load_current_committed_frontier().await?;
+    store.mark_live_state_ready(cursor, &frontier).await?;
+    store
+        .stamp_live_state_durable_consumer_cursor(cursor)
         .await?;
     Ok(())
 }
 
-pub(crate) async fn mark_live_state_ready_with_backend(
-    backend: &dyn LixBackend,
-    cursor: &ReplayCursor,
-) -> Result<(), LixError> {
-    let frontier =
-        crate::live_state::load_current_committed_version_frontier_with_backend(backend).await?;
-    backend
-        .execute(&build_mark_live_state_ready_sql(cursor, &frontier), &[])
-        .await?;
-    upsert_durable_state_commit_consumer_cursor_with_backend(
-        backend,
-        LIVE_STATE_DURABLE_CONSUMER_KEY,
-        &durable_state_commit_cursor_from_replay_with_backend(backend, cursor).await?,
-    )
-    .await?;
-    Ok(())
-}
-
-async fn stamp_live_state_durable_consumer_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    cursor: &ReplayCursor,
-) -> Result<(), LixError> {
-    let durable_cursor =
-        durable_state_commit_cursor_from_replay_in_transaction(transaction, cursor).await?;
-    upsert_durable_state_commit_consumer_cursor_in_transaction(
-        transaction,
-        LIVE_STATE_DURABLE_CONSUMER_KEY,
-        &durable_cursor,
-    )
-    .await
-}
-
-async fn clear_live_state_durable_consumer_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<(), LixError> {
-    delete_durable_state_commit_consumer_cursor_in_transaction(
-        transaction,
-        LIVE_STATE_DURABLE_CONSUMER_KEY,
-    )
-    .await
-}
-
-async fn durable_state_commit_cursor_from_replay_with_backend(
-    backend: &dyn crate::LixBackend,
-    cursor: &ReplayCursor,
-) -> Result<DurableStateCommitCursor, LixError> {
-    Ok(DurableStateCommitCursor {
-        change_id: cursor.change_id.clone(),
-        created_at: cursor.created_at.clone(),
-        visibility_append_seq: load_latest_untracked_visibility_append_seq(backend).await?,
-    })
-}
-
-async fn durable_state_commit_cursor_from_replay_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    cursor: &ReplayCursor,
-) -> Result<DurableStateCommitCursor, LixError> {
-    Ok(DurableStateCommitCursor {
-        change_id: cursor.change_id.clone(),
-        created_at: cursor.created_at.clone(),
-        visibility_append_seq: load_latest_untracked_visibility_append_seq_in_transaction(
-            transaction,
-        )
-        .await?,
-    })
-}
-
-pub(crate) async fn load_live_state_mode_with_backend(
-    backend: &dyn LixBackend,
+pub(crate) async fn load_live_state_mode(
+    store: &impl LiveStateLifecycleReadStore,
 ) -> Result<LiveStateMode, LixError> {
-    Ok(load_live_state_status_row_with_backend(backend).await?.mode)
+    store.load_live_state_mode().await
 }
 
-pub(crate) async fn try_claim_live_state_bootstrap_with_backend(
-    backend: &dyn LixBackend,
+pub(crate) async fn try_claim_live_state_bootstrap(
+    store: &impl LiveStateLifecycleAdminStore,
 ) -> Result<bool, LixError> {
-    let result = backend
-        .execute(
-            "UPDATE lix_internal_live_state_status \
-             SET mode = 'bootstrapping', \
-                 latest_change_id = NULL, \
-                 latest_change_created_at = NULL, \
-                 applied_committed_frontier = NULL, \
-                 schema_epoch = $1, \
-                 updated_at = CURRENT_TIMESTAMP \
-             WHERE singleton_id = 1 \
-               AND mode = 'uninitialized' \
-             RETURNING singleton_id",
-            &[Value::Text(LIVE_STATE_SCHEMA_EPOCH.to_string())],
-        )
-        .await?;
-    Ok(result.rows.first().is_some())
+    store.try_claim_live_state_bootstrap().await
 }
 
 pub(crate) async fn load_latest_replay_cursor(
-    backend: &dyn LixBackend,
+    store: &impl LiveStateLifecycleReadStore,
 ) -> Result<Option<ReplayCursor>, LixError> {
-    let result = backend
-        .execute(
-            "SELECT id, created_at \
-             FROM lix_internal_change \
-             ORDER BY created_at DESC, id DESC \
-             LIMIT 1",
-            &[],
-        )
-        .await?;
-    parse_latest_replay_cursor(&result)
+    store.load_latest_replay_cursor().await
 }
 
-pub(crate) async fn load_latest_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+pub(crate) fn parse_latest_replay_cursor(
+    result: &QueryResult,
 ) -> Result<Option<ReplayCursor>, LixError> {
-    let result = transaction
-        .execute(
-            "SELECT id, created_at \
-             FROM lix_internal_change \
-             ORDER BY created_at DESC, id DESC \
-             LIMIT 1",
-            &[],
-        )
-        .await?;
-    parse_latest_replay_cursor(&result)
-}
-
-async fn ensure_live_state_status_row_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<(), LixError> {
-    transaction
-        .execute(LIVE_STATE_STATUS_CREATE_TABLE_SQL, &[])
-        .await?;
-    if !live_state_status_column_exists_in_transaction(transaction, "applied_committed_frontier")
-        .await?
-    {
-        transaction
-            .execute(
-                "ALTER TABLE lix_internal_live_state_status \
-                 ADD COLUMN applied_committed_frontier TEXT",
-                &[],
-            )
-            .await?;
-    }
-    transaction
-        .execute(LIVE_STATE_STATUS_SEED_ROW_SQL, &[])
-        .await?;
-    Ok(())
-}
-
-fn parse_latest_replay_cursor(result: &QueryResult) -> Result<Option<ReplayCursor>, LixError> {
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -568,67 +431,7 @@ fn build_upsert_live_state_status_sql(
     )
 }
 
-async fn load_live_state_status_row_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<LiveStateStatusRow, LixError> {
-    Ok(load_nullable_live_state_status_with_backend(backend)
-        .await?
-        .unwrap_or_else(default_live_state_status))
-}
-
-async fn load_live_state_snapshot_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<LiveStateSnapshot, LixError> {
-    Ok(LiveStateSnapshot {
-        status: load_nullable_live_state_status_with_backend(backend).await?,
-        latest_replay_cursor: load_latest_replay_cursor(backend).await?,
-        current_committed_frontier:
-            crate::live_state::load_current_committed_version_frontier_with_backend(backend).await?,
-    })
-}
-
-async fn load_live_state_snapshot_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<LiveStateSnapshot, LixError> {
-    Ok(LiveStateSnapshot {
-        status: load_nullable_live_state_status_in_transaction(transaction).await?,
-        latest_replay_cursor: load_latest_replay_cursor_in_transaction(transaction).await?,
-        current_committed_frontier: load_current_committed_frontier_in_transaction(transaction)
-            .await?,
-    })
-}
-
-async fn load_nullable_live_state_status_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<Option<LiveStateStatusRow>, LixError> {
-    let result = backend
-        .execute(
-            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch, applied_committed_frontier \
-             FROM lix_internal_live_state_status \
-             WHERE singleton_id = 1 \
-             LIMIT 1",
-            &[],
-        )
-        .await;
-    parse_nullable_live_state_status_result(result)
-}
-
-async fn load_nullable_live_state_status_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<Option<LiveStateStatusRow>, LixError> {
-    let result = transaction
-        .execute(
-            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch, applied_committed_frontier \
-             FROM lix_internal_live_state_status \
-             WHERE singleton_id = 1 \
-             LIMIT 1",
-            &[],
-        )
-        .await;
-    parse_nullable_live_state_status_result(result)
-}
-
-fn parse_nullable_live_state_status_result(
+pub(crate) fn parse_nullable_live_state_status_result(
     result: Result<QueryResult, LixError>,
 ) -> Result<Option<LiveStateStatusRow>, LixError> {
     let result = match result {
@@ -675,7 +478,9 @@ fn projection_status_from_snapshot(snapshot: LiveStateSnapshot) -> LiveStateProj
     }
 }
 
-fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow, LixError> {
+pub(crate) fn live_state_status_row_from_values(
+    row: &[Value],
+) -> Result<LiveStateStatusRow, LixError> {
     let mode_text = text_value(row.first(), "lix_internal_live_state_status.mode")?;
     let Some(mode) = LiveStateMode::parse(&mode_text) else {
         return Err(LixError::new(
@@ -704,7 +509,7 @@ fn live_state_status_row_from_values(row: &[Value]) -> Result<LiveStateStatusRow
     })
 }
 
-fn default_live_state_status() -> LiveStateStatusRow {
+pub(crate) fn default_live_state_status() -> LiveStateStatusRow {
     LiveStateStatusRow {
         mode: LiveStateMode::Uninitialized,
         schema_epoch: LIVE_STATE_SCHEMA_EPOCH.to_string(),
@@ -713,7 +518,7 @@ fn default_live_state_status() -> LiveStateStatusRow {
     }
 }
 
-fn default_live_state_snapshot() -> LiveStateSnapshot {
+pub(crate) fn default_live_state_snapshot() -> LiveStateSnapshot {
     LiveStateSnapshot {
         status: None,
         latest_replay_cursor: None,
@@ -782,57 +587,6 @@ fn escape_sql_string(value: &str) -> String {
     value.replace('\'', "''")
 }
 
-async fn load_current_committed_frontier_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<CommittedVersionFrontier, LixError> {
-    let mut executor = transaction;
-    crate::live_state::load_current_committed_version_frontier_with_executor(&mut executor).await
-}
-
-async fn load_current_applied_frontier_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-) -> Result<Option<CommittedVersionFrontier>, LixError> {
-    Ok(load_nullable_live_state_status_in_transaction(transaction)
-        .await?
-        .and_then(|status| status.applied_committed_frontier))
-}
-
-async fn live_state_status_column_exists_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    column: &str,
-) -> Result<bool, LixError> {
-    let exists = match transaction.dialect() {
-        crate::SqlDialect::Sqlite => {
-            transaction
-                .execute(
-                    "SELECT 1 \
-                     FROM pragma_table_info('lix_internal_live_state_status') \
-                     WHERE name = $1 \
-                     LIMIT 1",
-                    &[Value::Text(column.to_string())],
-                )
-                .await?
-        }
-        crate::SqlDialect::Postgres => {
-            transaction
-                .execute(
-                    "SELECT 1 \
-                     FROM information_schema.columns \
-                     WHERE table_schema = current_schema() \
-                       AND table_name = $1 \
-                       AND column_name = $2 \
-                     LIMIT 1",
-                    &[
-                        Value::Text(LIVE_STATE_STATUS_TABLE.to_string()),
-                        Value::Text(column.to_string()),
-                    ],
-                )
-                .await?
-        }
-    };
-    Ok(!exists.rows.is_empty())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -840,6 +594,7 @@ mod tests {
         append_untracked_change_visibility_rows, CanonicalUntrackedVisibilityKind,
         CanonicalUntrackedVisibilityWrite,
     };
+    use crate::live_state::store_sql::SqlLiveStateStore;
     use crate::streams::{
         load_durable_state_commit_consumer_cursors, load_durable_state_commit_low_watermark,
         upsert_durable_state_commit_consumer_cursor_in_transaction, DurableStateCommitCursor,
@@ -885,7 +640,7 @@ mod tests {
 
         if untracked {
             let mut transaction = backend
-                .begin_transaction(crate::backend::TransactionBeginMode::Write)
+                .begin_write_transaction()
                 .await
                 .expect("latest replay cursor visibility transaction should begin");
             append_untracked_change_visibility_rows(
@@ -911,13 +666,13 @@ mod tests {
     }
 
     async fn delete_status_row(backend: &TestSqliteBackend) {
-        backend
-            .execute(
-                "DELETE FROM lix_internal_live_state_status WHERE singleton_id = 1",
-                &[],
-            )
-            .await
-            .expect("status row should delete");
+        crate::live_state::store_sql::execute_query_with_backend(
+            backend,
+            "DELETE FROM lix_internal_live_state_status WHERE singleton_id = 1",
+            &[],
+        )
+        .await
+        .expect("status row should delete");
     }
 
     fn frontier_json(entries: &[(&str, &str)]) -> String {
@@ -936,7 +691,11 @@ mod tests {
     async fn readiness_is_uninitialized_without_canonical_state() {
         let backend = init_lifecycle_backend().await;
         assert_eq!(
-            evaluate_live_state_snapshot(&load_live_state_snapshot(&backend).await.unwrap()),
+            evaluate_live_state_snapshot(
+                &load_live_state_snapshot(&SqlLiveStateStore::from_backend(&backend))
+                    .await
+                    .unwrap(),
+            ),
             LiveStateReadiness::Uninitialized
         );
     }
@@ -962,7 +721,11 @@ mod tests {
         .expect("status row should seed");
 
         assert_eq!(
-            evaluate_live_state_snapshot(&load_live_state_snapshot(&backend).await.unwrap()),
+            evaluate_live_state_snapshot(
+                &load_live_state_snapshot(&SqlLiveStateStore::from_backend(&backend))
+                    .await
+                    .unwrap(),
+            ),
             LiveStateReadiness::Ready
         );
     }
@@ -988,7 +751,9 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
 
-        let snapshot = load_live_state_snapshot(&backend).await.unwrap();
+        let snapshot = load_live_state_snapshot(&SqlLiveStateStore::from_backend(&backend))
+            .await
+            .unwrap();
         assert_eq!(
             evaluate_live_state_snapshot(&snapshot),
             LiveStateReadiness::NeedsRebuild
@@ -1022,13 +787,15 @@ mod tests {
         .await
         .expect("status row should seed");
         let mut transaction = backend
-            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
 
-        let error = require_ready_in_transaction(transaction.as_mut())
-            .await
-            .expect_err("needs_rebuild should fail");
+        let error = require_ready_in_transaction(&mut SqlLiveStateStore::from_transaction(
+            transaction.as_mut(),
+        ))
+        .await
+        .expect_err("needs_rebuild should fail");
         assert_eq!(
             error.code,
             crate::common::ErrorCode::LiveStateNotReady.as_str()
@@ -1048,7 +815,9 @@ mod tests {
             .expect("local version head should seed");
         seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
 
-        let snapshot = load_live_state_snapshot(&backend).await.unwrap();
+        let snapshot = load_live_state_snapshot(&SqlLiveStateStore::from_backend(&backend))
+            .await
+            .unwrap();
         assert_eq!(
             evaluate_live_state_snapshot(&snapshot),
             LiveStateReadiness::NeedsRebuild
@@ -1061,7 +830,7 @@ mod tests {
         seed_latest_replay_cursor(&backend, "change-tracked", "2026-03-15T01:02:02Z", false).await;
         seed_latest_replay_cursor(&backend, "change-untracked", "2026-03-15T01:02:03Z", true).await;
 
-        let latest = load_latest_replay_cursor(&backend)
+        let latest = load_latest_replay_cursor(&SqlLiveStateStore::from_backend(&backend))
             .await
             .expect("latest replay cursor should load")
             .expect("latest replay cursor should exist");
@@ -1092,13 +861,15 @@ mod tests {
         .await
         .expect("status row should seed");
         let mut transaction = backend
-            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
 
-        require_ready_in_transaction(transaction.as_mut())
-            .await
-            .expect("inflight cursor drift inside transaction should be allowed");
+        require_ready_in_transaction(&mut SqlLiveStateStore::from_transaction(
+            transaction.as_mut(),
+        ))
+        .await
+        .expect("inflight cursor drift inside transaction should be allowed");
         transaction
             .rollback()
             .await
@@ -1126,13 +897,15 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
 
-        advance_commit_replay_boundary_in_transaction(transaction.as_mut())
-            .await
-            .expect("replay-boundary update should succeed");
+        advance_commit_replay_boundary_in_transaction(&mut SqlLiveStateStore::from_transaction(
+            transaction.as_mut(),
+        ))
+        .await
+        .expect("replay-boundary update should succeed");
         assert!(
             backend.executed_sql().iter().any(|sql| sql
                 .contains("INSERT INTO lix_internal_live_state_status ")
@@ -1155,13 +928,15 @@ mod tests {
             .expect("local version head should seed");
         seed_latest_replay_cursor(&backend, "change-2", "2026-03-15T01:02:03Z", false).await;
         let mut transaction = backend
-            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
 
-        mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction.as_mut())
-            .await
-            .expect("ready stamp should succeed");
+        mark_live_state_ready_at_latest_replay_cursor_in_transaction(
+            &mut SqlLiveStateStore::from_transaction(transaction.as_mut()),
+        )
+        .await
+        .expect("ready stamp should succeed");
         transaction
             .commit()
             .await
@@ -1192,7 +967,7 @@ mod tests {
     async fn live_state_ready_without_replay_cursor_clears_durable_consumer_cursor() {
         let backend = init_lifecycle_backend().await;
         let mut transaction = backend
-            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
 
@@ -1207,9 +982,11 @@ mod tests {
         )
         .await
         .expect("seed durable consumer cursor should succeed");
-        mark_live_state_ready_without_replay_cursor_in_transaction(transaction.as_mut())
-            .await
-            .expect("ready without cursor should succeed");
+        mark_live_state_ready_without_replay_cursor_in_transaction(
+            &mut SqlLiveStateStore::from_transaction(transaction.as_mut()),
+        )
+        .await
+        .expect("ready without cursor should succeed");
         transaction
             .commit()
             .await
@@ -1249,13 +1026,15 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(crate::backend::TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
 
-        advance_commit_replay_boundary_in_transaction(transaction.as_mut())
-            .await
-            .expect("replay-boundary update should succeed");
+        advance_commit_replay_boundary_in_transaction(&mut SqlLiveStateStore::from_transaction(
+            transaction.as_mut(),
+        ))
+        .await
+        .expect("replay-boundary update should succeed");
         assert!(
             backend.executed_sql().iter().any(|sql| sql
                 .contains("INSERT INTO lix_internal_live_state_status ")

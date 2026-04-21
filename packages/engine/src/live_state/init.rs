@@ -1,8 +1,11 @@
-use crate::backend::{add_column_if_missing, execute_ddl_batch};
 use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::lifecycle;
 use crate::live_state::register_schema;
-use crate::{LixBackend, LixError};
+use crate::live_state::store::LiveStateBackendRef;
+use crate::live_state::store_sql::{
+    add_column_if_missing_with_backend, execute_ddl_batch_with_backend, SqlLiveStateStore,
+};
+use crate::LixError;
 
 const LIVE_STATE_CREATE_TABLE_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_registered_schema_bootstrap (\
@@ -76,22 +79,23 @@ const LIVE_STATE_INDEX_STATEMENTS: &[&str] = &[
      ON lix_internal_file_lixcol_cache (file_id, version_id)",
 ];
 
-pub async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    lifecycle::init(backend).await?;
-    execute_ddl_batch(
+pub async fn init(backend: LiveStateBackendRef<'_>) -> Result<(), LixError> {
+    lifecycle::init(&SqlLiveStateStore::from_backend(backend)).await?;
+    execute_ddl_batch_with_backend(
         backend,
         "live_state.tables",
         LIVE_STATE_CREATE_TABLE_STATEMENTS,
     )
     .await?;
     ensure_internal_storage_scope_keys(backend).await?;
-    execute_ddl_batch(backend, "live_state.indexes", LIVE_STATE_INDEX_STATEMENTS).await?;
+    execute_ddl_batch_with_backend(backend, "live_state.indexes", LIVE_STATE_INDEX_STATEMENTS)
+        .await?;
     register_schema(backend, "lix_registered_schema").await?;
     Ok(())
 }
 
-async fn ensure_internal_storage_scope_keys(backend: &dyn LixBackend) -> Result<(), LixError> {
-    add_column_if_missing(
+async fn ensure_internal_storage_scope_keys(backend: LiveStateBackendRef<'_>) -> Result<(), LixError> {
+    add_column_if_missing_with_backend(
         backend,
         "lix_internal_registered_schema_bootstrap",
         STORAGE_SCOPE_KEY_COLUMN,
@@ -101,20 +105,20 @@ async fn ensure_internal_storage_scope_keys(backend: &dyn LixBackend) -> Result<
         ),
     )
     .await?;
-    backend
-        .execute(
-            &format!(
-                "UPDATE lix_internal_registered_schema_bootstrap \
-                 SET {storage_scope_key} = CASE \
-                   WHEN file_id IS NULL THEN '{engine_scope}' \
-                   ELSE 'file:' || file_id \
-                 END",
-                storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
-                engine_scope = storage_scope_key_for_file_id(None),
-            ),
-            &[],
-        )
-        .await?;
+    crate::live_state::store_sql::execute_query_with_backend(
+        backend,
+        &format!(
+            "UPDATE lix_internal_registered_schema_bootstrap \
+             SET {storage_scope_key} = CASE \
+               WHEN file_id IS NULL THEN '{engine_scope}' \
+               ELSE 'file:' || file_id \
+             END",
+            storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
+            engine_scope = storage_scope_key_for_file_id(None),
+        ),
+        &[],
+    )
+    .await?;
 
     Ok(())
 }

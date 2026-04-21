@@ -4,11 +4,12 @@ use crate::live_state::storage::{
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
     quoted_live_table_name,
 };
+use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::{LiveWriteOperation, LiveWriteRow};
-use crate::{LixBackendTransaction, LixError};
+use crate::LixError;
 
 pub(crate) async fn apply_write_batch_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     batch: &[LiveWriteRow],
 ) -> Result<(), LixError> {
     if batch.is_empty() {
@@ -44,7 +45,7 @@ pub(crate) async fn apply_write_batch_in_transaction(
 }
 
 async fn apply_upsert_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     row: &LiveWriteRow,
 ) -> Result<(), LixError> {
     let layout = {
@@ -109,12 +110,12 @@ async fn apply_upsert_in_transaction(
         normalized_values = normalized_values_sql,
         normalized_updates = normalized_updates,
     );
-    transaction.execute(&sql, &[]).await?;
+    crate::live_state::store_sql::execute_query_with_transaction(transaction, &sql, &[]).await?;
     Ok(())
 }
 
 async fn apply_delete_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     row: &LiveWriteRow,
 ) -> Result<(), LixError> {
     let sql = format!(
@@ -135,6 +136,6 @@ async fn apply_delete_in_transaction(
             .unwrap_or_else(|| "file_id IS NULL".to_string()),
         version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),
     );
-    transaction.execute(&sql, &[]).await?;
+    crate::live_state::store_sql::execute_query_with_transaction(transaction, &sql, &[]).await?;
     Ok(())
 }

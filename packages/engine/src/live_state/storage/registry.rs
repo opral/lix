@@ -1,114 +1,16 @@
 use super::layout::{
-    builtin_live_table_layout, live_table_layout_from_schema, load_live_table_layout_with_executor,
-    merge_live_table_layouts, LiveTableLayout,
+    builtin_live_table_layout, live_table_layout_from_schema, merge_live_table_layouts,
+    LiveTableLayout,
 };
-use super::sql::ensure_schema_live_table_sql_statements;
-use crate::backend::add_column_if_missing_with_executor;
-use crate::backend::QueryExecutor;
-use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};
-use crate::live_state::SchemaRegistration;
+use crate::live_state::store::{LiveStateBackendRef, LiveStateTransactionRef};
 use crate::schema::schema_from_registered_snapshot;
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use crate::{LixError, Value};
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LiveTableRequirement {
-    pub(crate) schema_key: String,
-    pub(crate) layout: Option<LiveTableLayout>,
-}
-
-pub(crate) async fn register_schema(
-    backend: &dyn LixBackend,
-    registration: &SchemaRegistration,
-) -> Result<(), LixError> {
-    ensure_schema_live_table_with_requirement(
-        backend,
-        &requirement_from_registration(registration)?,
-    )
-    .await
-}
-
-pub(crate) async fn register_schema_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    registration: &SchemaRegistration,
-) -> Result<(), LixError> {
-    ensure_schema_live_table_with_requirement_in_transaction(
-        transaction,
-        &requirement_from_registration(registration)?,
-    )
-    .await
-}
-
-pub(crate) async fn ensure_schema_live_table_with_requirement(
-    backend: &dyn LixBackend,
-    requirement: &LiveTableRequirement,
-) -> Result<(), LixError> {
-    let mut executor = backend;
-    ensure_schema_live_table_with_requirement_for_executor(&mut executor, requirement).await
-}
-
-pub(crate) async fn ensure_schema_live_table_with_requirement_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    requirement: &LiveTableRequirement,
-) -> Result<(), LixError> {
-    let mut executor = transaction;
-    ensure_schema_live_table_with_requirement_for_executor(&mut executor, requirement).await
-}
-
-async fn ensure_schema_live_table_with_requirement_for_executor(
-    executor: &mut dyn QueryExecutor,
-    requirement: &LiveTableRequirement,
-) -> Result<(), LixError> {
-    let layout = match requirement.layout.as_ref() {
-        Some(layout) => layout.clone(),
-        None => load_live_table_layout_with_executor(executor, &requirement.schema_key).await?,
-    };
-    let statements = ensure_schema_live_table_sql_statements(
-        &requirement.schema_key,
-        executor.dialect(),
-        &layout,
-    );
-    let table_name = tracked_relation_name(&requirement.schema_key);
-
-    if let Some(create_table) = statements.first() {
-        executor.execute(create_table, &[]).await?;
-    }
-
-    add_column_if_missing_with_executor(
-        executor,
-        &table_name,
-        STORAGE_SCOPE_KEY_COLUMN,
-        &format!(
-            "TEXT NOT NULL DEFAULT '{}'",
-            storage_scope_key_for_file_id(None)
-        ),
-    )
-    .await?;
-    executor
-        .execute(
-            &format!(
-                "UPDATE {table_name} \
-                 SET {storage_scope_key} = CASE \
-                   WHEN file_id IS NULL THEN '{engine_scope}' \
-                   ELSE 'file:' || file_id \
-                 END",
-                storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
-                engine_scope = storage_scope_key_for_file_id(None),
-            ),
-            &[],
-        )
-        .await?;
-
-    for statement in statements.iter().skip(1) {
-        executor.execute(statement, &[]).await?;
-    }
-    Ok(())
-}
-
 pub(crate) async fn load_live_table_layout_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     let mut provider = BackendSchemaLayoutProvider { backend };
@@ -124,7 +26,7 @@ pub(crate) async fn load_live_table_layout_with_backend(
 }
 
 pub(crate) async fn load_live_table_layout_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     let mut provider = TransactionSchemaLayoutProvider { transaction };
@@ -137,31 +39,35 @@ trait RegisteredSchemaLayoutProvider {
 }
 
 struct BackendSchemaLayoutProvider<'a> {
-    backend: &'a dyn LixBackend,
+    backend: LiveStateBackendRef<'a>,
 }
 
 #[async_trait(?Send)]
 impl RegisteredSchemaLayoutProvider for BackendSchemaLayoutProvider<'_> {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
-        let result = self
-            .backend
-            .execute(REGISTERED_SCHEMA_LAYOUT_SQL, &[])
-            .await?;
+        let result = crate::live_state::store_sql::execute_query_with_backend(
+            self.backend,
+            REGISTERED_SCHEMA_LAYOUT_SQL,
+            &[],
+        )
+        .await?;
         Ok(result.rows.into_iter().collect())
     }
 }
 
 struct TransactionSchemaLayoutProvider<'a> {
-    transaction: &'a mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'a>,
 }
 
 #[async_trait(?Send)]
 impl RegisteredSchemaLayoutProvider for TransactionSchemaLayoutProvider<'_> {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
-        let result = self
-            .transaction
-            .execute(REGISTERED_SCHEMA_LAYOUT_SQL, &[])
-            .await?;
+        let result = crate::live_state::store_sql::execute_query_with_transaction(
+            self.transaction,
+            REGISTERED_SCHEMA_LAYOUT_SQL,
+            &[],
+        )
+        .await?;
         Ok(result.rows.into_iter().collect())
     }
 }
@@ -185,7 +91,7 @@ async fn load_live_table_layout_with_provider(
 }
 
 async fn load_live_table_layout_from_registered_schema_live_table(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     let registered_schema_table = tracked_relation_name("lix_registered_schema");
@@ -204,28 +110,8 @@ async fn load_live_table_layout_from_registered_schema_live_table(
         snapshot_expr = snapshot_expr,
         registered_schema_table = registered_schema_table,
     );
-    let result = backend.execute(&sql, &[]).await?;
+    let result = crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
     compile_registered_live_layout(schema_key, result.rows)
-}
-
-fn requirement_from_registration(
-    registration: &SchemaRegistration,
-) -> Result<LiveTableRequirement, LixError> {
-    let layout = if let Some(schema_definition) = registration.schema_definition_override() {
-        Some(live_table_layout_from_schema(schema_definition)?)
-    } else {
-        registration
-            .registered_snapshot()
-            .map(|snapshot| {
-                let (_, schema) = schema_from_registered_snapshot(snapshot)?;
-                live_table_layout_from_schema(&schema)
-            })
-            .transpose()?
-    };
-    Ok(LiveTableRequirement {
-        schema_key: registration.schema_key().to_string(),
-        layout,
-    })
 }
 
 pub(crate) fn compile_registered_live_layout(

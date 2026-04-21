@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
-use crate::backend::TransactionBeginMode;
 use crate::common::storage_scope_key_for_file_id;
 use crate::live_state::lifecycle::build_set_live_state_mode_sql;
+use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::storage::{
     load_live_table_layout_in_transaction, normalized_insert_columns_sql,
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
@@ -15,36 +15,30 @@ use crate::live_state::LiveStateMode;
 use crate::live_state::{
     mark_live_state_ready_at_latest_replay_cursor_in_transaction, register_schema_in_transaction,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use crate::{LixError, Value};
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
-    backend: &dyn LixBackend,
+    transaction: LiveStateTransactionRef<'_>,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
-    transaction
-        .execute(
-            &build_set_live_state_mode_sql(LiveStateMode::Rebuilding),
+    crate::live_state::store_sql::execute_query_with_transaction(
+        transaction,
+        &build_set_live_state_mode_sql(LiveStateMode::Rebuilding),
+        &[],
+    )
+    .await?;
+    let (rows_deleted, tables_touched) = apply_live_state_scope_in_transaction(transaction, plan).await?;
+
+    if matches!(plan.scope, LiveStateRebuildScope::Full) {
+        mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction).await?;
+    } else {
+        crate::live_state::store_sql::execute_query_with_transaction(
+            transaction,
+            &build_set_live_state_mode_sql(LiveStateMode::NeedsRebuild),
             &[],
         )
         .await?;
-    let (rows_deleted, tables_touched) =
-        apply_live_state_scope_in_transaction(transaction.as_mut(), plan).await?;
-
-    if matches!(plan.scope, LiveStateRebuildScope::Full) {
-        mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction.as_mut()).await?;
-    } else {
-        transaction
-            .execute(
-                &build_set_live_state_mode_sql(LiveStateMode::NeedsRebuild),
-                &[],
-            )
-            .await?;
     }
-
-    transaction.commit().await?;
 
     Ok(LiveStateApplyReport {
         run_id: plan.run_id.clone(),
@@ -55,7 +49,7 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
 }
 
 pub(crate) async fn apply_live_state_scope_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     plan: &LiveStateRebuildPlan,
 ) -> Result<(usize, BTreeSet<String>), LixError> {
     let mut tables_touched = BTreeSet::new();
@@ -163,14 +157,14 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
             normalized_updates = normalized_update_assignments_sql(&normalized_values),
         );
 
-        transaction.execute(&sql, &[]).await?;
+        crate::live_state::store_sql::execute_query_with_transaction(transaction, &sql, &[]).await?;
     }
 
     Ok((rows_deleted, tables_touched))
 }
 
 async fn clear_scope_rows(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     schema_lanes: &BTreeMap<String, BTreeSet<bool>>,
     scope: &LiveStateRebuildScope,
     tables_touched: &mut BTreeSet<String>,
@@ -229,10 +223,21 @@ async fn clear_scope_rows(
             )
         };
 
-        let count_result = transaction.execute(&count_sql, &[]).await?;
+        let count_result =
+            crate::live_state::store_sql::execute_query_with_transaction(
+                transaction,
+                &count_sql,
+                &[],
+            )
+            .await?;
         rows_deleted += parse_count_result(&count_result.rows)?;
 
-        transaction.execute(&delete_sql, &[]).await?;
+        crate::live_state::store_sql::execute_query_with_transaction(
+            transaction,
+            &delete_sql,
+            &[],
+        )
+        .await?;
     }
 
     Ok(rows_deleted)

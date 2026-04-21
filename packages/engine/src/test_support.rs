@@ -151,6 +151,12 @@ impl TestSqliteBackend {
     pub(crate) fn clear_hooks(&self) {
         self.state.lock().expect("sqlite state lock").hooks.clear();
     }
+
+    pub(crate) async fn begin_write_transaction(
+        &self,
+    ) -> Result<Box<dyn crate::backend::LixBackendTransaction + '_>, LixError> {
+        self.begin_transaction(TransactionBeginMode::Write).await
+    }
 }
 
 #[async_trait(?Send)]
