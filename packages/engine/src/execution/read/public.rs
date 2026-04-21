@@ -64,7 +64,12 @@ pub(crate) async fn execute_prepared_public_read_artifact_without_freshness_chec
             execute_history_read_plan_with_backend(backend, &artifact.plan).await?
         }
         PreparedPublicReadPlanArtifact::Sql2(artifact) => {
-            crate::sql2::execute_read_with_backend(backend, &artifact.artifact).await?
+            if let Some(shared_backend) = host.shared_backend() {
+                crate::sql2::execute_read_with_shared_backend(shared_backend, &artifact.artifact)
+                    .await?
+            } else {
+                crate::sql2::execute_read_with_backend(backend, &artifact.artifact).await?
+            }
         }
     };
     Ok(finalize_prepared_public_read_result(result, artifact))

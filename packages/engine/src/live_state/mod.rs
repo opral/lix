@@ -48,6 +48,7 @@ mod row_queries;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
 mod snapshot_queries;
+mod state_surface;
 pub(crate) mod storage;
 mod storage_metadata;
 pub(crate) mod stored_rows;
@@ -98,6 +99,11 @@ pub use row_queries::{
 };
 pub(crate) use schema_access::LiveRowShape;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
+pub use state_surface::{
+    open_state_by_version_snapshot, open_state_by_version_snapshot_with_shared_backend,
+    StateByVersionScanRequest, StateByVersionSnapshot, StateSurfaceColumn, StateSurfaceFilter,
+    StateSurfaceRow,
+};
 #[cfg(test)]
 pub(crate) use storage_metadata::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
 #[cfg(test)]
@@ -130,6 +136,7 @@ pub(crate) use types::{
 };
 pub use types::{LiveStateMode, SchemaRegistration};
 pub(crate) use untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
+pub(crate) use untracked::scan_rows_with_backend_limit as scan_untracked_rows_with_backend_limit;
 #[cfg(test)]
 pub(crate) use untracked::UntrackedReadView;
 #[allow(unused_imports)]

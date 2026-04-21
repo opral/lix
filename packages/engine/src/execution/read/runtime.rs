@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::catalog::{CatalogReadTimeProjectionRequest, SurfaceReadFreshness};
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
@@ -22,6 +23,10 @@ pub(crate) struct ReadTimeProjectionRow {
 
 #[async_trait(?Send)]
 pub(crate) trait ReadExecutionHost {
+    fn shared_backend(&self) -> Option<Arc<dyn LixBackend + Send + Sync>> {
+        None
+    }
+
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,

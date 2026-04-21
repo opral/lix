@@ -38,6 +38,29 @@ pub async fn scan_rows_with_backend(
     scan_rows_with_executor(&mut executor, request).await
 }
 
+pub(crate) async fn scan_rows_with_backend_limit(
+    backend: &dyn LixBackend,
+    request: &UntrackedScanRequest,
+    limit: usize,
+) -> Result<Vec<UntrackedRow>, LixError> {
+    let mut executor = backend;
+    scan_rows_with_executor_limit(&mut executor, request, limit).await
+}
+
+pub(crate) async fn scan_rows_with_executor_limit(
+    executor: &mut dyn QueryExecutor,
+    request: &UntrackedScanRequest,
+    limit: usize,
+) -> Result<Vec<UntrackedRow>, LixError> {
+    scan_rows_with_limit_and_order(
+        executor,
+        request,
+        Some(limit),
+        &["entity_id ASC", "file_id ASC"],
+    )
+    .await
+}
+
 pub(crate) async fn load_exact_row_with_executor(
     executor: &mut dyn QueryExecutor,
     request: &ExactUntrackedRowRequest,

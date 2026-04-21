@@ -162,6 +162,7 @@ pub(crate) async fn load_live_snapshot_rows_with_backend(
         version_id,
         &constraints,
         &required_columns,
+        None,
     )
     .await?;
 

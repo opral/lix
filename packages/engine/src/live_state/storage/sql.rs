@@ -9,6 +9,11 @@ use crate::{LixError, SqlDialect, Value};
 use super::layout::{LiveColumnSpec, LiveRowAccess, LiveTableLayout};
 
 pub(crate) const TRACKED_LIVE_TABLE_PREFIX: &str = "lix_internal_live_v1_";
+pub(crate) const NO_LIVE_COLUMNS_SENTINEL: &str = "__lix_no_live_columns__";
+
+pub(crate) fn no_live_columns() -> Vec<String> {
+    vec![NO_LIVE_COLUMNS_SENTINEL.to_string()]
+}
 
 pub(crate) fn ensure_schema_live_table_sql_statements(
     schema_key: &str,
@@ -50,6 +55,10 @@ pub(crate) fn selected_columns<'a>(
     required_columns: &[String],
     state_label: &str,
 ) -> Result<Vec<&'a LiveColumnSpec>, LixError> {
+    if required_columns.len() == 1 && required_columns[0] == NO_LIVE_COLUMNS_SENTINEL {
+        return Ok(Vec::new());
+    }
+
     if required_columns.is_empty() {
         return Ok(access.columns().iter().collect());
     }
