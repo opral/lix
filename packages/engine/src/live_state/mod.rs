@@ -544,6 +544,14 @@ pub(crate) async fn delete_file_payload_cache_data(
     materialize::filesystem::delete_file_payload_cache_data(backend, file_id, version_id).await
 }
 
+pub(crate) async fn rebuild_file_payloads_with_plugins(
+    backend: LiveStateBackendRef<'_>,
+    plugin_materializer: &dyn crate::plugin::FilesystemPluginMaterializer,
+    plan: &LiveStateRebuildPlan,
+) -> Result<(), LixError> {
+    materialize::rebuild_file_payloads_with_plugins(backend, plugin_materializer, plan).await
+}
+
 pub(crate) async fn rebuild_scope_in_transaction(
     transaction: LiveStateTransactionRef<'_>,
     request: &LiveStateRebuildRequest,

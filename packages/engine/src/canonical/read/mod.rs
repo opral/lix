@@ -12,6 +12,6 @@ pub(crate) use history::{
 };
 pub(crate) use state::{
     load_canonical_change_row_by_id, load_commit_lineage_entry_by_id,
-    load_exact_committed_change_from_commit_with_executor, CommitLineageEntry, CommitQueryExecutor,
+    load_exact_committed_change_from_commit_with_executor, CommitLineageEntry,
     CommittedCanonicalChangeRow, ExactCommittedStateRowRequest,
 };

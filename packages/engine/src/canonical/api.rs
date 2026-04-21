@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::backend::{transaction_backend_view, QueryExecutor};
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -17,10 +16,20 @@ use crate::canonical::read::{
     CanonicalRootCommit as ReadCanonicalRootCommit, CommitLineageEntry,
     ExactCommittedStateRowRequest,
 };
+use crate::canonical::store::{
+    CanonicalBackendRef, CanonicalExecutorRef, CanonicalTransactionRef,
+};
+use crate::canonical::store_sql::{
+    execute_batch_with_transaction, execute_query_with_backend, execute_query_with_executor,
+    execute_query_with_transaction, load_durable_state_commit_low_watermark_in_transaction,
+};
 use crate::common::escape_sql_string;
 use crate::functions::LixFunctionProvider;
-use crate::streams::{load_durable_state_commit_low_watermark, DurableStateCommitCursor};
-use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
+use crate::streams::DurableStateCommitCursor;
+use crate::{LixError, QueryResult, Value};
+
+#[cfg(test)]
+use crate::QueryExecutor;
 
 pub(crate) type CanonicalChangeWrite = ChangeRow;
 pub(crate) type CanonicalUntrackedVisibilityWrite = UntrackedChangeVisibilityRow;
@@ -254,7 +263,7 @@ pub(crate) enum CanonicalVisibility {
 }
 
 pub(crate) async fn append_changes(
-    tx: &mut dyn LixBackendTransaction,
+    tx: CanonicalTransactionRef<'_>,
     changes: &[CanonicalChangeWrite],
     functions: &mut dyn LixFunctionProvider,
 ) -> Result<CanonicalAppendSummary, LixError> {
@@ -275,7 +284,7 @@ pub(crate) async fn append_changes(
         &commit_graph_rows,
         tx.dialect(),
     )?);
-    tx.execute_batch(&prepared).await?;
+    execute_batch_with_transaction(tx, &prepared).await?;
 
     Ok(CanonicalAppendSummary {
         latest_change_id: canonical_output
@@ -290,22 +299,23 @@ pub(crate) async fn append_changes(
 }
 
 pub(crate) async fn append_untracked_change_visibility_rows(
-    tx: &mut dyn LixBackendTransaction,
+    tx: CanonicalTransactionRef<'_>,
     visibility_rows: &[CanonicalUntrackedVisibilityWrite],
 ) -> Result<(), LixError> {
     if visibility_rows.is_empty() {
         return Ok(());
     }
     let prepared = build_prepared_batch_from_visibility_rows(visibility_rows, tx.dialect())?;
-    tx.execute_batch(&prepared).await.map(|_| ())
+    execute_batch_with_transaction(tx, &prepared).await
 }
 
 pub(crate) async fn replace_snapshot_content_in_transaction(
-    tx: &mut dyn LixBackendTransaction,
+    tx: CanonicalTransactionRef<'_>,
     snapshot_id: &str,
     snapshot_content: &str,
 ) -> Result<(), LixError> {
-    tx.execute(
+    execute_query_with_transaction(
+        tx,
         "UPDATE lix_internal_snapshot \
          SET content = $1 \
          WHERE id = $2",
@@ -319,7 +329,7 @@ pub(crate) async fn replace_snapshot_content_in_transaction(
 }
 
 pub(crate) async fn compact_untracked_changes_for_touched_rows_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: CanonicalTransactionRef<'_>,
     visibility_rows: &[CanonicalUntrackedVisibilityWrite],
 ) -> Result<usize, LixError> {
     let touched = visibility_rows
@@ -334,13 +344,13 @@ pub(crate) async fn compact_untracked_changes_for_touched_rows_in_transaction(
 
 #[allow(dead_code)]
 pub(crate) async fn compact_stale_untracked_changes_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: CanonicalTransactionRef<'_>,
 ) -> Result<usize, LixError> {
     compact_untracked_changes_in_transaction(transaction, None).await
 }
 
 pub(crate) async fn load_commit(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     commit_id: &str,
 ) -> Result<Option<CanonicalCommit>, LixError> {
     Ok(load_commit_lineage_entry_by_id(executor, commit_id)
@@ -349,7 +359,7 @@ pub(crate) async fn load_commit(
 }
 
 pub(crate) async fn load_change(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     change_id: &str,
 ) -> Result<Option<CanonicalChange>, LixError> {
     Ok(load_canonical_change_row_by_id(executor, change_id)
@@ -453,7 +463,7 @@ pub(crate) async fn load_latest_untracked_change_visibility_for_identity(
 }
 
 pub(crate) async fn load_commit_member_change(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     commit_id: &str,
     change_id: &str,
 ) -> Result<Option<CanonicalChange>, LixError> {
@@ -468,7 +478,7 @@ pub(crate) async fn load_commit_member_change(
 }
 
 pub(crate) async fn load_exact_row_at_commit(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     commit_id: &str,
     identity: &CanonicalStateIdentity,
 ) -> Result<Option<CanonicalStateRow>, LixError> {
@@ -508,25 +518,25 @@ pub(crate) async fn load_exact_row_at_commit(
 }
 
 pub(crate) async fn load_history(
-    backend: &dyn LixBackend,
+    backend: CanonicalBackendRef<'_>,
     request: &CanonicalHistoryRequest,
 ) -> Result<Vec<CanonicalHistoryRow>, LixError> {
     let sql = build_canonical_history_query_sql(backend.dialect(), request)?;
-    let result = backend.execute(&sql, &[]).await?;
+    let result = execute_query_with_backend(backend, &sql, &[]).await?;
     parse_canonical_history_rows(result)
 }
 
 pub(crate) async fn load_visible_state(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     request: &CanonicalVisibleStateRequest,
 ) -> Result<Vec<CanonicalVisibleStateRow>, LixError> {
     let sql = build_visible_state_query_sql(executor.dialect(), request)?;
-    let result = executor.execute(&sql, &[]).await?;
+    let result = execute_query_with_executor(executor, &sql, &[]).await?;
     parse_visible_state_rows(result)
 }
 
 pub(crate) async fn resolve_merge_base(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     left_head_commit_id: &str,
     right_head_commit_id: &str,
 ) -> Result<Option<String>, LixError> {
@@ -574,7 +584,7 @@ fn canonical_change_from_row(
 }
 
 async fn untracked_visibility_exists(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     change_id: &str,
 ) -> Result<bool, LixError> {
     let sql = format!(
@@ -585,9 +595,8 @@ async fn untracked_visibility_exists(
         crate::canonical::journal::UNTRACKED_CHANGE_VISIBILITY_TABLE,
         executor.dialect().placeholder(1),
     );
-    let result = executor
-        .execute(&sql, &[Value::Text(change_id.to_string())])
-        .await?;
+    let result =
+        execute_query_with_executor(executor, &sql, &[Value::Text(change_id.to_string())]).await?;
     Ok(!result.rows.is_empty())
 }
 
@@ -977,13 +986,10 @@ fn render_where_clause_sql(predicates: &[String], prefix: &str) -> String {
 }
 
 async fn compact_untracked_changes_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: CanonicalTransactionRef<'_>,
     identities: Option<&BTreeSet<CanonicalUntrackedIdentity>>,
 ) -> Result<usize, LixError> {
-    let low_watermark = {
-        let backend = transaction_backend_view(transaction);
-        load_durable_state_commit_low_watermark(&backend).await?
-    };
+    let low_watermark = load_durable_state_commit_low_watermark_in_transaction(transaction).await?;
     let rows = {
         let mut executor = &mut *transaction;
         load_untracked_change_rows_for_compaction(&mut executor, identities).await?
@@ -994,7 +1000,7 @@ async fn compact_untracked_changes_in_transaction(
 }
 
 async fn load_untracked_change_rows_for_compaction(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     identities: Option<&BTreeSet<CanonicalUntrackedIdentity>>,
 ) -> Result<Vec<CanonicalUntrackedChangeRow>, LixError> {
     let dialect = executor.dialect();
@@ -1045,7 +1051,7 @@ async fn load_untracked_change_rows_for_compaction(
             format!("WHERE {}", predicates.join(" AND "))
         }
     );
-    let result = executor.execute(&sql, &params).await?;
+    let result = execute_query_with_executor(executor, &sql, &params).await?;
     result
         .rows
         .iter()
@@ -1147,7 +1153,7 @@ fn untracked_change_row_is_at_or_below_watermark(
 }
 
 async fn delete_visibility_rows_and_orphaned_changes(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: CanonicalTransactionRef<'_>,
     rows: &[CanonicalUntrackedChangeRow],
 ) -> Result<(), LixError> {
     const DELETE_CHUNK_SIZE: usize = 256;
@@ -1170,16 +1176,16 @@ async fn delete_visibility_rows_and_orphaned_changes(
                 dialect.placeholder(index + 1)
             })
             .collect::<Vec<_>>();
-        transaction
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_untracked_change_visibility \
-                     WHERE id IN ({})",
-                    placeholders.join(", ")
-                ),
-                &params,
-            )
-            .await?;
+        execute_query_with_transaction(
+            transaction,
+            &format!(
+                "DELETE FROM lix_internal_untracked_change_visibility \
+                 WHERE id IN ({})",
+                placeholders.join(", ")
+            ),
+            &params,
+        )
+        .await?;
     }
 
     let change_ids = rows
@@ -1200,26 +1206,26 @@ async fn delete_visibility_rows_and_orphaned_changes(
                 dialect.placeholder(index + 1)
             })
             .collect::<Vec<_>>();
-        transaction
-            .execute(
-                &format!(
-                    "WITH {change_commit_ctes} \
-                     DELETE FROM lix_internal_change \
-                     WHERE id IN ({placeholders}) \
-                       AND NOT EXISTS (\
-                         SELECT 1 FROM lix_internal_untracked_change_visibility v \
-                         WHERE v.change_id = lix_internal_change.id\
-                       ) \
-                       AND NOT EXISTS (\
-                         SELECT 1 FROM change_commit_by_change_id cc \
-                         WHERE cc.change_id = lix_internal_change.id\
-                       )",
-                    change_commit_ctes = change_commit_ctes,
-                    placeholders = placeholders.join(", "),
-                ),
-                &params,
-            )
-            .await?;
+        execute_query_with_transaction(
+            transaction,
+            &format!(
+                "WITH {change_commit_ctes} \
+                 DELETE FROM lix_internal_change \
+                 WHERE id IN ({placeholders}) \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM lix_internal_untracked_change_visibility v \
+                     WHERE v.change_id = lix_internal_change.id\
+                   ) \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM change_commit_by_change_id cc \
+                     WHERE cc.change_id = lix_internal_change.id\
+                   )",
+                change_commit_ctes = change_commit_ctes,
+                placeholders = placeholders.join(", "),
+            ),
+            &params,
+        )
+        .await?;
     }
 
     let snapshot_ids = rows
@@ -1239,20 +1245,20 @@ async fn delete_visibility_rows_and_orphaned_changes(
                 dialect.placeholder(index + 1)
             })
             .collect::<Vec<_>>();
-        transaction
-            .execute(
-                &format!(
-                    "DELETE FROM lix_internal_snapshot \
-                     WHERE id IN ({}) \
-                       AND NOT EXISTS (\
-                         SELECT 1 FROM lix_internal_change c \
-                         WHERE c.snapshot_id = lix_internal_snapshot.id\
-                       )",
-                    placeholders.join(", ")
-                ),
-                &params,
-            )
-            .await?;
+        execute_query_with_transaction(
+            transaction,
+            &format!(
+                "DELETE FROM lix_internal_snapshot \
+                 WHERE id IN ({}) \
+                   AND NOT EXISTS (\
+                     SELECT 1 FROM lix_internal_change c \
+                     WHERE c.snapshot_id = lix_internal_snapshot.id\
+                   )",
+                placeholders.join(", ")
+            ),
+            &params,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1323,7 +1329,7 @@ fn parse_visible_state_rows(
 }
 
 async fn load_commit_depths(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     head_commit_id: &str,
 ) -> Result<BTreeMap<String, usize>, LixError> {
     let mut depths = BTreeMap::new();

@@ -11,6 +11,13 @@ use super::{
     CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
 
+pub(crate) type CanonicalBackendRef<'a> = &'a (dyn crate::LixBackend + 'a);
+pub(crate) type CanonicalExecutorRef<'a> = &'a mut (dyn crate::QueryExecutor + 'a);
+pub(crate) type CanonicalTransactionRef<'a> = &'a mut (dyn crate::LixBackendTransaction + 'a);
+pub(crate) type CanonicalPreparedBatch = crate::PreparedBatch;
+pub(crate) type CanonicalPreparedStatement = crate::PreparedStatement;
+pub(crate) type CanonicalCommitQueryExecutor<'a> = dyn crate::QueryExecutor + 'a;
+
 /// Owner-facing read surface for canonical committed-history persistence.
 #[async_trait(?Send)]
 pub(crate) trait CanonicalReadStore {
