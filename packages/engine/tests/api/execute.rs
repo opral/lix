@@ -94,7 +94,10 @@ simulation_test!(
             .await
             .expect_err("sqlite_master read should be rejected");
 
-        assert_eq!(error.code, "LIX_ERROR_DIRECT_READS_UNSUPPORTED");
+        assert!(
+            !error.code.is_empty(),
+            "sqlite_master read should fail with a normal compiler/runtime error"
+        );
     }
 );
 

@@ -1,9 +1,7 @@
-use crate::sql::logical_plan::direct_reads::{
+use crate::sql::logical_plan::history_reads::{
     DirectoryHistoryReadPlan, FileHistoryReadPlan, HistoryReadPlan, StateHistoryReadPlan,
 };
-use crate::sql::logical_plan::plan::{
-    DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
-};
+use crate::sql::logical_plan::plan::{LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan};
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadGroupByKind, BroadPublicReadJoinConstraint, BroadPublicReadJoinKind,
     BroadPublicReadProjectionItemKind, BroadPublicReadQuery, BroadPublicReadRelation,
@@ -11,7 +9,6 @@ use crate::sql::logical_plan::public_ir::{
     BroadPublicReadTableWithJoins, BroadSqlExpr, BroadSqlExprKind, BroadSqlFunction,
     BroadSqlFunctionArg, BroadSqlFunctionArgExpr, BroadSqlFunctionArguments,
 };
-use crate::sql::logical_plan::result_contract::ResultContract;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LogicalPlanVerificationError {
@@ -30,7 +27,6 @@ pub(crate) fn verify_logical_plan(plan: &LogicalPlan) -> Result<(), LogicalPlanV
     match plan {
         LogicalPlan::PublicRead(plan) => verify_public_read_logical_plan(plan),
         LogicalPlan::PublicWrite(plan) => verify_public_write_logical_plan(plan),
-        LogicalPlan::Direct(plan) => verify_direct_logical_plan(plan),
     }
 }
 
@@ -53,7 +49,7 @@ pub(crate) fn verify_public_read_logical_plan(
             let read = plan.structured_read();
             if read.resolved_relation.descriptor.public_name.is_empty() {
                 return Err(LogicalPlanVerificationError::new(
-                    "direct history read must target a named surface",
+                    "history read must target a named surface",
                 ));
             }
             verify_direct_public_read_plan(history_read_plan)?;
@@ -455,22 +451,6 @@ pub(crate) fn verify_public_write_logical_plan(
     {
         return Err(LogicalPlanVerificationError::new(
             "planned write must target a named surface",
-        ));
-    }
-
-    Ok(())
-}
-
-pub(crate) fn verify_direct_logical_plan(
-    plan: &DirectLogicalPlan,
-) -> Result<(), LogicalPlanVerificationError> {
-    if plan.normalized_statements.prepared_statements.is_empty()
-        && !matches!(plan.result_contract, ResultContract::DmlNoReturning)
-        && plan.normalized_statements.mutations.is_empty()
-        && plan.normalized_statements.update_validations.is_empty()
-    {
-        return Err(LogicalPlanVerificationError::new(
-            "internal logical plan must contain statements or explicit internal effects",
         ));
     }
 

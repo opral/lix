@@ -635,7 +635,7 @@ simulation_test!(
                 })
             })
             .await
-            .expect("transactional direct state-history read should succeed");
+            .expect("transactional state-history read should succeed");
     }
 );
 

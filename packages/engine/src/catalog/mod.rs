@@ -2,10 +2,10 @@ mod api;
 mod binding;
 mod declaration;
 mod dependency;
-mod direct_read;
 mod directory;
 mod file;
 mod filesystem_query;
+mod history_read;
 mod public_surface_registry;
 mod read_surface;
 mod read_time_projection;
@@ -59,8 +59,6 @@ pub(crate) use dependency::{
     CatalogSurfaceDependencyMetadata,
 };
 #[allow(unused_imports)]
-pub(crate) use direct_read::{history_read_semantics, CatalogHistoryReadSemantics};
-#[allow(unused_imports)]
 pub(crate) use directory::LixDirectoryProjection;
 #[allow(unused_imports)]
 pub(crate) use directory::{
@@ -76,6 +74,8 @@ pub(crate) use file::{
 };
 #[allow(unused_imports)]
 pub(crate) use filesystem_query::*;
+#[allow(unused_imports)]
+pub(crate) use history_read::{history_read_semantics, CatalogHistoryReadSemantics};
 #[allow(unused_imports)]
 pub(crate) use public_surface_registry::{
     apply_registered_schema_snapshot_to_surface_registry, load_public_surface_registry_with_backend,

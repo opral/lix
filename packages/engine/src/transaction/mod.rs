@@ -93,7 +93,7 @@ pub(crate) use prepared_artifacts::{
     PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
     PreparedPublicWriteExecution, PreparedPublicWriteMaterialization,
     PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
-    PreparedWriteArtifact, PreparedWriteStatement,
+    PreparedScalarReadArtifact, PreparedWriteArtifact, PreparedWriteStatement,
 };
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};

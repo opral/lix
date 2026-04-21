@@ -4,7 +4,7 @@ use crate::sql::physical_plan::LoweredResultColumns;
 use crate::Value;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectStateHistoryField {
+pub(crate) enum StateHistoryField {
     EntityId,
     SchemaKey,
     FileId,
@@ -27,7 +27,7 @@ pub(crate) enum StateHistoryAggregate {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StateHistoryProjectionValue {
-    Field(DirectStateHistoryField),
+    Field(StateHistoryField),
     Aggregate(StateHistoryAggregate),
 }
 
@@ -39,7 +39,7 @@ pub(crate) struct StateHistoryProjection {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StateHistorySortValue {
-    Field(DirectStateHistoryField),
+    Field(StateHistoryField),
     Aggregate(StateHistoryAggregate),
 }
 
@@ -52,15 +52,15 @@ pub(crate) struct StateHistorySortKey {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum StateHistoryPredicate {
-    Eq(DirectStateHistoryField, Value),
-    NotEq(DirectStateHistoryField, Value),
-    Gt(DirectStateHistoryField, Value),
-    GtEq(DirectStateHistoryField, Value),
-    Lt(DirectStateHistoryField, Value),
-    LtEq(DirectStateHistoryField, Value),
-    In(DirectStateHistoryField, Vec<Value>),
-    IsNull(DirectStateHistoryField),
-    IsNotNull(DirectStateHistoryField),
+    Eq(StateHistoryField, Value),
+    NotEq(StateHistoryField, Value),
+    Gt(StateHistoryField, Value),
+    GtEq(StateHistoryField, Value),
+    Lt(StateHistoryField, Value),
+    LtEq(StateHistoryField, Value),
+    In(StateHistoryField, Vec<Value>),
+    IsNull(StateHistoryField),
+    IsNotNull(StateHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -70,7 +70,7 @@ pub(crate) struct StateHistoryReadPlan {
     pub(crate) projections: Vec<StateHistoryProjection>,
     pub(crate) wildcard_projection: bool,
     pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) group_by_fields: Vec<DirectStateHistoryField>,
+    pub(crate) group_by_fields: Vec<StateHistoryField>,
     pub(crate) having: Option<StateHistoryAggregatePredicate>,
     pub(crate) sort_keys: Vec<StateHistorySortKey>,
     pub(crate) limit: Option<u64>,
@@ -89,35 +89,35 @@ pub(crate) enum StateHistoryAggregatePredicate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectEntityHistoryField {
+pub(crate) enum EntityHistoryField {
     Property(String),
-    State(DirectStateHistoryField),
+    State(StateHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EntityHistoryProjection {
     pub(crate) output_name: String,
-    pub(crate) field: DirectEntityHistoryField,
+    pub(crate) field: EntityHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct EntityHistorySortKey {
     pub(crate) output_name: String,
-    pub(crate) field: Option<DirectEntityHistoryField>,
+    pub(crate) field: Option<EntityHistoryField>,
     pub(crate) descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum EntityHistoryPredicate {
-    Eq(DirectEntityHistoryField, Value),
-    NotEq(DirectEntityHistoryField, Value),
-    Gt(DirectEntityHistoryField, Value),
-    GtEq(DirectEntityHistoryField, Value),
-    Lt(DirectEntityHistoryField, Value),
-    LtEq(DirectEntityHistoryField, Value),
-    In(DirectEntityHistoryField, Vec<Value>),
-    IsNull(DirectEntityHistoryField),
-    IsNotNull(DirectEntityHistoryField),
+    Eq(EntityHistoryField, Value),
+    NotEq(EntityHistoryField, Value),
+    Gt(EntityHistoryField, Value),
+    GtEq(EntityHistoryField, Value),
+    Lt(EntityHistoryField, Value),
+    LtEq(EntityHistoryField, Value),
+    In(EntityHistoryField, Vec<Value>),
+    IsNull(EntityHistoryField),
+    IsNotNull(EntityHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -135,7 +135,7 @@ pub(crate) struct EntityHistoryReadPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectFileHistoryField {
+pub(crate) enum FileHistoryField {
     Id,
     Path,
     Data,
@@ -158,27 +158,27 @@ pub(crate) enum DirectFileHistoryField {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FileHistoryProjection {
     pub(crate) output_name: String,
-    pub(crate) field: DirectFileHistoryField,
+    pub(crate) field: FileHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FileHistorySortKey {
     pub(crate) output_name: String,
-    pub(crate) field: Option<DirectFileHistoryField>,
+    pub(crate) field: Option<FileHistoryField>,
     pub(crate) descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum FileHistoryPredicate {
-    Eq(DirectFileHistoryField, Value),
-    NotEq(DirectFileHistoryField, Value),
-    Gt(DirectFileHistoryField, Value),
-    GtEq(DirectFileHistoryField, Value),
-    Lt(DirectFileHistoryField, Value),
-    LtEq(DirectFileHistoryField, Value),
-    In(DirectFileHistoryField, Vec<Value>),
-    IsNull(DirectFileHistoryField),
-    IsNotNull(DirectFileHistoryField),
+    Eq(FileHistoryField, Value),
+    NotEq(FileHistoryField, Value),
+    Gt(FileHistoryField, Value),
+    GtEq(FileHistoryField, Value),
+    Lt(FileHistoryField, Value),
+    LtEq(FileHistoryField, Value),
+    In(FileHistoryField, Vec<Value>),
+    IsNull(FileHistoryField),
+    IsNotNull(FileHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -202,7 +202,7 @@ pub(crate) struct FileHistoryReadPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum DirectDirectoryHistoryField {
+pub(crate) enum DirectoryHistoryField {
     Id,
     ParentId,
     Name,
@@ -225,27 +225,27 @@ pub(crate) enum DirectDirectoryHistoryField {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DirectoryHistoryProjection {
     pub(crate) output_name: String,
-    pub(crate) field: DirectDirectoryHistoryField,
+    pub(crate) field: DirectoryHistoryField,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DirectoryHistorySortKey {
     pub(crate) output_name: String,
-    pub(crate) field: Option<DirectDirectoryHistoryField>,
+    pub(crate) field: Option<DirectoryHistoryField>,
     pub(crate) descending: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum DirectoryHistoryPredicate {
-    Eq(DirectDirectoryHistoryField, Value),
-    NotEq(DirectDirectoryHistoryField, Value),
-    Gt(DirectDirectoryHistoryField, Value),
-    GtEq(DirectDirectoryHistoryField, Value),
-    Lt(DirectDirectoryHistoryField, Value),
-    LtEq(DirectDirectoryHistoryField, Value),
-    In(DirectDirectoryHistoryField, Vec<Value>),
-    IsNull(DirectDirectoryHistoryField),
-    IsNotNull(DirectDirectoryHistoryField),
+    Eq(DirectoryHistoryField, Value),
+    NotEq(DirectoryHistoryField, Value),
+    Gt(DirectoryHistoryField, Value),
+    GtEq(DirectoryHistoryField, Value),
+    Lt(DirectoryHistoryField, Value),
+    LtEq(DirectoryHistoryField, Value),
+    In(DirectoryHistoryField, Vec<Value>),
+    IsNull(DirectoryHistoryField),
+    IsNotNull(DirectoryHistoryField),
 }
 
 #[derive(Debug, Clone, PartialEq)]

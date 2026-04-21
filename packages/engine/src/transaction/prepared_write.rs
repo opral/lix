@@ -4,7 +4,8 @@ use crate::sql::{
     PublicReadSource, WriteDiagnosticContext,
 };
 use crate::transaction::{
-    PreparedDirectWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement,
+    PreparedDirectWriteArtifact, PreparedScalarReadArtifact, PreparedWriteFunctionBindings,
+    PreparedWriteStatement,
 };
 use crate::{LixError, QueryResult};
 
@@ -22,6 +23,7 @@ pub(crate) enum WritePath<'a> {
     ExplainOnly,
     PendingRead(&'a PreparedPublicRead),
     CommittedRead(&'a PreparedPublicRead),
+    ScalarRead(&'a PreparedScalarReadArtifact),
     BufferedDelta(&'a TransactionWriteDelta),
     NoopWrite,
     DirectWrite(&'a PreparedDirectWriteArtifact),
@@ -108,6 +110,9 @@ impl WriteCommand {
                 PublicReadSource::PendingOverlay => WritePath::PendingRead(public_read),
                 PublicReadSource::Committed(_) => WritePath::CommittedRead(public_read),
             };
+        }
+        if let Some(scalar_read) = self.prepared.scalar_read() {
+            return WritePath::ScalarRead(scalar_read);
         }
         if let Some(delta) = self.transaction_write_delta.as_ref() {
             return WritePath::BufferedDelta(delta);

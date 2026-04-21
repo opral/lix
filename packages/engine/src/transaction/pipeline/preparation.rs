@@ -44,9 +44,9 @@ use crate::transaction::{
     PreparedPublicSurfaceRegistryMutation, PreparedPublicWrite, PreparedPublicWriteContract,
     PreparedPublicWriteExecution, PreparedPublicWriteMaterialization,
     PreparedPublicWritePlanArtifact, PreparedResolvedWritePartition, PreparedResolvedWritePlan,
-    PreparedWriteArtifact, PreparedWriteFunctionBindings, PreparedWriteStatement,
-    SessionCompilerState, TransactionWriteSelectorResolver, UpdateValidationInput,
-    UpdateValidationInputRow, WriteCommand, WriteExecutionContext,
+    PreparedScalarReadArtifact, PreparedWriteArtifact, PreparedWriteFunctionBindings,
+    PreparedWriteStatement, SessionCompilerState, TransactionWriteSelectorResolver,
+    UpdateValidationInput, UpdateValidationInputRow, WriteCommand, WriteExecutionContext,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, Value};
@@ -613,6 +613,12 @@ fn prepared_write_statement_from_compiled_execution(
 
     let artifact = if let Some(public_read) = compiled.public_read() {
         PreparedWriteArtifact::PublicRead(prepare_public_read_artifact(public_read, dialect)?)
+    } else if let Some(scalar) = compiled.scalar_read() {
+        PreparedWriteArtifact::ScalarRead(PreparedScalarReadArtifact {
+            prepared_batch: PreparedBatch {
+                steps: scalar.prepared_statements.clone(),
+            },
+        })
     } else if let Some(public_write) = compiled.public_write() {
         PreparedWriteArtifact::PublicWrite(
             prepared_public_write_artifact_from_prepared_public_write(public_write),
@@ -662,6 +668,7 @@ fn prepared_public_surface_registry_effect_for_artifact(
 
     match artifact {
         PreparedWriteArtifact::PublicRead(_) => Ok(PreparedPublicSurfaceRegistryEffect::None),
+        PreparedWriteArtifact::ScalarRead(_) => Ok(PreparedPublicSurfaceRegistryEffect::None),
         PreparedWriteArtifact::PublicWrite(public_write) => {
             if public_write_mutates_registered_schema(public_write) {
                 return Ok(PreparedPublicSurfaceRegistryEffect::ReloadFromStorage);

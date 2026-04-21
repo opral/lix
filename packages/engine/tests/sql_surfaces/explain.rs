@@ -3184,21 +3184,9 @@ simulation_test!(
 
         assert_text_explain_contract(
             &result,
-            &[
-                "request",
-                "semantic_statement",
-                "logical_plan",
-                "optimized_logical_plan",
-                "compiled_artifacts",
-                "stage_timings",
-            ],
+            &["request", "compiled_artifacts", "stage_timings"],
             &[
                 ("request", &["mode: plan", "format: text"]),
-                ("semantic_statement", &["kind: internal"]),
-                (
-                    "logical_plan",
-                    &["kind: internal", "result_contract: select"],
-                ),
                 ("compiled_artifacts", &["lowered_sql_statements: 1"]),
                 ("stage_timings", &["parse:", "logical_planning:"]),
             ],

@@ -20,8 +20,8 @@ use crate::transaction::{
     normalize_sql_error_with_transaction_and_relation_names, BufferedWriteCommandMetadata,
     BufferedWriteFlushClass, BufferedWriteSessionEffects, BufferedWriteTransaction,
     DeferredCommitEffects, PendingCommitState, PendingWriteOverlay, PreparedDirectWriteArtifact,
-    PreparedWriteStatement, SessionCompilerState, TransactionWriteDelta, WriteCommand,
-    WriteExecutionContext, WritePath, WriteResult,
+    PreparedScalarReadArtifact, PreparedWriteStatement, SessionCompilerState,
+    TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath, WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -286,6 +286,15 @@ async fn execute_write_command_with_transaction(
             )
             .await
         }
+        WritePath::ScalarRead(scalar_read) => {
+            execute_scalar_read_query_write_command(
+                execution_context,
+                transaction,
+                command,
+                scalar_read,
+            )
+            .await
+        }
         WritePath::BufferedDelta(delta) => {
             let write_outcome = delta
                 .execute(execution_context, transaction, pending_commit_state)
@@ -353,6 +362,60 @@ async fn execute_read_query_write_command(
             execution_started.elapsed(),
         )?));
     }
+    Ok(WriteResult::Immediate(public_result))
+}
+
+async fn execute_scalar_read_query_write_command(
+    execution_context: &dyn WriteExecutionContext,
+    transaction: &mut dyn LixBackendTransaction,
+    command: &WriteCommand,
+    scalar_read: &PreparedScalarReadArtifact,
+) -> Result<WriteResult, LixError> {
+    let execution_started = std::time::Instant::now();
+    let mut public_result = QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
+    };
+
+    for statement in &scalar_read.prepared_batch.steps {
+        public_result = match transaction.execute(&statement.sql, &statement.params).await {
+            Ok(result) => result,
+            Err(error) => {
+                let normalized = normalize_sql_error_with_transaction_and_relation_names(
+                    transaction,
+                    error,
+                    command.diagnostic_context().relation_names(),
+                )
+                .await;
+                return Err(normalized);
+            }
+        };
+    }
+
+    execution_context
+        .persist_runtime_sequence_in_transaction(transaction, command.function_bindings().provider())
+        .await
+        .map_err(|error| LixError {
+            code: error.code,
+            description: format!(
+                "scalar read runtime-sequence persistence failed inside write txn: {}",
+                error.description
+            ),
+            hint: None,
+        })?;
+
+    if let Some(template) = command
+        .diagnostic_context()
+        .analyzed_explain_template
+        .as_ref()
+    {
+        return Ok(WriteResult::Immediate(render_analyzed_explain_result(
+            template,
+            &public_result,
+            execution_started.elapsed(),
+        )?));
+    }
+
     Ok(WriteResult::Immediate(public_result))
 }
 

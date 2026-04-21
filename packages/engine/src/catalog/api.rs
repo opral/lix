@@ -412,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn builtin_facade_exposes_catalog_owned_direct_read_semantics() {
+    fn builtin_facade_exposes_catalog_owned_history_read_semantics() {
         let facade = builtin_catalog_compiler_facade();
         let binding = facade
             .resolve_surface("lix_file_history")

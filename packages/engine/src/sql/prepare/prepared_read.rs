@@ -4,13 +4,13 @@ use crate::sql::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
-use crate::sql::logical_plan::direct_reads::{
-    DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectStateHistoryField, DirectoryHistoryAggregate, DirectoryHistoryPredicate,
+use crate::sql::logical_plan::history_reads::{
+    DirectoryHistoryAggregate, DirectoryHistoryField, DirectoryHistoryPredicate,
     DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
-    EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan, EntityHistorySortKey,
-    FileHistoryAggregate, FileHistoryPredicate, FileHistoryProjection, FileHistoryReadPlan,
-    FileHistorySortKey, HistoryReadPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    EntityHistoryField, EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan,
+    EntityHistorySortKey, FileHistoryAggregate, FileHistoryField, FileHistoryPredicate,
+    FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
+    StateHistoryAggregate, StateHistoryAggregatePredicate, StateHistoryField,
     StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
     StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
 };
@@ -136,7 +136,6 @@ async fn compile_committed_read_statement(
         compiled,
         diagnostic_context,
         is_scalar_read,
-        bound_statement,
     )
 }
 
@@ -171,7 +170,6 @@ fn prepared_read_statement_from_compiled_execution(
     compiled: CompiledExecution,
     mut diagnostic_context: ReadDiagnosticContext,
     is_scalar_read: bool,
-    bound_statement: &BoundStatementInstance,
 ) -> Result<PreparedReadStatement, LixError> {
     let transaction_mode =
         transaction_mode_for_committed_read_execution(&compiled, is_scalar_read)?;
@@ -197,24 +195,16 @@ fn prepared_read_statement_from_compiled_execution(
 
     let artifact = if let Some(public_read) = compiled.public_read() {
         PreparedReadArtifact::Public(prepare_public_read_artifact(public_read, dialect)?)
-    } else if let Some(internal) = compiled.direct_execution() {
-        if is_scalar_read {
-            PreparedReadArtifact::Scalar(PreparedBatchReadArtifact {
-                prepared_batch: prepared_batch_for_scalar_read(internal, bound_statement, dialect),
-            })
-        } else {
-            return Err(LixError::new(
-                "LIX_ERROR_DIRECT_READS_UNSUPPORTED",
-                format!(
-                    "committed read routing produced direct execution unexpectedly ({} prepared statement(s)); direct reads are no longer supported",
-                    internal.prepared_statements.len()
-                ),
-            ));
-        }
+    } else if let Some(scalar) = compiled.scalar_read() {
+        PreparedReadArtifact::Scalar(PreparedBatchReadArtifact {
+            prepared_batch: PreparedBatch {
+                steps: scalar.prepared_statements.clone(),
+            },
+        })
     } else {
         return Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            "committed read routing compiled a public write unexpectedly",
+            "committed read routing compiled an unsupported non-public execution unexpectedly",
         ));
     };
 
@@ -223,16 +213,6 @@ fn prepared_read_statement_from_compiled_execution(
         artifact,
         diagnostic_context,
     })
-}
-
-fn prepared_batch_for_scalar_read(
-    direct: &super::compiled::CompiledDirectExecution,
-    _bound_statement: &BoundStatementInstance,
-    _dialect: crate::SqlDialect,
-) -> PreparedBatch {
-    PreparedBatch {
-        steps: direct.prepared_statements.clone(),
-    }
 }
 
 fn base_read_diagnostic_context(
@@ -515,21 +495,21 @@ fn prepared_directory_history_read_plan(
     }
 }
 
-fn prepared_state_history_field(field: DirectStateHistoryField) -> PreparedStateHistoryField {
+fn prepared_state_history_field(field: StateHistoryField) -> PreparedStateHistoryField {
     match field {
-        DirectStateHistoryField::EntityId => PreparedStateHistoryField::EntityId,
-        DirectStateHistoryField::SchemaKey => PreparedStateHistoryField::SchemaKey,
-        DirectStateHistoryField::FileId => PreparedStateHistoryField::FileId,
-        DirectStateHistoryField::PluginKey => PreparedStateHistoryField::PluginKey,
-        DirectStateHistoryField::SnapshotContent => PreparedStateHistoryField::SnapshotContent,
-        DirectStateHistoryField::Metadata => PreparedStateHistoryField::Metadata,
-        DirectStateHistoryField::SchemaVersion => PreparedStateHistoryField::SchemaVersion,
-        DirectStateHistoryField::ChangeId => PreparedStateHistoryField::ChangeId,
-        DirectStateHistoryField::CommitId => PreparedStateHistoryField::CommitId,
-        DirectStateHistoryField::CommitCreatedAt => PreparedStateHistoryField::CommitCreatedAt,
-        DirectStateHistoryField::RootCommitId => PreparedStateHistoryField::RootCommitId,
-        DirectStateHistoryField::Depth => PreparedStateHistoryField::Depth,
-        DirectStateHistoryField::VersionId => PreparedStateHistoryField::VersionId,
+        StateHistoryField::EntityId => PreparedStateHistoryField::EntityId,
+        StateHistoryField::SchemaKey => PreparedStateHistoryField::SchemaKey,
+        StateHistoryField::FileId => PreparedStateHistoryField::FileId,
+        StateHistoryField::PluginKey => PreparedStateHistoryField::PluginKey,
+        StateHistoryField::SnapshotContent => PreparedStateHistoryField::SnapshotContent,
+        StateHistoryField::Metadata => PreparedStateHistoryField::Metadata,
+        StateHistoryField::SchemaVersion => PreparedStateHistoryField::SchemaVersion,
+        StateHistoryField::ChangeId => PreparedStateHistoryField::ChangeId,
+        StateHistoryField::CommitId => PreparedStateHistoryField::CommitId,
+        StateHistoryField::CommitCreatedAt => PreparedStateHistoryField::CommitCreatedAt,
+        StateHistoryField::RootCommitId => PreparedStateHistoryField::RootCommitId,
+        StateHistoryField::Depth => PreparedStateHistoryField::Depth,
+        StateHistoryField::VersionId => PreparedStateHistoryField::VersionId,
     }
 }
 
@@ -663,12 +643,10 @@ fn prepared_state_history_aggregate_predicate(
     }
 }
 
-fn prepared_entity_history_field(field: DirectEntityHistoryField) -> PreparedEntityHistoryField {
+fn prepared_entity_history_field(field: EntityHistoryField) -> PreparedEntityHistoryField {
     match field {
-        DirectEntityHistoryField::Property(property) => {
-            PreparedEntityHistoryField::Property(property)
-        }
-        DirectEntityHistoryField::State(field) => {
+        EntityHistoryField::Property(property) => PreparedEntityHistoryField::Property(property),
+        EntityHistoryField::State(field) => {
             PreparedEntityHistoryField::State(prepared_state_history_field(field))
         }
     }
@@ -725,25 +703,25 @@ fn prepared_entity_history_predicate(
     }
 }
 
-fn prepared_file_history_field(field: DirectFileHistoryField) -> PreparedFileHistoryField {
+fn prepared_file_history_field(field: FileHistoryField) -> PreparedFileHistoryField {
     match field {
-        DirectFileHistoryField::Id => PreparedFileHistoryField::Id,
-        DirectFileHistoryField::Path => PreparedFileHistoryField::Path,
-        DirectFileHistoryField::Data => PreparedFileHistoryField::Data,
-        DirectFileHistoryField::Metadata => PreparedFileHistoryField::Metadata,
-        DirectFileHistoryField::Hidden => PreparedFileHistoryField::Hidden,
-        DirectFileHistoryField::EntityId => PreparedFileHistoryField::EntityId,
-        DirectFileHistoryField::SchemaKey => PreparedFileHistoryField::SchemaKey,
-        DirectFileHistoryField::FileId => PreparedFileHistoryField::FileId,
-        DirectFileHistoryField::VersionId => PreparedFileHistoryField::VersionId,
-        DirectFileHistoryField::PluginKey => PreparedFileHistoryField::PluginKey,
-        DirectFileHistoryField::SchemaVersion => PreparedFileHistoryField::SchemaVersion,
-        DirectFileHistoryField::ChangeId => PreparedFileHistoryField::ChangeId,
-        DirectFileHistoryField::LixcolMetadata => PreparedFileHistoryField::LixcolMetadata,
-        DirectFileHistoryField::CommitId => PreparedFileHistoryField::CommitId,
-        DirectFileHistoryField::CommitCreatedAt => PreparedFileHistoryField::CommitCreatedAt,
-        DirectFileHistoryField::RootCommitId => PreparedFileHistoryField::RootCommitId,
-        DirectFileHistoryField::Depth => PreparedFileHistoryField::Depth,
+        FileHistoryField::Id => PreparedFileHistoryField::Id,
+        FileHistoryField::Path => PreparedFileHistoryField::Path,
+        FileHistoryField::Data => PreparedFileHistoryField::Data,
+        FileHistoryField::Metadata => PreparedFileHistoryField::Metadata,
+        FileHistoryField::Hidden => PreparedFileHistoryField::Hidden,
+        FileHistoryField::EntityId => PreparedFileHistoryField::EntityId,
+        FileHistoryField::SchemaKey => PreparedFileHistoryField::SchemaKey,
+        FileHistoryField::FileId => PreparedFileHistoryField::FileId,
+        FileHistoryField::VersionId => PreparedFileHistoryField::VersionId,
+        FileHistoryField::PluginKey => PreparedFileHistoryField::PluginKey,
+        FileHistoryField::SchemaVersion => PreparedFileHistoryField::SchemaVersion,
+        FileHistoryField::ChangeId => PreparedFileHistoryField::ChangeId,
+        FileHistoryField::LixcolMetadata => PreparedFileHistoryField::LixcolMetadata,
+        FileHistoryField::CommitId => PreparedFileHistoryField::CommitId,
+        FileHistoryField::CommitCreatedAt => PreparedFileHistoryField::CommitCreatedAt,
+        FileHistoryField::RootCommitId => PreparedFileHistoryField::RootCommitId,
+        FileHistoryField::Depth => PreparedFileHistoryField::Depth,
     }
 }
 
@@ -806,31 +784,25 @@ fn prepared_file_history_aggregate(
     }
 }
 
-fn prepared_directory_history_field(
-    field: DirectDirectoryHistoryField,
-) -> PreparedDirectoryHistoryField {
+fn prepared_directory_history_field(field: DirectoryHistoryField) -> PreparedDirectoryHistoryField {
     match field {
-        DirectDirectoryHistoryField::Id => PreparedDirectoryHistoryField::Id,
-        DirectDirectoryHistoryField::ParentId => PreparedDirectoryHistoryField::ParentId,
-        DirectDirectoryHistoryField::Name => PreparedDirectoryHistoryField::Name,
-        DirectDirectoryHistoryField::Path => PreparedDirectoryHistoryField::Path,
-        DirectDirectoryHistoryField::Hidden => PreparedDirectoryHistoryField::Hidden,
-        DirectDirectoryHistoryField::EntityId => PreparedDirectoryHistoryField::EntityId,
-        DirectDirectoryHistoryField::SchemaKey => PreparedDirectoryHistoryField::SchemaKey,
-        DirectDirectoryHistoryField::FileId => PreparedDirectoryHistoryField::FileId,
-        DirectDirectoryHistoryField::VersionId => PreparedDirectoryHistoryField::VersionId,
-        DirectDirectoryHistoryField::PluginKey => PreparedDirectoryHistoryField::PluginKey,
-        DirectDirectoryHistoryField::SchemaVersion => PreparedDirectoryHistoryField::SchemaVersion,
-        DirectDirectoryHistoryField::ChangeId => PreparedDirectoryHistoryField::ChangeId,
-        DirectDirectoryHistoryField::LixcolMetadata => {
-            PreparedDirectoryHistoryField::LixcolMetadata
-        }
-        DirectDirectoryHistoryField::CommitId => PreparedDirectoryHistoryField::CommitId,
-        DirectDirectoryHistoryField::CommitCreatedAt => {
-            PreparedDirectoryHistoryField::CommitCreatedAt
-        }
-        DirectDirectoryHistoryField::RootCommitId => PreparedDirectoryHistoryField::RootCommitId,
-        DirectDirectoryHistoryField::Depth => PreparedDirectoryHistoryField::Depth,
+        DirectoryHistoryField::Id => PreparedDirectoryHistoryField::Id,
+        DirectoryHistoryField::ParentId => PreparedDirectoryHistoryField::ParentId,
+        DirectoryHistoryField::Name => PreparedDirectoryHistoryField::Name,
+        DirectoryHistoryField::Path => PreparedDirectoryHistoryField::Path,
+        DirectoryHistoryField::Hidden => PreparedDirectoryHistoryField::Hidden,
+        DirectoryHistoryField::EntityId => PreparedDirectoryHistoryField::EntityId,
+        DirectoryHistoryField::SchemaKey => PreparedDirectoryHistoryField::SchemaKey,
+        DirectoryHistoryField::FileId => PreparedDirectoryHistoryField::FileId,
+        DirectoryHistoryField::VersionId => PreparedDirectoryHistoryField::VersionId,
+        DirectoryHistoryField::PluginKey => PreparedDirectoryHistoryField::PluginKey,
+        DirectoryHistoryField::SchemaVersion => PreparedDirectoryHistoryField::SchemaVersion,
+        DirectoryHistoryField::ChangeId => PreparedDirectoryHistoryField::ChangeId,
+        DirectoryHistoryField::LixcolMetadata => PreparedDirectoryHistoryField::LixcolMetadata,
+        DirectoryHistoryField::CommitId => PreparedDirectoryHistoryField::CommitId,
+        DirectoryHistoryField::CommitCreatedAt => PreparedDirectoryHistoryField::CommitCreatedAt,
+        DirectoryHistoryField::RootCommitId => PreparedDirectoryHistoryField::RootCommitId,
+        DirectoryHistoryField::Depth => PreparedDirectoryHistoryField::Depth,
     }
 }
 
@@ -920,18 +892,18 @@ fn transaction_mode_for_committed_read_execution(
     if let Some(public_read) = compiled.public_read() {
         return Ok(public_read.committed_read_mode().transaction_mode());
     }
-    if compiled.direct_execution().is_some() {
+    if compiled.scalar_read().is_some() {
         if is_scalar_read {
             return Ok(TransactionBeginMode::Read);
         }
         return Err(LixError::new(
-            "LIX_ERROR_DIRECT_READS_UNSUPPORTED",
-            "committed read routing produced direct execution unexpectedly; direct reads are no longer supported",
+            "LIX_ERROR_UNKNOWN",
+            "committed read routing produced a scalar read unexpectedly",
         ));
     }
     Err(LixError::new(
         "LIX_ERROR_UNKNOWN",
-        "committed read routing compiled a public write unexpectedly",
+        "committed read routing compiled an unsupported non-public execution unexpectedly",
     ))
 }
 

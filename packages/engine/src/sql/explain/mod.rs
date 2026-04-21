@@ -3,7 +3,6 @@
 //! This stage owns explain parsing, stable explain artifacts, stage timings,
 //! and compiler-owned explain payload/template generation.
 
-use crate::backend::PreparedStatement;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemRelationKind,
     RelationBindContext, RelationBinding, ResolvedRelation, SurfaceCapability, SurfaceFamily,
@@ -17,13 +16,13 @@ use crate::history::{
 };
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
-use crate::sql::logical_plan::direct_reads::{
-    DirectDirectoryHistoryField, DirectEntityHistoryField, DirectFileHistoryField,
-    DirectStateHistoryField, DirectoryHistoryAggregate, DirectoryHistoryPredicate,
+use crate::sql::logical_plan::history_reads::{
+    DirectoryHistoryAggregate, DirectoryHistoryField, DirectoryHistoryPredicate,
     DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
-    EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan, EntityHistorySortKey,
-    FileHistoryAggregate, FileHistoryPredicate, FileHistoryProjection, FileHistoryReadPlan,
-    FileHistorySortKey, HistoryReadPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
+    EntityHistoryField, EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan,
+    EntityHistorySortKey, FileHistoryAggregate, FileHistoryField, FileHistoryPredicate,
+    FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
+    StateHistoryAggregate, StateHistoryAggregatePredicate, StateHistoryField,
     StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
     StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
 };
@@ -47,7 +46,7 @@ use crate::sql::logical_plan::public_ir::{
     WriteSelector,
 };
 use crate::sql::logical_plan::{
-    DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan, ResultContract,
+    DirectLogicalPlan, LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan,
 };
 use crate::sql::physical_plan::plan::{
     LoweredReadStatement, LoweredReadStatementShape, LoweredStatementBindings,
@@ -58,7 +57,6 @@ use crate::sql::physical_plan::{
     PublicWritePhysicalPlan, TerminalRelationRenderNode, TrackedWritePlan, UntrackedWritePlan,
 };
 use crate::sql::prepare::public_surface::routing::RoutingPassTrace;
-use crate::sql::semantic_ir::direct::NormalizedDirectStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::{
     EffectiveStatePlan, StateSourceAuthority,
 };
@@ -366,15 +364,6 @@ pub(crate) enum ExplainLoweredResultColumnType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainResultContract {
-    Select,
-    DmlNoReturning,
-    DmlReturning,
-    Nothing,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub(crate) enum ExplainHistoryRootScopeKind {
     AllRoots,
     RequestedRoots,
@@ -534,12 +523,6 @@ pub(crate) struct PushdownExplainArtifacts {
     pub(crate) residual_predicates: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct PreparedStatementSnapshot {
-    pub(crate) sql: String,
-    pub(crate) params: Vec<Value>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SchemaLiveTableRequirementSnapshot {
     pub(crate) schema_key: String,
@@ -566,15 +549,6 @@ pub(crate) struct UpdateValidationPlanSnapshot {
     pub(crate) where_clause: Option<String>,
     pub(crate) snapshot_content: Option<JsonValue>,
     pub(crate) snapshot_patch: Option<BTreeMap<String, JsonValue>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct DirectStatementsSnapshot {
-    pub(crate) sql: String,
-    pub(crate) prepared_statements: Vec<PreparedStatementSnapshot>,
-    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirementSnapshot>,
-    pub(crate) mutations: Vec<MutationRowSnapshot>,
-    pub(crate) update_validations: Vec<UpdateValidationPlanSnapshot>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1006,7 +980,7 @@ pub(crate) struct DirectoryHistoryRequestSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainDirectAggregate {
+pub(crate) enum ExplainHistoryAggregate {
     Count,
 }
 
@@ -1037,7 +1011,7 @@ pub(crate) enum ExplainAggregatePredicateOperator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainDirectStateHistoryField {
+pub(crate) enum ExplainStateHistoryField {
     EntityId,
     SchemaKey,
     FileId,
@@ -1055,14 +1029,14 @@ pub(crate) enum ExplainDirectStateHistoryField {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum ExplainDirectEntityHistoryField {
+pub(crate) enum ExplainEntityHistoryField {
     Property(String),
-    State(ExplainDirectStateHistoryField),
+    State(ExplainStateHistoryField),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainDirectFileHistoryField {
+pub(crate) enum ExplainFileHistoryField {
     Id,
     Path,
     Data,
@@ -1084,7 +1058,7 @@ pub(crate) enum ExplainDirectFileHistoryField {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainDirectDirectoryHistoryField {
+pub(crate) enum ExplainDirectoryHistoryField {
     Id,
     ParentId,
     Name,
@@ -1105,7 +1079,7 @@ pub(crate) enum ExplainDirectDirectoryHistoryField {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct DirectPredicateSnapshot<Field> {
+pub(crate) struct HistoryPredicateSnapshot<Field> {
     pub(crate) operator: ExplainPredicateOperator,
     pub(crate) field: Field,
     pub(crate) value: Option<Value>,
@@ -1114,13 +1088,13 @@ pub(crate) struct DirectPredicateSnapshot<Field> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct DirectFieldProjectionSnapshot<Field> {
+pub(crate) struct HistoryFieldProjectionSnapshot<Field> {
     pub(crate) output_name: String,
     pub(crate) field: Field,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct DirectSortKeySnapshot<Field> {
+pub(crate) struct HistorySortKeySnapshot<Field> {
     pub(crate) output_name: String,
     pub(crate) field: Option<Field>,
     pub(crate) descending: bool,
@@ -1129,8 +1103,8 @@ pub(crate) struct DirectSortKeySnapshot<Field> {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum StateHistoryProjectionValueSnapshot {
-    Field(ExplainDirectStateHistoryField),
-    Aggregate(ExplainDirectAggregate),
+    Field(ExplainStateHistoryField),
+    Aggregate(ExplainHistoryAggregate),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1142,8 +1116,8 @@ pub(crate) struct StateHistoryProjectionSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum StateHistorySortValueSnapshot {
-    Field(ExplainDirectStateHistoryField),
-    Aggregate(ExplainDirectAggregate),
+    Field(ExplainStateHistoryField),
+    Aggregate(ExplainHistoryAggregate),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1156,17 +1130,17 @@ pub(crate) struct StateHistorySortKeySnapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct StateHistoryAggregatePredicateSnapshot {
     pub(crate) operator: ExplainAggregatePredicateOperator,
-    pub(crate) aggregate: ExplainDirectAggregate,
+    pub(crate) aggregate: ExplainHistoryAggregate,
     pub(crate) value: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct StateHistoryReadPlanSnapshot {
     pub(crate) request: StateHistoryRequestSnapshot,
-    pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectStateHistoryField>>,
+    pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainStateHistoryField>>,
     pub(crate) projections: Vec<StateHistoryProjectionSnapshot>,
     pub(crate) sort_keys: Vec<StateHistorySortKeySnapshot>,
-    pub(crate) group_by: Vec<ExplainDirectStateHistoryField>,
+    pub(crate) group_by: Vec<ExplainStateHistoryField>,
     pub(crate) having: Option<StateHistoryAggregatePredicateSnapshot>,
     pub(crate) limit: Option<u64>,
     pub(crate) offset: u64,
@@ -1178,9 +1152,9 @@ pub(crate) struct StateHistoryReadPlanSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct EntityHistoryReadPlanSnapshot {
     pub(crate) request: StateHistoryRequestSnapshot,
-    pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectEntityHistoryField>>,
-    pub(crate) projections: Vec<DirectFieldProjectionSnapshot<ExplainDirectEntityHistoryField>>,
-    pub(crate) sort_keys: Vec<DirectSortKeySnapshot<ExplainDirectEntityHistoryField>>,
+    pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainEntityHistoryField>>,
+    pub(crate) projections: Vec<HistoryFieldProjectionSnapshot<ExplainEntityHistoryField>>,
+    pub(crate) sort_keys: Vec<HistorySortKeySnapshot<ExplainEntityHistoryField>>,
     pub(crate) limit: Option<u64>,
     pub(crate) offset: u64,
     pub(crate) wildcard_projection: bool,
@@ -1192,14 +1166,14 @@ pub(crate) struct EntityHistoryReadPlanSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct FileHistoryReadPlanSnapshot {
     pub(crate) request: FileHistoryRequestSnapshot,
-    pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectFileHistoryField>>,
-    pub(crate) projections: Vec<DirectFieldProjectionSnapshot<ExplainDirectFileHistoryField>>,
-    pub(crate) sort_keys: Vec<DirectSortKeySnapshot<ExplainDirectFileHistoryField>>,
+    pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainFileHistoryField>>,
+    pub(crate) projections: Vec<HistoryFieldProjectionSnapshot<ExplainFileHistoryField>>,
+    pub(crate) sort_keys: Vec<HistorySortKeySnapshot<ExplainFileHistoryField>>,
     pub(crate) limit: Option<u64>,
     pub(crate) offset: u64,
     pub(crate) wildcard_projection: bool,
     pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) aggregate: Option<ExplainDirectAggregate>,
+    pub(crate) aggregate: Option<ExplainHistoryAggregate>,
     pub(crate) aggregate_output_name: Option<String>,
     pub(crate) result_columns: LoweredResultColumnsSnapshot,
 }
@@ -1207,14 +1181,14 @@ pub(crate) struct FileHistoryReadPlanSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct DirectoryHistoryReadPlanSnapshot {
     pub(crate) request: DirectoryHistoryRequestSnapshot,
-    pub(crate) predicates: Vec<DirectPredicateSnapshot<ExplainDirectDirectoryHistoryField>>,
-    pub(crate) projections: Vec<DirectFieldProjectionSnapshot<ExplainDirectDirectoryHistoryField>>,
-    pub(crate) sort_keys: Vec<DirectSortKeySnapshot<ExplainDirectDirectoryHistoryField>>,
+    pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainDirectoryHistoryField>>,
+    pub(crate) projections: Vec<HistoryFieldProjectionSnapshot<ExplainDirectoryHistoryField>>,
+    pub(crate) sort_keys: Vec<HistorySortKeySnapshot<ExplainDirectoryHistoryField>>,
     pub(crate) limit: Option<u64>,
     pub(crate) offset: u64,
     pub(crate) wildcard_projection: bool,
     pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) aggregate: Option<ExplainDirectAggregate>,
+    pub(crate) aggregate: Option<ExplainHistoryAggregate>,
     pub(crate) aggregate_output_name: Option<String>,
     pub(crate) result_columns: LoweredResultColumnsSnapshot,
 }
@@ -1785,17 +1759,10 @@ pub(crate) struct ExplainPublicWriteLogicalPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct ExplainDirectLogicalPlan {
-    pub(crate) statements: Box<DirectStatementsSnapshot>,
-    pub(crate) result_contract: ExplainResultContract,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainSemanticStatement {
     PublicRead(Box<ExplainPublicReadSemantics>),
     PublicWrite(Box<ExplainPublicWriteSemantics>),
-    Direct(Box<DirectStatementsSnapshot>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -1822,7 +1789,6 @@ pub(crate) struct ExplainPublicWriteSemantics {
 pub(crate) enum ExplainLogicalPlanSnapshot {
     PublicRead(Box<ExplainPublicReadLogicalPlan>),
     PublicWrite(Box<ExplainPublicWriteLogicalPlan>),
-    Direct(Box<ExplainDirectLogicalPlan>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -2040,12 +2006,6 @@ fn render_semantic_statement_text(statement: &ExplainSemanticStatement) -> Strin
             details.resolved_relation.public_name,
             explain_write_operation_kind_label(details.write_command.operation_kind),
         ),
-        ExplainSemanticStatement::Direct(statements) => format!(
-            "kind: internal\nprepared_statements: {}\nmutations: {}\nupdate_validations: {}",
-            statements.prepared_statements.len(),
-            statements.mutations.len(),
-            statements.update_validations.len(),
-        ),
     }
 }
 
@@ -2112,12 +2072,6 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
             details.planned_write.command.target.public_name,
             explain_write_operation_kind_label(details.planned_write.command.operation_kind),
             explain_state_source_kind_label(details.planned_write.state_source),
-        ),
-        ExplainLogicalPlanSnapshot::Direct(details) => format!(
-            "kind: internal\nresult_contract: {}\nprepared_statements: {}\nmutations: {}",
-            explain_result_contract_label(details.result_contract),
-            details.statements.prepared_statements.len(),
-            details.statements.mutations.len(),
         ),
     }
 }
@@ -2481,7 +2435,7 @@ pub(crate) struct PublicWriteExplainBuildInput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct DirectExplainBuildInput {
+pub(crate) struct InternalSqlExplainBuildInput {
     pub(crate) request: ExplainRequest,
     pub(crate) logical_plan: DirectLogicalPlan,
     pub(crate) stage_timings: Vec<ExplainStageTiming>,
@@ -2673,16 +2627,16 @@ fn broad_public_read_explain_artifacts_collapsed(
         && logical_plan == optimized_logical_plan
 }
 
-pub(crate) fn build_direct_explain_artifacts(input: DirectExplainBuildInput) -> ExplainArtifacts {
+pub(crate) fn build_internal_sql_explain_artifacts(
+    input: InternalSqlExplainBuildInput,
+) -> ExplainArtifacts {
     let compiled_artifacts = compiled_artifacts_for_direct(&input.logical_plan);
 
-    build_explain_artifacts(
+    build_explain_artifacts_from_snapshots(
         Some(input.request),
-        Some(SemanticStatement::Direct(
-            input.logical_plan.normalized_statements.clone(),
-        )),
-        Some(LogicalPlan::Direct(input.logical_plan.clone())),
-        Some(LogicalPlan::Direct(input.logical_plan)),
+        None,
+        None,
+        None,
         None,
         compiled_artifacts,
         Vec::new(),
@@ -2700,20 +2654,36 @@ fn build_explain_artifacts(
     routing_passes: Vec<RoutingPassTrace>,
     stage_timings: Vec<ExplainStageTiming>,
 ) -> ExplainArtifacts {
+    build_explain_artifacts_from_snapshots(
+        request,
+        semantic_statement,
+        logical_plan.as_ref().map(logical_plan_snapshot),
+        optimized_logical_plan.as_ref().map(logical_plan_snapshot),
+        physical_plan,
+        compiled_artifacts,
+        routing_passes,
+        stage_timings,
+    )
+}
+
+fn build_explain_artifacts_from_snapshots(
+    request: Option<ExplainRequest>,
+    semantic_statement: Option<SemanticStatement>,
+    logical_plan: Option<ExplainLogicalPlanSnapshot>,
+    optimized_logical_plan: Option<ExplainLogicalPlanSnapshot>,
+    physical_plan: Option<PhysicalPlan>,
+    compiled_artifacts: CompiledExplainArtifacts,
+    routing_passes: Vec<RoutingPassTrace>,
+    stage_timings: Vec<ExplainStageTiming>,
+) -> ExplainArtifacts {
     ExplainArtifacts {
         request,
         semantic_statement: semantic_statement
             .as_ref()
             .map(semantic_statement_snapshot)
             .map(Box::new),
-        logical_plan: logical_plan
-            .as_ref()
-            .map(logical_plan_snapshot)
-            .map(Box::new),
-        optimized_logical_plan: optimized_logical_plan
-            .as_ref()
-            .map(logical_plan_snapshot)
-            .map(Box::new),
+        logical_plan: logical_plan.map(Box::new),
+        optimized_logical_plan: optimized_logical_plan.map(Box::new),
         physical_plan: physical_plan
             .as_ref()
             .map(physical_plan_snapshot)
@@ -2906,9 +2876,6 @@ fn semantic_statement_snapshot(statement: &SemanticStatement) -> ExplainSemantic
         SemanticStatement::PublicWrite(semantics) => ExplainSemanticStatement::PublicWrite(
             Box::new(public_write_semantics_snapshot(semantics)),
         ),
-        SemanticStatement::Direct(statements) => {
-            ExplainSemanticStatement::Direct(Box::new(direct_statements_snapshot(statements)))
-        }
     }
 }
 
@@ -2982,32 +2949,6 @@ fn public_write_semantics_snapshot(
         write_command: Box::new(write_command_snapshot(
             &semantics.canonicalized.write_command,
         )),
-    }
-}
-
-fn direct_statements_snapshot(statements: &NormalizedDirectStatements) -> DirectStatementsSnapshot {
-    DirectStatementsSnapshot {
-        sql: statements.sql.clone(),
-        prepared_statements: statements
-            .prepared_statements
-            .iter()
-            .map(prepared_statement_snapshot)
-            .collect(),
-        live_table_requirements: statements
-            .live_table_requirements
-            .iter()
-            .map(schema_live_table_requirement_snapshot)
-            .collect(),
-        mutations: statements
-            .mutations
-            .iter()
-            .map(mutation_row_snapshot)
-            .collect(),
-        update_validations: statements
-            .update_validations
-            .iter()
-            .map(update_validation_plan_snapshot)
-            .collect(),
     }
 }
 
@@ -4820,16 +4761,6 @@ fn logical_plan_snapshot(plan: &LogicalPlan) -> ExplainLogicalPlanSnapshot {
                 planned_write: Box::new(planned_write_snapshot(&plan.planned_write)),
             }))
         }
-        LogicalPlan::Direct(plan) => {
-            ExplainLogicalPlanSnapshot::Direct(Box::new(direct_logical_plan_snapshot(plan)))
-        }
-    }
-}
-
-fn direct_logical_plan_snapshot(plan: &DirectLogicalPlan) -> ExplainDirectLogicalPlan {
-    ExplainDirectLogicalPlan {
-        statements: Box::new(direct_statements_snapshot(&plan.normalized_statements)),
-        result_contract: result_contract_snapshot(plan.result_contract),
     }
 }
 
@@ -5942,13 +5873,6 @@ fn effective_state_plan_snapshot(plan: &EffectiveStatePlan) -> EffectiveStatePla
     }
 }
 
-fn prepared_statement_snapshot(statement: &PreparedStatement) -> PreparedStatementSnapshot {
-    PreparedStatementSnapshot {
-        sql: statement.sql.clone(),
-        params: statement.params.clone(),
-    }
-}
-
 fn schema_live_table_requirement_snapshot(
     requirement: &SchemaLiveTableRequirement,
 ) -> SchemaLiveTableRequirementSnapshot {
@@ -6158,15 +6082,6 @@ fn lowered_result_column_name(column: &LoweredResultColumn) -> ExplainLoweredRes
     }
 }
 
-fn result_contract_snapshot(contract: ResultContract) -> ExplainResultContract {
-    match contract {
-        ResultContract::Select => ExplainResultContract::Select,
-        ResultContract::DmlNoReturning => ExplainResultContract::DmlNoReturning,
-        ResultContract::DmlReturning => ExplainResultContract::DmlReturning,
-        ResultContract::Nothing => ExplainResultContract::Nothing,
-    }
-}
-
 fn state_history_root_scope_snapshot(scope: &StateHistoryRootScope) -> ExplainHistoryRootScopeKind {
     match scope {
         StateHistoryRootScope::AllRoots => ExplainHistoryRootScopeKind::AllRoots,
@@ -6284,101 +6199,87 @@ fn state_source_kind_snapshot(kind: StateSourceKind) -> ExplainStateSourceKind {
     }
 }
 
-fn state_history_field_snapshot(field: &DirectStateHistoryField) -> ExplainDirectStateHistoryField {
+fn state_history_field_snapshot(field: &StateHistoryField) -> ExplainStateHistoryField {
     match field {
-        DirectStateHistoryField::EntityId => ExplainDirectStateHistoryField::EntityId,
-        DirectStateHistoryField::SchemaKey => ExplainDirectStateHistoryField::SchemaKey,
-        DirectStateHistoryField::FileId => ExplainDirectStateHistoryField::FileId,
-        DirectStateHistoryField::PluginKey => ExplainDirectStateHistoryField::PluginKey,
-        DirectStateHistoryField::SnapshotContent => ExplainDirectStateHistoryField::SnapshotContent,
-        DirectStateHistoryField::Metadata => ExplainDirectStateHistoryField::Metadata,
-        DirectStateHistoryField::SchemaVersion => ExplainDirectStateHistoryField::SchemaVersion,
-        DirectStateHistoryField::ChangeId => ExplainDirectStateHistoryField::ChangeId,
-        DirectStateHistoryField::CommitId => ExplainDirectStateHistoryField::CommitId,
-        DirectStateHistoryField::CommitCreatedAt => ExplainDirectStateHistoryField::CommitCreatedAt,
-        DirectStateHistoryField::RootCommitId => ExplainDirectStateHistoryField::RootCommitId,
-        DirectStateHistoryField::Depth => ExplainDirectStateHistoryField::Depth,
-        DirectStateHistoryField::VersionId => ExplainDirectStateHistoryField::VersionId,
+        StateHistoryField::EntityId => ExplainStateHistoryField::EntityId,
+        StateHistoryField::SchemaKey => ExplainStateHistoryField::SchemaKey,
+        StateHistoryField::FileId => ExplainStateHistoryField::FileId,
+        StateHistoryField::PluginKey => ExplainStateHistoryField::PluginKey,
+        StateHistoryField::SnapshotContent => ExplainStateHistoryField::SnapshotContent,
+        StateHistoryField::Metadata => ExplainStateHistoryField::Metadata,
+        StateHistoryField::SchemaVersion => ExplainStateHistoryField::SchemaVersion,
+        StateHistoryField::ChangeId => ExplainStateHistoryField::ChangeId,
+        StateHistoryField::CommitId => ExplainStateHistoryField::CommitId,
+        StateHistoryField::CommitCreatedAt => ExplainStateHistoryField::CommitCreatedAt,
+        StateHistoryField::RootCommitId => ExplainStateHistoryField::RootCommitId,
+        StateHistoryField::Depth => ExplainStateHistoryField::Depth,
+        StateHistoryField::VersionId => ExplainStateHistoryField::VersionId,
     }
 }
 
-fn entity_history_field_snapshot(
-    field: &DirectEntityHistoryField,
-) -> ExplainDirectEntityHistoryField {
+fn entity_history_field_snapshot(field: &EntityHistoryField) -> ExplainEntityHistoryField {
     match field {
-        DirectEntityHistoryField::Property(name) => {
-            ExplainDirectEntityHistoryField::Property(name.clone())
-        }
-        DirectEntityHistoryField::State(field) => {
-            ExplainDirectEntityHistoryField::State(state_history_field_snapshot(field))
+        EntityHistoryField::Property(name) => ExplainEntityHistoryField::Property(name.clone()),
+        EntityHistoryField::State(field) => {
+            ExplainEntityHistoryField::State(state_history_field_snapshot(field))
         }
     }
 }
 
-fn file_history_field_snapshot(field: &DirectFileHistoryField) -> ExplainDirectFileHistoryField {
+fn file_history_field_snapshot(field: &FileHistoryField) -> ExplainFileHistoryField {
     match field {
-        DirectFileHistoryField::Id => ExplainDirectFileHistoryField::Id,
-        DirectFileHistoryField::Path => ExplainDirectFileHistoryField::Path,
-        DirectFileHistoryField::Data => ExplainDirectFileHistoryField::Data,
-        DirectFileHistoryField::Metadata => ExplainDirectFileHistoryField::Metadata,
-        DirectFileHistoryField::Hidden => ExplainDirectFileHistoryField::Hidden,
-        DirectFileHistoryField::EntityId => ExplainDirectFileHistoryField::EntityId,
-        DirectFileHistoryField::SchemaKey => ExplainDirectFileHistoryField::SchemaKey,
-        DirectFileHistoryField::FileId => ExplainDirectFileHistoryField::FileId,
-        DirectFileHistoryField::VersionId => ExplainDirectFileHistoryField::VersionId,
-        DirectFileHistoryField::PluginKey => ExplainDirectFileHistoryField::PluginKey,
-        DirectFileHistoryField::SchemaVersion => ExplainDirectFileHistoryField::SchemaVersion,
-        DirectFileHistoryField::ChangeId => ExplainDirectFileHistoryField::ChangeId,
-        DirectFileHistoryField::LixcolMetadata => ExplainDirectFileHistoryField::LixcolMetadata,
-        DirectFileHistoryField::CommitId => ExplainDirectFileHistoryField::CommitId,
-        DirectFileHistoryField::CommitCreatedAt => ExplainDirectFileHistoryField::CommitCreatedAt,
-        DirectFileHistoryField::RootCommitId => ExplainDirectFileHistoryField::RootCommitId,
-        DirectFileHistoryField::Depth => ExplainDirectFileHistoryField::Depth,
+        FileHistoryField::Id => ExplainFileHistoryField::Id,
+        FileHistoryField::Path => ExplainFileHistoryField::Path,
+        FileHistoryField::Data => ExplainFileHistoryField::Data,
+        FileHistoryField::Metadata => ExplainFileHistoryField::Metadata,
+        FileHistoryField::Hidden => ExplainFileHistoryField::Hidden,
+        FileHistoryField::EntityId => ExplainFileHistoryField::EntityId,
+        FileHistoryField::SchemaKey => ExplainFileHistoryField::SchemaKey,
+        FileHistoryField::FileId => ExplainFileHistoryField::FileId,
+        FileHistoryField::VersionId => ExplainFileHistoryField::VersionId,
+        FileHistoryField::PluginKey => ExplainFileHistoryField::PluginKey,
+        FileHistoryField::SchemaVersion => ExplainFileHistoryField::SchemaVersion,
+        FileHistoryField::ChangeId => ExplainFileHistoryField::ChangeId,
+        FileHistoryField::LixcolMetadata => ExplainFileHistoryField::LixcolMetadata,
+        FileHistoryField::CommitId => ExplainFileHistoryField::CommitId,
+        FileHistoryField::CommitCreatedAt => ExplainFileHistoryField::CommitCreatedAt,
+        FileHistoryField::RootCommitId => ExplainFileHistoryField::RootCommitId,
+        FileHistoryField::Depth => ExplainFileHistoryField::Depth,
     }
 }
 
-fn directory_history_field_snapshot(
-    field: &DirectDirectoryHistoryField,
-) -> ExplainDirectDirectoryHistoryField {
+fn directory_history_field_snapshot(field: &DirectoryHistoryField) -> ExplainDirectoryHistoryField {
     match field {
-        DirectDirectoryHistoryField::Id => ExplainDirectDirectoryHistoryField::Id,
-        DirectDirectoryHistoryField::ParentId => ExplainDirectDirectoryHistoryField::ParentId,
-        DirectDirectoryHistoryField::Name => ExplainDirectDirectoryHistoryField::Name,
-        DirectDirectoryHistoryField::Path => ExplainDirectDirectoryHistoryField::Path,
-        DirectDirectoryHistoryField::Hidden => ExplainDirectDirectoryHistoryField::Hidden,
-        DirectDirectoryHistoryField::EntityId => ExplainDirectDirectoryHistoryField::EntityId,
-        DirectDirectoryHistoryField::SchemaKey => ExplainDirectDirectoryHistoryField::SchemaKey,
-        DirectDirectoryHistoryField::FileId => ExplainDirectDirectoryHistoryField::FileId,
-        DirectDirectoryHistoryField::VersionId => ExplainDirectDirectoryHistoryField::VersionId,
-        DirectDirectoryHistoryField::PluginKey => ExplainDirectDirectoryHistoryField::PluginKey,
-        DirectDirectoryHistoryField::SchemaVersion => {
-            ExplainDirectDirectoryHistoryField::SchemaVersion
-        }
-        DirectDirectoryHistoryField::ChangeId => ExplainDirectDirectoryHistoryField::ChangeId,
-        DirectDirectoryHistoryField::LixcolMetadata => {
-            ExplainDirectDirectoryHistoryField::LixcolMetadata
-        }
-        DirectDirectoryHistoryField::CommitId => ExplainDirectDirectoryHistoryField::CommitId,
-        DirectDirectoryHistoryField::CommitCreatedAt => {
-            ExplainDirectDirectoryHistoryField::CommitCreatedAt
-        }
-        DirectDirectoryHistoryField::RootCommitId => {
-            ExplainDirectDirectoryHistoryField::RootCommitId
-        }
-        DirectDirectoryHistoryField::Depth => ExplainDirectDirectoryHistoryField::Depth,
+        DirectoryHistoryField::Id => ExplainDirectoryHistoryField::Id,
+        DirectoryHistoryField::ParentId => ExplainDirectoryHistoryField::ParentId,
+        DirectoryHistoryField::Name => ExplainDirectoryHistoryField::Name,
+        DirectoryHistoryField::Path => ExplainDirectoryHistoryField::Path,
+        DirectoryHistoryField::Hidden => ExplainDirectoryHistoryField::Hidden,
+        DirectoryHistoryField::EntityId => ExplainDirectoryHistoryField::EntityId,
+        DirectoryHistoryField::SchemaKey => ExplainDirectoryHistoryField::SchemaKey,
+        DirectoryHistoryField::FileId => ExplainDirectoryHistoryField::FileId,
+        DirectoryHistoryField::VersionId => ExplainDirectoryHistoryField::VersionId,
+        DirectoryHistoryField::PluginKey => ExplainDirectoryHistoryField::PluginKey,
+        DirectoryHistoryField::SchemaVersion => ExplainDirectoryHistoryField::SchemaVersion,
+        DirectoryHistoryField::ChangeId => ExplainDirectoryHistoryField::ChangeId,
+        DirectoryHistoryField::LixcolMetadata => ExplainDirectoryHistoryField::LixcolMetadata,
+        DirectoryHistoryField::CommitId => ExplainDirectoryHistoryField::CommitId,
+        DirectoryHistoryField::CommitCreatedAt => ExplainDirectoryHistoryField::CommitCreatedAt,
+        DirectoryHistoryField::RootCommitId => ExplainDirectoryHistoryField::RootCommitId,
+        DirectoryHistoryField::Depth => ExplainDirectoryHistoryField::Depth,
     }
 }
 
-fn history_aggregate_snapshot(_: &StateHistoryAggregate) -> ExplainDirectAggregate {
-    ExplainDirectAggregate::Count
+fn history_aggregate_snapshot(_: &StateHistoryAggregate) -> ExplainHistoryAggregate {
+    ExplainHistoryAggregate::Count
 }
 
-fn file_history_aggregate_snapshot(_: &FileHistoryAggregate) -> ExplainDirectAggregate {
-    ExplainDirectAggregate::Count
+fn file_history_aggregate_snapshot(_: &FileHistoryAggregate) -> ExplainHistoryAggregate {
+    ExplainHistoryAggregate::Count
 }
 
-fn directory_history_aggregate_snapshot(_: &DirectoryHistoryAggregate) -> ExplainDirectAggregate {
-    ExplainDirectAggregate::Count
+fn directory_history_aggregate_snapshot(_: &DirectoryHistoryAggregate) -> ExplainHistoryAggregate {
+    ExplainHistoryAggregate::Count
 }
 
 fn history_predicate_snapshot<Field>(
@@ -6386,8 +6287,8 @@ fn history_predicate_snapshot<Field>(
     field: Field,
     value: Option<Value>,
     values: Vec<Value>,
-) -> DirectPredicateSnapshot<Field> {
-    DirectPredicateSnapshot {
+) -> HistoryPredicateSnapshot<Field> {
+    HistoryPredicateSnapshot {
         operator,
         field,
         value,
@@ -6430,7 +6331,7 @@ fn state_history_sort_key_snapshot(key: &StateHistorySortKey) -> StateHistorySor
 
 fn state_history_predicate_snapshot(
     predicate: &StateHistoryPredicate,
-) -> DirectPredicateSnapshot<ExplainDirectStateHistoryField> {
+) -> HistoryPredicateSnapshot<ExplainStateHistoryField> {
     match predicate {
         StateHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
@@ -6552,8 +6453,8 @@ fn state_history_aggregate_predicate_snapshot_with_operator(
 
 fn entity_history_projection_snapshot(
     projection: &EntityHistoryProjection,
-) -> DirectFieldProjectionSnapshot<ExplainDirectEntityHistoryField> {
-    DirectFieldProjectionSnapshot {
+) -> HistoryFieldProjectionSnapshot<ExplainEntityHistoryField> {
+    HistoryFieldProjectionSnapshot {
         output_name: projection.output_name.clone(),
         field: entity_history_field_snapshot(&projection.field),
     }
@@ -6561,8 +6462,8 @@ fn entity_history_projection_snapshot(
 
 fn entity_history_sort_key_snapshot(
     key: &EntityHistorySortKey,
-) -> DirectSortKeySnapshot<ExplainDirectEntityHistoryField> {
-    DirectSortKeySnapshot {
+) -> HistorySortKeySnapshot<ExplainEntityHistoryField> {
+    HistorySortKeySnapshot {
         output_name: key.output_name.clone(),
         field: key.field.as_ref().map(entity_history_field_snapshot),
         descending: key.descending,
@@ -6571,7 +6472,7 @@ fn entity_history_sort_key_snapshot(
 
 fn entity_history_predicate_snapshot(
     predicate: &EntityHistoryPredicate,
-) -> DirectPredicateSnapshot<ExplainDirectEntityHistoryField> {
+) -> HistoryPredicateSnapshot<ExplainEntityHistoryField> {
     match predicate {
         EntityHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
@@ -6632,8 +6533,8 @@ fn entity_history_predicate_snapshot(
 
 fn file_history_projection_snapshot(
     projection: &FileHistoryProjection,
-) -> DirectFieldProjectionSnapshot<ExplainDirectFileHistoryField> {
-    DirectFieldProjectionSnapshot {
+) -> HistoryFieldProjectionSnapshot<ExplainFileHistoryField> {
+    HistoryFieldProjectionSnapshot {
         output_name: projection.output_name.clone(),
         field: file_history_field_snapshot(&projection.field),
     }
@@ -6641,8 +6542,8 @@ fn file_history_projection_snapshot(
 
 fn file_history_sort_key_snapshot(
     key: &FileHistorySortKey,
-) -> DirectSortKeySnapshot<ExplainDirectFileHistoryField> {
-    DirectSortKeySnapshot {
+) -> HistorySortKeySnapshot<ExplainFileHistoryField> {
+    HistorySortKeySnapshot {
         output_name: key.output_name.clone(),
         field: key.field.as_ref().map(file_history_field_snapshot),
         descending: key.descending,
@@ -6651,7 +6552,7 @@ fn file_history_sort_key_snapshot(
 
 fn file_history_predicate_snapshot(
     predicate: &FileHistoryPredicate,
-) -> DirectPredicateSnapshot<ExplainDirectFileHistoryField> {
+) -> HistoryPredicateSnapshot<ExplainFileHistoryField> {
     match predicate {
         FileHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
@@ -6712,8 +6613,8 @@ fn file_history_predicate_snapshot(
 
 fn directory_history_projection_snapshot(
     projection: &DirectoryHistoryProjection,
-) -> DirectFieldProjectionSnapshot<ExplainDirectDirectoryHistoryField> {
-    DirectFieldProjectionSnapshot {
+) -> HistoryFieldProjectionSnapshot<ExplainDirectoryHistoryField> {
+    HistoryFieldProjectionSnapshot {
         output_name: projection.output_name.clone(),
         field: directory_history_field_snapshot(&projection.field),
     }
@@ -6721,8 +6622,8 @@ fn directory_history_projection_snapshot(
 
 fn directory_history_sort_key_snapshot(
     key: &DirectoryHistorySortKey,
-) -> DirectSortKeySnapshot<ExplainDirectDirectoryHistoryField> {
-    DirectSortKeySnapshot {
+) -> HistorySortKeySnapshot<ExplainDirectoryHistoryField> {
+    HistorySortKeySnapshot {
         output_name: key.output_name.clone(),
         field: key.field.as_ref().map(directory_history_field_snapshot),
         descending: key.descending,
@@ -6731,7 +6632,7 @@ fn directory_history_sort_key_snapshot(
 
 fn directory_history_predicate_snapshot(
     predicate: &DirectoryHistoryPredicate,
-) -> DirectPredicateSnapshot<ExplainDirectDirectoryHistoryField> {
+) -> HistoryPredicateSnapshot<ExplainDirectoryHistoryField> {
     match predicate {
         DirectoryHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
             ExplainPredicateOperator::Eq,
@@ -6824,15 +6725,6 @@ fn explain_state_source_kind_label(kind: ExplainStateSourceKind) -> &'static str
     match kind {
         ExplainStateSourceKind::AuthoritativeCommitted => "authoritative_committed",
         ExplainStateSourceKind::UntrackedOverlay => "untracked_overlay",
-    }
-}
-
-fn explain_result_contract_label(contract: ExplainResultContract) -> &'static str {
-    match contract {
-        ExplainResultContract::Select => "select",
-        ExplainResultContract::DmlNoReturning => "dml_no_returning",
-        ExplainResultContract::DmlReturning => "dml_returning",
-        ExplainResultContract::Nothing => "nothing",
     }
 }
 

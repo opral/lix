@@ -1,7 +1,6 @@
 use super::canonicalize::{
     canonicalize_read_parts, canonicalize_write, CanonicalizeError, CanonicalizedWrite,
 };
-use super::direct::NormalizedDirectStatements;
 use super::statement::BoundStatement;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogHistoryReadSemantics,
@@ -57,7 +56,7 @@ impl StructuredPublicReadAnalysis {
         }
     }
 
-    pub(crate) fn logical_plan_with_direct_execution(
+    pub(crate) fn logical_plan_with_history_read(
         &self,
         history_read_plan: HistoryReadPlan,
     ) -> PublicReadLogicalPlan {
@@ -250,7 +249,6 @@ pub(crate) fn analyze_public_write_semantics(
 pub(crate) enum SemanticStatement {
     PublicRead(PublicReadSemantics),
     PublicWrite(PublicWriteSemantics),
-    Direct(NormalizedDirectStatements),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

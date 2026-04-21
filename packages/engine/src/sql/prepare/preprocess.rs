@@ -1,9 +1,7 @@
 use super::statement_references_public_surface;
 use crate::catalog::SurfaceRegistry;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
-use crate::sql::logical_plan::{
-    result_contract_for_statements, verify_direct_logical_plan, DirectLogicalPlan,
-};
+use crate::sql::logical_plan::{result_contract_for_statements, DirectLogicalPlan, ResultContract};
 use crate::sql::semantic_ir::prepare_direct_statements_to_plan;
 use crate::{LixError, SqlDialect, Value};
 use sqlparser::ast::Statement;
@@ -28,16 +26,23 @@ where
         normalized_statements,
         result_contract,
     };
-    verify_direct_logical_plan(&logical_plan).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "direct logical plan verification failed during preprocess: {}",
-                error.message
-            ),
-        )
-    })?;
+    ensure_internal_preprocess_plan_has_execution(&logical_plan)?;
     Ok(logical_plan)
+}
+
+fn ensure_internal_preprocess_plan_has_execution(plan: &DirectLogicalPlan) -> Result<(), LixError> {
+    if plan.normalized_statements.prepared_statements.is_empty()
+        && !matches!(plan.result_contract, ResultContract::DmlNoReturning)
+        && plan.normalized_statements.mutations.is_empty()
+        && plan.normalized_statements.update_validations.is_empty()
+    {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql compiler produced an internal execution plan without statements or explicit internal effects",
+        ));
+    }
+
+    Ok(())
 }
 
 fn reject_public_surface_statements(

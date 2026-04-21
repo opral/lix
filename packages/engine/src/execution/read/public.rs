@@ -5,7 +5,7 @@ use crate::sql::{
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
 use super::{
-    direct::execute_history_read_plan_with_backend, execute_read_time_projection_read,
+    execute_read_time_projection_read, history::execute_history_read_plan_with_backend,
     ReadExecutionHost,
 };
 
