@@ -445,10 +445,17 @@ pub(crate) struct PreparedHistoryReadArtifact {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
+pub(crate) struct PreparedSql2ReadPlanArtifact {
+    pub(crate) artifact: crate::sql2::PreparedSql2ReadArtifact,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub(crate) enum PreparedPublicReadPlanArtifact {
     ReadTimeProjection(PreparedReadTimeProjectionArtifact),
     PreparedBatch(PreparedBatchReadArtifact),
     HistoryRead(PreparedHistoryReadArtifact),
+    Sql2(PreparedSql2ReadPlanArtifact),
 }
 
 #[derive(Debug, Clone, PartialEq)]

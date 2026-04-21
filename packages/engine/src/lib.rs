@@ -14,6 +14,7 @@ pub(crate) mod plugin;
 mod schema;
 pub mod session;
 pub(crate) mod sql;
+pub(crate) mod sql2;
 pub mod streams;
 #[cfg(test)]
 mod test_support;
