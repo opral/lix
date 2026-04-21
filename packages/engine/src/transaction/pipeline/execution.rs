@@ -393,7 +393,10 @@ async fn execute_scalar_read_query_write_command(
     }
 
     execution_context
-        .persist_runtime_sequence_in_transaction(transaction, command.function_bindings().provider())
+        .persist_runtime_sequence_in_transaction(
+            transaction,
+            command.function_bindings().provider(),
+        )
         .await
         .map_err(|error| LixError {
             code: error.code,
