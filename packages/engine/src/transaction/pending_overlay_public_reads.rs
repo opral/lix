@@ -167,6 +167,7 @@ impl<'a> PendingOverlayReadModel<'a> {
                 &query.version_id,
                 &constraints,
                 &required_columns,
+                None,
             )
             .await?
             .into_iter()
@@ -179,6 +180,7 @@ impl<'a> PendingOverlayReadModel<'a> {
                 &query.version_id,
                 &constraints,
                 &required_columns,
+                None,
             )
             .await?
             .into_iter()

@@ -118,6 +118,7 @@ pub(crate) async fn scan_live_rows(
     version_id: &str,
     constraints: &[ScanConstraint],
     required_columns: &[String],
+    limit: Option<usize>,
 ) -> Result<Vec<LiveReadRow>, LixError> {
     let mut executor = backend;
     scan_live_rows_with_executor_ref(
@@ -127,6 +128,7 @@ pub(crate) async fn scan_live_rows(
         version_id,
         constraints,
         required_columns,
+        limit,
     )
     .await
 }
@@ -138,6 +140,7 @@ async fn scan_live_rows_with_executor_ref(
     version_id: &str,
     constraints: &[ScanConstraint],
     required_columns: &[String],
+    limit: Option<usize>,
 ) -> Result<Vec<LiveReadRow>, LixError> {
     match storage {
         LiveStorageLane::Tracked => {
@@ -154,16 +157,19 @@ async fn scan_live_rows_with_executor_ref(
             Ok(rows.into_iter().map(LiveReadRow::from).collect())
         }
         LiveStorageLane::Untracked => {
-            let rows = scan_untracked_rows_with_executor(
-                executor,
-                &UntrackedScanRequest {
-                    schema_key: schema_key.to_string(),
-                    version_id: version_id.to_string(),
-                    constraints: constraints.to_vec(),
-                    required_columns: required_columns.to_vec(),
-                },
-            )
-            .await?;
+            let request = UntrackedScanRequest {
+                schema_key: schema_key.to_string(),
+                version_id: version_id.to_string(),
+                constraints: constraints.to_vec(),
+                required_columns: required_columns.to_vec(),
+            };
+            let rows = match limit {
+                Some(limit) => {
+                    super::untracked::scan_rows_with_executor_limit(executor, &request, limit)
+                        .await?
+                }
+                None => scan_untracked_rows_with_executor(executor, &request).await?,
+            };
             Ok(rows.into_iter().map(LiveReadRow::from).collect())
         }
     }

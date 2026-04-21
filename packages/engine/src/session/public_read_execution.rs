@@ -5,6 +5,7 @@
 //! execution traits.
 
 use async_trait::async_trait;
+use std::sync::Arc;
 
 use crate::catalog::{
     CatalogProjectionRegistry, CatalogReadTimeProjectionRequest, SurfaceReadFreshness,
@@ -90,6 +91,10 @@ impl ReadExecutionHost for ProjectionReadExecutionHost<'_> {
 
 #[async_trait(?Send)]
 impl ReadExecutionHost for SessionExecutionContext<'_> {
+    fn shared_backend(&self) -> Option<Arc<dyn LixBackend + Send + Sync>> {
+        Some(Arc::clone(self.session_host().backend()))
+    }
+
     async fn derive_read_time_projection_rows(
         &self,
         backend: &dyn LixBackend,
