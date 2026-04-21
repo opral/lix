@@ -1,8 +1,9 @@
 use crate::catalog::SurfaceRegistry;
 use crate::functions::DynFunctionProvider;
 use crate::sql::explain::{
-    build_direct_explain_artifacts, unsupported_explain_analyze_error, unwrap_explain_statement,
-    DirectExplainBuildInput, ExplainRequest, ExplainStage, ExplainTimingCollector,
+    build_internal_sql_explain_artifacts, unsupported_explain_analyze_error,
+    unwrap_explain_statement, ExplainRequest, ExplainStage, ExplainTimingCollector,
+    InternalSqlExplainBuildInput,
 };
 use crate::sql::PlanEffects;
 use crate::{LixError, SqlDialect, Value};
@@ -11,7 +12,9 @@ use std::ops::ControlFlow;
 use std::time::Duration;
 use std::time::Instant;
 
-use super::compiled::{CompiledDirectExecution, CompiledExecution, CompiledExecutionBody};
+use super::compiled::{
+    CompiledDirectExecution, CompiledExecution, CompiledExecutionBody, CompiledScalarReadExecution,
+};
 use super::compiler_metadata::SqlCompilerMetadata;
 use super::contracts::requirements::PlanRequirements;
 use super::derive_effects::derive_plan_effects;
@@ -219,90 +222,132 @@ async fn compile_execution_with_context(
         && requirements.read_only_query
         && !scalar_read_only_query
     {
-        return Err(direct_reads_removed_error());
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "unsupported read statement shape",
+        ));
     }
+    let mut scalar_explain = None;
     let mut direct_explain = None;
-    let (effects, direct_execution) = if public_write_owns_execution || public_read_owns_execution {
-        (PlanEffects::default(), None)
-    } else {
-        let direct_source_statements = explained
-            .as_ref()
-            .and_then(|explained| {
-                explained
-                    .request
-                    .as_ref()
-                    .map(|_| vec![explained.statement.clone()])
-            })
-            .unwrap_or_else(|| statements.clone());
-        let direct_logical_planning_started = Instant::now();
-        let direct_logical_plan = preprocess_with_surfaces_to_logical_plan(
-            dialect,
-            compiler_context.surface_registry(),
-            direct_source_statements,
-            params,
-            functions.clone(),
-            origin_key,
-        )
-        .await
-        .map_err(LixError::from)
-        .map_err(|error| LixError {
-            code: error.code,
-            description: format!(
-                "compile_execution direct compilation failed: {}",
-                error.description
-            ),
-            hint: None,
-        })?;
-        let direct_logical_planning_duration = direct_logical_planning_started.elapsed();
-        let preprocess: PlannedStatementSet =
-            direct_logical_plan.normalized_statements.clone().into();
-        validate_compiled_direct_execution(&preprocess, direct_logical_plan.result_contract)?;
-        let effects = derive_plan_effects(&preprocess, origin_key).map_err(LixError::from)?;
-        let direct_execution = CompiledDirectExecution {
-            prepared_statements: preprocess.prepared_statements,
-            live_table_requirements: preprocess.live_table_requirements,
-            mutations: preprocess.mutations,
-            update_validations: preprocess.update_validations,
-            should_refresh_file_cache: requirements.should_refresh_file_cache,
+    let (effects, scalar_execution, direct_execution) =
+        if public_write_owns_execution || public_read_owns_execution {
+            (PlanEffects::default(), None, None)
+        } else {
+            let direct_source_statements = explained
+                .as_ref()
+                .and_then(|explained| {
+                    explained
+                        .request
+                        .as_ref()
+                        .map(|_| vec![explained.statement.clone()])
+                })
+                .unwrap_or_else(|| statements.clone());
+            let direct_logical_planning_started = Instant::now();
+            let direct_logical_plan = preprocess_with_surfaces_to_logical_plan(
+                dialect,
+                compiler_context.surface_registry(),
+                direct_source_statements,
+                params,
+                functions.clone(),
+                origin_key,
+            )
+            .await
+            .map_err(LixError::from)
+            .map_err(|error| LixError {
+                code: error.code,
+                description: format!(
+                    "compile_execution direct compilation failed: {}",
+                    error.description
+                ),
+                hint: None,
+            })?;
+            let direct_logical_planning_duration = direct_logical_planning_started.elapsed();
+            let preprocess: PlannedStatementSet =
+                direct_logical_plan.normalized_statements.clone().into();
+            validate_compiled_direct_execution(&preprocess, direct_logical_plan.result_contract)?;
+            let effects = derive_plan_effects(&preprocess, origin_key).map_err(LixError::from)?;
+            if scalar_read_only_query {
+                let scalar_execution = CompiledScalarReadExecution {
+                    prepared_statements: preprocess.prepared_statements,
+                };
+                if let Some(request) = explain_request.clone() {
+                    let mut stage_timings =
+                        ExplainTimingCollector::new(static_artifacts.parse_duration);
+                    stage_timings.record(
+                        ExplainStage::LogicalPlanning,
+                        direct_logical_planning_duration,
+                    );
+                    scalar_explain = Some(build_internal_sql_explain_artifacts(
+                        InternalSqlExplainBuildInput {
+                            request,
+                            logical_plan: direct_logical_plan.clone(),
+                            stage_timings: stage_timings.finish(),
+                        },
+                    ));
+                }
+                (effects, Some(scalar_execution), None)
+            } else {
+                let direct_execution = CompiledDirectExecution {
+                    prepared_statements: preprocess.prepared_statements,
+                    live_table_requirements: preprocess.live_table_requirements,
+                    mutations: preprocess.mutations,
+                    update_validations: preprocess.update_validations,
+                    should_refresh_file_cache: requirements.should_refresh_file_cache,
+                };
+                if let Some(request) = explain_request.clone() {
+                    let mut stage_timings =
+                        ExplainTimingCollector::new(static_artifacts.parse_duration);
+                    stage_timings.record(
+                        ExplainStage::LogicalPlanning,
+                        direct_logical_planning_duration,
+                    );
+                    direct_explain = Some(build_internal_sql_explain_artifacts(
+                        InternalSqlExplainBuildInput {
+                            request,
+                            logical_plan: direct_logical_plan.clone(),
+                            stage_timings: stage_timings.finish(),
+                        },
+                    ));
+                }
+                (effects, None, Some(direct_execution))
+            }
         };
-        if let Some(request) = explain_request.clone() {
-            let mut stage_timings = ExplainTimingCollector::new(static_artifacts.parse_duration);
-            stage_timings.record(
-                ExplainStage::LogicalPlanning,
-                direct_logical_planning_duration,
-            );
-            direct_explain = Some(build_direct_explain_artifacts(DirectExplainBuildInput {
-                request,
-                logical_plan: direct_logical_plan.clone(),
-                stage_timings: stage_timings.finish(),
-            }));
-        }
-        (effects, Some(direct_execution))
-    };
 
-    let body = match (public_read, public_write, direct_execution) {
-        (Some(public_read), None, None) => CompiledExecutionBody::PublicRead(public_read),
-        (None, Some(public_write), None) => CompiledExecutionBody::PublicWrite(public_write),
-        (None, None, Some(direct_execution)) => CompiledExecutionBody::Direct(direct_execution),
-        (public_read, public_write, direct_execution) => {
+    let body = match (
+        public_read,
+        public_write,
+        scalar_execution,
+        direct_execution,
+    ) {
+        (Some(public_read), None, None, None) => CompiledExecutionBody::PublicRead(public_read),
+        (None, Some(public_write), None, None) => CompiledExecutionBody::PublicWrite(public_write),
+        (None, None, Some(scalar_execution), None) => {
+            CompiledExecutionBody::ScalarRead(scalar_execution)
+        }
+        (None, None, None, Some(direct_execution)) => {
+            CompiledExecutionBody::Direct(direct_execution)
+        }
+        (public_read, public_write, scalar_execution, direct_execution) => {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                    "compiled execution must have exactly one body; got public_read={}, public_write={}, direct={}",
+                    "compiled execution must have exactly one body; got public_read={}, public_write={}, scalar={}, direct={}",
                     public_read.is_some(),
                     public_write.is_some(),
+                    scalar_execution.is_some(),
                     direct_execution.is_some()
                 ),
             ));
         }
     };
     if let Some(request) = explain_request.as_ref() {
-        validate_explain_execution_support(request, &body, requirements.read_only_query)?;
+        validate_explain_execution_support(request, &body)?;
     }
     let explain = match &body {
         CompiledExecutionBody::PublicRead(read) => {
             read.explain.request.as_ref().map(|_| read.explain.clone())
         }
+        CompiledExecutionBody::ScalarRead(_) => scalar_explain,
         CompiledExecutionBody::PublicWrite(write) => write
             .explain
             .request
@@ -319,13 +364,6 @@ async fn compile_execution_with_context(
         read_only_query: requirements.read_only_query,
         body,
     })
-}
-
-fn direct_reads_removed_error() -> LixError {
-    LixError::new(
-        "LIX_ERROR_DIRECT_READS_UNSUPPORTED",
-        "Direct reads are no longer supported. Route read queries through semantic public surfaces instead of backend SQL passthrough.",
-    )
 }
 
 async fn prepare_public_plan_for_compile(
@@ -398,15 +436,13 @@ fn derived_public_write_filesystem_intent(
 fn validate_explain_execution_support(
     request: &ExplainRequest,
     body: &CompiledExecutionBody,
-    read_only_query: bool,
 ) -> Result<(), LixError> {
     if !request.requires_execution() {
         return Ok(());
     }
 
     match body {
-        CompiledExecutionBody::PublicRead(_) => Ok(()),
-        CompiledExecutionBody::Direct(_) if read_only_query => Ok(()),
+        CompiledExecutionBody::PublicRead(_) | CompiledExecutionBody::ScalarRead(_) => Ok(()),
         CompiledExecutionBody::PublicWrite(_) => {
             Err(unsupported_explain_analyze_error("public write statements"))
         }
@@ -477,7 +513,7 @@ pub(crate) fn top_level_write_target_name(statement: &Statement) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::{direct_reads_removed_error, top_level_write_target_name};
+    use super::top_level_write_target_name;
     use crate::sql::parser::parse_sql_statements;
 
     #[test]
@@ -511,18 +547,5 @@ mod tests {
         let statements =
             parse_sql_statements("SELECT * FROM lix_file WHERE id = 'f1'").expect("parse");
         assert_eq!(top_level_write_target_name(&statements[0]), None);
-    }
-
-    #[test]
-    fn direct_reads_are_explicitly_reported_as_unsupported() {
-        let error = direct_reads_removed_error();
-        assert_eq!(error.code, "LIX_ERROR_DIRECT_READS_UNSUPPORTED");
-        assert!(
-            error
-                .description
-                .contains("Direct reads are no longer supported"),
-            "unexpected description: {}",
-            error.description
-        );
     }
 }

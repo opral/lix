@@ -1,4 +1,4 @@
-mod direct;
+mod history;
 mod pipeline;
 pub(crate) mod public;
 mod rowset;

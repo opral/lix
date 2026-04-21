@@ -6,6 +6,7 @@
 use crate::backend::PreparedStatement;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::sql::ast::lowering::lower_statement;
+use crate::sql::logical_plan::NormalizedDirectStatements;
 pub(crate) use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::semantic_ir::inline_functions::inline_lix_functions_with_provider;
 use crate::sql::semantic_ir::param_context::normalize_statement_placeholders_in_batch;
@@ -30,15 +31,6 @@ pub(crate) struct DirectStatementRewrite {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct NormalizedDirectStatements {
-    pub(crate) sql: String,
-    pub(crate) prepared_statements: Vec<PreparedStatement>,
-    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
-    pub(crate) mutations: Vec<MutationRow>,
-    pub(crate) update_validations: Vec<UpdateValidationPlan>,
-}
-
-#[derive(Debug, Clone, PartialEq)]
 struct StatementRewriteOutput {
     statements: Vec<Statement>,
     prepared_statements: Vec<PreparedStatement>,
@@ -57,15 +49,8 @@ enum RewrittenStatementBinding {
     Prepared(PreparedStatement),
 }
 
-impl NormalizedDirectStatements {
-    pub(crate) fn semantic_statement(&self) -> super::public::SemanticStatement {
-        super::public::SemanticStatement::Direct(self.clone())
-    }
-}
-
 impl From<NormalizedDirectStatements> for PlannedStatementSet {
     fn from(output: NormalizedDirectStatements) -> Self {
-        let _ = output.semantic_statement();
         Self {
             prepared_statements: output.prepared_statements,
             live_table_requirements: output.live_table_requirements,

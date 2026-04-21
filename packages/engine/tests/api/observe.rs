@@ -540,7 +540,7 @@ simulation_test!(
                 ],
             )
             .await
-            .expect("branch direct query should succeed");
+            .expect("branch history query should succeed");
         eprintln!(
             "debug branch by version rows: {:?}",
             debug_branch_version.statements[0].rows

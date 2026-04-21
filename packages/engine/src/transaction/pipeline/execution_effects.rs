@@ -24,9 +24,10 @@ pub(crate) fn command_metadata(
         WritePath::ExplainOnly => BufferedWriteFlushClass::NoPreFlush,
         WritePath::DirectWrite(_) => BufferedWriteFlushClass::DirectWrite,
         WritePath::CommittedRead(_) => BufferedWriteFlushClass::CommittedRead,
-        WritePath::PendingRead(_) | WritePath::BufferedDelta(_) | WritePath::NoopWrite => {
-            BufferedWriteFlushClass::NoPreFlush
-        }
+        WritePath::PendingRead(_)
+        | WritePath::ScalarRead(_)
+        | WritePath::BufferedDelta(_)
+        | WritePath::NoopWrite => BufferedWriteFlushClass::NoPreFlush,
     };
 
     Ok(BufferedWriteCommandMetadata {

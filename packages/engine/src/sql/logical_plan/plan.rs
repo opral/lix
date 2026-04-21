@@ -1,12 +1,15 @@
+use crate::backend::PreparedStatement;
 use crate::catalog::ResolvedRelation;
-use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
+use crate::sql::logical_plan::history_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadStatement, PlannedWrite, StructuredPublicRead,
 };
 use crate::sql::logical_plan::result_contract::ResultContract;
-use crate::sql::semantic_ir::direct::NormalizedDirectStatements;
 use crate::sql::semantic_ir::semantics::effective_state_resolver::EffectiveStatePlan;
-use crate::sql::{DependencySpec, EffectiveStateRequest};
+use crate::sql::{
+    DependencySpec, EffectiveStateRequest, MutationRow, SchemaLiveTableRequirement,
+    UpdateValidationPlan,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SurfaceReadPlan {
@@ -92,6 +95,15 @@ pub(crate) struct PublicWriteLogicalPlan {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub(crate) struct NormalizedDirectStatements {
+    pub(crate) sql: String,
+    pub(crate) prepared_statements: Vec<PreparedStatement>,
+    pub(crate) live_table_requirements: Vec<SchemaLiveTableRequirement>,
+    pub(crate) mutations: Vec<MutationRow>,
+    pub(crate) update_validations: Vec<UpdateValidationPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DirectLogicalPlan {
     pub(crate) normalized_statements: NormalizedDirectStatements,
     pub(crate) result_contract: ResultContract,
@@ -101,5 +113,4 @@ pub(crate) struct DirectLogicalPlan {
 pub(crate) enum LogicalPlan {
     PublicRead(PublicReadLogicalPlan),
     PublicWrite(PublicWriteLogicalPlan),
-    Direct(DirectLogicalPlan),
 }

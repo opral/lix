@@ -125,6 +125,12 @@ impl PreparedPublicWrite {
 
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
+pub struct PreparedScalarReadArtifact {
+    pub prepared_batch: PreparedBatch,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub struct PreparedDirectWriteArtifact {
     pub prepared_batch: PreparedBatch,
     pub live_table_requirements: Vec<SchemaLiveTableRequirement>,
@@ -141,6 +147,7 @@ pub struct PreparedDirectWriteArtifact {
 #[allow(dead_code)]
 pub enum PreparedWriteArtifact {
     PublicRead(PreparedPublicRead),
+    ScalarRead(PreparedScalarReadArtifact),
     PublicWrite(PreparedPublicWrite),
     Direct(PreparedDirectWriteArtifact),
 }
@@ -160,21 +167,36 @@ impl PreparedWriteStatement {
     pub fn public_read(&self) -> Option<&PreparedPublicRead> {
         match &self.artifact {
             PreparedWriteArtifact::PublicRead(read) => Some(read),
-            PreparedWriteArtifact::PublicWrite(_) | PreparedWriteArtifact::Direct(_) => None,
+            PreparedWriteArtifact::ScalarRead(_)
+            | PreparedWriteArtifact::PublicWrite(_)
+            | PreparedWriteArtifact::Direct(_) => None,
+        }
+    }
+
+    pub fn scalar_read(&self) -> Option<&PreparedScalarReadArtifact> {
+        match &self.artifact {
+            PreparedWriteArtifact::ScalarRead(scalar) => Some(scalar),
+            PreparedWriteArtifact::PublicRead(_)
+            | PreparedWriteArtifact::PublicWrite(_)
+            | PreparedWriteArtifact::Direct(_) => None,
         }
     }
 
     pub fn public_write(&self) -> Option<&PreparedPublicWrite> {
         match &self.artifact {
             PreparedWriteArtifact::PublicWrite(write) => Some(write),
-            PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::Direct(_) => None,
+            PreparedWriteArtifact::PublicRead(_)
+            | PreparedWriteArtifact::ScalarRead(_)
+            | PreparedWriteArtifact::Direct(_) => None,
         }
     }
 
     pub fn direct_write(&self) -> Option<&PreparedDirectWriteArtifact> {
         match &self.artifact {
             PreparedWriteArtifact::Direct(direct) => Some(direct),
-            PreparedWriteArtifact::PublicRead(_) | PreparedWriteArtifact::PublicWrite(_) => None,
+            PreparedWriteArtifact::PublicRead(_)
+            | PreparedWriteArtifact::ScalarRead(_)
+            | PreparedWriteArtifact::PublicWrite(_) => None,
         }
     }
 }

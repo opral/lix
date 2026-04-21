@@ -3018,7 +3018,7 @@ mod tests {
                             assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
                         }
                         _ => {
-                            panic!("entity history read should use direct entity-history execution")
+                            panic!("entity history read should use history entity read execution")
                         }
                     }
                 })
@@ -3279,13 +3279,13 @@ mod tests {
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
-                panic!("filesystem history read should not use state-history direct plan")
+                panic!("filesystem history read should not use state-history history plan")
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!("filesystem history read should not use entity-history direct plan")
+                panic!("filesystem history read should not use entity-history history plan")
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
-                panic!("filesystem history read should not use directory-history direct plan")
+                panic!("filesystem history read should not use directory-history history plan")
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("filesystem history read should not use lowered SQL")
@@ -3343,17 +3343,17 @@ mod tests {
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
                 panic!(
-                    "filesystem by-version history read should not use state-history direct plan"
+                    "filesystem by-version history read should not use state-history history plan"
                 )
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
                 panic!(
-                    "filesystem by-version history read should not use entity-history direct plan"
+                    "filesystem by-version history read should not use entity-history history plan"
                 )
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
                 panic!(
-                    "filesystem by-version history read should not use directory-history direct plan"
+                    "filesystem by-version history read should not use directory-history history plan"
                 )
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {
@@ -3409,13 +3409,13 @@ mod tests {
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
-                panic!("directory history read should not use state-history direct plan")
+                panic!("directory history read should not use state-history history plan")
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!("directory history read should not use entity-history direct plan")
+                panic!("directory history read should not use entity-history history plan")
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
-                panic!("directory history read should not use file-history direct plan")
+                panic!("directory history read should not use file-history history plan")
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("directory history read should not use lowered SQL")
@@ -3464,17 +3464,17 @@ mod tests {
                         PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(
                             _,
                         )) => {
-                            panic!("filesystem history read should not use state-history direct plan")
+                            panic!("filesystem history read should not use state-history history plan")
                         }
                         PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
                             _,
                         )) => {
-                            panic!("filesystem history read should not use entity-history direct plan")
+                            panic!("filesystem history read should not use entity-history history plan")
                         }
                         PublicReadPhysicalPlan::HistoryRead(
                             HistoryReadPlan::DirectoryHistory(_),
                         ) => {
-                            panic!("filesystem history read should not use directory-history direct plan")
+                            panic!("filesystem history read should not use directory-history history plan")
                         }
                         PublicReadPhysicalPlan::LoweredSql(_) => {
                             panic!("filesystem history read should not use lowered SQL")
@@ -3526,7 +3526,7 @@ mod tests {
                             assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
                         }
                         _ => {
-                            panic!("entity history read should use direct entity-history execution")
+                            panic!("entity history read should use history entity read execution")
                         }
                     }
                 })
@@ -4089,13 +4089,13 @@ mod tests {
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!("state-history read should not use entity-history direct plan")
+                panic!("state-history read should not use entity-history history plan")
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
-                panic!("state-history read should not use file-history direct plan")
+                panic!("state-history read should not use file-history history plan")
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
-                panic!("state-history read should not use directory-history direct plan")
+                panic!("state-history read should not use directory-history history plan")
             }
             PublicReadPhysicalPlan::LoweredSql(_) => {
                 panic!("state-history read should not use lowered SQL")
@@ -4145,7 +4145,7 @@ mod tests {
                 );
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            _ => panic!("grouped state-history read should use direct state-history execution"),
+            _ => panic!("grouped state-history read should use history state read execution"),
         }
     }
 

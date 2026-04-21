@@ -2,7 +2,7 @@ use crate::sql::ast::lowering::lower_statement;
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::binder::{compile_statement_binding_template_with_state, RuntimeBindingValues};
 use crate::sql::common::pushdown::PushdownDecision;
-use crate::sql::logical_plan::direct_reads::HistoryReadPlan;
+use crate::sql::logical_plan::history_reads::HistoryReadPlan;
 use crate::sql::logical_plan::public_ir::PlannedStateRow;
 use crate::sql::parser::placeholders::PlaceholderState;
 use crate::sql::{

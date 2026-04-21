@@ -15,15 +15,15 @@ use crate::sql::explain::{
 };
 use crate::sql::logical_plan::public_ir::BroadPublicReadStatement;
 use crate::sql::logical_plan::{
-    verify_logical_plan, DirectDirectoryHistoryField, DirectEntityHistoryField,
-    DirectFileHistoryField, DirectStateHistoryField, DirectoryHistoryAggregate,
+    verify_logical_plan, DirectoryHistoryAggregate, DirectoryHistoryField,
     DirectoryHistoryPredicate, DirectoryHistoryProjection, DirectoryHistoryReadPlan,
-    DirectoryHistorySortKey, EntityHistoryPredicate, EntityHistoryProjection,
-    EntityHistoryReadPlan, EntityHistorySortKey, FileHistoryAggregate, FileHistoryPredicate,
-    FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan, LogicalPlan,
-    PublicReadLogicalPlan, StateHistoryAggregate, StateHistoryAggregatePredicate,
-    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
-    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
+    DirectoryHistorySortKey, EntityHistoryField, EntityHistoryPredicate, EntityHistoryProjection,
+    EntityHistoryReadPlan, EntityHistorySortKey, FileHistoryAggregate, FileHistoryField,
+    FileHistoryPredicate, FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey,
+    HistoryReadPlan, LogicalPlan, PublicReadLogicalPlan, StateHistoryAggregate,
+    StateHistoryAggregatePredicate, StateHistoryField, StateHistoryPredicate,
+    StateHistoryProjection, StateHistoryProjectionValue, StateHistoryReadPlan, StateHistorySortKey,
+    StateHistorySortValue,
 };
 use crate::sql::parser::placeholders::{resolve_placeholder_index, PlaceholderState};
 use crate::sql::physical_plan::lowerer::lower_broad_public_read_for_execution_with_layouts;
@@ -333,7 +333,7 @@ fn build_entity_history_read_plan(
 
 fn build_state_history_group_by_fields(
     structured_read: &StructuredPublicRead,
-) -> Result<Vec<DirectStateHistoryField>, LixError> {
+) -> Result<Vec<StateHistoryField>, LixError> {
     match &structured_read.query.group_by {
         GroupByExpr::Expressions(expressions, modifiers) => {
             if !modifiers.is_empty() {
@@ -475,10 +475,7 @@ fn apply_entity_history_pushdown(
                 file_ids,
                 plugin_keys,
             );
-            if matches!(
-                field,
-                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
-            ) {
+            if matches!(field, EntityHistoryField::State(StateHistoryField::Depth)) {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth);
                     update_max_depth(max_depth, depth);
@@ -499,40 +496,28 @@ fn apply_entity_history_pushdown(
             }
         }
         EntityHistoryPredicate::Gt(field, value) => {
-            if matches!(
-                field,
-                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
-            ) {
+            if matches!(field, EntityHistoryField::State(StateHistoryField::Depth)) {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth + 1);
                 }
             }
         }
         EntityHistoryPredicate::GtEq(field, value) => {
-            if matches!(
-                field,
-                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
-            ) {
+            if matches!(field, EntityHistoryField::State(StateHistoryField::Depth)) {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth);
                 }
             }
         }
         EntityHistoryPredicate::Lt(field, value) => {
-            if matches!(
-                field,
-                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
-            ) {
+            if matches!(field, EntityHistoryField::State(StateHistoryField::Depth)) {
                 if let Some(depth) = value_as_i64(value) {
                     update_max_depth(max_depth, depth - 1);
                 }
             }
         }
         EntityHistoryPredicate::LtEq(field, value) => {
-            if matches!(
-                field,
-                DirectEntityHistoryField::State(DirectStateHistoryField::Depth)
-            ) {
+            if matches!(field, EntityHistoryField::State(StateHistoryField::Depth)) {
                 if let Some(depth) = value_as_i64(value) {
                     update_max_depth(max_depth, depth);
                 }
@@ -545,7 +530,7 @@ fn apply_entity_history_pushdown(
 }
 
 fn push_text_value_for_entity_history_field(
-    field: &DirectEntityHistoryField,
+    field: &EntityHistoryField,
     value: &Value,
     root_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
@@ -557,30 +542,30 @@ fn push_text_value_for_entity_history_field(
         return;
     };
     match field {
-        DirectEntityHistoryField::State(DirectStateHistoryField::RootCommitId) => {
+        EntityHistoryField::State(StateHistoryField::RootCommitId) => {
             root_commit_ids.insert(text.to_string());
         }
-        DirectEntityHistoryField::State(DirectStateHistoryField::VersionId) => {
+        EntityHistoryField::State(StateHistoryField::VersionId) => {
             version_ids.insert(text.to_string());
         }
-        DirectEntityHistoryField::State(DirectStateHistoryField::EntityId) => {
+        EntityHistoryField::State(StateHistoryField::EntityId) => {
             entity_ids.insert(text.to_string());
         }
-        DirectEntityHistoryField::State(DirectStateHistoryField::FileId) => {
+        EntityHistoryField::State(StateHistoryField::FileId) => {
             file_ids.insert(text.to_string());
         }
-        DirectEntityHistoryField::State(DirectStateHistoryField::PluginKey) => {
+        EntityHistoryField::State(StateHistoryField::PluginKey) => {
             plugin_keys.insert(text.to_string());
         }
-        DirectEntityHistoryField::Property(_)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::SchemaKey)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::SnapshotContent)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::Metadata)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::SchemaVersion)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::ChangeId)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::CommitId)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::CommitCreatedAt)
-        | DirectEntityHistoryField::State(DirectStateHistoryField::Depth) => {}
+        EntityHistoryField::Property(_)
+        | EntityHistoryField::State(StateHistoryField::SchemaKey)
+        | EntityHistoryField::State(StateHistoryField::SnapshotContent)
+        | EntityHistoryField::State(StateHistoryField::Metadata)
+        | EntityHistoryField::State(StateHistoryField::SchemaVersion)
+        | EntityHistoryField::State(StateHistoryField::ChangeId)
+        | EntityHistoryField::State(StateHistoryField::CommitId)
+        | EntityHistoryField::State(StateHistoryField::CommitCreatedAt)
+        | EntityHistoryField::State(StateHistoryField::Depth) => {}
     }
 }
 
@@ -591,7 +576,7 @@ fn build_entity_history_projection_plan(
         Vec<EntityHistoryProjection>,
         bool,
         Vec<String>,
-        BTreeMap<String, DirectEntityHistoryField>,
+        BTreeMap<String, EntityHistoryField>,
     ),
     LixError,
 > {
@@ -618,7 +603,7 @@ fn build_entity_history_projection_plan(
 
 fn build_entity_history_sort_keys(
     structured_read: &StructuredPublicRead,
-    projection_aliases: &BTreeMap<String, DirectEntityHistoryField>,
+    projection_aliases: &BTreeMap<String, EntityHistoryField>,
 ) -> Result<Vec<EntityHistorySortKey>, LixError> {
     let Some(order_by) = &structured_read.query.order_by else {
         return Ok(Vec::new());
@@ -952,7 +937,7 @@ fn apply_directory_history_pushdown(
 }
 
 fn push_text_value_for_directory_history_field(
-    field: &DirectDirectoryHistoryField,
+    field: &DirectoryHistoryField,
     value: &Value,
     root_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
@@ -962,28 +947,28 @@ fn push_text_value_for_directory_history_field(
         return;
     };
     match field {
-        DirectDirectoryHistoryField::RootCommitId => {
+        DirectoryHistoryField::RootCommitId => {
             root_commit_ids.insert(text.to_string());
         }
-        DirectDirectoryHistoryField::VersionId => {
+        DirectoryHistoryField::VersionId => {
             version_ids.insert(text.to_string());
         }
-        DirectDirectoryHistoryField::Id | DirectDirectoryHistoryField::EntityId => {
+        DirectoryHistoryField::Id | DirectoryHistoryField::EntityId => {
             directory_ids.insert(text.to_string());
         }
-        DirectDirectoryHistoryField::ParentId
-        | DirectDirectoryHistoryField::Name
-        | DirectDirectoryHistoryField::Path
-        | DirectDirectoryHistoryField::Hidden
-        | DirectDirectoryHistoryField::SchemaKey
-        | DirectDirectoryHistoryField::FileId
-        | DirectDirectoryHistoryField::PluginKey
-        | DirectDirectoryHistoryField::SchemaVersion
-        | DirectDirectoryHistoryField::ChangeId
-        | DirectDirectoryHistoryField::LixcolMetadata
-        | DirectDirectoryHistoryField::CommitId
-        | DirectDirectoryHistoryField::CommitCreatedAt
-        | DirectDirectoryHistoryField::Depth => {}
+        DirectoryHistoryField::ParentId
+        | DirectoryHistoryField::Name
+        | DirectoryHistoryField::Path
+        | DirectoryHistoryField::Hidden
+        | DirectoryHistoryField::SchemaKey
+        | DirectoryHistoryField::FileId
+        | DirectoryHistoryField::PluginKey
+        | DirectoryHistoryField::SchemaVersion
+        | DirectoryHistoryField::ChangeId
+        | DirectoryHistoryField::LixcolMetadata
+        | DirectoryHistoryField::CommitId
+        | DirectoryHistoryField::CommitCreatedAt
+        | DirectoryHistoryField::Depth => {}
     }
 }
 
@@ -994,7 +979,7 @@ fn build_directory_history_projection_plan(
         Vec<DirectoryHistoryProjection>,
         bool,
         Vec<String>,
-        BTreeMap<String, DirectDirectoryHistoryField>,
+        BTreeMap<String, DirectoryHistoryField>,
     ),
     LixError,
 > {
@@ -1021,7 +1006,7 @@ fn build_directory_history_projection_plan(
 
 fn build_directory_history_sort_keys(
     structured_read: &StructuredPublicRead,
-    projection_aliases: &BTreeMap<String, DirectDirectoryHistoryField>,
+    projection_aliases: &BTreeMap<String, DirectoryHistoryField>,
 ) -> Result<Vec<DirectoryHistorySortKey>, LixError> {
     let Some(order_by) = &structured_read.query.order_by else {
         return Ok(Vec::new());
@@ -1107,7 +1092,7 @@ fn directory_history_result_columns(
 fn directory_history_field_from_select_item(
     resolved_relation: &ResolvedRelation,
     item: &SelectItem,
-) -> Result<DirectDirectoryHistoryField, LixError> {
+) -> Result<DirectoryHistoryField, LixError> {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
@@ -1136,7 +1121,7 @@ fn directory_history_output_name(item: &SelectItem) -> String {
 fn directory_history_field_from_expr(
     resolved_relation: &ResolvedRelation,
     expr: &Expr,
-) -> Result<Option<DirectDirectoryHistoryField>, LixError> {
+) -> Result<Option<DirectoryHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
             directory_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
@@ -1155,29 +1140,27 @@ fn directory_history_field_from_expr(
 fn directory_history_field_from_column_name(
     resolved_relation: &ResolvedRelation,
     column: &str,
-) -> Result<DirectDirectoryHistoryField, LixError> {
+) -> Result<DirectoryHistoryField, LixError> {
     match column.to_ascii_lowercase().as_str() {
-        "id" => Ok(DirectDirectoryHistoryField::Id),
-        "parent_id" => Ok(DirectDirectoryHistoryField::ParentId),
-        "name" => Ok(DirectDirectoryHistoryField::Name),
-        "path" => Ok(DirectDirectoryHistoryField::Path),
-        "hidden" => Ok(DirectDirectoryHistoryField::Hidden),
-        "entity_id" | "lixcol_entity_id" => Ok(DirectDirectoryHistoryField::EntityId),
-        "schema_key" | "lixcol_schema_key" => Ok(DirectDirectoryHistoryField::SchemaKey),
-        "file_id" | "lixcol_file_id" => Ok(DirectDirectoryHistoryField::FileId),
-        "version_id" | "lixcol_version_id" => Ok(DirectDirectoryHistoryField::VersionId),
-        "plugin_key" | "lixcol_plugin_key" => Ok(DirectDirectoryHistoryField::PluginKey),
-        "schema_version" | "lixcol_schema_version" => {
-            Ok(DirectDirectoryHistoryField::SchemaVersion)
-        }
-        "change_id" | "lixcol_change_id" => Ok(DirectDirectoryHistoryField::ChangeId),
-        "lixcol_metadata" => Ok(DirectDirectoryHistoryField::LixcolMetadata),
-        "commit_id" | "lixcol_commit_id" => Ok(DirectDirectoryHistoryField::CommitId),
+        "id" => Ok(DirectoryHistoryField::Id),
+        "parent_id" => Ok(DirectoryHistoryField::ParentId),
+        "name" => Ok(DirectoryHistoryField::Name),
+        "path" => Ok(DirectoryHistoryField::Path),
+        "hidden" => Ok(DirectoryHistoryField::Hidden),
+        "entity_id" | "lixcol_entity_id" => Ok(DirectoryHistoryField::EntityId),
+        "schema_key" | "lixcol_schema_key" => Ok(DirectoryHistoryField::SchemaKey),
+        "file_id" | "lixcol_file_id" => Ok(DirectoryHistoryField::FileId),
+        "version_id" | "lixcol_version_id" => Ok(DirectoryHistoryField::VersionId),
+        "plugin_key" | "lixcol_plugin_key" => Ok(DirectoryHistoryField::PluginKey),
+        "schema_version" | "lixcol_schema_version" => Ok(DirectoryHistoryField::SchemaVersion),
+        "change_id" | "lixcol_change_id" => Ok(DirectoryHistoryField::ChangeId),
+        "lixcol_metadata" => Ok(DirectoryHistoryField::LixcolMetadata),
+        "commit_id" | "lixcol_commit_id" => Ok(DirectoryHistoryField::CommitId),
         "commit_created_at" | "lixcol_commit_created_at" => {
-            Ok(DirectDirectoryHistoryField::CommitCreatedAt)
+            Ok(DirectoryHistoryField::CommitCreatedAt)
         }
-        "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectDirectoryHistoryField::RootCommitId),
-        "depth" | "lixcol_depth" => Ok(DirectDirectoryHistoryField::Depth),
+        "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectoryHistoryField::RootCommitId),
+        "depth" | "lixcol_depth" => Ok(DirectoryHistoryField::Depth),
         _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
             Some(&resolved_relation.descriptor.public_name),
@@ -1259,7 +1242,7 @@ fn parse_directory_history_predicate(
 }
 
 fn directory_history_predicate_from_operator(
-    field: DirectDirectoryHistoryField,
+    field: DirectoryHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<DirectoryHistoryPredicate> {
@@ -1275,7 +1258,7 @@ fn directory_history_predicate_from_operator(
 }
 
 fn directory_history_predicate_from_reversed_operator(
-    field: DirectDirectoryHistoryField,
+    field: DirectoryHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<DirectoryHistoryPredicate> {
@@ -1406,7 +1389,7 @@ fn apply_file_history_pushdown(
 }
 
 fn push_text_value_for_file_history_field(
-    field: &DirectFileHistoryField,
+    field: &FileHistoryField,
     value: &Value,
     root_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
@@ -1415,27 +1398,27 @@ fn push_text_value_for_file_history_field(
         return;
     };
     match field {
-        DirectFileHistoryField::RootCommitId => {
+        FileHistoryField::RootCommitId => {
             root_commit_ids.insert(text.to_string());
         }
-        DirectFileHistoryField::VersionId => {
+        FileHistoryField::VersionId => {
             version_ids.insert(text.to_string());
         }
-        DirectFileHistoryField::Id
-        | DirectFileHistoryField::EntityId
-        | DirectFileHistoryField::FileId
-        | DirectFileHistoryField::Path
-        | DirectFileHistoryField::Data
-        | DirectFileHistoryField::Metadata
-        | DirectFileHistoryField::Hidden
-        | DirectFileHistoryField::SchemaKey
-        | DirectFileHistoryField::PluginKey
-        | DirectFileHistoryField::SchemaVersion
-        | DirectFileHistoryField::ChangeId
-        | DirectFileHistoryField::LixcolMetadata
-        | DirectFileHistoryField::CommitId
-        | DirectFileHistoryField::CommitCreatedAt
-        | DirectFileHistoryField::Depth => {}
+        FileHistoryField::Id
+        | FileHistoryField::EntityId
+        | FileHistoryField::FileId
+        | FileHistoryField::Path
+        | FileHistoryField::Data
+        | FileHistoryField::Metadata
+        | FileHistoryField::Hidden
+        | FileHistoryField::SchemaKey
+        | FileHistoryField::PluginKey
+        | FileHistoryField::SchemaVersion
+        | FileHistoryField::ChangeId
+        | FileHistoryField::LixcolMetadata
+        | FileHistoryField::CommitId
+        | FileHistoryField::CommitCreatedAt
+        | FileHistoryField::Depth => {}
     }
 }
 
@@ -1450,13 +1433,13 @@ fn file_history_query_needs_data(
     for projection in &structured_read.query.projection {
         if matches!(
             file_history_field_from_select_item(&structured_read.resolved_relation, projection)?,
-            DirectFileHistoryField::Data
+            FileHistoryField::Data
         ) {
             return Ok(true);
         }
     }
     for predicate in predicates {
-        if file_history_predicate_field(predicate) == DirectFileHistoryField::Data {
+        if file_history_predicate_field(predicate) == FileHistoryField::Data {
             return Ok(true);
         }
     }
@@ -1473,7 +1456,7 @@ fn file_history_query_needs_data(
             else {
                 continue;
             };
-            if field == DirectFileHistoryField::Data {
+            if field == FileHistoryField::Data {
                 return Ok(true);
             }
         }
@@ -1488,7 +1471,7 @@ fn build_file_history_projection_plan(
         Vec<FileHistoryProjection>,
         bool,
         Vec<String>,
-        BTreeMap<String, DirectFileHistoryField>,
+        BTreeMap<String, FileHistoryField>,
     ),
     LixError,
 > {
@@ -1514,7 +1497,7 @@ fn build_file_history_projection_plan(
 
 fn build_file_history_sort_keys(
     structured_read: &StructuredPublicRead,
-    projection_aliases: &BTreeMap<String, DirectFileHistoryField>,
+    projection_aliases: &BTreeMap<String, FileHistoryField>,
 ) -> Result<Vec<FileHistorySortKey>, LixError> {
     let Some(order_by) = &structured_read.query.order_by else {
         return Ok(Vec::new());
@@ -1599,7 +1582,7 @@ fn file_history_result_columns(
 fn file_history_field_from_select_item(
     resolved_relation: &ResolvedRelation,
     item: &SelectItem,
-) -> Result<DirectFileHistoryField, LixError> {
+) -> Result<FileHistoryField, LixError> {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
@@ -1628,7 +1611,7 @@ fn file_history_output_name(item: &SelectItem) -> String {
 fn file_history_field_from_expr(
     resolved_relation: &ResolvedRelation,
     expr: &Expr,
-) -> Result<Option<DirectFileHistoryField>, LixError> {
+) -> Result<Option<FileHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
             file_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
@@ -1647,27 +1630,25 @@ fn file_history_field_from_expr(
 fn file_history_field_from_column_name(
     resolved_relation: &ResolvedRelation,
     column: &str,
-) -> Result<DirectFileHistoryField, LixError> {
+) -> Result<FileHistoryField, LixError> {
     match column.to_ascii_lowercase().as_str() {
-        "id" => Ok(DirectFileHistoryField::Id),
-        "path" => Ok(DirectFileHistoryField::Path),
-        "data" => Ok(DirectFileHistoryField::Data),
-        "metadata" => Ok(DirectFileHistoryField::Metadata),
-        "hidden" => Ok(DirectFileHistoryField::Hidden),
-        "entity_id" | "lixcol_entity_id" => Ok(DirectFileHistoryField::EntityId),
-        "schema_key" | "lixcol_schema_key" => Ok(DirectFileHistoryField::SchemaKey),
-        "file_id" | "lixcol_file_id" => Ok(DirectFileHistoryField::FileId),
-        "version_id" | "lixcol_version_id" => Ok(DirectFileHistoryField::VersionId),
-        "plugin_key" | "lixcol_plugin_key" => Ok(DirectFileHistoryField::PluginKey),
-        "schema_version" | "lixcol_schema_version" => Ok(DirectFileHistoryField::SchemaVersion),
-        "change_id" | "lixcol_change_id" => Ok(DirectFileHistoryField::ChangeId),
-        "lixcol_metadata" => Ok(DirectFileHistoryField::LixcolMetadata),
-        "commit_id" | "lixcol_commit_id" => Ok(DirectFileHistoryField::CommitId),
-        "commit_created_at" | "lixcol_commit_created_at" => {
-            Ok(DirectFileHistoryField::CommitCreatedAt)
-        }
-        "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectFileHistoryField::RootCommitId),
-        "depth" | "lixcol_depth" => Ok(DirectFileHistoryField::Depth),
+        "id" => Ok(FileHistoryField::Id),
+        "path" => Ok(FileHistoryField::Path),
+        "data" => Ok(FileHistoryField::Data),
+        "metadata" => Ok(FileHistoryField::Metadata),
+        "hidden" => Ok(FileHistoryField::Hidden),
+        "entity_id" | "lixcol_entity_id" => Ok(FileHistoryField::EntityId),
+        "schema_key" | "lixcol_schema_key" => Ok(FileHistoryField::SchemaKey),
+        "file_id" | "lixcol_file_id" => Ok(FileHistoryField::FileId),
+        "version_id" | "lixcol_version_id" => Ok(FileHistoryField::VersionId),
+        "plugin_key" | "lixcol_plugin_key" => Ok(FileHistoryField::PluginKey),
+        "schema_version" | "lixcol_schema_version" => Ok(FileHistoryField::SchemaVersion),
+        "change_id" | "lixcol_change_id" => Ok(FileHistoryField::ChangeId),
+        "lixcol_metadata" => Ok(FileHistoryField::LixcolMetadata),
+        "commit_id" | "lixcol_commit_id" => Ok(FileHistoryField::CommitId),
+        "commit_created_at" | "lixcol_commit_created_at" => Ok(FileHistoryField::CommitCreatedAt),
+        "root_commit_id" | "lixcol_root_commit_id" => Ok(FileHistoryField::RootCommitId),
+        "depth" | "lixcol_depth" => Ok(FileHistoryField::Depth),
         _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
             Some(&resolved_relation.descriptor.public_name),
@@ -1749,7 +1730,7 @@ fn parse_file_history_predicate(
 }
 
 fn file_history_predicate_from_operator(
-    field: DirectFileHistoryField,
+    field: FileHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<FileHistoryPredicate> {
@@ -1765,7 +1746,7 @@ fn file_history_predicate_from_operator(
 }
 
 fn file_history_predicate_from_reversed_operator(
-    field: DirectFileHistoryField,
+    field: FileHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<FileHistoryPredicate> {
@@ -1863,7 +1844,7 @@ fn apply_state_history_pushdown(
                 schema_keys,
                 plugin_keys,
             );
-            if *field == DirectStateHistoryField::Depth {
+            if *field == StateHistoryField::Depth {
                 if let Some(depth) = value_as_i64(value) {
                     update_min_depth(min_depth, depth);
                     update_max_depth(max_depth, depth);
@@ -1884,22 +1865,22 @@ fn apply_state_history_pushdown(
                 );
             }
         }
-        StateHistoryPredicate::Gt(field, value) if *field == DirectStateHistoryField::Depth => {
+        StateHistoryPredicate::Gt(field, value) if *field == StateHistoryField::Depth => {
             if let Some(depth) = value_as_i64(value) {
                 update_min_depth(min_depth, depth.saturating_add(1));
             }
         }
-        StateHistoryPredicate::GtEq(field, value) if *field == DirectStateHistoryField::Depth => {
+        StateHistoryPredicate::GtEq(field, value) if *field == StateHistoryField::Depth => {
             if let Some(depth) = value_as_i64(value) {
                 update_min_depth(min_depth, depth);
             }
         }
-        StateHistoryPredicate::Lt(field, value) if *field == DirectStateHistoryField::Depth => {
+        StateHistoryPredicate::Lt(field, value) if *field == StateHistoryField::Depth => {
             if let Some(depth) = value_as_i64(value) {
                 update_max_depth(max_depth, depth.saturating_sub(1));
             }
         }
-        StateHistoryPredicate::LtEq(field, value) if *field == DirectStateHistoryField::Depth => {
+        StateHistoryPredicate::LtEq(field, value) if *field == StateHistoryField::Depth => {
             if let Some(depth) = value_as_i64(value) {
                 update_max_depth(max_depth, depth);
             }
@@ -1916,7 +1897,7 @@ fn apply_state_history_pushdown(
 
 #[allow(clippy::too_many_arguments)]
 fn push_text_value_for_field(
-    field: &DirectStateHistoryField,
+    field: &StateHistoryField,
     value: &Value,
     root_commit_ids: &mut BTreeSet<String>,
     version_ids: &mut BTreeSet<String>,
@@ -1929,31 +1910,31 @@ fn push_text_value_for_field(
         return;
     };
     match field {
-        DirectStateHistoryField::RootCommitId => {
+        StateHistoryField::RootCommitId => {
             root_commit_ids.insert(text.to_string());
         }
-        DirectStateHistoryField::VersionId => {
+        StateHistoryField::VersionId => {
             version_ids.insert(text.to_string());
         }
-        DirectStateHistoryField::EntityId => {
+        StateHistoryField::EntityId => {
             entity_ids.insert(text.to_string());
         }
-        DirectStateHistoryField::FileId => {
+        StateHistoryField::FileId => {
             file_ids.insert(text.to_string());
         }
-        DirectStateHistoryField::SchemaKey => {
+        StateHistoryField::SchemaKey => {
             schema_keys.insert(text.to_string());
         }
-        DirectStateHistoryField::PluginKey => {
+        StateHistoryField::PluginKey => {
             plugin_keys.insert(text.to_string());
         }
-        DirectStateHistoryField::SnapshotContent
-        | DirectStateHistoryField::Metadata
-        | DirectStateHistoryField::SchemaVersion
-        | DirectStateHistoryField::ChangeId
-        | DirectStateHistoryField::CommitId
-        | DirectStateHistoryField::CommitCreatedAt
-        | DirectStateHistoryField::Depth => {}
+        StateHistoryField::SnapshotContent
+        | StateHistoryField::Metadata
+        | StateHistoryField::SchemaVersion
+        | StateHistoryField::ChangeId
+        | StateHistoryField::CommitId
+        | StateHistoryField::CommitCreatedAt
+        | StateHistoryField::Depth => {}
     }
 }
 
@@ -1982,13 +1963,12 @@ fn state_history_query_needs_snapshot_content(
     for projection in &structured_read.query.projection {
         let value =
             state_history_projection_value(&structured_read.resolved_relation, projection, &[])?;
-        if let StateHistoryProjectionValue::Field(DirectStateHistoryField::SnapshotContent) = value
-        {
+        if let StateHistoryProjectionValue::Field(StateHistoryField::SnapshotContent) = value {
             return Ok(true);
         }
     }
     for predicate in predicates {
-        if state_history_predicate_field(predicate) == DirectStateHistoryField::SnapshotContent {
+        if state_history_predicate_field(predicate) == StateHistoryField::SnapshotContent {
             return Ok(true);
         }
     }
@@ -2005,7 +1985,7 @@ fn state_history_query_needs_snapshot_content(
             else {
                 continue;
             };
-            if field == DirectStateHistoryField::SnapshotContent {
+            if field == StateHistoryField::SnapshotContent {
                 return Ok(true);
             }
         }
@@ -2015,7 +1995,7 @@ fn state_history_query_needs_snapshot_content(
 
 fn build_state_history_projection_plan(
     structured_read: &StructuredPublicRead,
-    group_by_fields: &[DirectStateHistoryField],
+    group_by_fields: &[StateHistoryField],
 ) -> Result<
     (
         Vec<StateHistoryProjection>,
@@ -2167,7 +2147,7 @@ fn direct_surface_column_type(
 fn entity_history_field_from_select_item(
     resolved_relation: &ResolvedRelation,
     item: &SelectItem,
-) -> Result<DirectEntityHistoryField, LixError> {
+) -> Result<EntityHistoryField, LixError> {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
         SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => {
@@ -2188,7 +2168,7 @@ fn entity_history_field_from_select_item(
 fn state_history_projection_value(
     resolved_relation: &ResolvedRelation,
     item: &SelectItem,
-    group_by_fields: &[DirectStateHistoryField],
+    group_by_fields: &[StateHistoryField],
 ) -> Result<StateHistoryProjectionValue, LixError> {
     let expr = match item {
         SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
@@ -2276,7 +2256,7 @@ fn direct_expr_output_name(expr: &Expr) -> String {
 fn state_history_field_from_expr(
     resolved_relation: &ResolvedRelation,
     expr: &Expr,
-) -> Result<Option<DirectStateHistoryField>, LixError> {
+) -> Result<Option<StateHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
             state_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
@@ -2295,7 +2275,7 @@ fn state_history_field_from_expr(
 fn entity_history_field_from_expr(
     resolved_relation: &ResolvedRelation,
     expr: &Expr,
-) -> Result<Option<DirectEntityHistoryField>, LixError> {
+) -> Result<Option<EntityHistoryField>, LixError> {
     match expr {
         Expr::Identifier(ident) => {
             entity_history_field_from_column_name(resolved_relation, &ident.value).map(Some)
@@ -2335,21 +2315,21 @@ fn state_history_sort_value_from_projection_value(
 fn state_history_field_from_column_name(
     resolved_relation: &ResolvedRelation,
     column: &str,
-) -> Result<DirectStateHistoryField, LixError> {
+) -> Result<StateHistoryField, LixError> {
     match column.to_ascii_lowercase().as_str() {
-        "entity_id" | "lixcol_entity_id" => Ok(DirectStateHistoryField::EntityId),
-        "schema_key" | "lixcol_schema_key" => Ok(DirectStateHistoryField::SchemaKey),
-        "file_id" | "lixcol_file_id" => Ok(DirectStateHistoryField::FileId),
-        "plugin_key" | "lixcol_plugin_key" => Ok(DirectStateHistoryField::PluginKey),
-        "snapshot_content" => Ok(DirectStateHistoryField::SnapshotContent),
-        "metadata" | "lixcol_metadata" => Ok(DirectStateHistoryField::Metadata),
-        "schema_version" | "lixcol_schema_version" => Ok(DirectStateHistoryField::SchemaVersion),
-        "change_id" | "lixcol_change_id" => Ok(DirectStateHistoryField::ChangeId),
-        "commit_id" | "lixcol_commit_id" => Ok(DirectStateHistoryField::CommitId),
-        "commit_created_at" => Ok(DirectStateHistoryField::CommitCreatedAt),
-        "root_commit_id" | "lixcol_root_commit_id" => Ok(DirectStateHistoryField::RootCommitId),
-        "depth" | "lixcol_depth" => Ok(DirectStateHistoryField::Depth),
-        "version_id" | "lixcol_version_id" => Ok(DirectStateHistoryField::VersionId),
+        "entity_id" | "lixcol_entity_id" => Ok(StateHistoryField::EntityId),
+        "schema_key" | "lixcol_schema_key" => Ok(StateHistoryField::SchemaKey),
+        "file_id" | "lixcol_file_id" => Ok(StateHistoryField::FileId),
+        "plugin_key" | "lixcol_plugin_key" => Ok(StateHistoryField::PluginKey),
+        "snapshot_content" => Ok(StateHistoryField::SnapshotContent),
+        "metadata" | "lixcol_metadata" => Ok(StateHistoryField::Metadata),
+        "schema_version" | "lixcol_schema_version" => Ok(StateHistoryField::SchemaVersion),
+        "change_id" | "lixcol_change_id" => Ok(StateHistoryField::ChangeId),
+        "commit_id" | "lixcol_commit_id" => Ok(StateHistoryField::CommitId),
+        "commit_created_at" => Ok(StateHistoryField::CommitCreatedAt),
+        "root_commit_id" | "lixcol_root_commit_id" => Ok(StateHistoryField::RootCommitId),
+        "depth" | "lixcol_depth" => Ok(StateHistoryField::Depth),
+        "version_id" | "lixcol_version_id" => Ok(StateHistoryField::VersionId),
         _ => Err(crate::sql::diagnostics::sql_unknown_column_error(
             column,
             Some(&resolved_relation.descriptor.public_name),
@@ -2366,10 +2346,10 @@ fn state_history_field_from_column_name(
 fn entity_history_field_from_column_name(
     resolved_relation: &ResolvedRelation,
     column: &str,
-) -> Result<DirectEntityHistoryField, LixError> {
+) -> Result<EntityHistoryField, LixError> {
     let lowercase = column.to_ascii_lowercase();
     if let Ok(field) = state_history_field_from_column_name(resolved_relation, column) {
-        return Ok(DirectEntityHistoryField::State(field));
+        return Ok(EntityHistoryField::State(field));
     }
     if resolved_relation
         .descriptor
@@ -2377,7 +2357,7 @@ fn entity_history_field_from_column_name(
         .iter()
         .any(|candidate| candidate.eq_ignore_ascii_case(column))
     {
-        return Ok(DirectEntityHistoryField::Property(lowercase));
+        return Ok(EntityHistoryField::Property(lowercase));
     }
     Err(crate::sql::diagnostics::sql_unknown_column_error(
         column,
@@ -2531,7 +2511,7 @@ fn parse_entity_history_predicate(
 }
 
 fn entity_history_predicate_from_operator(
-    field: DirectEntityHistoryField,
+    field: EntityHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<EntityHistoryPredicate> {
@@ -2547,7 +2527,7 @@ fn entity_history_predicate_from_operator(
 }
 
 fn entity_history_predicate_from_reversed_operator(
-    field: DirectEntityHistoryField,
+    field: EntityHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<EntityHistoryPredicate> {
@@ -2627,7 +2607,7 @@ fn state_history_aggregate_predicate_from_reversed_operator(
 }
 
 fn state_history_predicate_from_operator(
-    field: DirectStateHistoryField,
+    field: StateHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<StateHistoryPredicate> {
@@ -2643,7 +2623,7 @@ fn state_history_predicate_from_operator(
 }
 
 fn state_history_predicate_from_reversed_operator(
-    field: DirectStateHistoryField,
+    field: StateHistoryField,
     op: &BinaryOperator,
     value: Value,
 ) -> Option<StateHistoryPredicate> {
@@ -2825,51 +2805,51 @@ fn direct_u64_from_expr(
     }
 }
 
-fn file_history_field_name(field: &DirectFileHistoryField) -> &'static str {
+fn file_history_field_name(field: &FileHistoryField) -> &'static str {
     match field {
-        DirectFileHistoryField::Id => "id",
-        DirectFileHistoryField::Path => "path",
-        DirectFileHistoryField::Data => "data",
-        DirectFileHistoryField::Metadata => "metadata",
-        DirectFileHistoryField::Hidden => "hidden",
-        DirectFileHistoryField::EntityId => "lixcol_entity_id",
-        DirectFileHistoryField::SchemaKey => "lixcol_schema_key",
-        DirectFileHistoryField::FileId => "lixcol_file_id",
-        DirectFileHistoryField::VersionId => "lixcol_version_id",
-        DirectFileHistoryField::PluginKey => "lixcol_plugin_key",
-        DirectFileHistoryField::SchemaVersion => "lixcol_schema_version",
-        DirectFileHistoryField::ChangeId => "lixcol_change_id",
-        DirectFileHistoryField::LixcolMetadata => "lixcol_metadata",
-        DirectFileHistoryField::CommitId => "lixcol_commit_id",
-        DirectFileHistoryField::CommitCreatedAt => "lixcol_commit_created_at",
-        DirectFileHistoryField::RootCommitId => "lixcol_root_commit_id",
-        DirectFileHistoryField::Depth => "lixcol_depth",
+        FileHistoryField::Id => "id",
+        FileHistoryField::Path => "path",
+        FileHistoryField::Data => "data",
+        FileHistoryField::Metadata => "metadata",
+        FileHistoryField::Hidden => "hidden",
+        FileHistoryField::EntityId => "lixcol_entity_id",
+        FileHistoryField::SchemaKey => "lixcol_schema_key",
+        FileHistoryField::FileId => "lixcol_file_id",
+        FileHistoryField::VersionId => "lixcol_version_id",
+        FileHistoryField::PluginKey => "lixcol_plugin_key",
+        FileHistoryField::SchemaVersion => "lixcol_schema_version",
+        FileHistoryField::ChangeId => "lixcol_change_id",
+        FileHistoryField::LixcolMetadata => "lixcol_metadata",
+        FileHistoryField::CommitId => "lixcol_commit_id",
+        FileHistoryField::CommitCreatedAt => "lixcol_commit_created_at",
+        FileHistoryField::RootCommitId => "lixcol_root_commit_id",
+        FileHistoryField::Depth => "lixcol_depth",
     }
 }
 
-fn directory_history_field_name(field: &DirectDirectoryHistoryField) -> &'static str {
+fn directory_history_field_name(field: &DirectoryHistoryField) -> &'static str {
     match field {
-        DirectDirectoryHistoryField::Id => "id",
-        DirectDirectoryHistoryField::ParentId => "parent_id",
-        DirectDirectoryHistoryField::Name => "name",
-        DirectDirectoryHistoryField::Path => "path",
-        DirectDirectoryHistoryField::Hidden => "hidden",
-        DirectDirectoryHistoryField::EntityId => "lixcol_entity_id",
-        DirectDirectoryHistoryField::SchemaKey => "lixcol_schema_key",
-        DirectDirectoryHistoryField::FileId => "lixcol_file_id",
-        DirectDirectoryHistoryField::VersionId => "lixcol_version_id",
-        DirectDirectoryHistoryField::PluginKey => "lixcol_plugin_key",
-        DirectDirectoryHistoryField::SchemaVersion => "lixcol_schema_version",
-        DirectDirectoryHistoryField::ChangeId => "lixcol_change_id",
-        DirectDirectoryHistoryField::LixcolMetadata => "lixcol_metadata",
-        DirectDirectoryHistoryField::CommitId => "lixcol_commit_id",
-        DirectDirectoryHistoryField::CommitCreatedAt => "lixcol_commit_created_at",
-        DirectDirectoryHistoryField::RootCommitId => "lixcol_root_commit_id",
-        DirectDirectoryHistoryField::Depth => "lixcol_depth",
+        DirectoryHistoryField::Id => "id",
+        DirectoryHistoryField::ParentId => "parent_id",
+        DirectoryHistoryField::Name => "name",
+        DirectoryHistoryField::Path => "path",
+        DirectoryHistoryField::Hidden => "hidden",
+        DirectoryHistoryField::EntityId => "lixcol_entity_id",
+        DirectoryHistoryField::SchemaKey => "lixcol_schema_key",
+        DirectoryHistoryField::FileId => "lixcol_file_id",
+        DirectoryHistoryField::VersionId => "lixcol_version_id",
+        DirectoryHistoryField::PluginKey => "lixcol_plugin_key",
+        DirectoryHistoryField::SchemaVersion => "lixcol_schema_version",
+        DirectoryHistoryField::ChangeId => "lixcol_change_id",
+        DirectoryHistoryField::LixcolMetadata => "lixcol_metadata",
+        DirectoryHistoryField::CommitId => "lixcol_commit_id",
+        DirectoryHistoryField::CommitCreatedAt => "lixcol_commit_created_at",
+        DirectoryHistoryField::RootCommitId => "lixcol_root_commit_id",
+        DirectoryHistoryField::Depth => "lixcol_depth",
     }
 }
 
-fn file_history_predicate_field(predicate: &FileHistoryPredicate) -> DirectFileHistoryField {
+fn file_history_predicate_field(predicate: &FileHistoryPredicate) -> FileHistoryField {
     match predicate {
         FileHistoryPredicate::Eq(field, _)
         | FileHistoryPredicate::NotEq(field, _)
@@ -2883,7 +2863,7 @@ fn file_history_predicate_field(predicate: &FileHistoryPredicate) -> DirectFileH
     }
 }
 
-fn state_history_predicate_field(predicate: &StateHistoryPredicate) -> DirectStateHistoryField {
+fn state_history_predicate_field(predicate: &StateHistoryPredicate) -> StateHistoryField {
     match predicate {
         StateHistoryPredicate::Eq(field, _)
         | StateHistoryPredicate::NotEq(field, _)
@@ -2897,28 +2877,28 @@ fn state_history_predicate_field(predicate: &StateHistoryPredicate) -> DirectSta
     }
 }
 
-fn state_history_field_name(field: &DirectStateHistoryField) -> &'static str {
+fn state_history_field_name(field: &StateHistoryField) -> &'static str {
     match field {
-        DirectStateHistoryField::EntityId => "entity_id",
-        DirectStateHistoryField::SchemaKey => "schema_key",
-        DirectStateHistoryField::FileId => "file_id",
-        DirectStateHistoryField::PluginKey => "plugin_key",
-        DirectStateHistoryField::SnapshotContent => "snapshot_content",
-        DirectStateHistoryField::Metadata => "metadata",
-        DirectStateHistoryField::SchemaVersion => "schema_version",
-        DirectStateHistoryField::ChangeId => "change_id",
-        DirectStateHistoryField::CommitId => "commit_id",
-        DirectStateHistoryField::CommitCreatedAt => "commit_created_at",
-        DirectStateHistoryField::RootCommitId => "root_commit_id",
-        DirectStateHistoryField::Depth => "depth",
-        DirectStateHistoryField::VersionId => "version_id",
+        StateHistoryField::EntityId => "entity_id",
+        StateHistoryField::SchemaKey => "schema_key",
+        StateHistoryField::FileId => "file_id",
+        StateHistoryField::PluginKey => "plugin_key",
+        StateHistoryField::SnapshotContent => "snapshot_content",
+        StateHistoryField::Metadata => "metadata",
+        StateHistoryField::SchemaVersion => "schema_version",
+        StateHistoryField::ChangeId => "change_id",
+        StateHistoryField::CommitId => "commit_id",
+        StateHistoryField::CommitCreatedAt => "commit_created_at",
+        StateHistoryField::RootCommitId => "root_commit_id",
+        StateHistoryField::Depth => "depth",
+        StateHistoryField::VersionId => "version_id",
     }
 }
 
-fn entity_history_field_name(field: &DirectEntityHistoryField) -> &str {
+fn entity_history_field_name(field: &EntityHistoryField) -> &str {
     match field {
-        DirectEntityHistoryField::Property(property) => property.as_str(),
-        DirectEntityHistoryField::State(field) => state_history_field_name(field),
+        EntityHistoryField::Property(property) => property.as_str(),
+        EntityHistoryField::State(field) => state_history_field_name(field),
     }
 }
 
@@ -3069,7 +3049,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     //   prepared-batch.
     // - capability_resolution: load external schemas/layouts needed to lower specialized SQL
     //   execution once the chosen plan kind requires backend capability state.
-    // - physical_planning: build the direct history plan or the lowered read batch after any
+    // - physical_planning: build the history plan or the lowered read batch after any
     //   required capability resolution has completed.
     // - artifact_preparation: render lowered backend SQL from a lowered read batch. Direct
     //   history plans omit this stage because they do not prepare backend SQL text.
@@ -3329,7 +3309,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
         PublicReadPhysicalPlan::LoweredSql(_) => logical_plan.clone(),
         PublicReadPhysicalPlan::ReadTimeProjection(_) => logical_plan.clone(),
         PublicReadPhysicalPlan::HistoryRead(history_read_plan) => {
-            analysis.logical_plan_with_direct_execution(history_read_plan.clone())
+            analysis.logical_plan_with_history_read(history_read_plan.clone())
         }
     };
     verify_logical_plan(&LogicalPlan::PublicRead(optimized_logical_plan.clone())).map_err(
@@ -3473,7 +3453,7 @@ fn entity_history_pushdown_decision(plan: &EntityHistoryReadPlan) -> Option<Push
             | EntityHistoryPredicate::IsNull(field)
             | EntityHistoryPredicate::IsNotNull(field) => field,
         };
-        if matches!(field, DirectEntityHistoryField::Property(_)) {
+        if matches!(field, EntityHistoryField::Property(_)) {
             residual_predicates.push(entity_history_predicate_expr(predicate));
         }
     }

@@ -956,11 +956,11 @@ fn observe_initial_snapshot_is_session_scoped() {
         let worker_direct = worker
             .execute(&query.sql, &[])
             .await
-            .expect("worker direct query should succeed");
+            .expect("worker history query should succeed");
         let workspace_direct = lix
             .execute(&query.sql, &[])
             .await
-            .expect("workspace direct query should succeed");
+            .expect("workspace history query should succeed");
         assert_eq!(first_i64(&worker_direct), 1);
         assert_eq!(first_i64(&workspace_direct), 0);
 
