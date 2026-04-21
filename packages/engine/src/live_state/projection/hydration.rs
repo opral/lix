@@ -12,7 +12,8 @@ use crate::live_state::tracked::{
 use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::live_state::store::LiveStateBackendRef;
+use crate::{LixError, Value};
 
 /// Hydrate the declared live-row inputs for one projection across the tracked
 /// and untracked visibility lanes.
@@ -21,7 +22,7 @@ use crate::{LixBackend, LixError, Value};
 /// frontier lookups that resolve per-input scope such as global-only or current
 /// committed local-version rows.
 pub(crate) async fn hydrate_projection_input_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     projection: &dyn CatalogProjectionDefinition,
     requested_version_id: Option<&str>,
 ) -> Result<CatalogProjectionInput, LixError> {
@@ -32,7 +33,7 @@ pub(crate) async fn hydrate_projection_input_with_backend(
 }
 
 async fn hydrate_projection_input_with_context_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     context: &ProjectionHydrationContext,
     projection: &dyn CatalogProjectionDefinition,
 ) -> Result<CatalogProjectionInput, LixError> {
@@ -57,7 +58,7 @@ struct ProjectionHydrationContext {
 
 impl ProjectionHydrationContext {
     async fn for_read_time_with_backend(
-        backend: &dyn LixBackend,
+        backend: LiveStateBackendRef<'_>,
         requested_version_id: Option<&str>,
     ) -> Result<Self, LixError> {
         let frontier = load_current_committed_version_frontier_with_backend(backend).await?;
@@ -97,7 +98,7 @@ impl ProjectionHydrationContext {
 }
 
 async fn hydrate_input_rows_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     context: &ProjectionHydrationContext,
     spec: CatalogProjectionInputSpec,
 ) -> Result<CatalogProjectionInputRows, LixError> {
@@ -204,7 +205,7 @@ async fn hydrate_input_rows_with_backend(
 }
 
 async fn build_catalog_projection_context_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     context: &ProjectionHydrationContext,
     inputs: &[CatalogProjectionInputRows],
 ) -> Result<CatalogProjectionContext, LixError> {
@@ -229,7 +230,7 @@ async fn build_catalog_projection_context_with_backend(
 }
 
 async fn load_change_commit_ids_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     change_ids: &std::collections::BTreeSet<String>,
 ) -> Result<std::collections::BTreeMap<String, String>, LixError> {
     if change_ids.is_empty() {
@@ -250,7 +251,7 @@ async fn load_change_commit_ids_with_backend(
             crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
         in_list = in_list,
     );
-    let result = backend.execute(&sql, &[]).await?;
+    let result = crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
     let mut rows = std::collections::BTreeMap::new();
     for row in result.rows {
         let Some(Value::Text(change_id)) = row.first() else {
@@ -265,7 +266,7 @@ async fn load_change_commit_ids_with_backend(
 }
 
 async fn load_blob_data_by_hash_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     blob_hashes: &std::collections::BTreeSet<String>,
 ) -> Result<std::collections::BTreeMap<String, Option<Vec<u8>>>, LixError> {
     let mut rows = std::collections::BTreeMap::new();
@@ -281,7 +282,6 @@ async fn load_blob_data_by_hash_with_backend(
 #[cfg(test)]
 mod tests {
     use super::hydrate_projection_input_with_backend;
-    use crate::backend::TransactionBeginMode;
     use crate::catalog::{
         CatalogDerivedRow, CatalogProjectionDefinition, CatalogProjectionInput,
         CatalogProjectionInputSpec, CatalogProjectionInputVersionScope,
@@ -291,7 +291,6 @@ mod tests {
     use crate::live_state::{builtin_schema_storage_metadata, LiveRow};
     use crate::schema::{LixVersionDescriptor, LixVersionRef};
     use crate::test_support::{init_test_backend_core, TestSqliteBackend};
-    use crate::LixBackend;
 
     #[derive(Debug, Clone, Copy)]
     struct TestLixVersionProjection;
@@ -516,7 +515,7 @@ mod tests {
             .await
             .expect("version ref schema should register");
         let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("write transaction should begin");
         live_state::write_live_rows(
@@ -675,7 +674,7 @@ mod tests {
             .await
             .expect("key value schema should register");
         let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("write transaction should begin");
         live_state::write_live_rows(

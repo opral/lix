@@ -3,9 +3,9 @@
 use serde_json::Value as JsonValue;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::QueryExecutor;
+use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::schema::builtin_schema_definition;
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::{LixError, SqlDialect, Value};
 
 use super::registry::{compile_registered_live_layout, load_live_table_layout_with_backend};
 use super::sql::live_schema_key_for_table_name;
@@ -291,7 +291,7 @@ pub(crate) fn logical_snapshot_from_projected_row(
 }
 
 pub(crate) async fn load_live_row_access_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<LiveRowAccess, LixError> {
     Ok(LiveRowAccess::new(
@@ -300,7 +300,7 @@ pub(crate) async fn load_live_row_access_with_backend(
 }
 
 pub(crate) async fn load_live_row_access_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     schema_key: &str,
 ) -> Result<LiveRowAccess, LixError> {
     Ok(LiveRowAccess::new(
@@ -309,7 +309,7 @@ pub(crate) async fn load_live_row_access_with_executor(
 }
 
 pub(crate) async fn load_live_row_access_for_table_name(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     table_name: &str,
 ) -> Result<Option<LiveRowAccess>, LixError> {
     let Some(schema_key) = live_schema_key_for_table_name(table_name) else {
@@ -321,15 +321,18 @@ pub(crate) async fn load_live_row_access_for_table_name(
 }
 
 pub(crate) async fn load_live_table_layout_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     if let Some(layout) = builtin_live_table_layout(schema_key)? {
         return Ok(layout);
     }
-    let result = executor
-        .execute(REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL, &[])
-        .await?;
+    let result = crate::live_state::store_sql::execute_query_with_executor(
+        executor,
+        REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL,
+        &[],
+    )
+    .await?;
     compile_registered_live_layout(schema_key, result.rows)
 }
 

@@ -1,20 +1,20 @@
-use crate::backend::QueryExecutor;
 use crate::common::is_missing_relation_error;
 #[cfg(test)]
 use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;
+use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::live_state::storage::{
     build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
     required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixError, Value};
 
 #[cfg(test)]
 use super::contracts::BatchUntrackedRowRequest;
 use super::contracts::{ExactUntrackedRowRequest, UntrackedRow, UntrackedScanRequest};
 
 pub async fn load_exact_row_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactUntrackedRowRequest,
 ) -> Result<Option<UntrackedRow>, LixError> {
     let mut executor = backend;
@@ -23,7 +23,7 @@ pub async fn load_exact_row_with_backend(
 
 #[cfg(test)]
 pub async fn load_exact_rows_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &BatchUntrackedRowRequest,
 ) -> Result<Vec<UntrackedRow>, LixError> {
     let mut executor = backend;
@@ -31,7 +31,7 @@ pub async fn load_exact_rows_with_backend(
 }
 
 pub async fn scan_rows_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &UntrackedScanRequest,
 ) -> Result<Vec<UntrackedRow>, LixError> {
     let mut executor = backend;
@@ -39,7 +39,7 @@ pub async fn scan_rows_with_backend(
 }
 
 pub(crate) async fn load_exact_row_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     request: &ExactUntrackedRowRequest,
 ) -> Result<Option<UntrackedRow>, LixError> {
     let scan_request = UntrackedScanRequest {
@@ -65,7 +65,7 @@ pub(crate) async fn load_exact_row_with_executor(
 
 #[cfg(test)]
 pub(crate) async fn load_exact_rows_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     request: &BatchUntrackedRowRequest,
 ) -> Result<Vec<UntrackedRow>, LixError> {
     if request.entity_ids.is_empty() {
@@ -87,14 +87,14 @@ pub(crate) async fn load_exact_rows_with_executor(
 }
 
 pub(crate) async fn scan_rows_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     request: &UntrackedScanRequest,
 ) -> Result<Vec<UntrackedRow>, LixError> {
     scan_rows_with_limit_and_order(executor, request, None, &["entity_id ASC", "file_id ASC"]).await
 }
 
 async fn scan_rows_with_limit_and_order(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     request: &UntrackedScanRequest,
     limit: Option<usize>,
     order_by: &[&str],
@@ -113,7 +113,7 @@ async fn scan_rows_with_limit_and_order(
         limit,
     })?;
 
-    let result = match executor.execute(&sql, &[]).await {
+    let result = match crate::live_state::store_sql::execute_query_with_executor(executor, &sql, &[]).await {
         Ok(result) => result,
         Err(error) if is_missing_relation_error(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),

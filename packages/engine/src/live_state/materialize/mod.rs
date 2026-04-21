@@ -21,64 +21,52 @@ pub use types::{
     VersionHeadDebugRow, VisibilityWinnerDebugRow,
 };
 
+use crate::live_state::store::{
+    LiveStateBackendRef, LiveStateExecutorRef, LiveStateTransactionRef,
+};
 use crate::plugin::FilesystemPluginMaterializer;
-use crate::{LixBackend, LixBackendTransaction, LixError};
+use crate::LixError;
 
-use super::LiveStateMode;
-
-pub async fn rebuild_plan(
-    backend: &dyn LixBackend,
+pub(crate) async fn rebuild_plan_with_backend(
+    backend: LiveStateBackendRef<'_>,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
     plan::live_state_rebuild_plan_internal(backend, req).await
 }
 
-pub(crate) async fn rebuild_plan_with_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+pub(crate) async fn rebuild_plan_with_executor(
+    executor: LiveStateExecutorRef<'_>,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
-    let mut executor = crate::backend::transaction_backend_view(transaction);
-    plan::live_state_rebuild_plan_with_executor(&mut executor, req).await
+    plan::live_state_rebuild_plan_with_executor(executor, req).await
 }
 
-pub async fn apply_rebuild_plan(
-    backend: &dyn LixBackend,
+pub(crate) async fn rebuild_plan_with_transaction(
+    transaction: LiveStateTransactionRef<'_>,
+    req: &LiveStateRebuildRequest,
+) -> Result<LiveStateRebuildPlan, LixError> {
+    let mut executor = crate::live_state::store_sql::executor_from_transaction(transaction);
+    rebuild_plan_with_executor(&mut executor, req).await
+}
+
+pub(crate) async fn apply_rebuild_plan_in_transaction(
+    transaction: LiveStateTransactionRef<'_>,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
-    apply::apply_live_state_rebuild_plan_internal(backend, plan).await
+    apply::apply_live_state_rebuild_plan_internal(transaction, plan).await
 }
 
 pub(crate) async fn apply_rebuild_scope_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     plan: &LiveStateRebuildPlan,
 ) -> Result<(usize, std::collections::BTreeSet<String>), LixError> {
     apply::apply_live_state_scope_in_transaction(transaction, plan).await
 }
 
-pub async fn rebuild(
-    backend: &dyn LixBackend,
-    req: &LiveStateRebuildRequest,
-) -> Result<LiveStateRebuildReport, LixError> {
-    let plan = rebuild_plan(backend, req).await?;
-    let apply = apply_rebuild_plan(backend, &plan).await?;
-    Ok(LiveStateRebuildReport { plan, apply })
-}
-
-pub(crate) async fn rebuild_projection(
-    backend: &dyn LixBackend,
+pub(crate) async fn rebuild_file_payloads_with_plugins(
+    backend: LiveStateBackendRef<'_>,
     plugin_materializer: &dyn FilesystemPluginMaterializer,
-    req: &LiveStateRebuildRequest,
-) -> Result<LiveStateRebuildReport, LixError> {
-    let plan = rebuild_plan(backend, req).await?;
-    let apply = apply_rebuild_plan(backend, &plan).await?;
-
-    if let Err(error) =
-        rebuild_files::rebuild_file_payloads_with_plugins(backend, plugin_materializer, &plan).await
-    {
-        let _ =
-            crate::live_state::mark_mode_with_backend(backend, LiveStateMode::NeedsRebuild).await;
-        return Err(error);
-    }
-
-    Ok(LiveStateRebuildReport { plan, apply })
+    plan: &LiveStateRebuildPlan,
+) -> Result<(), LixError> {
+    rebuild_files::rebuild_file_payloads_with_plugins(backend, plugin_materializer, plan).await
 }

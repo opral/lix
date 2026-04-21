@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use crate::backend::QueryExecutor;
+use crate::live_state::store::LiveStateExecutorRef;
 use crate::schema::{LixCommit, LixVersionDescriptor};
 
 use crate::live_state::ReplayCursor;
@@ -62,12 +62,12 @@ pub(crate) struct LoadedData {
 }
 
 pub(crate) async fn load_data_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
 ) -> Result<LoadedData, LixError> {
     let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
-    let result = executor.execute(sql, &[]).await?;
+    let result = crate::live_state::store_sql::execute_query_with_executor(executor, sql, &[]).await?;
 
     let mut changes = BTreeMap::new();
     let mut commits = BTreeMap::new();
@@ -155,7 +155,8 @@ pub(crate) async fn load_data_with_executor(
     let scope_sql =
         "SELECT id, change_id, version_id, visibility_kind, entity_id, schema_key, file_id, created_at, append_seq \
                      FROM lix_internal_untracked_change_visibility";
-    let scope_result = executor.execute(scope_sql, &[]).await?;
+    let scope_result =
+        crate::live_state::store_sql::execute_query_with_executor(executor, scope_sql, &[]).await?;
     let mut untracked_visibility_rows = Vec::new();
     for row in scope_result.rows {
         let _visibility_kind = text_required(&row, 3, "visibility_kind")?;

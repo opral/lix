@@ -7,7 +7,10 @@ use crate::canonical::{
     CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
     CanonicalVisibleStateRow,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, NullableKeyFilter, Value};
+use crate::live_state::store::{
+    LiveStateBackendRef, LiveStateExecutorRef, LiveStateTransactionRef,
+};
+use crate::{LixError, NullableKeyFilter, Value};
 
 use super::constraints::ScanConstraint;
 use super::schema_access::load_live_row_shape_with_backend;
@@ -124,8 +127,8 @@ pub fn decode_registered_schema_row(
     Ok(Some((key, schema)))
 }
 
-pub async fn scan_live_rows(
-    backend: &dyn LixBackend,
+pub(crate) async fn scan_live_rows(
+    backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
     match request.source {
@@ -135,8 +138,8 @@ pub async fn scan_live_rows(
     }
 }
 
-pub async fn load_exact_live_row(
-    backend: &dyn LixBackend,
+pub(crate) async fn load_exact_live_row(
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
     match request.source {
@@ -146,8 +149,8 @@ pub async fn load_exact_live_row(
     }
 }
 
-pub async fn write_live_rows(
-    transaction: &mut dyn LixBackendTransaction,
+pub(crate) async fn write_live_rows(
+    transaction: LiveStateTransactionRef<'_>,
     rows: &[LiveRow],
 ) -> Result<(), LixError> {
     let (tracked, untracked) = partition_live_rows_for_write(rows)?;
@@ -180,7 +183,7 @@ fn partition_live_rows_for_write(
 }
 
 async fn scan_tracked_rows(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
     let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
@@ -218,7 +221,7 @@ async fn scan_tracked_rows(
 }
 
 async fn scan_untracked_rows(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
     let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
@@ -241,7 +244,7 @@ async fn scan_untracked_rows(
 }
 
 async fn load_exact_tracked_row(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
     let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
@@ -284,7 +287,7 @@ async fn load_exact_tracked_row(
 }
 
 async fn load_exact_untracked_row(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
     let contract = load_live_row_shape_with_backend(backend, &request.schema_key).await?;
@@ -305,14 +308,14 @@ async fn load_exact_untracked_row(
 }
 
 async fn scan_effective_rows(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
     scan_effective_rows_with_options(backend, request, true, true).await
 }
 
 async fn scan_effective_rows_with_options(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
     include_global_overlay: bool,
     include_untracked_overlay: bool,
@@ -347,7 +350,7 @@ async fn scan_effective_rows_with_options(
 }
 
 async fn load_exact_effective_row(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
     let live_state_is_ready =
@@ -395,7 +398,7 @@ enum EffectiveLaneOutcome {
 }
 
 async fn load_exact_effective_row_with_canonical_fallback(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
     let lanes = effective_lanes(
@@ -429,7 +432,7 @@ async fn load_exact_effective_row_with_canonical_fallback(
 }
 
 async fn load_exact_untracked_row_for_lane(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
     lane: EffectiveLane,
 ) -> Result<EffectiveLaneOutcome, LixError> {
@@ -455,7 +458,7 @@ async fn load_exact_untracked_row_for_lane(
 }
 
 async fn load_exact_tracked_row_from_canonical_for_lane(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
     lane: EffectiveLane,
 ) -> Result<EffectiveLaneOutcome, LixError> {
@@ -502,7 +505,7 @@ async fn load_exact_tracked_row_from_canonical_for_lane(
 }
 
 async fn load_version_head_commit_id_from_live_row(
-    executor: &mut dyn crate::backend::QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
     let Some(row) = load_exact_untracked_row_with_executor(
@@ -547,7 +550,7 @@ fn canonical_visible_state_row_matches_query(
 }
 
 async fn canonical_effective_lane_outcome_from_visible_row(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     storage_version_id: String,
     lane: EffectiveLane,
     row: CanonicalVisibleStateRow,
@@ -629,7 +632,7 @@ fn lane_version_id(requested_version_id: &str, lane: EffectiveLane) -> String {
 }
 
 async fn scan_lane_rows(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
     lane: EffectiveLane,
 ) -> Result<Vec<LiveRow>, LixError> {
@@ -842,7 +845,6 @@ mod tests {
         load_exact_live_row, partition_live_rows_for_write, ExactLiveRowQuery, LiveRow,
         LiveRowSource,
     };
-    use crate::backend::TransactionBeginMode;
     use crate::live_state::LiveWriteOperation;
     use crate::live_state::ReplayCursor;
     use crate::live_state::{write_live_rows, LiveStateMode};
@@ -851,7 +853,7 @@ mod tests {
         init_test_backend_core, seed_canonical_change_row, seed_live_state_status_row,
         seed_local_version_head, CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::{CommittedVersionFrontier, LixBackend, NullableKeyFilter};
+    use crate::{CommittedVersionFrontier, NullableKeyFilter};
     use serde_json::Value as JsonValue;
 
     fn registered_schema_row(snapshot_content: Option<&str>) -> LiveRow {
@@ -1054,7 +1056,7 @@ mod tests {
         .expect("canonical commit should seed");
 
         let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("write transaction should open");
         write_live_rows(

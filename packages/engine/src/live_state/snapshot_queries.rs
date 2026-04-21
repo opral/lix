@@ -6,7 +6,8 @@ use serde_json::Value as JsonValue;
 use crate::live_state::{
     LiveFilter, LiveFilterField, LiveFilterOp, LiveSnapshotRow, LiveSnapshotStorage,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::live_state::store::LiveStateBackendRef;
+use crate::{LixError, Value};
 
 use super::schema_access::LiveRowShape;
 use super::visible_rows::{scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane};
@@ -111,7 +112,7 @@ impl LiveRowShapeContract for LiveRowShapeAdapter {
 }
 
 pub(crate) async fn load_live_read_shape_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<LiveRowShapeAdapter, LixError> {
     schema_access::load_live_row_shape_with_backend(backend, schema_key)
@@ -120,7 +121,7 @@ pub(crate) async fn load_live_read_shape_with_backend(
 }
 
 pub(crate) async fn load_live_read_shape_for_table_name(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     table_name: &str,
 ) -> Result<Option<LiveRowShapeAdapter>, LixError> {
     schema_access::load_live_row_shape_for_table_name(backend, table_name)
@@ -129,7 +130,7 @@ pub(crate) async fn load_live_read_shape_for_table_name(
 }
 
 pub(crate) async fn normalize_live_snapshot_values_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
     snapshot_content: Option<&str>,
 ) -> Result<BTreeMap<String, Value>, LixError> {
@@ -139,7 +140,7 @@ pub(crate) async fn normalize_live_snapshot_values_with_backend(
 }
 
 pub(crate) async fn load_live_snapshot_rows_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     storage: LiveSnapshotStorage,
     schema_key: &str,
     version_id: &str,
@@ -207,34 +208,4 @@ fn snapshot_row_from_live_row(
         source_change_id: row.change_id().map(str::to_string),
         snapshot: row.snapshot_json(&shape.contract)?,
     })
-}
-
-#[async_trait(?Send)]
-impl LiveStateQueryBackend for dyn LixBackend + '_ {
-    async fn load_live_read_shape_for_table_name(
-        &self,
-        table_name: &str,
-    ) -> Result<Option<Box<dyn LiveRowShapeContract>>, LixError> {
-        load_live_read_shape_for_table_name(self, table_name)
-            .await
-            .map(|shape| shape.map(|shape| Box::new(shape) as Box<dyn LiveRowShapeContract>))
-    }
-
-    async fn load_live_snapshot_rows(
-        &self,
-        storage: LiveSnapshotStorage,
-        schema_key: &str,
-        version_id: &str,
-        filters: &[LiveFilter],
-    ) -> Result<Vec<LiveSnapshotRow>, LixError> {
-        load_live_snapshot_rows_with_backend(self, storage, schema_key, version_id, filters).await
-    }
-
-    async fn normalize_live_snapshot_values(
-        &self,
-        schema_key: &str,
-        snapshot_content: Option<&str>,
-    ) -> Result<BTreeMap<String, Value>, LixError> {
-        normalize_live_snapshot_values_with_backend(self, schema_key, snapshot_content).await
-    }
 }

@@ -4,6 +4,8 @@ mod gc;
 mod init;
 mod read;
 pub(crate) mod schema;
+pub(crate) mod store;
+pub(crate) mod store_sql;
 mod write;
 
 use crate::transaction::WriteBatch;

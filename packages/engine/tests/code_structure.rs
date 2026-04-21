@@ -128,6 +128,24 @@ struct ImportPathViolation {
     imported_path: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawSqlExecutionViolation {
+    file: String,
+    pattern: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RawBackendTypeViolation {
+    file: String,
+    type_name: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct TransactionLifecycleViolation {
+    file: String,
+    pattern: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UseToken {
     DblColon,
@@ -1757,6 +1775,71 @@ fn render_grouped_import_path_violations(violations: &[ImportPathViolation]) -> 
     rendered
 }
 
+fn render_grouped_raw_sql_execution_violations(violations: &[RawSqlExecutionViolation]) -> String {
+    let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for violation in violations {
+        grouped
+            .entry(violation.file.as_str())
+            .or_default()
+            .push(violation.pattern);
+    }
+
+    let mut rendered = String::new();
+    for (file, patterns) in grouped {
+        let _ = writeln!(&mut rendered, "{file}:");
+        for pattern in patterns {
+            let _ = writeln!(&mut rendered, "  - {pattern}");
+        }
+    }
+
+    rendered
+}
+
+fn render_grouped_raw_backend_type_violations(violations: &[RawBackendTypeViolation]) -> String {
+    let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for violation in violations {
+        grouped
+            .entry(violation.file.as_str())
+            .or_default()
+            .push(violation.type_name);
+    }
+
+    let mut rendered = String::new();
+    for (file, type_names) in grouped {
+        let _ = writeln!(&mut rendered, "{file}:");
+        for type_name in type_names {
+            let _ = writeln!(&mut rendered, "  - {type_name}");
+        }
+    }
+
+    rendered
+}
+
+fn render_grouped_transaction_lifecycle_violations(
+    violations: &[TransactionLifecycleViolation],
+) -> String {
+    let mut grouped: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+
+    for violation in violations {
+        grouped
+            .entry(violation.file.as_str())
+            .or_default()
+            .push(violation.pattern);
+    }
+
+    let mut rendered = String::new();
+    for (file, patterns) in grouped {
+        let _ = writeln!(&mut rendered, "{file}:");
+        for pattern in patterns {
+            let _ = writeln!(&mut rendered, "  - {pattern}");
+        }
+    }
+
+    rendered
+}
+
 fn top_level_module_set() -> HashSet<String> {
     let lib_source = fs::read_to_string(lib_path()).expect("src/lib.rs should be readable");
     parse_top_level_modules(&lib_source).into_iter().collect()
@@ -1890,6 +1973,189 @@ fn current_services_sibling_dependency_violations() -> Vec<ImportPathViolation> 
     violations.into_iter().collect()
 }
 
+fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
+    let in_scope_owner_root = relative_path.starts_with("live_state/")
+        || relative_path.starts_with("canonical/")
+        || relative_path.starts_with("binary_cas/")
+        || relative_path.starts_with("session/version_ops/");
+    let is_allowed_adapter_surface =
+        relative_path.ends_with("/store.rs") || relative_path.ends_with("/store_sql.rs");
+
+    in_scope_owner_root && !is_allowed_adapter_surface
+}
+
+fn current_engine_owned_persistence_raw_sql_execution_violations() -> Vec<RawSqlExecutionViolation>
+{
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !is_engine_owned_persistence_path(&relative_path) {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for pattern in [".execute(", ".execute_batch("] {
+            if masked_source.contains(pattern) {
+                violations.insert(RawSqlExecutionViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn contains_identifier(source: &str, identifier: &str) -> bool {
+    let bytes = source.as_bytes();
+    let needle = identifier.as_bytes();
+    let mut index = 0usize;
+
+    while index + needle.len() <= bytes.len() {
+        if &bytes[index..index + needle.len()] != needle {
+            index += 1;
+            continue;
+        }
+
+        let boundary_before = index == 0 || !is_ident_continue(bytes[index - 1]);
+        let boundary_after =
+            index + needle.len() == bytes.len() || !is_ident_continue(bytes[index + needle.len()]);
+        if boundary_before && boundary_after {
+            return true;
+        }
+
+        index += 1;
+    }
+
+    false
+}
+
+fn current_engine_owned_persistence_raw_backend_type_violations() -> Vec<RawBackendTypeViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !is_engine_owned_persistence_path(&relative_path) {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for type_name in ["LixBackend", "LixBackendTransaction"] {
+            if contains_identifier(&masked_source, type_name) {
+                violations.insert(RawBackendTypeViolation {
+                    file: relative_path.clone(),
+                    type_name,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn is_owner_persistence_root_path(relative_path: &str) -> bool {
+    relative_path.starts_with("live_state/")
+        || relative_path.starts_with("canonical/")
+        || relative_path.starts_with("binary_cas/")
+}
+
+fn is_owner_sql_adapter_path(relative_path: &str) -> bool {
+    relative_path.ends_with("/store_sql.rs")
+}
+
+fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !is_owner_persistence_root_path(&relative_path)
+            || is_owner_sql_adapter_path(&relative_path)
+        {
+            continue;
+        }
+
+        let current_module_path = module_path_for_file(&relative_path);
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path.first().is_none_or(|root| root != "backend") {
+                continue;
+            }
+
+            violations.insert(ImportPathViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_store_sql_import_boundary_violations() -> Vec<ImportPathViolation> {
+    let module_set = top_level_module_set();
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        let current_module_path = module_path_for_file(&relative_path);
+        let current_root = current_module_path.first().map(String::as_str);
+
+        for imported_path in
+            collect_module_paths_from_source(&source, &current_module_path, &module_set)
+        {
+            if imported_path
+                .get(1)
+                .is_none_or(|segment| segment != "store_sql")
+            {
+                continue;
+            }
+
+            let owner_root = imported_path.first().map(String::as_str);
+            if current_root == owner_root {
+                continue;
+            }
+
+            violations.insert(ImportPathViolation {
+                importer_file: relative_path.clone(),
+                imported_path: imported_path.join("::"),
+            });
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_owner_persistence_transaction_lifecycle_violations(
+) -> Vec<TransactionLifecycleViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !is_owner_persistence_root_path(&relative_path)
+            || is_owner_sql_adapter_path(&relative_path)
+        {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for pattern in [
+            ".begin_transaction(",
+            ".begin_savepoint(",
+            "begin_write_transaction(",
+            ".commit().await",
+            ".rollback().await",
+        ] {
+            if masked_source.contains(pattern) {
+                violations.insert(TransactionLifecycleViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
 #[test]
 fn sealed_owner_violations_are_empty() {
     let violations = current_sealed_owner_violations();
@@ -1984,5 +2250,72 @@ fn services_direct_children_do_not_import_sibling_services() {
         violations.is_empty(),
         "direct child `services/*` modules must not import sibling service namespaces.\n\nCurrent violations:\n{}",
         render_grouped_import_path_violations(&violations),
+    );
+}
+
+// Engine-owned persistence modules should execute through owner-local adapters
+// rather than calling raw backend SQL directly.
+#[test]
+fn engine_owned_persistence_modules_do_not_execute_raw_sql_directly() {
+    let violations = current_engine_owned_persistence_raw_sql_execution_violations();
+
+    assert!(
+        violations.is_empty(),
+        "engine-owned persistence modules must not execute raw SQL directly outside owner-local adapter files.\n\nCurrent violations:\n{}",
+        render_grouped_raw_sql_execution_violations(&violations),
+    );
+}
+
+// Engine-owned persistence modules should depend on owner-local store
+// interfaces rather than raw backend handle types.
+#[test]
+fn engine_owned_persistence_modules_do_not_import_raw_backend_types() {
+    let violations = current_engine_owned_persistence_raw_backend_type_violations();
+
+    assert!(
+        violations.is_empty(),
+        "engine-owned persistence modules must not depend on raw backend types outside owner-local adapter files.\n\nCurrent violations:\n{}",
+        render_grouped_raw_backend_type_violations(&violations),
+    );
+}
+
+// Owner persistence code should speak in owner-local store terms, not import
+// lower `backend/*` helpers directly outside SQL adapter files.
+#[test]
+fn owner_persistence_modules_do_not_depend_on_backend_root_outside_sql_adapters() {
+    let violations = current_owner_persistence_backend_root_dependency_violations();
+
+    assert!(
+        violations.is_empty(),
+        "owner persistence modules must not depend on `backend/*` outside owner-local SQL adapter files.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
+    );
+}
+
+// SQL-backed store adapters are owner internals. Other roots may import the
+// owner-facing store interfaces, but not the `store_sql` implementations.
+#[test]
+fn store_sql_modules_are_not_imported_outside_their_owning_root() {
+    let violations = current_store_sql_import_boundary_violations();
+
+    assert!(
+        violations.is_empty(),
+        "`store_sql` modules must not be imported outside their owning root.\n\nCurrent violations:\n{}",
+        render_grouped_import_path_violations(&violations),
+    );
+}
+
+// Owner persistence modules may perform work inside a caller-owned transaction,
+// but must not decide when transactions begin or end. Transaction lifecycle
+// policy belongs to session/runtime, while owner-local SQL adapters may still
+// contain low-level backend transaction calls during the MVP.
+#[test]
+fn owner_persistence_modules_do_not_own_transaction_lifecycle() {
+    let violations = current_owner_persistence_transaction_lifecycle_violations();
+
+    assert!(
+        violations.is_empty(),
+        "owner persistence modules must not begin, commit, or roll back transactions outside owner-local SQL adapter files.\n\nCurrent violations:\n{}",
+        render_grouped_transaction_lifecycle_violations(&violations),
     );
 }

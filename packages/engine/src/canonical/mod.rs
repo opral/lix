@@ -53,6 +53,8 @@ mod journal;
 pub(crate) mod json;
 mod read;
 mod receipt;
+pub(crate) mod store;
+pub(crate) mod store_sql;
 
 pub(crate) use change_commit_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 pub use json::CanonicalJson;

@@ -1,4 +1,5 @@
-use crate::{LixBackend, LixError, SqlDialect, Value};
+use crate::live_state::store::LiveStateBackendRef;
+use crate::{LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,7 +77,7 @@ impl LiveRowShape {
 }
 
 pub(crate) async fn load_live_row_shape_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<LiveRowShape, LixError> {
     super::storage::load_live_row_access_with_backend(backend, schema_key)
@@ -85,7 +86,7 @@ pub(crate) async fn load_live_row_shape_with_backend(
 }
 
 pub(crate) async fn load_live_row_shape_for_table_name(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     table_name: &str,
 ) -> Result<Option<LiveRowShape>, LixError> {
     super::storage::load_live_row_access_for_table_name(backend, table_name)
@@ -106,34 +107,34 @@ pub(crate) fn live_row_shape_from_layout(layout: super::storage::LiveTableLayout
 }
 
 pub(crate) async fn live_storage_relation_exists_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<bool, LixError> {
     let relation_name = tracked_relation_name(schema_key);
     match backend.dialect() {
         SqlDialect::Sqlite => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(relation_name)],
-                )
-                .await?;
+            let result = crate::live_state::store_sql::execute_query_with_backend(
+                backend,
+                "SELECT 1 \
+                 FROM sqlite_master \
+                 WHERE name = $1 \
+                   AND type IN ('table', 'view') \
+                 LIMIT 1",
+                &[Value::Text(relation_name)],
+            )
+            .await?;
             Ok(!result.rows.is_empty())
         }
         SqlDialect::Postgres => {
-            let result = backend
-                .execute(
-                    "SELECT 1 \
-                     FROM information_schema.tables \
-                     WHERE table_name = $1 \
-                     LIMIT 1",
-                    &[Value::Text(relation_name)],
-                )
-                .await?;
+            let result = crate::live_state::store_sql::execute_query_with_backend(
+                backend,
+                "SELECT 1 \
+                 FROM information_schema.tables \
+                 WHERE table_name = $1 \
+                 LIMIT 1",
+                &[Value::Text(relation_name)],
+            )
+            .await?;
             Ok(!result.rows.is_empty())
         }
     }
