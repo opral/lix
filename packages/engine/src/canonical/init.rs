@@ -1,6 +1,10 @@
-use crate::backend::{add_column_if_missing, execute_ddl_batch};
 use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
-use crate::{LixBackend, LixError, SqlDialect};
+use crate::canonical::store::CanonicalBackendRef;
+use crate::canonical::store_sql::{
+    add_column_if_missing_with_backend, execute_ddl_batch_with_backend,
+    execute_query_with_backend,
+};
+use crate::{LixError, SqlDialect};
 
 const CANONICAL_INDEX_STATEMENTS: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_lix_internal_untracked_change_visibility_change_id \
@@ -23,15 +27,15 @@ const CANONICAL_INDEX_STATEMENTS: &[&str] = &[
      ON lix_internal_entity_state_timeline_breakpoint (root_commit_id, storage_scope_key, plugin_key, schema_key, entity_id, from_depth)",
 ];
 
-pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
+pub(crate) async fn init_storage(backend: CanonicalBackendRef<'_>) -> Result<(), LixError> {
     let create_table_statements = canonical_create_table_statements(backend.dialect());
     let create_table_statement_refs = create_table_statements
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    execute_ddl_batch(backend, "canonical.tables", &create_table_statement_refs).await?;
+    execute_ddl_batch_with_backend(backend, "canonical.tables", &create_table_statement_refs).await?;
     ensure_breakpoint_storage_scope_keys(backend).await?;
-    execute_ddl_batch(backend, "canonical.indexes", CANONICAL_INDEX_STATEMENTS).await
+    execute_ddl_batch_with_backend(backend, "canonical.indexes", CANONICAL_INDEX_STATEMENTS).await
 }
 
 fn canonical_create_table_statements(dialect: SqlDialect) -> Vec<String> {
@@ -143,8 +147,8 @@ END"#
     statements
 }
 
-async fn ensure_breakpoint_storage_scope_keys(backend: &dyn LixBackend) -> Result<(), LixError> {
-    add_column_if_missing(
+async fn ensure_breakpoint_storage_scope_keys(backend: CanonicalBackendRef<'_>) -> Result<(), LixError> {
+    add_column_if_missing_with_backend(
         backend,
         "lix_internal_entity_state_timeline_breakpoint",
         STORAGE_SCOPE_KEY_COLUMN,
@@ -154,19 +158,19 @@ async fn ensure_breakpoint_storage_scope_keys(backend: &dyn LixBackend) -> Resul
         ),
     )
     .await?;
-    backend
-        .execute(
-            &format!(
-                "UPDATE lix_internal_entity_state_timeline_breakpoint \
-                 SET {storage_scope_key} = CASE \
-                   WHEN file_id IS NULL THEN '{engine_scope}' \
-                   ELSE 'file:' || file_id \
-                 END",
-                storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
-                engine_scope = storage_scope_key_for_file_id(None),
-            ),
-            &[],
-        )
-        .await?;
+    execute_query_with_backend(
+        backend,
+        &format!(
+            "UPDATE lix_internal_entity_state_timeline_breakpoint \
+             SET {storage_scope_key} = CASE \
+               WHEN file_id IS NULL THEN '{engine_scope}' \
+               ELSE 'file:' || file_id \
+             END",
+            storage_scope_key = STORAGE_SCOPE_KEY_COLUMN,
+            engine_scope = storage_scope_key_for_file_id(None),
+        ),
+        &[],
+    )
+    .await?;
     Ok(())
 }

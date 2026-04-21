@@ -522,7 +522,7 @@ impl Lix {
             }
         };
 
-        if let Err(error) = crate::live_state::materialize::rebuild_file_payloads_with_plugins(
+        if let Err(error) = crate::live_state::rebuild_file_payloads_with_plugins(
             self.engine.backend().as_ref(),
             self.engine.as_ref(),
             &report.plan,
