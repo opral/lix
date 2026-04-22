@@ -1,7 +1,8 @@
 //! Pending-overlay public-read adapters.
 //!
-//! `transaction/*` owns overlay-visible public-read semantics, including the
-//! registry rebuild path that must reflect pending registered-schema rows.
+//! `execution/*` owns public-read execution semantics, including the overlay
+//! view that merges committed live-state rows with pending transaction-local
+//! visibility.
 
 use std::collections::BTreeMap;
 
@@ -20,7 +21,6 @@ use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 use serde_json::Value as JsonValue;
 
-const REGISTERED_SCHEMA_BOOTSTRAP_TABLE: &str = "lix_internal_registered_schema_bootstrap";
 const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 
 struct PendingOverlayReadModel<'a> {
@@ -90,31 +90,8 @@ impl<'a> PendingOverlayReadModel<'a> {
     }
 
     async fn visible_registered_schema_rows(&self) -> Result<BTreeMap<String, String>, LixError> {
-        let sql = format!(
-            "SELECT snapshot_content FROM {table} \
-             WHERE version_id = '{global_version}' \
-               AND is_tombstone = 0 \
-               AND snapshot_content IS NOT NULL",
-            table = REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-            global_version = GLOBAL_VERSION_ID,
-        );
-        let result = self.base.execute(&sql, &[]).await?;
-        let mut rows = BTreeMap::new();
-        for row in result.rows {
-            let Some(Value::Text(snapshot_content)) = row.first() else {
-                continue;
-            };
-            let snapshot: JsonValue =
-                serde_json::from_str(snapshot_content).map_err(|error| LixError {
-                    code: "LIX_ERROR_UNKNOWN".to_string(),
-                    description: format!(
-                        "registered schema snapshot_content invalid JSON: {error}"
-                    ),
-                    hint: None,
-                })?;
-            let (key, _) = crate::schema::schema_from_registered_snapshot(&snapshot)?;
-            rows.insert(key.entity_id(), snapshot_content.clone());
-        }
+        let mut rows =
+            crate::live_state::load_visible_registered_schema_snapshot_contents(self.base).await?;
 
         if let Some(pending_overlay) = self.pending_overlay {
             for (entity_id, snapshot_content) in pending_overlay.visible_registered_schema_entries()

@@ -2,8 +2,7 @@ use super::layout::{
     builtin_live_table_layout, live_table_layout_from_schema, merge_live_table_layouts,
     LiveTableLayout,
 };
-use crate::live_state::schema_access::{snapshot_select_expr_for_schema, tracked_relation_name};
-use crate::live_state::store::{LiveStateBackendRef, LiveStateTransactionRef};
+use crate::live_state::store::LiveStateBackendRef;
 use crate::schema::schema_from_registered_snapshot;
 use crate::{LixError, Value};
 use async_trait::async_trait;
@@ -25,14 +24,6 @@ pub(crate) async fn load_live_table_layout_with_backend(
     }
 }
 
-pub(crate) async fn load_live_table_layout_in_transaction(
-    transaction: LiveStateTransactionRef<'_>,
-    schema_key: &str,
-) -> Result<LiveTableLayout, LixError> {
-    let mut provider = TransactionSchemaLayoutProvider { transaction };
-    load_live_table_layout_with_provider(&mut provider, schema_key).await
-}
-
 #[async_trait(?Send)]
 trait RegisteredSchemaLayoutProvider {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError>;
@@ -45,39 +36,10 @@ struct BackendSchemaLayoutProvider<'a> {
 #[async_trait(?Send)]
 impl RegisteredSchemaLayoutProvider for BackendSchemaLayoutProvider<'_> {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
-        let result = crate::live_state::store_sql::execute_query_with_backend(
-            self.backend,
-            REGISTERED_SCHEMA_LAYOUT_SQL,
-            &[],
-        )
-        .await?;
-        Ok(result.rows.into_iter().collect())
+        crate::live_state::storage::load_registered_schema_layout_rows_with_backend(self.backend)
+            .await
     }
 }
-
-struct TransactionSchemaLayoutProvider<'a> {
-    transaction: LiveStateTransactionRef<'a>,
-}
-
-#[async_trait(?Send)]
-impl RegisteredSchemaLayoutProvider for TransactionSchemaLayoutProvider<'_> {
-    async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
-        let result = crate::live_state::store_sql::execute_query_with_transaction(
-            self.transaction,
-            REGISTERED_SCHEMA_LAYOUT_SQL,
-            &[],
-        )
-        .await?;
-        Ok(result.rows.into_iter().collect())
-    }
-}
-
-const REGISTERED_SCHEMA_LAYOUT_SQL: &str = "SELECT snapshot_content \
-     FROM lix_internal_registered_schema_bootstrap \
-     WHERE schema_key = 'lix_registered_schema' \
-       AND version_id = 'global' \
-       AND is_tombstone = 0 \
-       AND snapshot_content IS NOT NULL";
 
 async fn load_live_table_layout_with_provider(
     provider: &mut dyn RegisteredSchemaLayoutProvider,
@@ -94,25 +56,10 @@ async fn load_live_table_layout_from_registered_schema_live_table(
     backend: LiveStateBackendRef<'_>,
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
-    let registered_schema_table = tracked_relation_name("lix_registered_schema");
-    let snapshot_expr = snapshot_select_expr_for_schema(
-        "lix_registered_schema",
-        None,
-        backend.dialect(),
-        Some("m"),
-    )?;
-    let sql = format!(
-        "SELECT {snapshot_expr} AS snapshot_content \
-         FROM {registered_schema_table} m \
-         WHERE m.schema_key = 'lix_registered_schema' \
-           AND m.version_id = 'global' \
-           AND m.is_tombstone = 0",
-        snapshot_expr = snapshot_expr,
-        registered_schema_table = registered_schema_table,
-    );
-    let result =
-        crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
-    compile_registered_live_layout(schema_key, result.rows)
+    compile_registered_live_layout(
+        schema_key,
+        crate::live_state::storage::load_registered_schema_live_table_layout_rows(backend).await?,
+    )
 }
 
 pub(crate) fn compile_registered_live_layout(

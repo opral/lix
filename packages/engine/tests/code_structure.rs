@@ -56,20 +56,13 @@ const FORBIDDEN_DEPENDENCY_RULES: &[ForbiddenDependencyRule] = &[
     },
     ForbiddenDependencyRule {
         from_scope: "sql",
-        reason: "sql is the compiler and should not depend on execution, workflow, or session/services owners directly; backend-owned raw prepared SQL runtime DTOs are allowed as a lower execution seam",
+        reason: "sql is the compiler and should stay in the public SQL lane; it must not depend on execution, workflow, or higher orchestration roots directly",
         forbidden_scopes: &["execution", "services", "session"],
     },
     ForbiddenDependencyRule {
         from_scope: "execution",
-        reason: "execution is a runner leaf; it may consume sql-owned prepared artifacts but must not depend on higher orchestration owners or transaction internals directly",
-        forbidden_scopes: &[
-            "canonical",
-            "api",
-            "init",
-            "services",
-            "session",
-            "transaction",
-        ],
+        reason: "execution is the public SQL runner leaf; it may consume sql-owned prepared artifacts but must not depend on higher orchestration owners or transaction internals",
+        forbidden_scopes: &["canonical", "api", "init", "services", "session", "transaction"],
     },
     ForbiddenDependencyRule {
         from_scope: "session",
@@ -1978,8 +1971,9 @@ fn is_engine_owned_persistence_path(relative_path: &str) -> bool {
         || relative_path.starts_with("canonical/")
         || relative_path.starts_with("binary_cas/")
         || relative_path.starts_with("session/version_ops/");
-    let is_allowed_adapter_surface =
-        relative_path.ends_with("/store.rs") || relative_path.ends_with("/store_sql.rs");
+    let is_allowed_adapter_surface = relative_path.ends_with("/store.rs")
+        || relative_path.ends_with("/store_sql.rs")
+        || relative_path.ends_with("/storage.rs");
 
     in_scope_owner_root && !is_allowed_adapter_surface
 }
@@ -2060,7 +2054,7 @@ fn is_owner_persistence_root_path(relative_path: &str) -> bool {
 }
 
 fn is_owner_sql_adapter_path(relative_path: &str) -> bool {
-    relative_path.ends_with("/store_sql.rs")
+    relative_path.ends_with("/store_sql.rs") || relative_path.ends_with("/storage.rs")
 }
 
 fn current_owner_persistence_backend_root_dependency_violations() -> Vec<ImportPathViolation> {
@@ -2154,6 +2148,133 @@ fn current_owner_persistence_transaction_lifecycle_violations() -> Vec<Transacti
     }
 
     violations.into_iter().collect()
+}
+
+fn is_owner_local_storage_path(relative_path: &str) -> bool {
+    relative_path.ends_with("/storage.rs")
+}
+
+fn is_allowed_raw_execute_boundary_path(relative_path: &str) -> bool {
+    is_owner_local_storage_path(relative_path)
+        || relative_path.starts_with("sql/")
+        || relative_path.starts_with("execution/")
+        || relative_path.starts_with("backend/")
+        || relative_path == "transaction/backend.rs"
+        || relative_path == "transaction/buffered_write_transaction.rs"
+        || relative_path == "transaction/live_state_write_transaction.rs"
+}
+
+fn current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations(
+) -> Vec<RawSqlExecutionViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if is_allowed_raw_execute_boundary_path(&relative_path) {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for pattern in [
+            "backend.execute(",
+            "transaction.execute(",
+            "executor.execute(",
+            "self.base.execute(",
+            "self.backend.execute(",
+            "self.backend_transaction.execute(",
+            ".execute_batch(",
+        ] {
+            if masked_source.contains(pattern) {
+                violations.insert(RawSqlExecutionViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn is_orchestration_runtime_path(relative_path: &str) -> bool {
+    relative_path.starts_with("api/")
+        || relative_path.starts_with("init/")
+        || relative_path.starts_with("session/")
+        || relative_path.starts_with("transaction/")
+}
+
+fn current_scattered_internal_metadata_crud_outside_owner_storage_violations(
+) -> Vec<RawSqlExecutionViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !is_orchestration_runtime_path(&relative_path)
+            || is_owner_local_storage_path(&relative_path)
+        {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for pattern in [
+            "SELECT value FROM lix_internal_workspace_metadata",
+            "INSERT INTO lix_internal_workspace_metadata",
+            "CREATE TABLE lix_internal_workspace_metadata",
+            "FROM lix_internal_commit_idempotency",
+            "INSERT INTO lix_internal_commit_idempotency",
+            "CREATE TABLE IF NOT EXISTS lix_internal_commit_idempotency",
+            "FROM lix_internal_undo_redo_operation",
+            "INSERT INTO lix_internal_undo_redo_operation",
+            "CREATE TABLE IF NOT EXISTS lix_internal_undo_redo_operation",
+        ] {
+            if masked_source.contains(pattern) {
+                violations.insert(RawSqlExecutionViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_owner_storage_public_sql_shaped_api_violations() -> Vec<RawSqlExecutionViolation> {
+    let mut violations = BTreeSet::new();
+
+    for (relative_path, source) in production_source_files() {
+        if !is_owner_local_storage_path(&relative_path) {
+            continue;
+        }
+
+        let masked_source = mask_rust_source(&source);
+        for pattern in [
+            "pub(crate) async fn execute_query_with_",
+            "pub(crate) async fn execute_batch_with_",
+            "pub(crate) async fn execute_ddl_batch_with_",
+            "pub(crate) async fn add_column_if_missing_with_",
+            "pub(crate) async fn begin_write_transaction",
+            "pub(crate) fn executor_from_transaction",
+        ] {
+            if masked_source.contains(pattern) {
+                violations.insert(RawSqlExecutionViolation {
+                    file: relative_path.clone(),
+                    pattern,
+                });
+            }
+        }
+    }
+
+    violations.into_iter().collect()
+}
+
+fn current_shared_persistence_root_files() -> Vec<String> {
+    production_source_files()
+        .into_iter()
+        .filter_map(|(relative_path, _)| {
+            relative_path
+                .starts_with("persistence/")
+                .then_some(relative_path)
+        })
+        .collect()
 }
 
 #[test]
@@ -2317,5 +2438,53 @@ fn owner_persistence_modules_do_not_own_transaction_lifecycle() {
         violations.is_empty(),
         "owner persistence modules must not begin, commit, or roll back transactions outside owner-local SQL adapter files.\n\nCurrent violations:\n{}",
         render_grouped_transaction_lifecycle_violations(&violations),
+    );
+}
+
+#[test]
+fn raw_backend_execute_is_only_used_in_owner_storage_or_public_sql_layers() {
+    let violations = current_raw_execute_outside_owner_storage_or_public_sql_boundary_violations();
+
+    assert!(
+        violations.is_empty(),
+        "raw backend / transaction SQL execution may only appear in owner-local `storage.rs`, `sql/*`, `execution/*`, or backend glue.\n\nCurrent violations:\n{}",
+        render_grouped_raw_sql_execution_violations(&violations),
+    );
+}
+
+#[test]
+fn internal_metadata_crud_is_centralized_in_owner_storage() {
+    let violations = current_scattered_internal_metadata_crud_outside_owner_storage_violations();
+
+    assert!(
+        violations.is_empty(),
+        "internal metadata CRUD for workspace selectors, commit idempotency, and undo/redo log should live in owner-local `storage.rs` seams, not scattered through `api/*`, `init/*`, `session/*`, or `transaction/*`.\n\nCurrent violations:\n{}",
+        render_grouped_raw_sql_execution_violations(&violations),
+    );
+}
+
+#[test]
+fn owner_storage_modules_do_not_expose_public_sql_shaped_helpers() {
+    let violations = current_owner_storage_public_sql_shaped_api_violations();
+
+    assert!(
+        violations.is_empty(),
+        "owner-local `storage.rs` seams should expose operation-shaped APIs rather than public SQL-shaped helpers.\n\nCurrent violations:\n{}",
+        render_grouped_raw_sql_execution_violations(&violations),
+    );
+}
+
+#[test]
+fn shared_persistence_root_is_empty_or_absent() {
+    let remaining_files = current_shared_persistence_root_files();
+
+    assert!(
+        remaining_files.is_empty(),
+        "the shared `persistence/*` root is transitional and should become empty or disappear as owner-local `storage.rs` seams take over.\n\nCurrent files:\n{}",
+        remaining_files
+            .into_iter()
+            .map(|file| format!("- {file}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
     );
 }

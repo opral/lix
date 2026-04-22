@@ -9,13 +9,13 @@
 
 use std::collections::BTreeSet;
 
-use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
+use crate::canonical::storage::{
+    load_best_checkpoint_commit_id, load_checkpoint_labeled_entity_ids,
+};
 use crate::canonical::store::CanonicalExecutorRef;
-use crate::canonical::store_sql::execute_query_with_executor;
-use crate::common::escape_sql_string;
 use crate::common::is_missing_relation_error;
-use crate::{LixError, Value};
+use crate::LixError;
 
 use super::checkpoint_commit_label_entity_id;
 
@@ -72,33 +72,11 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
         return Ok(None);
     }
 
-    let label_entity_ids = commit_ids
-        .iter()
-        .map(|commit_id| checkpoint_commit_label_entity_id(commit_id))
-        .collect::<Vec<_>>();
-    let label_in_list = label_entity_ids
-        .iter()
-        .map(|entity_id| format!("'{}'", escape_sql_string(entity_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let label_sql = format!(
-        "SELECT entity_id \
-         FROM lix_internal_change \
-         WHERE entity_id IN ({label_in_list}) \
-           AND schema_key = 'lix_entity_label' \
-           AND file_id IS NULL \
-           AND plugin_key IS NULL"
-    );
-    let label_result = match execute_query_with_executor(executor, &label_sql, &[]).await {
+    let labeled_entity_ids = match load_checkpoint_labeled_entity_ids(executor, commit_ids).await {
         Ok(result) => result,
         Err(err) if is_missing_relation_error(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let labeled_entity_ids = label_result
-        .rows
-        .iter()
-        .map(|row| text_value(row.first(), "lix_internal_change.entity_id"))
-        .collect::<Result<BTreeSet<_>, _>>()?;
     let labeled_commit_ids = commit_ids
         .iter()
         .filter(|commit_id| {
@@ -110,53 +88,14 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
         return Ok(None);
     }
 
-    let commit_in_list = labeled_commit_ids
-        .iter()
-        .map(|commit_id| format!("'{}'", escape_sql_string(commit_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let order_sql = format!(
-        "SELECT commit_id \
-         FROM {COMMIT_GRAPH_NODE_TABLE} \
-         WHERE commit_id IN ({commit_in_list}) \
-         ORDER BY generation DESC, commit_id DESC \
-         LIMIT 1"
-    );
-    let rows = execute_query_with_executor(executor, &order_sql, &[]).await?;
-    let Some(first) = rows.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(text_value(
-        first.first(),
-        "lix_internal_commit_graph_node.commit_id",
-    )?))
-}
-
-fn text_value(value: Option<&Value>, label: &str) -> Result<String, LixError> {
-    match value {
-        Some(Value::Text(text)) if !text.is_empty() => Ok(text.clone()),
-        Some(Value::Text(_)) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("{label} must not be empty"),
-            hint: None,
-        }),
-        Some(Value::Integer(number)) => Ok(number.to_string()),
-        Some(other) => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("{label} must be text-like, got {other:?}"),
-            hint: None,
-        }),
-        None => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!("missing {label}"),
-            hint: None,
-        }),
-    }
+    load_best_checkpoint_commit_id(executor, &labeled_commit_ids).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::COMMIT_GRAPH_NODE_TABLE;
+    use crate::Value;
     use crate::{QueryResult, SqlDialect};
     use async_trait::async_trait;
     use std::collections::BTreeMap;

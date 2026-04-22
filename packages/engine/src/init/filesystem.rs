@@ -1,8 +1,6 @@
-use crate::live_state::tracked_relation_name;
 use crate::LixError;
-use crate::Value;
 
-use super::seed::{system_directory_name, text_value, InitExecutor};
+use super::seed::{system_directory_name, InitExecutor};
 
 pub(crate) async fn seed_bootstrap(executor: &mut InitExecutor<'_, '_>) -> Result<(), LixError> {
     executor.seed_global_system_directories().await
@@ -77,54 +75,11 @@ impl<'engine, 'tx> InitExecutor<'engine, 'tx> {
         name: &str,
         parent_id: Option<&str>,
     ) -> Result<Option<String>, LixError> {
-        let directory_table = tracked_relation_name("lix_directory_descriptor");
-        let existing = match parent_id {
-            Some(parent_id) => {
-                self.execute_backend(
-                    &format!(
-                        "SELECT entity_id \
-                         FROM {directory_table} \
-                         WHERE schema_key = 'lix_directory_descriptor' \
-                           AND file_id IS NULL \
-                           AND version_id = 'global' \
-                           AND untracked = false \
-                           AND is_tombstone = 0 \
-                           AND name = $1 \
-                           AND parent_id = $2 \
-                         ORDER BY updated_at DESC, created_at DESC, entity_id DESC \
-                         LIMIT 1"
-                    ),
-                    &[
-                        Value::Text(name.to_string()),
-                        Value::Text(parent_id.to_string()),
-                    ],
-                )
-                .await?
-            }
-            None => {
-                self.execute_backend(
-                    &format!(
-                        "SELECT entity_id \
-                         FROM {directory_table} \
-                         WHERE schema_key = 'lix_directory_descriptor' \
-                           AND file_id IS NULL \
-                           AND version_id = 'global' \
-                           AND untracked = false \
-                           AND is_tombstone = 0 \
-                           AND name = $1 \
-                           AND parent_id IS NULL \
-                         ORDER BY updated_at DESC, created_at DESC, entity_id DESC \
-                         LIMIT 1"
-                    ),
-                    &[Value::Text(name.to_string())],
-                )
-                .await?
-            }
-        };
-        Ok(existing
-            .rows
-            .first()
-            .map(|row| text_value(row.first(), "system directory entity_id"))
-            .transpose()?)
+        crate::init::storage::load_seeded_system_directory_id(
+            self.backend_transaction_mut()?,
+            name,
+            parent_id,
+        )
+        .await
     }
 }

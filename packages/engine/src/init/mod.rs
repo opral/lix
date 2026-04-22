@@ -2,6 +2,7 @@ mod filesystem;
 mod run;
 mod schema_bootstrap;
 mod seed;
+pub(crate) mod storage;
 
 pub(crate) use run::{init, init_if_needed};
 #[cfg(test)]
