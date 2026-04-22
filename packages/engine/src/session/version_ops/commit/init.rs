@@ -1,7 +1,8 @@
-use crate::backend::execute_ddl_batch;
-use crate::{LixBackend, LixError};
+use crate::session::version_ops::VersionOpsBackendRef;
+use crate::session::version_ops_storage::execute_ddl_batch_with_backend;
+use crate::LixError;
 
-pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
+pub(crate) async fn init(backend: VersionOpsBackendRef<'_>) -> Result<(), LixError> {
     let statements = [
         format!(
             "CREATE TABLE IF NOT EXISTS {} (\
@@ -28,5 +29,5 @@ pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
         ),
     ];
     let statement_refs = statements.iter().map(String::as_str).collect::<Vec<_>>();
-    execute_ddl_batch(backend, "commit", &statement_refs).await
+    execute_ddl_batch_with_backend(backend, "commit", &statement_refs).await
 }

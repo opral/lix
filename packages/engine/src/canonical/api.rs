@@ -16,9 +16,7 @@ use crate::canonical::read::{
     CanonicalRootCommit as ReadCanonicalRootCommit, CommitLineageEntry,
     ExactCommittedStateRowRequest,
 };
-use crate::canonical::store::{
-    CanonicalBackendRef, CanonicalExecutorRef, CanonicalTransactionRef,
-};
+use crate::canonical::store::{CanonicalBackendRef, CanonicalExecutorRef, CanonicalTransactionRef};
 use crate::canonical::store_sql::{
     execute_batch_with_transaction, execute_query_with_backend, execute_query_with_executor,
     execute_query_with_transaction, load_durable_state_commit_low_watermark_in_transaction,

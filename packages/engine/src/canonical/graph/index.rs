@@ -2,11 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
+use crate::canonical::journal::CanonicalCommitOutput;
 use crate::canonical::store::{
     CanonicalCommitQueryExecutor, CanonicalPreparedBatch, CanonicalPreparedStatement,
 };
 use crate::canonical::store_sql::execute_query_with_executor;
-use crate::canonical::journal::CanonicalCommitOutput;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 

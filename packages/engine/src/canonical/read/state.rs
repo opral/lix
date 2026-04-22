@@ -257,8 +257,8 @@ pub(crate) async fn load_canonical_change_row_by_id(
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                WHERE c.id = $1 \
                LIMIT 1";
-    let result = execute_query_with_executor(executor, sql, &[Value::Text(change_id.to_string())])
-        .await?;
+    let result =
+        execute_query_with_executor(executor, sql, &[Value::Text(change_id.to_string())]).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };

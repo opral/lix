@@ -9,10 +9,10 @@
 
 use std::collections::BTreeSet;
 
-use crate::canonical::store::CanonicalExecutorRef;
-use crate::canonical::store_sql::execute_query_with_executor;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
+use crate::canonical::store::CanonicalExecutorRef;
+use crate::canonical::store_sql::execute_query_with_executor;
 use crate::common::escape_sql_string;
 use crate::common::is_missing_relation_error;
 use crate::{LixError, Value};

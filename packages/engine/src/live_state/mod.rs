@@ -61,8 +61,8 @@ pub(crate) mod untracked;
 mod visible_rows;
 use crate::catalog::SurfaceReadFreshness;
 use crate::live_state::store::{
-    LiveStateBackendRef, LiveStateExecutorRef, LiveStateMaterializeStore,
-    LiveStateReadStore, LiveStateTransactionRef, LiveStateWriteStore,
+    LiveStateBackendRef, LiveStateExecutorRef, LiveStateMaterializeStore, LiveStateReadStore,
+    LiveStateTransactionRef, LiveStateWriteStore,
 };
 use crate::live_state::store_sql::SqlLiveStateStore;
 use crate::{LixError, Value};
@@ -220,7 +220,9 @@ pub async fn require_ready(backend: LiveStateBackendRef<'_>) -> Result<(), LixEr
 pub async fn projection_status(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<ProjectionStatus, LixError> {
-    SqlLiveStateStore::from_backend(backend).projection_status().await
+    SqlLiveStateStore::from_backend(backend)
+        .projection_status()
+        .await
 }
 
 pub(crate) async fn ensure_projection_read_freshness_with_backend(

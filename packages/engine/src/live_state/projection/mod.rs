@@ -13,10 +13,10 @@ pub(crate) mod hydration;
 pub(crate) mod replay;
 pub(crate) mod status;
 
+use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::{
     CanonicalCommitProjectionReceipt, LiveStateMode, LiveStateProjectionStatus, ReplayCursor,
 };
-use crate::live_state::store::LiveStateTransactionRef;
 use crate::schema::LixVersionRef;
 use crate::version::CommittedVersionFrontier;
 use crate::LixError;
@@ -25,13 +25,13 @@ use crate::LixError;
 use std::collections::BTreeSet;
 
 #[cfg(test)]
-use crate::live_state::{
-    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
-};
-#[cfg(test)]
 use crate::live_state::store::LiveStateBackendRef;
 #[cfg(test)]
 use crate::live_state::store_sql::begin_write_transaction;
+#[cfg(test)]
+use crate::live_state::{
+    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+};
 
 #[cfg(test)]
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
@@ -135,9 +135,7 @@ pub(crate) fn projection_status_from_live_state(
     status: LiveStateProjectionStatus,
 ) -> ProjectionStatus {
     ProjectionStatus {
-        projections: vec![derived_projection_status_from_live_state(
-            status,
-        )],
+        projections: vec![derived_projection_status_from_live_state(status)],
     }
 }
 
@@ -360,8 +358,8 @@ async fn apply_live_state_replay_scope_to_cursor(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_canonical_receipt_in_transaction, catch_up_live_state_to_current_frontier,
-        replay, status, DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode,
+        apply_canonical_receipt_in_transaction, catch_up_live_state_to_current_frontier, replay,
+        status, DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode,
     };
     use crate::canonical::CanonicalCommitReceipt;
     use crate::live_state::{CanonicalCommitProjectionReceipt, LiveStateMode, ReplayCursor};
@@ -370,8 +368,8 @@ mod tests {
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
-    use crate::CreateVersionOptions;
     use crate::CommittedVersionFrontier;
+    use crate::CreateVersionOptions;
     use std::collections::BTreeMap;
 
     async fn init_projection_backend() -> TestSqliteBackend {

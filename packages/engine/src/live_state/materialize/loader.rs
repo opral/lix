@@ -67,7 +67,8 @@ pub(crate) async fn load_data_with_executor(
     let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content AS snapshot_content, c.metadata, c.created_at \
                FROM lix_internal_change c \
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id";
-    let result = crate::live_state::store_sql::execute_query_with_executor(executor, sql, &[]).await?;
+    let result =
+        crate::live_state::store_sql::execute_query_with_executor(executor, sql, &[]).await?;
 
     let mut changes = BTreeMap::new();
     let mut commits = BTreeMap::new();

@@ -8,7 +8,9 @@ use crate::live_state::untracked::{
 };
 use crate::live_state::LiveRow;
 use crate::schema::LixActiveVersion;
-use crate::test_support::{commit_untracked_rows as commit_untracked_rows_via_support, TestSqliteBackend};
+use crate::test_support::{
+    commit_untracked_rows as commit_untracked_rows_via_support, TestSqliteBackend,
+};
 use crate::{LixError, NullableKeyFilter, Value};
 
 async fn commit_untracked_rows(

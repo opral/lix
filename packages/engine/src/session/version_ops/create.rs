@@ -1,6 +1,7 @@
 use crate::functions::FunctionBindings;
+use crate::version::stage_create_version_insert;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
+use crate::{ExecuteOptions, LixError, Session, SessionTransaction};
 
 use super::context::require_target_version_context_in_transaction;
 
@@ -58,18 +59,7 @@ async fn create_version_in_transaction(
     }
     let hidden = options.hidden;
 
-    tx.execute(
-        "INSERT INTO lix_version (\
-         id, name, hidden, commit_id\
-         ) VALUES ($1, $2, $3, $4)",
-        &[
-            Value::Text(id.clone()),
-            Value::Text(name.clone()),
-            Value::Boolean(hidden),
-            Value::Text(parent_commit_id.clone()),
-        ],
-    )
-    .await?;
+    stage_create_version_insert(tx, &id, &name, hidden, &parent_commit_id).await?;
 
     Ok(CreateVersionResult {
         id,

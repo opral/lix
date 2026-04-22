@@ -3,7 +3,9 @@
 //! This subsystem owns built-in version row metadata and snapshot codecs used
 //! across catalog, SQL, live-state, init, and session version workflows.
 
+mod admin_write;
 mod frontier;
+mod read;
 
 use serde_json::Value as JsonValue;
 use std::sync::OnceLock;
@@ -12,7 +14,15 @@ use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
 use crate::schema::{LixActiveVersion, LixVersionDescriptor, LixVersionRef};
 use crate::LixError;
 
+pub(crate) use admin_write::{stage_create_version_insert, stage_update_version_head};
 pub use frontier::CommittedVersionFrontier;
+pub(crate) use read::{
+    load_checkpoint_version_heads_with_executor,
+    load_exact_canonical_row_at_version_head_with_executor,
+    load_version_descriptor_with_pending_overlay, load_version_head_commit_id_with_executor,
+    load_version_head_commit_id_with_pending_overlay, load_version_info_for_versions,
+    version_exists_with_backend, version_exists_with_executor, VersionInfo, VersionSnapshot,
+};
 
 pub const GLOBAL_VERSION_ID: &str = "global";
 

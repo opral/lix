@@ -4,9 +4,7 @@ use crate::backend::TransactionBeginMode;
 use crate::binary_cas;
 use crate::canonical;
 use crate::live_state;
-use crate::live_state::{
-    load_mode_with_backend, LiveStateMode,
-};
+use crate::live_state::{load_mode_with_backend, LiveStateMode};
 use crate::session;
 use crate::{Lix, LixBackend, LixError, SqlDialect};
 

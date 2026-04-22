@@ -445,7 +445,9 @@ pub(crate) fn parse_nullable_live_state_status_result(
     Ok(Some(live_state_status_row_from_values(row)?))
 }
 
-fn projection_status_from_snapshot(snapshot: LiveStateSnapshot) -> LiveStateProjectionStatus {
+pub(crate) fn projection_status_from_snapshot(
+    snapshot: LiveStateSnapshot,
+) -> LiveStateProjectionStatus {
     let readiness = evaluate_live_state_snapshot(&snapshot);
     let LiveStateSnapshot {
         status,

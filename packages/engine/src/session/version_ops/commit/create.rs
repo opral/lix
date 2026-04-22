@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::QueryExecutor;
 use crate::canonical::{
     append_changes, append_untracked_change_visibility_rows, CanonicalChangeWrite,
     CanonicalCommitReceipt, CanonicalStateIdentity, UpdatedVersionRef,
@@ -10,24 +9,23 @@ use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::session::version_ops::{
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_head_commit_id_with_executor, load_version_info_for_versions, VersionInfo,
-    VersionSnapshot,
+    VersionOpsTransactionRef, VersionSnapshot,
 };
+use crate::session::version_ops_read::VersionOpsReadRef;
 use crate::sql::MutationRow;
 use crate::sql::OptionalTextPatch;
 use crate::transaction::execute_write_batch_with_transaction;
 use crate::transaction::{
-    compile_filesystem_transaction_state_from_state,
+    append_commit_idempotency_row, compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors,
+    load_commit_idempotency_replay_in_transaction,
     persist_runtime_sequence_highest_seen_in_transaction, with_exact_filesystem_descriptors,
     BinaryBlobWrite, ExactFilesystemDescriptorState, FilesystemDescriptorState,
     FilesystemSemanticChange, FilesystemTransactionState, WriteBatch, FILESYSTEM_FILE_SCHEMA_KEY,
 };
 use crate::version::version_ref_snapshot_content;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::SqlDialect;
-use crate::{
-    CanonicalJson, CanonicalSchemaKey, LixBackendTransaction, LixError, QueryResult, Value,
-};
+use crate::{CanonicalJson, CanonicalSchemaKey, LixError};
 use async_trait::async_trait;
 
 use super::generate::{canonical_change_is_commit_member, generate_commit};
@@ -40,7 +38,6 @@ use super::types::{
     canonical_untracked_visibility_rows_from_updated_version_refs, GenerateCommitArgs,
     GenerateCommitResult, StagedChange,
 };
-use super::COMMIT_IDEMPOTENCY_TABLE;
 const BINARY_BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const BINARY_BLOB_REF_SCHEMA_VERSION: &str = "1";
 const IDEMPOTENCY_KIND_EXACT: &str = "exact";
@@ -150,12 +147,12 @@ pub(crate) struct CreateCommitError {
 pub(crate) trait CreateCommitInvariantChecker {
     async fn recheck_invariants(
         &mut self,
-        transaction: &mut dyn LixBackendTransaction,
+        transaction: VersionOpsTransactionRef<'_>,
     ) -> Result<(), CreateCommitError>;
 }
 
 pub(crate) async fn create_commit(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     args: CreateCommitArgs,
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
@@ -173,18 +170,15 @@ pub(crate) async fn create_commit(
 
     let needs_deterministic_sequence = functions.deterministic_sequence_enabled()
         && !functions.deterministic_sequence_initialized();
-    let preflight = {
-        let mut executor = TransactionCommitExecutor { transaction };
-        load_create_commit_preflight_state(
-            &mut executor,
-            &concrete_lane,
-            &args.preconditions,
-            &args.filesystem_state,
-            needs_deterministic_sequence,
-            &args.active_account_ids,
-        )
-        .await?
-    };
+    let preflight = load_create_commit_preflight_state(
+        transaction,
+        &concrete_lane,
+        &args.preconditions,
+        &args.filesystem_state,
+        needs_deterministic_sequence,
+        &args.active_account_ids,
+    )
+    .await?;
     if let Some(sequence_start) = preflight.deterministic_sequence_start {
         functions.initialize_deterministic_sequence(sequence_start);
     }
@@ -280,7 +274,7 @@ pub(crate) async fn create_commit(
         args.origin_key.as_deref(),
     )?;
     let applied_changes = {
-        let mut executor = TransactionCommitExecutor { transaction };
+        let mut executor = crate::backend::transaction_backend_view(transaction);
         normalize_staged_changes(&mut executor, &applied_changes).await?
     };
     // Binary CAS writes are only meaningful when a surviving staged change still
@@ -320,7 +314,7 @@ pub(crate) async fn create_commit(
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut versions = {
-        let mut executor = TransactionCommitExecutor { transaction };
+        let mut executor = crate::backend::transaction_backend_view(transaction);
         load_version_info_for_versions(&mut executor, &versions_to_load)
             .await
             .map_err(backend_error)?
@@ -402,7 +396,16 @@ pub(crate) async fn create_commit(
     let deterministic_sequence_highest_seen =
         functions.deterministic_sequence_persist_highest_seen();
     let mut write_batch = WriteBatch::new();
-    write_batch.push_statement(insert_idempotency_row_sql(&idempotency_write), Vec::new());
+    append_commit_idempotency_row(
+        &mut write_batch,
+        &idempotency_write.write_lane,
+        &idempotency_write.idempotency_key,
+        &idempotency_write.idempotency_kind,
+        &idempotency_write.idempotency_value,
+        &idempotency_write.parent_head_snapshot_content,
+        &idempotency_write.commit_id,
+        &idempotency_write.created_at,
+    );
     if let Some(highest_seen) = deterministic_sequence_highest_seen {
         persist_runtime_sequence_highest_seen_in_transaction(transaction, highest_seen)
             .await
@@ -556,21 +559,6 @@ enum ConcreteWriteLane {
     GlobalAdmin,
 }
 
-struct TransactionCommitExecutor<'a> {
-    transaction: &'a mut dyn LixBackendTransaction,
-}
-
-#[async_trait(?Send)]
-impl QueryExecutor for TransactionCommitExecutor<'_> {
-    fn dialect(&self) -> SqlDialect {
-        self.transaction.dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.transaction.execute(sql, params).await
-    }
-}
-
 fn concrete_lane(
     preconditions: &CreateCommitPreconditions,
 ) -> Result<ConcreteWriteLane, CreateCommitError> {
@@ -629,7 +617,7 @@ fn resolve_staged_changes(
 }
 
 async fn normalize_staged_changes(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     changes: &[StagedChange],
 ) -> Result<Vec<StagedChange>, CreateCommitError> {
     let mut normalized = Vec::with_capacity(changes.len());
@@ -643,7 +631,7 @@ async fn normalize_staged_changes(
 }
 
 async fn staged_change_is_noop(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     change: &StagedChange,
 ) -> Result<bool, CreateCommitError> {
     let Some(_schema_version) = change.schema_version.clone() else {
@@ -868,7 +856,7 @@ struct CreateCommitPreflightState {
 }
 
 async fn load_create_commit_preflight_state(
-    executor: &mut dyn QueryExecutor,
+    transaction: VersionOpsTransactionRef<'_>,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &CreateCommitPreconditions,
     filesystem_state: &FilesystemTransactionState,
@@ -879,28 +867,33 @@ async fn load_create_commit_preflight_state(
         ConcreteWriteLane::Version { version_id } => version_id.as_str(),
         ConcreteWriteLane::GlobalAdmin => GLOBAL_VERSION_ID,
     };
-    let current_head = load_version_head_commit_id_with_executor(executor, lane_entity_id)
-        .await
-        .map_err(backend_error)?;
+    let current_head = {
+        let mut executor = crate::backend::transaction_backend_view(transaction);
+        load_version_head_commit_id_with_executor(&mut executor, lane_entity_id)
+            .await
+            .map_err(backend_error)?
+    };
     let current_head_snapshot = current_head
         .as_ref()
         .map(|commit_id| version_ref_snapshot_content(lane_entity_id, commit_id));
     let existing_replay = load_create_commit_existing_replay(
-        executor,
+        transaction,
         concrete_lane,
         preconditions,
         current_head_snapshot.as_deref(),
     )
     .await?;
     let deterministic_sequence_start = if include_deterministic_sequence {
-        load_create_commit_deterministic_sequence_start(executor).await?
+        let mut executor = crate::backend::transaction_backend_view(transaction);
+        load_create_commit_deterministic_sequence_start(&mut executor).await?
     } else {
         None
     };
     let active_accounts = active_account_ids.to_vec();
     let file_descriptors = if filesystem_transaction_state_needs_exact_descriptors(filesystem_state)
     {
-        load_create_commit_file_descriptors(executor, filesystem_state, lane_entity_id).await?
+        let mut executor = crate::backend::transaction_backend_view(transaction);
+        load_create_commit_file_descriptors(&mut executor, filesystem_state, lane_entity_id).await?
     } else {
         BTreeMap::new()
     };
@@ -959,7 +952,7 @@ fn parse_file_descriptor_preflight_row(
 }
 
 async fn load_create_commit_existing_replay(
-    executor: &mut dyn QueryExecutor,
+    transaction: VersionOpsTransactionRef<'_>,
     concrete_lane: &ConcreteWriteLane,
     preconditions: &CreateCommitPreconditions,
     current_head_snapshot: Option<&str>,
@@ -977,31 +970,19 @@ async fn load_create_commit_existing_replay(
             )
         }
     };
-    let sql = format!(
-        "SELECT commit_id \
-         FROM {table_name} \
-         WHERE write_lane = '{write_lane}' \
-           AND idempotency_kind = '{kind}' \
-           AND idempotency_value = '{value}' \
-           AND parent_head_snapshot_content = '{parent_head_snapshot_content}' \
-         LIMIT 1",
-        table_name = COMMIT_IDEMPOTENCY_TABLE,
-        write_lane = escape_sql_string(&lane_storage_key(concrete_lane)),
-        kind = escape_sql_string(kind),
-        value = escape_sql_string(value),
-        parent_head_snapshot_content = escape_sql_string(parent_head_snapshot_content),
-    );
-    let result = executor.execute(&sql, &[]).await.map_err(backend_error)?;
-    Ok(result
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .and_then(value_as_text)
-        .filter(|commit_id| !commit_id.is_empty()))
+    load_commit_idempotency_replay_in_transaction(
+        transaction,
+        &lane_storage_key(concrete_lane),
+        kind,
+        value,
+        parent_head_snapshot_content,
+    )
+    .await
+    .map_err(backend_error)
 }
 
 async fn load_create_commit_deterministic_sequence_start(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
 ) -> Result<Option<i64>, CreateCommitError> {
     load_create_commit_deterministic_sequence_start_impl(executor)
         .await
@@ -1009,7 +990,7 @@ async fn load_create_commit_deterministic_sequence_start(
 }
 
 async fn load_create_commit_file_descriptors(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     filesystem_state: &FilesystemTransactionState,
     lane_entity_id: &str,
 ) -> Result<BTreeMap<String, ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1036,7 +1017,7 @@ async fn load_create_commit_file_descriptors(
 }
 
 async fn load_create_commit_file_descriptor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     file_id: &str,
     lane_entity_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1059,7 +1040,7 @@ async fn load_create_commit_file_descriptor(
 }
 
 async fn load_untracked_file_descriptor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1069,7 +1050,7 @@ async fn load_untracked_file_descriptor(
 }
 
 async fn load_tracked_file_descriptor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, CreateCommitError> {
@@ -1257,23 +1238,6 @@ fn build_canonical_commit_receipt(
     ))
 }
 
-fn insert_idempotency_row_sql(idempotency: &CommitIdempotencyWrite) -> String {
-    format!(
-        "INSERT INTO {table_name} \
-         (write_lane, idempotency_key, idempotency_kind, idempotency_value, parent_head_snapshot_content, commit_id, created_at) \
-         VALUES ('{write_lane}', '{idempotency_key}', '{idempotency_kind}', '{idempotency_value}', '{parent_head_snapshot_content}', '{commit_id}', '{created_at}')",
-        table_name = COMMIT_IDEMPOTENCY_TABLE,
-        write_lane = escape_sql_string(&idempotency.write_lane),
-        idempotency_key = escape_sql_string(&idempotency.idempotency_key),
-        idempotency_kind = escape_sql_string(&idempotency.idempotency_kind),
-        idempotency_value = escape_sql_string(&idempotency.idempotency_value),
-        parent_head_snapshot_content =
-            escape_sql_string(&idempotency.parent_head_snapshot_content),
-        commit_id = escape_sql_string(&idempotency.commit_id),
-        created_at = escape_sql_string(&idempotency.created_at),
-    )
-}
-
 fn lane_storage_key(concrete_lane: &ConcreteWriteLane) -> String {
     match concrete_lane {
         ConcreteWriteLane::Version { version_id } => format!("version:{version_id}"),
@@ -1286,20 +1250,6 @@ fn backend_error(error: LixError) -> CreateCommitError {
         kind: CreateCommitErrorKind::Internal,
         message: error.description,
     }
-}
-
-fn value_as_text(value: &Value) -> Option<String> {
-    match value {
-        Value::Text(text) => Some(text.clone()),
-        Value::Integer(integer) => Some(integer.to_string()),
-        Value::Boolean(boolean) => Some(boolean.to_string()),
-        Value::Real(real) => Some(real.to_string()),
-        _ => None,
-    }
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
 }
 
 fn try_identity<T>(value: impl Into<String>, context: &str) -> Result<T, CreateCommitError>

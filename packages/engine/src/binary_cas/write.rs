@@ -4,10 +4,11 @@ use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE,
 };
+use crate::binary_cas::store::BinaryCasTransactionRef;
 use crate::binary_cas::BinaryBlobWrite;
 use crate::functions::current_timestamp;
 use crate::transaction::{execute_write_batch_with_transaction, WriteBatch};
-use crate::{LixBackendTransaction, LixError, SqlDialect, Value};
+use crate::{LixError, SqlDialect, Value};
 use std::collections::BTreeMap;
 
 const SQLITE_MAX_BIND_PARAMETERS_PER_STATEMENT: usize = 32_766;
@@ -63,7 +64,7 @@ pub(crate) struct BinaryCasWriteBatch {
 }
 
 pub(crate) async fn persist_blob_writes_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
     if writes.is_empty() {

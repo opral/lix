@@ -8,13 +8,13 @@ use crate::LixError;
 
 use super::{
     lifecycle::LiveStateSnapshot,
+    materialize::{LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildRequest},
     snapshot_queries::{
         load_live_read_shape_for_table_name, load_live_snapshot_rows_with_backend,
         normalize_live_snapshot_values_with_backend, LiveRowShapeContract, LiveStateQueryBackend,
     },
-    ExactLiveRowQuery, LiveRow, LiveRowQuery,
-    materialize::{LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildRequest},
-    LiveStateMode, ProjectionStatus, ReplayCursor, SchemaRegistration,
+    ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveStateMode, ProjectionStatus, ReplayCursor,
+    SchemaRegistration,
 };
 
 pub(crate) type LiveStateBackendRef<'a> = &'a (dyn crate::LixBackend + 'a);

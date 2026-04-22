@@ -121,7 +121,11 @@ pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip(
     executor: CanonicalExecutorRef<'_>,
     head_commit_id: &str,
 ) -> Result<Option<String>, LixError> {
-    checkpoint_labels::resolve_last_checkpoint_commit_id_for_tip_with_executor(executor, head_commit_id).await
+    checkpoint_labels::resolve_last_checkpoint_commit_id_for_tip_with_executor(
+        executor,
+        head_commit_id,
+    )
+    .await
 }
 
 #[async_trait(?Send)]
@@ -219,8 +223,7 @@ impl CanonicalWriteStore for SqlCanonicalWriteStore<'_> {
         &mut self,
         visibility_rows: &[CanonicalUntrackedVisibilityWrite],
     ) -> Result<(), LixError> {
-        api::append_untracked_change_visibility_rows(self.transaction, visibility_rows)
-            .await
+        api::append_untracked_change_visibility_rows(self.transaction, visibility_rows).await
     }
 
     async fn replace_snapshot_content(
@@ -228,13 +231,15 @@ impl CanonicalWriteStore for SqlCanonicalWriteStore<'_> {
         snapshot_id: &str,
         snapshot_content: &str,
     ) -> Result<(), LixError> {
-        api::replace_snapshot_content_in_transaction(self.transaction, snapshot_id, snapshot_content)
-            .await
+        api::replace_snapshot_content_in_transaction(
+            self.transaction,
+            snapshot_id,
+            snapshot_content,
+        )
+        .await
     }
 }
 
 fn invalid_canonical_store_access(expected: &str) -> LixError {
-    LixError::unknown(format!(
-        "canonical store access requires a {expected}"
-    ))
+    LixError::unknown(format!("canonical store access requires a {expected}"))
 }
