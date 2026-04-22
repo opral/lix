@@ -36,29 +36,6 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
         .collect()
 }
 
-fn normalize_global_projection_rows(rows: &[Vec<Value>]) -> Vec<Vec<Value>> {
-    rows.iter()
-        .map(|row| {
-            row.iter()
-                .enumerate()
-                .map(|(index, value)| {
-                    if index == 1 {
-                        match value {
-                            Value::Text(actual) if actual == "version-a" => {
-                                Value::Text(actual.clone())
-                            }
-                            Value::Text(_) => Value::Text("global".to_string()),
-                            other => panic!("expected text version_id, got {other:?}"),
-                        }
-                    } else {
-                        value.clone()
-                    }
-                })
-                .collect()
-        })
-        .collect()
-}
-
 async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
     register_registered_schema_snapshot(
         engine,
@@ -808,6 +785,17 @@ simulation_test!(
 
         register_test_schema(&engine).await;
         engine.create_named_version("version-a").await.unwrap();
+        let main_rows = engine
+            .execute(
+                "SELECT id FROM lix_version WHERE name = 'main' LIMIT 1",
+                &[],
+            )
+            .await
+            .unwrap();
+        let main_version_id = match &main_rows.statements[0].rows[0][0] {
+            Value::Text(value) => value.clone(),
+            other => panic!("expected main version id text, got {other:?}"),
+        };
         ensure_file_descriptor(&engine, "global", "test-file").await;
         ensure_file_descriptor(&engine, "version-a", "test-file").await;
 
@@ -829,21 +817,42 @@ simulation_test!(
                 "SELECT entity_id, version_id, untracked \
                  FROM lix_state_by_version \
                  WHERE schema_key = 'test_state_schema' \
-                 ORDER BY entity_id",
+                 ORDER BY entity_id, version_id",
                 &[],
             )
             .await
             .unwrap();
 
-        let normalized = normalize_global_projection_rows(&normalize_bool_like_rows(
-            &rows.statements[0].rows,
-            &[2],
-        ));
+        let normalized = normalize_bool_like_rows(&rows.statements[0].rows, &[2])
+            .into_iter()
+            .map(|row| {
+                row.into_iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        if index == 1 {
+                            match value {
+                                Value::Text(actual) if actual == main_version_id => {
+                                    Value::Text("main".to_string())
+                                }
+                                other => other,
+                            }
+                        } else {
+                            value
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
         sim.assert_deterministic(normalized.clone());
-        assert_eq!(normalized.len(), 5);
+        assert_eq!(normalized.len(), 7);
         assert_eq!(
             normalized,
             vec![
+                vec![
+                    Value::Text("entity-global-tracked".to_string()),
+                    Value::Text("main".to_string()),
+                    Value::Boolean(false),
+                ],
                 vec![
                     Value::Text("entity-global-tracked".to_string()),
                     Value::Text("global".to_string()),
@@ -853,6 +862,11 @@ simulation_test!(
                     Value::Text("entity-global-tracked".to_string()),
                     Value::Text("version-a".to_string()),
                     Value::Boolean(false),
+                ],
+                vec![
+                    Value::Text("entity-global-untracked".to_string()),
+                    Value::Text("main".to_string()),
+                    Value::Boolean(true),
                 ],
                 vec![
                     Value::Text("entity-global-untracked".to_string()),

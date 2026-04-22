@@ -10,21 +10,15 @@ use crate::catalog::{
 };
 use crate::history::{
     DirectoryHistoryRequest, FileHistoryContentMode, FileHistoryLineageScope, FileHistoryRequest,
-    FileHistoryRootScope, FileHistoryVersionScope, StateHistoryContentMode,
-    StateHistoryLineageScope, StateHistoryOrder, StateHistoryRequest, StateHistoryRootScope,
-    StateHistoryVersionScope,
+    FileHistoryRootScope, FileHistoryVersionScope,
 };
 use crate::sql::binder::runtime::{RuntimeBindingKind, StatementBindingSource};
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport};
 use crate::sql::logical_plan::history_reads::{
     DirectoryHistoryAggregate, DirectoryHistoryField, DirectoryHistoryPredicate,
     DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
-    EntityHistoryField, EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan,
-    EntityHistorySortKey, FileHistoryAggregate, FileHistoryField, FileHistoryPredicate,
-    FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
-    StateHistoryAggregate, StateHistoryAggregatePredicate, StateHistoryField,
-    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
-    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
+    FileHistoryAggregate, FileHistoryField, FileHistoryPredicate, FileHistoryProjection,
+    FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
 };
 use crate::sql::logical_plan::public_ir::{
     BroadPublicReadAlias, BroadPublicReadDistinct, BroadPublicReadGroupBy,
@@ -381,19 +375,6 @@ pub(crate) enum ExplainHistoryLineageScope {
 pub(crate) enum ExplainHistoryVersionScopeKind {
     Any,
     RequestedVersions,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainStateHistoryContentMode {
-    MetadataOnly,
-    IncludeSnapshotContent,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainStateHistoryOrder {
-    EntityFileSchemaDepthAsc,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -938,24 +919,6 @@ pub(crate) struct LoweredReadBatchSnapshot {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct StateHistoryRequestSnapshot {
-    pub(crate) root_scope: ExplainHistoryRootScopeKind,
-    pub(crate) requested_roots: Vec<String>,
-    pub(crate) lineage_scope: ExplainHistoryLineageScope,
-    pub(crate) lineage_version_id: Option<String>,
-    pub(crate) version_scope: ExplainHistoryVersionScopeKind,
-    pub(crate) requested_versions: Vec<String>,
-    pub(crate) entity_ids: Vec<String>,
-    pub(crate) file_ids: Vec<String>,
-    pub(crate) schema_keys: Vec<String>,
-    pub(crate) plugin_keys: Vec<String>,
-    pub(crate) min_depth: Option<i64>,
-    pub(crate) max_depth: Option<i64>,
-    pub(crate) content_mode: ExplainStateHistoryContentMode,
-    pub(crate) order: ExplainStateHistoryOrder,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct FileHistoryRequestSnapshot {
     pub(crate) lineage_scope: ExplainHistoryLineageScope,
     pub(crate) lineage_version_id: Option<String>,
@@ -996,42 +959,6 @@ pub(crate) enum ExplainPredicateOperator {
     In,
     IsNull,
     IsNotNull,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainAggregatePredicateOperator {
-    Eq,
-    NotEq,
-    Gt,
-    GtEq,
-    Lt,
-    LtEq,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ExplainStateHistoryField {
-    EntityId,
-    SchemaKey,
-    FileId,
-    PluginKey,
-    SnapshotContent,
-    Metadata,
-    SchemaVersion,
-    ChangeId,
-    CommitId,
-    CommitCreatedAt,
-    RootCommitId,
-    Depth,
-    VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum ExplainEntityHistoryField {
-    Property(String),
-    State(ExplainStateHistoryField),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -1101,69 +1028,6 @@ pub(crate) struct HistorySortKeySnapshot<Field> {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum StateHistoryProjectionValueSnapshot {
-    Field(ExplainStateHistoryField),
-    Aggregate(ExplainHistoryAggregate),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct StateHistoryProjectionSnapshot {
-    pub(crate) output_name: String,
-    pub(crate) value: StateHistoryProjectionValueSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-#[serde(tag = "kind", content = "details", rename_all = "snake_case")]
-pub(crate) enum StateHistorySortValueSnapshot {
-    Field(ExplainStateHistoryField),
-    Aggregate(ExplainHistoryAggregate),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct StateHistorySortKeySnapshot {
-    pub(crate) output_name: String,
-    pub(crate) value: Option<StateHistorySortValueSnapshot>,
-    pub(crate) descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct StateHistoryAggregatePredicateSnapshot {
-    pub(crate) operator: ExplainAggregatePredicateOperator,
-    pub(crate) aggregate: ExplainHistoryAggregate,
-    pub(crate) value: i64,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct StateHistoryReadPlanSnapshot {
-    pub(crate) request: StateHistoryRequestSnapshot,
-    pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainStateHistoryField>>,
-    pub(crate) projections: Vec<StateHistoryProjectionSnapshot>,
-    pub(crate) sort_keys: Vec<StateHistorySortKeySnapshot>,
-    pub(crate) group_by: Vec<ExplainStateHistoryField>,
-    pub(crate) having: Option<StateHistoryAggregatePredicateSnapshot>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) result_columns: LoweredResultColumnsSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub(crate) struct EntityHistoryReadPlanSnapshot {
-    pub(crate) request: StateHistoryRequestSnapshot,
-    pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainEntityHistoryField>>,
-    pub(crate) projections: Vec<HistoryFieldProjectionSnapshot<ExplainEntityHistoryField>>,
-    pub(crate) sort_keys: Vec<HistorySortKeySnapshot<ExplainEntityHistoryField>>,
-    pub(crate) limit: Option<u64>,
-    pub(crate) offset: u64,
-    pub(crate) wildcard_projection: bool,
-    pub(crate) wildcard_columns: Vec<String>,
-    pub(crate) result_columns: LoweredResultColumnsSnapshot,
-    pub(crate) resolved_relation: ResolvedRelationSnapshot,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct FileHistoryReadPlanSnapshot {
     pub(crate) request: FileHistoryRequestSnapshot,
     pub(crate) predicates: Vec<HistoryPredicateSnapshot<ExplainFileHistoryField>>,
@@ -1196,8 +1060,6 @@ pub(crate) struct DirectoryHistoryReadPlanSnapshot {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainHistoryReadPlan {
-    StateHistory(Box<StateHistoryReadPlanSnapshot>),
-    EntityHistory(Box<EntityHistoryReadPlanSnapshot>),
     FileHistory(Box<FileHistoryReadPlanSnapshot>),
     DirectoryHistory(Box<DirectoryHistoryReadPlanSnapshot>),
 }
@@ -5535,82 +5397,12 @@ fn lowered_result_columns_snapshot(columns: &LoweredResultColumns) -> LoweredRes
 
 fn history_read_plan_snapshot(plan: &HistoryReadPlan) -> ExplainHistoryReadPlan {
     match plan {
-        HistoryReadPlan::StateHistory(plan) => {
-            ExplainHistoryReadPlan::StateHistory(Box::new(state_history_read_plan_snapshot(plan)))
-        }
-        HistoryReadPlan::EntityHistory(plan) => {
-            ExplainHistoryReadPlan::EntityHistory(Box::new(entity_history_read_plan_snapshot(plan)))
-        }
         HistoryReadPlan::FileHistory(plan) => {
             ExplainHistoryReadPlan::FileHistory(Box::new(file_history_read_plan_snapshot(plan)))
         }
         HistoryReadPlan::DirectoryHistory(plan) => ExplainHistoryReadPlan::DirectoryHistory(
             Box::new(directory_history_read_plan_snapshot(plan)),
         ),
-    }
-}
-
-fn state_history_read_plan_snapshot(plan: &StateHistoryReadPlan) -> StateHistoryReadPlanSnapshot {
-    StateHistoryReadPlanSnapshot {
-        request: state_history_request_snapshot(&plan.request),
-        predicates: plan
-            .predicates
-            .iter()
-            .map(state_history_predicate_snapshot)
-            .collect(),
-        projections: plan
-            .projections
-            .iter()
-            .map(state_history_projection_snapshot)
-            .collect(),
-        sort_keys: plan
-            .sort_keys
-            .iter()
-            .map(state_history_sort_key_snapshot)
-            .collect(),
-        group_by: plan
-            .group_by_fields
-            .iter()
-            .map(state_history_field_snapshot)
-            .collect(),
-        having: plan
-            .having
-            .as_ref()
-            .map(state_history_aggregate_predicate_snapshot),
-        limit: plan.limit,
-        offset: plan.offset,
-        wildcard_projection: plan.wildcard_projection,
-        wildcard_columns: plan.wildcard_columns.clone(),
-        result_columns: lowered_result_columns_snapshot(&plan.result_columns),
-    }
-}
-
-fn entity_history_read_plan_snapshot(
-    plan: &EntityHistoryReadPlan,
-) -> EntityHistoryReadPlanSnapshot {
-    EntityHistoryReadPlanSnapshot {
-        request: state_history_request_snapshot(&plan.request),
-        predicates: plan
-            .predicates
-            .iter()
-            .map(entity_history_predicate_snapshot)
-            .collect(),
-        projections: plan
-            .projections
-            .iter()
-            .map(entity_history_projection_snapshot)
-            .collect(),
-        sort_keys: plan
-            .sort_keys
-            .iter()
-            .map(entity_history_sort_key_snapshot)
-            .collect(),
-        limit: plan.limit,
-        offset: plan.offset,
-        wildcard_projection: plan.wildcard_projection,
-        wildcard_columns: plan.wildcard_columns.clone(),
-        result_columns: lowered_result_columns_snapshot(&plan.result_columns),
-        resolved_relation: resolved_relation_snapshot(&plan.resolved_relation),
     }
 }
 
@@ -5672,25 +5464,6 @@ fn directory_history_read_plan_snapshot(
             .map(directory_history_aggregate_snapshot),
         aggregate_output_name: plan.aggregate_output_name.clone(),
         result_columns: lowered_result_columns_snapshot(&plan.result_columns),
-    }
-}
-
-fn state_history_request_snapshot(request: &StateHistoryRequest) -> StateHistoryRequestSnapshot {
-    StateHistoryRequestSnapshot {
-        root_scope: state_history_root_scope_snapshot(&request.root_scope),
-        requested_roots: state_history_requested_roots(&request.root_scope),
-        lineage_scope: state_history_lineage_scope_snapshot(request.lineage_scope),
-        lineage_version_id: request.lineage_version_id.clone(),
-        version_scope: state_history_version_scope_snapshot(&request.version_scope),
-        requested_versions: state_history_requested_versions(&request.version_scope),
-        entity_ids: request.entity_ids.clone(),
-        file_ids: request.file_ids.clone(),
-        schema_keys: request.schema_keys.clone(),
-        plugin_keys: request.plugin_keys.clone(),
-        min_depth: request.min_depth,
-        max_depth: request.max_depth,
-        content_mode: state_history_content_mode_snapshot(request.content_mode),
-        order: state_history_order_snapshot(request.order),
     }
 }
 
@@ -6082,66 +5855,6 @@ fn lowered_result_column_name(column: &LoweredResultColumn) -> ExplainLoweredRes
     }
 }
 
-fn state_history_root_scope_snapshot(scope: &StateHistoryRootScope) -> ExplainHistoryRootScopeKind {
-    match scope {
-        StateHistoryRootScope::AllRoots => ExplainHistoryRootScopeKind::AllRoots,
-        StateHistoryRootScope::RequestedRoots(_) => ExplainHistoryRootScopeKind::RequestedRoots,
-    }
-}
-
-fn state_history_requested_roots(scope: &StateHistoryRootScope) -> Vec<String> {
-    match scope {
-        StateHistoryRootScope::AllRoots => Vec::new(),
-        StateHistoryRootScope::RequestedRoots(roots) => roots.clone(),
-    }
-}
-
-fn state_history_lineage_scope_snapshot(
-    scope: StateHistoryLineageScope,
-) -> ExplainHistoryLineageScope {
-    match scope {
-        StateHistoryLineageScope::Standard => ExplainHistoryLineageScope::Standard,
-        StateHistoryLineageScope::ActiveVersion => ExplainHistoryLineageScope::ActiveVersion,
-    }
-}
-
-fn state_history_version_scope_snapshot(
-    scope: &StateHistoryVersionScope,
-) -> ExplainHistoryVersionScopeKind {
-    match scope {
-        StateHistoryVersionScope::Any => ExplainHistoryVersionScopeKind::Any,
-        StateHistoryVersionScope::RequestedVersions(_) => {
-            ExplainHistoryVersionScopeKind::RequestedVersions
-        }
-    }
-}
-
-fn state_history_requested_versions(scope: &StateHistoryVersionScope) -> Vec<String> {
-    match scope {
-        StateHistoryVersionScope::Any => Vec::new(),
-        StateHistoryVersionScope::RequestedVersions(versions) => versions.clone(),
-    }
-}
-
-fn state_history_content_mode_snapshot(
-    mode: StateHistoryContentMode,
-) -> ExplainStateHistoryContentMode {
-    match mode {
-        StateHistoryContentMode::MetadataOnly => ExplainStateHistoryContentMode::MetadataOnly,
-        StateHistoryContentMode::IncludeSnapshotContent => {
-            ExplainStateHistoryContentMode::IncludeSnapshotContent
-        }
-    }
-}
-
-fn state_history_order_snapshot(order: StateHistoryOrder) -> ExplainStateHistoryOrder {
-    match order {
-        StateHistoryOrder::EntityFileSchemaDepthAsc => {
-            ExplainStateHistoryOrder::EntityFileSchemaDepthAsc
-        }
-    }
-}
-
 fn file_history_root_scope_snapshot(scope: &FileHistoryRootScope) -> ExplainHistoryRootScopeKind {
     match scope {
         FileHistoryRootScope::AllRoots => ExplainHistoryRootScopeKind::AllRoots,
@@ -6199,33 +5912,6 @@ fn state_source_kind_snapshot(kind: StateSourceKind) -> ExplainStateSourceKind {
     }
 }
 
-fn state_history_field_snapshot(field: &StateHistoryField) -> ExplainStateHistoryField {
-    match field {
-        StateHistoryField::EntityId => ExplainStateHistoryField::EntityId,
-        StateHistoryField::SchemaKey => ExplainStateHistoryField::SchemaKey,
-        StateHistoryField::FileId => ExplainStateHistoryField::FileId,
-        StateHistoryField::PluginKey => ExplainStateHistoryField::PluginKey,
-        StateHistoryField::SnapshotContent => ExplainStateHistoryField::SnapshotContent,
-        StateHistoryField::Metadata => ExplainStateHistoryField::Metadata,
-        StateHistoryField::SchemaVersion => ExplainStateHistoryField::SchemaVersion,
-        StateHistoryField::ChangeId => ExplainStateHistoryField::ChangeId,
-        StateHistoryField::CommitId => ExplainStateHistoryField::CommitId,
-        StateHistoryField::CommitCreatedAt => ExplainStateHistoryField::CommitCreatedAt,
-        StateHistoryField::RootCommitId => ExplainStateHistoryField::RootCommitId,
-        StateHistoryField::Depth => ExplainStateHistoryField::Depth,
-        StateHistoryField::VersionId => ExplainStateHistoryField::VersionId,
-    }
-}
-
-fn entity_history_field_snapshot(field: &EntityHistoryField) -> ExplainEntityHistoryField {
-    match field {
-        EntityHistoryField::Property(name) => ExplainEntityHistoryField::Property(name.clone()),
-        EntityHistoryField::State(field) => {
-            ExplainEntityHistoryField::State(state_history_field_snapshot(field))
-        }
-    }
-}
-
 fn file_history_field_snapshot(field: &FileHistoryField) -> ExplainFileHistoryField {
     match field {
         FileHistoryField::Id => ExplainFileHistoryField::Id,
@@ -6270,10 +5956,6 @@ fn directory_history_field_snapshot(field: &DirectoryHistoryField) -> ExplainDir
     }
 }
 
-fn history_aggregate_snapshot(_: &StateHistoryAggregate) -> ExplainHistoryAggregate {
-    ExplainHistoryAggregate::Count
-}
-
 fn file_history_aggregate_snapshot(_: &FileHistoryAggregate) -> ExplainHistoryAggregate {
     ExplainHistoryAggregate::Count
 }
@@ -6293,241 +5975,6 @@ fn history_predicate_snapshot<Field>(
         field,
         value,
         values,
-    }
-}
-
-fn state_history_projection_snapshot(
-    projection: &StateHistoryProjection,
-) -> StateHistoryProjectionSnapshot {
-    StateHistoryProjectionSnapshot {
-        output_name: projection.output_name.clone(),
-        value: match &projection.value {
-            StateHistoryProjectionValue::Field(field) => {
-                StateHistoryProjectionValueSnapshot::Field(state_history_field_snapshot(field))
-            }
-            StateHistoryProjectionValue::Aggregate(aggregate) => {
-                StateHistoryProjectionValueSnapshot::Aggregate(history_aggregate_snapshot(
-                    aggregate,
-                ))
-            }
-        },
-    }
-}
-
-fn state_history_sort_key_snapshot(key: &StateHistorySortKey) -> StateHistorySortKeySnapshot {
-    StateHistorySortKeySnapshot {
-        output_name: key.output_name.clone(),
-        value: key.value.as_ref().map(|value| match value {
-            StateHistorySortValue::Field(field) => {
-                StateHistorySortValueSnapshot::Field(state_history_field_snapshot(field))
-            }
-            StateHistorySortValue::Aggregate(aggregate) => {
-                StateHistorySortValueSnapshot::Aggregate(history_aggregate_snapshot(aggregate))
-            }
-        }),
-        descending: key.descending,
-    }
-}
-
-fn state_history_predicate_snapshot(
-    predicate: &StateHistoryPredicate,
-) -> HistoryPredicateSnapshot<ExplainStateHistoryField> {
-    match predicate {
-        StateHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::Eq,
-            state_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        StateHistoryPredicate::NotEq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::NotEq,
-            state_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        StateHistoryPredicate::Gt(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::Gt,
-            state_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        StateHistoryPredicate::GtEq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::GtEq,
-            state_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        StateHistoryPredicate::Lt(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::Lt,
-            state_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        StateHistoryPredicate::LtEq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::LtEq,
-            state_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        StateHistoryPredicate::In(field, values) => history_predicate_snapshot(
-            ExplainPredicateOperator::In,
-            state_history_field_snapshot(field),
-            None,
-            values.clone(),
-        ),
-        StateHistoryPredicate::IsNull(field) => history_predicate_snapshot(
-            ExplainPredicateOperator::IsNull,
-            state_history_field_snapshot(field),
-            None,
-            Vec::new(),
-        ),
-        StateHistoryPredicate::IsNotNull(field) => history_predicate_snapshot(
-            ExplainPredicateOperator::IsNotNull,
-            state_history_field_snapshot(field),
-            None,
-            Vec::new(),
-        ),
-    }
-}
-
-fn state_history_aggregate_predicate_snapshot(
-    predicate: &StateHistoryAggregatePredicate,
-) -> StateHistoryAggregatePredicateSnapshot {
-    match predicate {
-        StateHistoryAggregatePredicate::Eq(aggregate, value) => {
-            state_history_aggregate_predicate_snapshot_with_operator(
-                ExplainAggregatePredicateOperator::Eq,
-                aggregate,
-                *value,
-            )
-        }
-        StateHistoryAggregatePredicate::NotEq(aggregate, value) => {
-            state_history_aggregate_predicate_snapshot_with_operator(
-                ExplainAggregatePredicateOperator::NotEq,
-                aggregate,
-                *value,
-            )
-        }
-        StateHistoryAggregatePredicate::Gt(aggregate, value) => {
-            state_history_aggregate_predicate_snapshot_with_operator(
-                ExplainAggregatePredicateOperator::Gt,
-                aggregate,
-                *value,
-            )
-        }
-        StateHistoryAggregatePredicate::GtEq(aggregate, value) => {
-            state_history_aggregate_predicate_snapshot_with_operator(
-                ExplainAggregatePredicateOperator::GtEq,
-                aggregate,
-                *value,
-            )
-        }
-        StateHistoryAggregatePredicate::Lt(aggregate, value) => {
-            state_history_aggregate_predicate_snapshot_with_operator(
-                ExplainAggregatePredicateOperator::Lt,
-                aggregate,
-                *value,
-            )
-        }
-        StateHistoryAggregatePredicate::LtEq(aggregate, value) => {
-            state_history_aggregate_predicate_snapshot_with_operator(
-                ExplainAggregatePredicateOperator::LtEq,
-                aggregate,
-                *value,
-            )
-        }
-    }
-}
-
-fn state_history_aggregate_predicate_snapshot_with_operator(
-    operator: ExplainAggregatePredicateOperator,
-    aggregate: &StateHistoryAggregate,
-    value: i64,
-) -> StateHistoryAggregatePredicateSnapshot {
-    StateHistoryAggregatePredicateSnapshot {
-        operator,
-        aggregate: history_aggregate_snapshot(aggregate),
-        value,
-    }
-}
-
-fn entity_history_projection_snapshot(
-    projection: &EntityHistoryProjection,
-) -> HistoryFieldProjectionSnapshot<ExplainEntityHistoryField> {
-    HistoryFieldProjectionSnapshot {
-        output_name: projection.output_name.clone(),
-        field: entity_history_field_snapshot(&projection.field),
-    }
-}
-
-fn entity_history_sort_key_snapshot(
-    key: &EntityHistorySortKey,
-) -> HistorySortKeySnapshot<ExplainEntityHistoryField> {
-    HistorySortKeySnapshot {
-        output_name: key.output_name.clone(),
-        field: key.field.as_ref().map(entity_history_field_snapshot),
-        descending: key.descending,
-    }
-}
-
-fn entity_history_predicate_snapshot(
-    predicate: &EntityHistoryPredicate,
-) -> HistoryPredicateSnapshot<ExplainEntityHistoryField> {
-    match predicate {
-        EntityHistoryPredicate::Eq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::Eq,
-            entity_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::NotEq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::NotEq,
-            entity_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::Gt(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::Gt,
-            entity_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::GtEq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::GtEq,
-            entity_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::Lt(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::Lt,
-            entity_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::LtEq(field, value) => history_predicate_snapshot(
-            ExplainPredicateOperator::LtEq,
-            entity_history_field_snapshot(field),
-            Some(value.clone()),
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::In(field, values) => history_predicate_snapshot(
-            ExplainPredicateOperator::In,
-            entity_history_field_snapshot(field),
-            None,
-            values.clone(),
-        ),
-        EntityHistoryPredicate::IsNull(field) => history_predicate_snapshot(
-            ExplainPredicateOperator::IsNull,
-            entity_history_field_snapshot(field),
-            None,
-            Vec::new(),
-        ),
-        EntityHistoryPredicate::IsNotNull(field) => history_predicate_snapshot(
-            ExplainPredicateOperator::IsNotNull,
-            entity_history_field_snapshot(field),
-            None,
-            Vec::new(),
-        ),
     }
 }
 
@@ -6752,8 +6199,6 @@ fn explain_stage_label(stage: ExplainStage) -> &'static str {
 
 fn explain_history_read_plan_label(plan: &ExplainHistoryReadPlan) -> &'static str {
     match plan {
-        ExplainHistoryReadPlan::StateHistory(_) => "state_history",
-        ExplainHistoryReadPlan::EntityHistory(_) => "entity_history",
         ExplainHistoryReadPlan::FileHistory(_) => "file_history",
         ExplainHistoryReadPlan::DirectoryHistory(_) => "directory_history",
     }

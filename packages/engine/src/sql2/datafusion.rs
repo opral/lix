@@ -6,9 +6,7 @@ use std::sync::OnceLock;
 use std::thread;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{
-    ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
-};
+use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
@@ -22,8 +20,22 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Par
 use datafusion::prelude::SessionContext;
 use datafusion::{datasource::TableType, physical_plan::SendableRecordBatchStream};
 use futures_util::{stream, TryStreamExt};
+use sqlparser::ast::helpers::attached_token::AttachedToken;
+use sqlparser::ast::{
+    Expr as SqlExpr, GroupByExpr, Ident, Query as SqlQuery, Select as SqlSelect, SelectFlavor,
+    SelectItem as SqlSelectItem, SetExpr as SqlSetExpr, Statement as SqlStatement,
+    TableAlias as SqlTableAlias, TableFactor as SqlTableFactor,
+    TableWithJoins as SqlTableWithJoins, Value as SqlValue,
+};
+use sqlparser::dialect::GenericDialect;
+use sqlparser::parser::Parser;
 use tokio::sync::oneshot;
 
+use super::entity_view::{
+    PreparedSql2EntityViewPlan, Sql2EntityViewBaseRelation, VARIANT_FIELD_METADATA_KEY,
+    VARIANT_FIELD_METADATA_VALUE,
+};
+use super::udf::register_sql2_udfs;
 use crate::catalog::{
     open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,
     open_directory_by_version_surface_snapshot,
@@ -31,18 +43,27 @@ use crate::catalog::{
     open_directory_surface_snapshot, open_file_by_version_surface_snapshot,
     open_file_by_version_surface_snapshot_with_shared_backend, open_file_surface_snapshot,
     open_version_surface_snapshot, open_version_surface_snapshot_with_shared_backend,
-    ChangeSurfaceColumn, ChangeSurfaceFilter, ChangeSurfaceRow, ChangeSurfaceScanRequest,
-    ChangeSurfaceSnapshot, DirectorySurfaceColumn, DirectorySurfaceFilter, DirectorySurfaceRow,
+    open_working_changes_surface_snapshot,
+    open_working_changes_surface_snapshot_with_shared_backend, ChangeSurfaceColumn,
+    ChangeSurfaceFilter, ChangeSurfaceRow, ChangeSurfaceScanRequest, ChangeSurfaceSnapshot,
+    DirectorySurfaceColumn, DirectorySurfaceFilter, DirectorySurfaceRow,
     DirectorySurfaceScanRequest, DirectorySurfaceSnapshot, FileSurfaceColumn, FileSurfaceFilter,
-    FileSurfaceRow, FileSurfaceScanRequest, FileSurfaceSnapshot, SurfaceColumnType, SurfaceFamily,
-    SurfaceRegistry, SurfaceVariant, VersionSurfaceColumn, VersionSurfaceRow,
-    VersionSurfaceScanRequest, VersionSurfaceSnapshot,
+    FileSurfaceRow, FileSurfaceScanRequest, FileSurfaceSnapshot, VersionSurfaceColumn,
+    VersionSurfaceRow, VersionSurfaceScanRequest, VersionSurfaceSnapshot,
+    WorkingChangesSurfaceColumn, WorkingChangesSurfaceFilter, WorkingChangesSurfaceRow,
+    WorkingChangesSurfaceScanRequest, WorkingChangesSurfaceSnapshot,
+};
+use crate::history::{
+    CommittedStateHistoryReader, StateHistoryContentMode, StateHistoryLineageScope,
+    StateHistoryRequest, StateHistoryRootScope, StateHistoryRow, StateHistoryVersionScope,
 };
 use crate::live_state::{
     open_state_by_version_snapshot, open_state_by_version_snapshot_with_shared_backend,
-    StateByVersionScanRequest, StateByVersionSnapshot, StateSurfaceColumn, StateSurfaceFilter,
+    open_visible_state_by_version_snapshot, StateByVersionScanRequest, StateByVersionSnapshot,
+    StateSurfaceColumn, StateSurfaceFilter,
 };
 use crate::sql::diagnostics::sql_unknown_column_error;
+use crate::catalog::SurfaceColumnType;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -51,47 +72,7 @@ pub(crate) struct PreparedSql2ReadArtifact {
     pub(crate) bound_parameters: Vec<Value>,
     pub(crate) active_version_id: String,
     pub(crate) surface_names: Vec<String>,
-    pub(crate) entity_surfaces: BTreeMap<String, PreparedSql2EntitySurfaceSpec>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparedSql2EntitySurfaceSpec {
-    pub(crate) public_name: String,
-    pub(crate) schema_key: String,
-    pub(crate) surface_variant: SurfaceVariant,
-    pub(crate) column_order: Vec<String>,
-    pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
-}
-
-pub(crate) fn prepared_entity_surface_specs_for_registry(
-    registry: &SurfaceRegistry,
-    surface_names: &[String],
-) -> BTreeMap<String, PreparedSql2EntitySurfaceSpec> {
-    surface_names
-        .iter()
-        .filter_map(|surface_name| {
-            let resolved = registry.bind_relation_name(surface_name)?;
-            let schema_key = resolved.implicit_overrides.fixed_schema_key.clone()?;
-            (resolved.descriptor.surface_family == SurfaceFamily::Entity).then(|| {
-                (
-                    surface_name.clone(),
-                    PreparedSql2EntitySurfaceSpec {
-                        public_name: resolved.descriptor.public_name.clone(),
-                        schema_key,
-                        surface_variant: resolved.descriptor.surface_variant,
-                        column_order: resolved
-                            .descriptor
-                            .visible_columns
-                            .iter()
-                            .chain(resolved.descriptor.hidden_columns.iter())
-                            .cloned()
-                            .collect(),
-                        column_types: resolved.column_types,
-                    },
-                )
-            })
-        })
-        .collect()
+    pub(crate) entity_views: BTreeMap<String, PreparedSql2EntityViewPlan>,
 }
 
 pub(crate) async fn execute_read_with_backend(
@@ -114,8 +95,10 @@ async fn collect_query_result_from_ctx(
     ctx: SessionContext,
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<QueryResult, LixError> {
+    let sql = normalize_sql2_query_shape(&artifact.sql)?;
+    validate_variant_text_coercions(&sql, artifact)?;
     let mut dataframe = ctx
-        .sql(&artifact.sql)
+        .sql(&sql)
         .await
         .map_err(|error| datafusion_error_to_lix_error_with_artifact(error, artifact))?;
     if !artifact.bound_parameters.is_empty() {
@@ -129,17 +112,565 @@ async fn collect_query_result_from_ctx(
             )
             .map_err(|error| datafusion_error_to_lix_error_with_artifact(error, artifact))?;
     }
-    let result_columns = dataframe
-        .schema()
-        .fields()
+    let result_schema_fields = dataframe.schema().fields().iter().collect::<Vec<_>>();
+    let result_columns = result_schema_fields
         .iter()
         .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    let variant_result_columns = result_schema_fields
+        .iter()
+        .map(|field| {
+            field
+                .metadata()
+                .get(VARIANT_FIELD_METADATA_KEY)
+                .is_some_and(|value| value == VARIANT_FIELD_METADATA_VALUE)
+        })
         .collect::<Vec<_>>();
     let batches = dataframe
         .collect()
         .await
         .map_err(|error| datafusion_error_to_lix_error_with_artifact(error, artifact))?;
-    query_result_from_batches(&result_columns, &batches)
+    query_result_from_batches(&result_columns, &variant_result_columns, &batches)
+}
+
+fn normalize_sql2_query_shape(sql: &str) -> Result<String, LixError> {
+    let mut statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 query parse failed during normalization: {error}"),
+        )
+    })?;
+    if statements.len() != 1 {
+        return Ok(sql.to_string());
+    }
+
+    let Some(SqlStatement::Query(query)) = statements.get_mut(0) else {
+        return Ok(sql.to_string());
+    };
+    let SqlSetExpr::Select(select) = query.body.as_mut() else {
+        return Ok(sql.to_string());
+    };
+    if !select.from.is_empty() {
+        return Ok(sql.to_string());
+    }
+
+    select.from.push(single_row_source_table());
+    Ok(statements.remove(0).to_string())
+}
+
+fn validate_variant_text_coercions(
+    sql: &str,
+    artifact: &PreparedSql2ReadArtifact,
+) -> Result<(), LixError> {
+    if artifact.entity_views.is_empty() {
+        return Ok(());
+    }
+
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 query parse failed during variant validation: {error}"),
+        )
+    })?;
+    for statement in &statements {
+        if let SqlStatement::Query(query) = statement {
+            validate_variant_text_coercions_in_query(query, artifact, &BTreeMap::new())?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_variant_text_coercions_in_query(
+    query: &SqlQuery,
+    artifact: &PreparedSql2ReadArtifact,
+    outer_scope: &BTreeMap<String, String>,
+) -> Result<(), LixError> {
+    if let Some(with) = &query.with {
+        for cte in &with.cte_tables {
+            validate_variant_text_coercions_in_query(&cte.query, artifact, outer_scope)?;
+        }
+    }
+
+    validate_variant_text_coercions_in_set_expr(&query.body, artifact, outer_scope)?;
+
+    if let Some(order_by) = &query.order_by {
+        if let sqlparser::ast::OrderByKind::Expressions(exprs) = &order_by.kind {
+            for order in exprs {
+                validate_variant_text_coercions_in_expr(&order.expr, artifact, outer_scope)?;
+            }
+        }
+    }
+
+    if let Some(limit_clause) = &query.limit_clause {
+        match limit_clause {
+            sqlparser::ast::LimitClause::LimitOffset { limit, offset, .. } => {
+                if let Some(limit) = limit {
+                    validate_variant_text_coercions_in_expr(limit, artifact, outer_scope)?;
+                }
+                if let Some(offset) = offset {
+                    validate_variant_text_coercions_in_expr(&offset.value, artifact, outer_scope)?;
+                }
+            }
+            sqlparser::ast::LimitClause::OffsetCommaLimit { offset, limit } => {
+                validate_variant_text_coercions_in_expr(offset, artifact, outer_scope)?;
+                validate_variant_text_coercions_in_expr(limit, artifact, outer_scope)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_variant_text_coercions_in_set_expr(
+    set_expr: &SqlSetExpr,
+    artifact: &PreparedSql2ReadArtifact,
+    outer_scope: &BTreeMap<String, String>,
+) -> Result<(), LixError> {
+    match set_expr {
+        SqlSetExpr::Select(select) => {
+            let scope = sql2_variant_scope_for_select(select, artifact, outer_scope)?;
+            for projection in &select.projection {
+                match projection {
+                    SqlSelectItem::UnnamedExpr(expr) => {
+                        validate_variant_text_coercions_in_expr(expr, artifact, &scope)?
+                    }
+                    SqlSelectItem::ExprWithAlias { expr, .. } => {
+                        validate_variant_text_coercions_in_expr(expr, artifact, &scope)?
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(selection) = &select.selection {
+                validate_variant_text_coercions_in_expr(selection, artifact, &scope)?;
+            }
+            match &select.group_by {
+                GroupByExpr::Expressions(exprs, _modifiers) => {
+                    for expr in exprs {
+                        validate_variant_text_coercions_in_expr(expr, artifact, &scope)?;
+                    }
+                }
+                GroupByExpr::All(_) => {}
+            }
+            if let Some(having) = &select.having {
+                validate_variant_text_coercions_in_expr(having, artifact, &scope)?;
+            }
+            if let Some(qualify) = &select.qualify {
+                validate_variant_text_coercions_in_expr(qualify, artifact, &scope)?;
+            }
+            Ok(())
+        }
+        SqlSetExpr::Query(query) => {
+            validate_variant_text_coercions_in_query(query, artifact, outer_scope)
+        }
+        SqlSetExpr::SetOperation { left, right, .. } => {
+            validate_variant_text_coercions_in_set_expr(left, artifact, outer_scope)?;
+            validate_variant_text_coercions_in_set_expr(right, artifact, outer_scope)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn sql2_variant_scope_for_select(
+    select: &SqlSelect,
+    artifact: &PreparedSql2ReadArtifact,
+    outer_scope: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, LixError> {
+    let mut scope = outer_scope.clone();
+    for table_with_joins in &select.from {
+        collect_variant_scope_from_table_factor(&table_with_joins.relation, artifact, &mut scope)?;
+        for join in &table_with_joins.joins {
+            collect_variant_scope_from_table_factor(&join.relation, artifact, &mut scope)?;
+            match &join.join_operator {
+                sqlparser::ast::JoinOperator::Inner(constraint)
+                | sqlparser::ast::JoinOperator::LeftOuter(constraint)
+                | sqlparser::ast::JoinOperator::RightOuter(constraint)
+                | sqlparser::ast::JoinOperator::FullOuter(constraint)
+                | sqlparser::ast::JoinOperator::Semi(constraint)
+                | sqlparser::ast::JoinOperator::LeftSemi(constraint)
+                | sqlparser::ast::JoinOperator::RightSemi(constraint)
+                | sqlparser::ast::JoinOperator::Anti(constraint)
+                | sqlparser::ast::JoinOperator::LeftAnti(constraint)
+                | sqlparser::ast::JoinOperator::RightAnti(constraint)
+                | sqlparser::ast::JoinOperator::StraightJoin(constraint) => {
+                    validate_variant_text_coercions_in_join_constraint(
+                        constraint, artifact, &scope,
+                    )?;
+                }
+                sqlparser::ast::JoinOperator::CrossJoin(_)
+                | sqlparser::ast::JoinOperator::CrossApply
+                | sqlparser::ast::JoinOperator::OuterApply => {}
+                _ => {}
+            }
+        }
+    }
+    Ok(scope)
+}
+
+fn collect_variant_scope_from_table_factor(
+    relation: &SqlTableFactor,
+    artifact: &PreparedSql2ReadArtifact,
+    scope: &mut BTreeMap<String, String>,
+) -> Result<(), LixError> {
+    match relation {
+        SqlTableFactor::Table { name, alias, .. } => {
+            let relation_name = name.to_string();
+            if artifact.entity_views.contains_key(&relation_name) {
+                scope.insert(relation_name.clone(), relation_name.clone());
+                if let Some(alias) = alias {
+                    scope.insert(alias.name.value.clone(), relation_name);
+                }
+            }
+        }
+        SqlTableFactor::Derived { subquery, .. } => {
+            validate_variant_text_coercions_in_query(subquery, artifact, &BTreeMap::new())?;
+        }
+        SqlTableFactor::NestedJoin {
+            table_with_joins,
+            alias,
+        } => {
+            collect_variant_scope_from_table_factor(&table_with_joins.relation, artifact, scope)?;
+            if let Some(alias) = alias {
+                let relation_name = alias.name.value.clone();
+                scope.insert(relation_name.clone(), relation_name);
+            }
+            for join in &table_with_joins.joins {
+                collect_variant_scope_from_table_factor(&join.relation, artifact, scope)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn validate_variant_text_coercions_in_join_constraint(
+    constraint: &sqlparser::ast::JoinConstraint,
+    artifact: &PreparedSql2ReadArtifact,
+    scope: &BTreeMap<String, String>,
+) -> Result<(), LixError> {
+    match constraint {
+        sqlparser::ast::JoinConstraint::On(expr) => {
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)
+        }
+        sqlparser::ast::JoinConstraint::Using(_idents) => {
+            Ok(())
+        }
+        sqlparser::ast::JoinConstraint::Natural | sqlparser::ast::JoinConstraint::None => Ok(()),
+    }
+}
+
+fn validate_variant_text_coercions_in_expr(
+    expr: &SqlExpr,
+    artifact: &PreparedSql2ReadArtifact,
+    scope: &BTreeMap<String, String>,
+) -> Result<(), LixError> {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right } => {
+            if binary_operator_wants_text(op)
+                && ((expr_is_string_like_literal(left) && expr_is_bare_variant_column(right, artifact, scope))
+                    || (expr_is_string_like_literal(right)
+                        && expr_is_bare_variant_column(left, artifact, scope)))
+            {
+                return Err(variant_text_coercion_error(expr));
+            }
+            validate_variant_text_coercions_in_expr(left, artifact, scope)?;
+            validate_variant_text_coercions_in_expr(right, artifact, scope)
+        }
+        SqlExpr::Like { expr, pattern, .. }
+        | SqlExpr::ILike { expr, pattern, .. }
+        | SqlExpr::SimilarTo { expr, pattern, .. }
+        | SqlExpr::RLike { expr, pattern, .. } => {
+            if expr_is_bare_variant_column(expr, artifact, scope)
+                && expr_is_string_like_literal(pattern)
+            {
+                return Err(variant_text_coercion_error(expr));
+            }
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+            validate_variant_text_coercions_in_expr(pattern, artifact, scope)
+        }
+        SqlExpr::InList { expr, list, .. } => {
+            if expr_is_bare_variant_column(expr, artifact, scope)
+                && list.iter().any(expr_is_string_like_literal)
+            {
+                return Err(variant_text_coercion_error(expr));
+            }
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+            for item in list {
+                validate_variant_text_coercions_in_expr(item, artifact, scope)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Between { expr, low, high, .. } => {
+            if expr_is_bare_variant_column(expr, artifact, scope)
+                && (expr_is_string_like_literal(low) || expr_is_string_like_literal(high))
+            {
+                return Err(variant_text_coercion_error(expr));
+            }
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+            validate_variant_text_coercions_in_expr(low, artifact, scope)?;
+            validate_variant_text_coercions_in_expr(high, artifact, scope)
+        }
+        SqlExpr::Nested(expr)
+        | SqlExpr::UnaryOp { expr, .. }
+        | SqlExpr::IsFalse(expr)
+        | SqlExpr::IsNotFalse(expr)
+        | SqlExpr::IsTrue(expr)
+        | SqlExpr::IsNotTrue(expr)
+        | SqlExpr::IsNull(expr)
+        | SqlExpr::IsNotNull(expr)
+        | SqlExpr::IsUnknown(expr)
+        | SqlExpr::IsNotUnknown(expr) => {
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)
+        }
+        SqlExpr::IsDistinctFrom(left, right)
+        | SqlExpr::IsNotDistinctFrom(left, right) => {
+            validate_variant_text_coercions_in_expr(left, artifact, scope)?;
+            validate_variant_text_coercions_in_expr(right, artifact, scope)
+        }
+        SqlExpr::Cast { expr, .. } | SqlExpr::Convert { expr, .. } => {
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)
+        }
+        SqlExpr::Function(function) => {
+            match &function.args {
+                sqlparser::ast::FunctionArguments::None => {}
+                sqlparser::ast::FunctionArguments::Subquery(query) => {
+                    validate_variant_text_coercions_in_query(query, artifact, scope)?;
+                }
+                sqlparser::ast::FunctionArguments::List(args) => {
+                    for arg in &args.args {
+                        match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(
+                                sqlparser::ast::FunctionArgExpr::Expr(expr),
+                            )
+                            | sqlparser::ast::FunctionArg::Named {
+                                arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
+                                ..
+                            }
+                            | sqlparser::ast::FunctionArg::ExprNamed {
+                                arg: sqlparser::ast::FunctionArgExpr::Expr(expr),
+                                ..
+                            } => validate_variant_text_coercions_in_expr(expr, artifact, scope)?,
+                            _ => {}
+                        }
+                    }
+                    for clause in &args.clauses {
+                        match clause {
+                            sqlparser::ast::FunctionArgumentClause::OrderBy(order_by) => {
+                                for order in order_by {
+                                    validate_variant_text_coercions_in_expr(
+                                        &order.expr,
+                                        artifact,
+                                        scope,
+                                    )?;
+                                }
+                            }
+                            sqlparser::ast::FunctionArgumentClause::Limit(expr) => {
+                                validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        SqlExpr::Position { expr, r#in } => {
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+            validate_variant_text_coercions_in_expr(r#in, artifact, scope)
+        }
+        SqlExpr::Substring {
+            expr,
+            substring_from,
+            substring_for,
+            ..
+        } => {
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+            if let Some(from) = substring_from {
+                validate_variant_text_coercions_in_expr(from, artifact, scope)?;
+            }
+            if let Some(for_expr) = substring_for {
+                validate_variant_text_coercions_in_expr(for_expr, artifact, scope)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Trim {
+            expr, trim_what, ..
+        } => {
+            validate_variant_text_coercions_in_expr(expr, artifact, scope)?;
+            if let Some(trim_what) = trim_what {
+                validate_variant_text_coercions_in_expr(trim_what, artifact, scope)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Case {
+            operand,
+            conditions,
+            else_result,
+            ..
+        } => {
+            if let Some(operand) = operand {
+                validate_variant_text_coercions_in_expr(operand, artifact, scope)?;
+            }
+            for condition in conditions {
+                validate_variant_text_coercions_in_expr(&condition.condition, artifact, scope)?;
+                validate_variant_text_coercions_in_expr(&condition.result, artifact, scope)?;
+            }
+            if let Some(else_result) = else_result {
+                validate_variant_text_coercions_in_expr(else_result, artifact, scope)?;
+            }
+            Ok(())
+        }
+        SqlExpr::Exists { subquery, .. } | SqlExpr::Subquery(subquery) => {
+            validate_variant_text_coercions_in_query(subquery, artifact, scope)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn binary_operator_wants_text(op: &sqlparser::ast::BinaryOperator) -> bool {
+    matches!(
+        op,
+        sqlparser::ast::BinaryOperator::Eq
+            | sqlparser::ast::BinaryOperator::NotEq
+            | sqlparser::ast::BinaryOperator::Lt
+            | sqlparser::ast::BinaryOperator::LtEq
+            | sqlparser::ast::BinaryOperator::Gt
+            | sqlparser::ast::BinaryOperator::GtEq
+    )
+}
+
+fn expr_is_string_like_literal(expr: &SqlExpr) -> bool {
+    match expr {
+        SqlExpr::Value(value) => matches!(
+            value.value,
+            SqlValue::SingleQuotedString(_)
+                | SqlValue::DollarQuotedString(_)
+                | SqlValue::TripleSingleQuotedString(_)
+                | SqlValue::TripleDoubleQuotedString(_)
+                | SqlValue::SingleQuotedByteStringLiteral(_)
+                | SqlValue::DoubleQuotedByteStringLiteral(_)
+                | SqlValue::TripleSingleQuotedByteStringLiteral(_)
+                | SqlValue::TripleDoubleQuotedByteStringLiteral(_)
+                | SqlValue::EscapedStringLiteral(_)
+                | SqlValue::UnicodeStringLiteral(_)
+        ),
+        SqlExpr::Nested(expr) => expr_is_string_like_literal(expr),
+        _ => false,
+    }
+}
+
+fn expr_is_bare_variant_column(
+    expr: &SqlExpr,
+    artifact: &PreparedSql2ReadArtifact,
+    scope: &BTreeMap<String, String>,
+) -> bool {
+    match expr {
+        SqlExpr::Identifier(ident) => variant_column_type_for_reference(
+            None,
+            &ident.value,
+            artifact,
+            scope,
+        )
+        .is_some(),
+        SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => {
+            variant_column_type_for_reference(
+                Some(&idents[0].value),
+                &idents[1].value,
+                artifact,
+                scope,
+            )
+            .is_some()
+        }
+        SqlExpr::Nested(expr) => expr_is_bare_variant_column(expr, artifact, scope),
+        _ => false,
+    }
+}
+
+fn variant_column_type_for_reference(
+    qualifier: Option<&str>,
+    column_name: &str,
+    artifact: &PreparedSql2ReadArtifact,
+    scope: &BTreeMap<String, String>,
+) -> Option<SurfaceColumnType> {
+    if let Some(qualifier) = qualifier {
+        let relation_name = scope.get(qualifier)?;
+        let plan = artifact.entity_views.get(relation_name)?;
+        let column_type = plan.column_types.get(column_name)?;
+        return (*column_type == SurfaceColumnType::Variant).then_some(*column_type);
+    }
+
+    let mut variant_matches = artifact
+        .entity_views
+        .values()
+        .filter_map(|plan| {
+            plan.column_types
+                .get(column_name)
+                .copied()
+                .filter(|column_type| *column_type == SurfaceColumnType::Variant)
+        });
+    let first = variant_matches.next()?;
+    variant_matches.next().is_none().then_some(first)
+}
+
+fn variant_text_coercion_error(expr: &SqlExpr) -> LixError {
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!(
+            "variant payload expression '{expr}' requires an explicit cast or extraction before it can be used as text"
+        ),
+    )
+    .with_hint("use CAST(... AS TEXT), lix_text_decode(...), or lix_json_extract(...) explicitly")
+}
+
+fn single_row_source_table() -> SqlTableWithJoins {
+    SqlTableWithJoins {
+        relation: SqlTableFactor::Derived {
+            lateral: false,
+            subquery: Box::new(SqlQuery {
+                with: None,
+                body: Box::new(SqlSetExpr::Select(Box::new(SqlSelect {
+                    select_token: AttachedToken::empty(),
+                    distinct: None,
+                    top: None,
+                    top_before_distinct: false,
+                    projection: vec![SqlSelectItem::ExprWithAlias {
+                        expr: SqlExpr::Value(SqlValue::Number("1".to_string(), false).into()),
+                        alias: Ident::new("__lix_single_row"),
+                    }],
+                    exclude: None,
+                    into: None,
+                    from: Vec::new(),
+                    lateral_views: Vec::new(),
+                    prewhere: None,
+                    selection: None,
+                    group_by: GroupByExpr::Expressions(Vec::new(), Vec::new()),
+                    cluster_by: Vec::new(),
+                    distribute_by: Vec::new(),
+                    sort_by: Vec::new(),
+                    having: None,
+                    named_window: Vec::new(),
+                    qualify: None,
+                    window_before_qualify: false,
+                    value_table_mode: None,
+                    connect_by: None,
+                    flavor: SelectFlavor::Standard,
+                }))),
+                order_by: None,
+                limit_clause: None,
+                fetch: None,
+                locks: Vec::new(),
+                for_clause: None,
+                settings: None,
+                format_clause: None,
+                pipe_operators: Vec::new(),
+            }),
+            alias: Some(SqlTableAlias {
+                explicit: true,
+                name: Ident::new("__lix_single_row_source"),
+                columns: Vec::new(),
+            }),
+        },
+        joins: Vec::new(),
+    }
 }
 
 async fn build_session_for_read_with_borrowed_backend(
@@ -147,6 +678,7 @@ async fn build_session_for_read_with_borrowed_backend(
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<SessionContext, LixError> {
     let ctx = SessionContext::new();
+    register_sql2_udfs(&ctx);
     for surface_name in &artifact.surface_names {
         match surface_name.as_str() {
             "lix_state" => {
@@ -163,10 +695,33 @@ async fn build_session_for_read_with_borrowed_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_state_by_version" => {
-                return Err(LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    "sql2 phase-3 lix_state_by_version currently requires a shared backend execution host",
-                ));
+                let snapshot = open_visible_state_by_version_snapshot(backend).await?;
+                ctx.register_table(
+                    surface_name,
+                    Arc::new(LixStateProvider::new(
+                        LixStateSurfaceKind::StateByVersion,
+                        artifact.active_version_id.clone(),
+                        snapshot,
+                    )),
+                )
+                .map_err(datafusion_error_to_lix_error)?;
+            }
+            "lix_state_history" => {
+                let rows =
+                    load_materialized_state_history_rows(
+                        backend,
+                        &artifact.active_version_id,
+                        &artifact.sql,
+                    )
+                    .await?;
+                ctx.register_table(
+                    surface_name,
+                    Arc::new(LixStateHistoryProvider::new_materialized(
+                        artifact.active_version_id.clone(),
+                        rows,
+                    )),
+                )
+                .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_file" => {
                 let snapshot =
@@ -223,41 +778,36 @@ async fn build_session_for_read_with_borrowed_backend(
                 ctx.register_table(surface_name, Arc::new(LixVersionProvider::new(snapshot)))
                     .map_err(datafusion_error_to_lix_error)?;
             }
+            "lix_working_changes" => {
+                let snapshot =
+                    open_working_changes_surface_snapshot(backend, &artifact.active_version_id)
+                        .await?;
+                ctx.register_table(
+                    surface_name,
+                    Arc::new(LixWorkingChangesProvider::new(snapshot)),
+                )
+                .map_err(datafusion_error_to_lix_error)?;
+            }
             "lix_change" => {
                 let snapshot = open_change_surface_snapshot(backend).await?;
                 ctx.register_table(surface_name, Arc::new(LixChangeProvider::new(snapshot)))
                     .map_err(datafusion_error_to_lix_error)?;
             }
             other => {
-                let Some(spec) = artifact.entity_surfaces.get(other) else {
+                let Some(spec) = artifact.entity_views.get(other) else {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("sql2 phase-2 does not support surface '{other}' yet"),
                     ));
                 };
-                if spec.surface_variant == SurfaceVariant::ByVersion {
-                    return Err(LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!(
-                            "sql2 entity by-version surface '{}' currently requires a shared backend execution host",
-                            spec.public_name
-                        ),
-                    ));
-                }
-                let snapshot =
-                    open_state_by_version_snapshot(backend, &artifact.active_version_id).await?;
-                ctx.register_table(
+                register_entity_view_with_borrowed_backend(
+                    &ctx,
+                    backend,
+                    artifact,
+                    spec,
                     surface_name,
-                    Arc::new(
-                        LixEntityProvider::new(
-                            spec.clone(),
-                            artifact.active_version_id.clone(),
-                            snapshot,
-                        )
-                        .map_err(datafusion_error_to_lix_error)?,
-                    ),
                 )
-                .map_err(datafusion_error_to_lix_error)?;
+                .await?;
             }
         }
     }
@@ -269,11 +819,12 @@ async fn build_session_for_read_with_shared_backend(
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<SessionContext, LixError> {
     let ctx = SessionContext::new();
+    register_sql2_udfs(&ctx);
     let shared_state_snapshot = if artifact
         .surface_names
         .iter()
         .any(|surface| matches!(surface.as_str(), "lix_state" | "lix_state_by_version"))
-        || !artifact.entity_surfaces.is_empty()
+        || !artifact.entity_views.is_empty()
     {
         Some(open_state_by_version_snapshot_with_shared_backend(Arc::clone(&backend)).await?)
     } else {
@@ -319,6 +870,21 @@ async fn build_session_for_read_with_shared_backend(
     } else {
         None
     };
+    let shared_working_changes_snapshot = if artifact
+        .surface_names
+        .iter()
+        .any(|surface| surface.as_str() == "lix_working_changes")
+    {
+        Some(
+            open_working_changes_surface_snapshot_with_shared_backend(
+                Arc::clone(&backend),
+                &artifact.active_version_id,
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     for surface_name in &artifact.surface_names {
         match surface_name.as_str() {
             "lix_state" => {
@@ -347,6 +913,16 @@ async fn build_session_for_read_with_shared_backend(
                                 .as_ref()
                                 .expect("state surface snapshot should exist"),
                         ),
+                    )),
+                )
+                .map_err(datafusion_error_to_lix_error)?;
+            }
+            "lix_state_history" => {
+                ctx.register_table(
+                    surface_name,
+                    Arc::new(LixStateHistoryProvider::new_shared_backend(
+                        artifact.active_version_id.clone(),
+                        Arc::clone(&backend),
                     )),
                 )
                 .map_err(datafusion_error_to_lix_error)?;
@@ -433,33 +1009,138 @@ async fn build_session_for_read_with_shared_backend(
                 )
                 .map_err(datafusion_error_to_lix_error)?;
             }
+            "lix_working_changes" => {
+                ctx.register_table(
+                    surface_name,
+                    Arc::new(LixWorkingChangesProvider::new(Arc::clone(
+                        shared_working_changes_snapshot
+                            .as_ref()
+                            .expect("working changes surface snapshot should exist"),
+                    ))),
+                )
+                .map_err(datafusion_error_to_lix_error)?;
+            }
             other => {
-                let Some(spec) = artifact.entity_surfaces.get(other) else {
+                let Some(spec) = artifact.entity_views.get(other) else {
                     return Err(LixError::new(
                         "LIX_ERROR_UNKNOWN",
                         format!("sql2 phase-2 does not support surface '{other}' yet"),
                     ));
                 };
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(
-                        LixEntityProvider::new(
-                            spec.clone(),
-                            artifact.active_version_id.clone(),
+                match spec.base_relation {
+                    Sql2EntityViewBaseRelation::LixStateHistory => {
+                        register_entity_view_with_shared_history_backend(
+                            &ctx,
+                            artifact,
+                            spec,
+                            surface_name,
+                            Arc::clone(&backend),
+                        )?;
+                    }
+                    Sql2EntityViewBaseRelation::LixState
+                    | Sql2EntityViewBaseRelation::LixStateByVersion => {
+                        register_entity_view_with_shared_snapshot(
+                            &ctx,
+                            artifact,
+                            spec,
+                            surface_name,
                             Arc::clone(
                                 shared_state_snapshot
                                     .as_ref()
                                     .expect("state snapshot should exist for entity surfaces"),
                             ),
-                        )
-                        .map_err(datafusion_error_to_lix_error)?,
-                    ),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                        )?;
+                    }
+                }
             }
         }
     }
     Ok(ctx)
+}
+
+async fn register_entity_view_with_borrowed_backend(
+    ctx: &SessionContext,
+    backend: &dyn LixBackend,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2EntityViewPlan,
+    surface_name: &str,
+) -> Result<(), LixError> {
+    let provider: Arc<dyn TableProvider> = match spec.base_relation {
+        Sql2EntityViewBaseRelation::LixState => Arc::new(LixStateProvider::new(
+            LixStateSurfaceKind::State,
+            artifact.active_version_id.clone(),
+            open_state_by_version_snapshot(backend, &artifact.active_version_id).await?,
+        )),
+        Sql2EntityViewBaseRelation::LixStateByVersion => Arc::new(LixStateProvider::new(
+            LixStateSurfaceKind::StateByVersion,
+            artifact.active_version_id.clone(),
+            open_visible_state_by_version_snapshot(backend).await?,
+        )),
+        Sql2EntityViewBaseRelation::LixStateHistory => {
+            Arc::new(LixStateHistoryProvider::new_materialized(
+                artifact.active_version_id.clone(),
+                load_materialized_state_history_rows(
+                    backend,
+                    &artifact.active_version_id,
+                    &artifact.sql,
+                )
+                .await?,
+            ))
+        }
+    };
+    register_entity_view_provider(ctx, provider, spec, surface_name)
+}
+
+fn register_entity_view_with_shared_snapshot(
+    ctx: &SessionContext,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2EntityViewPlan,
+    surface_name: &str,
+    snapshot: Arc<dyn StateByVersionSnapshot>,
+) -> Result<(), LixError> {
+    let provider: Arc<dyn TableProvider> = Arc::new(LixStateProvider::new(
+        match spec.base_relation {
+            Sql2EntityViewBaseRelation::LixState => LixStateSurfaceKind::State,
+            Sql2EntityViewBaseRelation::LixStateByVersion => LixStateSurfaceKind::StateByVersion,
+            Sql2EntityViewBaseRelation::LixStateHistory => {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "sql2 entity view '{}' must register history-backed surfaces through the history provider",
+                        spec.public_name
+                    ),
+                ))
+            }
+        },
+        artifact.active_version_id.clone(),
+        snapshot,
+    ));
+    register_entity_view_provider(ctx, provider, spec, surface_name)
+}
+
+fn register_entity_view_with_shared_history_backend(
+    ctx: &SessionContext,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2EntityViewPlan,
+    surface_name: &str,
+    backend: Arc<dyn LixBackend + Send + Sync>,
+) -> Result<(), LixError> {
+    let provider: Arc<dyn TableProvider> = Arc::new(LixStateHistoryProvider::new_shared_backend(
+        artifact.active_version_id.clone(),
+        backend,
+    ));
+    register_entity_view_provider(ctx, provider, spec, surface_name)
+}
+
+fn register_entity_view_provider(
+    ctx: &SessionContext,
+    provider: Arc<dyn TableProvider>,
+    spec: &PreparedSql2EntityViewPlan,
+    surface_name: &str,
+) -> Result<(), LixError> {
+    ctx.register_table(surface_name, spec.compiled_view_provider(ctx, provider)?)
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(())
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
@@ -479,7 +1160,7 @@ fn datafusion_error_to_lix_error_with_artifact(
         let available_columns = artifact
             .surface_names
             .first()
-            .and_then(|surface_name| artifact.entity_surfaces.get(surface_name))
+            .and_then(|surface_name| artifact.entity_views.get(surface_name))
             .map(|spec| {
                 spec.column_order
                     .iter()
@@ -549,6 +1230,21 @@ enum LixStateSurfaceKind {
     StateByVersion,
 }
 
+#[derive(Clone)]
+enum LixStateHistorySource {
+    Materialized(Arc<Vec<StateHistoryRow>>),
+    SharedBackend(Arc<dyn LixBackend + Send + Sync>),
+}
+
+impl std::fmt::Debug for LixStateHistorySource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Materialized(rows) => f.debug_tuple("Materialized").field(&rows.len()).finish(),
+            Self::SharedBackend(_) => f.write_str("SharedBackend(..)"),
+        }
+    }
+}
+
 impl LixStateSurfaceKind {
     fn schema(self) -> SchemaRef {
         match self {
@@ -610,32 +1306,54 @@ impl LixStateProvider {
     }
 }
 
-#[derive(Debug, Clone)]
-struct LixEntityProvider {
-    spec: PreparedSql2EntitySurfaceSpec,
-    default_version_id: String,
-    schema: SchemaRef,
-    snapshot: Arc<dyn StateByVersionSnapshot>,
+fn lix_state_history_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("entity_id", DataType::Utf8, false),
+        Field::new("schema_key", DataType::Utf8, false),
+        Field::new("file_id", DataType::Utf8, true),
+        Field::new("plugin_key", DataType::Utf8, true),
+        Field::new("snapshot_content", DataType::Utf8, true),
+        Field::new("metadata", DataType::Utf8, true),
+        Field::new("schema_version", DataType::Utf8, false),
+        Field::new("change_id", DataType::Utf8, false),
+        Field::new("commit_id", DataType::Utf8, false),
+        Field::new("commit_created_at", DataType::Utf8, false),
+        Field::new("root_commit_id", DataType::Utf8, false),
+        Field::new("depth", DataType::Int64, false),
+        Field::new("version_id", DataType::Utf8, false),
+    ]))
 }
 
-impl LixEntityProvider {
-    fn new(
-        spec: PreparedSql2EntitySurfaceSpec,
-        default_version_id: String,
-        snapshot: Arc<dyn StateByVersionSnapshot>,
-    ) -> Result<Self> {
-        let schema = entity_surface_schema(&spec, &spec.column_order)?;
-        Ok(Self {
-            spec,
-            default_version_id,
-            schema,
-            snapshot,
-        })
+#[derive(Debug, Clone)]
+struct LixStateHistoryProvider {
+    active_version_id: String,
+    schema: SchemaRef,
+    source: LixStateHistorySource,
+}
+
+impl LixStateHistoryProvider {
+    fn new_materialized(active_version_id: String, rows: Vec<StateHistoryRow>) -> Self {
+        Self {
+            active_version_id,
+            schema: lix_state_history_schema(),
+            source: LixStateHistorySource::Materialized(Arc::new(rows)),
+        }
+    }
+
+    fn new_shared_backend(
+        active_version_id: String,
+        backend: Arc<dyn LixBackend + Send + Sync>,
+    ) -> Self {
+        Self {
+            active_version_id,
+            schema: lix_state_history_schema(),
+            source: LixStateHistorySource::SharedBackend(backend),
+        }
     }
 }
 
 #[async_trait]
-impl TableProvider for LixEntityProvider {
+impl TableProvider for LixStateHistoryProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -655,7 +1373,7 @@ impl TableProvider for LixEntityProvider {
         Ok(filters
             .iter()
             .map(|filter| {
-                if parse_entity_route_filter(filter, self.spec.surface_variant).is_some() {
+                if parse_state_history_filter(filter).is_some() {
                     TableProviderFilterPushDown::Exact
                 } else {
                     TableProviderFilterPushDown::Unsupported
@@ -671,41 +1389,36 @@ impl TableProvider for LixEntityProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let projected_columns = projected_entity_columns(&self.spec, projection);
-        let projected_schema = entity_surface_schema(&self.spec, &projected_columns)?;
-        let route = LixEntityRoute::from_filters(filters, self.spec.surface_variant);
-        Ok(Arc::new(LixEntityScanExec::new(
-            self.spec.clone(),
-            self.default_version_id.clone(),
-            Arc::clone(&self.snapshot),
+        let projected_schema = projected_schema(&self.schema, projection)?;
+        Ok(Arc::new(LixStateHistoryScanExec::new(
+            self.active_version_id.clone(),
+            self.source.clone(),
             projected_schema,
-            projected_columns,
-            route,
+            projection.cloned(),
+            StateHistoryRoute::from_filters(filters),
             limit,
         )))
     }
 }
 
 #[derive(Debug)]
-struct LixEntityScanExec {
-    spec: PreparedSql2EntitySurfaceSpec,
-    default_version_id: String,
-    snapshot: Arc<dyn StateByVersionSnapshot>,
+struct LixStateHistoryScanExec {
+    active_version_id: String,
+    source: LixStateHistorySource,
     schema: SchemaRef,
-    projected_columns: Vec<String>,
-    route: LixEntityRoute,
+    projection: Option<Vec<usize>>,
+    route: StateHistoryRoute,
     limit: Option<usize>,
     properties: Arc<PlanProperties>,
 }
 
-impl LixEntityScanExec {
+impl LixStateHistoryScanExec {
     fn new(
-        spec: PreparedSql2EntitySurfaceSpec,
-        default_version_id: String,
-        snapshot: Arc<dyn StateByVersionSnapshot>,
+        active_version_id: String,
+        source: LixStateHistorySource,
         schema: SchemaRef,
-        projected_columns: Vec<String>,
-        route: LixEntityRoute,
+        projection: Option<Vec<usize>>,
+        route: StateHistoryRoute,
         limit: Option<usize>,
     ) -> Self {
         let properties = PlanProperties::new(
@@ -715,11 +1428,10 @@ impl LixEntityScanExec {
             Boundedness::Bounded,
         );
         Self {
-            spec,
-            default_version_id,
-            snapshot,
+            active_version_id,
+            source,
             schema,
-            projected_columns,
+            projection,
             route,
             limit,
             properties: Arc::new(properties),
@@ -727,23 +1439,28 @@ impl LixEntityScanExec {
     }
 }
 
-impl DisplayAs for LixEntityScanExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "LixEntityScanExec({})", self.spec.public_name)
+impl DisplayAs for LixStateHistoryScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(
+                    f,
+                    "LixStateHistoryScanExec(active_version_id={}, limit={:?}, route={:?})",
+                    self.active_version_id, self.limit, self.route
+                )
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixStateHistoryScanExec"),
+        }
     }
 }
 
-impl ExecutionPlan for LixEntityScanExec {
+impl ExecutionPlan for LixStateHistoryScanExec {
     fn name(&self) -> &str {
-        "LixEntityScanExec"
+        "LixStateHistoryScanExec"
     }
 
     fn as_any(&self) -> &dyn Any {
         self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {
@@ -759,8 +1476,8 @@ impl ExecutionPlan for LixEntityScanExec {
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
         if !children.is_empty() {
-            return Err(DataFusionError::Internal(
-                "LixEntityScanExec does not support children".to_string(),
+            return Err(DataFusionError::Execution(
+                "LixStateHistoryScanExec does not accept children".to_string(),
             ));
         }
         Ok(self)
@@ -772,45 +1489,368 @@ impl ExecutionPlan for LixEntityScanExec {
         _context: Arc<TaskContext>,
     ) -> Result<SendableRecordBatchStream> {
         if partition != 0 {
-            return Err(DataFusionError::Execution(
-                "sql2 entity provider exposes exactly one partition".to_string(),
-            ));
-        }
-
-        if self.route.contradictory {
-            return Ok(Box::pin(RecordBatchStreamAdapter::new(
-                Arc::clone(&self.schema),
-                stream::iter(Vec::<Result<RecordBatch>>::new()),
+            return Err(DataFusionError::Execution(format!(
+                "LixStateHistoryScanExec only exposes one partition, got {partition}"
             )));
         }
 
-        let scan_request = entity_surface_scan_request(
-            &self.spec,
-            &self.default_version_id,
-            &self.projected_columns,
-            &self.route,
-            self.limit,
-        )?;
-        let snapshot = Arc::clone(&self.snapshot);
-        let spec = self.spec.clone();
-        let projected_columns = self.projected_columns.clone();
+        let active_version_id = self.active_version_id.clone();
+        let source = self.source.clone();
         let schema = Arc::clone(&self.schema);
+        let stream_schema = Arc::clone(&schema);
+        let limit = self.limit;
+        let route = self.route.clone();
+        let zero_column_projection = self
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.is_empty());
         let stream = stream::once(async move {
-            let state_batches =
-                enqueue_state_by_version_scan_batches(snapshot, scan_request).await?;
-            let entity_batches = entity_surface_batches_from_state_batches(
-                &spec,
-                &projected_columns,
-                &state_batches,
-            )?;
+            let request = state_history_request(&active_version_id, &route);
+            let rows = if request_contradictory(&request) {
+                Vec::new()
+            } else {
+                match source {
+                LixStateHistorySource::Materialized(rows) => rows.as_ref().clone(),
+                LixStateHistorySource::SharedBackend(backend) => {
+                    enqueue_state_history_scan(backend, request)
+                        .await?
+                }
+            }};
+            let rows = if let Some(limit) = limit {
+                rows.into_iter().take(limit).collect::<Vec<_>>()
+            } else {
+                rows
+            };
+            let batches = if zero_column_projection {
+                let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+                vec![RecordBatch::try_new_with_options(
+                    Arc::clone(&stream_schema),
+                    vec![],
+                    &options,
+                )
+                .map_err(|error| {
+                    DataFusionError::Execution(format!(
+                        "sql2 failed to build zero-column lix_state_history batch: {error}"
+                    ))
+                })?]
+            } else {
+                state_history_record_batches(Arc::clone(&stream_schema), &rows)?
+            };
             Ok::<_, DataFusionError>(stream::iter(
-                entity_batches
-                    .into_iter()
-                    .map(Ok::<RecordBatch, DataFusionError>),
+                batches.into_iter().map(Ok::<RecordBatch, DataFusionError>),
             ))
         })
         .try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+struct StateHistoryScanJob {
+    backend: Arc<dyn LixBackend + Send + Sync>,
+    request: StateHistoryRequest,
+    reply: oneshot::Sender<std::result::Result<Vec<StateHistoryRow>, LixError>>,
+}
+
+fn state_history_scan_worker() -> &'static mpsc::Sender<StateHistoryScanJob> {
+    static WORKER: OnceLock<mpsc::Sender<StateHistoryScanJob>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<StateHistoryScanJob>();
+        thread::Builder::new()
+            .name("sql2-state-history-scan".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("sql2 state-history runtime should build");
+                while let Ok(job) = rx.recv() {
+                    let result = runtime.block_on(async move {
+                        job.backend
+                            .as_ref()
+                            .load_committed_state_history_rows(&job.request)
+                            .await
+                    });
+                    let _ = job.reply.send(result);
+                }
+            })
+            .expect("sql2 state-history worker thread should spawn");
+        tx
+    })
+}
+
+async fn enqueue_state_history_scan(
+    backend: Arc<dyn LixBackend + Send + Sync>,
+    request: StateHistoryRequest,
+) -> Result<Vec<StateHistoryRow>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    state_history_scan_worker()
+        .send(StateHistoryScanJob {
+            backend,
+            request,
+            reply: reply_tx,
+        })
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "sql2 failed to enqueue state-history scan job: {error}"
+            ))
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| {
+            DataFusionError::Execution("sql2 state-history scan worker dropped reply".to_string())
+        })?
+        .map_err(lix_error_to_datafusion_error)
+}
+
+async fn load_materialized_state_history_rows(
+    backend: &dyn LixBackend,
+    active_version_id: &str,
+    sql: &str,
+) -> Result<Vec<StateHistoryRow>, LixError> {
+    backend
+        .load_committed_state_history_rows(&state_history_request(
+            active_version_id,
+            &state_history_route_from_sql(sql)?,
+        ))
+        .await
+}
+
+fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> StateHistoryRequest {
+    let mut request = StateHistoryRequest {
+        lineage_scope: StateHistoryLineageScope::ActiveVersion,
+        lineage_version_id: Some(active_version_id.to_string()),
+        content_mode: StateHistoryContentMode::IncludeSnapshotContent,
+        ..StateHistoryRequest::default()
+    };
+
+    if !route.root_commit_ids.is_empty() {
+        request.root_scope = StateHistoryRootScope::RequestedRoots(route.root_commit_ids.clone());
+    }
+    if !route.entity_ids.is_empty() {
+        request.entity_ids = route.entity_ids.clone();
+    }
+    if !route.schema_keys.is_empty() {
+        request.schema_keys = route.schema_keys.clone();
+    }
+    if !route.version_ids.is_empty() {
+        request.version_scope = StateHistoryVersionScope::RequestedVersions(route.version_ids.clone());
+    }
+    request.min_depth = route.min_depth;
+    request.max_depth = route.max_depth;
+    request
+}
+
+fn request_contradictory(request: &StateHistoryRequest) -> bool {
+    request.min_depth.zip(request.max_depth).is_some_and(|(min, max)| min > max)
+        || matches!(request.root_scope, StateHistoryRootScope::RequestedRoots(ref roots) if roots.is_empty())
+        || matches!(request.version_scope, StateHistoryVersionScope::RequestedVersions(ref versions) if versions.is_empty())
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StateHistoryRoute {
+    root_commit_ids: Vec<String>,
+    entity_ids: Vec<String>,
+    schema_keys: Vec<String>,
+    version_ids: Vec<String>,
+    min_depth: Option<i64>,
+    max_depth: Option<i64>,
+}
+
+impl StateHistoryRoute {
+    fn from_filters(filters: &[Expr]) -> Self {
+        let mut route = Self::default();
+        for filter in filters {
+            apply_state_history_filter(filter, &mut route);
+        }
+        route
+    }
+}
+
+fn parse_state_history_filter(expr: &Expr) -> Option<()> {
+    let Expr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    match binary_expr.op {
+        Operator::Eq | Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq => {}
+        _ => return None,
+    }
+
+    let Expr::Column(column) = &*binary_expr.left else {
+        return None;
+    };
+    let Expr::Literal(_, _) = &*binary_expr.right else {
+        return None;
+    };
+
+    match column.name.as_str() {
+        "root_commit_id" | "entity_id" | "schema_key" | "version_id" => Some(()),
+        _ => None,
+    }
+}
+
+fn apply_state_history_filter(expr: &Expr, route: &mut StateHistoryRoute) {
+    let Expr::BinaryExpr(binary_expr) = expr else {
+        return;
+    };
+    let Expr::Column(column) = &*binary_expr.left else {
+        return;
+    };
+    let right = &*binary_expr.right;
+    match (column.name.as_str(), &binary_expr.op, right) {
+        ("root_commit_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
+        | ("entity_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
+        | ("schema_key", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
+        | ("version_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
+            let bucket = match column.name.as_str() {
+                "root_commit_id" => &mut route.root_commit_ids,
+                "entity_id" => &mut route.entity_ids,
+                "schema_key" => &mut route.schema_keys,
+                "version_id" => &mut route.version_ids,
+                _ => unreachable!(),
+            };
+            if !bucket.contains(value) {
+                bucket.push(value.clone());
+            }
+        }
+        ("depth", Operator::Eq, depth_expr) => {
+            if let Some(value) = scalar_i64_literal(depth_expr) {
+                route.min_depth = Some(value);
+                route.max_depth = Some(value);
+            }
+        }
+        ("depth", Operator::Gt, depth_expr) => {
+            if let Some(value) = scalar_i64_literal(depth_expr) {
+                route.min_depth =
+                    Some(route.min_depth.map_or(value + 1, |current| current.max(value + 1)));
+            }
+        }
+        ("depth", Operator::GtEq, depth_expr) => {
+            if let Some(value) = scalar_i64_literal(depth_expr) {
+                route.min_depth =
+                    Some(route.min_depth.map_or(value, |current| current.max(value)));
+            }
+        }
+        ("depth", Operator::Lt, depth_expr) => {
+            if let Some(value) = scalar_i64_literal(depth_expr) {
+                route.max_depth =
+                    Some(route.max_depth.map_or(value - 1, |current| current.min(value - 1)));
+            }
+        }
+        ("depth", Operator::LtEq, depth_expr) => {
+            if let Some(value) = scalar_i64_literal(depth_expr) {
+                route.max_depth =
+                    Some(route.max_depth.map_or(value, |current| current.min(value)));
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scalar_i64_literal(expr: &Expr) -> Option<i64> {
+    match expr {
+        Expr::Literal(ScalarValue::Int8(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int16(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int32(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::Int64(Some(value)), _) => Some(*value),
+        Expr::Literal(ScalarValue::UInt8(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::UInt16(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::UInt32(Some(value)), _) => Some(i64::from(*value)),
+        Expr::Literal(ScalarValue::UInt64(Some(value)), _) => i64::try_from(*value).ok(),
+        _ => None,
+    }
+}
+
+fn state_history_route_from_sql(sql: &str) -> Result<StateHistoryRoute, LixError> {
+    let statements = Parser::parse_sql(&GenericDialect {}, sql).map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 query parse failed during state-history route extraction: {error}"),
+        )
+    })?;
+    let mut route = StateHistoryRoute::default();
+    for statement in &statements {
+        if let SqlStatement::Query(query) = statement {
+            collect_state_history_route_from_query(query, &mut route);
+        }
+    }
+    Ok(route)
+}
+
+fn collect_state_history_route_from_query(query: &SqlQuery, route: &mut StateHistoryRoute) {
+    if let SqlSetExpr::Select(select) = query.body.as_ref() {
+        if let Some(selection) = &select.selection {
+            collect_state_history_route_from_sql_expr(selection, route);
+        }
+    }
+}
+
+fn collect_state_history_route_from_sql_expr(expr: &SqlExpr, route: &mut StateHistoryRoute) {
+    match expr {
+        SqlExpr::BinaryOp { left, op, right } => {
+            if *op == sqlparser::ast::BinaryOperator::And {
+                collect_state_history_route_from_sql_expr(left, route);
+                collect_state_history_route_from_sql_expr(right, route);
+                return;
+            }
+            match (history_column_name(left), op, sql_expr_string_literal(right)) {
+                (Some("root_commit_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                    if !route.root_commit_ids.contains(&value.to_string()) {
+                        route.root_commit_ids.push(value.to_string());
+                    }
+                }
+                (Some("entity_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                    if !route.entity_ids.contains(&value.to_string()) {
+                        route.entity_ids.push(value.to_string());
+                    }
+                }
+                (Some("schema_key"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                    if !route.schema_keys.contains(&value.to_string()) {
+                        route.schema_keys.push(value.to_string());
+                    }
+                }
+                (Some("version_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                    if !route.version_ids.contains(&value.to_string()) {
+                        route.version_ids.push(value.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+        SqlExpr::Nested(inner) => collect_state_history_route_from_sql_expr(inner, route),
+        SqlExpr::InList {
+            expr,
+            list,
+            negated: false,
+        } => {
+            if let Some("root_commit_id") = history_column_name(expr) {
+                for item in list {
+                    if let Some(value) = sql_expr_string_literal(item) {
+                        if !route.root_commit_ids.contains(&value.to_string()) {
+                            route.root_commit_ids.push(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn history_column_name(expr: &SqlExpr) -> Option<&str> {
+    match expr {
+        SqlExpr::Identifier(ident) => Some(ident.value.as_str()),
+        SqlExpr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
+        _ => None,
+    }
+    .filter(|name| matches!(*name, "root_commit_id" | "entity_id" | "schema_key" | "version_id"))
+}
+
+fn sql_expr_string_literal(expr: &SqlExpr) -> Option<&str> {
+    match expr {
+        SqlExpr::Value(value) => match value.value {
+            SqlValue::SingleQuotedString(ref inner) => Some(inner.as_str()),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -968,11 +2008,16 @@ impl ExecutionPlan for LixStateScanExec {
         let route = self.route.clone();
         let limit = self.limit;
         let schema = Arc::clone(&self.schema);
+        let stream_schema = Arc::clone(&schema);
+        let zero_column_projection = self
+            .projection
+            .as_ref()
+            .is_some_and(|projection| projection.is_empty());
         let stream = stream::once(async move {
             let batches = if route.contradictory {
                 Vec::new()
             } else {
-                enqueue_state_by_version_scan_batches(
+                let batches = enqueue_state_by_version_scan_batches(
                     snapshot,
                     state_by_version_scan_request(
                         surface_kind,
@@ -982,7 +2027,28 @@ impl ExecutionPlan for LixStateScanExec {
                         limit,
                     )?,
                 )
-                .await?
+                .await?;
+                if zero_column_projection {
+                    batches
+                        .iter()
+                        .map(|batch| {
+                            let options =
+                                RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+                            RecordBatch::try_new_with_options(
+                                Arc::clone(&stream_schema),
+                                vec![],
+                                &options,
+                            )
+                            .map_err(|error| {
+                                DataFusionError::Execution(format!(
+                                    "sql2 failed to build zero-column lix_state batch: {error}"
+                                ))
+                            })
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                } else {
+                    batches
+                }
             };
             Ok::<_, DataFusionError>(stream::iter(
                 batches.into_iter().map(Ok::<RecordBatch, DataFusionError>),
@@ -1047,6 +2113,57 @@ async fn enqueue_state_by_version_scan_batches(
             DataFusionError::Execution("sql2 live_state scan worker dropped reply".to_string())
         })?
         .map_err(lix_error_to_datafusion_error)
+}
+
+fn state_history_record_batches(
+    schema: SchemaRef,
+    rows: &[StateHistoryRow],
+) -> Result<Vec<RecordBatch>> {
+    Ok(vec![state_history_record_batch(schema, rows)?])
+}
+
+fn state_history_record_batch(schema: SchemaRef, rows: &[StateHistoryRow]) -> Result<RecordBatch> {
+    let arrays = schema
+        .fields()
+        .iter()
+        .map(|field| {
+            Ok(match field.name().as_str() {
+                "entity_id" => string_array(rows.iter().map(|row| Some(row.entity_id.as_str()))),
+                "schema_key" => string_array(rows.iter().map(|row| Some(row.schema_key.as_str()))),
+                "file_id" => string_array(rows.iter().map(|row| row.file_id.as_deref())),
+                "plugin_key" => string_array(rows.iter().map(|row| row.plugin_key.as_deref())),
+                "snapshot_content" => {
+                    string_array(rows.iter().map(|row| row.snapshot_content.as_deref()))
+                }
+                "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
+                "schema_version" => {
+                    string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
+                }
+                "change_id" => string_array(rows.iter().map(|row| Some(row.change_id.as_str()))),
+                "commit_id" => string_array(rows.iter().map(|row| Some(row.commit_id.as_str()))),
+                "commit_created_at" => {
+                    string_array(rows.iter().map(|row| Some(row.commit_created_at.as_str())))
+                }
+                "root_commit_id" => {
+                    string_array(rows.iter().map(|row| Some(row.root_commit_id.as_str())))
+                }
+                "depth" => Arc::new(datafusion::arrow::array::Int64Array::from(
+                    rows.iter().map(|row| row.depth).collect::<Vec<_>>(),
+                )) as ArrayRef,
+                "version_id" => string_array(rows.iter().map(|row| Some(row.version_id.as_str()))),
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "sql2 does not support lix_state_history column '{other}'"
+                    )))
+                }
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    RecordBatch::try_new(schema, arrays).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "sql2 failed to build lix_state_history batch: {error}"
+        ))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2326,6 +3443,375 @@ fn change_projection_for_scan(projection: Option<&Vec<usize>>) -> Vec<ChangeSurf
     })
 }
 
+fn lix_working_changes_schema() -> SchemaRef {
+    Arc::new(Schema::new(vec![
+        Field::new("entity_id", DataType::Utf8, false),
+        Field::new("schema_key", DataType::Utf8, false),
+        Field::new("file_id", DataType::Utf8, true),
+        Field::new("lixcol_global", DataType::Boolean, false),
+        Field::new("before_change_id", DataType::Utf8, true),
+        Field::new("after_change_id", DataType::Utf8, true),
+        Field::new("before_commit_id", DataType::Utf8, true),
+        Field::new("after_commit_id", DataType::Utf8, true),
+        Field::new("status", DataType::Utf8, false),
+    ]))
+}
+
+#[derive(Debug, Clone)]
+struct LixWorkingChangesProvider {
+    schema: SchemaRef,
+    snapshot: Arc<dyn WorkingChangesSurfaceSnapshot>,
+}
+
+impl LixWorkingChangesProvider {
+    fn new(snapshot: Arc<dyn WorkingChangesSurfaceSnapshot>) -> Self {
+        Self {
+            schema: lix_working_changes_schema(),
+            snapshot,
+        }
+    }
+}
+
+#[async_trait]
+impl TableProvider for LixWorkingChangesProvider {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> Result<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|_| TableProviderFilterPushDown::Unsupported)
+            .collect())
+    }
+
+    async fn scan(
+        &self,
+        _state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let projected_schema = projected_schema(&self.schema, projection)?;
+        let route = LixWorkingChangesRoute::from_filters(filters);
+        Ok(Arc::new(LixWorkingChangesScanExec::new(
+            Arc::clone(&self.snapshot),
+            projected_schema,
+            projection.cloned(),
+            route,
+            limit,
+        )))
+    }
+}
+
+#[derive(Debug)]
+struct LixWorkingChangesScanExec {
+    snapshot: Arc<dyn WorkingChangesSurfaceSnapshot>,
+    schema: SchemaRef,
+    projection: Option<Vec<usize>>,
+    route: LixWorkingChangesRoute,
+    limit: Option<usize>,
+    properties: Arc<PlanProperties>,
+}
+
+impl LixWorkingChangesScanExec {
+    fn new(
+        snapshot: Arc<dyn WorkingChangesSurfaceSnapshot>,
+        schema: SchemaRef,
+        projection: Option<Vec<usize>>,
+        route: LixWorkingChangesRoute,
+        limit: Option<usize>,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            snapshot,
+            schema,
+            projection,
+            route,
+            limit,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for LixWorkingChangesScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "LixWorkingChangesScanExec")
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixWorkingChangesScanExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for LixWorkingChangesScanExec {
+    fn name(&self) -> &str {
+        "LixWorkingChangesScanExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Execution(
+                "LixWorkingChangesScanExec does not accept children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "LixWorkingChangesScanExec only exposes one partition, got {partition}"
+            )));
+        }
+
+        if self.route.contradictory {
+            return Ok(Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&self.schema),
+                stream::iter(Vec::<Result<RecordBatch>>::new()),
+            )));
+        }
+
+        let snapshot = Arc::clone(&self.snapshot);
+        let projection = self.projection.clone();
+        let route = self.route.clone();
+        let limit = self.limit;
+        let schema = Arc::clone(&self.schema);
+        let stream = stream::once(async move {
+            let scan_projection = working_changes_projection_for_scan(projection.as_ref());
+            let rows = enqueue_working_changes_surface_scan(
+                snapshot,
+                WorkingChangesSurfaceScanRequest {
+                    projection: scan_projection.clone(),
+                    filters: route.working_changes_filters(),
+                    limit,
+                },
+            )
+            .await?;
+            let batches = working_changes_surface_record_batches(scan_projection, &rows)?;
+            Ok::<_, DataFusionError>(stream::iter(
+                batches.into_iter().map(Ok::<RecordBatch, DataFusionError>),
+            ))
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+    }
+}
+
+#[derive(Debug)]
+struct WorkingChangesSurfaceScanJob {
+    snapshot: Arc<dyn WorkingChangesSurfaceSnapshot>,
+    request: WorkingChangesSurfaceScanRequest,
+    reply: oneshot::Sender<std::result::Result<Vec<WorkingChangesSurfaceRow>, LixError>>,
+}
+
+fn working_changes_surface_scan_worker() -> &'static mpsc::Sender<WorkingChangesSurfaceScanJob> {
+    static WORKER: OnceLock<mpsc::Sender<WorkingChangesSurfaceScanJob>> = OnceLock::new();
+    WORKER.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<WorkingChangesSurfaceScanJob>();
+        thread::Builder::new()
+            .name("sql2-working-changes-surface-scan".to_string())
+            .spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("sql2 working-changes-surface runtime should build");
+                while let Ok(job) = rx.recv() {
+                    let result = runtime.block_on(async move {
+                        job.snapshot.scan_working_changes(&job.request).await
+                    });
+                    let _ = job.reply.send(result);
+                }
+            })
+            .expect("sql2 working-changes-surface worker thread should spawn");
+        tx
+    })
+}
+
+async fn enqueue_working_changes_surface_scan(
+    snapshot: Arc<dyn WorkingChangesSurfaceSnapshot>,
+    request: WorkingChangesSurfaceScanRequest,
+) -> Result<Vec<WorkingChangesSurfaceRow>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    working_changes_surface_scan_worker()
+        .send(WorkingChangesSurfaceScanJob {
+            snapshot,
+            request,
+            reply: reply_tx,
+        })
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "sql2 failed to enqueue working changes surface scan job: {error}"
+            ))
+        })?;
+    reply_rx
+        .await
+        .map_err(|_| {
+            DataFusionError::Execution(
+                "sql2 working changes surface scan worker dropped reply".to_string(),
+            )
+        })?
+        .map_err(lix_error_to_datafusion_error)
+}
+
+fn working_changes_surface_record_batches(
+    projection: Vec<WorkingChangesSurfaceColumn>,
+    rows: &[WorkingChangesSurfaceRow],
+) -> Result<Vec<RecordBatch>> {
+    Ok(vec![working_changes_surface_record_batch(
+        &projection,
+        rows,
+    )?])
+}
+
+fn working_changes_surface_record_batch(
+    projection: &[WorkingChangesSurfaceColumn],
+    rows: &[WorkingChangesSurfaceRow],
+) -> Result<RecordBatch> {
+    if projection.is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        return RecordBatch::try_new_with_options(
+            working_changes_surface_schema(projection),
+            vec![],
+            &options,
+        )
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "sql2 failed to build zero-column lix_working_changes batch: {error}"
+            ))
+        });
+    }
+
+    let arrays = projection
+        .iter()
+        .map(|column| match column {
+            WorkingChangesSurfaceColumn::EntityId => {
+                string_array(rows.iter().map(|row| Some(row.entity_id.as_str())))
+            }
+            WorkingChangesSurfaceColumn::SchemaKey => {
+                string_array(rows.iter().map(|row| Some(row.schema_key.as_str())))
+            }
+            WorkingChangesSurfaceColumn::FileId => {
+                string_array(rows.iter().map(|row| row.file_id.as_deref()))
+            }
+            WorkingChangesSurfaceColumn::LixcolGlobal => Arc::new(BooleanArray::from(
+                rows.iter().map(|row| row.lixcol_global).collect::<Vec<_>>(),
+            )) as ArrayRef,
+            WorkingChangesSurfaceColumn::BeforeChangeId => {
+                string_array(rows.iter().map(|row| row.before_change_id.as_deref()))
+            }
+            WorkingChangesSurfaceColumn::AfterChangeId => {
+                string_array(rows.iter().map(|row| row.after_change_id.as_deref()))
+            }
+            WorkingChangesSurfaceColumn::BeforeCommitId => {
+                string_array(rows.iter().map(|row| row.before_commit_id.as_deref()))
+            }
+            WorkingChangesSurfaceColumn::AfterCommitId => {
+                string_array(rows.iter().map(|row| row.after_commit_id.as_deref()))
+            }
+            WorkingChangesSurfaceColumn::Status => {
+                string_array(rows.iter().map(|row| Some(row.status.as_str())))
+            }
+        })
+        .collect::<Vec<_>>();
+    RecordBatch::try_new(working_changes_surface_schema(projection), arrays).map_err(|error| {
+        DataFusionError::Execution(format!(
+            "sql2 failed to build lix_working_changes batch: {error}"
+        ))
+    })
+}
+
+fn working_changes_surface_schema(projection: &[WorkingChangesSurfaceColumn]) -> SchemaRef {
+    Arc::new(Schema::new(
+        projection
+            .iter()
+            .map(|column| match column {
+                WorkingChangesSurfaceColumn::EntityId => {
+                    Field::new("entity_id", DataType::Utf8, false)
+                }
+                WorkingChangesSurfaceColumn::SchemaKey => {
+                    Field::new("schema_key", DataType::Utf8, false)
+                }
+                WorkingChangesSurfaceColumn::FileId => Field::new("file_id", DataType::Utf8, true),
+                WorkingChangesSurfaceColumn::LixcolGlobal => {
+                    Field::new("lixcol_global", DataType::Boolean, false)
+                }
+                WorkingChangesSurfaceColumn::BeforeChangeId => {
+                    Field::new("before_change_id", DataType::Utf8, true)
+                }
+                WorkingChangesSurfaceColumn::AfterChangeId => {
+                    Field::new("after_change_id", DataType::Utf8, true)
+                }
+                WorkingChangesSurfaceColumn::BeforeCommitId => {
+                    Field::new("before_commit_id", DataType::Utf8, true)
+                }
+                WorkingChangesSurfaceColumn::AfterCommitId => {
+                    Field::new("after_commit_id", DataType::Utf8, true)
+                }
+                WorkingChangesSurfaceColumn::Status => Field::new("status", DataType::Utf8, false),
+            })
+            .collect::<Vec<_>>(),
+    ))
+}
+
+fn working_changes_projection_for_scan(
+    projection: Option<&Vec<usize>>,
+) -> Vec<WorkingChangesSurfaceColumn> {
+    let all_columns = vec![
+        WorkingChangesSurfaceColumn::EntityId,
+        WorkingChangesSurfaceColumn::SchemaKey,
+        WorkingChangesSurfaceColumn::FileId,
+        WorkingChangesSurfaceColumn::LixcolGlobal,
+        WorkingChangesSurfaceColumn::BeforeChangeId,
+        WorkingChangesSurfaceColumn::AfterChangeId,
+        WorkingChangesSurfaceColumn::BeforeCommitId,
+        WorkingChangesSurfaceColumn::AfterCommitId,
+        WorkingChangesSurfaceColumn::Status,
+    ];
+    projection.map_or(all_columns.clone(), |indices| {
+        indices
+            .iter()
+            .filter_map(|index| all_columns.get(*index).copied())
+            .collect()
+    })
+}
+
 fn lix_version_schema() -> SchemaRef {
     Arc::new(Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
@@ -2699,6 +4185,109 @@ fn change_filters_for_route(route: &LixChangeRoute) -> Vec<ChangeSurfaceFilter> 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct LixWorkingChangesRoute {
+    entity_id: Option<String>,
+    schema_key: Option<String>,
+    file_id: Option<String>,
+    status: Option<String>,
+    contradictory: bool,
+}
+
+impl LixWorkingChangesRoute {
+    fn from_filters(filters: &[Expr]) -> Self {
+        let mut route = Self::default();
+        for filter in filters {
+            let Expr::BinaryExpr(binary_expr) = filter else {
+                continue;
+            };
+            if binary_expr.op != Operator::Eq {
+                continue;
+            }
+
+            let predicate = parse_working_changes_route_column_literal_filter(
+                &binary_expr.left,
+                &binary_expr.right,
+            )
+            .or_else(|| {
+                parse_working_changes_route_column_literal_filter(
+                    &binary_expr.right,
+                    &binary_expr.left,
+                )
+            });
+            let Some((field, value)) = predicate else {
+                continue;
+            };
+
+            let slot = match field {
+                "entity_id" => &mut route.entity_id,
+                "schema_key" => &mut route.schema_key,
+                "file_id" => &mut route.file_id,
+                "status" => &mut route.status,
+                _ => continue,
+            };
+            assign_route_slot(slot, value, &mut route.contradictory);
+        }
+        route
+    }
+
+    fn working_changes_filters(&self) -> Vec<WorkingChangesSurfaceFilter> {
+        let mut filters = Vec::new();
+        if let Some(entity_id) = &self.entity_id {
+            filters.push(WorkingChangesSurfaceFilter::Eq(
+                WorkingChangesSurfaceColumn::EntityId,
+                Value::Text(entity_id.clone()),
+            ));
+        }
+        if let Some(schema_key) = &self.schema_key {
+            filters.push(WorkingChangesSurfaceFilter::Eq(
+                WorkingChangesSurfaceColumn::SchemaKey,
+                Value::Text(schema_key.clone()),
+            ));
+        }
+        if let Some(file_id) = &self.file_id {
+            filters.push(WorkingChangesSurfaceFilter::Eq(
+                WorkingChangesSurfaceColumn::FileId,
+                Value::Text(file_id.clone()),
+            ));
+        }
+        if let Some(status) = &self.status {
+            filters.push(WorkingChangesSurfaceFilter::Eq(
+                WorkingChangesSurfaceColumn::Status,
+                Value::Text(status.clone()),
+            ));
+        }
+        filters
+    }
+}
+
+fn parse_working_changes_route_column_literal_filter(
+    column_expr: &Expr,
+    literal_expr: &Expr,
+) -> Option<(&'static str, String)> {
+    let Expr::Column(column) = column_expr else {
+        return None;
+    };
+    let Expr::Literal(literal, _) = literal_expr else {
+        return None;
+    };
+
+    let value = match literal {
+        ScalarValue::Utf8(Some(value))
+        | ScalarValue::Utf8View(Some(value))
+        | ScalarValue::LargeUtf8(Some(value)) => value.clone(),
+        _ => return None,
+    };
+
+    match column.name.as_str() {
+        "entity_id" => Some(("entity_id", value)),
+        "schema_key" => Some(("schema_key", value)),
+        "file_id" => Some(("file_id", value)),
+        "status" => Some(("status", value)),
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct LixStateRoute {
     version_id: Option<String>,
     schema_key: Option<String>,
@@ -2960,11 +4549,8 @@ fn state_by_version_scan_request(
     limit: Option<usize>,
 ) -> Result<StateByVersionScanRequest> {
     let version_id = match surface_kind {
-        LixStateSurfaceKind::State => default_version_id.to_string(),
-        LixStateSurfaceKind::StateByVersion => route
-            .version_id
-            .clone()
-            .unwrap_or_else(|| default_version_id.to_string()),
+        LixStateSurfaceKind::State => Some(default_version_id.to_string()),
+        LixStateSurfaceKind::StateByVersion => route.version_id.clone(),
     };
     Ok(StateByVersionScanRequest {
         version_id,
@@ -3014,115 +4600,6 @@ fn directory_surface_scan_request(
         filters,
         limit,
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct LixEntityRoute {
-    lixcol_version_id: Option<String>,
-    lixcol_entity_id: Option<String>,
-    lixcol_file_id: Option<String>,
-    lixcol_global: Option<bool>,
-    lixcol_untracked: Option<bool>,
-    contradictory: bool,
-}
-
-impl LixEntityRoute {
-    fn from_filters(filters: &[Expr], surface_variant: SurfaceVariant) -> Self {
-        let mut route = Self::default();
-        for filter in filters {
-            let Some(predicate) = parse_entity_route_filter(filter, surface_variant) else {
-                continue;
-            };
-
-            match predicate {
-                RoutePredicate::Boolean { field, value } => {
-                    let slot = match field {
-                        RouteBooleanField::LixcolGlobal => &mut route.lixcol_global,
-                        RouteBooleanField::LixcolUntracked => &mut route.lixcol_untracked,
-                        RouteBooleanField::Global
-                        | RouteBooleanField::Untracked
-                        | RouteBooleanField::Hidden => continue,
-                    };
-                    assign_route_slot(slot, value, &mut route.contradictory);
-                }
-                RoutePredicate::String { field, value } => {
-                    let slot = match field {
-                        RouteStringField::LixcolVersionId => &mut route.lixcol_version_id,
-                        RouteStringField::EntityId => &mut route.lixcol_entity_id,
-                        RouteStringField::FileId => &mut route.lixcol_file_id,
-                        RouteStringField::VersionId
-                        | RouteStringField::SchemaKey
-                        | RouteStringField::PluginKey
-                        | RouteStringField::Id
-                        | RouteStringField::Path => continue,
-                    };
-                    assign_route_slot(slot, value, &mut route.contradictory);
-                }
-            }
-        }
-        route
-    }
-
-    fn state_filters(&self, schema_key: &str) -> Vec<StateSurfaceFilter> {
-        let mut filters = vec![StateSurfaceFilter::Eq(
-            StateSurfaceColumn::SchemaKey,
-            Value::Text(schema_key.to_string()),
-        )];
-        if let Some(entity_id) = &self.lixcol_entity_id {
-            filters.push(StateSurfaceFilter::Eq(
-                StateSurfaceColumn::EntityId,
-                Value::Text(entity_id.clone()),
-            ));
-        }
-        if let Some(file_id) = &self.lixcol_file_id {
-            filters.push(StateSurfaceFilter::Eq(
-                StateSurfaceColumn::FileId,
-                Value::Text(file_id.clone()),
-            ));
-        }
-        if let Some(global) = self.lixcol_global {
-            filters.push(StateSurfaceFilter::Eq(
-                StateSurfaceColumn::Global,
-                Value::Boolean(global),
-            ));
-        }
-        if let Some(untracked) = self.lixcol_untracked {
-            filters.push(StateSurfaceFilter::Eq(
-                StateSurfaceColumn::Untracked,
-                Value::Boolean(untracked),
-            ));
-        }
-        filters
-    }
-}
-
-fn entity_surface_scan_request(
-    spec: &PreparedSql2EntitySurfaceSpec,
-    default_version_id: &str,
-    projected_columns: &[String],
-    route: &LixEntityRoute,
-    limit: Option<usize>,
-) -> Result<StateByVersionScanRequest> {
-    let version_id = match spec.surface_variant {
-        SurfaceVariant::Default => default_version_id.to_string(),
-        SurfaceVariant::ByVersion => route
-            .lixcol_version_id
-            .clone()
-            .unwrap_or_else(|| default_version_id.to_string()),
-        other => {
-            return Err(DataFusionError::Execution(format!(
-                "sql2 does not support entity surface variant {:?} for {} yet",
-                other, spec.public_name
-            )));
-        }
-    };
-
-    Ok(StateByVersionScanRequest {
-        version_id,
-        projection: entity_state_projection(projected_columns),
-        filters: route.state_filters(&spec.schema_key),
-        limit,
-    })
 }
 
 fn assign_route_slot<T: PartialEq>(slot: &mut Option<T>, value: T, contradictory: &mut bool) {
@@ -3237,27 +4714,6 @@ fn parse_change_route_filter(expr: &Expr) -> Option<RoutePredicate> {
         .or_else(|| parse_change_route_column_literal_filter(&binary_expr.right, &binary_expr.left))
 }
 
-fn parse_entity_route_filter(
-    expr: &Expr,
-    surface_variant: SurfaceVariant,
-) -> Option<RoutePredicate> {
-    let Expr::BinaryExpr(binary_expr) = expr else {
-        return None;
-    };
-    if binary_expr.op != Operator::Eq {
-        return None;
-    }
-
-    parse_entity_route_column_literal_filter(&binary_expr.left, &binary_expr.right, surface_variant)
-        .or_else(|| {
-            parse_entity_route_column_literal_filter(
-                &binary_expr.right,
-                &binary_expr.left,
-                surface_variant,
-            )
-        })
-}
-
 fn parse_directory_route_column_literal_filter(
     column_expr: &Expr,
     literal_expr: &Expr,
@@ -3298,30 +4754,6 @@ fn parse_change_route_column_literal_filter(
         "file_id" => parse_string_route(literal, RouteStringField::FileId),
         "plugin_key" => parse_string_route(literal, RouteStringField::PluginKey),
         "untracked" => parse_boolean_route(literal, RouteBooleanField::Untracked),
-        _ => None,
-    }
-}
-
-fn parse_entity_route_column_literal_filter(
-    column_expr: &Expr,
-    literal_expr: &Expr,
-    surface_variant: SurfaceVariant,
-) -> Option<RoutePredicate> {
-    let Expr::Column(column) = column_expr else {
-        return None;
-    };
-    let Expr::Literal(literal, _) = literal_expr else {
-        return None;
-    };
-
-    match column.name.as_str() {
-        "lixcol_version_id" if surface_variant == SurfaceVariant::ByVersion => {
-            parse_string_route(literal, RouteStringField::LixcolVersionId)
-        }
-        "lixcol_entity_id" => parse_string_route(literal, RouteStringField::EntityId),
-        "lixcol_file_id" => parse_string_route(literal, RouteStringField::FileId),
-        "lixcol_global" => parse_boolean_route(literal, RouteBooleanField::LixcolGlobal),
-        "lixcol_untracked" => parse_boolean_route(literal, RouteBooleanField::LixcolUntracked),
         _ => None,
     }
 }
@@ -3426,293 +4858,25 @@ fn state_projection_for_scan(
     })
 }
 
-fn projected_entity_columns(
-    spec: &PreparedSql2EntitySurfaceSpec,
-    projection: Option<&Vec<usize>>,
-) -> Vec<String> {
-    projection.map_or_else(
-        || spec.column_order.clone(),
-        |indices| {
-            indices
-                .iter()
-                .filter_map(|index| spec.column_order.get(*index).cloned())
-                .collect()
-        },
-    )
-}
-
-fn entity_state_projection(projected_columns: &[String]) -> Vec<StateSurfaceColumn> {
-    let mut projection = Vec::<StateSurfaceColumn>::new();
-    let mut ensure = |column| {
-        if !projection.contains(&column) {
-            projection.push(column);
-        }
-    };
-
-    for column in projected_columns {
-        match column.as_str() {
-            "lixcol_entity_id" => ensure(StateSurfaceColumn::EntityId),
-            "lixcol_schema_key" => ensure(StateSurfaceColumn::SchemaKey),
-            "lixcol_file_id" => ensure(StateSurfaceColumn::FileId),
-            "lixcol_plugin_key" => ensure(StateSurfaceColumn::PluginKey),
-            "lixcol_schema_version" => ensure(StateSurfaceColumn::SchemaVersion),
-            "lixcol_version_id" => ensure(StateSurfaceColumn::VersionId),
-            "lixcol_metadata" => ensure(StateSurfaceColumn::Metadata),
-            "lixcol_global" => ensure(StateSurfaceColumn::Global),
-            "lixcol_untracked" => ensure(StateSurfaceColumn::Untracked),
-            _ => ensure(StateSurfaceColumn::SnapshotContent),
-        }
-    }
-
-    if projection.is_empty() {
-        projection.push(StateSurfaceColumn::SnapshotContent);
-    }
-
-    projection
-}
-
-fn entity_surface_schema(
-    spec: &PreparedSql2EntitySurfaceSpec,
-    column_names: &[String],
-) -> Result<SchemaRef> {
-    let fields = column_names
-        .iter()
-        .map(|column_name| {
-            let Some(column_type) = spec.column_types.get(column_name) else {
-                return Err(DataFusionError::Execution(format!(
-                    "sql2 entity surface '{}' is missing type info for column '{}'",
-                    spec.public_name, column_name
-                )));
-            };
-            Ok(Field::new(
-                column_name,
-                surface_column_data_type(*column_type),
-                true,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(Arc::new(Schema::new(fields)))
-}
-
-fn surface_column_data_type(column_type: SurfaceColumnType) -> DataType {
-    match column_type {
-        SurfaceColumnType::String | SurfaceColumnType::Json => DataType::Utf8,
-        SurfaceColumnType::Integer => DataType::Int64,
-        SurfaceColumnType::Number => DataType::Float64,
-        SurfaceColumnType::Boolean => DataType::Boolean,
-    }
-}
-
-fn entity_surface_batches_from_state_batches(
-    spec: &PreparedSql2EntitySurfaceSpec,
-    projected_columns: &[String],
-    state_batches: &[RecordBatch],
-) -> Result<Vec<RecordBatch>> {
-    let mut column_values = projected_columns
-        .iter()
-        .map(|column| (column.clone(), Vec::<Value>::new()))
-        .collect::<BTreeMap<_, _>>();
-
-    for batch in state_batches {
-        for row_index in 0..batch.num_rows() {
-            let state_row = state_row_from_batch(batch, row_index)?;
-            let entity_values = entity_row_values_from_state(spec, projected_columns, &state_row)?;
-            for (column_name, value) in entity_values {
-                column_values
-                    .get_mut(&column_name)
-                    .expect("entity column should exist in output map")
-                    .push(value);
-            }
-        }
-    }
-
-    let arrays = projected_columns
-        .iter()
-        .map(|column_name| {
-            let values = column_values
-                .remove(column_name)
-                .expect("entity output column should have collected values");
-            let column_type = *spec
-                .column_types
-                .get(column_name)
-                .expect("entity output column type should exist");
-            lix_values_to_array(&values, column_type)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let schema = entity_surface_schema(spec, projected_columns)?;
-    let batch = RecordBatch::try_new(schema, arrays).map_err(|error| {
-        DataFusionError::Execution(format!("sql2 entity batch build failed: {error}"))
-    })?;
-    Ok(vec![batch])
-}
-
-fn state_row_from_batch(batch: &RecordBatch, row_index: usize) -> Result<BTreeMap<String, Value>> {
-    let mut row = BTreeMap::new();
-    for (field, array) in batch.schema().fields().iter().zip(batch.columns()) {
-        let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)?;
-        row.insert(field.name().to_string(), scalar_value_to_lix_value(&scalar));
-    }
-    Ok(row)
-}
-
-fn entity_row_values_from_state(
-    spec: &PreparedSql2EntitySurfaceSpec,
-    projected_columns: &[String],
-    state_row: &BTreeMap<String, Value>,
-) -> Result<BTreeMap<String, Value>> {
-    let mut parsed_snapshot = None::<serde_json::Value>;
-    let needs_snapshot = projected_columns
-        .iter()
-        .any(|column| !column.starts_with("lixcol_"));
-    if needs_snapshot {
-        parsed_snapshot = match state_row.get("snapshot_content") {
-            Some(Value::Text(text)) => Some(serde_json::from_str(text).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "sql2 entity surface '{}' received invalid snapshot_content JSON: {error}",
-                    spec.public_name
-                ))
-            })?),
-            Some(Value::Null) | None => None,
-            Some(other) => {
-                return Err(DataFusionError::Execution(format!(
-                    "sql2 entity surface '{}' expected snapshot_content text, got {other:?}",
-                    spec.public_name
-                )))
-            }
-        };
-    }
-
-    let mut values = BTreeMap::new();
-    for column_name in projected_columns {
-        let value = match column_name.as_str() {
-            "lixcol_entity_id" => state_row.get("entity_id").cloned().unwrap_or(Value::Null),
-            "lixcol_schema_key" => state_row.get("schema_key").cloned().unwrap_or(Value::Null),
-            "lixcol_file_id" => state_row.get("file_id").cloned().unwrap_or(Value::Null),
-            "lixcol_plugin_key" => state_row.get("plugin_key").cloned().unwrap_or(Value::Null),
-            "lixcol_schema_version" => state_row
-                .get("schema_version")
-                .cloned()
-                .unwrap_or(Value::Null),
-            "lixcol_version_id" => state_row.get("version_id").cloned().unwrap_or(Value::Null),
-            "lixcol_metadata" => state_row.get("metadata").cloned().unwrap_or(Value::Null),
-            "lixcol_global" => state_row.get("global").cloned().unwrap_or(Value::Null),
-            "lixcol_untracked" => state_row.get("untracked").cloned().unwrap_or(Value::Null),
-            property_name => parsed_snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.get(property_name))
-                .map(json_value_to_lix_value)
-                .unwrap_or(Value::Null),
-        };
-        values.insert(column_name.clone(), value);
-    }
-
-    Ok(values)
-}
-
-fn json_value_to_lix_value(value: &serde_json::Value) -> Value {
-    match value {
-        serde_json::Value::Null => Value::Null,
-        serde_json::Value::Bool(value) => Value::Boolean(*value),
-        serde_json::Value::Number(value) => {
-            if let Some(integer) = value.as_i64() {
-                Value::Integer(integer)
-            } else {
-                Value::Real(value.as_f64().unwrap_or_default())
-            }
-        }
-        serde_json::Value::String(value) => Value::Text(value.clone()),
-        serde_json::Value::Array(_) | serde_json::Value::Object(_) => Value::Json(value.clone()),
-    }
-}
-
-fn lix_values_to_array(values: &[Value], column_type: SurfaceColumnType) -> Result<ArrayRef> {
-    match column_type {
-        SurfaceColumnType::String => {
-            let strings = values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Text(value) => Ok(Some(value.clone())),
-                    other => Err(DataFusionError::Execution(format!(
-                        "sql2 expected text value, got {other:?}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(StringArray::from(strings)))
-        }
-        SurfaceColumnType::Json => {
-            let strings = values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Text(value) => Ok(Some(value.clone())),
-                    Value::Json(value) => Ok(Some(value.to_string())),
-                    Value::Integer(value) => Ok(Some(value.to_string())),
-                    Value::Real(value) => Ok(Some(value.to_string())),
-                    Value::Boolean(value) => Ok(Some(value.to_string())),
-                    other => Err(DataFusionError::Execution(format!(
-                        "sql2 expected json-compatible value, got {other:?}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(StringArray::from(strings)))
-        }
-        SurfaceColumnType::Integer => {
-            let integers = values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Integer(value) => Ok(Some(*value)),
-                    other => Err(DataFusionError::Execution(format!(
-                        "sql2 expected integer value, got {other:?}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(Int64Array::from(integers)))
-        }
-        SurfaceColumnType::Number => {
-            let numbers = values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Integer(value) => Ok(Some(*value as f64)),
-                    Value::Real(value) => Ok(Some(*value)),
-                    other => Err(DataFusionError::Execution(format!(
-                        "sql2 expected numeric value, got {other:?}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(Float64Array::from(numbers)))
-        }
-        SurfaceColumnType::Boolean => {
-            let booleans = values
-                .iter()
-                .map(|value| match value {
-                    Value::Null => Ok(None),
-                    Value::Boolean(value) => Ok(Some(*value)),
-                    Value::Integer(value) if *value == 0 || *value == 1 => Ok(Some(*value != 0)),
-                    other => Err(DataFusionError::Execution(format!(
-                        "sql2 expected boolean value, got {other:?}"
-                    ))),
-                })
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Arc::new(BooleanArray::from(booleans)))
-        }
-    }
-}
-
 fn query_result_from_batches(
     result_columns: &[String],
+    variant_result_columns: &[bool],
     batches: &[RecordBatch],
 ) -> Result<QueryResult, LixError> {
     let mut rows = Vec::<Vec<Value>>::new();
     for batch in batches {
         for row_index in 0..batch.num_rows() {
             let mut row = Vec::<Value>::with_capacity(batch.num_columns());
-            for array in batch.columns() {
+            for (column_index, array) in batch.columns().iter().enumerate() {
                 let scalar = ScalarValue::try_from_array(array.as_ref(), row_index)
                     .map_err(datafusion_error_to_lix_error)?;
-                row.push(scalar_value_to_lix_value(&scalar));
+                row.push(scalar_value_to_lix_value(
+                    &scalar,
+                    variant_result_columns
+                        .get(column_index)
+                        .copied()
+                        .unwrap_or(false),
+                ));
             }
             rows.push(row);
         }
@@ -3724,7 +4888,7 @@ fn query_result_from_batches(
     })
 }
 
-fn scalar_value_to_lix_value(value: &ScalarValue) -> Value {
+fn scalar_value_to_lix_value(value: &ScalarValue, variant_output: bool) -> Value {
     match value {
         ScalarValue::Null => Value::Null,
         ScalarValue::Boolean(Some(value)) => Value::Boolean(*value),
@@ -3754,12 +4918,26 @@ fn scalar_value_to_lix_value(value: &ScalarValue) -> Value {
         ScalarValue::Float64(None) => Value::Null,
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
-        | ScalarValue::LargeUtf8(Some(value)) => Value::Text(value.clone()),
+        | ScalarValue::LargeUtf8(Some(value)) => {
+            if variant_output {
+                serde_json::from_str::<serde_json::Value>(value)
+                    .map(Value::Json)
+                    .unwrap_or_else(|_| Value::Text(value.clone()))
+            } else {
+                Value::Text(value.clone())
+            }
+        }
         ScalarValue::Utf8(None) | ScalarValue::Utf8View(None) | ScalarValue::LargeUtf8(None) => {
             Value::Null
         }
         ScalarValue::Binary(Some(value)) | ScalarValue::LargeBinary(Some(value)) => {
-            Value::Blob(value.clone())
+            if variant_output {
+                serde_json::from_slice::<serde_json::Value>(value)
+                    .map(Value::Json)
+                    .unwrap_or_else(|_| Value::Blob(value.clone()))
+            } else {
+                Value::Blob(value.clone())
+            }
         }
         ScalarValue::Binary(None) | ScalarValue::LargeBinary(None) => Value::Null,
         other => Value::Text(other.to_string()),
@@ -3783,17 +4961,20 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
+    use datafusion::datasource::ViewTable;
+
     use super::{
         build_session_for_read_with_borrowed_backend, build_session_for_read_with_shared_backend,
         execute_read_with_backend, execute_read_with_shared_backend, parse_directory_route_filter,
-        parse_file_route_filter, parse_route_filter, PreparedSql2ReadArtifact, RouteBooleanField,
-        RoutePredicate, RouteStringField,
+        parse_file_route_filter, parse_route_filter, LixStateHistoryProvider,
+        PreparedSql2ReadArtifact, RouteBooleanField, RoutePredicate, RouteStringField,
     };
     use crate::live_state::{
         open_state_by_version_snapshot_with_shared_backend, StateByVersionScanRequest,
         StateSurfaceColumn, StateSurfaceFilter,
     };
     use crate::session::AdditionalSessionOptions;
+    use crate::sql2::prepared_entity_view_plans_for_registry;
     use crate::test_support::{boot_test_engine, TestSqliteBackendEvent};
     use crate::{CreateVersionOptions, LixBackend, TransactionBeginMode, Value};
     use serde_json::json;
@@ -3822,6 +5003,21 @@ mod tests {
                     "value": { "type": "string" }
                 },
                 "required": ["value"],
+                "additionalProperties": false
+            }))
+            .await?;
+        session
+            .register_schema(&json!({
+                "x-lix-key": "stable_scalar_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "count": { "type": "integer" },
+                    "score": { "type": "number" },
+                    "enabled": { "type": "boolean" }
+                },
+                "required": ["name", "count", "score", "enabled"],
                 "additionalProperties": false
             }))
             .await?;
@@ -3856,6 +5052,16 @@ mod tests {
                  entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                  ) VALUES (\
                  'entity-b', 'test_state_schema', NULL, 'version-b', NULL, '{\"value\":\"B\"}', '1'\
+                 )",
+                &[],
+            )
+            .await?;
+        session
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'scalar-a', 'stable_scalar_schema', NULL, 'version-a', NULL, '{\"name\":\"alpha\",\"count\":7,\"score\":3.5,\"enabled\":true}', '1'\
                  )",
                 &[],
             )
@@ -4010,7 +5216,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
@@ -4036,7 +5242,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -4076,6 +5282,186 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_backend_path_registers_entity_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value FROM test_state_schema".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["test_state_schema".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["test_state_schema".to_string()],
+                    ),
+                };
+
+                let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
+                    .await
+                    .expect("entity session should build");
+                let provider = ctx
+                    .table_provider("test_state_schema")
+                    .await
+                    .expect("entity surface should be registered");
+
+                assert!(
+                    provider.as_any().is::<ViewTable>(),
+                    "entity surfaces should register as native DataFusion views"
+                );
+                assert!(
+                    provider.get_logical_plan().is_some(),
+                    "registered entity view should expose a logical plan"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn borrowed_backend_path_registers_history_entity_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value FROM test_state_schema_history".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["test_state_schema_history".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["test_state_schema_history".to_string()],
+                    ),
+                };
+
+                let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
+                    .await
+                    .expect("history entity session should build");
+                let provider = ctx
+                    .table_provider("test_state_schema_history")
+                    .await
+                    .expect("history entity surface should be registered");
+
+                assert!(
+                    provider.as_any().is::<ViewTable>(),
+                    "history entity surfaces should register as native DataFusion views"
+                );
+                assert!(
+                    provider.get_logical_plan().is_some(),
+                    "registered history entity view should expose a logical plan"
+                );
+                let schema = provider.schema();
+                let field_names = schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().as_str())
+                    .collect::<Vec<_>>();
+                assert!(
+                    field_names.contains(&"value"),
+                    "history entity view should expose schema-defined payload columns"
+                );
+                assert!(
+                    field_names.contains(&"lixcol_entity_id"),
+                    "history entity view should expose derived history state columns"
+                );
+                assert!(
+                    field_names.contains(&"lixcol_root_commit_id"),
+                    "history entity view should expose derived history root columns"
+                );
+                assert!(
+                    field_names.contains(&"lixcol_version_id"),
+                    "history entity view should expose derived history version columns"
+                );
+                assert!(
+                    field_names.contains(&"lixcol_depth"),
+                    "history entity view should expose derived history depth columns"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn shared_backend_path_registers_history_entity_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value FROM test_state_schema_history".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["test_state_schema_history".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["test_state_schema_history".to_string()],
+                    ),
+                };
+
+                let shared_backend: Arc<dyn crate::LixBackend + Send + Sync> =
+                    Arc::new(backend.clone());
+                let ctx = build_session_for_read_with_shared_backend(shared_backend, &artifact)
+                    .await
+                    .expect("shared-backend history entity session should build");
+                let provider = ctx
+                    .table_provider("test_state_schema_history")
+                    .await
+                    .expect("shared-backend history entity surface should be registered");
+
+                assert!(
+                    provider.as_any().is::<ViewTable>(),
+                    "shared-backend history entity surfaces should register as native DataFusion views"
+                );
+                assert!(
+                    provider.get_logical_plan().is_some(),
+                    "shared-backend registered history entity view should expose a logical plan"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn borrowed_backend_path_registers_lix_state_history_as_native_relation() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT entity_id FROM lix_state_history".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_state_history".to_string()],
+                    entity_views: BTreeMap::new(),
+                };
+
+                let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
+                    .await
+                    .expect("state-history session should build");
+                let provider = ctx
+                    .table_provider("lix_state_history")
+                    .await
+                    .expect("lix_state_history should be registered");
+
+                assert!(
+                    provider.as_any().is::<LixStateHistoryProvider>(),
+                    "lix_state_history should register as a native sql2 base relation"
+                );
+                assert!(
+                    !provider.as_any().is::<ViewTable>(),
+                    "lix_state_history should not register as a DataFusion view"
+                );
+            })
+        });
+    }
+
+    #[test]
     fn shared_backend_path_opens_read_transaction_for_query_snapshot() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
@@ -4088,7 +5474,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -4127,7 +5513,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -4160,7 +5546,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -4224,7 +5610,7 @@ mod tests {
                 backend.clear_query_log();
                 let _batches = untracked_snapshot
                     .scan_state_by_version_batches(&StateByVersionScanRequest {
-                        version_id: crate::version::GLOBAL_VERSION_ID.to_string(),
+                        version_id: Some(crate::version::GLOBAL_VERSION_ID.to_string()),
                         projection: vec![StateSurfaceColumn::EntityId],
                         filters: vec![
                             StateSurfaceFilter::Eq(
@@ -4263,7 +5649,7 @@ mod tests {
                 backend.clear_query_log();
                 let _batches = tracked_snapshot
                     .scan_state_by_version_batches(&StateByVersionScanRequest {
-                        version_id: "version-a".to_string(),
+                        version_id: Some("version-a".to_string()),
                         projection: vec![StateSurfaceColumn::EntityId],
                         filters: vec![
                             StateSurfaceFilter::Eq(
@@ -4309,7 +5695,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4329,6 +5715,30 @@ mod tests {
     }
 
     #[test]
+    fn execute_read_supports_top_level_select_without_from_over_scalar_subquery() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT COALESCE((SELECT snapshot_content FROM lix_state WHERE schema_key = 'test_state_schema' AND entity_id = 'missing-entity' LIMIT 1), 'missing')".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_state".to_string()],
+                    entity_views: BTreeMap::new(),
+                };
+
+                let result = execute_read_with_backend(&backend, &artifact)
+                    .await
+                    .expect("sql2 read should execute");
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0], vec![Value::Text("missing".to_string())]);
+            })
+        });
+    }
+
+    #[test]
     fn execute_read_exposes_commit_id_for_tracked_lix_state_rows() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
@@ -4340,7 +5750,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4367,7 +5777,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -4398,7 +5808,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_by_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4422,7 +5832,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_read_with_shared_backend_requires_exact_version_for_lix_state_by_version() {
+    fn execute_read_with_shared_backend_supports_broad_lix_state_by_version_reads() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, _session) = setup_sql2_state_fixture()
@@ -4433,17 +5843,422 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_by_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
-                let error = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
-                    .expect_err("by-version read without version filter should fail");
+                    .expect("broad by-version read should succeed");
                 assert!(
-                    error
-                        .description
-                        .contains("requires an exact version_id = ... predicate"),
-                    "unexpected error: {error:?}"
+                    result.rows.iter().any(|row| row[0] == Value::Text("entity-a".to_string()))
+                        && result.rows.iter().any(|row| row[0] == Value::Text("entity-b".to_string())),
+                    "expected broad by-version read to include rows from multiple visible versions: {:?}",
+                    result.rows
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_reads_lix_state_history() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT entity_id, root_commit_id, depth \
+                          FROM lix_state_history \
+                         WHERE schema_key = 'test_state_schema' \
+                         ORDER BY entity_id, depth"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_state_history".to_string()],
+                    entity_views: BTreeMap::new(),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend state-history read should execute");
+                assert_eq!(result.columns, vec!["entity_id", "root_commit_id", "depth"]);
+                assert!(
+                    !result.rows.is_empty(),
+                    "expected lix_state_history rows for the active version lineage"
+                );
+                assert!(
+                    result
+                        .rows
+                        .iter()
+                        .any(|row| row.first() == Some(&Value::Text("entity-a".to_string()))),
+                    "expected version-a history row in lix_state_history results: {:?}",
+                    result.rows
+                );
+                assert!(
+                    result
+                        .rows
+                        .iter()
+                        .all(|row| matches!(row.get(1), Some(Value::Text(_)))
+                            && matches!(row.get(2), Some(Value::Integer(_)))),
+                    "expected root_commit_id text and depth integer values: {:?}",
+                    result.rows
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_preserves_payload_projection_and_filtering_over_history_entity_views(
+    ) {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value, lixcol_depth \
+                          FROM test_state_schema_history \
+                         WHERE value = 'A' \
+                         ORDER BY lixcol_depth"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["test_state_schema_history".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["test_state_schema_history".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("history entity payload read should execute through sql2");
+                assert_eq!(result.columns, vec!["value", "lixcol_depth"]);
+                assert!(
+                    !result.rows.is_empty(),
+                    "expected history entity payload filtering to return rows"
+                );
+                for row in &result.rows {
+                    assert_eq!(row.len(), 2);
+                    assert_eq!(row[0], Value::Text("A".to_string()));
+                    assert!(
+                        matches!(row[1], Value::Integer(_)),
+                        "expected projected history depth integer, got {:?}",
+                        row[1]
+                    );
+                }
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_returns_variant_payload_columns_as_json_values() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('variant-read', 'value-a')",
+                        &[],
+                    )
+                    .await
+                    .expect("seed insert should succeed");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value FROM lix_key_value WHERE key = 'variant-read'".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_key_value".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["lix_key_value".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend variant read should execute");
+                assert_eq!(result.columns, vec!["value"]);
+                assert_eq!(
+                    result.rows,
+                    vec![vec![Value::Json(serde_json::json!("value-a"))]]
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_preserves_variant_results_through_aliases() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('variant-alias', 'value-a')",
+                        &[],
+                    )
+                    .await
+                    .expect("seed insert should succeed");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value AS payload FROM lix_key_value WHERE key = 'variant-alias'"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_key_value".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["lix_key_value".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend aliased variant read should execute");
+                assert_eq!(result.columns, vec!["payload"]);
+                assert_eq!(
+                    result.rows,
+                    vec![vec![Value::Json(serde_json::json!("value-a"))]]
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_requires_explicit_cast_for_variant_text_comparison() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('variant-compare', 'value-a')",
+                        &[],
+                    )
+                    .await
+                    .expect("seed insert should succeed");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT key FROM lix_key_value WHERE value = 'value-a'".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_key_value".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["lix_key_value".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await;
+                assert!(
+                    result.is_err(),
+                    "variant text comparison should require an explicit cast or extraction"
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_allows_explicit_text_decode_of_variant_payloads() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) VALUES ('variant-decode', 'value-a')",
+                        &[],
+                    )
+                    .await
+                    .expect("seed insert should succeed");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT lix_text_decode(value) AS payload_text \
+                          FROM lix_key_value \
+                         WHERE key = 'variant-decode'"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_key_value".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["lix_key_value".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("explicit text decode over variant should execute");
+                assert_eq!(result.columns, vec!["payload_text"]);
+                assert_eq!(
+                    result.rows,
+                    vec![vec![Value::Text("\"value-a\"".to_string())]]
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_allows_explicit_json_extract_over_variant_payloads() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .execute(
+                        "INSERT INTO lix_key_value (key, value) \
+                         VALUES ('variant-object', lix_json('{\"kind\":\"greeting\",\"text\":\"hello\"}'))",
+                        &[],
+                    )
+                    .await
+                    .expect("seed insert should succeed");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT lix_json_extract(value, 'text') AS payload_text \
+                          FROM lix_key_value \
+                         WHERE key = 'variant-object'"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_key_value".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["lix_key_value".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("explicit json extract over variant should execute");
+                assert_eq!(result.columns, vec!["payload_text"]);
+                assert_eq!(result.rows, vec![vec![Value::Text("hello".to_string())]]);
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_preserves_variant_json_null_values() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .execute(
+                        "INSERT INTO lix_state_by_version (\
+                         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                         ) VALUES (\
+                         'variant-null', 'lix_key_value', NULL, 'version-a', NULL, '{\"key\":\"variant-null\",\"value\":null}', '1'\
+                         )",
+                        &[],
+                    )
+                    .await
+                    .expect("seed insert should succeed");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value FROM lix_key_value WHERE key = 'variant-null'".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_key_value".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["lix_key_value".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend variant null read should execute");
+                assert_eq!(result.columns, vec!["value"]);
+                assert_eq!(result.rows, vec![vec![Value::Json(serde_json::Value::Null)]]);
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_preserves_table_like_scalar_payload_behavior() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT name, count, score, enabled \
+                          FROM stable_scalar_schema \
+                         WHERE name = 'alpha' \
+                           AND count = 7 \
+                           AND score = 3.5 \
+                           AND enabled = true"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["stable_scalar_schema".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["stable_scalar_schema".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("stable scalar entity query should execute");
+                assert_eq!(
+                    result,
+                    crate::QueryResult {
+                        columns: vec![
+                            "name".to_string(),
+                            "count".to_string(),
+                            "score".to_string(),
+                            "enabled".to_string(),
+                        ],
+                        rows: vec![vec![
+                            Value::Text("alpha".to_string()),
+                            Value::Integer(7),
+                            Value::Real(3.5),
+                            Value::Boolean(true),
+                        ]],
+                    }
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_backend_reads_lix_state_history() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT COUNT(*) AS total \
+                          FROM lix_state_history \
+                         WHERE schema_key = 'test_state_schema'"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_state_history".to_string()],
+                    entity_views: BTreeMap::new(),
+                };
+
+                let result = execute_read_with_backend(&backend, &artifact)
+                    .await
+                    .expect("sql2 borrowed-backend state-history read should execute");
+                assert_eq!(result.columns, vec!["total"]);
+                assert!(
+                    matches!(result.rows.first(), Some(row) if matches!(row.first(), Some(Value::Integer(value)) if *value > 0)),
+                    "expected positive lix_state_history row count, got {:?}",
+                    result.rows
                 );
             })
         });
@@ -4462,7 +6277,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4494,7 +6309,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4530,7 +6345,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file_by_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4564,7 +6379,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_directory".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4596,7 +6411,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_directory".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4632,7 +6447,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_directory_by_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4665,7 +6480,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4697,7 +6512,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4728,7 +6543,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_change".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4758,7 +6573,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_change".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4798,7 +6613,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_change".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -4829,7 +6644,7 @@ mod tests {
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file".to_string(), "lix_file_by_version".to_string()],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -4844,6 +6659,80 @@ mod tests {
                         ]),
                     "expected joined active/by-version file row: {:?}",
                     result.rows
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_supports_count_exists_and_filters_over_entity_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT COUNT(*) AS total \
+                          FROM test_state_schema \
+                         WHERE value = 'A' \
+                           AND EXISTS(SELECT 1 FROM test_state_schema WHERE value = 'A')"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["test_state_schema".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["test_state_schema".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend entity-view aggregate read should execute");
+                assert_eq!(result.columns, vec!["total"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0], vec![Value::Integer(1)]);
+            })
+        });
+    }
+
+    #[test]
+    fn execute_read_with_shared_backend_supports_joins_over_entity_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT s.value, st.entity_id \
+                          FROM test_state_schema s \
+                          JOIN lix_state st \
+                            ON s.lixcol_entity_id = st.entity_id \
+                         WHERE s.value = 'A' \
+                           AND st.schema_key = 'test_state_schema'"
+                        .to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["test_state_schema".to_string(), "lix_state".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["test_state_schema".to_string(), "lix_state".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend entity-view join read should execute");
+                assert_eq!(result.columns, vec!["value", "entity_id"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(
+                    result.rows[0],
+                    vec![
+                        Value::Text("A".to_string()),
+                        Value::Text("entity-a".to_string()),
+                    ]
                 );
             })
         });
@@ -4871,7 +6760,7 @@ mod tests {
                         "lix_state".to_string(),
                         "lix_state_by_version".to_string(),
                     ],
-                    entity_surfaces: BTreeMap::new(),
+                    entity_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)

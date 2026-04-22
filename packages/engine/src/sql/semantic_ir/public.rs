@@ -149,9 +149,10 @@ fn bind_active_history_root_commit_id(
     }
 
     let root_commit_id = active_history_root_commit_id?;
+    let root_commit_column = active_history_root_commit_column_name(&structured_read);
     let root_predicate = Expr::BinaryOp {
         left: Box::new(Expr::Identifier(sqlparser::ast::Ident::new(
-            "lixcol_root_commit_id",
+            root_commit_column,
         ))),
         op: BinaryOperator::Eq,
         right: Box::new(Expr::Value(
@@ -172,6 +173,18 @@ fn bind_active_history_root_commit_id(
         .selection_predicates
         .push(root_predicate);
     Some(structured_read)
+}
+
+fn active_history_root_commit_column_name(structured_read: &StructuredPublicRead) -> &'static str {
+    let exposed_columns = &structured_read.resolved_relation.exposed_columns;
+    if exposed_columns
+        .iter()
+        .any(|column| column.eq_ignore_ascii_case("root_commit_id"))
+    {
+        "root_commit_id"
+    } else {
+        "lixcol_root_commit_id"
+    }
 }
 
 fn structured_read_has_root_commit_predicate(structured_read: &StructuredPublicRead) -> bool {

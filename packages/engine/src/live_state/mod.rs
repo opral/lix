@@ -30,6 +30,7 @@
 //! Callers outside `live_state/*` should use the root-level entrypoints here.
 
 mod bridge;
+mod commit_derived;
 pub(crate) mod constraints;
 pub(crate) mod effective;
 mod frontier;
@@ -101,8 +102,9 @@ pub(crate) use schema_access::LiveRowShape;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
 pub use state_surface::{
     open_state_by_version_reader_with_backend, open_state_by_version_snapshot,
-    open_state_by_version_snapshot_with_shared_backend, StateByVersionScanRequest,
-    StateByVersionSnapshot, StateSurfaceColumn, StateSurfaceFilter, StateSurfaceRow,
+    open_state_by_version_snapshot_with_shared_backend, open_visible_state_by_version_snapshot,
+    StateByVersionScanRequest, StateByVersionSnapshot, StateSurfaceColumn, StateSurfaceFilter,
+    StateSurfaceRow,
 };
 #[cfg(test)]
 pub(crate) use storage_metadata::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};
@@ -141,9 +143,7 @@ pub(crate) use untracked::scan_rows_with_backend_limit as scan_untracked_rows_wi
 pub(crate) use untracked::UntrackedReadView;
 #[allow(unused_imports)]
 pub(crate) use untracked::{ExactUntrackedRowRequest, UntrackedRow};
-pub(crate) use visible_rows::{
-    scan_live_rows as scan_visible_live_rows, LiveReadRow, LiveStorageLane,
-};
+pub(crate) use visible_rows::LiveReadRow;
 
 pub(crate) const TRACKED_RELATION_PREFIX: &str = storage::sql::TRACKED_LIVE_TABLE_PREFIX;
 pub(crate) use naming::{tracked_relation_name, INTERNAL_RELATION_PREFIX};

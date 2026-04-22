@@ -1,11 +1,19 @@
 use crate::support;
 
 use lix_engine::Value;
+use serde_json::Value as JsonValue;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
         Value::Text(actual) => assert_eq!(actual, expected),
         other => panic!("expected text value '{expected}', got {other:?}"),
+    }
+}
+
+fn assert_json_string(value: &Value, expected: &str) {
+    match value {
+        Value::Json(JsonValue::String(actual)) => assert_eq!(actual, expected),
+        other => panic!("expected json string value '{expected}', got {other:?}"),
     }
 }
 
@@ -59,7 +67,7 @@ simulation_test!(
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert!(!rows.statements[0].rows.is_empty());
         assert_text(&rows.statements[0].rows[0][0], "key-history");
-        assert_text(&rows.statements[0].rows[0][1], "value-history");
+        assert_json_string(&rows.statements[0].rows[0][1], "value-history");
         assert!(matches!(rows.statements[0].rows[0][2], Value::Text(_)));
         assert!(matches!(rows.statements[0].rows[0][3], Value::Integer(_)));
     }

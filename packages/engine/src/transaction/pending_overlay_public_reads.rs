@@ -6,9 +6,8 @@
 use std::collections::BTreeMap;
 
 use crate::live_state::{
-    compile_live_row_shape_from_registered_snapshots, live_row_shape_from_definition,
-    scan_visible_live_rows, LiveReadRow, LiveRowShape, LiveStorageLane, ScanConstraint, ScanField,
-    ScanOperator,
+    compile_live_row_shape_from_registered_snapshots, live_row_shape_from_definition, LiveReadRow,
+    LiveRowShape, ScanConstraint, ScanField, ScanOperator,
 };
 use crate::sql::{
     PendingOverlayFilter, PendingOverlayLane, PendingOverlayOrderClause, PendingOverlayProjection,
@@ -129,16 +128,18 @@ impl<'a> PendingOverlayReadModel<'a> {
                 }
             }
 
-            for row in pending_overlay.visible_semantic_rows(false, REGISTERED_SCHEMA_KEY) {
-                if row.version_id != GLOBAL_VERSION_ID {
-                    continue;
-                }
-                match row.snapshot_content.as_ref().filter(|_| !row.tombstone) {
-                    Some(snapshot_content) => {
-                        rows.insert(row.entity_id.clone(), snapshot_content.clone());
+            for untracked in [false, true] {
+                for row in pending_overlay.visible_semantic_rows(untracked, REGISTERED_SCHEMA_KEY) {
+                    if row.version_id != GLOBAL_VERSION_ID {
+                        continue;
                     }
-                    None => {
-                        rows.remove(&row.entity_id);
+                    match row.snapshot_content.as_ref().filter(|_| !row.tombstone) {
+                        Some(snapshot_content) => {
+                            rows.insert(row.entity_id.clone(), snapshot_content.clone());
+                        }
+                        None => {
+                            rows.remove(&row.entity_id);
+                        }
                     }
                 }
             }
@@ -159,33 +160,55 @@ impl<'a> PendingOverlayReadModel<'a> {
             .map(|column| column.property_name.clone())
             .collect::<Vec<_>>();
         let untracked = pending_overlay_lane_is_untracked(query.lane);
-        let mut rows = match query.lane {
-            PendingOverlayLane::Tracked => scan_visible_live_rows(
+        let relation_exists =
+            crate::live_state::schema_access::live_storage_relation_exists_with_backend(
                 self.base,
-                LiveStorageLane::Tracked,
                 &query.schema_key,
-                &query.version_id,
-                &constraints,
-                &required_columns,
-                None,
             )
-            .await?
-            .into_iter()
-            .map(|row| visible_live_row_from_raw(&access, row, false))
-            .collect::<Result<Vec<_>, _>>()?,
-            PendingOverlayLane::Untracked => scan_visible_live_rows(
-                self.base,
-                LiveStorageLane::Untracked,
-                &query.schema_key,
-                &query.version_id,
-                &constraints,
-                &required_columns,
-                None,
-            )
-            .await?
-            .into_iter()
-            .map(|row| visible_live_row_from_raw(&access, row, true))
-            .collect::<Result<Vec<_>, _>>()?,
+            .await?;
+        let mut executor = self.base;
+        let mut rows = if relation_exists {
+            match query.lane {
+                PendingOverlayLane::Tracked => {
+                    let request = crate::live_state::tracked::TrackedScanRequest {
+                        schema_key: query.schema_key.clone(),
+                        version_id: query.version_id.clone(),
+                        constraints: constraints.clone(),
+                        required_columns: required_columns.clone(),
+                    };
+                    crate::live_state::tracked::scan_rows_with_executor_and_access(
+                        &mut executor,
+                        &request,
+                        access.raw_access(),
+                    )
+                    .await?
+                    .into_iter()
+                    .map(crate::live_state::LiveReadRow::from)
+                    .map(|row| visible_live_row_from_raw(&access, row, false))
+                    .collect::<Result<Vec<_>, _>>()?
+                }
+                PendingOverlayLane::Untracked => {
+                    let request = crate::live_state::untracked::UntrackedScanRequest {
+                        schema_key: query.schema_key.clone(),
+                        version_id: query.version_id.clone(),
+                        constraints: constraints.clone(),
+                        required_columns: required_columns.clone(),
+                    };
+                    crate::live_state::untracked::scan_rows_with_executor_and_access(
+                        &mut executor,
+                        &request,
+                        access.raw_access(),
+                        None,
+                    )
+                    .await?
+                    .into_iter()
+                    .map(crate::live_state::LiveReadRow::from)
+                    .map(|row| visible_live_row_from_raw(&access, row, true))
+                    .collect::<Result<Vec<_>, _>>()?
+                }
+            }
+        } else {
+            Vec::new()
         };
         let mut by_identity = rows
             .drain(..)

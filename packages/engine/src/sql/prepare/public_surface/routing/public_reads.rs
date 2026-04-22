@@ -2258,9 +2258,13 @@ fn collect_relation_names_in_sql_function_arg_expr<F>(
 }
 
 fn is_direct_only_history_surface(binding: &ResolvedRelation) -> bool {
-    builtin_catalog_compiler_facade()
-        .history_read_semantics(binding)
-        .is_some()
+    matches!(
+        builtin_catalog_compiler_facade().history_read_semantics(binding),
+        Some(
+            crate::catalog::CatalogHistoryReadSemantics::FileHistory { .. }
+                | crate::catalog::CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion
+        )
+    )
 }
 
 #[cfg(test)]
@@ -2472,13 +2476,13 @@ mod tests {
         );
         let decision = classify_public_read_plan_kind(&plan);
 
-        assert!(matches!(decision.kind, PublicReadPlanKind::HistoryRead));
+        assert!(matches!(decision.kind, PublicReadPlanKind::PreparedBatch));
         assert_eq!(decision.pass_traces.len(), 1);
         assert_eq!(
             decision.pass_traces[0].name,
             "public-read.classify-plan-kind"
         );
-        assert!(decision.pass_traces[0].changed);
+        assert!(!decision.pass_traces[0].changed);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use super::generate::{canonical_change_is_commit_member, generate_commit};
 use super::receipt::latest_replay_cursor_from_change_rows;
 use super::types::{
     canonical_changes_from_updated_version_refs,
-    canonical_untracked_visibility_rows_from_updated_version_refs,
+    canonical_untracked_visibility_rows_from_updated_version_refs, pending_commit_live_row,
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
     GenerateCommitArgs, GenerateCommitResult, StagedChange,
 };
@@ -81,6 +81,7 @@ pub(crate) async fn build_pending_commit_state(
     Ok(PendingCommitState {
         lane: pending_commit_lane_from_write_lane(&lane),
         commit_id: seed.commit_id.clone(),
+        commit_change_id: seed.commit_change_id.clone(),
         commit_change_snapshot_id,
         commit_snapshot,
     })
@@ -213,12 +214,20 @@ pub(crate) async fn merge_public_change_batch_into_pending_commit(
         timestamp,
     )?;
     let tracked_live_rows = tracked_live_rows_from_staged_changes(&staged_changes)?;
+    let pending_commit_live_row = pending_commit_live_row(
+        &session.lane,
+        &session.commit_id,
+        &session.commit_change_id,
+        &session.commit_snapshot,
+        timestamp,
+    )?;
     execute_generated_commit_result(
         transaction,
         rewritten,
         binary_blob_writes,
         functions,
         &tracked_live_rows,
+        Some(pending_commit_live_row),
     )
     .await
 }
@@ -325,6 +334,7 @@ async fn execute_generated_commit_result(
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,
     tracked_live_rows: &[crate::live_state::LiveRow],
+    pending_commit_live_row: Option<crate::live_state::LiveRow>,
 ) -> Result<CanonicalCommitProjectionReceipt, LixError> {
     let visibility_rows = canonical_untracked_visibility_rows_from_updated_version_refs(
         &result.updated_version_refs,
@@ -355,6 +365,9 @@ async fn execute_generated_commit_result(
     );
 
     let mut live_rows = tracked_live_rows.to_vec();
+    if let Some(commit_row) = pending_commit_live_row {
+        live_rows.push(commit_row);
+    }
     live_rows.extend(untracked_live_rows);
     if !live_rows.is_empty() {
         crate::live_state::write_live_rows(transaction, &live_rows).await?;

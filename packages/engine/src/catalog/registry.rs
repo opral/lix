@@ -4,7 +4,10 @@ use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use std::collections::BTreeMap;
 
-use super::state::state_surface_descriptor;
+use super::state::{
+    state_relation_column_types_for_variant, state_relation_columns_for_variant,
+    state_surface_descriptor,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub(crate) struct CatalogEpoch(u64);
@@ -104,6 +107,7 @@ pub(crate) enum SurfaceColumnType {
     Number,
     Boolean,
     Json,
+    Variant,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -592,58 +596,18 @@ fn entity_surface_capability(schema_key: &str, variant: SurfaceVariant) -> Surfa
     }
 }
 
-fn entity_visible_columns(spec: &DynamicEntitySurfaceSpec, variant: SurfaceVariant) -> Vec<String> {
-    let mut columns = spec.visible_columns.clone();
-    match variant {
-        SurfaceVariant::Default => {}
-        SurfaceVariant::ByVersion => columns.push("lixcol_version_id".to_string()),
-        SurfaceVariant::History => columns.extend([
-            "lixcol_entity_id".to_string(),
-            "lixcol_schema_key".to_string(),
-            "lixcol_file_id".to_string(),
-            "lixcol_plugin_key".to_string(),
-            "lixcol_schema_version".to_string(),
-            "lixcol_version_id".to_string(),
-            "lixcol_change_id".to_string(),
-            "lixcol_commit_id".to_string(),
-            "lixcol_commit_created_at".to_string(),
-            "lixcol_root_commit_id".to_string(),
-            "lixcol_depth".to_string(),
-            "lixcol_metadata".to_string(),
-            "lixcol_global".to_string(),
-            "lixcol_untracked".to_string(),
-        ]),
-        SurfaceVariant::WorkingChanges => {}
-    }
-    columns
+fn entity_visible_columns(
+    spec: &DynamicEntitySurfaceSpec,
+    _variant: SurfaceVariant,
+) -> Vec<String> {
+    spec.visible_columns.clone()
 }
 
 fn entity_hidden_columns(variant: SurfaceVariant) -> Vec<String> {
-    match variant {
-        SurfaceVariant::Default => vec![
-            "lixcol_entity_id".to_string(),
-            "lixcol_schema_key".to_string(),
-            "lixcol_file_id".to_string(),
-            "lixcol_plugin_key".to_string(),
-            "lixcol_schema_version".to_string(),
-            "lixcol_version_id".to_string(),
-            "lixcol_metadata".to_string(),
-            "lixcol_global".to_string(),
-            "lixcol_untracked".to_string(),
-        ],
-        SurfaceVariant::ByVersion => vec![
-            "lixcol_entity_id".to_string(),
-            "lixcol_schema_key".to_string(),
-            "lixcol_file_id".to_string(),
-            "lixcol_plugin_key".to_string(),
-            "lixcol_schema_version".to_string(),
-            "lixcol_metadata".to_string(),
-            "lixcol_global".to_string(),
-            "lixcol_untracked".to_string(),
-        ],
-        SurfaceVariant::History => Vec::new(),
-        SurfaceVariant::WorkingChanges => Vec::new(),
-    }
+    entity_base_relation_columns(variant)
+        .into_iter()
+        .map(|column_name| format!("lixcol_{column_name}"))
+        .collect()
 }
 
 fn entity_column_types(
@@ -651,38 +615,31 @@ fn entity_column_types(
     variant: SurfaceVariant,
 ) -> BTreeMap<String, SurfaceColumnType> {
     let mut column_types = spec.column_types.clone();
-    column_types.extend(BTreeMap::from([
-        ("lixcol_entity_id".to_string(), SurfaceColumnType::String),
-        ("lixcol_schema_key".to_string(), SurfaceColumnType::String),
-        ("lixcol_file_id".to_string(), SurfaceColumnType::String),
-        ("lixcol_plugin_key".to_string(), SurfaceColumnType::String),
-        (
-            "lixcol_schema_version".to_string(),
-            SurfaceColumnType::String,
-        ),
-        ("lixcol_version_id".to_string(), SurfaceColumnType::String),
-        ("lixcol_metadata".to_string(), SurfaceColumnType::Json),
-        ("lixcol_global".to_string(), SurfaceColumnType::Boolean),
-        ("lixcol_untracked".to_string(), SurfaceColumnType::Boolean),
-    ]));
-
-    if variant == SurfaceVariant::History {
-        column_types.extend(BTreeMap::from([
-            ("lixcol_change_id".to_string(), SurfaceColumnType::String),
-            ("lixcol_commit_id".to_string(), SurfaceColumnType::String),
-            (
-                "lixcol_commit_created_at".to_string(),
-                SurfaceColumnType::String,
-            ),
-            (
-                "lixcol_root_commit_id".to_string(),
-                SurfaceColumnType::String,
-            ),
-            ("lixcol_depth".to_string(), SurfaceColumnType::Integer),
-        ]));
-    }
+    column_types.extend(
+        entity_base_relation_column_types(variant)
+            .into_iter()
+            .map(|(column_name, column_type)| (format!("lixcol_{column_name}"), column_type)),
+    );
 
     column_types
+}
+
+fn entity_base_relation_variant(variant: SurfaceVariant) -> SurfaceVariant {
+    match variant {
+        SurfaceVariant::Default | SurfaceVariant::WorkingChanges => SurfaceVariant::Default,
+        SurfaceVariant::ByVersion => SurfaceVariant::ByVersion,
+        SurfaceVariant::History => SurfaceVariant::History,
+    }
+}
+
+fn entity_base_relation_columns(variant: SurfaceVariant) -> Vec<String> {
+    state_relation_columns_for_variant(entity_base_relation_variant(variant))
+}
+
+fn entity_base_relation_column_types(
+    variant: SurfaceVariant,
+) -> BTreeMap<String, SurfaceColumnType> {
+    state_relation_column_types_for_variant(entity_base_relation_variant(variant))
 }
 
 fn change_columns() -> Vec<String> {
@@ -876,4 +833,115 @@ fn version_column_types() -> BTreeMap<String, SurfaceColumnType> {
         ("hidden".to_string(), SurfaceColumnType::Boolean),
         ("commit_id".to_string(), SurfaceColumnType::String),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        dynamic_entity_surface_descriptor, entity_hidden_columns, CatalogSource,
+        DynamicEntitySurfaceSpec, SurfaceColumnType, SurfaceVariant,
+    };
+    use crate::catalog::state_relation_columns_for_variant;
+
+    fn test_entity_spec() -> DynamicEntitySurfaceSpec {
+        DynamicEntitySurfaceSpec {
+            schema_key: "test_entity".to_string(),
+            schema: serde_json::json!({
+                "x-lix-key": "test_entity",
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string" }
+                }
+            }),
+            visible_columns: vec!["id".to_string()],
+            column_types: std::collections::BTreeMap::from([(
+                "id".to_string(),
+                SurfaceColumnType::String,
+            )]),
+        }
+    }
+
+    #[test]
+    fn default_entity_surface_omits_version_column() {
+        let descriptor = dynamic_entity_surface_descriptor(
+            "test_entity",
+            &test_entity_spec(),
+            SurfaceVariant::Default,
+            CatalogSource::Builtin,
+        );
+
+        assert!(!descriptor
+            .visible_columns
+            .iter()
+            .chain(descriptor.hidden_columns.iter())
+            .any(|column| column == "lixcol_version_id"));
+        assert!(descriptor
+            .hidden_columns
+            .contains(&"lixcol_snapshot_content".to_string()));
+        assert!(!descriptor.column_types.contains_key("lixcol_version_id"));
+        assert_eq!(
+            descriptor.column_types.get("lixcol_snapshot_content"),
+            Some(&SurfaceColumnType::Json)
+        );
+        assert!(!descriptor.surface_traits.exposes_version_column);
+        assert!(!descriptor.implicit_overrides.expose_version_id);
+    }
+
+    #[test]
+    fn by_version_entity_surface_keeps_version_column() {
+        let descriptor = dynamic_entity_surface_descriptor(
+            "test_entity_by_version",
+            &test_entity_spec(),
+            SurfaceVariant::ByVersion,
+            CatalogSource::Builtin,
+        );
+
+        assert!(
+            descriptor
+                .visible_columns
+                .contains(&"lixcol_version_id".to_string())
+                || descriptor
+                    .hidden_columns
+                    .contains(&"lixcol_version_id".to_string())
+        );
+        assert!(descriptor
+            .hidden_columns
+            .contains(&"lixcol_snapshot_content".to_string()));
+        assert_eq!(
+            descriptor.column_types.get("lixcol_version_id"),
+            Some(&SurfaceColumnType::String)
+        );
+        assert!(descriptor.surface_traits.exposes_version_column);
+        assert!(descriptor.implicit_overrides.expose_version_id);
+    }
+
+    #[test]
+    fn history_entity_surface_derives_hidden_columns_from_history_base_relation() {
+        let descriptor = dynamic_entity_surface_descriptor(
+            "test_entity_history",
+            &test_entity_spec(),
+            SurfaceVariant::History,
+            CatalogSource::Builtin,
+        );
+
+        let expected_hidden_columns = state_relation_columns_for_variant(SurfaceVariant::History)
+            .into_iter()
+            .map(|column_name| format!("lixcol_{column_name}"))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            entity_hidden_columns(SurfaceVariant::History),
+            expected_hidden_columns
+        );
+        assert_eq!(descriptor.hidden_columns, expected_hidden_columns);
+        assert!(descriptor
+            .hidden_columns
+            .contains(&"lixcol_commit_created_at".to_string()));
+        assert!(descriptor
+            .hidden_columns
+            .contains(&"lixcol_root_commit_id".to_string()));
+        assert!(descriptor
+            .hidden_columns
+            .contains(&"lixcol_depth".to_string()));
+    }
 }

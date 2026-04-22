@@ -9,6 +9,7 @@ const CHECKPOINT_LABEL_ID: &str = "lix_label_checkpoint";
 fn as_text(value: &Value) -> String {
     match value {
         Value::Text(text) => text.clone(),
+        Value::Json(JsonValue::String(text)) => text.clone(),
         other => panic!("expected text value, got {other:?}"),
     }
 }

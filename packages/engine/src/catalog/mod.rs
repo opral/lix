@@ -18,6 +18,7 @@ mod state;
 mod transaction_write;
 mod version;
 mod version_surface;
+mod working_changes_surface;
 mod write_surface;
 
 use serde_json::Value as JsonValue;
@@ -37,7 +38,8 @@ pub(crate) use api::{
 pub(crate) use registry::*;
 #[allow(unused_imports)]
 pub(crate) use state::{
-    state_by_version_relation_name, state_surface_effective_foreign_key_target_schema_key,
+    state_by_version_relation_name, state_relation_column_is_nullable_for_variant,
+    state_relation_columns_for_variant, state_surface_effective_foreign_key_target_schema_key,
     state_surface_validation_schema,
 };
 
@@ -127,6 +129,13 @@ pub(crate) use version_surface::{
     load_version_surface_row_with_backend, open_version_surface_snapshot,
     open_version_surface_snapshot_with_shared_backend, VersionSurfaceColumn, VersionSurfaceRow,
     VersionSurfaceScanRequest, VersionSurfaceSnapshot,
+};
+#[allow(unused_imports)]
+pub(crate) use working_changes_surface::{
+    open_working_changes_surface_snapshot,
+    open_working_changes_surface_snapshot_with_shared_backend, WorkingChangesSurfaceColumn,
+    WorkingChangesSurfaceFilter, WorkingChangesSurfaceRow, WorkingChangesSurfaceScanRequest,
+    WorkingChangesSurfaceSnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use write_surface::{
@@ -319,7 +328,7 @@ fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnTy
         };
     }
 
-    Some(SurfaceColumnType::Json)
+    Some(SurfaceColumnType::Variant)
 }
 
 fn collect_surface_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a str>) {
@@ -341,5 +350,71 @@ fn collect_surface_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a 
                 collect_surface_type_kinds(branch, out);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
+        surface_column_type_from_schema,
+    };
+    use crate::catalog::SurfaceColumnType;
+    use serde_json::json;
+
+    #[test]
+    fn single_type_schema_properties_remain_scalar_surface_types() {
+        let spec = dynamic_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "phase8_scalar_schema",
+            "type": "object",
+            "properties": {
+                "title": { "type": "string" },
+                "count": { "type": "integer" },
+                "score": { "type": "number" },
+                "published": { "type": "boolean" }
+            }
+        }))
+        .expect("schema should compile");
+
+        assert_eq!(spec.column_types.get("title"), Some(&SurfaceColumnType::String));
+        assert_eq!(spec.column_types.get("count"), Some(&SurfaceColumnType::Integer));
+        assert_eq!(spec.column_types.get("score"), Some(&SurfaceColumnType::Number));
+        assert_eq!(
+            spec.column_types.get("published"),
+            Some(&SurfaceColumnType::Boolean)
+        );
+    }
+
+    #[test]
+    fn multi_type_schema_properties_become_variant_surface_types() {
+        let kind = surface_column_type_from_schema(&json!({
+            "anyOf": [
+                { "type": "string" },
+                { "type": "number" },
+                { "type": "object" },
+                { "type": "array" },
+                { "type": "boolean" },
+                { "type": "null" }
+            ]
+        }));
+
+        assert_eq!(kind, Some(SurfaceColumnType::Variant));
+    }
+
+    #[test]
+    fn builtin_lix_key_value_value_column_is_variant() {
+        let registry = build_builtin_surface_registry();
+        let resolved = registry
+            .bind_relation_name("lix_key_value")
+            .expect("builtin lix_key_value should be registered");
+
+        assert_eq!(
+            resolved.column_types.get("value"),
+            Some(&SurfaceColumnType::Variant)
+        );
+        assert_eq!(
+            resolved.column_types.get("key"),
+            Some(&SurfaceColumnType::String)
+        );
     }
 }

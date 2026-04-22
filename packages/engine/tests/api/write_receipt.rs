@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use lix_engine::{ObserveQuery, Value, WriteReceipt};
+use serde_json::Value as JsonValue;
 
 fn insert_key_value_sql(key: &str, value: &str) -> String {
     format!("INSERT INTO lix_key_value (key, value) VALUES ('{key}', '{value}')")
@@ -9,6 +10,7 @@ fn insert_key_value_sql(key: &str, value: &str) -> String {
 fn first_text(rows: &lix_engine::QueryResult) -> String {
     match &rows.rows[0][0] {
         Value::Text(value) => value.clone(),
+        Value::Json(JsonValue::String(value)) => value.clone(),
         other => panic!("expected first query cell to be text, got {other:?}"),
     }
 }

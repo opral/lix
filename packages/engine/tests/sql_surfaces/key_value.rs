@@ -34,7 +34,9 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content, untracked \
              FROM lix_state_by_version \
-             WHERE schema_key = 'lix_key_value' AND entity_id = 'key0'",
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'key0' \
+               AND version_id = 'global'",
                 &[],
             )
             .await
@@ -66,7 +68,9 @@ simulation_test!(
             .execute(
                 "SELECT snapshot_content \
              FROM lix_state_by_version \
-             WHERE schema_key = 'lix_key_value' AND entity_id = 'key0'",
+             WHERE schema_key = 'lix_key_value' \
+               AND entity_id = 'key0' \
+               AND version_id = 'global'",
                 &[],
             )
             .await
@@ -94,6 +98,7 @@ simulation_test!(
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id = 'key0' \
+               AND version_id = 'global' \
                AND snapshot_content IS NOT NULL",
                 &[],
             )
@@ -201,7 +206,7 @@ simulation_test!(
 
         engine
             .execute(
-                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
+                "UPDATE lix_key_value SET value = $2 WHERE key = $1",
                 &[
                     Value::Text("placeholder-key".to_string()),
                     Value::Text("after".to_string()),
@@ -221,7 +226,7 @@ simulation_test!(
         sim.assert_deterministic(updated.statements[0].rows.clone());
         assert_eq!(
             updated.statements[0].rows,
-            vec![vec![Value::Text("after".to_string())]]
+            vec![vec![Value::Json(json!("after"))]]
         );
     }
 );
@@ -256,6 +261,7 @@ simulation_test!(key_value_allows_arbitrary_json_values, |sim| async move {
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id IN ('key0', 'key1', 'key2', 'key3', 'key4', 'key5') \
+               AND version_id = 'global' \
              ORDER BY entity_id",
             &[],
         )
@@ -332,6 +338,7 @@ simulation_test!(
              FROM lix_state_by_version \
              WHERE schema_key = 'lix_key_value' \
                AND entity_id IN ('type_test_string', 'type_test_number') \
+               AND version_id = 'global' \
              ORDER BY entity_id",
                 &[],
             )

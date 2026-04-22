@@ -237,9 +237,21 @@ where
             description: "public filesystem write requires a concrete version_id".to_string(),
             hint: None,
         })?;
-        let execution_mode = default_execution_mode_for_request(
-            write_mode_request_for_insert_payload(planned_write, &payload),
-        );
+        let execution_mode =
+            assignments
+                .untracked
+                .map(|untracked| {
+                    default_execution_mode_for_request(if untracked {
+                        WriteModeRequest::ForceUntracked
+                    } else {
+                        WriteModeRequest::ForceTracked
+                    })
+                })
+                .unwrap_or_else(|| {
+                    default_execution_mode_for_request(
+                        write_mode_request_for_insert_payload(planned_write, &payload),
+                    )
+                });
         if let Some((_, _, batch)) =
             grouped_batches
                 .iter_mut()
@@ -586,9 +598,21 @@ where
             description: "public filesystem write requires a concrete version_id".to_string(),
             hint: None,
         })?;
-        let execution_mode = default_execution_mode_for_request(
-            write_mode_request_for_insert_payload(planned_write, &payload),
-        );
+        let execution_mode =
+            assignments
+                .untracked
+                .map(|untracked| {
+                    default_execution_mode_for_request(if untracked {
+                        WriteModeRequest::ForceUntracked
+                    } else {
+                        WriteModeRequest::ForceTracked
+                    })
+                })
+                .unwrap_or_else(|| {
+                    default_execution_mode_for_request(
+                        write_mode_request_for_insert_payload(planned_write, &payload),
+                    )
+                });
         if let Some((_, _, batch)) =
             grouped_batches
                 .iter_mut()

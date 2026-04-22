@@ -18,8 +18,8 @@ use super::pending::{
     merge_public_change_batch_into_pending_commit, pending_commit_state_matches_create_commit,
 };
 use super::types::{
-    tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
-    StagedChange,
+    tracked_live_commit_rows_from_canonical_changes, tracked_live_rows_from_staged_changes,
+    untracked_live_rows_from_updated_version_refs, StagedChange,
 };
 pub(crate) struct BufferedTrackedAppendArgs {
     pub(crate) timestamp: Option<String>,
@@ -64,11 +64,23 @@ async fn append_tracked_unchecked(
 
     if let Some(receipt) = result.receipt.as_ref() {
         let tracked_live_rows = tracked_live_rows_from_staged_changes(&result.applied_changes)?;
+        let tracked_live_commit_rows = result
+            .applied_output
+            .as_ref()
+            .map(|output| {
+                tracked_live_commit_rows_from_canonical_changes(
+                    &output.canonical_changes,
+                    &receipt.canonical_receipt.updated_version_refs,
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let untracked_live_rows = untracked_live_rows_from_updated_version_refs(
             &receipt.canonical_receipt.updated_version_refs,
         );
 
         let mut live_rows = tracked_live_rows;
+        live_rows.extend(tracked_live_commit_rows);
         live_rows.extend(untracked_live_rows);
         if !live_rows.is_empty() {
             crate::live_state::write_live_rows(transaction, &live_rows).await?;
@@ -328,6 +340,7 @@ mod tests {
         let mut pending_session = Some(PendingCommitState {
             lane: PendingCommitLane::Version("version-a".to_string()),
             commit_id: "commit-123".to_string(),
+            commit_change_id: "change-123".to_string(),
             commit_change_snapshot_id: "snapshot-1".to_string(),
             commit_snapshot: serde_json::json!({ "change_set_id": "change-set-1" }),
         });

@@ -65,8 +65,9 @@ async fn read_version_ref_commit_id(engine: &SimulatedLix, version_id: &str) -> 
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = '{}' \
+                   AND version_id = '{}' \
                  LIMIT 1",
-                version_id
+                version_id, version_id
             ),
             &[],
         )
@@ -482,14 +483,14 @@ simulation_test!(
             values.statements[0].rows[0],
             vec![
                 Value::Text("tx-kv-a".to_string()),
-                Value::Text("value-a".to_string())
+                Value::Json(JsonValue::String("value-a".to_string()))
             ]
         );
         assert_eq!(
             values.statements[0].rows[1],
             vec![
                 Value::Text("tx-kv-b".to_string()),
-                Value::Text("value-b".to_string())
+                Value::Json(JsonValue::String("value-b".to_string()))
             ]
         );
 
@@ -582,14 +583,14 @@ simulation_test!(
             values.statements[0].rows[0],
             vec![
                 Value::Text("tx-handle-kv-a".to_string()),
-                Value::Text("value-a".to_string())
+                Value::Json(JsonValue::String("value-a".to_string()))
             ]
         );
         assert_eq!(
             values.statements[0].rows[1],
             vec![
                 Value::Text("tx-handle-kv-b".to_string()),
-                Value::Text("value-b".to_string())
+                Value::Json(JsonValue::String("value-b".to_string()))
             ]
         );
 
@@ -655,6 +656,7 @@ simulation_test!(
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = $1 \
+                   AND version_id = $1 \
                    AND untracked = true",
                 &[Value::Text(version_id.clone())],
             )
@@ -688,6 +690,7 @@ simulation_test!(
                  FROM lix_state_by_version \
                  WHERE schema_key = 'lix_version_ref' \
                    AND entity_id = $1 \
+                   AND version_id = $1 \
                    AND untracked = true",
                 &[Value::Text(version_id.clone())],
             )

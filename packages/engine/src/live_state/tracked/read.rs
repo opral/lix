@@ -2,6 +2,7 @@ use crate::common::is_missing_relation_error;
 #[cfg(test)]
 use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;
+use crate::live_state::schema_access::live_storage_relation_exists_with_executor;
 use crate::live_state::storage::{
     build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
     required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
@@ -136,6 +137,21 @@ pub(crate) async fn scan_rows_with_executor(
     scan_rows_with_limit_and_order(executor, request, None, &["entity_id ASC", "file_id ASC"]).await
 }
 
+pub(crate) async fn scan_rows_with_executor_and_access(
+    executor: LiveStateExecutorRef<'_>,
+    request: &TrackedScanRequest,
+    access: &crate::live_state::storage::LiveRowAccess,
+) -> Result<Vec<TrackedRow>, LixError> {
+    scan_rows_with_limit_order_and_access(
+        executor,
+        request,
+        access,
+        None,
+        &["entity_id ASC", "file_id ASC"],
+    )
+    .await
+}
+
 pub(crate) async fn scan_tombstones_with_executor(
     executor: LiveStateExecutorRef<'_>,
     request: &TrackedScanRequest,
@@ -150,7 +166,21 @@ async fn scan_rows_with_limit_and_order(
     limit: Option<usize>,
     order_by: &[&str],
 ) -> Result<Vec<TrackedRow>, LixError> {
+    if !live_storage_relation_exists_with_executor(executor, &request.schema_key).await? {
+        return Ok(Vec::new());
+    }
+
     let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
+    scan_rows_with_limit_order_and_access(executor, request, &access, limit, order_by).await
+}
+
+async fn scan_rows_with_limit_order_and_access(
+    executor: LiveStateExecutorRef<'_>,
+    request: &TrackedScanRequest,
+    access: &crate::live_state::storage::LiveRowAccess,
+    limit: Option<usize>,
+    order_by: &[&str],
+) -> Result<Vec<TrackedRow>, LixError> {
     let selected_columns = selected_columns(&access, &request.required_columns, "tracked")?;
     let projection = selected_projection_sql(&selected_columns);
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
@@ -189,6 +219,10 @@ async fn scan_tombstones_with_limit_and_order(
     limit: Option<usize>,
     order_by: &[&str],
 ) -> Result<Vec<TrackedTombstoneMarker>, LixError> {
+    if !live_storage_relation_exists_with_executor(executor, &request.schema_key).await? {
+        return Ok(Vec::new());
+    }
+
     let sql = build_partitioned_scan_sql(ScanSqlRequest {
         select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, created_at, updated_at",
         schema_key: &request.schema_key,

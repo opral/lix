@@ -5,8 +5,10 @@ use crate::canonical::{
     CanonicalUntrackedVisibilityWrite, UpdatedVersionRef,
 };
 use crate::live_state::LiveRow;
+use crate::schema::{builtin_schema_definition, builtin_schema_storage_defaults};
 use crate::session::version_ops::VersionInfo;
 use crate::streams::StateChangeRecord;
+use crate::transaction::PendingCommitLane;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
@@ -115,6 +117,84 @@ pub(crate) fn tracked_live_rows_from_staged_changes(
         .collect()
 }
 
+pub(crate) fn tracked_live_commit_rows_from_canonical_changes(
+    canonical_changes: &[CanonicalChangeWrite],
+    updates: &[UpdatedVersionRef],
+) -> Result<Vec<LiveRow>, LixError> {
+    let commit_schema = builtin_live_schema_meta("lix_commit")?;
+
+    canonical_changes
+        .iter()
+        .filter(|change| change.schema_key.as_str() == "lix_commit")
+        .map(|change| {
+            let commit_id = change.entity_id.as_str();
+            if !updates
+                .iter()
+                .any(|update| update.commit_id.as_str() == commit_id)
+            {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "tracked live commit row materialization requires a version ref update for commit '{}'",
+                        commit_id
+                    ),
+                ));
+            }
+
+            Ok(LiveRow {
+                entity_id: commit_id.to_string(),
+                file_id: commit_schema.file_id.clone(),
+                schema_key: "lix_commit".to_string(),
+                schema_version: commit_schema.schema_version.clone(),
+                version_id: GLOBAL_VERSION_ID.to_string(),
+                plugin_key: commit_schema.plugin_key.clone(),
+                metadata: change.metadata.as_ref().map(|value| value.as_str().to_string()),
+                change_id: Some(change.id.clone()),
+                global: true,
+                untracked: false,
+                created_at: Some(change.created_at.clone()),
+                updated_at: Some(change.created_at.clone()),
+                snapshot_content: change
+                    .snapshot_content
+                    .as_ref()
+                    .map(|value| value.as_str().to_string()),
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn pending_commit_live_row(
+    lane: &PendingCommitLane,
+    commit_id: &str,
+    commit_change_id: &str,
+    commit_snapshot: &serde_json::Value,
+    created_at: &str,
+) -> Result<LiveRow, LixError> {
+    let commit_schema = builtin_live_schema_meta("lix_commit")?;
+    let _ = lane;
+
+    Ok(LiveRow {
+        entity_id: commit_id.to_string(),
+        file_id: commit_schema.file_id,
+        schema_key: "lix_commit".to_string(),
+        schema_version: commit_schema.schema_version,
+        version_id: GLOBAL_VERSION_ID.to_string(),
+        plugin_key: commit_schema.plugin_key,
+        metadata: None,
+        change_id: Some(commit_change_id.to_string()),
+        global: true,
+        untracked: false,
+        created_at: Some(created_at.to_string()),
+        updated_at: Some(created_at.to_string()),
+        snapshot_content: Some(serde_json::to_string(commit_snapshot).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("pending commit live row snapshot serialization failed: {error}"),
+            )
+        })?),
+    })
+}
+
 pub(crate) fn untracked_live_rows_from_updated_version_refs(
     updates: &[UpdatedVersionRef],
 ) -> Vec<LiveRow> {
@@ -216,6 +296,49 @@ pub(crate) fn canonical_untracked_visibility_rows_from_updated_version_refs(
             )
         })
         .collect())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BuiltinLiveSchemaMeta {
+    schema_version: String,
+    file_id: Option<String>,
+    plugin_key: Option<String>,
+}
+
+fn builtin_live_schema_meta(schema_key: &str) -> Result<BuiltinLiveSchemaMeta, LixError> {
+    let schema = builtin_schema_definition(schema_key).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("builtin live schema '{}' not found", schema_key),
+        )
+    })?;
+    let schema_version = schema
+        .get("x-lix-version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "builtin live schema '{}' is missing string x-lix-version",
+                    schema_key
+                ),
+            )
+        })?
+        .to_string();
+    let defaults = builtin_schema_storage_defaults(schema_key).ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "builtin live schema '{}' is missing storage defaults",
+                schema_key
+            ),
+        )
+    })?;
+    Ok(BuiltinLiveSchemaMeta {
+        schema_version,
+        file_id: defaults.file_id.map(str::to_string),
+        plugin_key: defaults.plugin_key.map(str::to_string),
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

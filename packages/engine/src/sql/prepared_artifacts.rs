@@ -6,9 +6,9 @@ use sqlparser::ast::Statement;
 
 use crate::backend::PreparedBatch;
 use crate::backend::TransactionBeginMode;
-use crate::catalog::{CatalogReadTimeProjectionRequest, ResolvedRelation, SurfaceReadFreshness};
+use crate::catalog::{CatalogReadTimeProjectionRequest, SurfaceReadFreshness};
 use crate::common::Value;
-use crate::history::{DirectoryHistoryRequest, FileHistoryRequest, StateHistoryRequest};
+use crate::history::{DirectoryHistoryRequest, FileHistoryRequest};
 use crate::streams::StateCommitStreamOperation;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,153 +111,8 @@ impl ReadTimeProjectionPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum PreparedHistoryReadPlanKind {
-    StateHistory,
-    EntityHistory,
     FileHistory,
     DirectoryHistory,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedStateHistoryField {
-    EntityId,
-    SchemaKey,
-    FileId,
-    PluginKey,
-    SnapshotContent,
-    Metadata,
-    SchemaVersion,
-    ChangeId,
-    CommitId,
-    CommitCreatedAt,
-    RootCommitId,
-    Depth,
-    VersionId,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedStateHistoryAggregate {
-    Count,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedStateHistoryProjectionValue {
-    Field(PreparedStateHistoryField),
-    Aggregate(PreparedStateHistoryAggregate),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedStateHistoryProjection {
-    pub output_name: String,
-    pub value: PreparedStateHistoryProjectionValue,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedStateHistorySortValue {
-    Field(PreparedStateHistoryField),
-    Aggregate(PreparedStateHistoryAggregate),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedStateHistorySortKey {
-    pub output_name: String,
-    pub value: Option<PreparedStateHistorySortValue>,
-    pub descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedStateHistoryPredicate {
-    Eq(PreparedStateHistoryField, Value),
-    NotEq(PreparedStateHistoryField, Value),
-    Gt(PreparedStateHistoryField, Value),
-    GtEq(PreparedStateHistoryField, Value),
-    Lt(PreparedStateHistoryField, Value),
-    LtEq(PreparedStateHistoryField, Value),
-    In(PreparedStateHistoryField, Vec<Value>),
-    IsNull(PreparedStateHistoryField),
-    IsNotNull(PreparedStateHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedStateHistoryAggregatePredicate {
-    Eq(PreparedStateHistoryAggregate, i64),
-    NotEq(PreparedStateHistoryAggregate, i64),
-    Gt(PreparedStateHistoryAggregate, i64),
-    GtEq(PreparedStateHistoryAggregate, i64),
-    Lt(PreparedStateHistoryAggregate, i64),
-    LtEq(PreparedStateHistoryAggregate, i64),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedStateHistoryReadPlan {
-    pub request: StateHistoryRequest,
-    pub predicates: Vec<PreparedStateHistoryPredicate>,
-    pub projections: Vec<PreparedStateHistoryProjection>,
-    pub wildcard_projection: bool,
-    pub wildcard_columns: Vec<String>,
-    pub group_by_fields: Vec<PreparedStateHistoryField>,
-    pub having: Option<PreparedStateHistoryAggregatePredicate>,
-    pub sort_keys: Vec<PreparedStateHistorySortKey>,
-    pub limit: Option<u64>,
-    pub offset: u64,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedEntityHistoryField {
-    Property(String),
-    State(PreparedStateHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedEntityHistoryProjection {
-    pub output_name: String,
-    pub field: PreparedEntityHistoryField,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedEntityHistorySortKey {
-    pub output_name: String,
-    pub field: Option<PreparedEntityHistoryField>,
-    pub descending: bool,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub enum PreparedEntityHistoryPredicate {
-    Eq(PreparedEntityHistoryField, Value),
-    NotEq(PreparedEntityHistoryField, Value),
-    Gt(PreparedEntityHistoryField, Value),
-    GtEq(PreparedEntityHistoryField, Value),
-    Lt(PreparedEntityHistoryField, Value),
-    LtEq(PreparedEntityHistoryField, Value),
-    In(PreparedEntityHistoryField, Vec<Value>),
-    IsNull(PreparedEntityHistoryField),
-    IsNotNull(PreparedEntityHistoryField),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[allow(dead_code)]
-pub struct PreparedEntityHistoryReadPlan {
-    pub resolved_relation: ResolvedRelation,
-    pub request: StateHistoryRequest,
-    pub predicates: Vec<PreparedEntityHistoryPredicate>,
-    pub projections: Vec<PreparedEntityHistoryProjection>,
-    pub wildcard_projection: bool,
-    pub wildcard_columns: Vec<String>,
-    pub sort_keys: Vec<PreparedEntityHistorySortKey>,
-    pub limit: Option<u64>,
-    pub offset: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -407,8 +262,6 @@ pub struct PreparedDirectoryHistoryReadPlan {
 #[derive(Debug, Clone, PartialEq)]
 #[allow(dead_code)]
 pub enum PreparedHistoryReadPlan {
-    StateHistory(PreparedStateHistoryReadPlan),
-    EntityHistory(PreparedEntityHistoryReadPlan),
     FileHistory(PreparedFileHistoryReadPlan),
     DirectoryHistory(PreparedDirectoryHistoryReadPlan),
 }
@@ -417,8 +270,6 @@ pub enum PreparedHistoryReadPlan {
 impl PreparedHistoryReadPlan {
     pub fn kind(&self) -> PreparedHistoryReadPlanKind {
         match self {
-            Self::StateHistory(_) => PreparedHistoryReadPlanKind::StateHistory,
-            Self::EntityHistory(_) => PreparedHistoryReadPlanKind::EntityHistory,
             Self::FileHistory(_) => PreparedHistoryReadPlanKind::FileHistory,
             Self::DirectoryHistory(_) => PreparedHistoryReadPlanKind::DirectoryHistory,
         }

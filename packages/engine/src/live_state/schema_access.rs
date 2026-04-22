@@ -1,4 +1,5 @@
 use crate::live_state::store::LiveStateBackendRef;
+use crate::live_state::store::LiveStateExecutorRef;
 use crate::{LixError, SqlDialect, Value};
 use serde_json::Value as JsonValue;
 
@@ -14,7 +15,7 @@ pub(crate) struct LiveRowShape {
 }
 
 impl LiveRowShape {
-    fn raw_access(&self) -> &super::storage::LiveRowAccess {
+    pub(crate) fn raw_access(&self) -> &super::storage::LiveRowAccess {
         &self.access
     }
 
@@ -133,6 +134,40 @@ pub(crate) async fn live_storage_relation_exists_with_backend(
                  WHERE table_name = $1 \
                  LIMIT 1",
                 &[Value::Text(relation_name)],
+            )
+            .await?;
+            Ok(!result.rows.is_empty())
+        }
+    }
+}
+
+pub(crate) async fn live_storage_relation_exists_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+    schema_key: &str,
+) -> Result<bool, LixError> {
+    let relation_name = tracked_relation_name(schema_key);
+    match executor.dialect() {
+        SqlDialect::Sqlite => {
+            let result = crate::live_state::store_sql::execute_query_with_executor(
+                executor,
+                "SELECT 1 \
+                 FROM sqlite_master \
+                 WHERE name = $1 \
+                   AND type IN ('table', 'view') \
+                 LIMIT 1",
+                &[Value::Text(relation_name.to_string())],
+            )
+            .await?;
+            Ok(!result.rows.is_empty())
+        }
+        SqlDialect::Postgres => {
+            let result = crate::live_state::store_sql::execute_query_with_executor(
+                executor,
+                "SELECT 1 \
+                 FROM information_schema.tables \
+                 WHERE table_name = $1 \
+                 LIMIT 1",
+                &[Value::Text(relation_name.to_string())],
             )
             .await?;
             Ok(!result.rows.is_empty())

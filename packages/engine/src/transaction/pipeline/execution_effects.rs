@@ -37,7 +37,6 @@ pub(crate) fn command_metadata(
             .is_bufferable_write()
             .then(|| step.transaction_write_delta().cloned())
             .flatten(),
-        registry_mutated_during_planning: !step.prepared().public_surface_registry_effect.is_none(),
     })
 }
 

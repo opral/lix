@@ -1,12 +1,19 @@
 use crate::support;
 
 use lix_engine::Value;
-use serde_json::json;
+use serde_json::{json, Value as JsonValue};
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
         Value::Text(actual) => assert_eq!(actual, expected),
         other => panic!("expected text value '{expected}', got {other:?}"),
+    }
+}
+
+fn assert_json_string(value: &Value, expected: &str) {
+    match value {
+        Value::Json(JsonValue::String(actual)) => assert_eq!(actual, expected),
+        other => panic!("expected json string value '{expected}', got {other:?}"),
     }
 }
 
@@ -113,7 +120,7 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_text(&rows.statements[0].rows[0][0], "value-b");
+        assert_json_string(&rows.statements[0].rows[0][0], "value-b");
     }
 );
 
@@ -157,7 +164,7 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_text(&rows.statements[0].rows[0][0], "value-b");
+        assert_json_string(&rows.statements[0].rows[0][0], "value-b");
     }
 );
 
@@ -285,7 +292,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) \
-                 VALUES (lix_json(?1), 'global') \
+                 VALUES (lix_json($1), 'global') \
                  ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
                 &[Value::Text(schema_json.to_string())],
             )
@@ -295,7 +302,7 @@ simulation_test!(
         engine
             .execute(
                 "INSERT INTO lix_registered_schema_by_version (value, lixcol_version_id) \
-                 VALUES (lix_json(?1), 'global') \
+                 VALUES (lix_json($1), 'global') \
                  ON CONFLICT (entity_id, file_id, version_id) DO NOTHING",
                 &[Value::Text(schema_json.to_string())],
             )

@@ -75,6 +75,7 @@ pub(crate) struct DirectoryInsertAssignments {
     pub(crate) name: Option<String>,
     pub(crate) path: Option<NormalizedDirectoryPath>,
     pub(crate) hidden: bool,
+    pub(crate) untracked: Option<bool>,
     pub(crate) metadata: Option<String>,
 }
 
@@ -83,6 +84,7 @@ pub(crate) struct FileInsertAssignments {
     pub(crate) id: Option<String>,
     pub(crate) path: ParsedFilePath,
     pub(crate) hidden: bool,
+    pub(crate) untracked: Option<bool>,
     pub(crate) metadata: Option<String>,
     pub(crate) data: Option<Vec<u8>>,
 }
@@ -177,6 +179,7 @@ pub(crate) fn parse_directory_insert_assignments(
             .and_then(value_as_bool)
             .or_else(|| defaults.get("hidden").and_then(value_as_bool))
             .unwrap_or(false),
+        untracked: payload.get("untracked").and_then(value_as_bool),
         metadata: optional_insert_text(payload, "metadata", "public filesystem directory")?,
     })
 }
@@ -213,6 +216,7 @@ pub(crate) fn parse_file_insert_assignments(
             .and_then(value_as_bool)
             .or_else(|| defaults.get("hidden").and_then(value_as_bool))
             .unwrap_or(false),
+        untracked: payload.get("untracked").and_then(value_as_bool),
         metadata: optional_insert_text(payload, "metadata", "public filesystem file")?,
         data: insert_blob_value(payload, "data")?,
     })

@@ -20,8 +20,9 @@ use crate::transaction::{
     normalize_sql_error_with_transaction_and_relation_names, BufferedWriteCommandMetadata,
     BufferedWriteFlushClass, BufferedWriteSessionEffects, BufferedWriteTransaction,
     DeferredCommitEffects, PendingCommitState, PendingWriteOverlay, PreparedDirectWriteArtifact,
-    PreparedScalarReadArtifact, PreparedWriteStatement, SessionCompilerState,
-    TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath, WriteResult,
+    PreparedPublicSurfaceRegistryMutation, PreparedScalarReadArtifact, PreparedWriteStatement,
+    SessionCompilerState, TransactionWriteDelta, WriteCommand, WriteExecutionContext, WritePath,
+    WriteResult,
 };
 use crate::{ExecuteResult, LixBackendTransaction, LixError, QueryResult, Value};
 
@@ -30,15 +31,16 @@ use super::{
     prepare_buffered_write_execution_step,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 enum PreparedWriteContextInvalidation {
     None,
+    ApplyMutations(Vec<PreparedPublicSurfaceRegistryMutation>),
     RegenerateFromPendingOverlay,
     RegenerateFromCommittedState,
 }
 
 impl PreparedWriteContextInvalidation {
-    fn is_none(self) -> bool {
+    fn is_none(&self) -> bool {
         matches!(self, Self::None)
     }
 }
@@ -180,7 +182,7 @@ async fn execute_bound_statement_in_buffered_write_scope(
             if continuation_safe {
                 apply_buffered_write_planning_effects(&command, context)?;
             }
-            let invalidation = prepared_write_context_invalidation_for_metadata(&metadata);
+            let invalidation = prepared_write_context_invalidation_for_metadata(command.prepared());
             if !invalidation.is_none() {
                 write_transaction.mark_public_surface_registry_refresh_pending();
                 let pending_write_overlay =
@@ -481,12 +483,18 @@ fn apply_buffered_write_planning_effects(
 }
 
 fn prepared_write_context_invalidation_for_metadata(
-    metadata: &BufferedWriteCommandMetadata,
+    prepared: &PreparedWriteStatement,
 ) -> PreparedWriteContextInvalidation {
-    if metadata.registry_mutated_during_planning {
-        PreparedWriteContextInvalidation::RegenerateFromPendingOverlay
-    } else {
-        PreparedWriteContextInvalidation::None
+    match &prepared.public_surface_registry_effect {
+        crate::transaction::PreparedPublicSurfaceRegistryEffect::None => {
+            PreparedWriteContextInvalidation::None
+        }
+        crate::transaction::PreparedPublicSurfaceRegistryEffect::ApplyMutations(mutations) => {
+            PreparedWriteContextInvalidation::ApplyMutations(mutations.clone())
+        }
+        crate::transaction::PreparedPublicSurfaceRegistryEffect::ReloadFromStorage => {
+            PreparedWriteContextInvalidation::RegenerateFromPendingOverlay
+        }
     }
 }
 
@@ -508,6 +516,28 @@ async fn apply_prepared_write_context_invalidation(
 ) -> Result<(), LixError> {
     let registry = match invalidation {
         PreparedWriteContextInvalidation::None => return Ok(()),
+        PreparedWriteContextInvalidation::ApplyMutations(mutations) => {
+            let mut registry = context.public_surface_registry.clone();
+            for mutation in mutations {
+                match mutation {
+                    PreparedPublicSurfaceRegistryMutation::UpsertRegisteredSchemaSnapshot {
+                        snapshot,
+                    } => {
+                        crate::catalog::apply_registered_schema_snapshot_to_surface_registry(
+                            &mut registry,
+                            &snapshot,
+                        )?;
+                    }
+                    PreparedPublicSurfaceRegistryMutation::RemoveDynamicSchema { schema_key } => {
+                        crate::catalog::remove_dynamic_entity_surfaces_for_schema_key(
+                            &mut registry,
+                            &schema_key,
+                        );
+                    }
+                }
+            }
+            registry
+        }
         PreparedWriteContextInvalidation::RegenerateFromPendingOverlay => {
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::transaction::build_public_read_surface_registry_with_pending_overlay(
