@@ -11,7 +11,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use tokio::sync::oneshot;
 
 use crate::backend::TransactionBeginMode;
-use crate::common::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 use super::commit_derived::{is_lazy_commit_derived_surface, scan_commit_derived_rows};
@@ -24,7 +23,7 @@ use super::untracked::{
 };
 use super::{
     decode_registered_schema_row, scan_live_rows, scan_tracked_rows_with_backend,
-    scan_untracked_rows_with_backend_limit, storage::no_live_columns, LiveRow, LiveRowQuery,
+    scan_untracked_rows_with_backend_limit, table_storage::no_live_columns, LiveRow, LiveRowQuery,
     LiveRowSource, ScanConstraint, ScanField, ScanOperator, TrackedRow, TrackedTombstoneMarker,
     UntrackedRow,
 };
@@ -1287,45 +1286,7 @@ async fn load_visible_state_schema_keys(
 async fn load_live_storage_schema_keys(
     backend: &dyn LixBackend,
 ) -> Result<BTreeSet<String>, LixError> {
-    let rows = match backend.dialect() {
-        crate::SqlDialect::Sqlite => {
-            crate::live_state::store_sql::execute_query_with_backend(
-                backend,
-                "SELECT name \
-                 FROM sqlite_master \
-                 WHERE type IN ('table', 'view') \
-                   AND name LIKE $1",
-                &[Value::Text(format!("{}%", super::TRACKED_RELATION_PREFIX))],
-            )
-            .await?
-            .rows
-        }
-        crate::SqlDialect::Postgres => {
-            crate::live_state::store_sql::execute_query_with_backend(
-                backend,
-                "SELECT table_name \
-                 FROM information_schema.tables \
-                 WHERE table_name LIKE $1",
-                &[Value::Text(format!("{}%", super::TRACKED_RELATION_PREFIX))],
-            )
-            .await?
-            .rows
-        }
-    };
-
-    let mut schema_keys = BTreeSet::new();
-    for row in rows {
-        let Some(Value::Text(table_name)) = row.first() else {
-            continue;
-        };
-        let Some(schema_key) = table_name.strip_prefix(super::TRACKED_RELATION_PREFIX) else {
-            continue;
-        };
-        if !schema_key.is_empty() {
-            schema_keys.insert(schema_key.to_string());
-        }
-    }
-    Ok(schema_keys)
+    crate::live_state::storage::load_live_storage_schema_keys(backend).await
 }
 
 async fn load_change_commit_ids_with_backend(
@@ -1343,33 +1304,7 @@ async fn load_change_commit_ids_with_backend(
         return Ok(BTreeMap::new());
     }
 
-    let in_list = change_ids
-        .iter()
-        .map(|change_id| format!("'{}'", escape_sql_string(change_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "WITH {change_commit_cte} \
-         SELECT change_id, commit_id \
-         FROM change_commit_by_change_id \
-         WHERE change_id IN ({in_list})",
-        change_commit_cte =
-            crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
-        in_list = in_list,
-    );
-    let result =
-        crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
-    let mut rows = BTreeMap::new();
-    for row in result.rows {
-        let Some(Value::Text(change_id)) = row.first() else {
-            continue;
-        };
-        let Some(Value::Text(commit_id)) = row.get(1) else {
-            continue;
-        };
-        rows.insert(change_id.clone(), commit_id.clone());
-    }
-    Ok(rows)
+    crate::live_state::storage::load_change_commit_id_map(backend, &change_ids).await
 }
 #[derive(Clone)]
 struct BackendBackedStateByVersion {

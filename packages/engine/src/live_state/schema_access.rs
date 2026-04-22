@@ -120,33 +120,8 @@ pub(crate) async fn live_storage_relation_exists_with_executor(
     schema_key: &str,
 ) -> Result<bool, LixError> {
     let relation_name = tracked_relation_name(schema_key);
-    match executor.dialect() {
-        SqlDialect::Sqlite => {
-            let result = crate::live_state::store_sql::execute_query_with_executor(
-                executor,
-                "SELECT 1 \
-                 FROM sqlite_master \
-                 WHERE name = $1 \
-                   AND type IN ('table', 'view') \
-                 LIMIT 1",
-                &[Value::Text(relation_name.to_string())],
-            )
-            .await?;
-            Ok(!result.rows.is_empty())
-        }
-        SqlDialect::Postgres => {
-            let result = crate::live_state::store_sql::execute_query_with_executor(
-                executor,
-                "SELECT 1 \
-                 FROM information_schema.tables \
-                 WHERE table_name = $1 \
-                 LIMIT 1",
-                &[Value::Text(relation_name.to_string())],
-            )
-            .await?;
-            Ok(!result.rows.is_empty())
-        }
-    }
+    crate::live_state::storage::live_storage_relation_exists_with_executor(executor, &relation_name)
+        .await
 }
 
 pub(crate) fn tracked_relation_name(schema_key: &str) -> String {
