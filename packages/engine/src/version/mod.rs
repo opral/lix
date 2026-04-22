@@ -17,7 +17,7 @@ use crate::LixError;
 pub(crate) use admin_write::{stage_create_version_insert, stage_update_version_head};
 pub use frontier::CommittedVersionFrontier;
 pub(crate) use read::{
-    load_checkpoint_version_heads_with_executor,
+    load_all_version_descriptors_with_executor, load_checkpoint_version_heads_with_executor,
     load_exact_canonical_row_at_version_head_with_executor,
     load_version_descriptor_with_pending_overlay, load_version_head_commit_id_with_executor,
     load_version_head_commit_id_with_pending_overlay, load_version_info_for_versions,

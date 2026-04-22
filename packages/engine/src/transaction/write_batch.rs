@@ -1,6 +1,10 @@
 use crate::backend::{PreparedBatch, PreparedStatement, TransactionBeginMode};
 use crate::{LixBackend, LixBackendTransaction, LixError, QueryResult, Value};
 
+pub(crate) trait PersistenceStatementSink {
+    fn push_persistence_statement(&mut self, sql: impl Into<String>, params: Vec<Value>);
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum WriteStep {
     Statement { sql: String, params: Vec<Value> },
@@ -25,6 +29,12 @@ impl WriteBatch {
 
     pub(crate) fn extend(&mut self, other: WriteBatch) {
         self.steps.extend(other.steps);
+    }
+}
+
+impl PersistenceStatementSink for WriteBatch {
+    fn push_persistence_statement(&mut self, sql: impl Into<String>, params: Vec<Value>) {
+        self.push_statement(sql, params);
     }
 }
 
@@ -68,7 +78,7 @@ async fn execute_write_batch_steps(
             }
         }
     }
-    transaction.execute_batch(&batch).await
+    crate::execution::execute_prepared_batch_in_transaction(transaction, &batch).await
 }
 
 #[cfg(test)]

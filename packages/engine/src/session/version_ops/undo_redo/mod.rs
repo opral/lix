@@ -13,6 +13,7 @@
 
 mod apply;
 mod init;
+pub(crate) mod storage;
 mod types;
 
 use crate::{ExecuteOptions, LixError, Session};

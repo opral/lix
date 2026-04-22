@@ -63,6 +63,9 @@ pub(crate) use host::{
     sql_compiler_seed_from_host, SessionExecutionContext, SessionHost,
 };
 
+pub(crate) use checkpoint_ops::{
+    clear_last_checkpoint_rows_in_transaction, insert_last_checkpoint_for_version_in_transaction,
+};
 pub(crate) use init::{init, load_checkpoint_version_heads_for_init};
 pub use runtime::ExecuteOptions;
 pub(crate) use runtime::SessionExecutionMode;
