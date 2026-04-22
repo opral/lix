@@ -29,9 +29,9 @@ use crate::live_state::lifecycle::{
     LIVE_STATE_STATUS_SEED_ROW_SQL, LIVE_STATE_STATUS_TABLE,
 };
 use crate::live_state::store::{
-    LiveStateBackendRef, LiveStateFrontierReadStore, LiveStateLifecycleAdminStore,
-    LiveStateLifecycleReadStore, LiveStateLifecycleWriteStore, LiveStateMaterializeStore,
-    LiveStateReadStore, LiveStateWriteStore,
+    LiveStateBackendRef, LiveStateExecutorRef, LiveStateFrontierReadStore,
+    LiveStateLifecycleAdminStore, LiveStateLifecycleReadStore, LiveStateLifecycleWriteStore,
+    LiveStateMaterializeStore, LiveStateReadStore, LiveStateWriteStore,
 };
 use crate::live_state::untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
 use crate::live_state::{
@@ -439,6 +439,82 @@ pub(crate) async fn live_storage_relation_exists(
         }
     };
     Ok(!result.rows.is_empty())
+}
+
+pub(crate) async fn live_storage_relation_exists_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+    relation_name: &str,
+) -> Result<bool, LixError> {
+    let result = match executor.dialect() {
+        SqlDialect::Sqlite => {
+            execute_query_with_executor(
+                executor,
+                "SELECT 1 \
+                 FROM sqlite_master \
+                 WHERE name = $1 \
+                   AND type IN ('table', 'view') \
+                 LIMIT 1",
+                &[Value::Text(relation_name.to_string())],
+            )
+            .await?
+        }
+        SqlDialect::Postgres => {
+            execute_query_with_executor(
+                executor,
+                "SELECT 1 \
+                 FROM information_schema.tables \
+                 WHERE table_name = $1 \
+                 LIMIT 1",
+                &[Value::Text(relation_name.to_string())],
+            )
+            .await?
+        }
+    };
+    Ok(!result.rows.is_empty())
+}
+
+pub(crate) async fn load_live_storage_schema_keys(
+    backend: LiveStateBackendRef<'_>,
+) -> Result<BTreeSet<String>, LixError> {
+    let rows = match backend.dialect() {
+        SqlDialect::Sqlite => {
+            execute_query_with_backend(
+                backend,
+                "SELECT name \
+                 FROM sqlite_master \
+                 WHERE type IN ('table', 'view') \
+                   AND name LIKE $1",
+                &[Value::Text(format!("{}%", sql::TRACKED_LIVE_TABLE_PREFIX))],
+            )
+            .await?
+            .rows
+        }
+        SqlDialect::Postgres => {
+            execute_query_with_backend(
+                backend,
+                "SELECT table_name \
+                 FROM information_schema.tables \
+                 WHERE table_name LIKE $1",
+                &[Value::Text(format!("{}%", sql::TRACKED_LIVE_TABLE_PREFIX))],
+            )
+            .await?
+            .rows
+        }
+    };
+
+    let mut schema_keys = BTreeSet::new();
+    for row in rows {
+        let Some(Value::Text(table_name)) = row.first() else {
+            continue;
+        };
+        let Some(schema_key) = table_name.strip_prefix(sql::TRACKED_LIVE_TABLE_PREFIX) else {
+            continue;
+        };
+        if !schema_key.is_empty() {
+            schema_keys.insert(schema_key.to_string());
+        }
+    }
+    Ok(schema_keys)
 }
 
 pub(crate) async fn scan_live_partition_with_executor(
