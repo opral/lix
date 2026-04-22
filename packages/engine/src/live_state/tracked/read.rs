@@ -24,15 +24,6 @@ pub async fn load_exact_row_with_backend(
     load_exact_row_with_executor(&mut executor, request).await
 }
 
-#[cfg(test)]
-pub async fn load_exact_rows_with_backend(
-    backend: LiveStateBackendRef<'_>,
-    request: &BatchTrackedRowRequest,
-) -> Result<Vec<TrackedRow>, LixError> {
-    let mut executor = backend;
-    load_exact_rows_with_executor(&mut executor, request).await
-}
-
 pub async fn scan_rows_with_backend(
     backend: LiveStateBackendRef<'_>,
     request: &TrackedScanRequest,

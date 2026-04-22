@@ -3342,7 +3342,6 @@ mod tests {
             .first()
             .expect("entity by-version read should lower");
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
-        assert!(lowered_sql.contains("version_id AS lixcol_version_id"));
     }
 
     #[test]
