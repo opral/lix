@@ -1,9 +1,10 @@
 use crate::canonical::compact_untracked_changes_for_touched_rows_in_transaction;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
+use crate::session::version_ops::VersionOpsTransactionRef;
 use crate::transaction::PendingCommitState;
 use crate::transaction::{binary_blob_writes_from_filesystem_state, FilesystemTransactionState};
-use crate::{LixBackendTransaction, LixError};
+use crate::LixError;
 
 use super::create::create_commit;
 pub(crate) use super::create::{
@@ -39,7 +40,7 @@ pub(crate) struct BufferedTrackedAppendOutcome {
 }
 
 pub(crate) async fn append_tracked(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     args: CreateCommitArgs,
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
@@ -48,7 +49,7 @@ pub(crate) async fn append_tracked(
 }
 
 async fn append_tracked_unchecked(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     args: CreateCommitArgs,
     functions: &mut dyn LixFunctionProvider,
     invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,
@@ -90,7 +91,7 @@ async fn append_tracked_unchecked(
 }
 
 pub(crate) async fn append_tracked_with_pending_public_session(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     args: BufferedTrackedAppendArgs,
     functions: &mut dyn LixFunctionProvider,
     mut invariant_checker: Option<&mut dyn CreateCommitInvariantChecker>,

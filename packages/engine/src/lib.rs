@@ -33,6 +33,7 @@ pub use schema::{
 
 pub use api::BootKeyValue;
 pub use api::{InitResult, Lix, LixConfig};
+pub(crate) use backend::QueryExecutor;
 pub use backend::TransactionBeginMode;
 pub use backend::{LixBackend, LixBackendTransaction, PreparedBatch, PreparedStatement};
 pub use canonical::CanonicalJson;

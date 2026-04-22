@@ -15,10 +15,8 @@ pub(crate) use layout::{
 };
 #[allow(unused_imports)]
 pub(crate) use registry::{
-    compile_registered_live_layout, ensure_schema_live_table_with_requirement,
-    ensure_schema_live_table_with_requirement_in_transaction,
-    load_live_table_layout_in_transaction, load_live_table_layout_with_backend, register_schema,
-    register_schema_in_transaction, LiveTableRequirement,
+    compile_registered_live_layout, load_live_table_layout_in_transaction,
+    load_live_table_layout_with_backend,
 };
 #[allow(unused_imports)]
 pub(crate) use sql::{

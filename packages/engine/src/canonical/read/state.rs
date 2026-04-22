@@ -7,6 +7,8 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::canonical::store::CanonicalCommitQueryExecutor;
+use crate::canonical::store_sql::execute_query_with_executor;
 use crate::common::is_missing_relation_error;
 use crate::schema::LixCommit;
 use crate::{LixError, Value};
@@ -40,10 +42,8 @@ pub(crate) struct ExactCommittedStateRowRequest {
     pub(crate) exact_filters: BTreeMap<String, Value>,
 }
 
-pub(crate) use crate::backend::QueryExecutor as CommitQueryExecutor;
-
 pub(crate) async fn load_exact_committed_change_from_commit_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     head_commit_id: &str,
     request: &ExactCommittedStateRowRequest,
 ) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
@@ -94,7 +94,7 @@ pub(crate) async fn load_exact_committed_change_from_commit_with_executor(
 }
 
 async fn load_reachable_commit_lineage(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     head_commit_id: &str,
 ) -> Result<BTreeMap<String, CommitLineageEntry>, LixError> {
     let mut lineage = BTreeMap::new();
@@ -145,7 +145,7 @@ async fn load_reachable_commit_lineage(
 }
 
 async fn load_commit_member_change_row_by_id(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     commit_id: &str,
     change_id: &str,
 ) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
@@ -206,7 +206,7 @@ fn canonical_change_matches_request(
 }
 
 pub(crate) async fn load_commit_lineage_entry_by_id(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     commit_id: &str,
 ) -> Result<Option<CommitLineageEntry>, LixError> {
     let sql = format!(
@@ -221,7 +221,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
          LIMIT 1",
         commit_id = escape_sql_string(commit_id),
     );
-    let result = match executor.execute(&sql, &[]).await {
+    let result = match execute_query_with_executor(executor, &sql, &[]).await {
         Ok(result) => result,
         Err(err) if is_missing_relation_error(&err) => return Ok(None),
         Err(err) => return Err(err),
@@ -249,7 +249,7 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
 }
 
 pub(crate) async fn load_canonical_change_row_by_id(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     change_id: &str,
 ) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
     let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.created_at \
@@ -257,9 +257,8 @@ pub(crate) async fn load_canonical_change_row_by_id(
                LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
                WHERE c.id = $1 \
                LIMIT 1";
-    let result = executor
-        .execute(sql, &[Value::Text(change_id.to_string())])
-        .await?;
+    let result =
+        execute_query_with_executor(executor, sql, &[Value::Text(change_id.to_string())]).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };
@@ -277,7 +276,7 @@ pub(crate) async fn load_canonical_change_row_by_id(
 }
 
 async fn untracked_visibility_exists(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     change_id: &str,
 ) -> Result<bool, LixError> {
     let sql = format!(
@@ -288,9 +287,8 @@ async fn untracked_visibility_exists(
         crate::canonical::journal::UNTRACKED_CHANGE_VISIBILITY_TABLE,
         executor.dialect().placeholder(1),
     );
-    let result = executor
-        .execute(&sql, &[Value::Text(change_id.to_string())])
-        .await?;
+    let result =
+        execute_query_with_executor(executor, &sql, &[Value::Text(change_id.to_string())]).await?;
     Ok(!result.rows.is_empty())
 }
 

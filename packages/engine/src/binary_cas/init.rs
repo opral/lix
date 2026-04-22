@@ -1,6 +1,9 @@
-use crate::backend::{add_column_if_missing, execute_ddl_batch};
 use crate::binary_cas::schema::INTERNAL_BINARY_CHUNK_STORE;
-use crate::{LixBackend, LixError};
+use crate::binary_cas::store::BinaryCasBackendRef;
+use crate::binary_cas::store_sql::{
+    add_column_if_missing_with_backend, execute_ddl_batch_with_backend,
+};
+use crate::LixError;
 
 const BINARY_CAS_INIT_STATEMENTS: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS lix_internal_binary_blob_store (\
@@ -51,16 +54,16 @@ const BINARY_CAS_INIT_STATEMENTS: &[&str] = &[
      ON lix_internal_binary_file_version_ref (version_id)",
 ];
 
-pub(crate) async fn init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    execute_ddl_batch(backend, "binary_cas", BINARY_CAS_INIT_STATEMENTS).await?;
-    add_column_if_missing(
+pub(crate) async fn init_storage(backend: BinaryCasBackendRef<'_>) -> Result<(), LixError> {
+    execute_ddl_batch_with_backend(backend, "binary_cas", BINARY_CAS_INIT_STATEMENTS).await?;
+    add_column_if_missing_with_backend(
         backend,
         INTERNAL_BINARY_CHUNK_STORE,
         "codec",
         "TEXT NOT NULL DEFAULT 'raw'",
     )
     .await?;
-    add_column_if_missing(
+    add_column_if_missing_with_backend(
         backend,
         INTERNAL_BINARY_CHUNK_STORE,
         "codec_dict_id",

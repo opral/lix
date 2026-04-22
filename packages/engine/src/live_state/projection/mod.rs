@@ -13,17 +13,27 @@ pub(crate) mod hydration;
 pub(crate) mod replay;
 pub(crate) mod status;
 
-use std::collections::BTreeSet;
-
-use crate::backend::TransactionBeginMode;
+use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::{
-    CanonicalCommitProjectionReceipt, LiveStateMode, LiveStateProjectionStatus,
-    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope, ReplayCursor,
+    CanonicalCommitProjectionReceipt, LiveStateMode, LiveStateProjectionStatus, ReplayCursor,
 };
 use crate::schema::LixVersionRef;
 use crate::version::CommittedVersionFrontier;
-use crate::{LixBackend, LixBackendTransaction, LixError};
+use crate::LixError;
 
+#[cfg(test)]
+use std::collections::BTreeSet;
+
+#[cfg(test)]
+use crate::live_state::store::LiveStateBackendRef;
+#[cfg(test)]
+use crate::live_state::store_sql::begin_write_transaction;
+#[cfg(test)]
+use crate::live_state::{
+    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
+};
+
+#[cfg(test)]
 const MAX_LIVE_STATE_DELTA_MERGE_PASSES: usize = 16;
 
 fn version_ref_schema_key() -> String {
@@ -99,12 +109,14 @@ pub struct ProjectionStatus {
     pub projections: Vec<DerivedProjectionStatus>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ProjectionCatchUpOutcome {
     AlreadyApplied,
     RebuiltToTarget,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProjectionCatchUpReport {
     pub(crate) projection: DerivedProjectionId,
@@ -119,18 +131,16 @@ pub(crate) struct ProjectionCatchUpReport {
     pub(crate) delta_merge_passes: usize,
 }
 
-pub(crate) async fn projection_status(
-    backend: &dyn LixBackend,
-) -> Result<ProjectionStatus, LixError> {
-    Ok(ProjectionStatus {
-        projections: vec![derived_projection_status_from_live_state(
-            status::load_live_state_projection_status_with_backend(backend).await?,
-        )],
-    })
+pub(crate) fn projection_status_from_live_state(
+    status: LiveStateProjectionStatus,
+) -> ProjectionStatus {
+    ProjectionStatus {
+        projections: vec![derived_projection_status_from_live_state(status)],
+    }
 }
 
 pub(crate) async fn apply_canonical_receipt_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     receipt: &CanonicalCommitProjectionReceipt,
 ) -> Result<(), LixError> {
     replay::advance_live_state_projection_replay_boundary_to_cursor_in_transaction(
@@ -141,21 +151,15 @@ pub(crate) async fn apply_canonical_receipt_in_transaction(
 }
 
 pub(crate) async fn mark_live_state_projection_ready_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
 ) -> Result<ReplayCursor, LixError> {
     crate::live_state::mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction)
         .await
 }
 
-pub(crate) async fn mark_live_state_projection_ready_with_backend(
-    backend: &dyn LixBackend,
-    cursor: &ReplayCursor,
-) -> Result<(), LixError> {
-    replay::mark_live_state_projection_ready_with_backend(backend, cursor).await
-}
-
+#[cfg(test)]
 pub(crate) async fn catch_up_live_state_to_current_frontier(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
 ) -> Result<ProjectionCatchUpReport, LixError> {
     let starting_status = status::load_live_state_projection_status_with_backend(backend).await?;
     let starting_cursor = starting_status.applied_cursor.clone();
@@ -227,11 +231,13 @@ pub(crate) async fn catch_up_live_state_to_current_frontier(
     ))
 }
 
+#[cfg(test)]
 fn live_state_projection_needs_replay_recovery(status: &LiveStateProjectionStatus) -> bool {
     status.mode == LiveStateMode::NeedsRebuild
         && status.applied_committed_frontier.as_ref() == Some(&status.current_committed_frontier)
 }
 
+#[cfg(test)]
 fn changed_version_ids_between_frontiers(
     applied_frontier: Option<&CommittedVersionFrontier>,
     current_frontier: &CommittedVersionFrontier,
@@ -254,13 +260,12 @@ fn changed_version_ids_between_frontiers(
     )
 }
 
+#[cfg(test)]
 async fn recover_live_state_projection_replay_state(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     target: Option<&ReplayCursor>,
 ) -> Result<(), LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let mut transaction = begin_write_transaction(backend).await?;
     let recovery_result = match target {
         Some(target) => {
             replay::mark_live_state_projection_ready_at_replay_cursor_in_transaction(
@@ -298,19 +303,19 @@ fn derived_projection_status_from_live_state(
     }
 }
 
+#[cfg(test)]
 fn live_state_projection_serves_current_frontier(status: &LiveStateProjectionStatus) -> bool {
     status.mode == LiveStateMode::Ready
         && status.applied_committed_frontier.as_ref() == Some(&status.current_committed_frontier)
 }
 
+#[cfg(test)]
 async fn apply_live_state_replay_scope_to_cursor(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     scope: &LiveStateRebuildScope,
     target: Option<&ReplayCursor>,
 ) -> Result<(), LixError> {
-    let mut transaction = backend
-        .begin_transaction(TransactionBeginMode::Write)
-        .await?;
+    let mut transaction = begin_write_transaction(backend).await?;
     let apply_result = crate::live_state::rebuild_scope_in_transaction(
         transaction.as_mut(),
         &LiveStateRebuildRequest {
@@ -353,11 +358,9 @@ async fn apply_live_state_replay_scope_to_cursor(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_canonical_receipt_in_transaction, catch_up_live_state_to_current_frontier,
-        projection_status, replay, status, DerivedProjectionId, ProjectionCatchUpOutcome,
-        ProjectionReplayMode,
+        apply_canonical_receipt_in_transaction, catch_up_live_state_to_current_frontier, replay,
+        status, DerivedProjectionId, ProjectionCatchUpOutcome, ProjectionReplayMode,
     };
-    use crate::backend::TransactionBeginMode;
     use crate::canonical::CanonicalCommitReceipt;
     use crate::live_state::{CanonicalCommitProjectionReceipt, LiveStateMode, ReplayCursor};
     use crate::test_support::{
@@ -365,8 +368,8 @@ mod tests {
         seed_live_state_status_row, seed_local_version_head, CanonicalChangeSeed,
         TestSqliteBackend,
     };
+    use crate::CommittedVersionFrontier;
     use crate::CreateVersionOptions;
-    use crate::{CommittedVersionFrontier, LixBackend};
     use std::collections::BTreeMap;
 
     async fn init_projection_backend() -> TestSqliteBackend {
@@ -429,7 +432,7 @@ mod tests {
         .await
         .expect("status row should seed");
 
-        let status = projection_status(&backend)
+        let status = crate::live_state::projection_status(&backend)
             .await
             .expect("projection status should load");
         assert_eq!(status.projections.len(), 1);
@@ -475,7 +478,7 @@ mod tests {
         .expect("status row should seed");
         backend.clear_query_log();
         let mut transaction = backend
-            .begin_transaction(TransactionBeginMode::Write)
+            .begin_write_transaction()
             .await
             .expect("transaction should begin");
         let receipt = CanonicalCommitProjectionReceipt::new(
@@ -585,7 +588,7 @@ mod tests {
                 .expect("version-c creation should produce a replay cursor");
 
             let mut transaction = backend
-                .begin_transaction(TransactionBeginMode::Write)
+                .begin_write_transaction()
                 .await
                 .expect("staleness transaction should open");
             replay::mark_live_state_projection_needs_rebuild_at_replay_cursor_in_transaction(

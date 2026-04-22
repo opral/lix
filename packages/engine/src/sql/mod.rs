@@ -89,6 +89,9 @@ pub(crate) use diagnostics::{
     sanitize_lowered_public_sql_error_description, transaction_control_statement_denied_error,
 };
 pub(crate) use effective_state_request::{EffectiveStateRequest, EffectiveStateVersionScope};
+pub(crate) use logical_plan::public_ir::{
+    StateSourceKind, WriteCommand as PlannedWriteCommand, WriteSelector,
+};
 pub(crate) use logical_plan::ResultContract;
 pub(crate) use planned_statement::{
     coalesce_live_table_requirements, is_untracked_live_table, MutationOperation, MutationRow,
@@ -99,6 +102,8 @@ pub(crate) use prepare::{
     SqlPreparationPendingOverlay, SqlPreparationPendingRow, SqlPreparationPendingStorage,
 };
 pub(crate) use prepared_artifacts::*;
+pub(crate) use semantic_ir::semantics::changes::ChangeError;
+pub(crate) use semantic_ir::statement::StatementContext;
 pub(crate) use write_artifacts::{
     ChangeBatch, CommitPreconditions, ExpectedHead, IdempotencyKey, OptionalTextPatch, PlanEffects,
     PlannedFilesystemDescriptor, PlannedFilesystemFile, PlannedFilesystemState, PlannedStateRow,

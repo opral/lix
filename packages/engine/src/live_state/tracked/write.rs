@@ -4,11 +4,12 @@ use crate::live_state::storage::{
     normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
     quoted_live_table_name,
 };
+use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::{LiveWriteOperation, LiveWriteRow};
-use crate::{LixBackendTransaction, LixError};
+use crate::LixError;
 
 pub(crate) async fn apply_write_batch_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     batch: &[LiveWriteRow],
 ) -> Result<(), LixError> {
     if batch.is_empty() {
@@ -63,7 +64,7 @@ pub(crate) async fn apply_write_batch_in_transaction(
 }
 
 async fn apply_materialized_row_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     row: &LiveWriteRow,
     snapshot_content: Option<&str>,
     is_tombstone: bool,
@@ -131,6 +132,6 @@ async fn apply_materialized_row_in_transaction(
         normalized_values = normalized_values_sql,
         normalized_updates = normalized_updates,
     );
-    transaction.execute(&sql, &[]).await?;
+    crate::live_state::store_sql::execute_query_with_transaction(transaction, &sql, &[]).await?;
     Ok(())
 }

@@ -9,14 +9,18 @@
 
 use std::collections::BTreeSet;
 
-use crate::backend::QueryExecutor;
 use crate::canonical::graph::COMMIT_GRAPH_NODE_TABLE;
 use crate::canonical::read::load_commit_lineage_entry_by_id;
+use crate::canonical::store::CanonicalExecutorRef;
+use crate::canonical::store_sql::execute_query_with_executor;
 use crate::common::escape_sql_string;
 use crate::common::is_missing_relation_error;
 use crate::{LixError, Value};
 
 use super::checkpoint_commit_label_entity_id;
+
+#[cfg(test)]
+use crate::QueryExecutor;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CheckpointVersionHeadFact {
@@ -25,7 +29,7 @@ pub(crate) struct CheckpointVersionHeadFact {
 }
 
 pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     head_commit_id: &str,
 ) -> Result<Option<String>, LixError> {
     let mut frontier = vec![head_commit_id.to_string()];
@@ -61,7 +65,7 @@ pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip_with_executor(
 }
 
 async fn select_best_checkpoint_commit_from_candidates_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: CanonicalExecutorRef<'_>,
     commit_ids: &[String],
 ) -> Result<Option<String>, LixError> {
     if commit_ids.is_empty() {
@@ -85,7 +89,7 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
            AND file_id IS NULL \
            AND plugin_key IS NULL"
     );
-    let label_result = match executor.execute(&label_sql, &[]).await {
+    let label_result = match execute_query_with_executor(executor, &label_sql, &[]).await {
         Ok(result) => result,
         Err(err) if is_missing_relation_error(&err) => return Ok(None),
         Err(err) => return Err(err),
@@ -118,7 +122,7 @@ async fn select_best_checkpoint_commit_from_candidates_with_executor(
          ORDER BY generation DESC, commit_id DESC \
          LIMIT 1"
     );
-    let rows = executor.execute(&order_sql, &[]).await?;
+    let rows = execute_query_with_executor(executor, &order_sql, &[]).await?;
     let Some(first) = rows.rows.first() else {
         return Ok(None);
     };

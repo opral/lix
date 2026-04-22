@@ -1,22 +1,23 @@
 pub(crate) use crate::binary_cas::write::{BinaryBlobWriteInput, ResolvedBinaryBlobWrite};
 
-use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect};
+use crate::binary_cas::store::{BinaryCasBackendRef, BinaryCasTransactionRef};
+use crate::{LixError, SqlDialect};
 
 pub(crate) async fn blob_exists(
-    backend: &dyn LixBackend,
+    backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<bool, LixError> {
     crate::binary_cas::read::blob_exists(backend, blob_hash).await
 }
 
 pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
 ) -> Result<(), LixError> {
     crate::binary_cas::gc::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
 }
 
 pub(crate) async fn persist_resolved_binary_blob_writes_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
     writes: &[ResolvedBinaryBlobWrite],
 ) -> Result<(), LixError> {
     crate::binary_cas::write::persist_resolved_binary_blob_writes_in_transaction(
