@@ -143,34 +143,6 @@ async fn load_effective_version_head_commit_id_with_backend(
         .and_then(|heads| heads.get(version_id).cloned()))
 }
 
-fn pending_version_admin_state(
-    pending_overlay: Option<&dyn PendingOverlay>,
-    version_id: &str,
-) -> Result<Option<Option<ResolvedVersionAdminState>>, LixError> {
-    let descriptor = pending_version_descriptor_row(pending_overlay, version_id)?;
-    let head_commit_id = pending_version_head_commit_id(pending_overlay, version_id)?;
-
-    match (descriptor, head_commit_id) {
-        (Some(None), _) => Ok(Some(None)),
-        (Some(Some(descriptor)), head_commit_id) => Ok(Some(Some(ResolvedVersionAdminState {
-            version_id: descriptor.version_id,
-            name: descriptor.name,
-            hidden: descriptor.hidden,
-            descriptor_change_id: descriptor.change_id,
-            head_commit_id: head_commit_id.flatten(),
-        }))),
-        (None, Some(Some(commit_id))) => Ok(Some(Some(ResolvedVersionAdminState {
-            version_id: version_id.to_string(),
-            name: version_id.to_string(),
-            hidden: false,
-            descriptor_change_id: None,
-            head_commit_id: Some(commit_id),
-        }))),
-        (None, Some(None)) => Ok(Some(None)),
-        (None, None) => Ok(None),
-    }
-}
-
 fn pending_version_head_commit_id(
     pending_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,

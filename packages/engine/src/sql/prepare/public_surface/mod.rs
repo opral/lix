@@ -1823,7 +1823,7 @@ mod tests {
     };
     use crate::catalog::SurfaceReadFreshness;
     use crate::execution::execute_prepared_public_read_artifact_with_backend;
-    use crate::history::{FileHistoryRootScope, FileHistoryVersionScope, StateHistoryRootScope};
+    use crate::history::{FileHistoryRootScope, FileHistoryVersionScope};
     use crate::live_state::{self, mark_mode_with_backend, LiveStateMode};
     use crate::schema::LixCommit;
     use crate::sql::prepare::prepare_public_read_artifact;
@@ -1856,29 +1856,11 @@ mod tests {
     use sqlparser::dialect::GenericDialect;
     use sqlparser::parser::Parser;
     use std::collections::HashMap;
-    use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
-    };
     use std::time::Duration;
-    use tokio::time::sleep;
 
     #[derive(Default)]
     struct FakeBackend {
         registered_schema_rows: HashMap<String, String>,
-        registered_schema_delay: Option<Duration>,
-        registered_schema_query_count: Arc<AtomicUsize>,
-    }
-
-    impl FakeBackend {
-        fn with_registered_schema_delay(mut self, delay: Duration) -> Self {
-            self.registered_schema_delay = Some(delay);
-            self
-        }
-
-        fn registered_schema_query_count(&self) -> usize {
-            self.registered_schema_query_count.load(Ordering::SeqCst)
-        }
     }
 
     fn is_registered_schema_live_scan(sql: &str) -> bool {
@@ -1965,21 +1947,11 @@ mod tests {
             _params: &[Value],
         ) -> Result<crate::QueryResult, LixError> {
             if is_registered_schema_live_scan(sql) {
-                self.registered_schema_query_count
-                    .fetch_add(1, Ordering::SeqCst);
-                if let Some(delay) = self.registered_schema_delay {
-                    sleep(delay).await;
-                }
                 let (rows, columns) =
                     registered_schema_live_rows_for_projection(sql, &self.registered_schema_rows);
                 return Ok(crate::QueryResult { rows, columns });
             }
             if sql.contains("FROM lix_internal_registered_schema_bootstrap") {
-                self.registered_schema_query_count
-                    .fetch_add(1, Ordering::SeqCst);
-                if let Some(delay) = self.registered_schema_delay {
-                    sleep(delay).await;
-                }
                 let rows = self
                     .registered_schema_rows
                     .iter()
@@ -2074,21 +2046,6 @@ mod tests {
             .iter()
             .find(|timing| timing.stage == stage)
             .map(|timing| timing.duration_us)
-    }
-
-    fn message_registered_schema_snapshot() -> String {
-        json!({
-            "value": {
-                "x-lix-key": "message",
-                "x-lix-version": "1",
-                "type": "object",
-                "properties": {
-                    "id": { "type": "string" },
-                    "body": { "type": "string" }
-                }
-            }
-        })
-        .to_string()
     }
 
     async fn boot_real_backend() -> (crate::test_support::TestSqliteBackend, Session) {
@@ -2654,145 +2611,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepares_registered_schema_derived_entity_reads() {
-        let mut backend = FakeBackend::default();
-        backend
-            .registered_schema_rows
-            .insert("message".to_string(), message_registered_schema_snapshot());
-
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one("SELECT body FROM message WHERE id = 'm1'"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("registered-schema entity read should canonicalize");
-
-        assert_eq!(prepared.resolved_relations(), vec!["message"]);
-        assert_eq!(
-            prepared
-                .structured_read()
-                .expect("registered-schema entity read should use canonicalized path")
-                .resolved_relation
-                .implicit_overrides
-                .fixed_schema_key
-                .as_deref(),
-            Some("message")
-        );
-        assert!(prepared.dependency_spec().is_some());
-        assert!(prepared.effective_state_plan().is_some());
-        let lowered_sql = prepared
-            .explain
-            .compiled_artifacts
-            .lowered_sql
-            .first()
-            .expect("registered-schema entity read should lower");
-        assert!(lowered_sql.contains("FROM (SELECT"));
-        assert!(lowered_sql.contains("lix_internal_live_v1_message"));
-    }
-
-    #[tokio::test]
-    async fn explain_specialized_registered_schema_reads_keep_layout_loading_outside_compiler_stages(
-    ) {
-        let delay = Duration::from_millis(150);
-        let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
-        backend
-            .registered_schema_rows
-            .insert("message".to_string(), message_registered_schema_snapshot());
-
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one("SELECT body FROM message WHERE id = 'm1'"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("registered-schema specialized read should prepare");
-
-        assert!(
-            prepared.structured_read().is_some(),
-            "specialized registered-schema read should stay on the structured path"
-        );
-        assert!(
-            backend.registered_schema_query_count() > 0,
-            "registered-schema read should fetch schema state from the backend"
-        );
-
-        let capability_resolution = stage_duration_us(
-            &prepared,
-            crate::sql::explain::ExplainStage::CapabilityResolution,
-        )
-        .expect("specialized lowered read should record capability_resolution");
-        let routing = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Routing)
-            .expect("specialized lowered read should record routing timing");
-
-        assert!(
-            capability_resolution < (delay.as_micros() / 2) as u64,
-            "capability_resolution should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {capability_resolution}us"
-        );
-        assert!(
-            routing < (delay.as_micros() / 2) as u64,
-            "routing should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {routing}us"
-        );
-    }
-
-    #[tokio::test]
-    async fn explain_broad_registered_schema_reads_keep_layout_loading_outside_compiler_stages() {
-        let delay = Duration::from_millis(150);
-        let mut backend = FakeBackend::default().with_registered_schema_delay(delay);
-        backend
-            .registered_schema_rows
-            .insert("message".to_string(), message_registered_schema_snapshot());
-
-        let prepared = prepare_public_read_strict(
-            &backend,
-            &parse_one(
-                "SELECT body, COUNT(*) \
-                 FROM message \
-                 WHERE id = 'm1' \
-                 GROUP BY body \
-                 HAVING COUNT(*) > 0 \
-                 ORDER BY body",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("registered-schema broad read should not error")
-        .expect("registered-schema broad read should prepare through surface lowering");
-
-        assert!(
-            prepared.structured_read().is_none(),
-            "group-by/having registered-schema read should route through broad lowering"
-        );
-        assert!(
-            backend.registered_schema_query_count() > 0,
-            "broad registered-schema read should fetch schema state from the backend"
-        );
-
-        let capability_resolution = stage_duration_us(
-            &prepared,
-            crate::sql::explain::ExplainStage::CapabilityResolution,
-        )
-        .expect("broad lowered read should record capability_resolution");
-        let routing = stage_duration_us(&prepared, crate::sql::explain::ExplainStage::Routing)
-            .expect("broad lowered read should record routing timing");
-
-        assert!(
-            capability_resolution < (delay.as_micros() / 2) as u64,
-            "capability_resolution should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {capability_resolution}us"
-        );
-        assert!(
-            routing < (delay.as_micros() / 2) as u64,
-            "routing should stay below the injected schema-load delay now that metadata loading happens outside compiler timing: {routing}us"
-        );
-    }
-
-    #[tokio::test]
     async fn explain_broad_reads_charge_routing_delay_to_routing_stage() {
         let delay = Duration::from_millis(150);
         let backend = FakeBackend::default();
@@ -2887,6 +2705,7 @@ mod tests {
                             &[Value::Json(json!({
                                 "x-lix-key": "message",
                                 "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
                                 "type": "object",
                                 "properties": {
                                     "id": { "type": "string" },
@@ -2925,6 +2744,558 @@ mod tests {
                     );
                     assert!(lowered_sql.contains("lix_internal_live_v1_message"));
                     assert!(!lowered_sql.contains("FROM message"));
+                })
+        });
+    }
+
+    #[test]
+    fn broad_public_entity_reads_prepare_as_sql2_with_entity_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute("INSERT INTO message (id, body) VALUES ('m1', 'hello')", &[])
+                        .await
+                        .expect("entity row write should succeed");
+
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(
+                            "SELECT COUNT(*) AS total \
+                             FROM message \
+                             WHERE body = 'hello'",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("broad public entity read should prepare")
+                    .expect("broad public entity read should lower through sql2");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("prepared public read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("message"),
+                                "public entity read should carry a compiled entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("broad public entity read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["total".to_string()],
+                            rows: vec![vec![Value::Integer(1)]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn plain_public_entity_projection_reads_prepare_as_sql2_with_entity_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute("INSERT INTO message (id, body) VALUES ('m1', 'hello')", &[])
+                        .await
+                        .expect("entity row write should succeed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one("SELECT body FROM message WHERE id = 'm1'"),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("plain public entity read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("prepared public read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("message"),
+                                "plain public entity read should carry a compiled entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("plain public entity read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["body".to_string()],
+                            rows: vec![vec![Value::Text("hello".to_string())]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_entity_reads_filtered_on_schema_defined_payload_columns_prepare_as_sql2_with_entity_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO message (id, body) VALUES ('m1', 'hello')",
+                            &[],
+                        )
+                        .await
+                        .expect("entity row write should succeed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one("SELECT id FROM message WHERE body = 'hello'"),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("payload-filtered public entity read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("prepared public read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("message"),
+                                "payload-filtered public entity read should carry a compiled entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("payload-filtered public entity read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["id".to_string()],
+                            rows: vec![vec![Value::Text("m1".to_string())]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_entity_reads_filtered_on_exposed_lixcol_state_columns_prepare_as_sql2_with_entity_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO message (id, body) VALUES ('m1', 'hello')",
+                            &[],
+                        )
+                        .await
+                        .expect("entity row write should succeed");
+
+                    let entity_id_result = session
+                        .execute(
+                            "SELECT entity_id FROM lix_state WHERE schema_key = 'message' LIMIT 1",
+                            &[],
+                        )
+                        .await
+                        .expect("state entity id lookup should succeed");
+                    let entity_id = match &entity_id_result.statements[0].rows[0][0] {
+                        Value::Text(value) => value.clone(),
+                        other => panic!("expected text entity_id, got {other:?}"),
+                    };
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT body FROM message WHERE lixcol_entity_id = '{}'",
+                            entity_id.replace('\'', "''")
+                        )),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("lixcol-filtered public entity read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("prepared public read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("message"),
+                                "lixcol-filtered public entity read should carry a compiled entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("lixcol-filtered public entity read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["body".to_string()],
+                            rows: vec![vec![Value::Text("hello".to_string())]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_entity_by_version_reads_prepare_as_sql2_with_entity_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .create_version(crate::CreateVersionOptions {
+                            id: Some("version-a".to_string()),
+                            name: Some("version-a".to_string()),
+                            ..crate::CreateVersionOptions::default()
+                        })
+                        .await
+                        .expect("version creation should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO lix_state_by_version (\
+                             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                             ) VALUES (\
+                             'm1', 'message', NULL, 'version-a', NULL, '{\"id\":\"m1\",\"body\":\"hello\"}', '1'\
+                             )",
+                            &[],
+                        )
+                        .await
+                        .expect("by-version entity row write should succeed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT body, lixcol_version_id \
+                             FROM message_by_version \
+                             WHERE id = 'm1' AND lixcol_version_id = 'version-a'",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("public entity by-version read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("prepared public read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("message_by_version"),
+                                "public entity by-version read should carry a compiled entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("public entity by-version read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["body".to_string(), "lixcol_version_id".to_string()],
+                            rows: vec![vec![
+                                Value::Text("hello".to_string()),
+                                Value::Text("version-a".to_string()),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn mixed_public_queries_joining_entity_surfaces_with_base_surfaces_prepare_as_sql2_with_entity_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "body": { "type": "string" }
+                                },
+                                "required": ["id", "body"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute("INSERT INTO message (id, body) VALUES ('m1', 'hello')", &[])
+                        .await
+                        .expect("entity row write should succeed");
+
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(
+                            "SELECT m.body AS body, s.entity_id AS entity_id \
+                             FROM message m \
+                             JOIN lix_state s ON m.lixcol_entity_id = s.entity_id \
+                             WHERE s.schema_key = 'message'",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("mixed entity/base public read should prepare")
+                    .expect("mixed entity/base public read should lower through sql2");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("prepared public read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("message"),
+                                "mixed entity/base public read should carry a compiled entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("mixed entity/base public read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["body".to_string(), "entity_id".to_string()],
+                            rows: vec![vec![
+                                Value::Text("hello".to_string()),
+                                Value::Text("m1".to_string()),
+                            ]],
+                        }
+                    );
                 })
         });
     }
@@ -2982,7 +3353,7 @@ mod tests {
                 .build()
                 .expect("test runtime should build")
                 .block_on(async move {
-                    let (backend, _session, active_version_id, active_commit_id) =
+                    let (backend, session, active_version_id, active_commit_id) =
                         active_version_fixture().await;
                     let prepared = prepare_public_read(
                         &backend,
@@ -3020,19 +3391,36 @@ mod tests {
                             .clone(),
                         vec!["key = 'hello'".to_string()]
                     );
-                    match &prepared.execution {
-                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
-                            plan,
-                        )) => {
-                            assert_eq!(
-                                plan.request.root_scope,
-                                StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("entity history read should lower through sql2");
+                    assert!(lowered_sql.contains("FROM lix_state_history"));
+                    assert!(lowered_sql.contains(&active_commit_id));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("entity history read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact
+                                    .entity_views
+                                    .contains_key("lix_key_value_history"),
+                                "entity history read should carry a compiled history entity view"
                             );
-                            assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
                         }
-                        _ => {
-                            panic!("entity history read should use history entity read execution")
-                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
                     }
                 })
         });
@@ -3291,12 +3679,6 @@ mod tests {
                 );
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
-                panic!("filesystem history read should not use state-history history plan")
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!("filesystem history read should not use entity-history history plan")
-            }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
                 panic!("filesystem history read should not use directory-history history plan")
             }
@@ -3353,16 +3735,6 @@ mod tests {
                     FileHistoryVersionScope::RequestedVersions(vec!["version-a".to_string()])
                 );
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
-                panic!(
-                    "filesystem by-version history read should not use state-history history plan"
-                )
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!(
-                    "filesystem by-version history read should not use entity-history history plan"
-                )
             }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
                 panic!(
@@ -3421,12 +3793,6 @@ mod tests {
                 assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
                 assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
             }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(_)) => {
-                panic!("directory history read should not use state-history history plan")
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!("directory history read should not use entity-history history plan")
-            }
             PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
                 panic!("directory history read should not use file-history history plan")
             }
@@ -3474,16 +3840,6 @@ mod tests {
                                 FileHistoryRootScope::RequestedRoots(vec![active_commit_id])
                             );
                         }
-                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(
-                            _,
-                        )) => {
-                            panic!("filesystem history read should not use state-history history plan")
-                        }
-                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
-                            _,
-                        )) => {
-                            panic!("filesystem history read should not use entity-history history plan")
-                        }
                         PublicReadPhysicalPlan::HistoryRead(
                             HistoryReadPlan::DirectoryHistory(_),
                         ) => {
@@ -3503,6 +3859,72 @@ mod tests {
     }
 
     #[test]
+    fn public_entity_history_payload_reads_prepare_as_sql2() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session, active_version_id, _active_commit_id) =
+                        active_version_fixture().await;
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT key, value \
+                             FROM lix_key_value_history \
+                             WHERE key = 'hello' \
+                             ORDER BY lixcol_depth ASC",
+                        ),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("entity history payload read should canonicalize");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("entity history payload read should lower through sql2");
+                    assert!(lowered_sql.contains("FROM lix_state_history"));
+                    assert!(
+                        lowered_sql.contains("key"),
+                        "lowered history query should preserve payload filtering/projection"
+                    );
+                    assert!(
+                        lowered_sql.contains("value"),
+                        "lowered history query should preserve payload projection"
+                    );
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("entity history payload read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.entity_views.contains_key("lix_key_value_history"),
+                                "entity history payload read should carry a compiled history entity view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+                })
+        });
+    }
+
+    #[test]
     fn binds_active_root_commit_for_entity_history_reads_without_explicit_root() {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
@@ -3510,7 +3932,7 @@ mod tests {
                 .build()
                 .expect("test runtime should build")
                 .block_on(async move {
-                    let (backend, _session, active_version_id, active_commit_id) =
+                    let (backend, session, active_version_id, active_commit_id) =
                         active_version_fixture().await;
 
                     let prepared = prepare_public_read(
@@ -3528,26 +3950,43 @@ mod tests {
                     .await
                     .expect("entity history read should canonicalize");
 
-                    match &prepared.execution {
-                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(
-                            plan,
-                        )) => {
-                            assert_eq!(
-                                plan.request.root_scope,
-                                StateHistoryRootScope::RequestedRoots(vec![active_commit_id])
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("entity history read should lower through sql2");
+                    assert!(lowered_sql.contains("FROM lix_state_history"));
+                    assert!(lowered_sql.contains(&active_commit_id));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("entity history read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact
+                                    .entity_views
+                                    .contains_key("lix_key_value_history"),
+                                "entity history read should carry a compiled history entity view"
                             );
-                            assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
                         }
-                        _ => {
-                            panic!("entity history read should use history entity read execution")
-                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
                     }
                 })
         });
     }
 
     #[test]
-    fn prepares_explain_over_history_surfaces_without_backend_rewrite() {
+    fn prepares_explain_over_entity_history_surfaces_through_public_lowered_query() {
         run_with_large_stack(|| {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -3573,25 +4012,30 @@ mod tests {
                     match prepared {
                         PublicPlan::Read(prepared) => {
                             assert_eq!(prepared.resolved_relations(), vec!["lix_key_value_history"]);
-                            assert!(
-                                prepared.explain.compiled_artifacts.lowered_sql.is_empty(),
-                                "history EXPLAIN should stay on direct execution instead of lowering backend SQL"
-                            );
+                            let lowered_sql = prepared
+                                .explain
+                                .compiled_artifacts
+                                .lowered_sql
+                                .first()
+                                .expect("entity history EXPLAIN should lower");
+                            assert!(!lowered_sql.starts_with("EXPLAIN SELECT"));
+                            assert!(lowered_sql.contains("FROM lix_state_history"));
+                            assert!(prepared.explain.request.is_some());
                             assert!(
                                 stage_duration_us(
                                     &prepared,
                                     crate::sql::explain::ExplainStage::CapabilityResolution,
                                 )
-                                .is_none(),
-                                "direct-history EXPLAIN should not record capability_resolution timing"
+                                .is_some(),
+                                "lowered entity-history EXPLAIN should record capability_resolution timing"
                             );
                             assert!(
                                 stage_duration_us(
                                     &prepared,
                                     crate::sql::explain::ExplainStage::ArtifactPreparation,
                                 )
-                                .is_none(),
-                                "direct-history EXPLAIN should not record artifact_preparation timing"
+                                .is_some(),
+                                "lowered entity-history EXPLAIN should record artifact_preparation timing"
                             );
                         }
                         PublicPlan::Write(_) => {
@@ -4083,41 +4527,21 @@ mod tests {
         .await
         .expect("state-history read should canonicalize");
 
-        assert_eq!(
+        assert!(matches!(
+            prepared.execution,
+            PublicReadPhysicalPlan::LoweredSql(_)
+        ));
+        assert_eq!(prepared.resolved_relations(), vec!["lix_state_history"]);
+        assert!(
             prepared
                 .explain
                 .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .accepted_predicates
-                .clone(),
-            vec!["root_commit_id = 'commit-1'".to_string()]
+                .lowered_sql
+                .first()
+                .expect("state-history read should lower")
+                .contains("lix_state_history"),
+            "state-history read should lower through the sql2-visible base relation"
         );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
-                );
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::EntityHistory(_)) => {
-                panic!("state-history read should not use entity-history history plan")
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
-                panic!("state-history read should not use file-history history plan")
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
-                panic!("state-history read should not use directory-history history plan")
-            }
-            PublicReadPhysicalPlan::LoweredSql(_) => {
-                panic!("state-history read should not use lowered SQL")
-            }
-            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
-                panic!("state-history read should not use read-time projection execution")
-            }
-        }
     }
 
     #[tokio::test]
@@ -4140,27 +4564,267 @@ mod tests {
         .await
         .expect("grouped state-history read should canonicalize");
 
-        assert_eq!(
-            prepared
-                .explain
-                .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .accepted_predicates
-                .clone(),
-            vec!["root_commit_id = 'commit-1'".to_string()]
-        );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::StateHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    StateHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
-                );
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            _ => panic!("grouped state-history read should use history state read execution"),
-        }
+        assert!(matches!(
+            prepared.execution,
+            PublicReadPhysicalPlan::LoweredSql(_)
+        ));
+        assert_eq!(prepared.resolved_relations(), vec!["lix_state_history"]);
+        let source_sql = prepared
+            .explain
+            .compiled_artifacts
+            .lowered_sql
+            .first()
+            .expect("grouped state-history read should lower");
+        assert!(source_sql.contains("lix_state_history"));
+        assert!(prepared.source_statement_sql.contains("GROUP BY"));
+        assert!(prepared.source_statement_sql.contains("HAVING"));
+    }
+
+    #[test]
+    fn public_lix_state_history_reads_prepare_as_sql2() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(
+                            "SELECT root_commit_id, depth \
+                             FROM lix_state_history \
+                             ORDER BY depth ASC \
+                             LIMIT 1",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("public lix_state_history read should not error")
+                    .expect("public lix_state_history read should prepare");
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("public lix_state_history read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert_eq!(sql2.artifact.surface_names, vec!["lix_state_history"]);
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("public lix_state_history read should execute through sql2");
+
+                    assert_eq!(
+                        actual.columns,
+                        vec!["root_commit_id".to_string(), "depth".to_string()]
+                    );
+                    assert!(
+                        matches!(
+                            actual.rows.first(),
+                            Some(row)
+                                if matches!(row.first(), Some(Value::Text(_)))
+                                    && matches!(row.get(1), Some(Value::Integer(_)))
+                        ),
+                        "expected root_commit_id text and depth integer values, got {:?}",
+                        actual.rows
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_lix_state_history_reads_preserve_root_version_and_depth_semantics_through_sql2() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, _session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT root_commit_id, version_id, depth \
+                             FROM lix_state_history \
+                             WHERE version_id = '{version_id}' AND depth = 0 \
+                             ORDER BY root_commit_id \
+                             LIMIT 5",
+                            version_id = active_version_id.replace('\'', "''"),
+                        )),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("public lix_state_history semantic read should not error")
+                    .expect("public lix_state_history semantic read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &crate::catalog::build_builtin_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("public lix_state_history semantic read should convert");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert_eq!(sql2.artifact.surface_names, vec!["lix_state_history"]);
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("public lix_state_history semantic read should execute through sql2");
+
+                    assert_eq!(
+                        actual.columns,
+                        vec![
+                            "root_commit_id".to_string(),
+                            "version_id".to_string(),
+                            "depth".to_string(),
+                        ]
+                    );
+                    assert!(
+                        !actual.rows.is_empty(),
+                        "expected at least one active lineage row at depth 0"
+                    );
+                    assert!(
+                        actual.rows.iter().all(|row| {
+                            row.first() == Some(&Value::Text(active_commit_id.clone()))
+                                && row.get(1) == Some(&Value::Text(active_version_id.clone()))
+                                && row.get(2) == Some(&Value::Integer(0))
+                        }),
+                        "expected active root/version/depth semantics to hold, got {:?}",
+                        actual.rows
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_lix_state_history_grouping_aggregates_ordering_and_filtering_work_through_sql2() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT root_commit_id, version_id, COUNT(*) AS count_rows \
+                             FROM lix_state_history \
+                             WHERE version_id = '{version_id}' AND depth = 0 \
+                             GROUP BY root_commit_id, version_id \
+                             HAVING COUNT(*) > 0 \
+                             ORDER BY root_commit_id ASC \
+                             LIMIT 5",
+                            version_id = active_version_id.replace('\'', "''"),
+                        )),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("public grouped lix_state_history read should not error")
+                    .expect("public grouped lix_state_history read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("public grouped lix_state_history read should convert");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert_eq!(sql2.artifact.surface_names, vec!["lix_state_history"]);
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("public grouped lix_state_history read should execute through sql2");
+
+                    assert_eq!(
+                        actual.columns,
+                        vec![
+                            "root_commit_id".to_string(),
+                            "version_id".to_string(),
+                            "count_rows".to_string(),
+                        ]
+                    );
+                    assert!(
+                        !actual.rows.is_empty(),
+                        "expected grouped lix_state_history results for the active lineage"
+                    );
+                    assert!(
+                        actual.rows.iter().all(|row| {
+                            row.first() == Some(&Value::Text(active_commit_id.clone()))
+                                && row.get(1) == Some(&Value::Text(active_version_id.clone()))
+                                && matches!(row.get(2), Some(Value::Integer(value)) if *value > 0)
+                        }),
+                        "expected grouped history semantics to hold, got {:?}",
+                        actual.rows
+                    );
+
+                    let ordered_roots = actual
+                        .rows
+                        .iter()
+                        .map(|row| match &row[0] {
+                            Value::Text(value) => value.clone(),
+                            other => panic!("expected root_commit_id text, got {other:?}"),
+                        })
+                        .collect::<Vec<_>>();
+                    let mut sorted_roots = ordered_roots.clone();
+                    sorted_roots.sort();
+                    assert_eq!(
+                        ordered_roots, sorted_roots,
+                        "expected sql2 result ordering to respect ORDER BY root_commit_id"
+                    );
+                })
+        });
     }
 
     #[tokio::test]

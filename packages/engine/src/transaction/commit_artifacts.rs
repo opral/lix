@@ -12,6 +12,7 @@ pub enum PendingCommitLane {
 pub struct PendingCommitState {
     pub lane: PendingCommitLane,
     pub commit_id: String,
+    pub commit_change_id: String,
     pub commit_change_snapshot_id: String,
     pub commit_snapshot: JsonValue,
 }

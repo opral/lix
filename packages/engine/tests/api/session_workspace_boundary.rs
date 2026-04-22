@@ -9,6 +9,7 @@ use lix_engine::{
     AdditionalSessionOptions, CreateVersionOptions, ExecuteOptions, Lix, LixConfig, ObserveEvents,
     ObserveEventsOwned, ObserveQuery, Value,
 };
+use serde_json::Value as JsonValue;
 
 fn run_with_large_stack<F, Fut>(factory: F)
 where
@@ -66,6 +67,13 @@ fn first_text(result: &lix_engine::ExecuteResult) -> String {
     match &result.statements[0].rows[0][0] {
         Value::Text(value) => value.clone(),
         other => panic!("expected first result cell to be text, got {other:?}"),
+    }
+}
+
+fn first_json_string(result: &lix_engine::ExecuteResult) -> String {
+    match &result.statements[0].rows[0][0] {
+        Value::Json(JsonValue::String(value)) => value.clone(),
+        other => panic!("expected first result cell to be a JSON string, got {other:?}"),
     }
 }
 
@@ -339,21 +347,21 @@ fn additional_sessions_can_operate_against_different_active_versions_at_the_same
 
         let feature_value = feature
             .execute(
-                "SELECT COALESCE((SELECT value FROM lix_key_value WHERE key = 'shared-branch-key' LIMIT 1), 'missing')",
+                "SELECT value FROM lix_key_value WHERE key = 'shared-branch-key' LIMIT 1",
                 &[],
             )
             .await
             .expect("feature value query should succeed");
         let release_value = release
             .execute(
-                "SELECT COALESCE((SELECT value FROM lix_key_value WHERE key = 'shared-branch-key' LIMIT 1), 'missing')",
+                "SELECT value FROM lix_key_value WHERE key = 'shared-branch-key' LIMIT 1",
                 &[],
             )
             .await
             .expect("release value query should succeed");
         let workspace_value = lix
             .execute(
-                "SELECT COALESCE((SELECT value FROM lix_key_value WHERE key = 'shared-branch-key' LIMIT 1), 'missing')",
+                "SELECT value FROM lix_key_value WHERE key = 'shared-branch-key' LIMIT 1",
                 &[],
             )
             .await
@@ -361,9 +369,12 @@ fn additional_sessions_can_operate_against_different_active_versions_at_the_same
 
         assert_eq!(feature.active_version_id(), feature_version.id);
         assert_eq!(release.active_version_id(), release_version.id);
-        assert_eq!(first_text(&feature_value), "feature");
-        assert_eq!(first_text(&release_value), "release");
-        assert_eq!(first_text(&workspace_value), "missing");
+        assert_eq!(first_json_string(&feature_value), "feature");
+        assert_eq!(first_json_string(&release_value), "release");
+        assert!(
+            workspace_value.statements[0].rows.is_empty(),
+            "workspace session should not see branch-local key value rows"
+        );
 
         drop(release);
         drop(feature);

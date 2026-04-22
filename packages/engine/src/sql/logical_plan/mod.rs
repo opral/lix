@@ -11,12 +11,8 @@ pub(crate) mod verify;
 pub(crate) use history_reads::{
     DirectoryHistoryAggregate, DirectoryHistoryField, DirectoryHistoryPredicate,
     DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
-    EntityHistoryField, EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan,
-    EntityHistorySortKey, FileHistoryAggregate, FileHistoryField, FileHistoryPredicate,
-    FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
-    StateHistoryAggregate, StateHistoryAggregatePredicate, StateHistoryField,
-    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
-    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
+    FileHistoryAggregate, FileHistoryField, FileHistoryPredicate, FileHistoryProjection,
+    FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
 };
 pub(crate) use plan::{
     DirectLogicalPlan, LogicalPlan, NormalizedDirectStatements, PublicReadLogicalPlan,

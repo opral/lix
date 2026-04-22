@@ -22,3 +22,13 @@ impl CommittedStateHistoryReader for dyn LixBackend + '_ {
         state_loader::load_state_history_rows(self, request).await
     }
 }
+
+#[async_trait(?Send)]
+impl CommittedStateHistoryReader for dyn LixBackend + Send + Sync + '_ {
+    async fn load_committed_state_history_rows(
+        &self,
+        request: &StateHistoryRequest,
+    ) -> Result<Vec<StateHistoryRow>, LixError> {
+        state_loader::load_state_history_rows(self, request).await
+    }
+}

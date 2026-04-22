@@ -80,11 +80,7 @@ pub(crate) fn state_surface_descriptor(name: &str, variant: SurfaceVariant) -> S
         ),
     };
 
-    let visible_columns = match variant {
-        SurfaceVariant::History => state_history_columns(),
-        SurfaceVariant::ByVersion => state_by_version_columns(),
-        _ => state_columns(),
-    };
+    let visible_columns = state_relation_columns_for_variant(variant);
 
     let hidden_columns = match variant {
         SurfaceVariant::Default => vec!["version_id".to_string()],
@@ -128,6 +124,64 @@ pub(crate) fn state_surface_descriptor(name: &str, variant: SurfaceVariant) -> S
             ..SurfaceImplicitOverrides::default()
         },
         catalog_source: CatalogSource::Builtin,
+    }
+}
+
+pub(crate) fn state_relation_columns_for_variant(variant: SurfaceVariant) -> Vec<String> {
+    match variant {
+        SurfaceVariant::History => state_history_columns(),
+        SurfaceVariant::ByVersion => state_by_version_columns(),
+        SurfaceVariant::Default | SurfaceVariant::WorkingChanges => state_columns(),
+    }
+}
+
+pub(crate) fn state_relation_column_types_for_variant(
+    variant: SurfaceVariant,
+) -> BTreeMap<String, SurfaceColumnType> {
+    let all_types = state_column_types();
+    state_relation_columns_for_variant(variant)
+        .into_iter()
+        .filter_map(|column_name| {
+            all_types
+                .get(&column_name)
+                .copied()
+                .map(|column_type| (column_name, column_type))
+        })
+        .collect()
+}
+
+pub(crate) fn state_relation_column_is_nullable_for_variant(
+    variant: SurfaceVariant,
+    column_name: &str,
+) -> Option<bool> {
+    match entity_base_relation_variant(variant) {
+        SurfaceVariant::Default => match column_name {
+            "entity_id" | "schema_key" | "global" | "untracked" => Some(false),
+            "file_id" | "plugin_key" | "snapshot_content" | "metadata" | "schema_version"
+            | "created_at" | "updated_at" | "change_id" | "commit_id" => Some(true),
+            _ => None,
+        },
+        SurfaceVariant::ByVersion => match column_name {
+            "entity_id" | "schema_key" | "global" | "untracked" | "version_id" => Some(false),
+            "file_id" | "plugin_key" | "snapshot_content" | "metadata" | "schema_version"
+            | "created_at" | "updated_at" | "change_id" | "commit_id" => Some(true),
+            _ => None,
+        },
+        SurfaceVariant::History => match column_name {
+            "entity_id" | "schema_key" | "schema_version" | "change_id" | "commit_id"
+            | "commit_created_at" | "root_commit_id" | "depth" | "version_id" => Some(false),
+            "file_id" | "plugin_key" | "snapshot_content" | "metadata" => Some(true),
+            _ => None,
+        },
+        SurfaceVariant::WorkingChanges => None,
+    }
+}
+
+fn entity_base_relation_variant(variant: SurfaceVariant) -> SurfaceVariant {
+    match variant {
+        SurfaceVariant::Default | SurfaceVariant::WorkingChanges => SurfaceVariant::Default,
+        SurfaceVariant::ByVersion => SurfaceVariant::ByVersion,
+        SurfaceVariant::History => SurfaceVariant::History,
     }
 }
 

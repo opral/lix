@@ -3,6 +3,7 @@ use crate::support;
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Lix, LixConfig};
 use lix_engine::{ObserveOptions, ObserveQuery, Value};
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -70,7 +71,7 @@ simulation_test!(
             initial.rows.rows,
             vec![vec![
                 Value::Text("observe-existing-visible".to_string()),
-                Value::Text("v0".to_string())
+                Value::Json(json!("v0"))
             ]]
         );
     }
@@ -224,7 +225,7 @@ simulation_test!(
             update.rows.rows[0],
             vec![
                 Value::Text("observe-public-entity".to_string()),
-                Value::Text("v0".to_string())
+                Value::Json(json!("v0"))
             ]
         );
     }
@@ -242,54 +243,66 @@ simulation_test!(
 
         let key = "observe-recover-json";
         engine
-            .execute(
-                "INSERT INTO lix_key_value (key, value) VALUES (?1, ?2)",
-                &[
-                    Value::Text(key.to_string()),
-                    Value::Text(r#"{"value":"ok-0"}"#.to_string()),
-                ],
-            )
+            .execute(&insert_key_value_sql(key, "0"), &[])
             .await
             .expect("seed insert should succeed");
 
+        let active_version_id = engine
+            .active_version_id()
+            .await
+            .expect("active version id query should succeed");
+
         let mut observed = engine
             .observe(ObserveQuery::new(
-                "SELECT lix_json_extract(value, 'value') FROM lix_key_value WHERE key = ?1",
-                vec![Value::Text(key.to_string())],
+                "SELECT CAST(lix_json_extract(snapshot_content, 'value') AS INTEGER) \
+                 FROM lix_state_by_version \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = ?1 AND version_id = ?2",
+                vec![
+                    Value::Text(key.to_string()),
+                    Value::Text(active_version_id.clone()),
+                ],
             ))
             .expect("observe should succeed");
 
         let initial = observed.next().await.unwrap().unwrap();
-        assert_eq!(
-            initial.rows.rows,
-            vec![vec![Value::Text("ok-0".to_string())]]
-        );
+        assert_eq!(initial.rows.rows, vec![vec![Value::Integer(0)]]);
 
         let failing_next = observed.next();
         engine
             .execute(
-                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
-                &[Value::Text(key.to_string()), Value::Text("{".to_string())],
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = ?3 \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = ?1 AND version_id = ?2",
+                &[
+                    Value::Text(key.to_string()),
+                    Value::Text(active_version_id.clone()),
+                    Value::Text(format!(r#"{{"key":"{key}","value":"oops"}}"#)),
+                ],
             )
             .await
-            .expect("malformed update should still commit");
+            .expect("cast-failing update should still commit");
 
         let query_error = failing_next
             .await
             .expect_err("observe follow-up should surface malformed json");
         assert!(
-            query_error.description.contains("malformed")
-                || query_error.description.contains("json")
+            query_error.description.contains("cast")
+                || query_error.description.contains("integer")
+                || query_error.description.contains("parse")
+                || query_error.description.contains("number")
                 || query_error.description.contains("parse")
         );
 
         let recovered_next = observed.next();
         engine
             .execute(
-                "UPDATE lix_key_value SET value = ?2 WHERE key = ?1",
+                "UPDATE lix_state_by_version \
+                 SET snapshot_content = ?3 \
+                 WHERE schema_key = 'lix_key_value' AND entity_id = ?1 AND version_id = ?2",
                 &[
                     Value::Text(key.to_string()),
-                    Value::Text(r#"{"value":"ok-1"}"#.to_string()),
+                    Value::Text(active_version_id),
+                    Value::Text(format!(r#"{{"key":"{key}","value":1}}"#)),
                 ],
             )
             .await
@@ -300,10 +313,7 @@ simulation_test!(
             .expect("observe recovery should not time out")
             .expect("observe recovery should succeed")
             .expect("observe recovery event should exist");
-        assert_eq!(
-            recovered.rows.rows,
-            vec![vec![Value::Text("ok-1".to_string())]]
-        );
+        assert_eq!(recovered.rows.rows, vec![vec![Value::Integer(1)]]);
     }
 );
 

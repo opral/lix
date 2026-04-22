@@ -7,12 +7,8 @@ use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_expla
 use crate::sql::logical_plan::history_reads::{
     DirectoryHistoryAggregate, DirectoryHistoryField, DirectoryHistoryPredicate,
     DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
-    EntityHistoryField, EntityHistoryPredicate, EntityHistoryProjection, EntityHistoryReadPlan,
-    EntityHistorySortKey, FileHistoryAggregate, FileHistoryField, FileHistoryPredicate,
-    FileHistoryProjection, FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
-    StateHistoryAggregate, StateHistoryAggregatePredicate, StateHistoryField,
-    StateHistoryPredicate, StateHistoryProjection, StateHistoryProjectionValue,
-    StateHistoryReadPlan, StateHistorySortKey, StateHistorySortValue,
+    FileHistoryAggregate, FileHistoryField, FileHistoryPredicate, FileHistoryProjection,
+    FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
 };
 use crate::sql::physical_plan::{
     LoweredResultColumn, LoweredResultColumns, PublicReadPhysicalPlan,
@@ -21,19 +17,13 @@ use crate::sql::prepare::SqlPreparationMetadataReader;
 use crate::sql::{
     PreparedBatchReadArtifact, PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryField,
     PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryProjection,
-    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedEntityHistoryField,
-    PreparedEntityHistoryPredicate, PreparedEntityHistoryProjection, PreparedEntityHistoryReadPlan,
-    PreparedEntityHistorySortKey, PreparedExplainMode, PreparedFileHistoryAggregate,
-    PreparedFileHistoryField, PreparedFileHistoryPredicate, PreparedFileHistoryProjection,
-    PreparedFileHistoryReadPlan, PreparedFileHistorySortKey, PreparedHistoryReadArtifact,
-    PreparedHistoryReadPlan, PreparedPublicRead, PreparedPublicReadPlanArtifact,
-    PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
-    PreparedReadTimeProjectionArtifact, PreparedSql2ReadPlanArtifact,
-    PreparedStateHistoryAggregate, PreparedStateHistoryAggregatePredicate,
-    PreparedStateHistoryField, PreparedStateHistoryPredicate, PreparedStateHistoryProjection,
-    PreparedStateHistoryProjectionValue, PreparedStateHistoryReadPlan, PreparedStateHistorySortKey,
-    PreparedStateHistorySortValue, PublicReadResultColumn, PublicReadResultColumns,
-    ReadDiagnosticContext,
+    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedExplainMode,
+    PreparedFileHistoryAggregate, PreparedFileHistoryField, PreparedFileHistoryPredicate,
+    PreparedFileHistoryProjection, PreparedFileHistoryReadPlan, PreparedFileHistorySortKey,
+    PreparedHistoryReadArtifact, PreparedHistoryReadPlan, PreparedPublicRead,
+    PreparedPublicReadPlanArtifact, PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
+    PreparedReadTimeProjectionArtifact, PreparedSql2ReadPlanArtifact, PublicReadResultColumn,
+    PublicReadResultColumns, ReadDiagnosticContext,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
@@ -262,7 +252,7 @@ pub(crate) fn prepare_public_read_artifact(
                     bound_parameters: public_read.bound_parameters.clone(),
                     active_version_id: public_read.runtime_bindings.active_version_id.clone(),
                     surface_names: public_read.resolved_relations.clone(),
-                    entity_surfaces: crate::sql2::prepared_entity_surface_specs_for_registry(
+                    entity_views: crate::sql2::prepared_entity_view_plans_for_registry(
                         surface_registry,
                         &public_read.resolved_relations,
                     ),
@@ -294,12 +284,6 @@ fn result_columns_for_public_read_execution(
             public_read_result_columns_from_lowered(&lowered.result_columns),
         ),
         PublicReadPhysicalPlan::HistoryRead(plan) => Some(match plan {
-            HistoryReadPlan::StateHistory(plan) => {
-                public_read_result_columns_from_lowered(&plan.result_columns)
-            }
-            HistoryReadPlan::EntityHistory(plan) => {
-                public_read_result_columns_from_lowered(&plan.result_columns)
-            }
             HistoryReadPlan::FileHistory(plan) => {
                 public_read_result_columns_from_lowered(&plan.result_columns)
             }
@@ -343,87 +327,12 @@ fn public_read_result_column_from_lowered(kind: LoweredResultColumn) -> PublicRe
 
 fn prepared_history_read_plan(plan: &HistoryReadPlan) -> PreparedHistoryReadPlan {
     match plan {
-        HistoryReadPlan::StateHistory(plan) => {
-            PreparedHistoryReadPlan::StateHistory(prepared_state_history_read_plan(plan))
-        }
-        HistoryReadPlan::EntityHistory(plan) => {
-            PreparedHistoryReadPlan::EntityHistory(prepared_entity_history_read_plan(plan))
-        }
         HistoryReadPlan::FileHistory(plan) => {
             PreparedHistoryReadPlan::FileHistory(prepared_file_history_read_plan(plan))
         }
         HistoryReadPlan::DirectoryHistory(plan) => {
             PreparedHistoryReadPlan::DirectoryHistory(prepared_directory_history_read_plan(plan))
         }
-    }
-}
-
-fn prepared_state_history_read_plan(plan: &StateHistoryReadPlan) -> PreparedStateHistoryReadPlan {
-    PreparedStateHistoryReadPlan {
-        request: plan.request.clone(),
-        predicates: plan
-            .predicates
-            .iter()
-            .cloned()
-            .map(prepared_state_history_predicate)
-            .collect(),
-        projections: plan
-            .projections
-            .iter()
-            .cloned()
-            .map(prepared_state_history_projection)
-            .collect(),
-        wildcard_projection: plan.wildcard_projection,
-        wildcard_columns: plan.wildcard_columns.clone(),
-        group_by_fields: plan
-            .group_by_fields
-            .iter()
-            .cloned()
-            .map(prepared_state_history_field)
-            .collect(),
-        having: plan
-            .having
-            .clone()
-            .map(prepared_state_history_aggregate_predicate),
-        sort_keys: plan
-            .sort_keys
-            .iter()
-            .cloned()
-            .map(prepared_state_history_sort_key)
-            .collect(),
-        limit: plan.limit,
-        offset: plan.offset,
-    }
-}
-
-fn prepared_entity_history_read_plan(
-    plan: &EntityHistoryReadPlan,
-) -> PreparedEntityHistoryReadPlan {
-    PreparedEntityHistoryReadPlan {
-        resolved_relation: plan.resolved_relation.clone(),
-        request: plan.request.clone(),
-        predicates: plan
-            .predicates
-            .iter()
-            .cloned()
-            .map(prepared_entity_history_predicate)
-            .collect(),
-        projections: plan
-            .projections
-            .iter()
-            .cloned()
-            .map(prepared_entity_history_projection)
-            .collect(),
-        wildcard_projection: plan.wildcard_projection,
-        wildcard_columns: plan.wildcard_columns.clone(),
-        sort_keys: plan
-            .sort_keys
-            .iter()
-            .cloned()
-            .map(prepared_entity_history_sort_key)
-            .collect(),
-        limit: plan.limit,
-        offset: plan.offset,
     }
 }
 
@@ -489,214 +398,6 @@ fn prepared_directory_history_read_plan(
             .clone()
             .map(prepared_directory_history_aggregate),
         aggregate_output_name: plan.aggregate_output_name.clone(),
-    }
-}
-
-fn prepared_state_history_field(field: StateHistoryField) -> PreparedStateHistoryField {
-    match field {
-        StateHistoryField::EntityId => PreparedStateHistoryField::EntityId,
-        StateHistoryField::SchemaKey => PreparedStateHistoryField::SchemaKey,
-        StateHistoryField::FileId => PreparedStateHistoryField::FileId,
-        StateHistoryField::PluginKey => PreparedStateHistoryField::PluginKey,
-        StateHistoryField::SnapshotContent => PreparedStateHistoryField::SnapshotContent,
-        StateHistoryField::Metadata => PreparedStateHistoryField::Metadata,
-        StateHistoryField::SchemaVersion => PreparedStateHistoryField::SchemaVersion,
-        StateHistoryField::ChangeId => PreparedStateHistoryField::ChangeId,
-        StateHistoryField::CommitId => PreparedStateHistoryField::CommitId,
-        StateHistoryField::CommitCreatedAt => PreparedStateHistoryField::CommitCreatedAt,
-        StateHistoryField::RootCommitId => PreparedStateHistoryField::RootCommitId,
-        StateHistoryField::Depth => PreparedStateHistoryField::Depth,
-        StateHistoryField::VersionId => PreparedStateHistoryField::VersionId,
-    }
-}
-
-fn prepared_state_history_aggregate(
-    aggregate: StateHistoryAggregate,
-) -> PreparedStateHistoryAggregate {
-    match aggregate {
-        StateHistoryAggregate::Count => PreparedStateHistoryAggregate::Count,
-    }
-}
-
-fn prepared_state_history_projection_value(
-    value: StateHistoryProjectionValue,
-) -> PreparedStateHistoryProjectionValue {
-    match value {
-        StateHistoryProjectionValue::Field(field) => {
-            PreparedStateHistoryProjectionValue::Field(prepared_state_history_field(field))
-        }
-        StateHistoryProjectionValue::Aggregate(aggregate) => {
-            PreparedStateHistoryProjectionValue::Aggregate(prepared_state_history_aggregate(
-                aggregate,
-            ))
-        }
-    }
-}
-
-fn prepared_state_history_projection(
-    projection: StateHistoryProjection,
-) -> PreparedStateHistoryProjection {
-    PreparedStateHistoryProjection {
-        output_name: projection.output_name,
-        value: prepared_state_history_projection_value(projection.value),
-    }
-}
-
-fn prepared_state_history_sort_value(
-    value: StateHistorySortValue,
-) -> PreparedStateHistorySortValue {
-    match value {
-        StateHistorySortValue::Field(field) => {
-            PreparedStateHistorySortValue::Field(prepared_state_history_field(field))
-        }
-        StateHistorySortValue::Aggregate(aggregate) => {
-            PreparedStateHistorySortValue::Aggregate(prepared_state_history_aggregate(aggregate))
-        }
-    }
-}
-
-fn prepared_state_history_sort_key(key: StateHistorySortKey) -> PreparedStateHistorySortKey {
-    PreparedStateHistorySortKey {
-        output_name: key.output_name,
-        value: key.value.map(prepared_state_history_sort_value),
-        descending: key.descending,
-    }
-}
-
-fn prepared_state_history_predicate(
-    predicate: StateHistoryPredicate,
-) -> PreparedStateHistoryPredicate {
-    match predicate {
-        StateHistoryPredicate::Eq(field, value) => {
-            PreparedStateHistoryPredicate::Eq(prepared_state_history_field(field), value)
-        }
-        StateHistoryPredicate::NotEq(field, value) => {
-            PreparedStateHistoryPredicate::NotEq(prepared_state_history_field(field), value)
-        }
-        StateHistoryPredicate::Gt(field, value) => {
-            PreparedStateHistoryPredicate::Gt(prepared_state_history_field(field), value)
-        }
-        StateHistoryPredicate::GtEq(field, value) => {
-            PreparedStateHistoryPredicate::GtEq(prepared_state_history_field(field), value)
-        }
-        StateHistoryPredicate::Lt(field, value) => {
-            PreparedStateHistoryPredicate::Lt(prepared_state_history_field(field), value)
-        }
-        StateHistoryPredicate::LtEq(field, value) => {
-            PreparedStateHistoryPredicate::LtEq(prepared_state_history_field(field), value)
-        }
-        StateHistoryPredicate::In(field, values) => {
-            PreparedStateHistoryPredicate::In(prepared_state_history_field(field), values)
-        }
-        StateHistoryPredicate::IsNull(field) => {
-            PreparedStateHistoryPredicate::IsNull(prepared_state_history_field(field))
-        }
-        StateHistoryPredicate::IsNotNull(field) => {
-            PreparedStateHistoryPredicate::IsNotNull(prepared_state_history_field(field))
-        }
-    }
-}
-
-fn prepared_state_history_aggregate_predicate(
-    predicate: StateHistoryAggregatePredicate,
-) -> PreparedStateHistoryAggregatePredicate {
-    match predicate {
-        StateHistoryAggregatePredicate::Eq(aggregate, value) => {
-            PreparedStateHistoryAggregatePredicate::Eq(
-                prepared_state_history_aggregate(aggregate),
-                value,
-            )
-        }
-        StateHistoryAggregatePredicate::NotEq(aggregate, value) => {
-            PreparedStateHistoryAggregatePredicate::NotEq(
-                prepared_state_history_aggregate(aggregate),
-                value,
-            )
-        }
-        StateHistoryAggregatePredicate::Gt(aggregate, value) => {
-            PreparedStateHistoryAggregatePredicate::Gt(
-                prepared_state_history_aggregate(aggregate),
-                value,
-            )
-        }
-        StateHistoryAggregatePredicate::GtEq(aggregate, value) => {
-            PreparedStateHistoryAggregatePredicate::GtEq(
-                prepared_state_history_aggregate(aggregate),
-                value,
-            )
-        }
-        StateHistoryAggregatePredicate::Lt(aggregate, value) => {
-            PreparedStateHistoryAggregatePredicate::Lt(
-                prepared_state_history_aggregate(aggregate),
-                value,
-            )
-        }
-        StateHistoryAggregatePredicate::LtEq(aggregate, value) => {
-            PreparedStateHistoryAggregatePredicate::LtEq(
-                prepared_state_history_aggregate(aggregate),
-                value,
-            )
-        }
-    }
-}
-
-fn prepared_entity_history_field(field: EntityHistoryField) -> PreparedEntityHistoryField {
-    match field {
-        EntityHistoryField::Property(property) => PreparedEntityHistoryField::Property(property),
-        EntityHistoryField::State(field) => {
-            PreparedEntityHistoryField::State(prepared_state_history_field(field))
-        }
-    }
-}
-
-fn prepared_entity_history_projection(
-    projection: EntityHistoryProjection,
-) -> PreparedEntityHistoryProjection {
-    PreparedEntityHistoryProjection {
-        output_name: projection.output_name,
-        field: prepared_entity_history_field(projection.field),
-    }
-}
-
-fn prepared_entity_history_sort_key(key: EntityHistorySortKey) -> PreparedEntityHistorySortKey {
-    PreparedEntityHistorySortKey {
-        output_name: key.output_name,
-        field: key.field.map(prepared_entity_history_field),
-        descending: key.descending,
-    }
-}
-
-fn prepared_entity_history_predicate(
-    predicate: EntityHistoryPredicate,
-) -> PreparedEntityHistoryPredicate {
-    match predicate {
-        EntityHistoryPredicate::Eq(field, value) => {
-            PreparedEntityHistoryPredicate::Eq(prepared_entity_history_field(field), value)
-        }
-        EntityHistoryPredicate::NotEq(field, value) => {
-            PreparedEntityHistoryPredicate::NotEq(prepared_entity_history_field(field), value)
-        }
-        EntityHistoryPredicate::Gt(field, value) => {
-            PreparedEntityHistoryPredicate::Gt(prepared_entity_history_field(field), value)
-        }
-        EntityHistoryPredicate::GtEq(field, value) => {
-            PreparedEntityHistoryPredicate::GtEq(prepared_entity_history_field(field), value)
-        }
-        EntityHistoryPredicate::Lt(field, value) => {
-            PreparedEntityHistoryPredicate::Lt(prepared_entity_history_field(field), value)
-        }
-        EntityHistoryPredicate::LtEq(field, value) => {
-            PreparedEntityHistoryPredicate::LtEq(prepared_entity_history_field(field), value)
-        }
-        EntityHistoryPredicate::In(field, values) => {
-            PreparedEntityHistoryPredicate::In(prepared_entity_history_field(field), values)
-        }
-        EntityHistoryPredicate::IsNull(field) => {
-            PreparedEntityHistoryPredicate::IsNull(prepared_entity_history_field(field))
-        }
-        EntityHistoryPredicate::IsNotNull(field) => {
-            PreparedEntityHistoryPredicate::IsNotNull(prepared_entity_history_field(field))
-        }
     }
 }
 

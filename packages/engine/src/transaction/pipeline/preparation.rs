@@ -679,14 +679,14 @@ fn prepared_public_surface_registry_effect_for_artifact(
         PreparedWriteArtifact::PublicRead(_) => Ok(PreparedPublicSurfaceRegistryEffect::None),
         PreparedWriteArtifact::ScalarRead(_) => Ok(PreparedPublicSurfaceRegistryEffect::None),
         PreparedWriteArtifact::PublicWrite(public_write) => {
-            if public_write_mutates_registered_schema(public_write) {
-                return Ok(PreparedPublicSurfaceRegistryEffect::ReloadFromStorage);
-            }
-
             let mutations =
                 prepared_public_surface_registry_mutations_from_public_write(public_write)?;
             if mutations.is_empty() {
-                Ok(PreparedPublicSurfaceRegistryEffect::None)
+                if public_write_mutates_registered_schema(public_write) {
+                    Ok(PreparedPublicSurfaceRegistryEffect::ReloadFromStorage)
+                } else {
+                    Ok(PreparedPublicSurfaceRegistryEffect::None)
+                }
             } else {
                 Ok(PreparedPublicSurfaceRegistryEffect::ApplyMutations(
                     mutations,

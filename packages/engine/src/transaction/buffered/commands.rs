@@ -16,7 +16,6 @@ pub(crate) struct BufferedWriteCommandMetadata {
     pub(crate) flush_class: BufferedWriteFlushClass,
     pub(crate) has_materialization_plan: bool,
     pub(crate) transaction_write_delta: Option<TransactionWriteDelta>,
-    pub(crate) registry_mutated_during_planning: bool,
 }
 
 #[derive(Clone)]

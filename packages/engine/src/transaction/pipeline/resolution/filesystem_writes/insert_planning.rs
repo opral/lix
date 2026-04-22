@@ -1192,6 +1192,7 @@ mod tests {
             name: Some("guide:alpha@beta".to_string()),
             path: None,
             hidden: false,
+            untracked: None,
             metadata: None,
         }];
         let existing_directory_paths_by_id =

@@ -2,6 +2,7 @@ use crate::support;
 
 use futures_util::FutureExt;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Value};
+use serde_json::json;
 use std::io::{Cursor, Write};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
@@ -956,14 +957,14 @@ simulation_test!(
             rows.statements[0].rows[0],
             vec![
                 Value::Text("tx-pending-like-a".to_string()),
-                Value::Text("after".to_string()),
+                Value::Json(json!("after")),
             ]
         );
         assert_eq!(
             rows.statements[0].rows[1],
             vec![
                 Value::Text("tx-pending-like-b".to_string()),
-                Value::Text("after".to_string()),
+                Value::Json(json!("after")),
             ]
         );
         assert_eq!(public_commit_count(&engine).await, commit_count_before + 1);
@@ -1179,8 +1180,8 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(rows.statements[0].rows.len(), 2);
-        assert_eq!(rows.statements[0].rows[0][0], Value::Text("a".to_string()));
-        assert_eq!(rows.statements[0].rows[1][0], Value::Text("b".to_string()));
+        assert_eq!(rows.statements[0].rows[0][0], Value::Json(json!("a")));
+        assert_eq!(rows.statements[0].rows[1][0], Value::Json(json!("b")));
     }
 );
 
@@ -1275,8 +1276,8 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(rows.statements[0].rows.len(), 2);
-        assert_eq!(rows.statements[0].rows[0][0], Value::Text("a".to_string()));
-        assert_eq!(rows.statements[0].rows[1][0], Value::Text("b".to_string()));
+        assert_eq!(rows.statements[0].rows[0][0], Value::Json(json!("a")));
+        assert_eq!(rows.statements[0].rows[1][0], Value::Json(json!("b")));
     }
 );
 
@@ -1342,8 +1343,8 @@ simulation_test!(
         assert_eq!(
             rows.statements[0].rows,
             vec![
-                vec![Value::Text("after-a".to_string())],
-                vec![Value::Text("after-b".to_string())],
+                vec![Value::Json(json!("after-a"))],
+                vec![Value::Json(json!("after-b"))],
             ]
         );
     }
@@ -1409,7 +1410,7 @@ simulation_test!(
             rows.statements[0].rows,
             vec![vec![
                 Value::Text("tx-ud-a".to_string()),
-                Value::Text("after-a".to_string()),
+                Value::Json(json!("after-a")),
             ]]
         );
     }
@@ -1792,7 +1793,7 @@ simulation_test!(
         assert_eq!(result.statements[0].rows.len(), 1);
         assert_eq!(
             result.statements[0].rows[0][0],
-            Value::Text("ok".to_string())
+            Value::Json(json!("ok"))
         );
     }
 );

@@ -1,5 +1,5 @@
 use crate::sql::logical_plan::history_reads::{
-    DirectoryHistoryReadPlan, FileHistoryReadPlan, HistoryReadPlan, StateHistoryReadPlan,
+    DirectoryHistoryReadPlan, FileHistoryReadPlan, HistoryReadPlan,
 };
 use crate::sql::logical_plan::plan::{LogicalPlan, PublicReadLogicalPlan, PublicWriteLogicalPlan};
 use crate::sql::logical_plan::public_ir::{
@@ -461,31 +461,9 @@ fn verify_direct_public_read_plan(
     plan: &HistoryReadPlan,
 ) -> Result<(), LogicalPlanVerificationError> {
     match plan {
-        HistoryReadPlan::StateHistory(plan) => verify_state_history_read_plan(plan),
-        HistoryReadPlan::EntityHistory(plan) => {
-            if plan.resolved_relation.descriptor.public_name.is_empty() {
-                Err(LogicalPlanVerificationError::new(
-                    "entity history direct read must target a named surface",
-                ))
-            } else {
-                Ok(())
-            }
-        }
         HistoryReadPlan::FileHistory(plan) => verify_file_history_read_plan(plan),
         HistoryReadPlan::DirectoryHistory(plan) => verify_directory_history_read_plan(plan),
     }
-}
-
-fn verify_state_history_read_plan(
-    plan: &StateHistoryReadPlan,
-) -> Result<(), LogicalPlanVerificationError> {
-    if plan.having.is_some() && plan.group_by_fields.is_empty() && plan.projections.is_empty() {
-        return Err(LogicalPlanVerificationError::new(
-            "state history aggregate predicates require grouped or projected inputs",
-        ));
-    }
-
-    Ok(())
 }
 
 fn verify_file_history_read_plan(

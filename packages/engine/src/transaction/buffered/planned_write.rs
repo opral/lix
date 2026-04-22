@@ -819,11 +819,10 @@ fn collect_semantic_overlay_row(
         Some(crate::Value::Text(value)) => value.clone(),
         _ => return Ok(false),
     };
-    let snapshot_content = match row.values.get("snapshot_content") {
-        Some(crate::Value::Text(snapshot)) => Some(snapshot.clone()),
-        Some(crate::Value::Null) | None if row.tombstone => None,
-        None => None,
-        _ => return Ok(false),
+    let snapshot_content = if row.tombstone {
+        None
+    } else {
+        planned_json_text(row, "snapshot_content")?
     };
     overlay.rows.insert(
         PendingSemanticRowIdentity {

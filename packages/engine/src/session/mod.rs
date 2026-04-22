@@ -911,7 +911,7 @@ fn prepared_read_batch_can_execute_with_backend(
     prepared_read_batch
         .statements
         .iter()
-        .all(|statement| matches!(statement.artifact, PreparedReadArtifact::Public(_)))
+        .all(|statement| !matches!(statement.artifact, PreparedReadArtifact::Public(_)))
 }
 
 fn committed_read_context<'a>(

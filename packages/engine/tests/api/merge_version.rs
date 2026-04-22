@@ -3,10 +3,12 @@ use crate::support;
 use lix_engine::{
     CreateVersionOptions, ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, Value,
 };
+use serde_json::Value as JsonValue;
 
 fn value_as_text(value: &Value) -> String {
     match value {
         Value::Text(value) => value.clone(),
+        Value::Json(JsonValue::String(value)) => value.clone(),
         Value::Integer(value) => value.to_string(),
         other => panic!("expected text-like value, got {other:?}"),
     }

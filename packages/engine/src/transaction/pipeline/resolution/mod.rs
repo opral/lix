@@ -945,7 +945,11 @@ pub(super) fn write_mode_request_for_insert_payload(
     planned_write: &PlannedWrite,
     payload: &BTreeMap<String, Value>,
 ) -> WriteModeRequest {
-    match payload.get("untracked").and_then(bool_from_value) {
+    match payload
+        .get("untracked")
+        .or_else(|| payload.get("lixcol_untracked"))
+        .and_then(bool_from_value)
+    {
         Some(true) => WriteModeRequest::ForceUntracked,
         Some(false) => WriteModeRequest::ForceTracked,
         None => planned_write.command.requested_mode,

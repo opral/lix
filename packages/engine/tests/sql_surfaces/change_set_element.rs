@@ -8,7 +8,7 @@ fn as_text(value: &Value) -> String {
 }
 
 simulation_test!(
-    lix_change_set_element_by_version_scopes_to_version_heads,
+    lix_change_set_element_by_version_inherits_global_commit_derived_rows,
     |sim| async move {
         let engine = sim
             .boot_simulated_lix_deterministic()
@@ -85,7 +85,11 @@ simulation_test!(
             .expect("active by-version membership query should succeed");
         assert_eq!(active_count.statements[0].rows.len(), 1);
         match &active_count.statements[0].rows[0][0] {
-            Value::Integer(count) => assert_eq!(*count, 1),
+            Value::Integer(count) => assert_eq!(
+                *count, 1,
+                "unexpected active by-version count rows={:?}",
+                active_count.statements[0].rows
+            ),
             other => panic!("expected active count as integer, got {other:?}"),
         }
 
@@ -103,7 +107,7 @@ simulation_test!(
             .expect("branch by-version membership query should succeed");
         assert_eq!(created_count.statements[0].rows.len(), 1);
         match &created_count.statements[0].rows[0][0] {
-            Value::Integer(count) => assert_eq!(*count, 0),
+            Value::Integer(count) => assert_eq!(*count, 1),
             other => panic!("expected branch count as integer, got {other:?}"),
         }
     }

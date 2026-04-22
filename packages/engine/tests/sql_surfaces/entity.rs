@@ -11,6 +11,13 @@ fn assert_text(value: &Value, expected: &str) {
     }
 }
 
+fn assert_json_string(value: &Value, expected: &str) {
+    match value {
+        Value::Json(JsonValue::String(actual)) => assert_eq!(actual, expected),
+        other => panic!("expected json string value '{expected}', got {other:?}"),
+    }
+}
+
 fn is_true(value: &Value) -> bool {
     match value {
         Value::Boolean(actual) => *actual,
@@ -166,7 +173,7 @@ simulation_test!(
         sim.assert_deterministic(result.statements[0].rows.clone());
         assert_eq!(result.statements[0].rows.len(), 1);
         assert_text(&result.statements[0].rows[0][0], "key-sel");
-        assert_text(&result.statements[0].rows[0][1], "value-sel");
+        assert_json_string(&result.statements[0].rows[0][1], "value-sel");
         assert_text(&result.statements[0].rows[0][2], "lix_key_value");
     }
 );
@@ -211,7 +218,7 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(updated.statements[0].rows.clone());
         assert_eq!(updated.statements[0].rows.len(), 1);
-        assert_text(&updated.statements[0].rows[0][0], "value-update");
+        assert_json_string(&updated.statements[0].rows[0][0], "value-update");
 
         engine
             .execute("DELETE FROM lix_key_value WHERE key = 'key-write'", &[])
@@ -318,7 +325,7 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(updated.statements[0].rows.clone());
         assert_eq!(updated.statements[0].rows.len(), 1);
-        assert_text(&updated.statements[0].rows[0][0], "value-b");
+        assert_json_string(&updated.statements[0].rows[0][0], "value-b");
     }
 );
 
@@ -358,7 +365,7 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_text(&rows.statements[0].rows[0][0], "value-a");
+        assert_json_string(&rows.statements[0].rows[0][0], "value-a");
     }
 );
 
@@ -494,7 +501,7 @@ simulation_test!(
         sim.assert_deterministic(normalize_bool_like_rows(&rows.statements[0].rows, &[3]));
         assert_eq!(rows.statements[0].rows.len(), 1);
         assert_text(&rows.statements[0].rows[0][0], "inherit-key");
-        assert_text(&rows.statements[0].rows[0][1], "from-global");
+        assert_json_string(&rows.statements[0].rows[0][1], "from-global");
         assert_text(&rows.statements[0].rows[0][2], "version-child");
         assert_boolean_like(&rows.statements[0].rows[0][3], true);
     }

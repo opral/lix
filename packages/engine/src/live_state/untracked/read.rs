@@ -2,6 +2,7 @@ use crate::common::is_missing_relation_error;
 #[cfg(test)]
 use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;
+use crate::live_state::schema_access::live_storage_relation_exists_with_executor;
 use crate::live_state::storage::{
     build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
     required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
@@ -39,7 +40,7 @@ pub async fn scan_rows_with_backend(
 }
 
 pub(crate) async fn scan_rows_with_backend_limit(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &UntrackedScanRequest,
     limit: usize,
 ) -> Result<Vec<UntrackedRow>, LixError> {
@@ -48,7 +49,7 @@ pub(crate) async fn scan_rows_with_backend_limit(
 }
 
 pub(crate) async fn scan_rows_with_executor_limit(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     request: &UntrackedScanRequest,
     limit: usize,
 ) -> Result<Vec<UntrackedRow>, LixError> {
@@ -116,13 +117,43 @@ pub(crate) async fn scan_rows_with_executor(
     scan_rows_with_limit_and_order(executor, request, None, &["entity_id ASC", "file_id ASC"]).await
 }
 
+pub(crate) async fn scan_rows_with_executor_and_access(
+    executor: LiveStateExecutorRef<'_>,
+    request: &UntrackedScanRequest,
+    access: &crate::live_state::storage::LiveRowAccess,
+    limit: Option<usize>,
+) -> Result<Vec<UntrackedRow>, LixError> {
+    scan_rows_with_limit_order_and_access(
+        executor,
+        request,
+        access,
+        limit,
+        &["entity_id ASC", "file_id ASC"],
+    )
+    .await
+}
+
 async fn scan_rows_with_limit_and_order(
     executor: LiveStateExecutorRef<'_>,
     request: &UntrackedScanRequest,
     limit: Option<usize>,
     order_by: &[&str],
 ) -> Result<Vec<UntrackedRow>, LixError> {
+    if !live_storage_relation_exists_with_executor(executor, &request.schema_key).await? {
+        return Ok(Vec::new());
+    }
+
     let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
+    scan_rows_with_limit_order_and_access(executor, request, &access, limit, order_by).await
+}
+
+async fn scan_rows_with_limit_order_and_access(
+    executor: LiveStateExecutorRef<'_>,
+    request: &UntrackedScanRequest,
+    access: &crate::live_state::storage::LiveRowAccess,
+    limit: Option<usize>,
+    order_by: &[&str],
+) -> Result<Vec<UntrackedRow>, LixError> {
     let selected_columns = selected_columns(&access, &request.required_columns, "untracked")?;
     let projection = selected_projection_sql(&selected_columns);
     let sql = build_partitioned_scan_sql(ScanSqlRequest {

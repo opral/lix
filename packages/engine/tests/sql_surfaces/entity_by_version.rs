@@ -1,9 +1,17 @@
 use lix_engine::Value;
+use serde_json::Value as JsonValue;
 
 fn assert_text(value: &Value, expected: &str) {
     match value {
         Value::Text(actual) => assert_eq!(actual, expected),
         other => panic!("expected text value '{expected}', got {other:?}"),
+    }
+}
+
+fn assert_json_string(value: &Value, expected: &str) {
+    match value {
+        Value::Json(JsonValue::String(actual)) => assert_eq!(actual, expected),
+        other => panic!("expected json string value '{expected}', got {other:?}"),
     }
 }
 
@@ -40,7 +48,7 @@ simulation_test!(
         sim.assert_deterministic(inserted.statements[0].rows.clone());
         assert_eq!(inserted.statements[0].rows.len(), 1);
         assert_text(&inserted.statements[0].rows[0][0], "key-bv");
-        assert_text(&inserted.statements[0].rows[0][1], "value-insert");
+        assert_json_string(&inserted.statements[0].rows[0][1], "value-insert");
         assert_text(&inserted.statements[0].rows[0][2], &version_id);
 
         engine
@@ -70,7 +78,7 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic(updated.statements[0].rows.clone());
         assert_eq!(updated.statements[0].rows.len(), 1);
-        assert_text(&updated.statements[0].rows[0][0], "value-update");
+        assert_json_string(&updated.statements[0].rows[0][0], "value-update");
 
         engine
             .execute(
@@ -178,7 +186,7 @@ simulation_test!(
 
         sim.assert_deterministic_normalized(updated.statements[0].rows.clone());
         assert_eq!(updated.statements[0].rows.len(), 1);
-        assert_text(&updated.statements[0].rows[0][0], "value-b");
+        assert_json_string(&updated.statements[0].rows[0][0], "value-b");
         assert!(
             matches!(
                 updated.statements[0].rows[0][1],
@@ -236,6 +244,6 @@ simulation_test!(
             .unwrap();
         sim.assert_deterministic_normalized(rows.statements[0].rows.clone());
         assert_eq!(rows.statements[0].rows.len(), 1);
-        assert_text(&rows.statements[0].rows[0][0], "value-a");
+        assert_json_string(&rows.statements[0].rows[0][0], "value-a");
     }
 );

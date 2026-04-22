@@ -1111,6 +1111,35 @@ mod tests {
         transaction_frontier_hits: Arc<AtomicUsize>,
     }
 
+    fn observe_change_source_row() -> QueryResult {
+        QueryResult {
+            rows: vec![vec![
+                Value::Text("change-observe-1".to_string()),
+                Value::Text("entity-observe-1".to_string()),
+                Value::Text("lix_key_value".to_string()),
+                Value::Text("1".to_string()),
+                Value::Null,
+                Value::Null,
+                Value::Null,
+                Value::Text("2026-01-01T00:00:00Z".to_string()),
+                Value::Boolean(false),
+                Value::Null,
+            ]],
+            columns: vec![
+                "id".to_string(),
+                "entity_id".to_string(),
+                "schema_key".to_string(),
+                "schema_version".to_string(),
+                "file_id".to_string(),
+                "plugin_key".to_string(),
+                "metadata".to_string(),
+                "created_at".to_string(),
+                "untracked".to_string(),
+                "snapshot_content".to_string(),
+            ],
+        }
+    }
+
     #[async_trait(?Send)]
     impl LixBackend for CountingObserveBackend {
         fn dialect(&self) -> SqlDialect {
@@ -1118,12 +1147,9 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("observe-shared-sentinel") {
+            if sql.contains("FROM lix_internal_change ch") {
                 self.observe_query_hits.fetch_add(1, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Text("observe-shared-sentinel".to_string())]],
-                    columns: vec!["marker".to_string()],
-                });
+                return Ok(observe_change_source_row());
             }
             if sql.contains("FROM lix_internal_change") {
                 return Ok(QueryResult {
@@ -1166,12 +1192,9 @@ mod tests {
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("observe-shared-sentinel") {
+            if sql.contains("FROM lix_internal_change ch") {
                 self.observe_query_hits.fetch_add(1, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Text("observe-shared-sentinel".to_string())]],
-                    columns: vec!["marker".to_string()],
-                });
+                return Ok(observe_change_source_row());
             }
             if sql.contains("FROM lix_internal_change") {
                 return Ok(QueryResult {
@@ -1201,12 +1224,9 @@ mod tests {
         }
 
         async fn execute(&self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("observe-snapshot-sentinel") {
+            if sql.contains("FROM lix_internal_change ch") {
                 self.backend_query_hits.fetch_add(1, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Text("observe-snapshot-sentinel".to_string())]],
-                    columns: vec!["marker".to_string()],
-                });
+                return Ok(observe_change_source_row());
             }
             if sql.contains("ORDER BY created_at DESC, id DESC") {
                 self.backend_frontier_hits.fetch_add(1, Ordering::SeqCst);
@@ -1266,12 +1286,9 @@ mod tests {
         }
 
         async fn execute(&mut self, sql: &str, _params: &[Value]) -> Result<QueryResult, LixError> {
-            if sql.contains("observe-snapshot-sentinel") {
+            if sql.contains("FROM lix_internal_change ch") {
                 self.transaction_query_hits.fetch_add(1, Ordering::SeqCst);
-                return Ok(QueryResult {
-                    rows: vec![vec![Value::Text("observe-snapshot-sentinel".to_string())]],
-                    columns: vec!["marker".to_string()],
-                });
+                return Ok(observe_change_source_row());
             }
             if sql.contains("ORDER BY created_at DESC, id DESC") {
                 self.transaction_frontier_hits

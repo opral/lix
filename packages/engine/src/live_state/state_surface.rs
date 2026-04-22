@@ -11,8 +11,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use tokio::sync::oneshot;
 
 use crate::backend::TransactionBeginMode;
+use crate::common::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
+use super::commit_derived::{is_lazy_commit_derived_surface, scan_commit_derived_rows};
 use super::schema_access::load_live_row_shape_with_backend;
 use super::tracked::{
     scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,
@@ -72,7 +74,7 @@ pub struct StateSurfaceRow {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StateByVersionScanRequest {
-    pub version_id: String,
+    pub version_id: Option<String>,
     pub projection: Vec<StateSurfaceColumn>,
     pub filters: Vec<StateSurfaceFilter>,
     pub limit: Option<usize>,
@@ -91,7 +93,15 @@ pub async fn open_state_by_version_snapshot(
     version_id: &str,
 ) -> Result<Arc<dyn StateByVersionSnapshot>, LixError> {
     Ok(Arc::new(
-        SnapshotBackedStateByVersion::load(backend, version_id).await?,
+        SnapshotBackedStateByVersion::load_exact(backend, version_id).await?,
+    ))
+}
+
+pub async fn open_visible_state_by_version_snapshot(
+    backend: &dyn LixBackend,
+) -> Result<Arc<dyn StateByVersionSnapshot>, LixError> {
+    Ok(Arc::new(
+        SnapshotBackedStateByVersion::load_visible_versions(backend).await?,
     ))
 }
 
@@ -133,9 +143,7 @@ pub async fn open_state_by_version_snapshot_with_shared_backend(
                         let result = runtime.block_on(async {
                             let backend =
                                 crate::backend::transaction_backend_view(transaction.as_mut());
-                            let mut rows =
-                                load_state_by_version_rows(&backend, &request.version_id, &request)
-                                    .await?;
+                            let mut rows = load_state_by_version_rows(&backend, &request).await?;
 
                             if !request.filters.is_empty() {
                                 rows.retain(|row| {
@@ -180,17 +188,17 @@ pub async fn open_state_by_version_snapshot_with_shared_backend(
 
 #[derive(Debug, Clone)]
 struct SnapshotBackedStateByVersion {
-    version_id: String,
+    pinned_version_id: Option<String>,
     rows: Vec<StateSurfaceRow>,
 }
 
 impl SnapshotBackedStateByVersion {
-    async fn load(backend: &dyn LixBackend, version_id: &str) -> Result<Self, LixError> {
-        let rows = load_state_by_version_rows(
+    async fn load_exact(backend: &dyn LixBackend, version_id: &str) -> Result<Self, LixError> {
+        let rows = load_state_by_version_rows_for_version(
             backend,
             version_id,
             &StateByVersionScanRequest {
-                version_id: version_id.to_string(),
+                version_id: Some(version_id.to_string()),
                 projection: Vec::new(),
                 filters: Vec::new(),
                 limit: None,
@@ -198,7 +206,24 @@ impl SnapshotBackedStateByVersion {
         )
         .await?;
         Ok(Self {
-            version_id: version_id.to_string(),
+            pinned_version_id: Some(version_id.to_string()),
+            rows,
+        })
+    }
+
+    async fn load_visible_versions(backend: &dyn LixBackend) -> Result<Self, LixError> {
+        let rows = load_state_by_version_rows(
+            backend,
+            &StateByVersionScanRequest {
+                version_id: None,
+                projection: Vec::new(),
+                filters: Vec::new(),
+                limit: None,
+            },
+        )
+        .await?;
+        Ok(Self {
+            pinned_version_id: None,
             rows,
         })
     }
@@ -228,16 +253,25 @@ impl StateByVersionSnapshot for SnapshotBackedStateByVersion {
         &self,
         request: &StateByVersionScanRequest,
     ) -> Result<Vec<RecordBatch>, LixError> {
-        if request.version_id != self.version_id {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "cached state_by_version snapshot was opened for version '{}' but query requested '{}'",
-                    self.version_id, request.version_id
-                ),
-            ));
+        if let (Some(pinned_version_id), Some(requested_version_id)) = (
+            self.pinned_version_id.as_deref(),
+            request.version_id.as_deref(),
+        ) {
+            if requested_version_id != pinned_version_id {
+                return Err(LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!(
+                        "cached state_by_version snapshot was opened for version '{}' but query requested '{}'",
+                        pinned_version_id, requested_version_id
+                    ),
+                ));
+            }
         }
         let mut rows = self.rows.clone();
+
+        if let Some(requested_version_id) = request.version_id.as_deref() {
+            rows.retain(|row| row.version_id == requested_version_id);
+        }
 
         if !request.filters.is_empty() {
             rows.retain(|row| {
@@ -289,8 +323,7 @@ impl StateByVersionSnapshot for BackendBackedStateByVersion {
         &self,
         request: &StateByVersionScanRequest,
     ) -> Result<Vec<RecordBatch>, LixError> {
-        let mut rows =
-            load_state_by_version_rows(self.backend.as_ref(), &request.version_id, request).await?;
+        let mut rows = load_state_by_version_rows(self.backend.as_ref(), request).await?;
 
         if !request.filters.is_empty() {
             rows.retain(|row| {
@@ -511,6 +544,18 @@ fn state_surface_column_value(row: &StateSurfaceRow, column: StateSurfaceColumn)
 
 async fn load_state_by_version_rows(
     backend: &dyn LixBackend,
+    request: &StateByVersionScanRequest,
+) -> Result<Vec<StateSurfaceRow>, LixError> {
+    let target_version_ids = resolve_target_version_ids_for_request(backend, request).await?;
+    let mut rows = Vec::new();
+    for version_id in target_version_ids {
+        rows.extend(load_state_by_version_rows_for_version(backend, &version_id, request).await?);
+    }
+    Ok(rows)
+}
+
+async fn load_state_by_version_rows_for_version(
+    backend: &dyn LixBackend,
     version_id: &str,
     request: &StateByVersionScanRequest,
 ) -> Result<Vec<StateSurfaceRow>, LixError> {
@@ -567,6 +612,26 @@ async fn load_state_by_version_rows(
             version_id: version_id.to_string(),
         })
         .collect())
+}
+
+async fn resolve_target_version_ids_for_request(
+    backend: &dyn LixBackend,
+    request: &StateByVersionScanRequest,
+) -> Result<Vec<String>, LixError> {
+    if let Some(version_id) = request.version_id.clone() {
+        return Ok(vec![version_id]);
+    }
+
+    let mut version_ids =
+        crate::live_state::load_current_committed_version_frontier_with_backend(backend)
+            .await?
+            .version_heads
+            .into_keys()
+            .collect::<Vec<_>>();
+    version_ids.push(GLOBAL_VERSION_ID.to_string());
+    version_ids.sort();
+    version_ids.dedup();
+    Ok(version_ids)
 }
 
 fn request_needs_commit_id(request: &StateByVersionScanRequest) -> bool {
@@ -848,8 +913,24 @@ async fn resolve_state_schema_keys(
 ) -> Result<Vec<String>, LixError> {
     match &route.schema_keys {
         Some(schema_keys) => Ok(schema_keys.clone()),
-        None => load_visible_state_schema_keys(backend, version_id).await,
+        None => {
+            let mut schema_keys = load_visible_state_schema_keys(backend, version_id).await?;
+            schema_keys.extend(commit_family_state_schema_keys());
+            schema_keys.sort();
+            schema_keys.dedup();
+            Ok(schema_keys)
+        }
     }
+}
+
+fn commit_family_state_schema_keys() -> Vec<String> {
+    vec![
+        "lix_commit".to_string(),
+        "lix_change_set".to_string(),
+        "lix_change_set_element".to_string(),
+        "lix_commit_edge".to_string(),
+        "lix_change_author".to_string(),
+    ]
 }
 
 async fn load_effective_rows_for_schema(
@@ -961,6 +1042,16 @@ async fn load_effective_rows_for_lane(
     query: &LiveRowQuery,
     source_limit: Option<usize>,
 ) -> Result<Vec<StateSurfaceLaneRow>, LixError> {
+    if is_lazy_commit_derived_surface(schema_key) {
+        return load_lazy_commit_derived_rows_for_lane(
+            backend,
+            force_global,
+            query,
+            snapshot_shape.is_some(),
+        )
+        .await;
+    }
+
     match query.source {
         LiveRowSource::Tracked => {
             load_tracked_rows_for_lane(
@@ -990,6 +1081,33 @@ async fn load_effective_rows_for_lane(
             "state_surface lane loading does not support nested effective queries",
         )),
     }
+}
+
+async fn load_lazy_commit_derived_rows_for_lane(
+    backend: &dyn LixBackend,
+    force_global: bool,
+    query: &LiveRowQuery,
+    include_snapshot_content: bool,
+) -> Result<Vec<StateSurfaceLaneRow>, LixError> {
+    let rows = scan_commit_derived_rows(backend, query, |backend, request| {
+        let request = request.clone();
+        Box::pin(async move { scan_live_rows(backend, &request).await })
+    })
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|mut row| {
+            row.global = force_global || row.global;
+            if !include_snapshot_content {
+                row.snapshot_content = None;
+            }
+            StateSurfaceLaneRow {
+                row,
+                is_tombstone: false,
+            }
+        })
+        .collect())
 }
 
 async fn load_tracked_rows_for_lane(
@@ -1144,6 +1262,7 @@ async fn load_visible_state_schema_keys(
     backend: &dyn LixBackend,
     version_id: &str,
 ) -> Result<Vec<String>, LixError> {
+    let mut schema_keys = load_live_storage_schema_keys(backend).await?;
     let rows = scan_live_rows(
         backend,
         &LiveRowQuery {
@@ -1156,7 +1275,6 @@ async fn load_visible_state_schema_keys(
     )
     .await?;
 
-    let mut schema_keys = BTreeSet::<String>::new();
     for row in &rows {
         let Some((schema_key, _)) = decode_registered_schema_row(row)? else {
             continue;
@@ -1164,6 +1282,50 @@ async fn load_visible_state_schema_keys(
         schema_keys.insert(schema_key.schema_key);
     }
     Ok(schema_keys.into_iter().collect())
+}
+
+async fn load_live_storage_schema_keys(
+    backend: &dyn LixBackend,
+) -> Result<BTreeSet<String>, LixError> {
+    let rows = match backend.dialect() {
+        crate::SqlDialect::Sqlite => {
+            crate::live_state::store_sql::execute_query_with_backend(
+                backend,
+                "SELECT name \
+                 FROM sqlite_master \
+                 WHERE type IN ('table', 'view') \
+                   AND name LIKE $1",
+                &[Value::Text(format!("{}%", super::TRACKED_RELATION_PREFIX))],
+            )
+            .await?
+            .rows
+        }
+        crate::SqlDialect::Postgres => {
+            crate::live_state::store_sql::execute_query_with_backend(
+                backend,
+                "SELECT table_name \
+                 FROM information_schema.tables \
+                 WHERE table_name LIKE $1",
+                &[Value::Text(format!("{}%", super::TRACKED_RELATION_PREFIX))],
+            )
+            .await?
+            .rows
+        }
+    };
+
+    let mut schema_keys = BTreeSet::new();
+    for row in rows {
+        let Some(Value::Text(table_name)) = row.first() else {
+            continue;
+        };
+        let Some(schema_key) = table_name.strip_prefix(super::TRACKED_RELATION_PREFIX) else {
+            continue;
+        };
+        if !schema_key.is_empty() {
+            schema_keys.insert(schema_key.to_string());
+        }
+    }
+    Ok(schema_keys)
 }
 
 async fn load_change_commit_ids_with_backend(
@@ -1181,8 +1343,33 @@ async fn load_change_commit_ids_with_backend(
         return Ok(BTreeMap::new());
     }
 
-    let mut executor = backend;
-    crate::canonical::load_change_commit_ids_with_executor(&mut executor, &change_ids).await
+    let in_list = change_ids
+        .iter()
+        .map(|change_id| format!("'{}'", escape_sql_string(change_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH {change_commit_cte} \
+         SELECT change_id, commit_id \
+         FROM change_commit_by_change_id \
+         WHERE change_id IN ({in_list})",
+        change_commit_cte =
+            crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
+        in_list = in_list,
+    );
+    let result =
+        crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
+    let mut rows = BTreeMap::new();
+    for row in result.rows {
+        let Some(Value::Text(change_id)) = row.first() else {
+            continue;
+        };
+        let Some(Value::Text(commit_id)) = row.get(1) else {
+            continue;
+        };
+        rows.insert(change_id.clone(), commit_id.clone());
+    }
+    Ok(rows)
 }
 #[derive(Clone)]
 struct BackendBackedStateByVersion {
@@ -1192,5 +1379,161 @@ struct BackendBackedStateByVersion {
 impl std::fmt::Debug for BackendBackedStateByVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendBackedStateByVersion").finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        open_state_by_version_snapshot, StateByVersionScanRequest, StateSurfaceColumn,
+        StateSurfaceFilter,
+    };
+    use crate::live_state::{
+        scan_live_rows, write_live_rows, LiveRow, LiveRowQuery, LiveRowSource,
+    };
+    use crate::schema::LixCommit;
+    use crate::test_support::{
+        init_test_backend_core, seed_canonical_change_row, CanonicalChangeSeed, TestSqliteBackend,
+    };
+    use crate::Value;
+    use datafusion::arrow::array::StringArray;
+
+    fn commit_live_row(snapshot: &LixCommit, version_id: &str) -> LiveRow {
+        LiveRow {
+            entity_id: snapshot.id.clone(),
+            file_id: None,
+            schema_key: "lix_commit".to_string(),
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: None,
+            metadata: Some("{\"kind\":\"commit\"}".to_string()),
+            change_id: Some(format!("change-{}", snapshot.id)),
+            global: version_id == crate::version::GLOBAL_VERSION_ID,
+            untracked: false,
+            created_at: Some("2026-03-30T00:00:00Z".to_string()),
+            updated_at: Some("2026-03-30T00:00:00Z".to_string()),
+            snapshot_content: Some(
+                serde_json::to_string(snapshot).expect("commit snapshot should serialize"),
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn state_by_version_snapshot_exposes_lazy_commit_derived_rows() {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-1",
+                entity_id: "entity-a",
+                schema_key: "test_schema",
+                schema_version: "1",
+                file_id: Some("file-a"),
+                plugin_key: None,
+                snapshot_id: "snapshot-1",
+                snapshot_content: Some(r#"{"key":"a"}"#),
+                metadata: Some(r#"{"member":true}"#),
+                created_at: "2026-03-30T00:00:00Z",
+            },
+        )
+        .await
+        .expect("canonical member change should seed");
+
+        let mut transaction = backend
+            .begin_write_transaction()
+            .await
+            .expect("write transaction should open");
+        write_live_rows(
+            transaction.as_mut(),
+            &[commit_live_row(
+                &LixCommit {
+                    id: "commit-1".to_string(),
+                    change_set_id: Some("cs-1".to_string()),
+                    change_ids: vec!["change-1".to_string()],
+                    author_account_ids: vec![],
+                    parent_commit_ids: vec![],
+                },
+                "main",
+            )],
+        )
+        .await
+        .expect("commit live row should write");
+        transaction
+            .commit()
+            .await
+            .expect("write transaction should commit");
+
+        let direct_rows = scan_live_rows(
+            &backend,
+            &LiveRowQuery {
+                schema_key: "lix_change_set_element".to_string(),
+                version_id: "main".to_string(),
+                source: LiveRowSource::Effective,
+                constraints: vec![crate::live_state::ScanConstraint {
+                    field: crate::live_state::ScanField::EntityId,
+                    operator: crate::live_state::ScanOperator::Eq(Value::Text(
+                        "cs-1~change-1".to_string(),
+                    )),
+                }],
+                include_tombstones: false,
+            },
+        )
+        .await
+        .expect("direct lazy scan should succeed");
+        assert_eq!(direct_rows.len(), 1);
+
+        let snapshot = open_state_by_version_snapshot(&backend, "main")
+            .await
+            .expect("snapshot should open");
+        let batches = snapshot
+            .scan_state_by_version_batches(&StateByVersionScanRequest {
+                version_id: Some("main".to_string()),
+                projection: vec![
+                    StateSurfaceColumn::EntityId,
+                    StateSurfaceColumn::SchemaKey,
+                    StateSurfaceColumn::SnapshotContent,
+                ],
+                filters: vec![
+                    StateSurfaceFilter::Eq(
+                        StateSurfaceColumn::SchemaKey,
+                        Value::Text("lix_change_set_element".to_string()),
+                    ),
+                    StateSurfaceFilter::Eq(
+                        StateSurfaceColumn::EntityId,
+                        Value::Text("cs-1~change-1".to_string()),
+                    ),
+                ],
+                limit: None,
+            })
+            .await
+            .expect("state_by_version scan should succeed");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        let entity_ids = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("entity_id should be a string array");
+        let schema_keys = batches[0]
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("schema_key should be a string array");
+        let snapshot_contents = batches[0]
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("snapshot_content should be a string array");
+
+        assert_eq!(entity_ids.value(0), "cs-1~change-1");
+        assert_eq!(schema_keys.value(0), "lix_change_set_element");
+        let snapshot: serde_json::Value =
+            serde_json::from_str(snapshot_contents.value(0)).expect("valid derived snapshot JSON");
+        assert_eq!(snapshot["change_set_id"], "cs-1");
+        assert_eq!(snapshot["change_id"], "change-1");
     }
 }

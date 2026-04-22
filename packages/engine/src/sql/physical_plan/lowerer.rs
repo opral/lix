@@ -1,7 +1,8 @@
 use crate::catalog::{
-    builtin_catalog_compiler_facade, CatalogCompilerApi, FilesystemProjectionScope,
-    FilesystemRelationBinding, FilesystemRelationKind, RelationBindContext, RelationBinding,
-    ResolvedRelation, SurfaceColumnType, SurfaceFamily, SurfaceRegistry, SurfaceVariant,
+    builtin_catalog_compiler_facade, state_relation_columns_for_variant, CatalogCompilerApi,
+    FilesystemProjectionScope, FilesystemRelationBinding, FilesystemRelationKind,
+    RelationBindContext, RelationBinding, ResolvedRelation, SurfaceColumnType, SurfaceFamily,
+    SurfaceRegistry, SurfaceVariant,
 };
 use crate::sql::common::pushdown::{PushdownDecision, PushdownSupport, RejectedPredicate};
 use crate::sql::diagnostics::sql_unknown_column_error;
@@ -16,7 +17,7 @@ use crate::sql::physical_plan::plan::{
 };
 use crate::sql::physical_plan::public_surface_sql_support::{
     entity_surface_has_live_payload_collisions, entity_surface_payload_alias,
-    entity_surface_uses_payload_alias, render_identifier,
+    entity_surface_uses_payload_alias, render_identifier, render_where_clause_sql,
 };
 use crate::sql::physical_plan::source_sql::{
     build_effective_public_read_source_sql, build_working_changes_public_read_source_sql,
@@ -407,7 +408,8 @@ fn lowered_result_column_from_surface_type(column_type: SurfaceColumnType) -> Lo
         SurfaceColumnType::String
         | SurfaceColumnType::Integer
         | SurfaceColumnType::Number
-        | SurfaceColumnType::Json => LoweredResultColumn::Untyped,
+        | SurfaceColumnType::Json
+        | SurfaceColumnType::Variant => LoweredResultColumn::Untyped,
     }
 }
 
@@ -1036,10 +1038,15 @@ fn build_state_source_sql(
             pushdown_predicates,
             known_live_layouts,
         )?,
-        SurfaceVariant::History => return Ok(None),
+        SurfaceVariant::History => build_state_history_source_sql(pushdown_predicates),
         SurfaceVariant::WorkingChanges => return Ok(None),
     };
     Ok(Some(sql))
+}
+
+fn build_state_history_source_sql(pushdown_predicates: &[Expr]) -> String {
+    let where_clause = render_where_clause_sql(pushdown_predicates, " WHERE ");
+    format!("SELECT * FROM lix_state_history{where_clause}")
 }
 
 fn build_admin_source_sql(
@@ -1095,7 +1102,31 @@ fn build_entity_source_sql(
                 false,
             )?)
         }
-        SurfaceVariant::History => None,
+        SurfaceVariant::History => {
+            let schema_key = resolved_relation
+                .descriptor
+                .implicit_overrides
+                .fixed_schema_key
+                .clone()
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "history entity surface '{}' is missing a fixed schema key",
+                            resolved_relation.descriptor.public_name
+                        ),
+                    )
+                })?;
+            let mut history_predicates = vec![Expr::BinaryOp {
+                left: Box::new(Expr::Identifier(sqlparser::ast::Ident::new("schema_key"))),
+                op: sqlparser::ast::BinaryOperator::Eq,
+                right: Box::new(Expr::Value(
+                    sqlparser::ast::Value::SingleQuotedString(schema_key).into(),
+                )),
+            }];
+            history_predicates.extend(pushdown_predicates.iter().cloned());
+            Some(build_state_history_source_sql(&history_predicates))
+        }
         SurfaceVariant::WorkingChanges => None,
     };
     let Some(state_source_sql) = state_source_sql else {
@@ -1245,21 +1276,18 @@ fn entity_projection_sql_for_column(
     None
 }
 
-fn entity_hidden_alias_source_column(alias: &str, variant: SurfaceVariant) -> Option<&'static str> {
-    match alias.to_ascii_lowercase().as_str() {
-        "lixcol_entity_id" => Some("entity_id"),
-        "lixcol_schema_key" => Some("schema_key"),
-        "lixcol_file_id" => Some("file_id"),
-        "lixcol_plugin_key" => Some("plugin_key"),
-        "lixcol_schema_version" => Some("schema_version"),
-        "lixcol_change_id" => Some("change_id"),
-        "lixcol_created_at" => Some("created_at"),
-        "lixcol_updated_at" => Some("updated_at"),
-        "lixcol_global" => Some("global"),
-        "lixcol_untracked" => Some("untracked"),
-        "lixcol_metadata" => Some("metadata"),
-        "lixcol_version_id" if variant == SurfaceVariant::ByVersion => Some("version_id"),
-        _ => None,
+fn entity_hidden_alias_source_column(alias: &str, variant: SurfaceVariant) -> Option<String> {
+    let source_column = alias.strip_prefix("lixcol_")?.to_ascii_lowercase();
+    state_relation_columns_for_variant(entity_base_relation_variant(variant))
+        .into_iter()
+        .find(|candidate| candidate == &source_column)
+}
+
+fn entity_base_relation_variant(variant: SurfaceVariant) -> SurfaceVariant {
+    match variant {
+        SurfaceVariant::Default | SurfaceVariant::WorkingChanges => SurfaceVariant::Default,
+        SurfaceVariant::ByVersion => SurfaceVariant::ByVersion,
+        SurfaceVariant::History => SurfaceVariant::History,
     }
 }
 
@@ -1910,6 +1938,38 @@ mod tests {
         assert_eq!(
             lowered.pushdown_decision.accepted_predicate_sql(),
             Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn lowers_builtin_entity_history_reads_through_state_history_surfaces() {
+        let registry = crate::catalog::build_builtin_surface_registry();
+        let lowered = lowered_batch(
+            &registry,
+            "SELECT key, lixcol_commit_id, lixcol_commit_created_at, \
+                    lixcol_root_commit_id, lixcol_depth, lixcol_version_id \
+             FROM lix_key_value_history \
+             WHERE key = 'hello'",
+        )
+        .expect("builtin entity history read should lower");
+        let lowered_sql = lowered.statements[0]
+            .render_sql(SqlDialect::Sqlite)
+            .expect("lowered statement should render");
+
+        assert!(lowered_sql.contains("FROM lix_state_history"));
+        assert!(lowered_sql.contains("commit_id"));
+        assert!(lowered_sql.contains("lixcol_commit_id"));
+        assert!(lowered_sql.contains("commit_created_at"));
+        assert!(lowered_sql.contains("lixcol_commit_created_at"));
+        assert!(lowered_sql.contains("root_commit_id"));
+        assert!(lowered_sql.contains("lixcol_root_commit_id"));
+        assert!(lowered_sql.contains("depth"));
+        assert!(lowered_sql.contains("lixcol_depth"));
+        assert!(lowered_sql.contains("version_id"));
+        assert!(lowered_sql.contains("lixcol_version_id"));
+        assert_eq!(
+            lowered.pushdown_decision.residual_predicate_sql(),
+            vec!["key = 'hello'".to_string()]
         );
     }
 
