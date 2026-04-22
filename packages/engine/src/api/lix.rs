@@ -483,19 +483,75 @@ impl Lix {
         &self,
         plan: &LiveStateRebuildPlan,
     ) -> Result<LiveStateApplyReport, LixError> {
-        crate::live_state::apply_rebuild_plan(self.engine.backend().as_ref(), plan).await
+        let mut transaction = self
+            .engine
+            .backend()
+            .begin_transaction(TransactionBeginMode::Write)
+            .await?;
+        let apply_result = crate::live_state::apply_rebuild_plan(transaction.as_mut(), plan).await;
+        match apply_result {
+            Ok(report) => {
+                transaction.commit().await?;
+                Ok(report)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
     }
 
     pub async fn rebuild_live_state(
         &self,
         req: &LiveStateRebuildRequest,
     ) -> Result<LiveStateRebuildReport, LixError> {
-        crate::live_state::rebuild_projection(
+        let mut transaction = self
+            .engine
+            .backend()
+            .begin_transaction(TransactionBeginMode::Write)
+            .await?;
+        let rebuild_result = crate::live_state::rebuild(transaction.as_mut(), req).await;
+        let report = match rebuild_result {
+            Ok(report) => {
+                transaction.commit().await?;
+                report
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = crate::live_state::rebuild_file_payloads_with_plugins(
             self.engine.backend().as_ref(),
             self.engine.as_ref(),
-            req,
+            &report.plan,
         )
         .await
+        {
+            let mut transaction = self
+                .engine
+                .backend()
+                .begin_transaction(TransactionBeginMode::Write)
+                .await?;
+            let mark_result = crate::live_state::mark_mode_in_transaction(
+                transaction.as_mut(),
+                crate::live_state::LiveStateMode::NeedsRebuild,
+            )
+            .await;
+            match mark_result {
+                Ok(()) => {
+                    transaction.commit().await?;
+                }
+                Err(mark_error) => {
+                    let _ = transaction.rollback().await;
+                    return Err(mark_error);
+                }
+            }
+            return Err(error);
+        }
+
+        Ok(report)
     }
 
     pub async fn begin_transaction_with_options(

@@ -30,8 +30,6 @@ pub(crate) use crate::live_state::{
     ExactRowRequest as ExactTrackedRowRequest, ScanRequest as TrackedScanRequest,
 };
 #[cfg(test)]
-use crate::LixBackend;
-#[cfg(test)]
 use crate::LixError;
 use crate::Value;
 
@@ -89,7 +87,7 @@ fn value_as_text(value: &Value) -> Option<&str> {
 #[async_trait(?Send)]
 impl<T> TrackedReadView for T
 where
-    T: LixBackend,
+    for<'a> &'a T: crate::QueryExecutor,
 {
     async fn load_exact_rows(
         &self,
@@ -110,7 +108,7 @@ where
 #[async_trait(?Send)]
 impl<T> TrackedTombstoneView for T
 where
-    T: LixBackend,
+    for<'a> &'a T: crate::QueryExecutor,
 {
     async fn scan_tombstones(
         &self,

@@ -4,7 +4,7 @@
 //! model boundary. It persists canonical changes into local storage so replay
 //! systems can rebuild derived state from them later.
 
-use crate::backend::{PreparedBatch, PreparedStatement};
+use crate::canonical::store::{CanonicalPreparedBatch, CanonicalPreparedStatement};
 use crate::functions::LixFunctionProvider;
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
@@ -111,7 +111,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
     canonical_output: &CanonicalCommitOutput,
     functions: &mut dyn LixFunctionProvider,
     dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
+) -> Result<CanonicalPreparedBatch, LixError> {
     let mut ensure_no_content = false;
     let mut snapshot_rows = Vec::new();
     let mut change_rows = Vec::new();
@@ -148,7 +148,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
         });
     }
 
-    let mut prepared = PreparedBatch { steps: Vec::new() };
+    let mut prepared = CanonicalPreparedBatch { steps: Vec::new() };
 
     if ensure_no_content {
         let p1 = dialect.placeholder(1);
@@ -233,7 +233,7 @@ pub(crate) fn build_prepared_batch_from_canonical_output(
 pub(crate) fn build_prepared_batch_from_visibility_rows(
     visibility_rows: &[UntrackedChangeVisibilityRow],
     dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
+) -> Result<CanonicalPreparedBatch, LixError> {
     let visibility_rows = visibility_rows
         .iter()
         .map(|row| CanonicalUntrackedVisibilityInsertRow {
@@ -248,7 +248,7 @@ pub(crate) fn build_prepared_batch_from_visibility_rows(
         })
         .collect::<Vec<_>>();
 
-    let mut prepared = PreparedBatch { steps: Vec::new() };
+    let mut prepared = CanonicalPreparedBatch { steps: Vec::new() };
     push_chunked_prepared_insert_statements(
         &mut prepared,
         UNTRACKED_CHANGE_VISIBILITY_TABLE,
@@ -300,7 +300,7 @@ fn max_rows_per_insert_for_dialect(dialect: SqlDialect, params_per_row: usize) -
 }
 
 fn push_chunked_prepared_insert_statements<Row, F>(
-    prepared: &mut PreparedBatch,
+    prepared: &mut CanonicalPreparedBatch,
     table: &str,
     columns: &[&str],
     rows: &[Row],
@@ -346,12 +346,12 @@ where
 }
 
 fn push_bound_statement(
-    prepared: &mut PreparedBatch,
+    prepared: &mut CanonicalPreparedBatch,
     sql: &str,
     params: Vec<Value>,
     _dialect: SqlDialect,
 ) -> Result<(), LixError> {
-    prepared.push_statement(PreparedStatement {
+    prepared.push_statement(CanonicalPreparedStatement {
         sql: sql.to_string(),
         params,
     });

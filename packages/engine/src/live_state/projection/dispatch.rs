@@ -3,10 +3,11 @@ use crate::catalog::{
     CatalogReadTimeProjectionRequest, RegisteredCatalogProjection,
 };
 use crate::live_state::projection::hydration::hydrate_projection_input_with_backend;
-use crate::{LixBackend, LixError};
+use crate::live_state::store::LiveStateBackendRef;
+use crate::LixError;
 
 pub(crate) async fn derive_read_time_projection_rows_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     registry: &CatalogProjectionRegistry,
     request: &CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<CatalogDerivedRow>, LixError> {
@@ -31,7 +32,7 @@ pub(crate) async fn derive_read_time_projection_rows_with_backend(
 }
 
 async fn derive_registered_projection_rows_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     registration: &RegisteredCatalogProjection,
     request: &CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<CatalogDerivedRow>, LixError> {

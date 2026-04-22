@@ -51,6 +51,8 @@ mod snapshot_queries;
 mod state_surface;
 pub(crate) mod storage;
 mod storage_metadata;
+pub(crate) mod store;
+pub(crate) mod store_sql;
 pub(crate) mod stored_rows;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -59,8 +61,12 @@ mod types;
 pub(crate) mod untracked;
 mod visible_rows;
 use crate::catalog::SurfaceReadFreshness;
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
-use async_trait::async_trait;
+use crate::live_state::store::{
+    LiveStateBackendRef, LiveStateExecutorRef, LiveStateMaterializeStore, LiveStateReadStore,
+    LiveStateTransactionRef, LiveStateWriteStore,
+};
+use crate::live_state::store_sql::SqlLiveStateStore;
+use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) use bridge::LiveStateTransactionBridge;
@@ -70,11 +76,6 @@ pub(crate) use effective::EffectiveRowsResolver;
 pub use effective::{
     EffectiveRow, EffectiveRowIdentity, EffectiveRowRequest, EffectiveRowSet, EffectiveRowState,
     EffectiveRowsRequest, LaneResult, OverlayLane,
-};
-pub(crate) use frontier::{
-    load_current_committed_version_frontier_with_backend,
-    load_current_committed_version_frontier_with_executor,
-    load_version_head_commit_id_with_executor, load_version_head_commit_map_with_executor,
 };
 pub use init::init;
 pub use lifecycle::LiveStateReadiness;
@@ -94,8 +95,7 @@ pub(crate) use projection_receipt::CanonicalCommitProjectionReceipt;
 pub(crate) use read_context::LiveReadContext;
 pub use replay_cursor::ReplayCursor;
 pub use row_queries::{
-    decode_registered_schema_row, load_exact_live_row, scan_live_rows, write_live_rows,
-    ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSource,
+    decode_registered_schema_row, ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveRowSource,
 };
 pub(crate) use schema_access::LiveRowShape;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
@@ -163,16 +163,77 @@ pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
     ]
 }
 
-pub async fn require_ready(backend: &dyn LixBackend) -> Result<(), LixError> {
-    lifecycle::require_ready(backend).await
+pub(crate) async fn load_version_head_commit_id_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+    version_id: &str,
+) -> Result<Option<String>, LixError> {
+    frontier::load_version_head_commit_id(
+        &mut SqlLiveStateStore::from_executor(executor),
+        version_id,
+    )
+    .await
 }
 
-pub async fn projection_status(backend: &dyn LixBackend) -> Result<ProjectionStatus, LixError> {
-    projection::projection_status(backend).await
+pub(crate) async fn load_version_head_commit_map_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+) -> Result<Option<std::collections::BTreeMap<String, String>>, LixError> {
+    frontier::load_version_head_commit_map(&mut SqlLiveStateStore::from_executor(executor)).await
+}
+
+pub(crate) async fn load_current_committed_version_frontier_with_backend(
+    backend: LiveStateBackendRef<'_>,
+) -> Result<crate::version::CommittedVersionFrontier, LixError> {
+    frontier::load_current_committed_version_frontier(&mut SqlLiveStateStore::from_backend(backend))
+        .await
+}
+
+pub(crate) async fn load_current_committed_version_frontier_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+) -> Result<crate::version::CommittedVersionFrontier, LixError> {
+    frontier::load_current_committed_version_frontier(&mut SqlLiveStateStore::from_executor(
+        executor,
+    ))
+    .await
+}
+
+pub async fn scan_live_rows(
+    backend: LiveStateBackendRef<'_>,
+    request: &LiveRowQuery,
+) -> Result<Vec<LiveRow>, LixError> {
+    let store = SqlLiveStateStore::from_backend(backend);
+    store.scan_live_rows(request).await
+}
+
+pub async fn load_exact_live_row(
+    backend: LiveStateBackendRef<'_>,
+    request: &ExactLiveRowQuery,
+) -> Result<Option<LiveRow>, LixError> {
+    let store = SqlLiveStateStore::from_backend(backend);
+    store.load_exact_live_row(request).await
+}
+
+pub async fn write_live_rows(
+    transaction: LiveStateTransactionRef<'_>,
+    rows: &[LiveRow],
+) -> Result<(), LixError> {
+    let mut store = SqlLiveStateStore::from_transaction(transaction);
+    store.write_live_rows(rows).await
+}
+
+pub async fn require_ready(backend: LiveStateBackendRef<'_>) -> Result<(), LixError> {
+    lifecycle::require_ready(&SqlLiveStateStore::from_backend(backend)).await
+}
+
+pub async fn projection_status(
+    backend: LiveStateBackendRef<'_>,
+) -> Result<ProjectionStatus, LixError> {
+    SqlLiveStateStore::from_backend(backend)
+        .projection_status()
+        .await
 }
 
 pub(crate) async fn ensure_projection_read_freshness_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     freshness_contract: SurfaceReadFreshness,
     resolved_relations: &[String],
 ) -> Result<(), LixError> {
@@ -193,7 +254,7 @@ pub(crate) async fn ensure_projection_read_freshness_with_backend(
 }
 
 pub(crate) async fn ensure_projection_read_freshness_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     freshness_contract: SurfaceReadFreshness,
     resolved_relations: &[String],
 ) -> Result<(), LixError> {
@@ -205,9 +266,9 @@ pub(crate) async fn ensure_projection_read_freshness_in_transaction(
         return Ok(());
     }
 
-    let backend = crate::backend::transaction_backend_view(transaction);
+    let mut backend = crate::live_state::store_sql::executor_from_transaction(transaction);
     let status =
-        projection::status::load_live_state_projection_status_with_backend(&backend).await?;
+        projection::status::load_live_state_projection_status_with_executor(&mut backend).await?;
     if status.mode == LiveStateMode::Bootstrapping {
         return Ok(());
     }
@@ -216,13 +277,13 @@ pub(crate) async fn ensure_projection_read_freshness_in_transaction(
 }
 
 pub(crate) async fn list_installed_plugin_archive_refs(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
 ) -> Result<Vec<PluginArchiveRef>, LixError> {
     plugin_archives::list_installed_plugin_archive_refs(backend).await
 }
 
 pub(crate) async fn derive_read_time_surface_rows(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     registry: &crate::catalog::CatalogProjectionRegistry,
     request: &crate::catalog::CatalogReadTimeProjectionRequest,
 ) -> Result<Vec<crate::catalog::CatalogDerivedRow>, LixError> {
@@ -231,65 +292,89 @@ pub(crate) async fn derive_read_time_surface_rows(
 }
 
 pub async fn register_schema(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     registration: impl Into<SchemaRegistration>,
 ) -> Result<(), LixError> {
     let registration = registration.into();
-    storage::register_schema(backend, &registration).await
+    let mut store = SqlLiveStateStore::from_backend(backend);
+    store.register_schema(&registration).await
 }
 
 pub async fn finalize_live_state_after_commit_write(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
 ) -> Result<(), LixError> {
     finalize_live_state_after_immediate_write(transaction).await
 }
 
 pub(crate) async fn finalize_live_state_after_immediate_write(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
 ) -> Result<(), LixError> {
-    if lifecycle::require_ready_in_transaction(transaction)
+    let mut store = SqlLiveStateStore::from_transaction(transaction);
+    if lifecycle::require_ready_in_transaction(&mut store)
         .await
         .is_ok()
     {
-        lifecycle::mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction)
-            .await?;
+        lifecycle::mark_live_state_ready_at_latest_replay_cursor_in_transaction(&mut store).await?;
     }
     Ok(())
 }
 
 pub async fn rebuild_plan(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     request: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
-    materialize::rebuild_plan(backend, request).await
+    let mut store = SqlLiveStateStore::from_backend(backend);
+    store.rebuild_plan(request).await
 }
 
 pub async fn apply_rebuild_plan(
-    backend: &dyn LixBackend,
+    transaction: LiveStateTransactionRef<'_>,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
-    materialize::apply_rebuild_plan(backend, plan).await
+    let mut store = SqlLiveStateStore::from_transaction(transaction);
+    store.apply_rebuild_plan(plan).await
 }
 
 pub async fn rebuild(
-    backend: &dyn LixBackend,
+    transaction: LiveStateTransactionRef<'_>,
     request: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildReport, LixError> {
-    materialize::rebuild(backend, request).await
+    let mut store = SqlLiveStateStore::from_transaction(transaction);
+    let plan = store.rebuild_plan(request).await?;
+    let apply = store.apply_rebuild_plan(&plan).await?;
+    Ok(LiveStateRebuildReport { plan, apply })
 }
 
-pub(crate) async fn rebuild_projection(
-    backend: &dyn LixBackend,
-    plugin_materializer: &dyn crate::plugin::FilesystemPluginMaterializer,
-    request: &LiveStateRebuildRequest,
-) -> Result<LiveStateRebuildReport, LixError> {
-    materialize::rebuild_projection(backend, plugin_materializer, request).await
+pub(crate) async fn initialize_in_transaction(
+    transaction: LiveStateTransactionRef<'_>,
+) -> Result<(), LixError> {
+    if !lifecycle::try_claim_live_state_bootstrap_in_transaction(
+        &mut SqlLiveStateStore::from_transaction(transaction),
+    )
+    .await?
+    {
+        return Err(crate::common::already_initialized_error());
+    }
+
+    mark_mode_in_transaction(transaction, LiveStateMode::Rebuilding).await?;
+    rebuild_scope_in_transaction(
+        transaction,
+        &LiveStateRebuildRequest {
+            scope: LiveStateRebuildScope::Full,
+            debug: LiveStateRebuildDebugMode::Off,
+            debug_row_limit: 0,
+        },
+    )
+    .await?;
+    mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction).await?;
+    Ok(())
 }
 
 pub(crate) async fn require_ready_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
 ) -> Result<(), LixError> {
-    lifecycle::require_ready_in_transaction(transaction).await
+    lifecycle::require_ready_in_transaction(&mut SqlLiveStateStore::from_transaction(transaction))
+        .await
 }
 
 fn projection_stale_error(
@@ -334,34 +419,25 @@ fn format_committed_frontier(frontier: &crate::CommittedVersionFrontier) -> Stri
 }
 
 pub(crate) async fn register_schema_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
     registration: impl Into<SchemaRegistration>,
 ) -> Result<(), LixError> {
     let registration = registration.into();
-    storage::register_schema_in_transaction(transaction, &registration).await
+    let mut store = SqlLiveStateStore::from_transaction(transaction);
+    store.register_schema(&registration).await
 }
 
 pub(crate) async fn mark_live_state_ready_at_latest_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
 ) -> Result<ReplayCursor, LixError> {
-    lifecycle::mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction).await
-}
-
-pub(crate) async fn load_latest_live_state_replay_cursor_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<Option<ReplayCursor>, LixError> {
-    projection::replay::load_latest_live_state_replay_cursor_with_backend(backend).await
-}
-
-pub(crate) async fn mark_live_state_projection_ready_with_backend(
-    backend: &dyn LixBackend,
-    cursor: &ReplayCursor,
-) -> Result<(), LixError> {
-    projection::mark_live_state_projection_ready_with_backend(backend, cursor).await
+    lifecycle::mark_live_state_ready_at_latest_replay_cursor_in_transaction(
+        &mut SqlLiveStateStore::from_transaction(transaction),
+    )
+    .await
 }
 
 pub(crate) async fn mark_live_state_projection_ready_without_replay_cursor_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: LiveStateTransactionRef<'_>,
 ) -> Result<(), LixError> {
     projection::replay::mark_live_state_projection_ready_without_replay_cursor_in_transaction(
         transaction,
@@ -370,22 +446,28 @@ pub(crate) async fn mark_live_state_projection_ready_without_replay_cursor_in_tr
 }
 
 pub(crate) async fn load_mode_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
 ) -> Result<LiveStateMode, LixError> {
-    lifecycle::load_live_state_mode_with_backend(backend).await
+    lifecycle::load_live_state_mode(&SqlLiveStateStore::from_backend(backend)).await
 }
 
-pub(crate) async fn try_claim_bootstrap_with_backend(
-    backend: &dyn LixBackend,
-) -> Result<bool, LixError> {
-    lifecycle::try_claim_live_state_bootstrap_with_backend(backend).await
-}
-
+#[cfg(test)]
 pub(crate) async fn mark_mode_with_backend(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     mode: LiveStateMode,
 ) -> Result<(), LixError> {
-    lifecycle::mark_live_state_mode_with_backend(backend, mode).await
+    lifecycle::mark_live_state_mode(&SqlLiveStateStore::from_backend(backend), mode).await
+}
+
+pub(crate) async fn mark_mode_in_transaction(
+    transaction: LiveStateTransactionRef<'_>,
+    mode: LiveStateMode,
+) -> Result<(), LixError> {
+    lifecycle::mark_live_state_mode_in_transaction(
+        &mut SqlLiveStateStore::from_transaction(transaction),
+        mode,
+    )
+    .await
 }
 
 pub(crate) fn live_row_shape_from_definition(
@@ -446,7 +528,7 @@ pub(crate) fn snapshot_select_expr_for_schema(
 }
 
 pub(crate) async fn load_file_payload_cache_data(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<Vec<u8>, LixError> {
@@ -454,7 +536,7 @@ pub(crate) async fn load_file_payload_cache_data(
 }
 
 pub(crate) async fn upsert_file_payload_cache_data(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     file_id: &str,
     version_id: &str,
     data: &[u8],
@@ -464,45 +546,25 @@ pub(crate) async fn upsert_file_payload_cache_data(
 }
 
 pub(crate) async fn delete_file_payload_cache_data(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<(), LixError> {
     materialize::filesystem::delete_file_payload_cache_data(backend, file_id, version_id).await
 }
 
-pub(crate) async fn rebuild_scope_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    request: &LiveStateRebuildRequest,
-) -> Result<LiveStateApplyReport, LixError> {
-    let plan = materialize::rebuild_plan_with_transaction(transaction, request).await?;
-    let (rows_deleted, tables_touched) =
-        materialize::apply_rebuild_scope_in_transaction(transaction, &plan).await?;
-    Ok(LiveStateApplyReport {
-        run_id: plan.run_id.clone(),
-        rows_written: plan.writes.len(),
-        rows_deleted,
-        tables_touched: tables_touched.into_iter().collect(),
-    })
+pub(crate) async fn rebuild_file_payloads_with_plugins(
+    backend: LiveStateBackendRef<'_>,
+    plugin_materializer: &dyn crate::plugin::FilesystemPluginMaterializer,
+    plan: &LiveStateRebuildPlan,
+) -> Result<(), LixError> {
+    materialize::rebuild_file_payloads_with_plugins(backend, plugin_materializer, plan).await
 }
 
-#[async_trait(?Send)]
-impl crate::live_state::LiveStateTransactionBridge for dyn LixBackendTransaction + '_ {
-    async fn register_live_state_schema(
-        &mut self,
-        registration: &crate::live_state::SchemaRegistration,
-    ) -> Result<(), LixError> {
-        register_schema_in_transaction(self, registration.clone()).await
-    }
-
-    async fn advance_live_state_replay_boundary(
-        &mut self,
-        replay_cursor: &ReplayCursor,
-    ) -> Result<(), LixError> {
-        projection::replay::advance_live_state_projection_replay_boundary_to_cursor_in_transaction(
-            self,
-            replay_cursor,
-        )
-        .await
-    }
+pub(crate) async fn rebuild_scope_in_transaction(
+    transaction: LiveStateTransactionRef<'_>,
+    request: &LiveStateRebuildRequest,
+) -> Result<LiveStateApplyReport, LixError> {
+    let mut store = SqlLiveStateStore::from_transaction(transaction);
+    store.rebuild_scope(request).await
 }

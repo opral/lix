@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_commit, load_commit_member_change, load_exact_row_at_commit, CanonicalChange,
     CanonicalStateIdentity, CanonicalStateRow,
@@ -9,15 +8,21 @@ use crate::functions::FunctionBindings;
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
 use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
+use crate::session::version_ops_read::VersionOpsReadRef;
+use crate::session::version_ops_storage::{
+    insert_undo_redo_operation_in_transaction as persist_undo_redo_operation_in_transaction,
+    load_undo_redo_operation_rows_in_transaction,
+};
 use crate::streams::{StateCommitStreamChange, StateCommitStreamOperation};
-use crate::{LixBackendTransaction, LixError, SessionTransaction, Value};
+use crate::{LixError, SessionTransaction, Value};
 
 use super::super::context::{
     exact_current_head_preconditions, load_version_context_with_executor,
     require_target_version_context_in_transaction, resolve_target_version_in_transaction,
     ResolvedVersionTarget, VersionContextSource,
 };
-use super::{RedoResult, UndoResult, UNDO_REDO_OPERATION_TABLE};
+use super::super::VersionOpsTransactionRef;
+use super::{RedoResult, UndoResult};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UndoRedoOperationKind {
@@ -395,7 +400,7 @@ async fn ensure_version_exists_in_session(
 }
 
 async fn ensure_version_exists_with_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     version_id: &str,
 ) -> Result<(), LixError> {
     let mut executor = crate::backend::transaction_backend_view(transaction);
@@ -407,7 +412,7 @@ async fn ensure_version_exists_with_transaction(
 }
 
 async fn rebuild_semantic_undo_redo_stacks(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     version_id: &str,
 ) -> Result<SemanticUndoRedoStacks, LixError> {
     let mut executor = crate::backend::transaction_backend_view(transaction);
@@ -479,50 +484,29 @@ async fn rebuild_semantic_undo_redo_stacks(
 }
 
 async fn load_undo_redo_operations_for_version_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     version_id: &str,
 ) -> Result<Vec<UndoRedoOperationRecord>, LixError> {
-    let sql = format!(
-        "SELECT version_id, operation_commit_id, operation_kind, target_commit_id, created_at \
-         FROM {table} \
-         WHERE version_id = $1 \
-         ORDER BY created_at ASC, operation_commit_id ASC",
-        table = UNDO_REDO_OPERATION_TABLE,
-    );
-    let result = transaction
-        .execute(&sql, &[Value::Text(version_id.to_string())])
-        .await?;
-
-    result
-        .rows
+    load_undo_redo_operation_rows_in_transaction(transaction, version_id)
+        .await?
         .iter()
         .map(|row| parse_undo_redo_operation_record(row))
         .collect()
 }
 
 async fn insert_undo_redo_operation_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     record: &UndoRedoOperationRecord,
 ) -> Result<(), LixError> {
-    let sql = format!(
-        "INSERT INTO {table} (\
-         version_id, operation_commit_id, operation_kind, target_commit_id, created_at\
-         ) VALUES ($1, $2, $3, $4, $5)",
-        table = UNDO_REDO_OPERATION_TABLE,
-    );
-    transaction
-        .execute(
-            &sql,
-            &[
-                Value::Text(record.version_id.clone()),
-                Value::Text(record.operation_commit_id.clone()),
-                Value::Text(record.operation_kind.as_str().to_string()),
-                Value::Text(record.target_commit_id.clone()),
-                Value::Text(record.created_at.clone()),
-            ],
-        )
-        .await?;
-    Ok(())
+    persist_undo_redo_operation_in_transaction(
+        transaction,
+        &record.version_id,
+        &record.operation_commit_id,
+        record.operation_kind.as_str(),
+        &record.target_commit_id,
+        &record.created_at,
+    )
+    .await
 }
 
 fn parse_undo_redo_operation_record(row: &[Value]) -> Result<UndoRedoOperationRecord, LixError> {
@@ -559,13 +543,10 @@ fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, Lix
     }
 }
 
-async fn load_linear_commit_lineage<E>(
-    executor: &mut E,
+async fn load_linear_commit_lineage(
+    executor: VersionOpsReadRef<'_>,
     head_commit_id: &str,
-) -> Result<Vec<crate::canonical::CanonicalCommit>, LixError>
-where
-    E: QueryExecutor,
-{
+) -> Result<Vec<crate::canonical::CanonicalCommit>, LixError> {
     let mut lineage = Vec::new();
     let mut current_commit_id = Some(head_commit_id.to_string());
     while let Some(commit_id) = current_commit_id.take() {
@@ -590,7 +571,7 @@ where
 }
 
 async fn load_target_commit_change_effects(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     _version_id: &str,
     target_commit_id: &str,
 ) -> Result<Vec<TargetCommitChangeEffect>, LixError> {

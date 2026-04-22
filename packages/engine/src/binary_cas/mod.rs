@@ -4,10 +4,16 @@ mod gc;
 mod init;
 mod read;
 pub(crate) mod schema;
+pub(crate) mod store;
+pub(crate) mod store_sql;
 mod write;
 
+use crate::binary_cas::store::{
+    BinaryCasBackendRef, BinaryCasReadStore, BinaryCasTransactionRef, BinaryCasWriteStore,
+};
+use crate::binary_cas::store_sql::{SqlBinaryCasReadStore, SqlBinaryCasWriteStore};
 use crate::transaction::WriteBatch;
-use crate::{LixBackend, LixBackendTransaction, LixError, SqlDialect};
+use crate::{LixError, SqlDialect};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryBlobWrite<'a> {
@@ -16,28 +22,33 @@ pub(crate) struct BinaryBlobWrite<'a> {
     pub data: &'a [u8],
 }
 
-pub(crate) use init::init;
 pub(crate) use read::BlobDataReader;
 
 pub(crate) async fn load_blob_data_by_hash(
-    backend: &dyn LixBackend,
+    backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    read::load_binary_blob_data_by_hash(backend, blob_hash).await
+    SqlBinaryCasReadStore::new(backend)
+        .load_blob_data_by_hash(blob_hash)
+        .await
 }
 
 pub(crate) async fn blob_exists(
-    backend: &dyn LixBackend,
+    backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<bool, LixError> {
-    read::blob_exists(backend, blob_hash).await
+    SqlBinaryCasReadStore::new(backend)
+        .blob_exists(blob_hash)
+        .await
 }
 
 pub(crate) async fn persist_blob_writes_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
     writes: &[BinaryBlobWrite<'_>],
 ) -> Result<(), LixError> {
-    write::persist_blob_writes_in_transaction(transaction, writes).await
+    SqlBinaryCasWriteStore::new(transaction)
+        .persist_blob_writes(writes)
+        .await
 }
 
 pub(crate) fn append_blob_writes_to_write_batch(
@@ -49,9 +60,11 @@ pub(crate) fn append_blob_writes_to_write_batch(
 }
 
 pub(crate) async fn garbage_collect_unreachable_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
 ) -> Result<(), LixError> {
-    gc::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
+    SqlBinaryCasWriteStore::new(transaction)
+        .garbage_collect_unreachable()
+        .await
 }
 
 pub(crate) fn binary_blob_store_relation_name() -> &'static str {
@@ -70,4 +83,8 @@ pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
         schema::INTERNAL_BINARY_CHUNK_STORE,
         schema::INTERNAL_BINARY_FILE_VERSION_REF,
     ]
+}
+
+pub(crate) async fn init(backend: BinaryCasBackendRef<'_>) -> Result<(), LixError> {
+    store_sql::init_storage(backend).await
 }

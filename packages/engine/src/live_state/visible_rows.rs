@@ -1,5 +1,5 @@
-use crate::backend::QueryExecutor;
-use crate::{LixBackend, LixError, Value};
+use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
+use crate::{LixError, Value};
 
 use super::constraints::ScanConstraint;
 use super::schema_access::LiveRowShape;
@@ -112,7 +112,7 @@ impl From<UntrackedRow> for LiveReadRow {
 }
 
 pub(crate) async fn scan_live_rows(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     storage: LiveStorageLane,
     schema_key: &str,
     version_id: &str,
@@ -134,7 +134,7 @@ pub(crate) async fn scan_live_rows(
 }
 
 async fn scan_live_rows_with_executor_ref(
-    executor: &mut dyn QueryExecutor,
+    executor: LiveStateExecutorRef<'_>,
     storage: LiveStorageLane,
     schema_key: &str,
     version_id: &str,

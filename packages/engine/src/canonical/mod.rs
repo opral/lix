@@ -53,6 +53,19 @@ mod journal;
 pub(crate) mod json;
 mod read;
 mod receipt;
+pub(crate) mod store;
+pub(crate) mod store_sql;
+
+use crate::canonical::store::{
+    CanonicalBackendRef, CanonicalExecutorRef, CanonicalReadStore, CanonicalTransactionRef,
+    CanonicalWriteStore,
+};
+use crate::canonical::store_sql::{
+    resolve_last_checkpoint_commit_id_for_tip, SqlCanonicalExecutorReadStore,
+    SqlCanonicalReadStore, SqlCanonicalWriteStore,
+};
+use crate::functions::LixFunctionProvider;
+use crate::LixError;
 
 pub(crate) use change_commit_sql::build_lazy_change_commit_by_change_id_ctes_sql;
 pub use json::CanonicalJson;
@@ -60,30 +73,24 @@ pub use receipt::{CanonicalCommitReceipt, UpdatedVersionRef};
 
 #[allow(unused_imports)]
 pub(crate) use api::{
-    append_changes, append_untracked_change_visibility_rows, canonical_untracked_visibility_kind,
-    canonical_untracked_visibility_row_id_for_change,
+    canonical_untracked_visibility_kind, canonical_untracked_visibility_row_id_for_change,
     canonical_untracked_visibility_write_from_change_visibility,
     compact_stale_untracked_changes_in_transaction,
-    compact_untracked_changes_for_touched_rows_in_transaction, load_change,
-    load_change_commit_ids_with_executor, load_commit, load_commit_member_change,
-    load_exact_row_at_commit, load_history, load_visible_state,
-    replace_snapshot_content_in_transaction, resolve_merge_base, CanonicalAppendSummary,
-    CanonicalChange, CanonicalChangeWrite, CanonicalCommit, CanonicalContentMode,
-    CanonicalHistoryContentMode, CanonicalHistoryRequest, CanonicalHistoryRootSelection,
-    CanonicalHistoryRow, CanonicalRootCommit, CanonicalStateIdentity, CanonicalStateRow,
-    CanonicalTombstoneMode, CanonicalUntrackedVisibilityKind, CanonicalUntrackedVisibilityWrite,
-    CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
-    CanonicalVisibleStateRow,
+    compact_untracked_changes_for_touched_rows_in_transaction, load_commit_member_change,
+    load_exact_row_at_commit, CanonicalAppendSummary, CanonicalChange, CanonicalChangeWrite,
+    CanonicalCommit, CanonicalContentMode, CanonicalHistoryContentMode, CanonicalHistoryRequest,
+    CanonicalHistoryRootSelection, CanonicalHistoryRow, CanonicalRootCommit,
+    CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode,
+    CanonicalUntrackedVisibilityKind, CanonicalUntrackedVisibilityWrite, CanonicalVisibility,
+    CanonicalVisibleStateFilter, CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
 #[allow(unused_imports)]
 pub(crate) use checkpoint_labels::{
     checkpoint_commit_label_entity_id, checkpoint_commit_label_snapshot, checkpoint_label_snapshot,
-    resolve_last_checkpoint_commit_id_for_tip_with_executor, CheckpointVersionHeadFact,
-    CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY, CHECKPOINT_LABEL_ID, CHECKPOINT_LABEL_NAME,
-    CHECKPOINT_LABEL_SCHEMA_KEY,
+    CheckpointVersionHeadFact, CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY, CHECKPOINT_LABEL_ID,
+    CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
 };
 pub(crate) use graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
-pub(crate) use init::init;
 #[allow(unused_imports)]
 pub(crate) use read::{
     load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
@@ -101,4 +108,88 @@ pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
         ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE,
         TIMELINE_STATUS_TABLE,
     ]
+}
+
+pub(crate) async fn init(backend: CanonicalBackendRef<'_>) -> Result<(), LixError> {
+    store_sql::init_storage(backend).await
+}
+
+pub(crate) async fn append_changes(
+    transaction: CanonicalTransactionRef<'_>,
+    changes: &[CanonicalChangeWrite],
+    functions: &mut dyn LixFunctionProvider,
+) -> Result<CanonicalAppendSummary, LixError> {
+    let mut store = SqlCanonicalWriteStore::new(transaction);
+    store.append_changes(changes, functions).await
+}
+
+pub(crate) async fn append_untracked_change_visibility_rows(
+    transaction: CanonicalTransactionRef<'_>,
+    visibility_rows: &[CanonicalUntrackedVisibilityWrite],
+) -> Result<(), LixError> {
+    let mut store = SqlCanonicalWriteStore::new(transaction);
+    store
+        .append_untracked_change_visibility_rows(visibility_rows)
+        .await
+}
+
+pub(crate) async fn replace_snapshot_content_in_transaction(
+    transaction: CanonicalTransactionRef<'_>,
+    snapshot_id: &str,
+    snapshot_content: &str,
+) -> Result<(), LixError> {
+    let mut store = SqlCanonicalWriteStore::new(transaction);
+    store
+        .replace_snapshot_content(snapshot_id, snapshot_content)
+        .await
+}
+
+pub(crate) async fn load_commit(
+    executor: CanonicalExecutorRef<'_>,
+    commit_id: &str,
+) -> Result<Option<CanonicalCommit>, LixError> {
+    let mut store = SqlCanonicalExecutorReadStore::new(executor);
+    store.load_commit(commit_id).await
+}
+
+pub(crate) async fn load_change(
+    executor: CanonicalExecutorRef<'_>,
+    change_id: &str,
+) -> Result<Option<CanonicalChange>, LixError> {
+    let mut store = SqlCanonicalExecutorReadStore::new(executor);
+    store.load_change(change_id).await
+}
+
+pub(crate) async fn load_history(
+    backend: CanonicalBackendRef<'_>,
+    request: &CanonicalHistoryRequest,
+) -> Result<Vec<CanonicalHistoryRow>, LixError> {
+    let mut store = SqlCanonicalReadStore::new(backend);
+    store.load_history(request).await
+}
+
+pub(crate) async fn load_visible_state(
+    executor: CanonicalExecutorRef<'_>,
+    request: &CanonicalVisibleStateRequest,
+) -> Result<Vec<CanonicalVisibleStateRow>, LixError> {
+    let mut store = SqlCanonicalExecutorReadStore::new(executor);
+    store.load_visible_state(request).await
+}
+
+pub(crate) async fn resolve_merge_base(
+    executor: CanonicalExecutorRef<'_>,
+    left_head_commit_id: &str,
+    right_head_commit_id: &str,
+) -> Result<Option<String>, LixError> {
+    let mut store = SqlCanonicalExecutorReadStore::new(executor);
+    store
+        .resolve_merge_base(left_head_commit_id, right_head_commit_id)
+        .await
+}
+
+pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip_with_executor(
+    executor: CanonicalExecutorRef<'_>,
+    head_commit_id: &str,
+) -> Result<Option<String>, LixError> {
+    resolve_last_checkpoint_commit_id_for_tip(executor, head_commit_id).await
 }

@@ -1,10 +1,11 @@
 use crate::binary_cas::BlobDataReader;
 use crate::catalog::{load_file_row_by_id, FilesystemProjectionScope};
+use crate::live_state::store::LiveStateBackendRef;
 use crate::live_state::{LiveStateRebuildPlan, LiveStateWrite, LiveStateWriteOp};
 use crate::plugin::{
     select_best_glob_match, FilesystemPluginMaterializer, InstalledPlugin, PluginContentType,
 };
-use crate::{LixBackend, LixError};
+use crate::LixError;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -50,7 +51,7 @@ struct BuiltinBinaryBlobRefSnapshot {
 }
 
 pub(crate) async fn rebuild_file_payloads_with_plugins(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     plugin_materializer: &dyn FilesystemPluginMaterializer,
     plan: &LiveStateRebuildPlan,
 ) -> Result<(), LixError> {
@@ -286,7 +287,7 @@ fn builtin_binary_blob_ref_from_changes(
 }
 
 async fn load_file_descriptors(
-    backend: &dyn LixBackend,
+    backend: LiveStateBackendRef<'_>,
     targets: &BTreeSet<(String, String)>,
 ) -> Result<BTreeMap<(String, String), FileDescriptorRow>, LixError> {
     let mut descriptors = BTreeMap::new();

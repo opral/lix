@@ -2,9 +2,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value as JsonValue;
 
-use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::canonical::journal::CanonicalCommitOutput;
-use crate::canonical::read::CommitQueryExecutor;
+use crate::canonical::store::{
+    CanonicalCommitQueryExecutor, CanonicalPreparedBatch, CanonicalPreparedStatement,
+};
+use crate::canonical::store_sql::execute_query_with_executor;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 
@@ -17,7 +19,7 @@ pub(crate) struct CommitGraphNodeWriteRow {
 }
 
 pub(crate) async fn resolve_commit_graph_node_write_rows_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     canonical_output: &CanonicalCommitOutput,
 ) -> Result<Vec<CommitGraphNodeWriteRow>, LixError> {
     let parent_map = collect_commit_parent_map(canonical_output)?;
@@ -64,12 +66,12 @@ pub(crate) async fn resolve_commit_graph_node_write_rows_with_executor(
 pub(crate) fn build_commit_graph_node_prepared_batch(
     rows: &[CommitGraphNodeWriteRow],
     dialect: SqlDialect,
-) -> Result<PreparedBatch, LixError> {
-    let mut batch = PreparedBatch { steps: Vec::new() };
+) -> Result<CanonicalPreparedBatch, LixError> {
+    let mut batch = CanonicalPreparedBatch { steps: Vec::new() };
     for row in rows {
         let p1 = dialect.placeholder(1);
         let p2 = dialect.placeholder(2);
-        batch.push_statement(PreparedStatement {
+        batch.push_statement(CanonicalPreparedStatement {
             sql: format!(
                 "INSERT INTO lix_internal_commit_graph_node (commit_id, generation) \
                  VALUES ({p1}, {p2}) \
@@ -127,7 +129,7 @@ fn parse_commit_snapshot_parent_ids(raw: &str) -> Result<BTreeSet<String>, LixEr
 }
 
 async fn load_commit_graph_generation_with_executor(
-    executor: &mut dyn CommitQueryExecutor,
+    executor: &mut CanonicalCommitQueryExecutor<'_>,
     commit_id: &str,
 ) -> Result<Option<i64>, LixError> {
     let dialect = executor.dialect();
@@ -137,7 +139,7 @@ async fn load_commit_graph_generation_with_executor(
         table = COMMIT_GRAPH_NODE_TABLE
     );
     let params = vec![EngineValue::Text(commit_id.to_string())];
-    let result = executor.execute(&sql, &params).await?;
+    let result = execute_query_with_executor(executor, &sql, &params).await?;
     let Some(row) = result.rows.first() else {
         return Ok(None);
     };

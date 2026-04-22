@@ -1,8 +1,8 @@
-use crate::backend::{LixBackend, QueryExecutor};
 use crate::session::version_ops::commit::{
     CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitPreconditions,
     CreateCommitWriteLane,
 };
+use crate::session::version_ops_read::VersionOpsReadRef;
 use crate::session::workspace::require_workspace_active_version_id;
 use crate::transaction::PendingOverlay;
 use crate::{LixError, SessionTransaction};
@@ -12,6 +12,7 @@ use super::descriptors::{
     load_version_descriptor_with_pending_overlay, version_exists_with_backend,
     version_exists_with_executor,
 };
+use super::VersionOpsBackendRef;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VersionContextSource {
@@ -82,7 +83,7 @@ pub(crate) fn normalize_optional_version_id(
 }
 
 pub(crate) async fn ensure_version_exists_with_backend(
-    backend: &dyn LixBackend,
+    backend: VersionOpsBackendRef<'_>,
     version_id: &str,
 ) -> Result<(), LixError> {
     if !version_exists_with_backend(backend, version_id).await? {
@@ -95,7 +96,7 @@ pub(crate) async fn ensure_version_exists_with_backend(
 }
 
 pub(crate) async fn ensure_version_exists_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     version_id: &str,
 ) -> Result<(), LixError> {
     if !version_exists_with_executor(executor, version_id).await? {
@@ -125,7 +126,7 @@ pub(crate) async fn resolve_target_version_in_transaction(
 }
 
 pub(crate) async fn resolve_target_version_with_backend(
-    backend: &dyn LixBackend,
+    backend: VersionOpsBackendRef<'_>,
     requested_version_id: Option<&str>,
     field_name: &str,
 ) -> Result<ResolvedVersionTarget, LixError> {
@@ -142,14 +143,14 @@ pub(crate) async fn resolve_target_version_with_backend(
 }
 
 pub(crate) async fn load_version_context_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     target: ResolvedVersionTarget,
 ) -> Result<Option<VersionContext>, LixError> {
     load_version_context_with_pending_overlay(executor, None, target).await
 }
 
 async fn load_version_context_with_pending_overlay(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     pending_overlay: Option<&dyn PendingOverlay>,
     target: ResolvedVersionTarget,
 ) -> Result<Option<VersionContext>, LixError> {
@@ -173,7 +174,7 @@ async fn load_version_context_with_pending_overlay(
 }
 
 pub(crate) async fn require_version_context_with_executor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     target: ResolvedVersionTarget,
     subject: &str,
 ) -> Result<VersionContext, LixError> {
@@ -181,7 +182,7 @@ pub(crate) async fn require_version_context_with_executor(
 }
 
 async fn require_version_context_with_pending_overlay(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     pending_overlay: Option<&dyn PendingOverlay>,
     target: ResolvedVersionTarget,
     subject: &str,
@@ -239,7 +240,7 @@ pub(crate) async fn require_target_version_context_in_transaction(
 
 #[allow(dead_code)]
 pub(crate) async fn require_target_version_context_with_backend(
-    backend: &dyn LixBackend,
+    backend: VersionOpsBackendRef<'_>,
     requested_version_id: Option<&str>,
     field_name: &str,
     subject: &str,
@@ -252,7 +253,7 @@ pub(crate) async fn require_target_version_context_with_backend(
 
 #[allow(dead_code)]
 pub(crate) async fn load_target_version_context_with_backend(
-    backend: &dyn LixBackend,
+    backend: VersionOpsBackendRef<'_>,
     requested_version_id: Option<&str>,
     field_name: &str,
 ) -> Result<Option<VersionContext>, LixError> {

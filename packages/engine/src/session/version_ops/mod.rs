@@ -5,6 +5,7 @@ pub(crate) mod context;
 mod create;
 pub(crate) mod descriptors;
 mod merge;
+mod store;
 pub(crate) mod undo_redo;
 
 pub(crate) use bootstrap::init;
@@ -17,4 +18,5 @@ pub(crate) use create::create_version_in_session;
 pub use create::{CreateVersionOptions, CreateVersionResult};
 pub(crate) use merge::merge_version_in_session;
 pub use merge::{ExpectedVersionHeads, MergeOutcome, MergeVersionOptions, MergeVersionResult};
+pub(crate) use store::{VersionOpsBackendRef, VersionOpsTransactionRef};
 pub use undo_redo::{RedoOptions, RedoResult, UndoOptions, UndoResult};

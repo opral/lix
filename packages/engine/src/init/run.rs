@@ -4,12 +4,7 @@ use crate::backend::TransactionBeginMode;
 use crate::binary_cas;
 use crate::canonical;
 use crate::live_state;
-use crate::live_state::{
-    load_latest_live_state_replay_cursor_with_backend, load_mode_with_backend,
-    mark_live_state_projection_ready_with_backend, mark_mode_with_backend,
-    rebuild_scope_in_transaction, try_claim_bootstrap_with_backend, LiveStateMode,
-    LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
-};
+use crate::live_state::{load_mode_with_backend, LiveStateMode};
 use crate::session;
 use crate::{Lix, LixBackend, LixError, SqlDialect};
 
@@ -40,7 +35,6 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
         .backend()
         .begin_transaction(TransactionBeginMode::Write)
         .await?;
-    let mut claimed_bootstrap = false;
     let init_result = async {
         {
             let backend = crate::backend::transaction_backend_view(transaction.as_mut());
@@ -63,14 +57,6 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
                 .await
                 .map_err(|error| init_step_error("session::init", error))?;
         }
-        {
-            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
-            if !try_claim_bootstrap_with_backend(&backend).await? {
-                return Err(crate::common::already_initialized_error());
-            }
-        }
-        claimed_bootstrap = true;
-
         let mut init = InitExecutor::new(lix, transaction.as_mut())
             .map_err(|error| init_step_error("init_executor", error))?;
         init.seed_builtin_registered_schemas()
@@ -110,34 +96,9 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
             .await
             .map_err(|error| init_step_error("persist_runtime_state", error))?;
         drop(init);
-        {
-            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
-            mark_mode_with_backend(&backend, LiveStateMode::Rebuilding)
-                .await
-                .map_err(|error| init_step_error("mark_live_state_rebuilding", error))?;
-        }
-        rebuild_scope_in_transaction(
-            transaction.as_mut(),
-            &LiveStateRebuildRequest {
-                scope: LiveStateRebuildScope::Full,
-                debug: LiveStateRebuildDebugMode::Off,
-                debug_row_limit: 0,
-            },
-        )
-        .await
-        .map_err(|error| init_step_error("live_state::rebuild_scope_in_transaction", error))?;
-        {
-            let backend = crate::backend::transaction_backend_view(transaction.as_mut());
-            let cursor = load_latest_live_state_replay_cursor_with_backend(&backend)
-                .await?
-                .ok_or_else(|| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        "initialize expected replay cursor after bootstrap seeding",
-                    )
-                })?;
-            mark_live_state_projection_ready_with_backend(&backend, &cursor).await
-        }
+        live_state::initialize_in_transaction(transaction.as_mut())
+            .await
+            .map_err(|error| init_step_error("live_state::initialize_in_transaction", error))
     }
     .await;
 

@@ -1,162 +1,22 @@
-use crate::backend::QueryExecutor;
-use crate::common::is_missing_relation_error;
+use crate::live_state::store::LiveStateFrontierReadStore;
 use crate::version::CommittedVersionFrontier;
-use crate::version::{
-    version_ref_schema_key, version_ref_schema_version, version_ref_storage_version_id,
-};
-use crate::{LixBackend, LixError, NullableKeyFilter, Value};
+use crate::LixError;
 
-use super::naming::tracked_relation_name;
-use super::untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
-use super::ExactUntrackedRowRequest;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct VersionHeadRef {
-    version_id: String,
-    commit_id: String,
-}
-
-pub(crate) async fn load_version_head_commit_id_with_executor(
-    executor: &mut dyn QueryExecutor,
+pub(crate) async fn load_version_head_commit_id(
+    store: &mut impl LiveStateFrontierReadStore,
     version_id: &str,
 ) -> Result<Option<String>, LixError> {
-    let Some(row) = load_exact_untracked_row_with_executor(
-        executor,
-        &ExactUntrackedRowRequest {
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: version_ref_storage_version_id().to_string(),
-            entity_id: version_id.to_string(),
-            file_id: NullableKeyFilter::Null,
-        },
-    )
-    .await?
-    else {
-        return Ok(None);
-    };
-
-    let Some(commit_id) = row
-        .property_text("commit_id")
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("local version head for '{version_id}' has empty commit_id"),
-        ));
-    };
-
-    Ok(Some(commit_id))
+    store.load_version_head_commit_id(version_id).await
 }
 
-pub(crate) async fn load_version_head_commit_map_with_executor(
-    executor: &mut dyn QueryExecutor,
+pub(crate) async fn load_version_head_commit_map(
+    store: &mut impl LiveStateFrontierReadStore,
 ) -> Result<Option<std::collections::BTreeMap<String, String>>, LixError> {
-    Ok(load_all_version_head_refs_with_executor(executor)
-        .await?
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| (row.version_id, row.commit_id))
-                .collect()
-        }))
+    store.load_version_head_commit_map().await
 }
 
-pub(crate) async fn load_current_committed_version_frontier_with_backend(
-    backend: &dyn LixBackend,
+pub(crate) async fn load_current_committed_version_frontier(
+    store: &mut impl LiveStateFrontierReadStore,
 ) -> Result<CommittedVersionFrontier, LixError> {
-    let mut executor = backend;
-    load_current_committed_version_frontier_with_executor(&mut executor).await
-}
-
-pub(crate) async fn load_current_committed_version_frontier_with_executor(
-    executor: &mut dyn QueryExecutor,
-) -> Result<CommittedVersionFrontier, LixError> {
-    Ok(CommittedVersionFrontier {
-        version_heads: load_all_version_head_refs_with_executor(executor)
-            .await?
-            .unwrap_or_default()
-            .into_iter()
-            .map(|row| (row.version_id, row.commit_id))
-            .collect(),
-    })
-}
-
-async fn load_all_version_head_refs_with_executor(
-    executor: &mut dyn QueryExecutor,
-) -> Result<Option<Vec<VersionHeadRef>>, LixError> {
-    let result = match executor
-        .execute(
-            &format!(
-                "SELECT entity_id, commit_id \
-                 FROM {table} \
-                 WHERE schema_key = $1 \
-                   AND schema_version = $2 \
-                   AND file_id IS NULL \
-                   AND version_id = $3 \
-                   AND plugin_key IS NULL \
-                   AND untracked = true \
-                   AND is_tombstone = 0 \
-                   AND commit_id IS NOT NULL \
-                   AND commit_id <> '' \
-                 ORDER BY entity_id ASC, updated_at DESC",
-                table = tracked_relation_name(version_ref_schema_key()),
-            ),
-            &[
-                Value::Text(version_ref_schema_key().to_string()),
-                Value::Text(version_ref_schema_version().to_string()),
-                Value::Text(version_ref_storage_version_id().to_string()),
-            ],
-        )
-        .await
-    {
-        Ok(result) => result,
-        Err(error) if is_missing_relation_error(&error) => return Ok(None),
-        Err(error) => return Err(error),
-    };
-
-    let mut rows = Vec::with_capacity(result.rows.len());
-    let mut previous_version_id: Option<String> = None;
-    for row in &result.rows {
-        let parsed = parse_version_head_ref_row(row)?;
-        if matches!(previous_version_id.as_ref(), Some(previous) if previous == &parsed.version_id)
-        {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "local version-head resolution for version '{}' found multiple exact rows",
-                    parsed.version_id
-                ),
-            ));
-        }
-        previous_version_id = Some(parsed.version_id.clone());
-        rows.push(parsed);
-    }
-    Ok(Some(rows))
-}
-
-fn parse_version_head_ref_row(row: &[Value]) -> Result<VersionHeadRef, LixError> {
-    let version_id = required_text_cell(row, 0, "entity_id")?;
-    let commit_id = required_text_cell(row, 1, "commit_id")?;
-    if commit_id.is_empty() {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!(
-                "local version head for '{}' has empty commit_id",
-                version_id
-            ),
-        ));
-    }
-    Ok(VersionHeadRef {
-        version_id,
-        commit_id,
-    })
-}
-
-fn required_text_cell(row: &[Value], index: usize, column_name: &str) -> Result<String, LixError> {
-    match row.get(index) {
-        Some(Value::Text(value)) => Ok(value.clone()),
-        Some(Value::Integer(value)) => Ok(value.to_string()),
-        Some(_) | None => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("local version-ref row is missing text column '{column_name}'"),
-        )),
-    }
+    store.load_current_committed_version_frontier().await
 }
