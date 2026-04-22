@@ -106,7 +106,12 @@ pub(crate) enum SurfaceColumnType {
     Integer,
     Number,
     Boolean,
+    // `Json` is the schema-derived type for values that remain in the JSON domain,
+    // including fields whose JSON Schema permits multiple JSON kinds. A field does
+    // not become `Variant` merely because rows may contain different JSON values.
     Json,
+    // `Variant` is an engine-owned opt-in polymorphic type. It is reserved for
+    // explicitly modeled engine-native payloads rather than JSON Schema inference.
     Variant,
 }
 

@@ -591,6 +591,9 @@ fn variant_column_type_for_reference(
     artifact: &PreparedSql2ReadArtifact,
     scope: &BTreeMap<String, String>,
 ) -> Option<SurfaceColumnType> {
+    // Only explicit owner-chosen Variant columns should reach this path.
+    // Schema-derived mixed JSON kinds must stay Json and therefore must not
+    // participate in variant detection or binary-output behavior.
     if let Some(qualifier) = qualifier {
         let relation_name = scope.get(qualifier)?;
         let plan = artifact.entity_views.get(relation_name)?;
@@ -4966,9 +4969,11 @@ mod tests {
     use super::{
         build_session_for_read_with_borrowed_backend, build_session_for_read_with_shared_backend,
         execute_read_with_backend, execute_read_with_shared_backend, parse_directory_route_filter,
-        parse_file_route_filter, parse_route_filter, LixStateHistoryProvider,
-        PreparedSql2ReadArtifact, RouteBooleanField, RoutePredicate, RouteStringField,
+        parse_file_route_filter, parse_route_filter, validate_variant_text_coercions,
+        LixStateHistoryProvider, PreparedSql2ReadArtifact, RouteBooleanField, RoutePredicate,
+        RouteStringField,
     };
+    use crate::catalog::SurfaceColumnType;
     use crate::live_state::{
         open_state_by_version_snapshot_with_shared_backend, StateByVersionScanRequest,
         StateSurfaceColumn, StateSurfaceFilter,
@@ -5104,6 +5109,25 @@ mod tests {
             .expect("test thread should spawn")
             .join()
             .expect("test thread should join");
+    }
+
+    fn force_entity_view_column_to_variant(
+        artifact: &mut PreparedSql2ReadArtifact,
+        surface_name: &str,
+        column_name: &str,
+    ) {
+        let plan = artifact
+            .entity_views
+            .get_mut(surface_name)
+            .expect("surface should have an entity-view plan");
+        *plan
+            .column_types
+            .get_mut(column_name)
+            .expect("surface should expose the requested column type") = SurfaceColumnType::Variant;
+        plan.column_plans
+            .get_mut(column_name)
+            .expect("surface should expose the requested column plan")
+            .column_type = SurfaceColumnType::Variant;
     }
 
     #[test]
@@ -5953,7 +5977,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_read_with_shared_backend_returns_variant_payload_columns_as_json_values() {
+    fn execute_read_with_shared_backend_returns_json_payload_columns_as_json_values() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, session) = setup_sql2_state_fixture()
@@ -5980,18 +6004,15 @@ mod tests {
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
-                    .expect("sql2 shared-backend variant read should execute");
+                    .expect("sql2 shared-backend JSON read should execute");
                 assert_eq!(result.columns, vec!["value"]);
-                assert_eq!(
-                    result.rows,
-                    vec![vec![Value::Json(serde_json::json!("value-a"))]]
-                );
+                assert_eq!(result.rows, vec![vec![Value::Text("\"value-a\"".to_string())]]);
             })
         });
     }
 
     #[test]
-    fn execute_read_with_shared_backend_preserves_variant_results_through_aliases() {
+    fn execute_read_with_shared_backend_preserves_json_results_through_aliases() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, session) = setup_sql2_state_fixture()
@@ -6019,18 +6040,64 @@ mod tests {
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
-                    .expect("sql2 shared-backend aliased variant read should execute");
+                    .expect("sql2 shared-backend aliased JSON read should execute");
                 assert_eq!(result.columns, vec!["payload"]);
-                assert_eq!(
-                    result.rows,
-                    vec![vec![Value::Json(serde_json::json!("value-a"))]]
-                );
+                assert_eq!(result.rows, vec![vec![Value::Text("\"value-a\"".to_string())]]);
             })
         });
     }
 
     #[test]
-    fn execute_read_with_shared_backend_requires_explicit_cast_for_variant_text_comparison() {
+    fn mixed_json_kind_entity_views_do_not_trigger_variant_text_validation() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                session
+                    .register_schema(&json!({
+                        "x-lix-key": "json_union_schema",
+                        "x-lix-version": "1",
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "anyOf": [
+                                    { "type": "string" },
+                                    { "type": "object" }
+                                ]
+                            }
+                        },
+                        "additionalProperties": false
+                    }))
+                    .await
+                    .expect("schema registration should succeed");
+
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT value FROM json_union_schema WHERE value = 'hello'".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["json_union_schema".to_string()],
+                    entity_views: prepared_entity_view_plans_for_registry(
+                        &registry,
+                        &["json_union_schema".to_string()],
+                    ),
+                };
+
+                validate_variant_text_coercions(&artifact.sql, &artifact)
+                    .expect("schema-derived JSON unions should not be treated as variant text");
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("schema-derived JSON query should execute");
+                assert_eq!(result.columns, vec!["value"]);
+                assert!(result.rows.is_empty());
+            })
+        });
+    }
+
+    #[test]
+    fn explicit_variant_columns_require_explicit_cast_for_text_comparison() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, session) = setup_sql2_state_fixture()
@@ -6044,7 +6111,7 @@ mod tests {
                     .await
                     .expect("seed insert should succeed");
                 let registry = session.public_surface_registry();
-                let artifact = PreparedSql2ReadArtifact {
+                let mut artifact = PreparedSql2ReadArtifact {
                     sql: "SELECT key FROM lix_key_value WHERE value = 'value-a'".to_string(),
                     bound_parameters: vec![],
                     active_version_id: "version-a".to_string(),
@@ -6054,19 +6121,20 @@ mod tests {
                         &["lix_key_value".to_string()],
                     ),
                 };
+                force_entity_view_column_to_variant(&mut artifact, "lix_key_value", "value");
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await;
                 assert!(
                     result.is_err(),
-                    "variant text comparison should require an explicit cast or extraction"
+                    "explicit variant text comparison should require an explicit cast or extraction"
                 );
             })
         });
     }
 
     #[test]
-    fn execute_read_with_shared_backend_allows_explicit_text_decode_of_variant_payloads() {
+    fn explicit_variant_columns_allow_explicit_text_decode() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, session) = setup_sql2_state_fixture()
@@ -6080,7 +6148,7 @@ mod tests {
                     .await
                     .expect("seed insert should succeed");
                 let registry = session.public_surface_registry();
-                let artifact = PreparedSql2ReadArtifact {
+                let mut artifact = PreparedSql2ReadArtifact {
                     sql: "SELECT lix_text_decode(value) AS payload_text \
                           FROM lix_key_value \
                          WHERE key = 'variant-decode'"
@@ -6093,10 +6161,11 @@ mod tests {
                         &["lix_key_value".to_string()],
                     ),
                 };
+                force_entity_view_column_to_variant(&mut artifact, "lix_key_value", "value");
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
-                    .expect("explicit text decode over variant should execute");
+                    .expect("explicit text decode over explicit variant should execute");
                 assert_eq!(result.columns, vec!["payload_text"]);
                 assert_eq!(
                     result.rows,
@@ -6107,7 +6176,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_read_with_shared_backend_allows_explicit_json_extract_over_variant_payloads() {
+    fn explicit_variant_columns_allow_explicit_json_extract() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, session) = setup_sql2_state_fixture()
@@ -6122,7 +6191,7 @@ mod tests {
                     .await
                     .expect("seed insert should succeed");
                 let registry = session.public_surface_registry();
-                let artifact = PreparedSql2ReadArtifact {
+                let mut artifact = PreparedSql2ReadArtifact {
                     sql: "SELECT lix_json_extract(value, 'text') AS payload_text \
                           FROM lix_key_value \
                          WHERE key = 'variant-object'"
@@ -6135,10 +6204,11 @@ mod tests {
                         &["lix_key_value".to_string()],
                     ),
                 };
+                force_entity_view_column_to_variant(&mut artifact, "lix_key_value", "value");
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
-                    .expect("explicit json extract over variant should execute");
+                    .expect("explicit json extract over explicit variant should execute");
                 assert_eq!(result.columns, vec!["payload_text"]);
                 assert_eq!(result.rows, vec![vec![Value::Text("hello".to_string())]]);
             })
@@ -6146,7 +6216,7 @@ mod tests {
     }
 
     #[test]
-    fn execute_read_with_shared_backend_preserves_variant_json_null_values() {
+    fn execute_read_with_shared_backend_preserves_json_null_values() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
                 let (backend, session) = setup_sql2_state_fixture()
@@ -6177,9 +6247,9 @@ mod tests {
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
-                    .expect("sql2 shared-backend variant null read should execute");
+                    .expect("sql2 shared-backend JSON null read should execute");
                 assert_eq!(result.columns, vec!["value"]);
-                assert_eq!(result.rows, vec![vec![Value::Json(serde_json::Value::Null)]]);
+                assert_eq!(result.rows, vec![vec![Value::Null]]);
             })
         });
     }
