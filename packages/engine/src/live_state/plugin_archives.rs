@@ -1,8 +1,5 @@
-use crate::binary_cas::binary_file_version_ref_relation_name;
 use crate::live_state::store::LiveStateBackendRef;
 use crate::{LixError, Value};
-
-use super::FILE_PATH_CACHE_TABLE;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PluginArchiveRef {
@@ -15,26 +12,8 @@ pub(crate) struct PluginArchiveRef {
 pub(crate) async fn list_installed_plugin_archive_refs(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<Vec<PluginArchiveRef>, LixError> {
-    let rows = crate::live_state::store_sql::execute_query_with_backend(
-        backend,
-        &format!(
-            "SELECT binary_ref.file_id, binary_ref.version_id, path_cache.path, binary_ref.blob_hash \
-             FROM {binary_file_version_ref} AS binary_ref \
-             INNER JOIN {file_path_cache} AS path_cache \
-                 ON path_cache.file_id = binary_ref.file_id \
-                AND path_cache.version_id = binary_ref.version_id \
-             WHERE binary_ref.version_id = 'global' \
-               AND path_cache.path LIKE '/.lix/plugins/%.lixplugin' \
-               AND path_cache.path NOT LIKE '/.lix/plugins/%/%' \
-             ORDER BY path_cache.path",
-            binary_file_version_ref = binary_file_version_ref_relation_name(),
-            file_path_cache = FILE_PATH_CACHE_TABLE,
-        ),
-        &[],
-    )
-    .await?;
-
-    rows.rows
+    crate::live_state::storage::load_plugin_archive_ref_rows(backend)
+        .await?
         .into_iter()
         .map(|row| plugin_archive_ref_from_row(&row))
         .collect()

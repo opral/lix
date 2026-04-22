@@ -10,7 +10,7 @@ use std::time::Instant;
 use serde_json::Value as JsonValue;
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 
-use crate::backend::PreparedBatch;
+use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::catalog::CatalogProjectionRegistry;
 use crate::catalog::SurfaceRegistry;
 use crate::functions::{
@@ -503,7 +503,14 @@ async fn load_update_validation_input(
     }
 
     let bound = bind_sql(&sql, params, backend.dialect())?;
-    let result = backend.execute(&bound.sql, &bound.params).await?;
+    let result = crate::execution::execute_single_prepared_statement_with_backend(
+        backend,
+        PreparedStatement {
+            sql: bound.sql,
+            params: bound.params,
+        },
+    )
+    .await?;
     let rows = result
         .rows
         .into_iter()

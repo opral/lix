@@ -8,6 +8,7 @@ mod live_state_write_state;
 mod planned_write;
 mod public_apply;
 mod registered_schema_mirror;
+pub(crate) mod storage;
 #[cfg(test)]
 mod write_plan;
 #[cfg(test)]
@@ -28,7 +29,7 @@ pub(crate) use planned_write::{
     PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PlannedDirectWriteUnit,
     PublicWriteTxnUnit, TransactionWriteDelta, TransactionWriteUnit,
 };
-pub(crate) use registered_schema_mirror::{
+pub(crate) use storage::{
     upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,
 };
 #[cfg(test)]

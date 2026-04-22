@@ -6,7 +6,7 @@ use crate::canonical;
 use crate::live_state;
 use crate::live_state::{load_mode_with_backend, LiveStateMode};
 use crate::session;
-use crate::{Lix, LixBackend, LixError, SqlDialect};
+use crate::{Lix, LixError};
 
 use super::filesystem;
 use super::seed::InitExecutor;
@@ -38,7 +38,7 @@ pub(crate) async fn init(lix: &Lix) -> Result<(), LixError> {
     let init_result = async {
         {
             let backend = crate::backend::transaction_backend_view(transaction.as_mut());
-            prepare_backend_for_init(&backend)
+            crate::init::storage::prepare_backend_for_init(&backend)
                 .await
                 .map_err(|error| init_step_error("prepare_backend_for_init", error))?;
             live_state::init(&backend)
@@ -216,13 +216,6 @@ fn is_init_locked_error(description: &str) -> bool {
     normalized.contains("database is locked")
         || normalized.contains("database schema is locked")
         || normalized.contains("database table is locked")
-}
-
-async fn prepare_backend_for_init(backend: &dyn LixBackend) -> Result<(), LixError> {
-    if backend.dialect() == SqlDialect::Sqlite {
-        backend.execute("PRAGMA foreign_keys = ON", &[]).await?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]

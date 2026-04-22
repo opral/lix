@@ -3,10 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde_json::Value as JsonValue;
 
 use crate::canonical::journal::CanonicalCommitOutput;
+use crate::canonical::storage::load_commit_graph_generation;
 use crate::canonical::store::{
     CanonicalCommitQueryExecutor, CanonicalPreparedBatch, CanonicalPreparedStatement,
 };
-use crate::canonical::store_sql::execute_query_with_executor;
 use crate::Value as EngineValue;
 use crate::{LixError, SqlDialect};
 
@@ -132,29 +132,7 @@ async fn load_commit_graph_generation_with_executor(
     executor: &mut CanonicalCommitQueryExecutor<'_>,
     commit_id: &str,
 ) -> Result<Option<i64>, LixError> {
-    let dialect = executor.dialect();
-    let p1 = dialect.placeholder(1);
-    let sql = format!(
-        "SELECT generation FROM {table} WHERE commit_id = {p1}",
-        table = COMMIT_GRAPH_NODE_TABLE
-    );
-    let params = vec![EngineValue::Text(commit_id.to_string())];
-    let result = execute_query_with_executor(executor, &sql, &params).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    let Some(value) = row.first() else {
-        return Ok(None);
-    };
-    match value {
-        EngineValue::Integer(value) => Ok(Some(*value)),
-        EngineValue::Null => Ok(None),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "commit graph generation must be integer".to_string(),
-            hint: None,
-        }),
-    }
+    load_commit_graph_generation(executor, commit_id).await
 }
 
 fn resolve_commit_generation(

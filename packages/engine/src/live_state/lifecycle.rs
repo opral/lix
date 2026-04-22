@@ -596,7 +596,7 @@ mod tests {
         append_untracked_change_visibility_rows, CanonicalUntrackedVisibilityKind,
         CanonicalUntrackedVisibilityWrite,
     };
-    use crate::live_state::store_sql::SqlLiveStateStore;
+    use crate::live_state::storage::SqlLiveStateStore;
     use crate::streams::{
         load_durable_state_commit_consumer_cursors, load_durable_state_commit_low_watermark,
         upsert_durable_state_commit_consumer_cursor_in_transaction, DurableStateCommitCursor,
@@ -668,13 +668,9 @@ mod tests {
     }
 
     async fn delete_status_row(backend: &TestSqliteBackend) {
-        crate::live_state::store_sql::execute_query_with_backend(
-            backend,
-            "DELETE FROM lix_internal_live_state_status WHERE singleton_id = 1",
-            &[],
-        )
-        .await
-        .expect("status row should delete");
+        crate::live_state::storage::delete_live_state_status_row_for_tests(backend)
+            .await
+            .expect("status row should delete");
     }
 
     fn frontier_json(entries: &[(&str, &str)]) -> String {

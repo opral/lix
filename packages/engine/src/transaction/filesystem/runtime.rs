@@ -1,6 +1,5 @@
 use crate::catalog::{
-    load_file_row_by_id_without_path, resolve_file_id_by_path_in_version,
-    state_by_version_relation_name, FilesystemProjectionScope,
+    load_file_row_by_id_without_path, resolve_file_id_by_path_in_version, FilesystemProjectionScope,
 };
 use crate::common::stable_content_fingerprint_hex;
 use crate::sql::MutationRow;
@@ -9,7 +8,7 @@ use crate::transaction::overlay::{PendingFilesystemDescriptorView, PendingFilesy
 use crate::transaction::FilesystemPayloadChange;
 use crate::transaction::TransactionExecutionBackend;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixBackendTransaction, LixError, Value};
+use crate::{LixBackendTransaction, LixError};
 use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const FILESYSTEM_FILE_SCHEMA_KEY: &str = "lix_file_descriptor";
@@ -490,51 +489,11 @@ pub(crate) async fn persist_filesystem_payload_changes_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     changes: &[FilesystemPayloadChange],
 ) -> Result<(), LixError> {
-    let tracked = changes
-        .iter()
-        .filter(|change| !change.untracked)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !tracked.is_empty() {
-        persist_filesystem_payload_changes_with_untracked_in_transaction(
-            transaction,
-            &tracked,
-            false,
-        )
-        .await?;
-    }
-
-    let untracked = changes
-        .iter()
-        .filter(|change| change.untracked)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !untracked.is_empty() {
-        persist_filesystem_payload_changes_with_untracked_in_transaction(
-            transaction,
-            &untracked,
-            true,
-        )
-        .await?;
-    }
-
-    Ok(())
-}
-
-pub(crate) async fn persist_filesystem_payload_changes_with_untracked_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
-    changes: &[FilesystemPayloadChange],
-    untracked: bool,
-) -> Result<(), LixError> {
-    let deduped_changes = dedupe_filesystem_payload_changes(changes);
-    if deduped_changes.is_empty() {
-        return Ok(());
-    }
-
-    let (sql, params) = build_filesystem_payload_changes_insert(&deduped_changes, untracked);
-    transaction.execute(&sql, &params).await?;
-
-    Ok(())
+    crate::transaction::filesystem::storage::persist_filesystem_payload_changes_in_transaction(
+        transaction,
+        changes,
+    )
+    .await
 }
 
 pub(crate) async fn compile_filesystem_finalization_from_state_in_transaction(
@@ -660,75 +619,4 @@ fn should_run_binary_cas_gc(
         || filesystem_payload_changes
             .iter()
             .any(|change| change.schema_key == BINARY_BLOB_REF_SCHEMA_KEY)
-}
-
-pub(crate) fn build_filesystem_payload_changes_insert(
-    changes: &[FilesystemPayloadChange],
-    untracked: bool,
-) -> (String, Vec<Value>) {
-    let values_per_row = if untracked { 10 } else { 9 };
-    let mut params = Vec::with_capacity(changes.len() * values_per_row);
-    let mut rows = Vec::with_capacity(changes.len());
-
-    for (row_index, change) in changes.iter().enumerate() {
-        rows.push(values_row_placeholders_sql(row_index, values_per_row));
-        params.push(Value::Text(change.entity_id.clone()));
-        params.push(Value::Text(change.schema_key.clone()));
-        params.push(match &change.file_id {
-            Some(file_id) => Value::Text(file_id.clone()),
-            None => Value::Null,
-        });
-        params.push(Value::Text(change.version_id.clone()));
-        params.push(match &change.plugin_key {
-            Some(plugin_key) => Value::Text(plugin_key.clone()),
-            None => Value::Null,
-        });
-        params.push(match &change.snapshot_content {
-            Some(snapshot_content) => Value::Text(snapshot_content.clone()),
-            None => Value::Null,
-        });
-        params.push(Value::Text(change.schema_version.clone()));
-        params.push(match &change.metadata {
-            Some(metadata) => Value::Text(metadata.clone()),
-            None => Value::Null,
-        });
-        params.push(match &change.origin_key {
-            Some(origin_key) => Value::Text(origin_key.clone()),
-            None => Value::Null,
-        });
-        if untracked {
-            params.push(Value::Boolean(true));
-        }
-    }
-
-    let sql = insert_filesystem_payload_changes_sql(&rows.join(", "), untracked);
-    (sql, params)
-}
-
-fn values_row_placeholders_sql(row_index: usize, values_per_row: usize) -> String {
-    let base = row_index * values_per_row;
-    let placeholders = (1..=values_per_row)
-        .map(|offset| format!("${}", base + offset))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!("({placeholders})")
-}
-
-fn insert_filesystem_payload_changes_sql(row_values: &str, untracked: bool) -> String {
-    let state_by_version_table = state_by_version_relation_name();
-    if untracked {
-        return format!(
-            "INSERT INTO {} (\
-             entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, origin_key, untracked\
-             ) VALUES {row_values}",
-            state_by_version_table,
-        );
-    }
-
-    format!(
-        "INSERT INTO {} (\
-         entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version, metadata, origin_key\
-         ) VALUES {row_values}",
-        state_by_version_table,
-    )
 }
