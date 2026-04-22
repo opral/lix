@@ -4,7 +4,6 @@ use crate::backend::execute_ddl_batch;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogAdminWriteBehavior, CatalogCompilerApi,
 };
-use crate::common::escape_sql_string;
 use crate::sql::ChangeBatch;
 use crate::sql::PreparedWriteOperationKind;
 use crate::transaction::PreparedPublicWrite;
@@ -168,49 +167,21 @@ async fn upsert_last_checkpoint_rows_in_transaction(
     rows: &[(String, String)],
     update_existing: bool,
 ) -> Result<(), LixError> {
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let values_sql = rows
-        .iter()
-        .map(|(version_id, checkpoint_commit_id)| {
-            format!(
-                "('{}', '{}')",
-                escape_sql_string(version_id),
-                escape_sql_string(checkpoint_commit_id)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    let on_conflict = if update_existing {
-        "DO UPDATE SET checkpoint_commit_id = excluded.checkpoint_commit_id"
-    } else {
-        "DO NOTHING"
-    };
-    let sql = format!(
-        "INSERT INTO lix_internal_last_checkpoint (version_id, checkpoint_commit_id) \
-         VALUES {values_sql} \
-         ON CONFLICT (version_id) {on_conflict}"
-    );
-    transaction.execute(&sql, &[]).await?;
-    Ok(())
+    crate::session::checkpoint_ops::storage::upsert_last_checkpoint_rows_in_transaction(
+        transaction,
+        rows,
+        update_existing,
+    )
+    .await
 }
 
 async fn delete_last_checkpoint_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     version_ids: &[String],
 ) -> Result<(), LixError> {
-    if version_ids.is_empty() {
-        return Ok(());
-    }
-
-    let in_list = version_ids
-        .iter()
-        .map(|id| format!("'{}'", escape_sql_string(id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("DELETE FROM lix_internal_last_checkpoint WHERE version_id IN ({in_list})");
-    transaction.execute(&sql, &[]).await?;
-    Ok(())
+    crate::session::checkpoint_ops::storage::delete_last_checkpoint_rows_in_transaction(
+        transaction,
+        version_ids,
+    )
+    .await
 }

@@ -6,11 +6,11 @@
 
 use crate::live_state::lifecycle;
 use crate::live_state::lifecycle::LiveStateSnapshot;
-use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
-use crate::live_state::store_sql::{
+use crate::live_state::storage::{
     load_latest_replay_cursor_with_executor, load_nullable_live_state_status_with_executor,
     SqlLiveStateStore,
 };
+use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::live_state::LiveStateProjectionStatus;
 use crate::LixError;
 

@@ -4,8 +4,8 @@
 //! mechanics for derived projections. They are rebuildable and non-semantic.
 
 use crate::live_state::lifecycle;
+use crate::live_state::storage::SqlLiveStateStore;
 use crate::live_state::store::{LiveStateBackendRef, LiveStateTransactionRef};
-use crate::live_state::store_sql::SqlLiveStateStore;
 use crate::live_state::ReplayCursor;
 use crate::LixError;
 

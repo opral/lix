@@ -29,6 +29,8 @@
 //! Replay-specific implementation lives under `live_state::projection::*`.
 //! Callers outside `live_state/*` should use the root-level entrypoints here.
 
+use std::collections::BTreeMap;
+
 mod bridge;
 mod commit_derived;
 pub(crate) mod constraints;
@@ -45,15 +47,15 @@ mod projection_receipt;
 #[cfg(test)]
 mod read_context;
 mod replay_cursor;
-mod row_queries;
+pub(crate) mod row_queries;
 pub(crate) mod schema_access;
 pub(crate) mod shared;
 mod snapshot_queries;
 pub(crate) mod storage;
 mod storage_metadata;
 pub(crate) mod store;
-pub(crate) mod store_sql;
 pub(crate) mod stored_rows;
+mod table_storage;
 #[cfg(test)]
 pub(crate) mod testing;
 pub(crate) mod tracked;
@@ -61,11 +63,11 @@ mod types;
 pub(crate) mod untracked;
 mod visible_rows;
 use crate::catalog::SurfaceReadFreshness;
+use crate::live_state::storage::SqlLiveStateStore;
 use crate::live_state::store::{
     LiveStateBackendRef, LiveStateExecutorRef, LiveStateMaterializeStore, LiveStateReadStore,
     LiveStateTransactionRef, LiveStateWriteStore,
 };
-use crate::live_state::store_sql::SqlLiveStateStore;
 use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
@@ -260,7 +262,7 @@ pub(crate) async fn ensure_projection_read_freshness_in_transaction(
         return Ok(());
     }
 
-    let mut backend = crate::live_state::store_sql::executor_from_transaction(transaction);
+    let mut backend = crate::live_state::storage::transaction_executor_view(transaction);
     let status =
         projection::status::load_live_state_projection_status_with_executor(&mut backend).await?;
     if status.mode == LiveStateMode::Bootstrapping {
@@ -274,6 +276,12 @@ pub(crate) async fn list_installed_plugin_archive_refs(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<Vec<PluginArchiveRef>, LixError> {
     plugin_archives::list_installed_plugin_archive_refs(backend).await
+}
+
+pub(crate) async fn load_visible_registered_schema_snapshot_contents(
+    backend: LiveStateBackendRef<'_>,
+) -> Result<BTreeMap<String, String>, LixError> {
+    storage::load_visible_registered_schema_snapshot_contents(backend).await
 }
 
 pub(crate) async fn derive_read_time_surface_rows(

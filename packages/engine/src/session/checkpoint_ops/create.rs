@@ -5,7 +5,7 @@ use crate::transaction::{
     append_checkpoint_commit_label_fact_in_transaction, CheckpointCommitLabelWrite,
 };
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
+use crate::{ExecuteOptions, LixError, Session, SessionTransaction};
 
 use super::super::version_ops::context::require_target_version_context_in_transaction;
 
@@ -112,23 +112,13 @@ async fn ensure_checkpoint_label_on_commit(
     commit_id: &str,
 ) -> Result<(), LixError> {
     let state_entity_id = checkpoint_commit_label_entity_id(commit_id);
-    let exists = tx
-        .backend_transaction_mut()?
-        .execute(
-            "SELECT 1 \
-             FROM lix_internal_change \
-             WHERE entity_id = $1 \
-               AND schema_key = $2 \
-               AND file_id IS NULL \
-               AND plugin_key IS NULL \
-             LIMIT 1",
-            &[
-                Value::Text(state_entity_id.clone()),
-                Value::Text(CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY.to_string()),
-            ],
-        )
-        .await?;
-    if !exists.rows.is_empty() {
+    if crate::session::checkpoint_ops::storage::checkpoint_commit_label_exists_in_transaction(
+        tx.backend_transaction_mut()?,
+        &state_entity_id,
+        CHECKPOINT_COMMIT_LABEL_SCHEMA_KEY,
+    )
+    .await?
+    {
         return Ok(());
     }
 

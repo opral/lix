@@ -3,28 +3,21 @@ use std::collections::{BTreeMap, BTreeSet};
 use super::types::{
     LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildScope, LiveStateWriteOp,
 };
-use crate::common::storage_scope_key_for_file_id;
-use crate::live_state::lifecycle::build_set_live_state_mode_sql;
-use crate::live_state::storage::{
-    load_live_table_layout_in_transaction, normalized_insert_columns_sql,
-    normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
-    quoted_live_table_name,
-};
+use crate::live_state::storage::quoted_live_table_name;
 use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::LiveStateMode;
 use crate::live_state::{
     mark_live_state_ready_at_latest_replay_cursor_in_transaction, register_schema_in_transaction,
 };
-use crate::{LixError, Value};
+use crate::LixError;
 
 pub(crate) async fn apply_live_state_rebuild_plan_internal(
     transaction: LiveStateTransactionRef<'_>,
     plan: &LiveStateRebuildPlan,
 ) -> Result<LiveStateApplyReport, LixError> {
-    crate::live_state::store_sql::execute_query_with_transaction(
+    crate::live_state::storage::set_live_state_mode_in_transaction(
         transaction,
-        &build_set_live_state_mode_sql(LiveStateMode::Rebuilding),
-        &[],
+        LiveStateMode::Rebuilding,
     )
     .await?;
     let (rows_deleted, tables_touched) =
@@ -33,10 +26,9 @@ pub(crate) async fn apply_live_state_rebuild_plan_internal(
     if matches!(plan.scope, LiveStateRebuildScope::Full) {
         mark_live_state_ready_at_latest_replay_cursor_in_transaction(transaction).await?;
     } else {
-        crate::live_state::store_sql::execute_query_with_transaction(
+        crate::live_state::storage::set_live_state_mode_in_transaction(
             transaction,
-            &build_set_live_state_mode_sql(LiveStateMode::NeedsRebuild),
-            &[],
+            LiveStateMode::NeedsRebuild,
         )
         .await?;
     }
@@ -76,90 +68,11 @@ pub(crate) async fn apply_live_state_scope_in_transaction(
             continue;
         }
 
-        let is_tombstone = match write.op {
-            LiveStateWriteOp::Upsert => 0,
-            LiveStateWriteOp::Tombstone => 1,
-        };
-        let global_sql = if write.global { "true" } else { "false" };
-        let untracked_sql = if write.untracked { "true" } else { "false" };
-        let storage_scope_key = crate::live_state::constraints::escape_sql_string(
-            &storage_scope_key_for_file_id(write.file_id.as_deref()),
-        );
-        let file_id_sql = write
-            .file_id
-            .as_ref()
-            .map(|value| {
-                format!(
-                    "'{}'",
-                    crate::live_state::constraints::escape_sql_string(value.as_str())
-                )
-            })
-            .unwrap_or_else(|| "NULL".to_string());
-        let plugin_key_sql = write
-            .plugin_key
-            .as_ref()
-            .map(|value| {
-                format!(
-                    "'{}'",
-                    crate::live_state::constraints::escape_sql_string(value.as_str())
-                )
-            })
-            .unwrap_or_else(|| "NULL".to_string());
-        let metadata_sql = write
-            .metadata
-            .as_ref()
-            .map(|value| {
-                format!(
-                    "'{}'",
-                    crate::live_state::constraints::escape_sql_string(value.as_str())
-                )
-            })
-            .unwrap_or_else(|| "NULL".to_string());
-        let layout = load_live_table_layout_in_transaction(transaction, &write.schema_key).await?;
-        let normalized_values =
-            normalized_live_column_values(&layout, write.snapshot_content.as_deref())?
-                .into_iter()
-                .collect::<Vec<_>>();
-
-        let sql = format!(
-            "INSERT INTO {table} (\
-             entity_id, schema_key, schema_version, file_id, storage_scope_key, version_id, global, plugin_key, change_id, metadata, is_tombstone, untracked, created_at, updated_at{normalized_columns}\
-             ) VALUES (\
-             '{entity_id}', '{schema_key}', '{schema_version}', {file_id}, '{storage_scope_key}', '{version_id}', {global}, {plugin_key}, '{change_id}', {metadata}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'{normalized_values}\
-             ) ON CONFLICT (entity_id, storage_scope_key, version_id, untracked) DO UPDATE SET \
-             schema_key = excluded.schema_key, \
-             schema_version = excluded.schema_version, \
-             file_id = excluded.file_id, \
-             global = excluded.global, \
-             plugin_key = excluded.plugin_key, \
-             change_id = excluded.change_id, \
-             metadata = excluded.metadata, \
-             is_tombstone = excluded.is_tombstone, \
-             created_at = excluded.created_at, \
-             updated_at = excluded.updated_at{normalized_updates}",
-            table = table_name,
-            entity_id = crate::live_state::constraints::escape_sql_string(&write.entity_id),
-            schema_key = crate::live_state::constraints::escape_sql_string(&write.schema_key),
-            schema_version =
-                crate::live_state::constraints::escape_sql_string(&write.schema_version),
-            file_id = file_id_sql,
-            storage_scope_key = storage_scope_key,
-            version_id = crate::live_state::constraints::escape_sql_string(&write.version_id),
-            global = global_sql,
-            plugin_key = plugin_key_sql,
-            change_id = crate::live_state::constraints::escape_sql_string(&write.change_id),
-            metadata = metadata_sql,
-            is_tombstone = is_tombstone,
-            untracked = untracked_sql,
-            created_at = crate::live_state::constraints::escape_sql_string(&write.created_at),
-            updated_at = crate::live_state::constraints::escape_sql_string(&write.updated_at),
-            normalized_columns = normalized_insert_columns_sql(&normalized_values),
-            normalized_values = normalized_insert_values_sql(&normalized_values),
-            normalized_updates = normalized_update_assignments_sql(&normalized_values),
-        );
-
-        crate::live_state::store_sql::execute_query_with_transaction(transaction, &sql, &[])
-            .await?;
+        crate::live_state::storage::upsert_live_state_rebuild_row_in_transaction(
+            transaction,
+            write,
+        )
+        .await?;
     }
 
     Ok((rows_deleted, tables_touched))
@@ -193,79 +106,23 @@ async fn clear_scope_rows(
             (false, false) => continue,
         };
 
-        let (count_sql, delete_sql) = if let Some(in_list) = version_filter.as_ref() {
-            (
-                format!(
-                    "SELECT COUNT(*) FROM {table_name} \
-                     WHERE version_id IN ({in_list}){lane_predicate}",
-                    table_name = table_name,
-                    in_list = in_list,
-                    lane_predicate = lane_predicate,
-                ),
-                format!(
-                    "DELETE FROM {table_name} \
-                     WHERE version_id IN ({in_list}){lane_predicate}",
-                    table_name = table_name,
-                    in_list = in_list,
-                    lane_predicate = lane_predicate,
-                ),
-            )
-        } else {
-            (
-                format!(
-                    "SELECT COUNT(*) FROM {table_name} WHERE 1 = 1{lane_predicate}",
-                    table_name = table_name,
-                    lane_predicate = lane_predicate,
-                ),
-                format!(
-                    "DELETE FROM {table_name} WHERE 1 = 1{lane_predicate}",
-                    table_name = table_name,
-                    lane_predicate = lane_predicate,
-                ),
-            )
-        };
-
-        let count_result = crate::live_state::store_sql::execute_query_with_transaction(
+        rows_deleted += crate::live_state::storage::count_live_scope_rows_in_transaction(
             transaction,
-            &count_sql,
-            &[],
+            &table_name,
+            version_filter.as_deref(),
+            &lane_predicate,
         )
         .await?;
-        rows_deleted += parse_count_result(&count_result.rows)?;
-
-        crate::live_state::store_sql::execute_query_with_transaction(transaction, &delete_sql, &[])
-            .await?;
+        crate::live_state::storage::delete_live_scope_rows_in_transaction(
+            transaction,
+            &table_name,
+            version_filter.as_deref(),
+            &lane_predicate,
+        )
+        .await?;
     }
 
     Ok(rows_deleted)
-}
-
-fn parse_count_result(rows: &[Vec<Value>]) -> Result<usize, LixError> {
-    let Some(value) = rows.first().and_then(|row| row.first()) else {
-        return Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "materialization apply: count query returned no rows".to_string(),
-            hint: None,
-        });
-    };
-
-    match value {
-        Value::Integer(count) if *count >= 0 => Ok(*count as usize),
-        Value::Text(text) => text.parse::<usize>().map_err(|error| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: format!(
-                "materialization apply: invalid count text '{}': {}",
-                text, error
-            ),
-            hint: None,
-        }),
-        _ => Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "materialization apply: count query returned non-integer value"
-                .to_string(),
-            hint: None,
-        }),
-    }
 }
 
 fn in_clause_values(values: &BTreeSet<String>) -> String {

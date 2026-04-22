@@ -3,7 +3,6 @@ use crate::transaction::pipeline::{
 };
 use crate::transaction::FilesystemPayloadChange;
 use crate::transaction::{
-    build_filesystem_payload_changes_insert,
     compile_filesystem_finalization_from_state_in_transaction,
     filesystem_transaction_state_from_planned, PlannedDirectWriteUnit, WriteExecutionContext,
 };
@@ -79,25 +78,9 @@ async fn persist_filesystem_payload_changes_direct(
     transaction: &mut dyn LixBackendTransaction,
     changes: &[FilesystemPayloadChange],
 ) -> Result<(), LixError> {
-    let tracked = changes
-        .iter()
-        .filter(|change| !change.untracked)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !tracked.is_empty() {
-        let (sql, params) = build_filesystem_payload_changes_insert(&tracked, false);
-        transaction.execute(&sql, &params).await?;
-    }
-
-    let untracked = changes
-        .iter()
-        .filter(|change| change.untracked)
-        .cloned()
-        .collect::<Vec<_>>();
-    if !untracked.is_empty() {
-        let (sql, params) = build_filesystem_payload_changes_insert(&untracked, true);
-        transaction.execute(&sql, &params).await?;
-    }
-
-    Ok(())
+    crate::transaction::filesystem::storage::persist_filesystem_payload_changes_in_transaction(
+        transaction,
+        changes,
+    )
+    .await
 }

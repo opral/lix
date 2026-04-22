@@ -3,8 +3,8 @@ use crate::common::is_missing_relation_error;
 use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;
 use crate::live_state::storage::{
-    build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
-    required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
+    load_live_row_access_with_executor, required_bool_cell, required_text_cell, selected_columns,
+    selected_projection_sql, text_from_value, ScanSqlRequest,
 };
 use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::{LixError, Value};
@@ -102,7 +102,9 @@ async fn scan_rows_with_limit_and_order(
     let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
     let selected_columns = selected_columns(&access, &request.required_columns, "untracked")?;
     let projection = selected_projection_sql(&selected_columns);
-    let sql = build_partitioned_scan_sql(ScanSqlRequest {
+    let result = match crate::live_state::storage::scan_live_partition_with_executor(
+        executor,
+        ScanSqlRequest {
         select_prefix: "SELECT entity_id, schema_key, schema_version, file_id, version_id, global, plugin_key, metadata, change_id, created_at, updated_at",
         schema_key: &request.schema_key,
         version_id: &request.version_id,
@@ -111,12 +113,7 @@ async fn scan_rows_with_limit_and_order(
         constraints: &request.constraints,
         order_by,
         limit,
-    })?;
-
-    let result = match crate::live_state::store_sql::execute_query_with_executor(
-        executor,
-        &sql,
-        &[],
+        },
     )
     .await
     {
