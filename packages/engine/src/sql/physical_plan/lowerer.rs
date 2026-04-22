@@ -1992,6 +1992,15 @@ mod tests {
             &mut registry,
             crate::catalog::DynamicEntitySurfaceSpec {
                 schema_key: "message".to_string(),
+                schema: serde_json::json!({
+                    "x-lix-key": "message",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "body": { "type": "string" },
+                        "id": { "type": "string" }
+                    }
+                }),
                 visible_columns: vec!["body".to_string(), "id".to_string()],
                 column_types: BTreeMap::new(),
             },

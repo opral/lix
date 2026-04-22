@@ -29,7 +29,10 @@ use uuid::Uuid;
 
 use crate::backend::TransactionBeginMode;
 use crate::catalog::SurfaceRegistry;
-use crate::execution::execute_prepared_read_batch_in_committed_read_transaction;
+use crate::execution::{
+    execute_prepared_read_batch_in_committed_read_transaction,
+    execute_prepared_read_batch_with_backend,
+};
 use crate::functions::FunctionBindings;
 use crate::image::ImageChunkWriter;
 use crate::plugin::{prepare_registered_schema_write_statement, PluginInstallWriteContext};
@@ -43,7 +46,7 @@ use crate::sql::{
     extract_explicit_transaction_script, parse_sql_with_timing,
     prepare_committed_read_batch_in_transaction, prepare_committed_read_batch_with_backend,
     reject_public_create_table, transaction_control_statement_denied_error, CommittedReadContext,
-    QueryDependency, StatementBatch,
+    PreparedReadArtifact, QueryDependency, StatementBatch,
 };
 use crate::streams::{StateCommitStream, StateCommitStreamFilter};
 use crate::transaction::{
@@ -561,26 +564,37 @@ impl Session {
                     &committed_read_context,
                 )
                 .await?;
-                let mut transaction = self
-                    .session_host
-                    .begin_read_unit(prepared_read_batch.transaction_mode)
-                    .await?;
-                let result = execute_prepared_read_batch_in_committed_read_transaction(
-                    transaction.as_mut(),
-                    &execution_context,
-                    &prepared_read_batch,
-                )
-                .await;
-                match result {
-                    Ok(result) => {
-                        transaction.commit().await?;
-                        context.clear_function_bindings();
-                        Ok(result)
-                    }
-                    Err(error) => {
-                        let _ = transaction.rollback().await;
-                        context.clear_function_bindings();
-                        Err(error)
+                if prepared_read_batch_can_execute_with_backend(&prepared_read_batch) {
+                    let result = execute_prepared_read_batch_with_backend(
+                        self.session_host.backend().as_ref(),
+                        &execution_context,
+                        &prepared_read_batch,
+                    )
+                    .await;
+                    context.clear_function_bindings();
+                    result
+                } else {
+                    let mut transaction = self
+                        .session_host
+                        .begin_read_unit(prepared_read_batch.transaction_mode)
+                        .await?;
+                    let result = execute_prepared_read_batch_in_committed_read_transaction(
+                        transaction.as_mut(),
+                        &execution_context,
+                        &prepared_read_batch,
+                    )
+                    .await;
+                    match result {
+                        Ok(result) => {
+                            transaction.commit().await?;
+                            context.clear_function_bindings();
+                            Ok(result)
+                        }
+                        Err(error) => {
+                            let _ = transaction.rollback().await;
+                            context.clear_function_bindings();
+                            Err(error)
+                        }
                     }
                 }
             }
@@ -887,6 +901,15 @@ fn baseline_committed_read_transaction_mode(
         }
         SessionExecutionMode::WriteTransaction => TransactionBeginMode::Write,
     }
+}
+
+fn prepared_read_batch_can_execute_with_backend(
+    prepared_read_batch: &crate::sql::PreparedReadBatch,
+) -> bool {
+    prepared_read_batch
+        .statements
+        .iter()
+        .all(|statement| matches!(statement.artifact, PreparedReadArtifact::Public(_)))
 }
 
 fn committed_read_context<'a>(

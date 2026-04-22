@@ -100,9 +100,9 @@ pub use row_queries::{
 pub(crate) use schema_access::LiveRowShape;
 pub(crate) use snapshot_queries::{LiveRowShapeContract, LiveStateQueryBackend};
 pub use state_surface::{
-    open_state_by_version_snapshot, open_state_by_version_snapshot_with_shared_backend,
-    StateByVersionScanRequest, StateByVersionSnapshot, StateSurfaceColumn, StateSurfaceFilter,
-    StateSurfaceRow,
+    open_state_by_version_reader_with_backend, open_state_by_version_snapshot,
+    open_state_by_version_snapshot_with_shared_backend, StateByVersionScanRequest,
+    StateByVersionSnapshot, StateSurfaceColumn, StateSurfaceFilter, StateSurfaceRow,
 };
 #[cfg(test)]
 pub(crate) use storage_metadata::{builtin_schema_storage_metadata, BuiltinSchemaStorageLane};

@@ -2,12 +2,12 @@ use std::str::FromStr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
-use sqlx::{Column, Executor, Row, SqlitePool, ValueRef};
+use sqlx::{Column, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
 
 use lix_engine::{
-    collapse_prepared_batch_for_dialect, LixBackend, LixBackendTransaction, LixError,
-    PreparedBatch, QueryResult, SqlDialect, TransactionBeginMode, Value,
+    LixBackend, LixBackendTransaction, LixError, PreparedBatch, QueryResult, SqlDialect,
+    TransactionBeginMode, Value,
 };
 
 use crate::support::simulation_test::{Simulation, SimulationBehavior};
@@ -165,21 +165,23 @@ impl LixBackendTransaction for SqliteLixBackendTransaction {
     }
 
     async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        let collapsed = collapse_prepared_batch_for_dialect(batch, self.dialect())?;
-        if collapsed.sql.trim().is_empty() {
-            return Ok(QueryResult {
-                rows: Vec::new(),
-                columns: Vec::new(),
-            });
+        for step in &batch.steps {
+            if step.sql.trim().is_empty() {
+                continue;
+            }
+            let mut query = sqlx::query(step.sql.as_str()).persistent(false);
+            for param in &step.params {
+                query = bind_param_sqlite(query, param);
+            }
+            query
+                .execute(&mut *self.conn)
+                .await
+                .map_err(|err| LixError {
+                    code: "LIX_ERROR_UNKNOWN".to_string(),
+                    description: format!("{} | sql: {}", err, step.sql),
+                    hint: None,
+                })?;
         }
-        self.conn
-            .execute(collapsed.sql.as_str())
-            .await
-            .map_err(|err| LixError {
-                code: "LIX_ERROR_UNKNOWN".to_string(),
-                description: err.to_string(),
-                hint: None,
-            })?;
         Ok(QueryResult {
             rows: Vec::new(),
             columns: Vec::new(),
@@ -216,16 +218,21 @@ async fn execute_query_with_connection(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
-    let mut query = sqlx::query(sql);
+    let mut query = sqlx::query(sql).persistent(false);
     for param in params {
         query = bind_param_sqlite(query, param);
     }
 
-    let rows = query.fetch_all(&mut **conn).await.map_err(|err| LixError {
-        code: "LIX_ERROR_UNKNOWN".to_string(),
-        description: err.to_string(),
-        hint: None,
-    })?;
+    let rows = match query.fetch_all(&mut **conn).await {
+        Ok(rows) => rows,
+        Err(err) => {
+            return Err(LixError {
+                code: "LIX_ERROR_UNKNOWN".to_string(),
+                description: format!("{} | sql: {}", err, sql),
+                hint: None,
+            });
+        }
+    };
     let columns = rows
         .first()
         .map(|row| {

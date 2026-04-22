@@ -107,6 +107,7 @@ impl WritePreparationContext {
 
 struct WriteCommandSeed {
     dialect: crate::SqlDialect,
+    surface_registry: crate::catalog::SurfaceRegistry,
     statement_kind: PreparedWriteStatementKind,
     diagnostic_context: WriteDiagnosticContext,
     origin_key: Option<String>,
@@ -307,6 +308,7 @@ async fn compile_write_command(
     Ok(CompiledWriteCommand {
         payload: WriteCommandSeed {
             dialect,
+            surface_registry: prepared_context.public_surface_registry().clone(),
             statement_kind,
             diagnostic_context,
             origin_key,
@@ -398,6 +400,7 @@ fn assemble_write_command(
 ) -> Result<WriteCommand, LixError> {
     let WriteCommandSeed {
         dialect,
+        surface_registry,
         statement_kind,
         diagnostic_context,
         origin_key,
@@ -405,6 +408,7 @@ fn assemble_write_command(
         function_bindings,
     } = materialized.payload;
     let prepared_statement = prepared_write_statement_from_compiled_execution(
+        &surface_registry,
         dialect,
         statement_kind,
         compiled_execution,
@@ -600,6 +604,7 @@ fn value_to_string(value: &Value, name: &str) -> Result<String, LixError> {
 }
 
 fn prepared_write_statement_from_compiled_execution(
+    surface_registry: &crate::catalog::SurfaceRegistry,
     dialect: crate::SqlDialect,
     statement_kind: PreparedWriteStatementKind,
     compiled: CompiledExecution,
@@ -612,7 +617,11 @@ fn prepared_write_statement_from_compiled_execution(
     diagnostic_context.explain_mode = explain_diagnostics.explain_mode;
 
     let artifact = if let Some(public_read) = compiled.public_read() {
-        PreparedWriteArtifact::PublicRead(prepare_public_read_artifact(public_read, dialect)?)
+        PreparedWriteArtifact::PublicRead(prepare_public_read_artifact(
+            public_read,
+            surface_registry,
+            dialect,
+        )?)
     } else if let Some(scalar) = compiled.scalar_read() {
         PreparedWriteArtifact::ScalarRead(PreparedScalarReadArtifact {
             prepared_batch: PreparedBatch {

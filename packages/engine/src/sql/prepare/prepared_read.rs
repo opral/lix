@@ -1,5 +1,5 @@
+use crate::backend::PreparedBatch;
 use crate::backend::TransactionBeginMode;
-use crate::backend::{PreparedBatch, PreparedStatement};
 use crate::sql::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
@@ -35,7 +35,7 @@ use crate::sql::{
     PreparedStateHistorySortValue, PublicReadResultColumn, PublicReadResultColumns,
     ReadDiagnosticContext,
 };
-use crate::{LixBackend, LixBackendTransaction, LixError, Value};
+use crate::{LixBackend, LixBackendTransaction, LixError};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
 use std::ops::ControlFlow;
 
@@ -132,6 +132,7 @@ async fn compile_committed_read_statement(
     .await?;
     let is_scalar_read = diagnostic_context.relation_names.is_empty();
     prepared_read_statement_from_compiled_execution(
+        compiler_context.surface_registry(),
         compiler_context.dialect(),
         compiled,
         diagnostic_context,
@@ -166,6 +167,7 @@ async fn compile_committed_execution_step(
 }
 
 fn prepared_read_statement_from_compiled_execution(
+    surface_registry: &crate::catalog::SurfaceRegistry,
     dialect: crate::SqlDialect,
     compiled: CompiledExecution,
     mut diagnostic_context: ReadDiagnosticContext,
@@ -194,7 +196,11 @@ fn prepared_read_statement_from_compiled_execution(
     });
 
     let artifact = if let Some(public_read) = compiled.public_read() {
-        PreparedReadArtifact::Public(prepare_public_read_artifact(public_read, dialect)?)
+        PreparedReadArtifact::Public(prepare_public_read_artifact(
+            public_read,
+            surface_registry,
+            dialect,
+        )?)
     } else if let Some(scalar) = compiled.scalar_read() {
         PreparedReadArtifact::Scalar(PreparedBatchReadArtifact {
             prepared_batch: PreparedBatch {
@@ -235,7 +241,8 @@ fn base_read_diagnostic_context(
 
 pub(crate) fn prepare_public_read_artifact(
     public_read: &PublicReadPlan,
-    dialect: crate::SqlDialect,
+    surface_registry: &crate::catalog::SurfaceRegistry,
+    _dialect: crate::SqlDialect,
 ) -> Result<PreparedPublicRead, LixError> {
     let mut contract = super::public_surface::read::prepared_public_read_contract(public_read);
     if contract.result_columns.is_none() {
@@ -248,25 +255,19 @@ pub(crate) fn prepare_public_read_artifact(
                 read: read.clone(),
             })
         }
-        PublicReadPhysicalPlan::LoweredSql(lowered) => {
-            if public_read.route_via_sql2 {
-                PreparedPublicReadPlanArtifact::Sql2(PreparedSql2ReadPlanArtifact {
-                    artifact: crate::sql2::PreparedSql2ReadArtifact {
-                        sql: public_read.source_statement_sql.clone(),
-                        active_version_id: public_read.runtime_bindings.active_version_id.clone(),
-                        surface_names: public_read.resolved_relations.clone(),
-                    },
-                })
-            } else {
-                PreparedPublicReadPlanArtifact::PreparedBatch(PreparedBatchReadArtifact {
-                    prepared_batch: prepared_batch_from_lowered_batch(
-                        dialect,
-                        lowered,
-                        &public_read.bound_parameters,
-                        &public_read.runtime_bindings,
-                    )?,
-                })
-            }
+        PublicReadPhysicalPlan::LoweredSql(_lowered) => {
+            PreparedPublicReadPlanArtifact::Sql2(PreparedSql2ReadPlanArtifact {
+                artifact: crate::sql2::PreparedSql2ReadArtifact {
+                    sql: public_read.source_statement_sql.clone(),
+                    bound_parameters: public_read.bound_parameters.clone(),
+                    active_version_id: public_read.runtime_bindings.active_version_id.clone(),
+                    surface_names: public_read.resolved_relations.clone(),
+                    entity_surfaces: crate::sql2::prepared_entity_surface_specs_for_registry(
+                        surface_registry,
+                        &public_read.resolved_relations,
+                    ),
+                },
+            })
         }
         PublicReadPhysicalPlan::HistoryRead(plan) => {
             PreparedPublicReadPlanArtifact::HistoryRead(PreparedHistoryReadArtifact {
@@ -282,20 +283,6 @@ pub(crate) fn prepare_public_read_artifact(
         public_output_columns: public_read.public_output_columns.clone(),
         execution,
     })
-}
-
-fn prepared_batch_from_lowered_batch(
-    dialect: crate::SqlDialect,
-    lowered: &crate::sql::physical_plan::LoweredReadBatch,
-    params: &[Value],
-    runtime_bindings: &crate::sql::binder::RuntimeBindingValues,
-) -> Result<PreparedBatch, LixError> {
-    let mut batch = PreparedBatch { steps: Vec::new() };
-    for statement in &lowered.statements {
-        let (sql, params) = statement.bind_and_render_sql(params, runtime_bindings, dialect)?;
-        batch.steps.push(PreparedStatement { sql, params });
-    }
-    Ok(batch)
 }
 
 fn result_columns_for_public_read_execution(

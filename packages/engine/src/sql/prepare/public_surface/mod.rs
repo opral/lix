@@ -73,7 +73,6 @@ pub(crate) struct PublicReadPlan {
     pub(crate) freshness_contract: SurfaceReadFreshness,
     pub(crate) resolved_relations: Vec<String>,
     pub(crate) source_statement_sql: String,
-    pub(crate) route_via_sql2: bool,
     pub(crate) logical_plan: PublicReadLogicalPlan,
     pub(crate) execution: PublicReadPhysicalPlan,
     pub(crate) bound_parameters: Vec<Value>,
@@ -2307,8 +2306,12 @@ mod tests {
                     ));
                     assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
-                    let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
-                        .expect("descriptor-only lix_version read should convert");
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &crate::catalog::build_builtin_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("descriptor-only lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
                         &BuiltinReadExecutionHost,
@@ -2379,8 +2382,12 @@ mod tests {
                     ));
                     assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
-                    let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
-                        .expect("descriptor+ref lix_version read should convert");
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &crate::catalog::build_builtin_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("descriptor+ref lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,
                         &BuiltinReadExecutionHost,
@@ -2466,7 +2473,11 @@ mod tests {
                     ));
                     assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
 
-                    let artifact = prepare_public_read_artifact(&prepared, backend.dialect())
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &crate::catalog::build_builtin_surface_registry(),
+                        backend.dialect(),
+                    )
                         .expect("multi-version lix_version read should convert");
                     let actual = execute_prepared_public_read_artifact_with_backend(
                         &backend,

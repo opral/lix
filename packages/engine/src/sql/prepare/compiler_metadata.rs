@@ -2,19 +2,16 @@ use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
 use crate::catalog::SurfaceRegistry;
-use crate::live_state::tracked_relation_name;
 use crate::schema::{
     builtin_schema_definition, lix_state_surface_schema_definition,
     schema_from_registered_snapshot, SchemaKey,
 };
-use crate::sql::common::text::escape_sql_string;
 use crate::sql::{
     SqlPreparationMetadataReader, SqlPreparationPendingOverlay, SqlPreparationPendingStorage,
 };
-use crate::{LixBackend, LixError, Value};
+use crate::{LixBackend, LixError};
 use serde_json::Value as JsonValue;
 
-const GLOBAL_VERSION: &str = "global";
 const LIX_STATE_SURFACE_SCHEMA_KEY: &str = "lix_state";
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SqlCompilerMetadata {
@@ -50,6 +47,7 @@ pub(crate) async fn load_sql_compiler_metadata_with_reader_and_pending_overlay(
             schema_key.clone(),
             load_latest_schema_for_preparation_with_pending(
                 reader,
+                registry,
                 &schema_key,
                 current_version_heads.as_ref(),
                 pending_schemas.get(&schema_key),
@@ -72,6 +70,7 @@ struct PendingLatestSchemaEntry {
 
 async fn load_latest_schema_for_preparation_with_pending(
     reader: &mut dyn SqlPreparationMetadataReader,
+    registry: &SurfaceRegistry,
     schema_key: &str,
     current_version_heads: Option<&BTreeMap<String, String>>,
     pending_entry: Option<&PendingLatestSchemaEntry>,
@@ -84,8 +83,13 @@ async fn load_latest_schema_for_preparation_with_pending(
         return Ok(schema.clone());
     }
 
-    let stored_entry =
-        load_latest_schema_entry_for_preparation(reader, schema_key, current_version_heads).await?;
+    if let Some(schema) = registry.dynamic_schema_definition(schema_key) {
+        return Ok(schema.clone());
+    }
+
+    let stored_entry = reader
+        .load_latest_registered_schema_entry_for_preparation(schema_key, current_version_heads)
+        .await?;
     match (pending_entry, stored_entry) {
         (Some(pending), Some((stored_key, stored_schema))) => {
             if compare_schema_keys(&pending.key, &stored_key) != Ordering::Less {
@@ -100,85 +104,6 @@ async fn load_latest_schema_for_preparation_with_pending(
             "LIX_ERROR_UNKNOWN",
             format!("schema '{schema_key}' is not stored"),
         )),
-    }
-}
-
-async fn load_latest_schema_entry_for_preparation(
-    reader: &mut dyn SqlPreparationMetadataReader,
-    schema_key: &str,
-    current_version_heads: Option<&BTreeMap<String, String>>,
-) -> Result<Option<(SchemaKey, JsonValue)>, LixError> {
-    let registered_schema_table = tracked_relation_name("lix_registered_schema");
-    let prefix = format!("{schema_key}~");
-    let prefix_escaped = escape_sql_string(&prefix);
-    let prefix_len = prefix.len();
-    let visible_version_filter = registered_schema_visible_version_filter(current_version_heads);
-    let sql = format!(
-        "SELECT schema_version, value_json \
-         FROM {table} \
-         WHERE substr(entity_id, 1, {prefix_len}) = '{prefix_escaped}' \
-           AND ({visible_version_filter}) \
-           AND is_tombstone = 0 \
-           AND value_json IS NOT NULL \
-         ORDER BY CAST(schema_version AS INTEGER) DESC, \
-                  CASE WHEN version_id = '{global_version}' THEN 0 ELSE 1 END DESC, \
-                  version_id ASC \
-         LIMIT 1",
-        table = registered_schema_table,
-        prefix_len = prefix_len,
-        prefix_escaped = prefix_escaped,
-        global_version = GLOBAL_VERSION,
-        visible_version_filter = visible_version_filter,
-    );
-    let result = reader.execute_preparation_query(&sql, &[]).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-
-    let schema_version = required_text_cell(row, 0, "schema_version")?;
-    let value_json = required_text_cell(row, 1, "value_json")?;
-    Ok(Some((
-        SchemaKey::new(schema_key.to_string(), schema_version),
-        schema_from_registered_value_json(&value_json)?,
-    )))
-}
-
-fn registered_schema_visible_version_filter(
-    current_version_heads: Option<&BTreeMap<String, String>>,
-) -> String {
-    let mut version_ids = current_version_heads
-        .map(|heads| heads.keys().cloned().collect::<Vec<_>>())
-        .unwrap_or_default();
-    version_ids.sort();
-    version_ids.dedup();
-
-    let mut clauses = vec![format!("version_id = '{}'", GLOBAL_VERSION)];
-    if !version_ids.is_empty() {
-        let quoted = version_ids
-            .into_iter()
-            .map(|version_id| format!("'{}'", escape_sql_string(&version_id)))
-            .collect::<Vec<_>>()
-            .join(", ");
-        clauses.push(format!("version_id IN ({quoted})"));
-    }
-    clauses.join(" OR ")
-}
-
-fn schema_from_registered_value_json(raw: &str) -> Result<JsonValue, LixError> {
-    let parsed: JsonValue = serde_json::from_str(raw).map_err(|error| {
-        LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("registered schema value_json invalid JSON: {error}"),
-        )
-    })?;
-
-    if parsed.is_object() {
-        Ok(parsed)
-    } else {
-        Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "registered schema value_json must decode to an object",
-        ))
     }
 }
 
@@ -240,19 +165,5 @@ fn compare_schema_keys(left: &SchemaKey, right: &SchemaKey) -> Ordering {
     match (left.version_number(), right.version_number()) {
         (Some(left_version), Some(right_version)) => left_version.cmp(&right_version),
         _ => left.schema_version.cmp(&right.schema_version),
-    }
-}
-
-fn required_text_cell(row: &[Value], index: usize, name: &str) -> Result<String, LixError> {
-    match row.get(index) {
-        Some(Value::Text(text)) => Ok(text.clone()),
-        Some(_) => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("expected text value for {name}"),
-        )),
-        None => Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("missing value for {name}"),
-        )),
     }
 }

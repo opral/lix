@@ -1,9 +1,12 @@
 mod api;
 mod binding;
+mod change_surface;
 mod declaration;
 mod dependency;
 mod directory;
+mod directory_surface;
 mod file;
+mod file_surface;
 mod filesystem_query;
 mod history_read;
 mod public_surface_registry;
@@ -14,10 +17,11 @@ mod scan;
 mod state;
 mod transaction_write;
 mod version;
+mod version_surface;
 mod write_surface;
 
 use serde_json::Value as JsonValue;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::OnceLock;
 
 use crate::schema::{builtin_schema_definition, builtin_schema_keys};
@@ -46,6 +50,12 @@ pub(crate) use binding::{
     VersionHeadSourceBinding, VersionRelationBinding,
 };
 #[allow(unused_imports)]
+pub(crate) use change_surface::{
+    open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,
+    ChangeSurfaceColumn, ChangeSurfaceFilter, ChangeSurfaceRow, ChangeSurfaceScanRequest,
+    ChangeSurfaceSnapshot,
+};
+#[allow(unused_imports)]
 pub(crate) use declaration::{
     builtin_catalog_projection_registry, CatalogDerivedRow, CatalogProjectionContext,
     CatalogProjectionDefinition, CatalogProjectionInput, CatalogProjectionInputRows,
@@ -66,11 +76,25 @@ pub(crate) use directory::{
     builtin_lix_directory_catalog_registration, LixDirectoryByVersionProjection,
 };
 #[allow(unused_imports)]
+pub(crate) use directory_surface::{
+    open_directory_by_version_surface_snapshot,
+    open_directory_by_version_surface_snapshot_with_shared_backend,
+    open_directory_surface_snapshot, DirectorySurfaceColumn, DirectorySurfaceFilter,
+    DirectorySurfaceRow, DirectorySurfaceScanRequest, DirectorySurfaceSnapshot,
+};
+#[allow(unused_imports)]
 pub(crate) use file::LixFileProjection;
 #[allow(unused_imports)]
 pub(crate) use file::{
     builtin_lix_file_by_version_catalog_registration, builtin_lix_file_catalog_registration,
     LixFileByVersionProjection,
+};
+#[allow(unused_imports)]
+pub(crate) use file_surface::{
+    open_file_by_version_surface_snapshot,
+    open_file_by_version_surface_snapshot_with_shared_backend, open_file_surface_snapshot,
+    FileSurfaceColumn, FileSurfaceFilter, FileSurfaceRow, FileSurfaceScanRequest,
+    FileSurfaceSnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use filesystem_query::*;
@@ -98,6 +122,12 @@ pub(crate) use transaction_write::{
 };
 #[allow(unused_imports)]
 pub(crate) use version::{builtin_lix_version_catalog_registration, LixVersionProjection};
+#[allow(unused_imports)]
+pub(crate) use version_surface::{
+    load_version_surface_row_with_backend, open_version_surface_snapshot,
+    open_version_surface_snapshot_with_shared_backend, VersionSurfaceColumn, VersionSurfaceRow,
+    VersionSurfaceScanRequest, VersionSurfaceSnapshot,
+};
 #[allow(unused_imports)]
 pub(crate) use write_surface::{
     write_surface_semantics, CatalogAdminWriteBehavior, CatalogWriteSurfaceSemantics,
@@ -154,6 +184,7 @@ pub(crate) fn dynamic_entity_surface_spec_from_schema(
 
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
+        schema: schema.clone(),
         visible_columns,
         column_types,
     })
@@ -163,6 +194,7 @@ pub(crate) fn register_dynamic_entity_surface_spec(
     registry: &mut SurfaceRegistry,
     spec: DynamicEntitySurfaceSpec,
 ) -> CatalogEpoch {
+    registry.upsert_dynamic_schema(spec.schema_key.clone(), spec.schema.clone());
     let changed =
         registry.insert_descriptors(entity_surface_descriptors(&spec, CatalogSource::Dynamic));
     if changed {
@@ -175,6 +207,7 @@ pub(crate) fn remove_dynamic_entity_surfaces_for_schema_key(
     registry: &mut SurfaceRegistry,
     schema_key: &str,
 ) -> bool {
+    registry.remove_dynamic_schema(schema_key);
     let removed = registry.remove_descriptors_matching(|descriptor| {
         descriptor.catalog_source == CatalogSource::Dynamic
             && descriptor.implicit_overrides.fixed_schema_key.as_deref() == Some(schema_key)
@@ -260,35 +293,53 @@ fn builtin_entity_surface_spec_from_schema(
 
     Ok(DynamicEntitySurfaceSpec {
         schema_key: schema_key.to_string(),
+        schema: schema.clone(),
         visible_columns,
         column_types,
     })
 }
 
 fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnType> {
-    let types = match schema.get("type") {
-        Some(JsonValue::String(kind)) => vec![kind.as_str()],
-        Some(JsonValue::Array(kinds)) => kinds
-            .iter()
-            .filter_map(JsonValue::as_str)
-            .collect::<Vec<_>>(),
-        _ => return None,
-    };
+    let mut kinds = BTreeSet::new();
+    collect_surface_type_kinds(schema, &mut kinds);
+    kinds.remove("null");
 
-    if types.iter().any(|kind| *kind == "boolean") {
-        return Some(SurfaceColumnType::Boolean);
+    if kinds.is_empty() {
+        return None;
     }
-    if types.iter().any(|kind| *kind == "integer") {
-        return Some(SurfaceColumnType::Integer);
+
+    if kinds.len() == 1 {
+        return match kinds.into_iter().next() {
+            Some("boolean") => Some(SurfaceColumnType::Boolean),
+            Some("integer") => Some(SurfaceColumnType::Integer),
+            Some("number") => Some(SurfaceColumnType::Number),
+            Some("string") => Some(SurfaceColumnType::String),
+            Some("object" | "array") => Some(SurfaceColumnType::Json),
+            _ => None,
+        };
     }
-    if types.iter().any(|kind| *kind == "number") {
-        return Some(SurfaceColumnType::Number);
+
+    Some(SurfaceColumnType::Json)
+}
+
+fn collect_surface_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a str>) {
+    match schema.get("type") {
+        Some(JsonValue::String(kind)) => {
+            out.insert(kind.as_str());
+        }
+        Some(JsonValue::Array(kinds)) => {
+            for kind in kinds.iter().filter_map(JsonValue::as_str) {
+                out.insert(kind);
+            }
+        }
+        _ => {}
     }
-    if types.iter().any(|kind| *kind == "string") {
-        return Some(SurfaceColumnType::String);
+
+    for keyword in ["anyOf", "oneOf", "allOf"] {
+        if let Some(JsonValue::Array(branches)) = schema.get(keyword) {
+            for branch in branches {
+                collect_surface_type_kinds(branch, out);
+            }
+        }
     }
-    if types.iter().any(|kind| matches!(*kind, "object" | "array")) {
-        return Some(SurfaceColumnType::Json);
-    }
-    None
 }

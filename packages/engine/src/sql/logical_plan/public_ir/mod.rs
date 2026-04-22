@@ -925,6 +925,15 @@ mod tests {
             &mut registry,
             DynamicEntitySurfaceSpec {
                 schema_key: "lix_key_value".to_string(),
+                schema: serde_json::json!({
+                    "x-lix-key": "lix_key_value",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" },
+                        "value": { "type": "string" }
+                    }
+                }),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
             },

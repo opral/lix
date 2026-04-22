@@ -11,7 +11,6 @@ use datafusion::arrow::record_batch::RecordBatch;
 use tokio::sync::oneshot;
 
 use crate::backend::TransactionBeginMode;
-use crate::common::escape_sql_string;
 use crate::{LixBackend, LixError, Value};
 
 use super::schema_access::load_live_row_shape_with_backend;
@@ -94,6 +93,12 @@ pub async fn open_state_by_version_snapshot(
     Ok(Arc::new(
         SnapshotBackedStateByVersion::load(backend, version_id).await?,
     ))
+}
+
+pub fn open_state_by_version_reader_with_backend(
+    backend: Arc<dyn LixBackend + Send + Sync>,
+) -> Arc<dyn StateByVersionSnapshot> {
+    Arc::new(BackendBackedStateByVersion { backend })
 }
 
 pub async fn open_state_by_version_snapshot_with_shared_backend(
@@ -275,6 +280,32 @@ impl StateByVersionSnapshot for TransactionBackedStateByVersion {
                 "state_by_version snapshot worker dropped scan reply",
             )
         })?
+    }
+}
+
+#[async_trait(?Send)]
+impl StateByVersionSnapshot for BackendBackedStateByVersion {
+    async fn scan_state_by_version_batches(
+        &self,
+        request: &StateByVersionScanRequest,
+    ) -> Result<Vec<RecordBatch>, LixError> {
+        let mut rows =
+            load_state_by_version_rows(self.backend.as_ref(), &request.version_id, request).await?;
+
+        if !request.filters.is_empty() {
+            rows.retain(|row| {
+                request
+                    .filters
+                    .iter()
+                    .all(|filter| matches_filter(row, filter))
+            });
+        }
+
+        if let Some(limit) = request.limit {
+            rows.truncate(limit);
+        }
+
+        state_surface_batches_from_rows(&request.projection, &rows)
     }
 }
 
@@ -506,7 +537,11 @@ async fn load_state_by_version_rows(
         );
     }
 
-    let change_commit_ids = load_change_commit_ids_with_backend(backend, &rows).await?;
+    let change_commit_ids = if request_needs_commit_id(request) {
+        load_change_commit_ids_with_backend(backend, &rows).await?
+    } else {
+        BTreeMap::new()
+    };
     Ok(rows
         .into_iter()
         .map(|row| StateSurfaceRow {
@@ -526,9 +561,29 @@ async fn load_state_by_version_rows(
                 .and_then(|change_id| change_commit_ids.get(change_id).cloned()),
             change_id: row.change_id,
             untracked: row.untracked,
-            version_id: row.version_id,
+            // `state_by_version` exposes the effective row visible for the requested scope.
+            // Global fallback stays visible via `global = true`, while the public version
+            // column reflects the explicit version scope the query asked for.
+            version_id: version_id.to_string(),
         })
         .collect())
+}
+
+fn request_needs_commit_id(request: &StateByVersionScanRequest) -> bool {
+    request.projection.is_empty()
+        || request.projection.contains(&StateSurfaceColumn::CommitId)
+        || request
+            .filters
+            .iter()
+            .any(|filter| matches_filter_column(filter, StateSurfaceColumn::CommitId))
+}
+
+fn matches_filter_column(filter: &StateSurfaceFilter, column: StateSurfaceColumn) -> bool {
+    match filter {
+        StateSurfaceFilter::Eq(candidate, _) | StateSurfaceFilter::In(candidate, _) => {
+            *candidate == column
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -837,21 +892,27 @@ async fn load_effective_rows_for_schema(
         )
         .await?;
 
-        for row in lane_rows {
-            let key = (row.entity_id.clone(), row.file_id.clone());
+        for lane_row in lane_rows {
+            let key = (lane_row.row.entity_id.clone(), lane_row.row.file_id.clone());
             if resolved.contains_key(&key) || hidden.contains(&key) {
                 continue;
             }
 
-            if row.snapshot_content.is_none() {
+            if lane_row.is_tombstone {
                 hidden.insert(key);
             } else {
-                resolved.insert(key, row);
+                resolved.insert(key, lane_row.row);
             }
         }
     }
 
     Ok(resolved.into_values().collect())
+}
+
+#[derive(Debug)]
+struct StateSurfaceLaneRow {
+    row: LiveRow,
+    is_tombstone: bool,
 }
 
 fn request_needs_snapshot_content(request: &StateByVersionScanRequest) -> bool {
@@ -899,7 +960,7 @@ async fn load_effective_rows_for_lane(
     force_global: bool,
     query: &LiveRowQuery,
     source_limit: Option<usize>,
-) -> Result<Vec<LiveRow>, LixError> {
+) -> Result<Vec<StateSurfaceLaneRow>, LixError> {
     match query.source {
         LiveRowSource::Tracked => {
             load_tracked_rows_for_lane(
@@ -938,7 +999,7 @@ async fn load_tracked_rows_for_lane(
     required_columns: &[String],
     force_global: bool,
     query: &LiveRowQuery,
-) -> Result<Vec<LiveRow>, LixError> {
+) -> Result<Vec<StateSurfaceLaneRow>, LixError> {
     let mut rows = scan_tracked_rows_with_backend(
         backend,
         &TrackedScanRequest {
@@ -982,7 +1043,7 @@ async fn load_untracked_rows_for_lane(
     force_global: bool,
     query: &LiveRowQuery,
     source_limit: Option<usize>,
-) -> Result<Vec<LiveRow>, LixError> {
+) -> Result<Vec<StateSurfaceLaneRow>, LixError> {
     let request = UntrackedScanRequest {
         schema_key: schema_key.to_string(),
         version_id: query.version_id.clone(),
@@ -1003,24 +1064,27 @@ fn tracked_row_to_live_row(
     row: TrackedRow,
     snapshot_shape: &Option<super::LiveRowShape>,
     force_global: bool,
-) -> Result<LiveRow, LixError> {
-    Ok(LiveRow {
-        entity_id: row.entity_id.clone(),
-        file_id: row.file_id.clone(),
-        schema_key: row.schema_key.clone(),
-        schema_version: row.schema_version,
-        version_id: row.version_id,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        change_id: row.change_id,
-        global: force_global || row.global,
-        untracked: false,
-        created_at: Some(row.created_at),
-        updated_at: Some(row.updated_at),
-        snapshot_content: snapshot_shape
-            .as_ref()
-            .map(|shape| shape.snapshot_text_from_values(&row.schema_key, &row.values))
-            .transpose()?,
+) -> Result<StateSurfaceLaneRow, LixError> {
+    Ok(StateSurfaceLaneRow {
+        row: LiveRow {
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+            schema_key: row.schema_key.clone(),
+            schema_version: row.schema_version,
+            version_id: row.version_id,
+            plugin_key: row.plugin_key,
+            metadata: row.metadata,
+            change_id: row.change_id,
+            global: force_global || row.global,
+            untracked: false,
+            created_at: Some(row.created_at),
+            updated_at: Some(row.updated_at),
+            snapshot_content: snapshot_shape
+                .as_ref()
+                .map(|shape| shape.snapshot_text_from_values(&row.schema_key, &row.values))
+                .transpose()?,
+        },
+        is_tombstone: false,
     })
 }
 
@@ -1028,42 +1092,51 @@ fn untracked_row_to_live_row(
     row: UntrackedRow,
     snapshot_shape: &Option<super::LiveRowShape>,
     force_global: bool,
-) -> Result<LiveRow, LixError> {
-    Ok(LiveRow {
-        entity_id: row.entity_id.clone(),
-        file_id: row.file_id.clone(),
-        schema_key: row.schema_key.clone(),
-        schema_version: row.schema_version,
-        version_id: row.version_id,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        change_id: Some(row.change_id),
-        global: force_global || row.global,
-        untracked: true,
-        created_at: Some(row.created_at),
-        updated_at: Some(row.updated_at),
-        snapshot_content: snapshot_shape
-            .as_ref()
-            .map(|shape| shape.snapshot_text_from_values(&row.schema_key, &row.values))
-            .transpose()?,
+) -> Result<StateSurfaceLaneRow, LixError> {
+    Ok(StateSurfaceLaneRow {
+        row: LiveRow {
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+            schema_key: row.schema_key.clone(),
+            schema_version: row.schema_version,
+            version_id: row.version_id,
+            plugin_key: row.plugin_key,
+            metadata: row.metadata,
+            change_id: Some(row.change_id),
+            global: force_global || row.global,
+            untracked: true,
+            created_at: Some(row.created_at),
+            updated_at: Some(row.updated_at),
+            snapshot_content: snapshot_shape
+                .as_ref()
+                .map(|shape| shape.snapshot_text_from_values(&row.schema_key, &row.values))
+                .transpose()?,
+        },
+        is_tombstone: false,
     })
 }
 
-fn tracked_tombstone_to_live_row(row: TrackedTombstoneMarker, force_global: bool) -> LiveRow {
-    LiveRow {
-        entity_id: row.entity_id,
-        file_id: row.file_id,
-        schema_key: row.schema_key,
-        schema_version: row.schema_version.unwrap_or_default(),
-        version_id: row.version_id,
-        plugin_key: row.plugin_key,
-        metadata: row.metadata,
-        change_id: row.change_id,
-        global: force_global || row.global,
-        untracked: false,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-        snapshot_content: None,
+fn tracked_tombstone_to_live_row(
+    row: TrackedTombstoneMarker,
+    force_global: bool,
+) -> StateSurfaceLaneRow {
+    StateSurfaceLaneRow {
+        row: LiveRow {
+            entity_id: row.entity_id,
+            file_id: row.file_id,
+            schema_key: row.schema_key,
+            schema_version: row.schema_version.unwrap_or_default(),
+            version_id: row.version_id,
+            plugin_key: row.plugin_key,
+            metadata: row.metadata,
+            change_id: row.change_id,
+            global: force_global || row.global,
+            untracked: false,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            snapshot_content: None,
+        },
+        is_tombstone: true,
     }
 }
 
@@ -1108,29 +1181,16 @@ async fn load_change_commit_ids_with_backend(
         return Ok(BTreeMap::new());
     }
 
-    let in_list = change_ids
-        .iter()
-        .map(|change_id| format!("'{}'", escape_sql_string(change_id)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!(
-        "WITH {change_commit_cte} \
-         SELECT change_id, commit_id \
-         FROM change_commit_by_change_id \
-         WHERE change_id IN ({in_list})",
-        change_commit_cte =
-            crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect()),
-    );
-    let result = backend.execute(&sql, &[]).await?;
-    let mut commit_ids = BTreeMap::new();
-    for row in result.rows {
-        let Some(Value::Text(change_id)) = row.first() else {
-            continue;
-        };
-        let Some(Value::Text(commit_id)) = row.get(1) else {
-            continue;
-        };
-        commit_ids.insert(change_id.clone(), commit_id.clone());
+    let mut executor = backend;
+    crate::canonical::load_change_commit_ids_with_executor(&mut executor, &change_ids).await
+}
+#[derive(Clone)]
+struct BackendBackedStateByVersion {
+    backend: Arc<dyn LixBackend + Send + Sync>,
+}
+
+impl std::fmt::Debug for BackendBackedStateByVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendBackedStateByVersion").finish()
     }
-    Ok(commit_ids)
 }

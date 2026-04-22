@@ -1,17 +1,15 @@
-use std::collections::BTreeMap;
-
-use crate::canonical::{
-    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
+use crate::catalog::load_version_surface_row_with_backend;
+use crate::live_state::load_version_head_commit_map_with_executor;
+use crate::live_state::tracked::{
+    scan_rows_with_backend as scan_tracked_rows_with_backend, TrackedScanRequest,
 };
-use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
 use crate::transaction::PendingOverlay;
 use crate::version::{
-    parse_version_descriptor_snapshot, parse_version_ref_snapshot, version_descriptor_file_id,
-    version_descriptor_plugin_key, version_descriptor_schema_key,
+    parse_version_descriptor_snapshot, parse_version_ref_snapshot, version_descriptor_schema_key,
     version_descriptor_schema_version, version_ref_schema_key, version_ref_storage_version_id,
     GLOBAL_VERSION_ID,
 };
-use crate::{LixBackend, LixError, NullableKeyFilter, Value};
+use crate::{LixBackend, LixError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResolvedVersionAdminState {
@@ -35,63 +33,142 @@ pub(crate) async fn load_version_admin_state_with_backend(
     pending_overlay: Option<&dyn PendingOverlay>,
     version_id: &str,
 ) -> Result<Option<ResolvedVersionAdminState>, LixError> {
-    let mut executor = backend;
-    let Some(descriptor) =
-        load_version_descriptor_with_pending_overlay(&mut executor, pending_overlay, version_id)
-            .await?
-    else {
-        return Ok(None);
+    let descriptor = match pending_version_descriptor_row(pending_overlay, version_id)? {
+        Some(descriptor) => descriptor,
+        None => load_effective_version_descriptor_with_backend(backend, version_id).await?,
     };
-    let head_commit_id = load_version_head_commit_id_with_pending_overlay(
-        &mut executor,
-        pending_overlay,
-        version_id,
-    )
-    .await?;
+    let head_commit_id = match pending_version_head_commit_id(pending_overlay, version_id)? {
+        Some(head_commit_id) => head_commit_id,
+        None => load_effective_version_head_commit_id_with_backend(backend, version_id).await?,
+    };
 
-    Ok(Some(ResolvedVersionAdminState {
-        version_id: descriptor.version_id,
-        name: descriptor.name,
-        hidden: descriptor.hidden,
-        descriptor_change_id: descriptor.change_id,
-        head_commit_id,
-    }))
+    match (descriptor, head_commit_id) {
+        (Some(descriptor), head_commit_id) => Ok(Some(ResolvedVersionAdminState {
+            version_id: descriptor.version_id,
+            name: descriptor.name,
+            hidden: descriptor.hidden,
+            descriptor_change_id: descriptor.change_id,
+            head_commit_id,
+        })),
+        (None, Some(commit_id)) => Ok(Some(ResolvedVersionAdminState {
+            version_id: version_id.to_string(),
+            name: version_id.to_string(),
+            hidden: false,
+            descriptor_change_id: None,
+            head_commit_id: Some(commit_id),
+        })),
+        (None, None) => {
+            let Some(row) = load_version_surface_row_with_backend(backend, version_id).await?
+            else {
+                return Ok(None);
+            };
+            Ok(Some(ResolvedVersionAdminState {
+                version_id: row.id,
+                name: row.name,
+                hidden: row.hidden,
+                descriptor_change_id: None,
+                head_commit_id: Some(row.commit_id),
+            }))
+        }
+    }
 }
 
-async fn load_version_head_commit_id_with_pending_overlay(
-    executor: &mut dyn crate::backend::QueryExecutor,
-    pending_overlay: Option<&dyn PendingOverlay>,
+async fn load_effective_version_descriptor_with_backend(
+    backend: &dyn LixBackend,
     version_id: &str,
-) -> Result<Option<String>, LixError> {
-    if let Some(pending) = pending_version_head_commit_id(pending_overlay, version_id)? {
-        return Ok(pending);
-    }
-
-    let Some(row) = load_exact_untracked_row_with_executor(
-        executor,
-        &ExactUntrackedRowRequest {
-            schema_key: version_ref_schema_key().to_string(),
-            version_id: version_ref_storage_version_id().to_string(),
-            entity_id: version_id.to_string(),
-            file_id: NullableKeyFilter::Null,
+) -> Result<Option<VersionDescriptorRow>, LixError> {
+    let row = scan_tracked_rows_with_backend(
+        backend,
+        &TrackedScanRequest {
+            schema_key: version_descriptor_schema_key().to_string(),
+            version_id: GLOBAL_VERSION_ID.to_string(),
+            constraints: Vec::new(),
+            required_columns: vec!["id".to_string(), "name".to_string(), "hidden".to_string()],
         },
     )
     .await?
-    else {
+    .into_iter()
+    .find(|row| {
+        row.entity_id == version_id
+            && row.file_id.is_none()
+            && row.plugin_key.is_none()
+            && row.schema_version == version_descriptor_schema_version()
+    });
+
+    let Some(row) = row else {
         return Ok(None);
     };
 
-    let Some(commit_id) = row
-        .property_text("commit_id")
-        .filter(|value| !value.trim().is_empty())
-    else {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            format!("local version head for '{version_id}' has empty commit_id"),
-        ));
-    };
+    let version_id = row
+        .values
+        .get("id")
+        .and_then(|value| match value {
+            crate::Value::Text(value) => Some(value.clone()),
+            _ => None,
+        })
+        .unwrap_or(row.entity_id);
+    let name = row
+        .values
+        .get("name")
+        .and_then(|value| match value {
+            crate::Value::Text(value) => Some(value.clone()),
+            _ => None,
+        })
+        .unwrap_or_default();
+    let hidden = row
+        .values
+        .get("hidden")
+        .and_then(|value| match value {
+            crate::Value::Boolean(value) => Some(*value),
+            crate::Value::Integer(value) => Some(*value != 0),
+            _ => None,
+        })
+        .unwrap_or(false);
 
-    Ok(Some(commit_id))
+    Ok(Some(VersionDescriptorRow {
+        version_id,
+        name,
+        hidden,
+        change_id: row.change_id,
+    }))
+}
+
+async fn load_effective_version_head_commit_id_with_backend(
+    backend: &dyn LixBackend,
+    version_id: &str,
+) -> Result<Option<String>, LixError> {
+    let mut executor = backend;
+    Ok(load_version_head_commit_map_with_executor(&mut executor)
+        .await?
+        .and_then(|heads| heads.get(version_id).cloned()))
+}
+
+fn pending_version_admin_state(
+    pending_overlay: Option<&dyn PendingOverlay>,
+    version_id: &str,
+) -> Result<Option<Option<ResolvedVersionAdminState>>, LixError> {
+    let descriptor = pending_version_descriptor_row(pending_overlay, version_id)?;
+    let head_commit_id = pending_version_head_commit_id(pending_overlay, version_id)?;
+
+    match (descriptor, head_commit_id) {
+        (Some(None), _) => Ok(Some(None)),
+        (Some(Some(descriptor)), head_commit_id) => Ok(Some(Some(ResolvedVersionAdminState {
+            version_id: descriptor.version_id,
+            name: descriptor.name,
+            hidden: descriptor.hidden,
+            descriptor_change_id: descriptor.change_id,
+            head_commit_id: head_commit_id.flatten(),
+        }))),
+        (None, Some(Some(commit_id))) => Ok(Some(Some(ResolvedVersionAdminState {
+            version_id: version_id.to_string(),
+            name: version_id.to_string(),
+            hidden: false,
+            descriptor_change_id: None,
+            head_commit_id: Some(commit_id),
+        }))),
+        (None, Some(None)) => Ok(Some(None)),
+        (None, None) => Ok(None),
+    }
 }
 
 fn pending_version_head_commit_id(
@@ -132,58 +209,6 @@ fn pending_version_head_commit_id(
     }
 
     Ok(Some(Some(snapshot.commit_id)))
-}
-
-async fn load_version_descriptor_with_pending_overlay(
-    executor: &mut dyn crate::backend::QueryExecutor,
-    pending_overlay: Option<&dyn PendingOverlay>,
-    version_id: &str,
-) -> Result<Option<VersionDescriptorRow>, LixError> {
-    if let Some(pending) = pending_version_descriptor_row(pending_overlay, version_id)? {
-        return Ok(pending);
-    }
-
-    let Some(global_head_commit_id) =
-        load_version_head_commit_id_with_pending_overlay(executor, None, GLOBAL_VERSION_ID).await?
-    else {
-        return Ok(None);
-    };
-    let row = load_exact_committed_change_from_commit_with_executor(
-        executor,
-        &global_head_commit_id,
-        &ExactCommittedStateRowRequest {
-            entity_id: version_id.to_string(),
-            schema_key: version_descriptor_schema_key().to_string(),
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            exact_filters: BTreeMap::from([
-                (
-                    "file_id".to_string(),
-                    version_descriptor_file_id()
-                        .map(|value| Value::Text(value.to_string()))
-                        .unwrap_or(Value::Null),
-                ),
-                (
-                    "plugin_key".to_string(),
-                    version_descriptor_plugin_key()
-                        .map(|value| Value::Text(value.to_string()))
-                        .unwrap_or(Value::Null),
-                ),
-                (
-                    "schema_version".to_string(),
-                    Value::Text(version_descriptor_schema_version().to_string()),
-                ),
-            ]),
-        },
-    )
-    .await?;
-    let Some(row) = row else {
-        return Ok(None);
-    };
-    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
-        return Ok(None);
-    };
-
-    Ok(Some(parse_descriptor_row(snapshot_content, Some(row.id))?))
 }
 
 fn pending_version_descriptor_row(
