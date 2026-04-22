@@ -21,10 +21,25 @@ pub(crate) async fn execute_prepared_public_read_artifact_in_transaction(
     )
     .await?;
     let backend = crate::backend::transaction_backend_view(transaction);
-    execute_prepared_public_read_artifact_without_freshness_check_with_backend(
-        &backend, host, artifact,
-    )
-    .await
+    let result = match &artifact.execution {
+        PreparedPublicReadPlanArtifact::ReadTimeProjection(artifact) => {
+            execute_read_time_projection_read(&backend, host, &artifact.read).await?
+        }
+        PreparedPublicReadPlanArtifact::PreparedBatch(execution_artifact) => {
+            execute_prepared_batch_with_backend(&backend, &execution_artifact.prepared_batch)
+                .await
+                .map_err(|error| {
+                    translate_lowered_public_read_error(error, &artifact.resolved_relations)
+                })?
+        }
+        PreparedPublicReadPlanArtifact::HistoryRead(artifact) => {
+            execute_history_read_plan_with_backend(&backend, &artifact.plan).await?
+        }
+        PreparedPublicReadPlanArtifact::Sql2(artifact) => {
+            crate::sql2::execute_read_with_backend(&backend, &artifact.artifact).await?
+        }
+    };
+    Ok(finalize_prepared_public_read_result(result, artifact))
 }
 
 pub(crate) async fn execute_prepared_public_read_artifact_with_backend(

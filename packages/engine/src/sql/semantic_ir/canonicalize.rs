@@ -2005,6 +2005,15 @@ mod tests {
             &mut registry,
             DynamicEntitySurfaceSpec {
                 schema_key: "lix_key_value".to_string(),
+                schema: json!({
+                    "x-lix-key": "lix_key_value",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" },
+                        "value": { "type": "string" }
+                    }
+                }),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
             },
@@ -2332,6 +2341,15 @@ mod tests {
             &mut registry,
             DynamicEntitySurfaceSpec {
                 schema_key: "lix_key_value".to_string(),
+                schema: json!({
+                    "x-lix-key": "lix_key_value",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" },
+                        "value": { "type": "string" }
+                    }
+                }),
                 visible_columns: vec!["key".to_string(), "value".to_string()],
                 column_types: BTreeMap::new(),
             },
@@ -2390,6 +2408,15 @@ mod tests {
             &mut registry,
             DynamicEntitySurfaceSpec {
                 schema_key: "test_json_entity".to_string(),
+                schema: json!({
+                    "x-lix-key": "test_json_entity",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "key": { "type": "string" },
+                        "payload": { "type": "object" }
+                    }
+                }),
                 visible_columns: vec!["key".to_string(), "payload".to_string()],
                 column_types: BTreeMap::new(),
             },

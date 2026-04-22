@@ -350,7 +350,7 @@ async fn prepare_required_active_public_read_artifact_with_reader(
             "public write selector resolver expected a public read plan",
         ));
     };
-    prepare_public_read_artifact(&public_read, dialect)
+    prepare_public_read_artifact(&public_read, &preparation_context.registry, dialect)
 }
 
 async fn derive_read_time_projection_rows_with_registry(

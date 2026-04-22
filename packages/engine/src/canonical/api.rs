@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::backend::{transaction_backend_view, QueryExecutor};
+use crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql;
 use crate::canonical::graph::{
     build_commit_graph_node_prepared_batch, resolve_commit_graph_node_write_rows_with_executor,
 };
@@ -465,6 +466,40 @@ pub(crate) async fn load_commit_member_change(
         )));
     }
     Ok(change.map(canonical_change_from_row))
+}
+
+pub(crate) async fn load_change_commit_ids_with_executor(
+    executor: &mut dyn QueryExecutor,
+    change_ids: &BTreeSet<String>,
+) -> Result<BTreeMap<String, String>, LixError> {
+    if change_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+
+    let in_list = change_ids
+        .iter()
+        .map(|change_id| format!("'{}'", escape_sql_string(change_id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "WITH {change_commit_cte} \
+         SELECT change_id, commit_id \
+         FROM change_commit_by_change_id \
+         WHERE change_id IN ({in_list})",
+        change_commit_cte = build_lazy_change_commit_by_change_id_ctes_sql(executor.dialect()),
+    );
+    let result = executor.execute(&sql, &[]).await?;
+    let mut rows = BTreeMap::new();
+    for row in result.rows {
+        let Some(Value::Text(change_id)) = row.first() else {
+            continue;
+        };
+        let Some(Value::Text(commit_id)) = row.get(1) else {
+            continue;
+        };
+        rows.insert(change_id.clone(), commit_id.clone());
+    }
+    Ok(rows)
 }
 
 pub(crate) async fn load_exact_row_at_commit(

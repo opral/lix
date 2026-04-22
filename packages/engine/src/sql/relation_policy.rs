@@ -77,6 +77,7 @@ fn normalize_relation_name(relation_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use std::collections::BTreeMap;
 
     use crate::catalog::{
@@ -127,6 +128,15 @@ mod tests {
         registry.insert_descriptors(entity_surface_descriptors(
             &DynamicEntitySurfaceSpec {
                 schema_key: "project_message".to_string(),
+                schema: json!({
+                    "x-lix-key": "project_message",
+                    "x-lix-version": "1",
+                    "type": "object",
+                    "properties": {
+                        "id": { "type": "string" },
+                        "body": { "type": "string" }
+                    }
+                }),
                 visible_columns: vec!["id".to_string(), "body".to_string()],
                 column_types: BTreeMap::new(),
             },

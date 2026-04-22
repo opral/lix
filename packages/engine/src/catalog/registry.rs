@@ -1,5 +1,6 @@
 //! Catalog-owned public relation registry contracts.
 
+use serde_json::Value as JsonValue;
 use sqlparser::ast::{ObjectName, ObjectNamePart};
 use std::collections::BTreeMap;
 
@@ -140,6 +141,7 @@ pub(crate) struct ResolvedRelation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DynamicEntitySurfaceSpec {
     pub(crate) schema_key: String,
+    pub(crate) schema: JsonValue,
     pub(crate) visible_columns: Vec<String>,
     pub(crate) column_types: BTreeMap<String, SurfaceColumnType>,
 }
@@ -148,6 +150,7 @@ pub(crate) struct DynamicEntitySurfaceSpec {
 pub(crate) struct SurfaceRegistry {
     epoch: CatalogEpoch,
     descriptors: BTreeMap<String, SurfaceDescriptor>,
+    dynamic_schemas: BTreeMap<String, JsonValue>,
 }
 
 impl SurfaceRegistry {
@@ -271,9 +274,21 @@ impl SurfaceRegistry {
         self.registered_state_backed_schema_keys()
     }
 
+    pub(crate) fn dynamic_schema_definition(&self, schema_key: &str) -> Option<&JsonValue> {
+        self.dynamic_schemas.get(schema_key)
+    }
+
     fn insert_descriptor(&mut self, descriptor: SurfaceDescriptor) {
         self.descriptors
             .insert(normalize_surface_name(&descriptor.public_name), descriptor);
+    }
+
+    pub(crate) fn upsert_dynamic_schema(&mut self, schema_key: String, schema: JsonValue) {
+        self.dynamic_schemas.insert(schema_key, schema);
+    }
+
+    pub(crate) fn remove_dynamic_schema(&mut self, schema_key: &str) {
+        self.dynamic_schemas.remove(schema_key);
     }
 
     fn descriptor_name_available(&self, descriptor: &SurfaceDescriptor) -> bool {
