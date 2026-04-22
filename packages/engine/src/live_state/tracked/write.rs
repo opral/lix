@@ -1,9 +1,3 @@
-use crate::common::storage_scope_key_for_file_id;
-use crate::live_state::storage::{
-    load_live_table_layout_with_executor, normalized_insert_columns_sql,
-    normalized_insert_values_sql, normalized_live_column_values, normalized_update_assignments_sql,
-    quoted_live_table_name,
-};
 use crate::live_state::store::LiveStateTransactionRef;
 use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::LixError;
@@ -69,69 +63,11 @@ async fn apply_materialized_row_in_transaction(
     snapshot_content: Option<&str>,
     is_tombstone: bool,
 ) -> Result<(), LixError> {
-    let layout = {
-        let mut executor = &mut *transaction;
-        load_live_table_layout_with_executor(&mut executor, &row.schema_key).await?
-    };
-    let normalized_values = normalized_live_column_values(&layout, snapshot_content)?
-        .into_iter()
-        .collect::<Vec<_>>();
-    let normalized_columns = normalized_insert_columns_sql(&normalized_values);
-    let normalized_values_sql = normalized_insert_values_sql(&normalized_values);
-    let normalized_updates = normalized_update_assignments_sql(&normalized_values);
-    let created_at = row.created_at.as_deref().unwrap_or(&row.updated_at);
-    let metadata_sql = row
-        .metadata
-        .as_deref()
-        .map(crate::live_state::constraints::sql_literal_text)
-        .unwrap_or_else(|| "NULL".to_string());
-    let file_id_sql = row
-        .file_id
-        .as_deref()
-        .map(crate::live_state::constraints::sql_literal_text)
-        .unwrap_or_else(|| "NULL".to_string());
-    let storage_scope_key_sql = crate::live_state::constraints::sql_literal_text(
-        &storage_scope_key_for_file_id(row.file_id.as_deref()),
-    );
-    let plugin_key_sql = row
-        .plugin_key
-        .as_deref()
-        .map(crate::live_state::constraints::sql_literal_text)
-        .unwrap_or_else(|| "NULL".to_string());
-    let sql = format!(
-        "INSERT INTO {table} (\
-         entity_id, schema_key, schema_version, file_id, storage_scope_key, version_id, global, plugin_key, change_id, metadata, is_tombstone, created_at, updated_at{normalized_columns}\
-         ) VALUES (\
-         '{entity_id}', '{schema_key}', '{schema_version}', {file_id}, {storage_scope_key}, '{version_id}', {global}, {plugin_key}, '{change_id}', {metadata}, {is_tombstone}, '{created_at}', '{updated_at}'{normalized_values}\
-         ) ON CONFLICT (entity_id, storage_scope_key, version_id, untracked) DO UPDATE SET \
-         schema_key = excluded.schema_key, \
-         schema_version = excluded.schema_version, \
-         file_id = excluded.file_id, \
-         global = excluded.global, \
-         plugin_key = excluded.plugin_key, \
-         change_id = excluded.change_id, \
-         metadata = excluded.metadata, \
-         is_tombstone = excluded.is_tombstone, \
-         created_at = excluded.created_at, \
-         updated_at = excluded.updated_at{normalized_updates}",
-        table = quoted_live_table_name(&row.schema_key),
-        entity_id = crate::live_state::constraints::escape_sql_string(&row.entity_id),
-        schema_key = crate::live_state::constraints::escape_sql_string(&row.schema_key),
-        schema_version = crate::live_state::constraints::escape_sql_string(&row.schema_version),
-        version_id = crate::live_state::constraints::escape_sql_string(&row.version_id),
-        global = if row.global { "true" } else { "false" },
-        change_id = crate::live_state::constraints::escape_sql_string(&row.change_id),
-        metadata = metadata_sql,
-        is_tombstone = if is_tombstone { "1" } else { "0" },
-        created_at = crate::live_state::constraints::escape_sql_string(created_at),
-        updated_at = crate::live_state::constraints::escape_sql_string(&row.updated_at),
-        file_id = file_id_sql,
-        storage_scope_key = storage_scope_key_sql,
-        plugin_key = plugin_key_sql,
-        normalized_columns = normalized_columns,
-        normalized_values = normalized_values_sql,
-        normalized_updates = normalized_updates,
-    );
-    crate::live_state::store_sql::execute_query_with_transaction(transaction, &sql, &[]).await?;
-    Ok(())
+    crate::live_state::storage::upsert_tracked_live_row_in_transaction(
+        transaction,
+        row,
+        snapshot_content,
+        is_tombstone,
+    )
+    .await
 }

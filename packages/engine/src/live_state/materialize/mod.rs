@@ -45,7 +45,7 @@ pub(crate) async fn rebuild_plan_with_transaction(
     transaction: LiveStateTransactionRef<'_>,
     req: &LiveStateRebuildRequest,
 ) -> Result<LiveStateRebuildPlan, LixError> {
-    let mut executor = crate::live_state::store_sql::executor_from_transaction(transaction);
+    let mut executor = crate::live_state::storage::transaction_executor_view(transaction);
     rebuild_plan_with_executor(&mut executor, req).await
 }
 

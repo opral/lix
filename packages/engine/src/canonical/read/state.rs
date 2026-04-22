@@ -7,8 +7,10 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
+use crate::canonical::storage::{
+    load_change_row_by_id, load_commit_snapshot_content, untracked_visibility_exists,
+};
 use crate::canonical::store::CanonicalCommitQueryExecutor;
-use crate::canonical::store_sql::execute_query_with_executor;
 use crate::common::is_missing_relation_error;
 use crate::schema::LixCommit;
 use crate::{LixError, Value};
@@ -209,29 +211,12 @@ pub(crate) async fn load_commit_lineage_entry_by_id(
     executor: &mut CanonicalCommitQueryExecutor<'_>,
     commit_id: &str,
 ) -> Result<Option<CommitLineageEntry>, LixError> {
-    let sql = format!(
-        "SELECT s.content AS snapshot_content \
-         FROM lix_internal_change c \
-         LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-         WHERE c.schema_key = 'lix_commit' \
-           AND c.entity_id = '{commit_id}' \
-           AND c.file_id IS NULL \
-           AND c.plugin_key IS NULL \
-           AND s.content IS NOT NULL \
-         LIMIT 1",
-        commit_id = escape_sql_string(commit_id),
-    );
-    let result = match execute_query_with_executor(executor, &sql, &[]).await {
+    let snapshot_content = match load_commit_snapshot_content(executor, commit_id).await {
         Ok(result) => result,
         Err(err) if is_missing_relation_error(&err) => return Ok(None),
         Err(err) => return Err(err),
     };
-    let Some(snapshot_content) = result
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .and_then(text_from_value)
-    else {
+    let Some(snapshot_content) = snapshot_content else {
         return Ok(None);
     };
     let parsed: LixCommit = serde_json::from_str(&snapshot_content).map_err(|error| {
@@ -252,44 +237,7 @@ pub(crate) async fn load_canonical_change_row_by_id(
     executor: &mut CanonicalCommitQueryExecutor<'_>,
     change_id: &str,
 ) -> Result<Option<CommittedCanonicalChangeRow>, LixError> {
-    let sql = "SELECT c.id, c.entity_id, c.schema_key, c.schema_version, c.file_id, c.plugin_key, s.content, c.metadata, c.created_at \
-               FROM lix_internal_change c \
-               LEFT JOIN lix_internal_snapshot s ON s.id = c.snapshot_id \
-               WHERE c.id = $1 \
-               LIMIT 1";
-    let result =
-        execute_query_with_executor(executor, sql, &[Value::Text(change_id.to_string())]).await?;
-    let Some(row) = result.rows.first() else {
-        return Ok(None);
-    };
-    Ok(Some(CommittedCanonicalChangeRow {
-        id: required_text(row, 0, "lix_internal_change.id")?,
-        entity_id: required_text(row, 1, "lix_internal_change.entity_id")?,
-        schema_key: required_text(row, 2, "lix_internal_change.schema_key")?,
-        schema_version: required_text(row, 3, "lix_internal_change.schema_version")?,
-        file_id: row.get(4).and_then(text_from_value),
-        plugin_key: row.get(5).and_then(text_from_value),
-        snapshot_content: row.get(6).and_then(text_from_value),
-        metadata: row.get(7).and_then(text_from_value),
-        created_at: required_text(row, 8, "lix_internal_change.created_at")?,
-    }))
-}
-
-async fn untracked_visibility_exists(
-    executor: &mut CanonicalCommitQueryExecutor<'_>,
-    change_id: &str,
-) -> Result<bool, LixError> {
-    let sql = format!(
-        "SELECT 1 \
-         FROM {} \
-         WHERE change_id = {} \
-         LIMIT 1",
-        crate::canonical::journal::UNTRACKED_CHANGE_VISIBILITY_TABLE,
-        executor.dialect().placeholder(1),
-    );
-    let result =
-        execute_query_with_executor(executor, &sql, &[Value::Text(change_id.to_string())]).await?;
-    Ok(!result.rows.is_empty())
+    load_change_row_by_id(executor, change_id).await
 }
 
 fn matches_exact_text_filter(actual: Option<&str>, expected: &Value) -> bool {
@@ -300,32 +248,6 @@ fn matches_exact_text_filter(actual: Option<&str>, expected: &Value) -> bool {
         Value::Boolean(expected) => actual.is_some_and(|actual| actual == expected.to_string()),
         Value::Real(expected) => actual.is_some_and(|actual| actual == expected.to_string()),
         _ => false,
-    }
-}
-
-fn text_from_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Text(value) => Some(value.clone()),
-        Value::Integer(value) => Some(value.to_string()),
-        Value::Boolean(value) => Some(value.to_string()),
-        Value::Real(value) => Some(value.to_string()),
-        _ => None,
-    }
-}
-
-fn escape_sql_string(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
-fn required_text(row: &[Value], index: usize, field: &str) -> Result<String, LixError> {
-    match row.get(index) {
-        Some(Value::Text(value)) if !value.is_empty() => Ok(value.clone()),
-        Some(Value::Text(_)) => Err(LixError::unknown(format!("{field} is empty"))),
-        Some(Value::Integer(value)) => Ok(value.to_string()),
-        Some(other) => Err(LixError::unknown(format!(
-            "expected text-like value for {field}, got {other:?}"
-        ))),
-        None => Err(LixError::unknown(format!("missing {field}"))),
     }
 }
 

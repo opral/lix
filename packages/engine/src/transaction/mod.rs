@@ -10,6 +10,7 @@ pub(crate) mod buffered;
 mod buffered_write_transaction;
 mod checkpoint_labels;
 mod commit_artifacts;
+pub(crate) mod commit_idempotency;
 mod compiler_state;
 mod contracts;
 mod deterministic_sequence;
@@ -45,6 +46,7 @@ pub(crate) use commit_artifacts::{
     append_commit_idempotency_row, load_commit_change_snapshot_id_in_transaction,
     load_commit_idempotency_replay_in_transaction, PendingCommitLane, PendingCommitState,
 };
+pub(crate) use commit_idempotency::init_commit_idempotency_storage;
 pub(crate) use compiler_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
 };
@@ -62,7 +64,7 @@ pub(crate) use filesystem::payload_change::FilesystemPayloadChange;
 #[cfg(test)]
 pub(crate) use filesystem::runtime::FilesystemTransactionFileState;
 pub(crate) use filesystem::runtime::{
-    binary_blob_writes_from_filesystem_state, build_filesystem_payload_changes_insert,
+    binary_blob_writes_from_filesystem_state,
     compile_filesystem_finalization_from_state_in_transaction,
     compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_needs_exact_descriptors, merge_filesystem_transaction_state,
@@ -101,4 +103,6 @@ pub(crate) use prepared_artifacts::{
 pub(crate) use prepared_step::{stage_prepared_write_statement, PreparedWriteStatementStager};
 pub(crate) use prepared_write::{WriteCommand, WritePath, WriteResult};
 pub(crate) use validation_input::{UpdateValidationInput, UpdateValidationInputRow};
-pub(crate) use write_batch::{execute_write_batch_with_transaction, WriteBatch};
+pub(crate) use write_batch::{
+    execute_write_batch_with_transaction, PersistenceStatementSink, WriteBatch,
+};

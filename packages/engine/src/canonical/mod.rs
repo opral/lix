@@ -44,25 +44,24 @@
 //! `lix_commit_edge` as read-only query surfaces for SQL/public reads, but it
 //! does not own the meaning of those facts.
 //!
-mod api;
+pub(crate) mod api;
 mod change_commit_sql;
-mod checkpoint_labels;
+pub(crate) mod checkpoint_labels;
 mod graph;
-mod init;
 mod journal;
 pub(crate) mod json;
 mod read;
 mod receipt;
+pub(crate) mod storage;
 pub(crate) mod store;
-pub(crate) mod store_sql;
 
+use crate::canonical::storage::{
+    resolve_last_checkpoint_commit_id_for_tip, SqlCanonicalExecutorReadStore,
+    SqlCanonicalReadStore, SqlCanonicalWriteStore,
+};
 use crate::canonical::store::{
     CanonicalBackendRef, CanonicalExecutorRef, CanonicalReadStore, CanonicalTransactionRef,
     CanonicalWriteStore,
-};
-use crate::canonical::store_sql::{
-    resolve_last_checkpoint_commit_id_for_tip, SqlCanonicalExecutorReadStore,
-    SqlCanonicalReadStore, SqlCanonicalWriteStore,
 };
 use crate::functions::LixFunctionProvider;
 use crate::LixError;
@@ -80,9 +79,10 @@ pub(crate) use api::{
     load_exact_row_at_commit, CanonicalAppendSummary, CanonicalChange, CanonicalChangeWrite,
     CanonicalCommit, CanonicalContentMode, CanonicalHistoryContentMode, CanonicalHistoryRequest,
     CanonicalHistoryRootSelection, CanonicalHistoryRow, CanonicalRootCommit,
-    CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode,
-    CanonicalUntrackedVisibilityKind, CanonicalUntrackedVisibilityWrite, CanonicalVisibility,
-    CanonicalVisibleStateFilter, CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
+    CanonicalStateIdentity, CanonicalStateRow, CanonicalTombstoneMode, CanonicalUntrackedChangeRow,
+    CanonicalUntrackedIdentity, CanonicalUntrackedVisibilityKind,
+    CanonicalUntrackedVisibilityWrite, CanonicalVisibility, CanonicalVisibleStateFilter,
+    CanonicalVisibleStateRequest, CanonicalVisibleStateRow,
 };
 #[allow(unused_imports)]
 pub(crate) use checkpoint_labels::{
@@ -91,9 +91,11 @@ pub(crate) use checkpoint_labels::{
     CHECKPOINT_LABEL_NAME, CHECKPOINT_LABEL_SCHEMA_KEY,
 };
 pub(crate) use graph::{build_commit_generation_seed_sql, COMMIT_GRAPH_NODE_TABLE};
+pub(crate) use journal::write::UNTRACKED_CHANGE_VISIBILITY_TABLE;
 #[allow(unused_imports)]
 pub(crate) use read::{
-    load_exact_committed_change_from_commit_with_executor, ExactCommittedStateRowRequest,
+    load_exact_committed_change_from_commit_with_executor, CommittedCanonicalChangeRow,
+    ExactCommittedStateRowRequest,
 };
 pub(crate) const ENTITY_STATE_TIMELINE_BREAKPOINT_TABLE: &str =
     "lix_internal_entity_state_timeline_breakpoint";
@@ -111,7 +113,7 @@ pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
 }
 
 pub(crate) async fn init(backend: CanonicalBackendRef<'_>) -> Result<(), LixError> {
-    store_sql::init_storage(backend).await
+    crate::canonical::storage::init_storage(backend).await
 }
 
 pub(crate) async fn append_changes(

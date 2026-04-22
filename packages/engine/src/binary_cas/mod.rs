@@ -1,19 +1,16 @@
 mod chunking;
 mod codec;
-mod gc;
-mod init;
-mod read;
+pub(crate) mod gc;
+pub(crate) mod read;
 pub(crate) mod schema;
+pub(crate) mod storage;
 pub(crate) mod store;
-pub(crate) mod store_sql;
-mod write;
+pub(crate) mod write;
 
-use crate::binary_cas::store::{
-    BinaryCasBackendRef, BinaryCasReadStore, BinaryCasTransactionRef, BinaryCasWriteStore,
-};
-use crate::binary_cas::store_sql::{SqlBinaryCasReadStore, SqlBinaryCasWriteStore};
+use crate::binary_cas::store::{BinaryCasBackendRef, BinaryCasTransactionRef, BinaryCasWriteStore};
 use crate::transaction::WriteBatch;
 use crate::{LixError, SqlDialect};
+use storage::SqlBinaryCasWriteStore;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BinaryBlobWrite<'a> {
@@ -22,24 +19,21 @@ pub(crate) struct BinaryBlobWrite<'a> {
     pub data: &'a [u8],
 }
 
+pub(crate) use codec::decode_binary_chunk_payload;
 pub(crate) use read::BlobDataReader;
 
 pub(crate) async fn load_blob_data_by_hash(
     backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    SqlBinaryCasReadStore::new(backend)
-        .load_blob_data_by_hash(blob_hash)
-        .await
+    read::load_binary_blob_data_by_hash(backend, blob_hash).await
 }
 
 pub(crate) async fn blob_exists(
     backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<bool, LixError> {
-    SqlBinaryCasReadStore::new(backend)
-        .blob_exists(blob_hash)
-        .await
+    read::blob_exists(backend, blob_hash).await
 }
 
 pub(crate) async fn persist_blob_writes_in_transaction(
@@ -62,9 +56,7 @@ pub(crate) fn append_blob_writes_to_write_batch(
 pub(crate) async fn garbage_collect_unreachable_in_transaction(
     transaction: BinaryCasTransactionRef<'_>,
 ) -> Result<(), LixError> {
-    SqlBinaryCasWriteStore::new(transaction)
-        .garbage_collect_unreachable()
-        .await
+    gc::garbage_collect_unreachable_binary_cas_in_transaction(transaction).await
 }
 
 pub(crate) fn binary_blob_store_relation_name() -> &'static str {
@@ -86,5 +78,5 @@ pub(crate) fn internal_exact_relation_names() -> &'static [&'static str] {
 }
 
 pub(crate) async fn init(backend: BinaryCasBackendRef<'_>) -> Result<(), LixError> {
-    store_sql::init_storage(backend).await
+    storage::init_storage(backend).await
 }
