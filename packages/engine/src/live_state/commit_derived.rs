@@ -6,17 +6,11 @@
 
 use std::collections::BTreeMap;
 
-use crate::canonical::{
-    load_change, load_visible_state, CanonicalContentMode, CanonicalTombstoneMode,
-    CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
-};
-use crate::live_state::load_current_committed_version_frontier_with_backend;
-use crate::live_state::schema_access::live_storage_relation_exists_with_backend;
+use crate::canonical::load_change;
 use crate::live_state::storage_metadata::builtin_schema_storage_metadata;
 use crate::live_state::store::LiveStateBackendRef;
 use crate::live_state::{matches_constraints, LiveRow, LiveRowQuery, LiveRowSource};
 use crate::schema::LixCommit;
-use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,16 +91,7 @@ pub(crate) async fn scan_commit_derived_rows(
         constraints: Vec::new(),
         include_tombstones: request.include_tombstones,
     };
-    let commit_rows = if live_storage_relation_exists_with_backend(backend, "lix_commit").await? {
-        scan_base_commit_rows(backend, &base_request).await?
-    } else {
-        Vec::new()
-    };
-    let commit_rows = if commit_rows.is_empty() {
-        load_commit_rows_from_canonical_frontier(backend).await?
-    } else {
-        commit_rows
-    };
+    let commit_rows = scan_base_commit_rows(backend, &base_request).await?;
     if commit_rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -134,68 +119,6 @@ pub(crate) async fn scan_commit_derived_rows(
                     .is_none()
                     .cmp(&right.snapshot_content.is_none())
             })
-    });
-    Ok(rows)
-}
-
-async fn load_commit_rows_from_canonical_frontier(
-    backend: LiveStateBackendRef<'_>,
-) -> Result<Vec<LiveRow>, LixError> {
-    let frontier = load_current_committed_version_frontier_with_backend(backend).await?;
-    let commit_ids = frontier.version_heads.into_values().collect::<Vec<_>>();
-    if commit_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut filter = CanonicalVisibleStateFilter::default();
-    filter.schema_keys.insert("lix_commit".to_string());
-
-    let mut executor = backend;
-    let visible_rows = load_visible_state(
-        &mut executor,
-        &CanonicalVisibleStateRequest {
-            commit_ids,
-            filter,
-            content_mode: CanonicalContentMode::IncludeSnapshotContent,
-            tombstones: CanonicalTombstoneMode::ExcludeTombstones,
-        },
-    )
-    .await?;
-
-    let mut rows = Vec::new();
-    for row in visible_rows {
-        let Some(change) = load_change(&mut executor, &row.source_change_id).await? else {
-            return Err(LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                format!(
-                    "canonical visible lix_commit row references missing change '{}'",
-                    row.source_change_id
-                ),
-            ));
-        };
-
-        rows.push(LiveRow {
-            entity_id: row.entity_id,
-            file_id: row.file_id,
-            schema_key: row.schema_key,
-            schema_version: row.schema_version,
-            version_id: GLOBAL_VERSION_ID.to_string(),
-            plugin_key: row.plugin_key,
-            metadata: row.metadata,
-            change_id: Some(change.id),
-            global: true,
-            untracked: false,
-            created_at: Some(change.created_at.clone()),
-            updated_at: Some(change.created_at),
-            snapshot_content: row.snapshot_content,
-        });
-    }
-
-    rows.sort_by(|left, right| left.entity_id.cmp(&right.entity_id));
-    rows.dedup_by(|left, right| {
-        left.entity_id == right.entity_id
-            && left.file_id == right.file_id
-            && left.schema_key == right.schema_key
     });
     Ok(rows)
 }
@@ -278,12 +201,12 @@ fn expand_commit_row_to_lazy_derived_surface(
                 file_id: storage.file_id.clone(),
                 schema_key: storage.schema_key,
                 schema_version: storage.schema_version,
-                version_id: GLOBAL_VERSION_ID.to_string(),
+                version_id: commit_row.version_id.clone(),
                 plugin_key: storage.plugin_key,
                 metadata: commit_row.metadata.clone(),
                 change_id: commit_row.change_id.clone(),
-                global: true,
-                untracked: false,
+                global: commit_row.global,
+                untracked: commit_row.untracked,
                 created_at: commit_row.created_at.clone(),
                 updated_at: commit_row.updated_at.clone(),
                 snapshot_content: Some(json_string(serde_json::json!({
@@ -311,12 +234,12 @@ fn expand_commit_row_to_lazy_derived_surface(
                     file_id: storage.file_id.clone(),
                     schema_key: storage.schema_key.clone(),
                     schema_version: storage.schema_version.clone(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    version_id: commit_row.version_id.clone(),
                     plugin_key: storage.plugin_key.clone(),
                     metadata: change.metadata.clone(),
                     change_id: Some(change.id.clone()),
-                    global: true,
-                    untracked: false,
+                    global: commit_row.global,
+                    untracked: commit_row.untracked,
                     created_at: change.created_at.clone(),
                     updated_at: change
                         .updated_at
@@ -345,12 +268,12 @@ fn expand_commit_row_to_lazy_derived_surface(
                     file_id: storage.file_id.clone(),
                     schema_key: storage.schema_key.clone(),
                     schema_version: storage.schema_version.clone(),
-                    version_id: GLOBAL_VERSION_ID.to_string(),
+                    version_id: commit_row.version_id.clone(),
                     plugin_key: storage.plugin_key.clone(),
                     metadata: commit_row.metadata.clone(),
                     change_id: commit_row.change_id.clone(),
-                    global: true,
-                    untracked: false,
+                    global: commit_row.global,
+                    untracked: commit_row.untracked,
                     created_at: commit_row.created_at.clone(),
                     updated_at: commit_row.updated_at.clone(),
                     snapshot_content: Some(json_string(serde_json::json!({
@@ -378,12 +301,12 @@ fn expand_commit_row_to_lazy_derived_surface(
                         file_id: storage.file_id.clone(),
                         schema_key: storage.schema_key.clone(),
                         schema_version: storage.schema_version.clone(),
-                        version_id: GLOBAL_VERSION_ID.to_string(),
+                        version_id: commit_row.version_id.clone(),
                         plugin_key: storage.plugin_key.clone(),
                         metadata: change.metadata.clone(),
                         change_id: Some(change.id.clone()),
-                        global: true,
-                        untracked: false,
+                        global: commit_row.global,
+                        untracked: commit_row.untracked,
                         created_at: change.created_at.clone(),
                         updated_at: change
                             .updated_at

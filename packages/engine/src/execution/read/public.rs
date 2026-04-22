@@ -190,6 +190,35 @@ async fn execute_prepared_batch_with_backend(
     Ok(result)
 }
 
+pub(crate) async fn execute_single_prepared_statement_with_backend(
+    backend: &dyn LixBackend,
+    statement: crate::backend::PreparedStatement,
+) -> Result<QueryResult, LixError> {
+    execute_prepared_batch_with_backend(
+        backend,
+        &crate::backend::PreparedBatch {
+            steps: vec![statement],
+        },
+    )
+    .await
+}
+
+pub(crate) async fn execute_prepared_batch_in_transaction(
+    transaction: &mut dyn crate::LixBackendTransaction,
+    batch: &crate::backend::PreparedBatch,
+) -> Result<QueryResult, LixError> {
+    let mut result = QueryResult {
+        rows: Vec::new(),
+        columns: Vec::new(),
+    };
+    for statement in &batch.steps {
+        result = transaction
+            .execute(&statement.sql, &statement.params)
+            .await?;
+    }
+    Ok(result)
+}
+
 fn translate_lowered_public_read_error(error: LixError, public_surfaces: &[String]) -> LixError {
     // Read execution only sanitizes the already-SQL-shaped message for the
     // current public surfaces; the shaping rules remain owned by `sql/*`.

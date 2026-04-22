@@ -27,8 +27,6 @@ use std::collections::BTreeSet;
 #[cfg(test)]
 use crate::live_state::store::LiveStateBackendRef;
 #[cfg(test)]
-use crate::live_state::store_sql::begin_write_transaction;
-#[cfg(test)]
 use crate::live_state::{
     LiveStateRebuildDebugMode, LiveStateRebuildRequest, LiveStateRebuildScope,
 };
@@ -265,7 +263,9 @@ async fn recover_live_state_projection_replay_state(
     backend: LiveStateBackendRef<'_>,
     target: Option<&ReplayCursor>,
 ) -> Result<(), LixError> {
-    let mut transaction = begin_write_transaction(backend).await?;
+    let mut transaction = backend
+        .begin_transaction(crate::TransactionBeginMode::Write)
+        .await?;
     let recovery_result = match target {
         Some(target) => {
             replay::mark_live_state_projection_ready_at_replay_cursor_in_transaction(
@@ -315,7 +315,9 @@ async fn apply_live_state_replay_scope_to_cursor(
     scope: &LiveStateRebuildScope,
     target: Option<&ReplayCursor>,
 ) -> Result<(), LixError> {
-    let mut transaction = begin_write_transaction(backend).await?;
+    let mut transaction = backend
+        .begin_transaction(crate::TransactionBeginMode::Write)
+        .await?;
     let apply_result = crate::live_state::rebuild_scope_in_transaction(
         transaction.as_mut(),
         &LiveStateRebuildRequest {

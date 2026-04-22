@@ -327,13 +327,13 @@ pub(crate) async fn load_live_table_layout_with_executor(
     if let Some(layout) = builtin_live_table_layout(schema_key)? {
         return Ok(layout);
     }
-    let result = crate::live_state::store_sql::execute_query_with_executor(
-        executor,
-        REGISTERED_SCHEMA_BOOTSTRAP_LAYOUT_SQL,
-        &[],
+    compile_registered_live_layout(
+        schema_key,
+        crate::live_state::storage::load_registered_schema_bootstrap_layout_rows_with_executor(
+            executor,
+        )
+        .await?,
     )
-    .await?;
-    compile_registered_live_layout(schema_key, result.rows)
 }
 
 fn live_envelope_column_names() -> BTreeSet<&'static str> {

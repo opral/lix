@@ -14,10 +14,7 @@ pub(crate) use layout::{
     LiveTableLayout,
 };
 #[allow(unused_imports)]
-pub(crate) use registry::{
-    compile_registered_live_layout, load_live_table_layout_in_transaction,
-    load_live_table_layout_with_backend,
-};
+pub(crate) use registry::{compile_registered_live_layout, load_live_table_layout_with_backend};
 #[allow(unused_imports)]
 pub(crate) use sql::{
     build_partitioned_scan_sql, ensure_schema_live_table_sql_statements, is_untracked_live_table,

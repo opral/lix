@@ -374,25 +374,23 @@ async fn execute_scalar_read_query_write_command(
     scalar_read: &PreparedScalarReadArtifact,
 ) -> Result<WriteResult, LixError> {
     let execution_started = std::time::Instant::now();
-    let mut public_result = QueryResult {
-        rows: Vec::new(),
-        columns: Vec::new(),
+    let public_result = match crate::execution::execute_prepared_batch_in_transaction(
+        transaction,
+        &scalar_read.prepared_batch,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            let normalized = normalize_sql_error_with_transaction_and_relation_names(
+                transaction,
+                error,
+                command.diagnostic_context().relation_names(),
+            )
+            .await;
+            return Err(normalized);
+        }
     };
-
-    for statement in &scalar_read.prepared_batch.steps {
-        public_result = match transaction.execute(&statement.sql, &statement.params).await {
-            Ok(result) => result,
-            Err(error) => {
-                let normalized = normalize_sql_error_with_transaction_and_relation_names(
-                    transaction,
-                    error,
-                    command.diagnostic_context().relation_names(),
-                )
-                .await;
-                return Err(normalized);
-            }
-        };
-    }
 
     execution_context
         .persist_runtime_sequence_in_transaction(

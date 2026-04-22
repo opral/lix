@@ -16,11 +16,14 @@ use crate::canonical::read::{
     CanonicalRootCommit as ReadCanonicalRootCommit, CommitLineageEntry,
     ExactCommittedStateRowRequest,
 };
-use crate::canonical::store::{CanonicalBackendRef, CanonicalExecutorRef, CanonicalTransactionRef};
-use crate::canonical::store_sql::{
-    execute_batch_with_transaction, execute_query_with_backend, execute_query_with_executor,
-    execute_query_with_transaction, load_durable_state_commit_low_watermark_in_transaction,
+use crate::canonical::storage::{
+    append_change_batch_in_transaction, append_untracked_visibility_batch_in_transaction,
+    delete_visibility_rows_and_orphaned_changes,
+    load_durable_state_commit_low_watermark_in_transaction, load_history_query_result,
+    load_untracked_change_rows_for_compaction, load_visible_state_query_result,
+    untracked_visibility_exists,
 };
+use crate::canonical::store::{CanonicalBackendRef, CanonicalExecutorRef, CanonicalTransactionRef};
 use crate::common::escape_sql_string;
 use crate::functions::LixFunctionProvider;
 use crate::streams::DurableStateCommitCursor;
@@ -137,24 +140,24 @@ pub(crate) struct CanonicalAppendSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct CanonicalUntrackedIdentity {
-    version_id: String,
-    visibility_kind: CanonicalUntrackedVisibilityKind,
-    entity_id: String,
-    schema_key: String,
-    file_id: String,
+pub(crate) struct CanonicalUntrackedIdentity {
+    pub(crate) version_id: String,
+    pub(crate) visibility_kind: CanonicalUntrackedVisibilityKind,
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CanonicalUntrackedChangeRow {
-    visibility_id: String,
+pub(crate) struct CanonicalUntrackedChangeRow {
+    pub(crate) visibility_id: String,
     #[allow(dead_code)]
-    visibility_append_seq: i64,
-    change_id: String,
-    identity: CanonicalUntrackedIdentity,
-    snapshot_id: String,
-    change_created_at: String,
-    visibility_created_at: String,
+    pub(crate) visibility_append_seq: i64,
+    pub(crate) change_id: String,
+    pub(crate) identity: CanonicalUntrackedIdentity,
+    pub(crate) snapshot_id: String,
+    pub(crate) change_created_at: String,
+    pub(crate) visibility_created_at: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -282,7 +285,7 @@ pub(crate) async fn append_changes(
         &commit_graph_rows,
         tx.dialect(),
     )?);
-    execute_batch_with_transaction(tx, &prepared).await?;
+    append_change_batch_in_transaction(tx, &prepared).await?;
 
     Ok(CanonicalAppendSummary {
         latest_change_id: canonical_output
@@ -304,26 +307,7 @@ pub(crate) async fn append_untracked_change_visibility_rows(
         return Ok(());
     }
     let prepared = build_prepared_batch_from_visibility_rows(visibility_rows, tx.dialect())?;
-    execute_batch_with_transaction(tx, &prepared).await
-}
-
-pub(crate) async fn replace_snapshot_content_in_transaction(
-    tx: CanonicalTransactionRef<'_>,
-    snapshot_id: &str,
-    snapshot_content: &str,
-) -> Result<(), LixError> {
-    execute_query_with_transaction(
-        tx,
-        "UPDATE lix_internal_snapshot \
-         SET content = $1 \
-         WHERE id = $2",
-        &[
-            Value::Text(snapshot_content.to_string()),
-            Value::Text(snapshot_id.to_string()),
-        ],
-    )
-    .await
-    .map(|_| ())
+    append_untracked_visibility_batch_in_transaction(tx, &prepared).await
 }
 
 pub(crate) async fn compact_untracked_changes_for_touched_rows_in_transaction(
@@ -519,8 +503,7 @@ pub(crate) async fn load_history(
     backend: CanonicalBackendRef<'_>,
     request: &CanonicalHistoryRequest,
 ) -> Result<Vec<CanonicalHistoryRow>, LixError> {
-    let sql = build_canonical_history_query_sql(backend.dialect(), request)?;
-    let result = execute_query_with_backend(backend, &sql, &[]).await?;
+    let result = load_history_query_result(backend, request).await?;
     parse_canonical_history_rows(result)
 }
 
@@ -528,8 +511,7 @@ pub(crate) async fn load_visible_state(
     executor: CanonicalExecutorRef<'_>,
     request: &CanonicalVisibleStateRequest,
 ) -> Result<Vec<CanonicalVisibleStateRow>, LixError> {
-    let sql = build_visible_state_query_sql(executor.dialect(), request)?;
-    let result = execute_query_with_executor(executor, &sql, &[]).await?;
+    let result = load_visible_state_query_result(executor, request).await?;
     parse_visible_state_rows(result)
 }
 
@@ -581,24 +563,7 @@ fn canonical_change_from_row(
     }
 }
 
-async fn untracked_visibility_exists(
-    executor: CanonicalExecutorRef<'_>,
-    change_id: &str,
-) -> Result<bool, LixError> {
-    let sql = format!(
-        "SELECT 1 \
-         FROM {} \
-         WHERE change_id = {} \
-         LIMIT 1",
-        crate::canonical::journal::UNTRACKED_CHANGE_VISIBILITY_TABLE,
-        executor.dialect().placeholder(1),
-    );
-    let result =
-        execute_query_with_executor(executor, &sql, &[Value::Text(change_id.to_string())]).await?;
-    Ok(!result.rows.is_empty())
-}
-
-fn build_canonical_history_query_sql(
+pub(crate) fn build_canonical_history_query_sql(
     dialect: crate::SqlDialect,
     request: &CanonicalHistoryRequest,
 ) -> Result<String, LixError> {
@@ -664,7 +629,7 @@ fn build_canonical_history_query_sql(
     ))
 }
 
-fn build_visible_state_query_sql(
+pub(crate) fn build_visible_state_query_sql(
     dialect: crate::SqlDialect,
     request: &CanonicalVisibleStateRequest,
 ) -> Result<String, LixError> {
@@ -988,124 +953,16 @@ async fn compact_untracked_changes_in_transaction(
     identities: Option<&BTreeSet<CanonicalUntrackedIdentity>>,
 ) -> Result<usize, LixError> {
     let low_watermark = load_durable_state_commit_low_watermark_in_transaction(transaction).await?;
-    let rows = {
+    let identity_filter = identities
+        .map(|values| values.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let rows: Vec<CanonicalUntrackedChangeRow> = {
         let mut executor = &mut *transaction;
-        load_untracked_change_rows_for_compaction(&mut executor, identities).await?
+        load_untracked_change_rows_for_compaction(&mut executor, &identity_filter).await?
     };
     let delete_rows = select_compactable_untracked_change_rows(&rows, low_watermark.as_ref());
     delete_visibility_rows_and_orphaned_changes(transaction, &delete_rows).await?;
     Ok(delete_rows.len())
-}
-
-async fn load_untracked_change_rows_for_compaction(
-    executor: CanonicalExecutorRef<'_>,
-    identities: Option<&BTreeSet<CanonicalUntrackedIdentity>>,
-) -> Result<Vec<CanonicalUntrackedChangeRow>, LixError> {
-    let dialect = executor.dialect();
-    let mut params = Vec::new();
-    let mut next_placeholder = 1usize;
-    let mut predicates = Vec::new();
-
-    if let Some(identities) = identities {
-        if identities.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut groups = Vec::with_capacity(identities.len());
-        for identity in identities {
-            let version = dialect.placeholder(next_placeholder);
-            params.push(Value::Text(identity.version_id.clone()));
-            next_placeholder += 1;
-            let visibility_kind = dialect.placeholder(next_placeholder);
-            params.push(Value::Text(identity.visibility_kind.as_str().to_string()));
-            next_placeholder += 1;
-            let entity = dialect.placeholder(next_placeholder);
-            params.push(Value::Text(identity.entity_id.clone()));
-            next_placeholder += 1;
-            let schema = dialect.placeholder(next_placeholder);
-            params.push(Value::Text(identity.schema_key.clone()));
-            next_placeholder += 1;
-            let file = dialect.placeholder(next_placeholder);
-            params.push(Value::Text(identity.file_id.clone()));
-            next_placeholder += 1;
-            groups.push(format!(
-                "(v.version_id = {version} AND v.visibility_kind = {visibility_kind} AND v.entity_id = {entity} AND v.schema_key = {schema} AND COALESCE(v.file_id, '') = {file})"
-            ));
-        }
-        predicates.push(format!("({})", groups.join(" OR ")));
-    }
-
-    // Visibility append order is the retention authority. Payload timestamps stay
-    // available for debugging, but compaction must never pick winners by created_at.
-    let sql = format!(
-        "SELECT v.id, v.append_seq, c.id, v.version_id, v.visibility_kind, v.entity_id, v.schema_key, v.file_id, c.snapshot_id, c.created_at, v.created_at \
-         FROM lix_internal_untracked_change_visibility v \
-         JOIN lix_internal_change c \
-           ON c.id = v.change_id \
-         {where_sql} \
-         ORDER BY v.version_id ASC, v.visibility_kind ASC, v.entity_id ASC, v.schema_key ASC, v.file_id ASC, v.append_seq DESC",
-        where_sql = if predicates.is_empty() {
-            String::new()
-        } else {
-            format!("WHERE {}", predicates.join(" AND "))
-        }
-    );
-    let result = execute_query_with_executor(executor, &sql, &params).await?;
-    result
-        .rows
-        .iter()
-        .map(|row| {
-            Ok(CanonicalUntrackedChangeRow {
-                visibility_id: required_text_value(
-                    row,
-                    0,
-                    "lix_internal_untracked_change_visibility.id",
-                )?,
-                visibility_append_seq: required_integer_value(
-                    row,
-                    1,
-                    "lix_internal_untracked_change_visibility.append_seq",
-                )?,
-                change_id: required_text_value(row, 2, "lix_internal_change.id")?,
-                identity: CanonicalUntrackedIdentity {
-                    version_id: required_text_value(
-                        row,
-                        3,
-                        "lix_internal_untracked_change_visibility.version_id",
-                    )?,
-                    visibility_kind: CanonicalUntrackedVisibilityKind::parse(
-                        &required_text_value(
-                            row,
-                            4,
-                            "lix_internal_untracked_change_visibility.visibility_kind",
-                        )?,
-                    )?,
-                    entity_id: required_text_value(
-                        row,
-                        5,
-                        "lix_internal_untracked_change_visibility.entity_id",
-                    )?,
-                    schema_key: required_text_value(
-                        row,
-                        6,
-                        "lix_internal_untracked_change_visibility.schema_key",
-                    )?,
-                    file_id: optional_text_value(
-                        row,
-                        7,
-                        "lix_internal_untracked_change_visibility.file_id",
-                    )?
-                    .unwrap_or_default(),
-                },
-                snapshot_id: required_text_value(row, 8, "lix_internal_change.snapshot_id")?,
-                change_created_at: required_text_value(row, 9, "lix_internal_change.created_at")?,
-                visibility_created_at: required_text_value(
-                    row,
-                    10,
-                    "lix_internal_untracked_change_visibility.created_at",
-                )?,
-            })
-        })
-        .collect()
 }
 
 fn select_compactable_untracked_change_rows(
@@ -1148,118 +1005,6 @@ fn untracked_change_row_is_at_or_below_watermark(
 ) -> bool {
     low_watermark
         .is_none_or(|watermark| row.visibility_append_seq <= watermark.visibility_append_seq)
-}
-
-async fn delete_visibility_rows_and_orphaned_changes(
-    transaction: CanonicalTransactionRef<'_>,
-    rows: &[CanonicalUntrackedChangeRow],
-) -> Result<(), LixError> {
-    const DELETE_CHUNK_SIZE: usize = 256;
-    if rows.is_empty() {
-        return Ok(());
-    }
-
-    let dialect = transaction.dialect();
-    let visibility_ids = rows
-        .iter()
-        .map(|row| row.visibility_id.clone())
-        .collect::<Vec<_>>();
-    for chunk in visibility_ids.chunks(DELETE_CHUNK_SIZE) {
-        let mut params = Vec::with_capacity(chunk.len());
-        let placeholders = chunk
-            .iter()
-            .enumerate()
-            .map(|(index, visibility_id)| {
-                params.push(Value::Text(visibility_id.clone()));
-                dialect.placeholder(index + 1)
-            })
-            .collect::<Vec<_>>();
-        execute_query_with_transaction(
-            transaction,
-            &format!(
-                "DELETE FROM lix_internal_untracked_change_visibility \
-                 WHERE id IN ({})",
-                placeholders.join(", ")
-            ),
-            &params,
-        )
-        .await?;
-    }
-
-    let change_ids = rows
-        .iter()
-        .map(|row| row.change_id.clone())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    let change_commit_ctes =
-        crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(dialect);
-    for chunk in change_ids.chunks(DELETE_CHUNK_SIZE) {
-        let mut params = Vec::with_capacity(chunk.len());
-        let placeholders = chunk
-            .iter()
-            .enumerate()
-            .map(|(index, change_id)| {
-                params.push(Value::Text(change_id.clone()));
-                dialect.placeholder(index + 1)
-            })
-            .collect::<Vec<_>>();
-        execute_query_with_transaction(
-            transaction,
-            &format!(
-                "WITH {change_commit_ctes} \
-                 DELETE FROM lix_internal_change \
-                 WHERE id IN ({placeholders}) \
-                   AND NOT EXISTS (\
-                     SELECT 1 FROM lix_internal_untracked_change_visibility v \
-                     WHERE v.change_id = lix_internal_change.id\
-                   ) \
-                   AND NOT EXISTS (\
-                     SELECT 1 FROM change_commit_by_change_id cc \
-                     WHERE cc.change_id = lix_internal_change.id\
-                   )",
-                change_commit_ctes = change_commit_ctes,
-                placeholders = placeholders.join(", "),
-            ),
-            &params,
-        )
-        .await?;
-    }
-
-    let snapshot_ids = rows
-        .iter()
-        .map(|row| row.snapshot_id.clone())
-        .filter(|snapshot_id| snapshot_id != "no-content")
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
-    for chunk in snapshot_ids.chunks(DELETE_CHUNK_SIZE) {
-        let mut params = Vec::with_capacity(chunk.len());
-        let placeholders = chunk
-            .iter()
-            .enumerate()
-            .map(|(index, snapshot_id)| {
-                params.push(Value::Text(snapshot_id.clone()));
-                dialect.placeholder(index + 1)
-            })
-            .collect::<Vec<_>>();
-        execute_query_with_transaction(
-            transaction,
-            &format!(
-                "DELETE FROM lix_internal_snapshot \
-                 WHERE id IN ({}) \
-                   AND NOT EXISTS (\
-                     SELECT 1 FROM lix_internal_change c \
-                     WHERE c.snapshot_id = lix_internal_snapshot.id\
-                   )",
-                placeholders.join(", ")
-            ),
-            &params,
-        )
-        .await?;
-    }
-
-    Ok(())
 }
 
 fn canonical_untracked_identity_from_visibility(
