@@ -7,6 +7,7 @@ use crate::canonical::{
     CanonicalVisibility, CanonicalVisibleStateFilter, CanonicalVisibleStateRequest,
     CanonicalVisibleStateRow,
 };
+use crate::live_state::commit_derived::{is_lazy_commit_derived_surface, scan_commit_derived_rows};
 use crate::live_state::store::{
     LiveStateBackendRef, LiveStateExecutorRef, LiveStateTransactionRef,
 };
@@ -131,6 +132,10 @@ pub(crate) async fn scan_live_rows(
     backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
+    if is_lazy_commit_derived_surface(&request.schema_key) {
+        return scan_lazy_commit_derived_rows(backend, request).await;
+    }
+
     match request.source {
         LiveRowSource::Tracked => scan_tracked_rows(backend, request).await,
         LiveRowSource::Untracked => scan_untracked_rows(backend, request).await,
@@ -142,11 +147,67 @@ pub(crate) async fn load_exact_live_row(
     backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
+    if is_lazy_commit_derived_surface(&request.schema_key) {
+        return load_exact_lazy_commit_derived_row(backend, request).await;
+    }
+
     match request.source {
         LiveRowSource::Tracked => load_exact_tracked_row(backend, request).await,
         LiveRowSource::Untracked => load_exact_untracked_row(backend, request).await,
         LiveRowSource::Effective => load_exact_effective_row(backend, request).await,
     }
+}
+
+async fn scan_lazy_commit_derived_rows(
+    backend: LiveStateBackendRef<'_>,
+    request: &LiveRowQuery,
+) -> Result<Vec<LiveRow>, LixError> {
+    scan_commit_derived_rows(backend, request, |backend, request| {
+        let request = request.clone();
+        Box::pin(async move { scan_live_rows(backend, &request).await })
+    })
+    .await
+}
+
+async fn load_exact_lazy_commit_derived_row(
+    backend: LiveStateBackendRef<'_>,
+    request: &ExactLiveRowQuery,
+) -> Result<Option<LiveRow>, LixError> {
+    let mut scan_request = LiveRowQuery {
+        schema_key: request.schema_key.clone(),
+        version_id: request.version_id.clone(),
+        source: request.source,
+        constraints: vec![ScanConstraint {
+            field: super::ScanField::EntityId,
+            operator: super::ScanOperator::Eq(Value::Text(request.entity_id.clone())),
+        }],
+        include_tombstones: request.include_tombstones,
+    };
+    if let NullableKeyFilter::Value(file_id) = &request.file_id {
+        scan_request.constraints.push(ScanConstraint {
+            field: super::ScanField::FileId,
+            operator: super::ScanOperator::Eq(Value::Text(file_id.clone())),
+        });
+    }
+    if let Some(schema_version) = &request.schema_version {
+        scan_request.constraints.push(ScanConstraint {
+            field: super::ScanField::SchemaVersion,
+            operator: super::ScanOperator::Eq(Value::Text(schema_version.clone())),
+        });
+    }
+    if let NullableKeyFilter::Value(plugin_key) = &request.plugin_key {
+        scan_request.constraints.push(ScanConstraint {
+            field: super::ScanField::PluginKey,
+            operator: super::ScanOperator::Eq(Value::Text(plugin_key.clone())),
+        });
+    }
+
+    scan_lazy_commit_derived_rows(backend, &scan_request)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .find(|row| exact_live_row_matches_query(row, request))
+        })
 }
 
 pub(crate) async fn write_live_rows(
@@ -842,18 +903,21 @@ fn live_write_from_live_row(row: &LiveRow) -> Result<LiveWriteRow, LixError> {
 mod tests {
     use super::{
         decode_registered_schema_row, exact_live_row_matches_query, live_write_from_live_row,
-        load_exact_live_row, partition_live_rows_for_write, ExactLiveRowQuery, LiveRow,
-        LiveRowSource,
+        load_exact_live_row, partition_live_rows_for_write, scan_live_rows, ExactLiveRowQuery,
+        LiveRow, LiveRowQuery, LiveRowSource,
     };
     use crate::live_state::LiveWriteOperation;
     use crate::live_state::ReplayCursor;
-    use crate::live_state::{write_live_rows, LiveStateMode};
+    use crate::live_state::{
+        write_live_rows, LiveStateMode, ScanConstraint, ScanField, ScanOperator,
+    };
+    use crate::schema::LixCommit;
     use crate::schema::SchemaKey;
     use crate::test_support::{
         init_test_backend_core, seed_canonical_change_row, seed_live_state_status_row,
         seed_local_version_head, CanonicalChangeSeed, TestSqliteBackend,
     };
-    use crate::{CommittedVersionFrontier, NullableKeyFilter};
+    use crate::{CommittedVersionFrontier, NullableKeyFilter, Value};
     use serde_json::Value as JsonValue;
 
     fn registered_schema_row(snapshot_content: Option<&str>) -> LiveRow {
@@ -906,6 +970,26 @@ mod tests {
             include_tombstones: false,
             include_global_overlay: true,
             include_untracked_overlay: true,
+        }
+    }
+
+    fn commit_live_row(snapshot: &LixCommit, version_id: &str) -> LiveRow {
+        LiveRow {
+            entity_id: snapshot.id.clone(),
+            file_id: None,
+            schema_key: "lix_commit".to_string(),
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            plugin_key: None,
+            metadata: Some("{\"kind\":\"commit\"}".to_string()),
+            change_id: Some(format!("change-{}", snapshot.id)),
+            global: version_id == "global",
+            untracked: false,
+            created_at: Some("2026-03-30T00:00:00Z".to_string()),
+            updated_at: Some("2026-03-30T00:00:00Z".to_string()),
+            snapshot_content: Some(
+                serde_json::to_string(snapshot).expect("commit snapshot should serialize"),
+            ),
         }
     }
 
@@ -1119,5 +1203,132 @@ mod tests {
         assert_eq!(row.change_id.as_deref(), Some("change-1"));
         assert!(!row.global);
         assert!(!row.untracked);
+    }
+
+    #[tokio::test]
+    async fn scan_live_rows_expands_lazy_change_set_element_surface_from_visible_commit_rows() {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+        seed_canonical_change_row(
+            &backend,
+            CanonicalChangeSeed {
+                id: "change-1",
+                entity_id: "entity-a",
+                schema_key: "test_schema",
+                schema_version: "1",
+                file_id: Some("file-a"),
+                plugin_key: None,
+                snapshot_id: "snapshot-1",
+                snapshot_content: Some(r#"{"key":"a"}"#),
+                metadata: Some(r#"{"member":true}"#),
+                created_at: "2026-03-30T00:00:00Z",
+            },
+        )
+        .await
+        .expect("canonical member change should seed");
+
+        let mut transaction = backend
+            .begin_write_transaction()
+            .await
+            .expect("write transaction should open");
+        write_live_rows(
+            transaction.as_mut(),
+            &[commit_live_row(
+                &LixCommit {
+                    id: "commit-1".to_string(),
+                    change_set_id: Some("cs-1".to_string()),
+                    change_ids: vec!["change-1".to_string()],
+                    author_account_ids: vec![],
+                    parent_commit_ids: vec![],
+                },
+                "main",
+            )],
+        )
+        .await
+        .expect("commit live row should write");
+        transaction
+            .commit()
+            .await
+            .expect("write transaction should commit");
+
+        let rows = scan_live_rows(
+            &backend,
+            &LiveRowQuery {
+                schema_key: "lix_change_set_element".to_string(),
+                version_id: "main".to_string(),
+                source: LiveRowSource::Effective,
+                constraints: vec![ScanConstraint {
+                    field: ScanField::EntityId,
+                    operator: ScanOperator::Eq(Value::Text("cs-1~change-1".to_string())),
+                }],
+                include_tombstones: false,
+            },
+        )
+        .await
+        .expect("lazy derived scan should succeed");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].schema_key, "lix_change_set_element");
+        assert_eq!(rows[0].entity_id, "cs-1~change-1");
+        assert_eq!(rows[0].change_id.as_deref(), Some("change-1"));
+    }
+
+    #[tokio::test]
+    async fn load_exact_live_row_matches_lazy_commit_edge_surface() {
+        let backend = TestSqliteBackend::new();
+        init_test_backend_core(&backend)
+            .await
+            .expect("test backend init should succeed");
+
+        let mut transaction = backend
+            .begin_write_transaction()
+            .await
+            .expect("write transaction should open");
+        write_live_rows(
+            transaction.as_mut(),
+            &[commit_live_row(
+                &LixCommit {
+                    id: "commit-child".to_string(),
+                    change_set_id: Some("cs-1".to_string()),
+                    change_ids: vec![],
+                    author_account_ids: vec![],
+                    parent_commit_ids: vec!["commit-parent".to_string()],
+                },
+                "main",
+            )],
+        )
+        .await
+        .expect("commit live row should write");
+        transaction
+            .commit()
+            .await
+            .expect("write transaction should commit");
+
+        let row = load_exact_live_row(
+            &backend,
+            &ExactLiveRowQuery {
+                source: LiveRowSource::Effective,
+                schema_key: "lix_commit_edge".to_string(),
+                version_id: "main".to_string(),
+                entity_id: "commit-parent~commit-child".to_string(),
+                file_id: NullableKeyFilter::Null,
+                schema_version: Some("1".to_string()),
+                plugin_key: NullableKeyFilter::Null,
+                global: Some(false),
+                untracked: Some(false),
+                include_tombstones: false,
+                include_global_overlay: true,
+                include_untracked_overlay: true,
+            },
+        )
+        .await
+        .expect("exact lazy derived lookup should succeed")
+        .expect("exact lazy derived lookup should return a row");
+
+        assert_eq!(row.schema_key, "lix_commit_edge");
+        assert_eq!(row.entity_id, "commit-parent~commit-child");
+        assert_eq!(row.change_id.as_deref(), Some("change-commit-child"));
     }
 }

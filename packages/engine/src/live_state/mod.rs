@@ -30,6 +30,7 @@
 //! Callers outside `live_state/*` should use the root-level entrypoints here.
 
 mod bridge;
+mod commit_derived;
 pub(crate) mod constraints;
 pub(crate) mod effective;
 mod frontier;
