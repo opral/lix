@@ -9,8 +9,8 @@
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 
-use crate::backend::{add_column_if_missing, add_column_if_missing_with_executor};
 use crate::backend::QueryExecutor;
+use crate::backend::{add_column_if_missing, add_column_if_missing_with_executor};
 use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::live_state::lifecycle::{
     build_mark_live_state_ready_sql, build_mark_live_state_ready_without_cursor_sql,
@@ -25,7 +25,9 @@ use crate::live_state::store::{
     LiveStateReadStore, LiveStateTransactionRef, LiveStateWriteStore,
 };
 use crate::live_state::untracked::load_exact_row_with_executor as load_exact_untracked_row_with_executor;
-use crate::live_state::{ExactUntrackedRowRequest, LiveRow, LiveStateMode, ReplayCursor, SchemaRegistration};
+use crate::live_state::{
+    ExactUntrackedRowRequest, LiveRow, LiveStateMode, ReplayCursor, SchemaRegistration,
+};
 use crate::schema::schema_from_registered_snapshot;
 use crate::streams::{
     delete_durable_state_commit_consumer_cursor_in_transaction,
@@ -130,7 +132,9 @@ pub(crate) async fn execute_query_with_executor(
 pub(crate) async fn begin_write_transaction(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
-    backend.begin_transaction(crate::TransactionBeginMode::Write).await
+    backend
+        .begin_transaction(crate::TransactionBeginMode::Write)
+        .await
 }
 
 pub(crate) fn executor_from_transaction(
@@ -160,7 +164,9 @@ pub(crate) async fn add_column_if_missing_with_backend(
 impl LiveStateReadStore for SqlLiveStateStore<'_> {
     async fn require_ready(&self) -> Result<(), LixError> {
         match &self.access {
-            SqlLiveStateAccess::Backend(_) => crate::live_state::lifecycle::require_ready(self).await,
+            SqlLiveStateAccess::Backend(_) => {
+                crate::live_state::lifecycle::require_ready(self).await
+            }
             _ => Err(invalid_live_state_store_access(
                 "backend-backed live-state store",
             )),
@@ -169,18 +175,25 @@ impl LiveStateReadStore for SqlLiveStateStore<'_> {
 
     async fn projection_status(&self) -> Result<crate::live_state::ProjectionStatus, LixError> {
         match &self.access {
-            SqlLiveStateAccess::Backend(_) => Ok(super::projection::projection_status_from_live_state(
-                crate::live_state::lifecycle::load_projection_status(self).await?,
-            )),
+            SqlLiveStateAccess::Backend(_) => {
+                Ok(super::projection::projection_status_from_live_state(
+                    crate::live_state::lifecycle::load_projection_status(self).await?,
+                ))
+            }
             _ => Err(invalid_live_state_store_access(
                 "backend-backed live-state store",
             )),
         }
     }
 
-    async fn scan_live_rows(&self, request: &crate::live_state::LiveRowQuery) -> Result<Vec<LiveRow>, LixError> {
+    async fn scan_live_rows(
+        &self,
+        request: &crate::live_state::LiveRowQuery,
+    ) -> Result<Vec<LiveRow>, LixError> {
         match &self.access {
-            SqlLiveStateAccess::Backend(backend) => row_queries::scan_live_rows(*backend, request).await,
+            SqlLiveStateAccess::Backend(backend) => {
+                row_queries::scan_live_rows(*backend, request).await
+            }
             _ => Err(invalid_live_state_store_access(
                 "backend-backed live-state store",
             )),
@@ -209,19 +222,13 @@ impl LiveStateWriteStore for SqlLiveStateStore<'_> {
         match &mut self.access {
             SqlLiveStateAccess::Backend(backend) => {
                 let mut executor = *backend;
-                ensure_schema_live_table_with_requirement_with_executor(
-                    &mut executor,
-                    &requirement,
-                )
-                .await
+                ensure_schema_live_table_with_requirement_with_executor(&mut executor, &requirement)
+                    .await
             }
             SqlLiveStateAccess::Transaction(transaction) => {
                 let mut executor = crate::backend::transaction_backend_view(*transaction);
-                ensure_schema_live_table_with_requirement_with_executor(
-                    &mut executor,
-                    &requirement,
-                )
-                .await
+                ensure_schema_live_table_with_requirement_with_executor(&mut executor, &requirement)
+                    .await
             }
             SqlLiveStateAccess::Executor(executor) => {
                 ensure_schema_live_table_with_requirement_with_executor(*executor, &requirement)
@@ -292,8 +299,8 @@ impl LiveStateMaterializeStore for SqlLiveStateStore<'_> {
     ) -> Result<crate::live_state::LiveStateApplyReport, LixError> {
         match &mut self.access {
             SqlLiveStateAccess::Transaction(transaction) => {
-                let plan =
-                    super::materialize::rebuild_plan_with_transaction(*transaction, request).await?;
+                let plan = super::materialize::rebuild_plan_with_transaction(*transaction, request)
+                    .await?;
                 let (rows_deleted, tables_touched) =
                     super::materialize::apply_rebuild_scope_in_transaction(*transaction, &plan)
                         .await?;
@@ -675,6 +682,36 @@ async fn load_nullable_live_state_status_in_transaction(
         )
         .await;
     parse_nullable_live_state_status_result(result)
+}
+
+pub(crate) async fn load_nullable_live_state_status_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<crate::live_state::lifecycle::LiveStateStatusRow>, LixError> {
+    let result = executor
+        .execute(
+            "SELECT mode, latest_change_id, latest_change_created_at, schema_epoch, applied_committed_frontier \
+             FROM lix_internal_live_state_status \
+             WHERE singleton_id = 1 \
+             LIMIT 1",
+            &[],
+        )
+        .await;
+    parse_nullable_live_state_status_result(result)
+}
+
+pub(crate) async fn load_latest_replay_cursor_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<Option<ReplayCursor>, LixError> {
+    let result = executor
+        .execute(
+            "SELECT id, created_at \
+             FROM lix_internal_change \
+             ORDER BY created_at DESC, id DESC \
+             LIMIT 1",
+            &[],
+        )
+        .await?;
+    parse_latest_replay_cursor(&result)
 }
 
 async fn durable_state_commit_cursor_from_replay_with_backend(

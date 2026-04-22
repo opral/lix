@@ -2,11 +2,11 @@ use crate::common::is_missing_relation_error;
 #[cfg(test)]
 use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;
-use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::live_state::storage::{
     build_partitioned_scan_sql, load_live_row_access_with_executor, required_bool_cell,
     required_text_cell, selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
 };
+use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::{LixError, Value};
 
 #[cfg(test)]
@@ -113,7 +113,13 @@ async fn scan_rows_with_limit_and_order(
         limit,
     })?;
 
-    let result = match crate::live_state::store_sql::execute_query_with_executor(executor, &sql, &[]).await {
+    let result = match crate::live_state::store_sql::execute_query_with_executor(
+        executor,
+        &sql,
+        &[],
+    )
+    .await
+    {
         Ok(result) => result,
         Err(error) if is_missing_relation_error(&error) => return Ok(Vec::new()),
         Err(error) => return Err(error),

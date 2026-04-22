@@ -3,59 +3,54 @@ use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE,
 };
+use crate::binary_cas::store::BinaryCasBackendRef;
+use crate::binary_cas::store_sql::execute_query_with_backend;
 use async_trait::async_trait;
 
-use crate::{LixBackend, LixError, Value};
+use crate::{LixError, Value};
 
 #[async_trait(?Send)]
 pub(crate) trait BlobDataReader {
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError>;
 }
 
-#[async_trait(?Send)]
-impl BlobDataReader for dyn LixBackend + '_ {
-    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
-        load_binary_blob_data_by_hash(self, blob_hash).await
-    }
-}
-
 pub(crate) async fn blob_exists(
-    backend: &dyn LixBackend,
+    backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<bool, LixError> {
-    let result = backend
-        .execute(
-            &format!(
-                "SELECT 1 \
-                 FROM {blob_store} bs \
-                 JOIN {blob_manifest} bm ON bm.blob_hash = bs.blob_hash \
-                 WHERE bs.blob_hash = $1 \
-                 LIMIT 1",
-                blob_store = INTERNAL_BINARY_BLOB_STORE,
-                blob_manifest = INTERNAL_BINARY_BLOB_MANIFEST,
-            ),
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
+    let result = execute_query_with_backend(
+        backend,
+        &format!(
+            "SELECT 1 \
+             FROM {blob_store} bs \
+             JOIN {blob_manifest} bm ON bm.blob_hash = bs.blob_hash \
+             WHERE bs.blob_hash = $1 \
+             LIMIT 1",
+            blob_store = INTERNAL_BINARY_BLOB_STORE,
+            blob_manifest = INTERNAL_BINARY_BLOB_MANIFEST,
+        ),
+        &[Value::Text(blob_hash.to_string())],
+    )
+    .await?;
     Ok(!result.rows.is_empty())
 }
 
 pub(crate) async fn load_binary_blob_data_by_hash(
-    backend: &dyn LixBackend,
+    backend: BinaryCasBackendRef<'_>,
     blob_hash: &str,
 ) -> Result<Option<Vec<u8>>, LixError> {
-    let inline_result = backend
-        .execute(
-            &format!(
-                "SELECT data \
-                 FROM {blob_store} \
-                 WHERE blob_hash = $1 \
-                 LIMIT 1",
-                blob_store = INTERNAL_BINARY_BLOB_STORE,
-            ),
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
+    let inline_result = execute_query_with_backend(
+        backend,
+        &format!(
+            "SELECT data \
+             FROM {blob_store} \
+             WHERE blob_hash = $1 \
+             LIMIT 1",
+            blob_store = INTERNAL_BINARY_BLOB_STORE,
+        ),
+        &[Value::Text(blob_hash.to_string())],
+    )
+    .await?;
 
     if let Some(row) = inline_result.rows.first() {
         return Ok(Some(blob_required(
@@ -66,18 +61,18 @@ pub(crate) async fn load_binary_blob_data_by_hash(
         )?));
     }
 
-    let manifest_rows = backend
-        .execute(
-            &format!(
-                "SELECT size_bytes, chunk_count \
-                 FROM {blob_manifest} \
-                 WHERE blob_hash = $1 \
-                 LIMIT 1",
-                blob_manifest = INTERNAL_BINARY_BLOB_MANIFEST,
-            ),
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
+    let manifest_rows = execute_query_with_backend(
+        backend,
+        &format!(
+            "SELECT size_bytes, chunk_count \
+             FROM {blob_manifest} \
+             WHERE blob_hash = $1 \
+             LIMIT 1",
+            blob_manifest = INTERNAL_BINARY_BLOB_MANIFEST,
+        ),
+        &[Value::Text(blob_hash.to_string())],
+    )
+    .await?;
     let Some(manifest_row) = manifest_rows.rows.first() else {
         return Ok(None);
     };
@@ -96,20 +91,20 @@ pub(crate) async fn load_binary_blob_data_by_hash(
         });
     }
 
-    let chunk_rows = backend
-        .execute(
-            &format!(
-                "SELECT mc.chunk_index, mc.chunk_hash, mc.chunk_size, cs.data, cs.codec \
-                 FROM {manifest_chunk} mc \
-                 LEFT JOIN {chunk_store} cs ON cs.chunk_hash = mc.chunk_hash \
-                 WHERE mc.blob_hash = $1 \
-                 ORDER BY mc.chunk_index ASC",
-                manifest_chunk = INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,
-                chunk_store = INTERNAL_BINARY_CHUNK_STORE,
-            ),
-            &[Value::Text(blob_hash.to_string())],
-        )
-        .await?;
+    let chunk_rows = execute_query_with_backend(
+        backend,
+        &format!(
+            "SELECT mc.chunk_index, mc.chunk_hash, mc.chunk_size, cs.data, cs.codec \
+             FROM {manifest_chunk} mc \
+             LEFT JOIN {chunk_store} cs ON cs.chunk_hash = mc.chunk_hash \
+             WHERE mc.blob_hash = $1 \
+             ORDER BY mc.chunk_index ASC",
+            manifest_chunk = INTERNAL_BINARY_BLOB_MANIFEST_CHUNK,
+            chunk_store = INTERNAL_BINARY_CHUNK_STORE,
+        ),
+        &[Value::Text(blob_hash.to_string())],
+    )
+    .await?;
 
     let expected_chunk_count = usize::try_from(manifest_chunk_count).map_err(|_| LixError {
         code: "LIX_ERROR_UNKNOWN".to_string(),

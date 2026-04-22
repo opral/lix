@@ -110,7 +110,8 @@ async fn load_live_table_layout_from_registered_schema_live_table(
         snapshot_expr = snapshot_expr,
         registered_schema_table = registered_schema_table,
     );
-    let result = crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
+    let result =
+        crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
     compile_registered_live_layout(schema_key, result.rows)
 }
 

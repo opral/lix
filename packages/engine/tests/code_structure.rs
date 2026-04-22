@@ -2125,8 +2125,8 @@ fn current_store_sql_import_boundary_violations() -> Vec<ImportPathViolation> {
     violations.into_iter().collect()
 }
 
-fn current_owner_persistence_transaction_lifecycle_violations(
-) -> Vec<TransactionLifecycleViolation> {
+fn current_owner_persistence_transaction_lifecycle_violations() -> Vec<TransactionLifecycleViolation>
+{
     let mut violations = BTreeSet::new();
 
     for (relative_path, source) in production_source_files() {

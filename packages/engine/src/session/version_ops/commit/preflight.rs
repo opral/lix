@@ -1,7 +1,7 @@
-use crate::backend::QueryExecutor;
 use crate::canonical::CanonicalStateIdentity;
 use crate::live_state::key_value_schema_key;
 use crate::live_state::{load_exact_untracked_row_with_executor, ExactUntrackedRowRequest};
+use crate::session::version_ops_read::VersionOpsReadRef;
 use crate::transaction::{
     deterministic_sequence_key, ExactFilesystemDescriptorState, FilesystemDescriptorState,
     FILESYSTEM_FILE_SCHEMA_KEY,
@@ -12,7 +12,7 @@ use crate::{LixError, NullableKeyFilter, Value};
 use crate::session::version_ops::load_exact_canonical_row_at_version_head_with_executor;
 
 pub(crate) async fn load_create_commit_deterministic_sequence_start(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
 ) -> Result<Option<i64>, LixError> {
     let untracked = load_exact_untracked_row_with_executor(
         executor,
@@ -56,7 +56,7 @@ pub(crate) async fn load_create_commit_deterministic_sequence_start(
 }
 
 pub(crate) async fn load_untracked_file_descriptor(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     file_id: &str,
     version_id: &str,
 ) -> Result<Option<ExactFilesystemDescriptorState>, LixError> {

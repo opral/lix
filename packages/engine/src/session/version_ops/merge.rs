@@ -1,6 +1,5 @@
 use std::collections::{BTreeSet, VecDeque};
 
-use crate::backend::QueryExecutor;
 use crate::canonical::{
     load_commit, load_commit_member_change, load_exact_row_at_commit, resolve_merge_base,
     CanonicalStateIdentity, CanonicalStateRow,
@@ -12,9 +11,11 @@ use crate::live_state::{
     LiveStateRebuildScope,
 };
 use crate::session::version_ops::commit::{append_tracked, CreateCommitArgs, StagedChange};
+use crate::session::version_ops_read::VersionOpsReadRef;
 use crate::streams::{StateCommitStreamChange, StateCommitStreamOperation};
+use crate::version::stage_update_version_head;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{ExecuteOptions, LixError, Session, SessionTransaction, Value};
+use crate::{ExecuteOptions, LixError, Session, SessionTransaction};
 
 use super::context::{
     exact_resolved_head_preconditions, require_version_context_pair_in_transaction,
@@ -158,14 +159,7 @@ async fn merge_version_in_transaction(
     }
 
     if merge_base_commit_id.as_deref() == Some(target_head.as_str()) {
-        tx.execute(
-            "UPDATE lix_version SET commit_id = $1 WHERE id = $2",
-            &[
-                Value::Text(source_head.clone()),
-                Value::Text(target_version_id.clone()),
-            ],
-        )
-        .await?;
+        stage_update_version_head(tx, &target_version_id, &source_head).await?;
 
         {
             let session_host = tx.session_host();
@@ -365,7 +359,7 @@ async fn merge_version_in_transaction(
 }
 
 async fn collect_candidate_entities(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     head_commit_id: &str,
     stop_at_commit_id: Option<&str>,
 ) -> Result<BTreeSet<EntityKey>, LixError> {
@@ -407,7 +401,7 @@ async fn collect_candidate_entities(
 }
 
 async fn load_visible_entity_state_at_commit(
-    executor: &mut dyn QueryExecutor,
+    executor: VersionOpsReadRef<'_>,
     head_commit_id: Option<&str>,
     entity: &EntityKey,
 ) -> Result<Option<(VisibleEntityState, CanonicalStateRow)>, LixError> {

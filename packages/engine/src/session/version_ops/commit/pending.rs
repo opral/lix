@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::backend::QueryExecutor;
 use crate::canonical::{
     append_changes, append_untracked_change_visibility_rows,
     compact_untracked_changes_for_touched_rows_in_transaction,
@@ -8,14 +7,16 @@ use crate::canonical::{
 };
 use crate::functions::LixFunctionProvider;
 use crate::live_state::CanonicalCommitProjectionReceipt;
-use crate::session::version_ops::{load_version_info_for_versions, VersionInfo};
+use crate::session::version_ops::{
+    load_version_info_for_versions, VersionInfo, VersionOpsTransactionRef,
+};
 use crate::transaction::{
-    execute_write_batch_with_transaction, BinaryBlobWrite, PendingCommitLane, PendingCommitState,
-    WriteBatch,
+    execute_write_batch_with_transaction, load_commit_change_snapshot_id_in_transaction,
+    BinaryBlobWrite, PendingCommitLane, PendingCommitState, WriteBatch,
 };
 use crate::{
     CanonicalJson, CanonicalPluginKey, CanonicalSchemaKey, CanonicalSchemaVersion, EntityId,
-    FileId, LixBackendTransaction, LixError, QueryResult, Value, VersionId,
+    FileId, LixError, VersionId,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -31,21 +32,6 @@ use super::types::{
     tracked_live_rows_from_staged_changes, untracked_live_rows_from_updated_version_refs,
     GenerateCommitArgs, GenerateCommitResult, StagedChange,
 };
-struct TransactionCommitExecutor<'a> {
-    transaction: &'a mut dyn LixBackendTransaction,
-}
-
-#[async_trait::async_trait(?Send)]
-impl QueryExecutor for TransactionCommitExecutor<'_> {
-    fn dialect(&self) -> crate::SqlDialect {
-        self.transaction.dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.transaction.execute(sql, params).await
-    }
-}
-
 pub(crate) fn pending_commit_state_matches_create_commit(
     session: &PendingCommitState,
     preconditions: &CreateCommitPreconditions,
@@ -59,7 +45,7 @@ pub(crate) fn pending_commit_state_matches_create_commit(
 }
 
 pub(crate) async fn build_pending_commit_state(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     lane: CreateCommitWriteLane,
     applied_output: &CreateCommitAppliedOutput,
 ) -> Result<PendingCommitState, LixError> {
@@ -79,34 +65,18 @@ pub(crate) async fn build_pending_commit_state(
                 format!("pending commit state commit snapshot is invalid JSON: {error}"),
             )
         })?;
-    let snapshot_id_result = transaction
-        .execute(
-            "SELECT snapshot_id \
-             FROM lix_internal_change \
-             WHERE id = $1 \
-               AND schema_key = 'lix_commit' \
-               AND entity_id = $2 \
-             LIMIT 1",
-            &[
-                Value::Text(seed.commit_change_id.clone()),
-                Value::Text(seed.commit_id.clone()),
-            ],
+    let commit_change_snapshot_id = load_commit_change_snapshot_id_in_transaction(
+        transaction,
+        &seed.commit_change_id,
+        &seed.commit_id,
+    )
+    .await?
+    .ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "pending commit state could not load commit snapshot_id",
         )
-        .await?;
-    let commit_change_snapshot_id = snapshot_id_result
-        .rows
-        .first()
-        .and_then(|row| row.first())
-        .and_then(|value| match value {
-            Value::Text(text) => Some(text.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            LixError::new(
-                "LIX_ERROR_UNKNOWN",
-                "pending commit state could not load commit snapshot_id",
-            )
-        })?;
+    })?;
 
     Ok(PendingCommitState {
         lane: pending_commit_lane_from_write_lane(&lane),
@@ -139,7 +109,7 @@ fn pending_commit_lane_from_write_lane(lane: &CreateCommitWriteLane) -> PendingC
 }
 
 pub(crate) async fn merge_public_change_batch_into_pending_commit(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     session: &mut PendingCommitState,
     changes: &[StagedChange],
     binary_blob_writes: &[BinaryBlobWrite],
@@ -274,14 +244,14 @@ fn canonicalize_optional_json_text(
 }
 
 async fn load_version_info_for_staged_changes(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     staged_changes: &[StagedChange],
 ) -> Result<BTreeMap<String, VersionInfo>, LixError> {
     let affected_versions = staged_changes
         .iter()
         .map(|change| change.version_id.to_string())
         .collect::<BTreeSet<_>>();
-    let mut executor = TransactionCommitExecutor { transaction };
+    let mut executor = crate::backend::transaction_backend_view(transaction);
     load_version_info_for_versions(&mut executor, &affected_versions).await
 }
 
@@ -350,7 +320,7 @@ where
 }
 
 async fn execute_generated_commit_result(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: VersionOpsTransactionRef<'_>,
     result: GenerateCommitResult,
     binary_blob_writes: &[BinaryBlobWrite],
     functions: &mut dyn LixFunctionProvider,

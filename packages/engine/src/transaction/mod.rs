@@ -41,7 +41,10 @@ pub(crate) use buffered_write_transaction::BufferedWriteTransaction;
 pub(crate) use checkpoint_labels::{
     append_checkpoint_commit_label_fact_in_transaction, CheckpointCommitLabelWrite,
 };
-pub(crate) use commit_artifacts::{PendingCommitLane, PendingCommitState};
+pub(crate) use commit_artifacts::{
+    append_commit_idempotency_row, load_commit_change_snapshot_id_in_transaction,
+    load_commit_idempotency_replay_in_transaction, PendingCommitLane, PendingCommitState,
+};
 pub(crate) use compiler_state::{
     SessionCompilerCache, SessionCompilerCacheHandle, SessionCompilerState,
 };

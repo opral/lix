@@ -6,6 +6,16 @@ use crate::LixError;
 
 use super::BinaryBlobWrite;
 
+pub(crate) type BinaryCasBackendRef<'a> = &'a (dyn crate::LixBackend + 'a);
+pub(crate) type BinaryCasTransactionRef<'a> = &'a mut (dyn crate::LixBackendTransaction + 'a);
+
+#[async_trait(?Send)]
+impl super::read::BlobDataReader for dyn crate::LixBackend + '_ {
+    async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError> {
+        super::read::load_binary_blob_data_by_hash(self, blob_hash).await
+    }
+}
+
 /// Owner-facing read surface for binary CAS persistence.
 #[async_trait(?Send)]
 pub(crate) trait BinaryCasReadStore {

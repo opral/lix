@@ -14,6 +14,8 @@ pub(crate) mod public_read_execution;
 mod runtime;
 mod state;
 pub(crate) mod version_ops;
+pub(crate) mod version_ops_read;
+pub(crate) mod version_ops_storage;
 pub(crate) mod workspace;
 pub(crate) mod write_execution_context;
 

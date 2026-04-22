@@ -2,8 +2,10 @@ use crate::binary_cas::schema::{
     INTERNAL_BINARY_BLOB_MANIFEST, INTERNAL_BINARY_BLOB_MANIFEST_CHUNK, INTERNAL_BINARY_BLOB_STORE,
     INTERNAL_BINARY_CHUNK_STORE, INTERNAL_BINARY_FILE_VERSION_REF,
 };
+use crate::binary_cas::store::BinaryCasTransactionRef;
+use crate::binary_cas::store_sql::execute_query_with_transaction;
 use crate::catalog::state_by_version_relation_name;
-use crate::{LixBackendTransaction, LixError, QueryResult, SqlDialect, Value};
+use crate::{LixError, QueryResult, SqlDialect, Value};
 
 #[async_trait::async_trait(?Send)]
 trait BinaryCasGcExecutor {
@@ -13,7 +15,7 @@ trait BinaryCasGcExecutor {
 }
 
 struct TransactionBinaryCasGcExecutor<'a> {
-    transaction: &'a mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'a>,
 }
 
 #[async_trait::async_trait(?Send)]
@@ -23,7 +25,7 @@ impl<'a> BinaryCasGcExecutor for TransactionBinaryCasGcExecutor<'a> {
     }
 
     async fn execute_sql(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.transaction.execute(sql, params).await
+        execute_query_with_transaction(self.transaction, sql, params).await
     }
 
     async fn state_by_version_relation_exists(&mut self) -> Result<bool, LixError> {
@@ -32,7 +34,7 @@ impl<'a> BinaryCasGcExecutor for TransactionBinaryCasGcExecutor<'a> {
 }
 
 pub(crate) async fn garbage_collect_unreachable_binary_cas_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
 ) -> Result<(), LixError> {
     let mut executor = TransactionBinaryCasGcExecutor { transaction };
     garbage_collect_unreachable_binary_cas_with_executor(&mut executor).await
@@ -75,34 +77,34 @@ async fn garbage_collect_unreachable_binary_cas_with_executor(
 }
 
 async fn state_by_version_relation_exists_in_transaction(
-    transaction: &mut dyn LixBackendTransaction,
+    transaction: BinaryCasTransactionRef<'_>,
 ) -> Result<bool, LixError> {
     match transaction.dialect() {
         SqlDialect::Sqlite => {
-            let result = transaction
-                .execute(
-                    "SELECT 1 \
-                     FROM sqlite_master \
-                     WHERE name = $1 \
-                       AND type IN ('table', 'view') \
-                     LIMIT 1",
-                    &[Value::Text(state_by_version_relation_name().to_string())],
-                )
-                .await?;
+            let result = execute_query_with_transaction(
+                transaction,
+                "SELECT 1 \
+                 FROM sqlite_master \
+                 WHERE name = $1 \
+                   AND type IN ('table', 'view') \
+                 LIMIT 1",
+                &[Value::Text(state_by_version_relation_name().to_string())],
+            )
+            .await?;
             Ok(!result.rows.is_empty())
         }
         SqlDialect::Postgres => {
-            let result = transaction
-                .execute(
-                    "SELECT 1 \
-                     FROM pg_catalog.pg_class c \
-                     JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
-                     WHERE n.nspname = current_schema() \
-                       AND c.relname = $1 \
-                     LIMIT 1",
-                    &[Value::Text(state_by_version_relation_name().to_string())],
-                )
-                .await?;
+            let result = execute_query_with_transaction(
+                transaction,
+                "SELECT 1 \
+                 FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace \
+                 WHERE n.nspname = current_schema() \
+                   AND c.relname = $1 \
+                 LIMIT 1",
+                &[Value::Text(state_by_version_relation_name().to_string())],
+            )
+            .await?;
             Ok(!result.rows.is_empty())
         }
     }

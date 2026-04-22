@@ -94,7 +94,9 @@ pub async fn init(backend: LiveStateBackendRef<'_>) -> Result<(), LixError> {
     Ok(())
 }
 
-async fn ensure_internal_storage_scope_keys(backend: LiveStateBackendRef<'_>) -> Result<(), LixError> {
+async fn ensure_internal_storage_scope_keys(
+    backend: LiveStateBackendRef<'_>,
+) -> Result<(), LixError> {
     add_column_if_missing_with_backend(
         backend,
         "lix_internal_registered_schema_bootstrap",

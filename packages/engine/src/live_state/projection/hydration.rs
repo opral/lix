@@ -5,6 +5,7 @@ use crate::catalog::{
 };
 use crate::common::escape_sql_string;
 use crate::live_state::load_current_committed_version_frontier_with_backend;
+use crate::live_state::store::LiveStateBackendRef;
 use crate::live_state::tracked::{
     scan_rows_with_backend as scan_tracked_rows_with_backend,
     scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,
@@ -12,7 +13,6 @@ use crate::live_state::tracked::{
 use crate::live_state::untracked::{
     scan_rows_with_backend as scan_untracked_rows_with_backend, UntrackedScanRequest,
 };
-use crate::live_state::store::LiveStateBackendRef;
 use crate::{LixError, Value};
 
 /// Hydrate the declared live-row inputs for one projection across the tracked
@@ -251,7 +251,8 @@ async fn load_change_commit_ids_with_backend(
             crate::canonical::build_lazy_change_commit_by_change_id_ctes_sql(backend.dialect(),),
         in_list = in_list,
     );
-    let result = crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
+    let result =
+        crate::live_state::store_sql::execute_query_with_backend(backend, &sql, &[]).await?;
     let mut rows = std::collections::BTreeMap::new();
     for row in result.rows {
         let Some(Value::Text(change_id)) = row.first() else {

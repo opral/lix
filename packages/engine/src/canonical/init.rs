@@ -1,9 +1,8 @@
-use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::canonical::store::CanonicalBackendRef;
 use crate::canonical::store_sql::{
-    add_column_if_missing_with_backend, execute_ddl_batch_with_backend,
-    execute_query_with_backend,
+    add_column_if_missing_with_backend, execute_ddl_batch_with_backend, execute_query_with_backend,
 };
+use crate::common::{storage_scope_key_for_file_id, STORAGE_SCOPE_KEY_COLUMN};
 use crate::{LixError, SqlDialect};
 
 const CANONICAL_INDEX_STATEMENTS: &[&str] = &[
@@ -33,7 +32,8 @@ pub(crate) async fn init_storage(backend: CanonicalBackendRef<'_>) -> Result<(),
         .iter()
         .map(String::as_str)
         .collect::<Vec<_>>();
-    execute_ddl_batch_with_backend(backend, "canonical.tables", &create_table_statement_refs).await?;
+    execute_ddl_batch_with_backend(backend, "canonical.tables", &create_table_statement_refs)
+        .await?;
     ensure_breakpoint_storage_scope_keys(backend).await?;
     execute_ddl_batch_with_backend(backend, "canonical.indexes", CANONICAL_INDEX_STATEMENTS).await
 }
@@ -147,7 +147,9 @@ END"#
     statements
 }
 
-async fn ensure_breakpoint_storage_scope_keys(backend: CanonicalBackendRef<'_>) -> Result<(), LixError> {
+async fn ensure_breakpoint_storage_scope_keys(
+    backend: CanonicalBackendRef<'_>,
+) -> Result<(), LixError> {
     add_column_if_missing_with_backend(
         backend,
         "lix_internal_entity_state_timeline_breakpoint",
