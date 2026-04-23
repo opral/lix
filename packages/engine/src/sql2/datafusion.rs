@@ -1,12 +1,12 @@
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::thread;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BinaryArray, BooleanArray, StringArray};
+use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
@@ -18,7 +18,10 @@ use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanP
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
 use datafusion::prelude::SessionContext;
-use datafusion::{datasource::TableType, physical_plan::SendableRecordBatchStream};
+use datafusion::{
+    datasource::{TableType, ViewTable},
+    physical_plan::SendableRecordBatchStream,
+};
 use futures_util::{stream, TryStreamExt};
 use sqlparser::ast::helpers::attached_token::AttachedToken;
 use sqlparser::ast::{
@@ -35,7 +38,13 @@ use super::entity_view::{
     PreparedSql2EntityViewPlan, Sql2EntityViewBaseRelation, VARIANT_FIELD_METADATA_KEY,
     VARIANT_FIELD_METADATA_VALUE,
 };
+use super::filesystem_provider::{
+    LixDirectoryProvider, LixDirectorySurfaceKind, LixFileProvider, LixFileSurfaceKind,
+};
+use super::filesystem_view::{PreparedSql2FilesystemViewPlan, Sql2FilesystemViewBaseRelation};
 use super::udf::register_sql2_udfs;
+use crate::binary_cas::BlobDataReader;
+use crate::catalog::SurfaceColumnType;
 use crate::catalog::{
     open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,
     open_directory_by_version_surface_snapshot,
@@ -46,12 +55,9 @@ use crate::catalog::{
     open_working_changes_surface_snapshot,
     open_working_changes_surface_snapshot_with_shared_backend, ChangeSurfaceColumn,
     ChangeSurfaceFilter, ChangeSurfaceRow, ChangeSurfaceScanRequest, ChangeSurfaceSnapshot,
-    DirectorySurfaceColumn, DirectorySurfaceFilter, DirectorySurfaceRow,
-    DirectorySurfaceScanRequest, DirectorySurfaceSnapshot, FileSurfaceColumn, FileSurfaceFilter,
-    FileSurfaceRow, FileSurfaceScanRequest, FileSurfaceSnapshot, VersionSurfaceColumn,
-    VersionSurfaceRow, VersionSurfaceScanRequest, VersionSurfaceSnapshot,
-    WorkingChangesSurfaceColumn, WorkingChangesSurfaceFilter, WorkingChangesSurfaceRow,
-    WorkingChangesSurfaceScanRequest, WorkingChangesSurfaceSnapshot,
+    FileSurfaceSnapshot, VersionSurfaceColumn, VersionSurfaceRow, VersionSurfaceScanRequest,
+    VersionSurfaceSnapshot, WorkingChangesSurfaceColumn, WorkingChangesSurfaceFilter,
+    WorkingChangesSurfaceRow, WorkingChangesSurfaceScanRequest, WorkingChangesSurfaceSnapshot,
 };
 use crate::history::{
     CommittedStateHistoryReader, StateHistoryContentMode, StateHistoryLineageScope,
@@ -63,7 +69,6 @@ use crate::live_state::{
     StateSurfaceColumn, StateSurfaceFilter,
 };
 use crate::sql::diagnostics::sql_unknown_column_error;
-use crate::catalog::SurfaceColumnType;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -73,6 +78,8 @@ pub(crate) struct PreparedSql2ReadArtifact {
     pub(crate) active_version_id: String,
     pub(crate) surface_names: Vec<String>,
     pub(crate) entity_views: BTreeMap<String, PreparedSql2EntityViewPlan>,
+    #[allow(dead_code)]
+    pub(crate) filesystem_views: BTreeMap<String, PreparedSql2FilesystemViewPlan>,
 }
 
 pub(crate) async fn execute_read_with_backend(
@@ -80,20 +87,21 @@ pub(crate) async fn execute_read_with_backend(
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<QueryResult, LixError> {
     let ctx = build_session_for_read_with_borrowed_backend(backend, artifact).await?;
-    collect_query_result_from_ctx(ctx, artifact).await
+    collect_query_result_from_ctx(ctx, artifact, Some(backend)).await
 }
 
 pub(crate) async fn execute_read_with_shared_backend(
     backend: Arc<dyn LixBackend + Send + Sync>,
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<QueryResult, LixError> {
-    let ctx = build_session_for_read_with_shared_backend(backend, artifact).await?;
-    collect_query_result_from_ctx(ctx, artifact).await
+    let ctx = build_session_for_read_with_shared_backend(backend.clone(), artifact).await?;
+    collect_query_result_from_ctx(ctx, artifact, Some(backend.as_ref())).await
 }
 
 async fn collect_query_result_from_ctx(
     ctx: SessionContext,
     artifact: &PreparedSql2ReadArtifact,
+    backend: Option<&dyn LixBackend>,
 ) -> Result<QueryResult, LixError> {
     let sql = normalize_sql2_query_shape(&artifact.sql)?;
     validate_variant_text_coercions(&sql, artifact)?;
@@ -130,7 +138,11 @@ async fn collect_query_result_from_ctx(
         .collect()
         .await
         .map_err(|error| datafusion_error_to_lix_error_with_artifact(error, artifact))?;
-    query_result_from_batches(&result_columns, &variant_result_columns, &batches)
+    let mut result = query_result_from_batches(&result_columns, &variant_result_columns, &batches)?;
+    if let Some(backend) = backend {
+        hydrate_filesystem_history_blob_columns(backend, artifact, &mut result).await?;
+    }
+    Ok(result)
 }
 
 fn normalize_sql2_query_shape(sql: &str) -> Result<String, LixError> {
@@ -351,9 +363,7 @@ fn validate_variant_text_coercions_in_join_constraint(
         sqlparser::ast::JoinConstraint::On(expr) => {
             validate_variant_text_coercions_in_expr(expr, artifact, scope)
         }
-        sqlparser::ast::JoinConstraint::Using(_idents) => {
-            Ok(())
-        }
+        sqlparser::ast::JoinConstraint::Using(_idents) => Ok(()),
         sqlparser::ast::JoinConstraint::Natural | sqlparser::ast::JoinConstraint::None => Ok(()),
     }
 }
@@ -366,7 +376,8 @@ fn validate_variant_text_coercions_in_expr(
     match expr {
         SqlExpr::BinaryOp { left, op, right } => {
             if binary_operator_wants_text(op)
-                && ((expr_is_string_like_literal(left) && expr_is_bare_variant_column(right, artifact, scope))
+                && ((expr_is_string_like_literal(left)
+                    && expr_is_bare_variant_column(right, artifact, scope))
                     || (expr_is_string_like_literal(right)
                         && expr_is_bare_variant_column(left, artifact, scope)))
             {
@@ -399,7 +410,9 @@ fn validate_variant_text_coercions_in_expr(
             }
             Ok(())
         }
-        SqlExpr::Between { expr, low, high, .. } => {
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
             if expr_is_bare_variant_column(expr, artifact, scope)
                 && (expr_is_string_like_literal(low) || expr_is_string_like_literal(high))
             {
@@ -421,8 +434,7 @@ fn validate_variant_text_coercions_in_expr(
         | SqlExpr::IsNotUnknown(expr) => {
             validate_variant_text_coercions_in_expr(expr, artifact, scope)
         }
-        SqlExpr::IsDistinctFrom(left, right)
-        | SqlExpr::IsNotDistinctFrom(left, right) => {
+        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
             validate_variant_text_coercions_in_expr(left, artifact, scope)?;
             validate_variant_text_coercions_in_expr(right, artifact, scope)
         }
@@ -564,13 +576,9 @@ fn expr_is_bare_variant_column(
     scope: &BTreeMap<String, String>,
 ) -> bool {
     match expr {
-        SqlExpr::Identifier(ident) => variant_column_type_for_reference(
-            None,
-            &ident.value,
-            artifact,
-            scope,
-        )
-        .is_some(),
+        SqlExpr::Identifier(ident) => {
+            variant_column_type_for_reference(None, &ident.value, artifact, scope).is_some()
+        }
         SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => {
             variant_column_type_for_reference(
                 Some(&idents[0].value),
@@ -598,15 +606,12 @@ fn variant_column_type_for_reference(
         return (*column_type == SurfaceColumnType::Variant).then_some(*column_type);
     }
 
-    let mut variant_matches = artifact
-        .entity_views
-        .values()
-        .filter_map(|plan| {
-            plan.column_types
-                .get(column_name)
-                .copied()
-                .filter(|column_type| *column_type == SurfaceColumnType::Variant)
-        });
+    let mut variant_matches = artifact.entity_views.values().filter_map(|plan| {
+        plan.column_types
+            .get(column_name)
+            .copied()
+            .filter(|column_type| *column_type == SurfaceColumnType::Variant)
+    });
     let first = variant_matches.next()?;
     variant_matches.next().is_none().then_some(first)
 }
@@ -707,13 +712,12 @@ async fn build_session_for_read_with_borrowed_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_state_history" => {
-                let rows =
-                    load_materialized_state_history_rows(
-                        backend,
-                        &artifact.active_version_id,
-                        &artifact.sql,
-                    )
-                    .await?;
+                let rows = load_materialized_state_history_rows(
+                    backend,
+                    &artifact.active_version_id,
+                    &artifact.sql,
+                )
+                .await?;
                 ctx.register_table(
                     surface_name,
                     Arc::new(LixStateHistoryProvider::new_materialized(
@@ -724,54 +728,128 @@ async fn build_session_for_read_with_borrowed_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_file" => {
-                let snapshot =
-                    open_file_surface_snapshot(backend, &artifact.active_version_id).await?;
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixFileProvider::new(
-                        LixFileSurfaceKind::File,
-                        artifact.active_version_id.clone(),
-                        snapshot,
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_borrowed_backend(
+                        &ctx,
+                        backend,
+                        artifact,
+                        spec,
+                        surface_name,
+                    )
+                    .await?;
+                } else {
+                    let snapshot =
+                        open_file_surface_snapshot(backend, &artifact.active_version_id).await?;
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixFileProvider::new(
+                            LixFileSurfaceKind::File,
+                            artifact.active_version_id.clone(),
+                            snapshot,
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
             }
             "lix_file_by_version" => {
-                let snapshot = open_file_by_version_surface_snapshot(backend).await?;
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixFileProvider::new(
-                        LixFileSurfaceKind::FileByVersion,
-                        artifact.active_version_id.clone(),
-                        snapshot,
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_borrowed_backend(
+                        &ctx,
+                        backend,
+                        artifact,
+                        spec,
+                        surface_name,
+                    )
+                    .await?;
+                } else {
+                    let snapshot = open_file_by_version_surface_snapshot(backend).await?;
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixFileProvider::new(
+                            LixFileSurfaceKind::FileByVersion,
+                            artifact.active_version_id.clone(),
+                            snapshot,
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
             }
             "lix_directory" => {
-                let snapshot =
-                    open_directory_surface_snapshot(backend, &artifact.active_version_id).await?;
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixDirectoryProvider::new(
-                        LixDirectorySurfaceKind::Directory,
-                        artifact.active_version_id.clone(),
-                        snapshot,
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_borrowed_backend(
+                        &ctx,
+                        backend,
+                        artifact,
+                        spec,
+                        surface_name,
+                    )
+                    .await?;
+                } else {
+                    let snapshot =
+                        open_directory_surface_snapshot(backend, &artifact.active_version_id)
+                            .await?;
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixDirectoryProvider::new(
+                            LixDirectorySurfaceKind::Directory,
+                            artifact.active_version_id.clone(),
+                            snapshot,
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
             }
             "lix_directory_by_version" => {
-                let snapshot = open_directory_by_version_surface_snapshot(backend).await?;
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixDirectoryProvider::new(
-                        LixDirectorySurfaceKind::DirectoryByVersion,
-                        artifact.active_version_id.clone(),
-                        snapshot,
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_borrowed_backend(
+                        &ctx,
+                        backend,
+                        artifact,
+                        spec,
+                        surface_name,
+                    )
+                    .await?;
+                } else {
+                    let snapshot = open_directory_by_version_surface_snapshot(backend).await?;
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixDirectoryProvider::new(
+                            LixDirectorySurfaceKind::DirectoryByVersion,
+                            artifact.active_version_id.clone(),
+                            snapshot,
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
+            }
+            "lix_file_history" | "lix_file_history_by_version" | "lix_directory_history" => {
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    let provider: Arc<dyn TableProvider> =
+                        Arc::new(LixStateHistoryProvider::new_materialized(
+                            artifact.active_version_id.clone(),
+                            load_materialized_state_history_rows(
+                                backend,
+                                &artifact.active_version_id,
+                                &artifact.sql,
+                            )
+                            .await?,
+                        ));
+                    register_filesystem_history_view_with_state_history_provider(
+                        &ctx,
+                        artifact,
+                        spec,
+                        surface_name,
+                        provider,
+                    )
+                    .await?;
+                } else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled filesystem history surface '{surface_name}'"
+                        ),
+                    ));
+                }
             }
             "lix_version" => {
                 let snapshot = open_version_surface_snapshot(backend).await?;
@@ -825,6 +903,7 @@ async fn build_session_for_read_with_shared_backend(
         .iter()
         .any(|surface| matches!(surface.as_str(), "lix_state" | "lix_state_by_version"))
         || !artifact.entity_views.is_empty()
+        || !artifact.filesystem_views.is_empty()
     {
         Some(open_state_by_version_snapshot_with_shared_backend(Arc::clone(&backend)).await?)
     } else {
@@ -839,16 +918,22 @@ async fn build_session_for_read_with_shared_backend(
     } else {
         None
     };
-    let shared_directory_snapshot = if artifact.surface_names.iter().any(|surface| {
+    let needs_directory_snapshot = artifact.surface_names.iter().any(|surface| {
         matches!(
             surface.as_str(),
             "lix_directory" | "lix_directory_by_version"
         )
-    }) {
-        Some(
+    }) || artifact
+        .filesystem_views
+        .keys()
+        .any(|surface| matches!(surface.as_str(), "lix_file" | "lix_file_by_version"));
+    let shared_directory_snapshot = if needs_directory_snapshot {
+        Some(if artifact.filesystem_views.is_empty() {
             open_directory_by_version_surface_snapshot_with_shared_backend(Arc::clone(&backend))
-                .await?,
-        )
+                .await?
+        } else {
+            open_directory_by_version_surface_snapshot(backend.as_ref()).await?
+        })
     } else {
         None
     };
@@ -928,64 +1013,165 @@ async fn build_session_for_read_with_shared_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_file" => {
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixFileProvider::new(
-                        LixFileSurfaceKind::File,
-                        artifact.active_version_id.clone(),
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_shared_snapshot(
+                        &ctx,
+                        artifact,
+                        spec,
+                        surface_name,
                         Arc::clone(
+                            shared_state_snapshot
+                                .as_ref()
+                                .expect("state surface snapshot should exist"),
+                        ),
+                        Some(Arc::clone(
                             shared_file_snapshot
                                 .as_ref()
                                 .expect("file surface snapshot should exist"),
-                        ),
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                        )),
+                    )
+                    .await?;
+                } else {
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixFileProvider::new(
+                            LixFileSurfaceKind::File,
+                            artifact.active_version_id.clone(),
+                            Arc::clone(
+                                shared_file_snapshot
+                                    .as_ref()
+                                    .expect("file surface snapshot should exist"),
+                            ),
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
             }
             "lix_file_by_version" => {
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixFileProvider::new(
-                        LixFileSurfaceKind::FileByVersion,
-                        artifact.active_version_id.clone(),
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_shared_snapshot(
+                        &ctx,
+                        artifact,
+                        spec,
+                        surface_name,
                         Arc::clone(
+                            shared_state_snapshot
+                                .as_ref()
+                                .expect("state surface snapshot should exist"),
+                        ),
+                        Some(Arc::clone(
                             shared_file_snapshot
                                 .as_ref()
                                 .expect("file-by-version surface snapshot should exist"),
-                        ),
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                        )),
+                    )
+                    .await?;
+                } else {
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixFileProvider::new(
+                            LixFileSurfaceKind::FileByVersion,
+                            artifact.active_version_id.clone(),
+                            Arc::clone(
+                                shared_file_snapshot
+                                    .as_ref()
+                                    .expect("file-by-version surface snapshot should exist"),
+                            ),
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
             }
             "lix_directory" => {
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixDirectoryProvider::new(
-                        LixDirectorySurfaceKind::Directory,
-                        artifact.active_version_id.clone(),
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_shared_snapshot(
+                        &ctx,
+                        artifact,
+                        spec,
+                        surface_name,
                         Arc::clone(
-                            shared_directory_snapshot
+                            shared_state_snapshot
                                 .as_ref()
-                                .expect("directory surface snapshot should exist"),
+                                .expect("state surface snapshot should exist"),
                         ),
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                        None,
+                    )
+                    .await?;
+                } else {
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixDirectoryProvider::new(
+                            LixDirectorySurfaceKind::Directory,
+                            artifact.active_version_id.clone(),
+                            Arc::clone(
+                                shared_directory_snapshot
+                                    .as_ref()
+                                    .expect("directory surface snapshot should exist"),
+                            ),
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
             }
             "lix_directory_by_version" => {
-                ctx.register_table(
-                    surface_name,
-                    Arc::new(LixDirectoryProvider::new(
-                        LixDirectorySurfaceKind::DirectoryByVersion,
-                        artifact.active_version_id.clone(),
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    register_filesystem_view_with_shared_snapshot(
+                        &ctx,
+                        artifact,
+                        spec,
+                        surface_name,
                         Arc::clone(
-                            shared_directory_snapshot
+                            shared_state_snapshot
                                 .as_ref()
-                                .expect("directory surface snapshot should exist"),
+                                .expect("state surface snapshot should exist"),
                         ),
-                    )),
-                )
-                .map_err(datafusion_error_to_lix_error)?;
+                        None,
+                    )
+                    .await?;
+                } else {
+                    ctx.register_table(
+                        surface_name,
+                        Arc::new(LixDirectoryProvider::new(
+                            LixDirectorySurfaceKind::DirectoryByVersion,
+                            artifact.active_version_id.clone(),
+                            Arc::clone(
+                                shared_directory_snapshot
+                                    .as_ref()
+                                    .expect("directory surface snapshot should exist"),
+                            ),
+                        )),
+                    )
+                    .map_err(datafusion_error_to_lix_error)?;
+                }
+            }
+            "lix_file_history" | "lix_file_history_by_version" | "lix_directory_history" => {
+                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
+                    let provider: Arc<dyn TableProvider> =
+                        Arc::new(LixStateHistoryProvider::new_materialized(
+                            artifact.active_version_id.clone(),
+                            backend
+                                .load_committed_state_history_rows(&state_history_request(
+                                    &artifact.active_version_id,
+                                    &state_history_route_from_sql(&artifact.sql)?,
+                                ))
+                                .await?,
+                        ));
+                    register_filesystem_history_view_with_state_history_provider(
+                        &ctx,
+                        artifact,
+                        spec,
+                        surface_name,
+                        provider,
+                    )
+                    .await?;
+                } else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled shared-backend filesystem history surface '{surface_name}'"
+                        ),
+                    ));
+                }
             }
             "lix_version" => {
                 ctx.register_table(
@@ -1130,6 +1316,314 @@ fn register_entity_view_with_shared_history_backend(
         backend,
     ));
     register_entity_view_provider(ctx, provider, spec, surface_name)
+}
+
+async fn register_filesystem_view_with_borrowed_backend(
+    ctx: &SessionContext,
+    backend: &dyn LixBackend,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2FilesystemViewPlan,
+    surface_name: &str,
+) -> Result<(), LixError> {
+    let state_snapshot = open_visible_state_by_version_snapshot(backend).await?;
+    register_filesystem_view_with_state_snapshot(
+        ctx,
+        artifact,
+        spec,
+        surface_name,
+        state_snapshot,
+        Some(open_file_by_version_surface_snapshot(backend).await?),
+    )
+    .await
+}
+
+fn normalize_file_winner_provider(
+    ctx: &SessionContext,
+    provider: Arc<dyn TableProvider>,
+) -> Result<Arc<dyn TableProvider>, LixError> {
+    let dataframe = ctx
+        .read_table(provider)
+        .map_err(datafusion_error_to_lix_error)?
+        .select(vec![
+            datafusion::logical_expr::col("id"),
+            datafusion::logical_expr::col("directory_id"),
+            datafusion::logical_expr::col("name"),
+            datafusion::logical_expr::col("extension"),
+            datafusion::logical_expr::col("path"),
+            datafusion::logical_expr::col("hidden"),
+            datafusion::logical_expr::col("data"),
+            datafusion::logical_expr::col("metadata"),
+            datafusion::logical_expr::col("lixcol_entity_id").alias("entity_id"),
+            datafusion::logical_expr::col("lixcol_schema_key").alias("schema_key"),
+            datafusion::logical_expr::col("lixcol_file_id").alias("file_id"),
+            datafusion::logical_expr::col("lixcol_version_id").alias("version_id"),
+            datafusion::logical_expr::col("lixcol_plugin_key").alias("plugin_key"),
+            datafusion::logical_expr::col("lixcol_schema_version").alias("schema_version"),
+            datafusion::logical_expr::col("lixcol_global").alias("global"),
+            datafusion::logical_expr::col("lixcol_change_id").alias("change_id"),
+            datafusion::logical_expr::col("lixcol_created_at").alias("created_at"),
+            datafusion::logical_expr::col("lixcol_updated_at").alias("updated_at"),
+            datafusion::logical_expr::col("lixcol_commit_id").alias("commit_id"),
+            datafusion::logical_expr::col("lixcol_untracked").alias("untracked"),
+        ])
+        .map_err(datafusion_error_to_lix_error)?;
+    Ok(Arc::new(ViewTable::new(
+        dataframe.into_unoptimized_plan(),
+        None,
+    )))
+}
+
+async fn register_filesystem_view_with_shared_snapshot(
+    ctx: &SessionContext,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2FilesystemViewPlan,
+    surface_name: &str,
+    state_snapshot: Arc<dyn StateByVersionSnapshot>,
+    file_snapshot: Option<Arc<dyn FileSurfaceSnapshot>>,
+) -> Result<(), LixError> {
+    register_filesystem_view_with_state_snapshot(
+        ctx,
+        artifact,
+        spec,
+        surface_name,
+        state_snapshot,
+        file_snapshot,
+    )
+    .await
+}
+
+async fn register_filesystem_view_with_state_snapshot(
+    ctx: &SessionContext,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2FilesystemViewPlan,
+    surface_name: &str,
+    state_snapshot: Arc<dyn StateByVersionSnapshot>,
+    file_snapshot: Option<Arc<dyn FileSurfaceSnapshot>>,
+) -> Result<(), LixError> {
+    let state_provider: Arc<dyn TableProvider> = Arc::new(LixStateProvider::new(
+        LixStateSurfaceKind::StateByVersion,
+        artifact.active_version_id.clone(),
+        state_snapshot,
+    ));
+    let mut winner_providers = BTreeMap::new();
+    for (relation, base_plan) in &spec.base_relation_plans {
+        let compile_ctx = SessionContext::new();
+        register_sql2_udfs(&compile_ctx);
+        let base_provider =
+            base_plan.compiled_view_provider(&compile_ctx, Arc::clone(&state_provider))?;
+        let winner_provider = base_plan
+            .compiled_ranked_winner_view_provider(&compile_ctx, base_provider)
+            .await?;
+        winner_providers.insert(*relation, winner_provider);
+    }
+
+    match surface_name {
+        "lix_file" | "lix_file_by_version" => {
+            let file_relation = if spec
+                .base_relation_plans
+                .contains_key(&Sql2FilesystemViewBaseRelation::FileDescriptorRows)
+            {
+                Sql2FilesystemViewBaseRelation::FileDescriptorRows
+            } else {
+                Sql2FilesystemViewBaseRelation::FileDescriptorHistoryRows
+            };
+            let directory_relation = if spec
+                .base_relation_plans
+                .contains_key(&Sql2FilesystemViewBaseRelation::DirectoryDescriptorRows)
+            {
+                Sql2FilesystemViewBaseRelation::DirectoryDescriptorRows
+            } else {
+                Sql2FilesystemViewBaseRelation::DirectoryDescriptorHistoryRows
+            };
+            let blob_relation = if spec
+                .base_relation_plans
+                .contains_key(&Sql2FilesystemViewBaseRelation::BinaryBlobRefRows)
+            {
+                Sql2FilesystemViewBaseRelation::BinaryBlobRefRows
+            } else {
+                Sql2FilesystemViewBaseRelation::BinaryBlobRefHistoryRows
+            };
+            let file_provider = winner_providers
+                .get(&file_relation)
+                .cloned()
+                .expect("filesystem file view should have file winner provider");
+            let directory_provider = winner_providers
+                .get(&directory_relation)
+                .cloned()
+                .expect("filesystem file view should have directory winner provider");
+            let blob_provider = winner_providers
+                .get(&blob_relation)
+                .cloned()
+                .expect("filesystem file view should have blob winner provider");
+            let file_snapshot = file_snapshot
+                .expect("filesystem file view should have file snapshot for live data");
+            let raw_file_data_provider: Arc<dyn TableProvider> = Arc::new(LixFileProvider::new(
+                LixFileSurfaceKind::FileByVersion,
+                artifact.active_version_id.clone(),
+                file_snapshot,
+            ));
+            let file_data_ctx = SessionContext::new();
+            register_sql2_udfs(&file_data_ctx);
+            let _ = blob_provider;
+            let file_data_provider =
+                normalize_file_winner_provider(&file_data_ctx, raw_file_data_provider)?;
+            let final_ctx = SessionContext::new();
+            register_sql2_udfs(&final_ctx);
+            ctx.register_table(
+                surface_name,
+                spec.compiled_lix_file_view_provider(
+                    &final_ctx,
+                    &artifact.active_version_id,
+                    file_provider,
+                    directory_provider,
+                    file_data_provider,
+                )
+                .await?,
+            )
+            .map_err(datafusion_error_to_lix_error)?;
+        }
+        "lix_directory" | "lix_directory_by_version" => {
+            let directory_provider = winner_providers
+                .get(&Sql2FilesystemViewBaseRelation::DirectoryDescriptorRows)
+                .cloned()
+                .expect("filesystem directory view should have directory winner provider");
+            let final_ctx = SessionContext::new();
+            register_sql2_udfs(&final_ctx);
+            ctx.register_table(
+                surface_name,
+                spec.compiled_lix_directory_view_provider(
+                    &final_ctx,
+                    &artifact.active_version_id,
+                    directory_provider,
+                )
+                .await?,
+            )
+            .map_err(datafusion_error_to_lix_error)?;
+        }
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("sql2 does not support filesystem surface '{other}' yet"),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn register_filesystem_history_view_with_state_history_provider(
+    ctx: &SessionContext,
+    artifact: &PreparedSql2ReadArtifact,
+    spec: &PreparedSql2FilesystemViewPlan,
+    surface_name: &str,
+    state_history_provider: Arc<dyn TableProvider>,
+) -> Result<(), LixError> {
+    let compile_ctx = SessionContext::new();
+    register_sql2_udfs(&compile_ctx);
+
+    let mut base_relation_providers: BTreeMap<
+        Sql2FilesystemViewBaseRelation,
+        Arc<dyn TableProvider>,
+    > = BTreeMap::new();
+    for base_relation in &spec.base_relations {
+        let base_relation_plan = spec.base_relation_plans.get(base_relation).ok_or_else(|| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "filesystem history view '{}' is missing base relation plan for {:?}",
+                    spec.public_name, base_relation
+                ),
+            )
+        })?;
+        let base_provider_ctx = SessionContext::new();
+        register_sql2_udfs(&base_provider_ctx);
+        let provider = base_relation_plan
+            .compiled_view_provider(&base_provider_ctx, Arc::clone(&state_history_provider))?;
+        base_relation_providers.insert(*base_relation, provider);
+    }
+
+    match surface_name {
+        "lix_file_history" | "lix_file_history_by_version" => {
+            let file_history_rows_provider = base_relation_providers
+                .get(&Sql2FilesystemViewBaseRelation::FileDescriptorHistoryRows)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "filesystem history view '{}' is missing file descriptor history rows",
+                            spec.public_name
+                        ),
+                    )
+                })?;
+            let directory_history_rows_provider = base_relation_providers
+                .get(&Sql2FilesystemViewBaseRelation::DirectoryDescriptorHistoryRows)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "filesystem history view '{}' is missing directory descriptor history rows",
+                            spec.public_name
+                        ),
+                    )
+                })?;
+            let blob_history_rows_provider = base_relation_providers
+                .get(&Sql2FilesystemViewBaseRelation::BinaryBlobRefHistoryRows)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "filesystem history view '{}' is missing blob ref history rows",
+                            spec.public_name
+                        ),
+                    )
+                })?;
+            ctx.register_table(
+                surface_name,
+                spec.compiled_lix_file_history_view_provider(
+                    &compile_ctx,
+                    file_history_rows_provider,
+                    directory_history_rows_provider,
+                    blob_history_rows_provider,
+                )
+                .await?,
+            )
+            .map_err(datafusion_error_to_lix_error)?;
+        }
+        "lix_directory_history" => {
+            let directory_history_rows_provider = base_relation_providers
+                .get(&Sql2FilesystemViewBaseRelation::DirectoryDescriptorHistoryRows)
+                .cloned()
+                .ok_or_else(|| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "filesystem history view '{}' is missing directory descriptor history rows",
+                            spec.public_name
+                        ),
+                    )
+                })?;
+            ctx.register_table(
+                surface_name,
+                spec.compiled_lix_directory_history_view_provider(
+                    &compile_ctx,
+                    &artifact.active_version_id,
+                    directory_history_rows_provider,
+                )
+                .await?,
+            )
+            .map_err(datafusion_error_to_lix_error)?;
+        }
+        other => {
+            return Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("sql2 does not support filesystem history surface '{other}' yet"),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 fn register_entity_view_provider(
@@ -1510,12 +2004,12 @@ impl ExecutionPlan for LixStateHistoryScanExec {
                 Vec::new()
             } else {
                 match source {
-                LixStateHistorySource::Materialized(rows) => rows.as_ref().clone(),
-                LixStateHistorySource::SharedBackend(backend) => {
-                    enqueue_state_history_scan(backend, request)
-                        .await?
+                    LixStateHistorySource::Materialized(rows) => rows.as_ref().clone(),
+                    LixStateHistorySource::SharedBackend(backend) => {
+                        enqueue_state_history_scan(backend, request).await?
+                    }
                 }
-            }};
+            };
             let rows = if let Some(limit) = limit {
                 rows.into_iter().take(limit).collect::<Vec<_>>()
             } else {
@@ -1614,7 +2108,21 @@ async fn load_materialized_state_history_rows(
         .await
 }
 
-fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> StateHistoryRequest {
+fn canonical_state_history_column_name(name: &str) -> Option<&str> {
+    match name {
+        "root_commit_id" | "lixcol_root_commit_id" => Some("root_commit_id"),
+        "entity_id" | "lixcol_entity_id" => Some("entity_id"),
+        "schema_key" | "lixcol_schema_key" => Some("schema_key"),
+        "version_id" | "lixcol_version_id" => Some("version_id"),
+        "depth" | "lixcol_depth" => Some("depth"),
+        _ => None,
+    }
+}
+
+fn state_history_request(
+    active_version_id: &str,
+    route: &StateHistoryRoute,
+) -> StateHistoryRequest {
     let mut request = StateHistoryRequest {
         lineage_scope: StateHistoryLineageScope::ActiveVersion,
         lineage_version_id: Some(active_version_id.to_string()),
@@ -1632,7 +2140,8 @@ fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> 
         request.schema_keys = route.schema_keys.clone();
     }
     if !route.version_ids.is_empty() {
-        request.version_scope = StateHistoryVersionScope::RequestedVersions(route.version_ids.clone());
+        request.version_scope =
+            StateHistoryVersionScope::RequestedVersions(route.version_ids.clone());
     }
     request.min_depth = route.min_depth;
     request.max_depth = route.max_depth;
@@ -1640,7 +2149,10 @@ fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> 
 }
 
 fn request_contradictory(request: &StateHistoryRequest) -> bool {
-    request.min_depth.zip(request.max_depth).is_some_and(|(min, max)| min > max)
+    request
+        .min_depth
+        .zip(request.max_depth)
+        .is_some_and(|(min, max)| min > max)
         || matches!(request.root_scope, StateHistoryRootScope::RequestedRoots(ref roots) if roots.is_empty())
         || matches!(request.version_scope, StateHistoryVersionScope::RequestedVersions(ref versions) if versions.is_empty())
 }
@@ -1681,10 +2193,12 @@ fn parse_state_history_filter(expr: &Expr) -> Option<()> {
         return None;
     };
 
-    match column.name.as_str() {
-        "root_commit_id" | "entity_id" | "schema_key" | "version_id" => Some(()),
-        _ => None,
-    }
+    canonical_state_history_column_name(column.name.as_str()).and_then(|column_name| {
+        match column_name {
+            "root_commit_id" | "entity_id" | "schema_key" | "version_id" | "depth" => Some(()),
+            _ => None,
+        }
+    })
 }
 
 fn apply_state_history_filter(expr: &Expr, route: &mut StateHistoryRoute) {
@@ -1694,13 +2208,16 @@ fn apply_state_history_filter(expr: &Expr, route: &mut StateHistoryRoute) {
     let Expr::Column(column) = &*binary_expr.left else {
         return;
     };
+    let Some(column_name) = canonical_state_history_column_name(column.name.as_str()) else {
+        return;
+    };
     let right = &*binary_expr.right;
-    match (column.name.as_str(), &binary_expr.op, right) {
+    match (column_name, &binary_expr.op, right) {
         ("root_commit_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
         | ("entity_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
         | ("schema_key", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _))
         | ("version_id", Operator::Eq, Expr::Literal(ScalarValue::Utf8(Some(value)), _)) => {
-            let bucket = match column.name.as_str() {
+            let bucket = match column_name {
                 "root_commit_id" => &mut route.root_commit_ids,
                 "entity_id" => &mut route.entity_ids,
                 "schema_key" => &mut route.schema_keys,
@@ -1719,26 +2236,30 @@ fn apply_state_history_filter(expr: &Expr, route: &mut StateHistoryRoute) {
         }
         ("depth", Operator::Gt, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth =
-                    Some(route.min_depth.map_or(value + 1, |current| current.max(value + 1)));
+                route.min_depth = Some(
+                    route
+                        .min_depth
+                        .map_or(value + 1, |current| current.max(value + 1)),
+                );
             }
         }
         ("depth", Operator::GtEq, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth =
-                    Some(route.min_depth.map_or(value, |current| current.max(value)));
+                route.min_depth = Some(route.min_depth.map_or(value, |current| current.max(value)));
             }
         }
         ("depth", Operator::Lt, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.max_depth =
-                    Some(route.max_depth.map_or(value - 1, |current| current.min(value - 1)));
+                route.max_depth = Some(
+                    route
+                        .max_depth
+                        .map_or(value - 1, |current| current.min(value - 1)),
+                );
             }
         }
         ("depth", Operator::LtEq, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.max_depth =
-                    Some(route.max_depth.map_or(value, |current| current.min(value)));
+                route.max_depth = Some(route.max_depth.map_or(value, |current| current.min(value)));
             }
         }
         _ => {}
@@ -1791,25 +2312,73 @@ fn collect_state_history_route_from_sql_expr(expr: &SqlExpr, route: &mut StateHi
                 collect_state_history_route_from_sql_expr(right, route);
                 return;
             }
-            match (history_column_name(left), op, sql_expr_string_literal(right)) {
-                (Some("root_commit_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+            match (history_column_name(left), op) {
+                (Some("root_commit_id"), sqlparser::ast::BinaryOperator::Eq) => {
+                    let Some(value) = sql_expr_string_literal(right) else {
+                        return;
+                    };
                     if !route.root_commit_ids.contains(&value.to_string()) {
                         route.root_commit_ids.push(value.to_string());
                     }
                 }
-                (Some("entity_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                (Some("entity_id"), sqlparser::ast::BinaryOperator::Eq) => {
+                    let Some(value) = sql_expr_string_literal(right) else {
+                        return;
+                    };
                     if !route.entity_ids.contains(&value.to_string()) {
                         route.entity_ids.push(value.to_string());
                     }
                 }
-                (Some("schema_key"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                (Some("schema_key"), sqlparser::ast::BinaryOperator::Eq) => {
+                    let Some(value) = sql_expr_string_literal(right) else {
+                        return;
+                    };
                     if !route.schema_keys.contains(&value.to_string()) {
                         route.schema_keys.push(value.to_string());
                     }
                 }
-                (Some("version_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
+                (Some("version_id"), sqlparser::ast::BinaryOperator::Eq) => {
+                    let Some(value) = sql_expr_string_literal(right) else {
+                        return;
+                    };
                     if !route.version_ids.contains(&value.to_string()) {
                         route.version_ids.push(value.to_string());
+                    }
+                }
+                (Some("depth"), sqlparser::ast::BinaryOperator::Eq) => {
+                    if let Some(value) = sql_expr_i64_literal(right) {
+                        route.min_depth = Some(value);
+                        route.max_depth = Some(value);
+                    }
+                }
+                (Some("depth"), sqlparser::ast::BinaryOperator::Gt) => {
+                    if let Some(value) = sql_expr_i64_literal(right) {
+                        route.min_depth = Some(
+                            route
+                                .min_depth
+                                .map_or(value + 1, |current| current.max(value + 1)),
+                        );
+                    }
+                }
+                (Some("depth"), sqlparser::ast::BinaryOperator::GtEq) => {
+                    if let Some(value) = sql_expr_i64_literal(right) {
+                        route.min_depth =
+                            Some(route.min_depth.map_or(value, |current| current.max(value)));
+                    }
+                }
+                (Some("depth"), sqlparser::ast::BinaryOperator::Lt) => {
+                    if let Some(value) = sql_expr_i64_literal(right) {
+                        route.max_depth = Some(
+                            route
+                                .max_depth
+                                .map_or(value - 1, |current| current.min(value - 1)),
+                        );
+                    }
+                }
+                (Some("depth"), sqlparser::ast::BinaryOperator::LtEq) => {
+                    if let Some(value) = sql_expr_i64_literal(right) {
+                        route.max_depth =
+                            Some(route.max_depth.map_or(value, |current| current.min(value)));
                     }
                 }
                 _ => {}
@@ -1841,7 +2410,7 @@ fn history_column_name(expr: &SqlExpr) -> Option<&str> {
         SqlExpr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
         _ => None,
     }
-    .filter(|name| matches!(*name, "root_commit_id" | "entity_id" | "schema_key" | "version_id"))
+    .and_then(canonical_state_history_column_name)
 }
 
 fn sql_expr_string_literal(expr: &SqlExpr) -> Option<&str> {
@@ -1850,6 +2419,19 @@ fn sql_expr_string_literal(expr: &SqlExpr) -> Option<&str> {
             SqlValue::SingleQuotedString(ref inner) => Some(inner.as_str()),
             _ => None,
         },
+        _ => None,
+    }
+}
+
+fn sql_expr_i64_literal(expr: &SqlExpr) -> Option<i64> {
+    match expr {
+        SqlExpr::Value(value) => match &value.value {
+            SqlValue::Number(number, _) => number.parse::<i64>().ok(),
+            _ => None,
+        },
+        SqlExpr::UnaryOp { op, expr } if matches!(op, sqlparser::ast::UnaryOperator::Minus) => {
+            sql_expr_i64_literal(expr).map(|value| -value)
+        }
         _ => None,
     }
 }
@@ -2163,924 +2745,6 @@ fn state_history_record_batch(schema: SchemaRef, rows: &[StateHistoryRow]) -> Re
         DataFusionError::Execution(format!(
             "sql2 failed to build lix_state_history batch: {error}"
         ))
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LixFileSurfaceKind {
-    File,
-    FileByVersion,
-}
-
-fn lix_file_schema(surface_kind: LixFileSurfaceKind) -> SchemaRef {
-    let mut fields = vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("directory_id", DataType::Utf8, true),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("extension", DataType::Utf8, true),
-        Field::new("path", DataType::Utf8, true),
-        Field::new("data", DataType::Binary, true),
-        Field::new("metadata", DataType::Utf8, true),
-        Field::new("hidden", DataType::Boolean, false),
-        Field::new("lixcol_entity_id", DataType::Utf8, false),
-        Field::new("lixcol_schema_key", DataType::Utf8, false),
-        Field::new("lixcol_file_id", DataType::Utf8, true),
-    ];
-    if surface_kind == LixFileSurfaceKind::FileByVersion {
-        fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
-    }
-    fields.extend([
-        Field::new("lixcol_plugin_key", DataType::Utf8, true),
-        Field::new("lixcol_schema_version", DataType::Utf8, false),
-        Field::new("lixcol_global", DataType::Boolean, false),
-        Field::new("lixcol_change_id", DataType::Utf8, true),
-        Field::new("lixcol_created_at", DataType::Utf8, true),
-        Field::new("lixcol_updated_at", DataType::Utf8, true),
-        Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, false),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
-    ]);
-    Arc::new(Schema::new(fields))
-}
-
-#[derive(Debug, Clone)]
-struct LixFileProvider {
-    surface_kind: LixFileSurfaceKind,
-    default_version_id: String,
-    schema: SchemaRef,
-    snapshot: Arc<dyn FileSurfaceSnapshot>,
-}
-
-impl LixFileProvider {
-    fn new(
-        surface_kind: LixFileSurfaceKind,
-        default_version_id: String,
-        snapshot: Arc<dyn FileSurfaceSnapshot>,
-    ) -> Self {
-        Self {
-            surface_kind,
-            default_version_id,
-            schema: lix_file_schema(surface_kind),
-            snapshot,
-        }
-    }
-}
-
-#[async_trait]
-impl TableProvider for LixFileProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if parse_file_route_filter(filter).is_some() {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let projected_schema = projected_schema(&self.schema, projection)?;
-        let route = LixFileRoute::from_filters(filters);
-        Ok(Arc::new(LixFileScanExec::new(
-            self.surface_kind,
-            self.default_version_id.clone(),
-            Arc::clone(&self.snapshot),
-            projected_schema,
-            projection.cloned(),
-            route,
-            limit,
-        )))
-    }
-}
-
-#[derive(Debug)]
-struct LixFileScanExec {
-    surface_kind: LixFileSurfaceKind,
-    default_version_id: String,
-    snapshot: Arc<dyn FileSurfaceSnapshot>,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    route: LixFileRoute,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-impl LixFileScanExec {
-    fn new(
-        surface_kind: LixFileSurfaceKind,
-        default_version_id: String,
-        snapshot: Arc<dyn FileSurfaceSnapshot>,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        route: LixFileRoute,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            surface_kind,
-            default_version_id,
-            snapshot,
-            schema,
-            projection,
-            route,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixFileScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "LixFileScanExec(limit={:?}, route={:?})",
-                    self.limit, self.route
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixFileScanExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixFileScanExec {
-    fn name(&self) -> &str {
-        "LixFileScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixFileScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixFileScanExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let snapshot = Arc::clone(&self.snapshot);
-        let surface_kind = self.surface_kind;
-        let default_version_id = self.default_version_id.clone();
-        let projection = self.projection.clone();
-        let route = self.route.clone();
-        let limit = self.limit;
-        let schema = Arc::clone(&self.schema);
-        let stream = stream::once(async move {
-            let batches = if route.contradictory {
-                Vec::new()
-            } else {
-                let rows = enqueue_file_surface_scan(
-                    snapshot,
-                    file_surface_scan_request(
-                        surface_kind,
-                        &default_version_id,
-                        projection.as_ref(),
-                        &route,
-                        limit,
-                    ),
-                )
-                .await?;
-                file_surface_record_batches(
-                    file_projection_for_scan(surface_kind, projection.as_ref()),
-                    &rows,
-                )?
-            };
-            Ok::<_, DataFusionError>(stream::iter(
-                batches.into_iter().map(Ok::<RecordBatch, DataFusionError>),
-            ))
-        })
-        .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
-
-#[derive(Debug)]
-struct FileSurfaceScanJob {
-    snapshot: Arc<dyn FileSurfaceSnapshot>,
-    request: FileSurfaceScanRequest,
-    reply: oneshot::Sender<std::result::Result<Vec<FileSurfaceRow>, LixError>>,
-}
-
-fn file_surface_scan_worker() -> &'static mpsc::Sender<FileSurfaceScanJob> {
-    static WORKER: OnceLock<mpsc::Sender<FileSurfaceScanJob>> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<FileSurfaceScanJob>();
-        thread::Builder::new()
-            .name("sql2-file-surface-scan".to_string())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("sql2 file-surface runtime should build");
-                while let Ok(job) = rx.recv() {
-                    let result = runtime
-                        .block_on(async move { job.snapshot.scan_files(&job.request).await });
-                    let _ = job.reply.send(result);
-                }
-            })
-            .expect("sql2 file-surface worker thread should spawn");
-        tx
-    })
-}
-
-async fn enqueue_file_surface_scan(
-    snapshot: Arc<dyn FileSurfaceSnapshot>,
-    request: FileSurfaceScanRequest,
-) -> Result<Vec<FileSurfaceRow>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    file_surface_scan_worker()
-        .send(FileSurfaceScanJob {
-            snapshot,
-            request,
-            reply: reply_tx,
-        })
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "sql2 failed to enqueue file surface scan job: {error}"
-            ))
-        })?;
-    reply_rx
-        .await
-        .map_err(|_| {
-            DataFusionError::Execution("sql2 file surface scan worker dropped reply".to_string())
-        })?
-        .map_err(lix_error_to_datafusion_error)
-}
-
-fn file_surface_record_batches(
-    projection: Vec<FileSurfaceColumn>,
-    rows: &[FileSurfaceRow],
-) -> Result<Vec<RecordBatch>> {
-    Ok(vec![file_surface_record_batch(&projection, rows)?])
-}
-
-fn file_surface_record_batch(
-    projection: &[FileSurfaceColumn],
-    rows: &[FileSurfaceRow],
-) -> Result<RecordBatch> {
-    let arrays = projection
-        .iter()
-        .map(|column| match column {
-            FileSurfaceColumn::Id => string_array(rows.iter().map(|row| Some(row.id.as_str()))),
-            FileSurfaceColumn::DirectoryId => {
-                string_array(rows.iter().map(|row| row.directory_id.as_deref()))
-            }
-            FileSurfaceColumn::Name => string_array(rows.iter().map(|row| Some(row.name.as_str()))),
-            FileSurfaceColumn::Extension => {
-                string_array(rows.iter().map(|row| row.extension.as_deref()))
-            }
-            FileSurfaceColumn::Path => string_array(rows.iter().map(|row| row.path.as_deref())),
-            FileSurfaceColumn::Data => binary_array(rows.iter().map(|row| row.data.as_deref())),
-            FileSurfaceColumn::Metadata => {
-                string_array(rows.iter().map(|row| row.metadata.as_deref()))
-            }
-            FileSurfaceColumn::Hidden => Arc::new(BooleanArray::from(
-                rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            FileSurfaceColumn::LixcolEntityId => {
-                string_array(rows.iter().map(|row| Some(row.lixcol_entity_id.as_str())))
-            }
-            FileSurfaceColumn::LixcolSchemaKey => {
-                string_array(rows.iter().map(|row| Some(row.lixcol_schema_key.as_str())))
-            }
-            FileSurfaceColumn::LixcolFileId => {
-                string_array(rows.iter().map(|row| row.lixcol_file_id.as_deref()))
-            }
-            FileSurfaceColumn::LixcolVersionId => {
-                string_array(rows.iter().map(|row| Some(row.lixcol_version_id.as_str())))
-            }
-            FileSurfaceColumn::LixcolPluginKey => {
-                string_array(rows.iter().map(|row| row.lixcol_plugin_key.as_deref()))
-            }
-            FileSurfaceColumn::LixcolSchemaVersion => string_array(
-                rows.iter()
-                    .map(|row| Some(row.lixcol_schema_version.as_str())),
-            ),
-            FileSurfaceColumn::LixcolGlobal => Arc::new(BooleanArray::from(
-                rows.iter().map(|row| row.lixcol_global).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            FileSurfaceColumn::LixcolChangeId => {
-                string_array(rows.iter().map(|row| row.lixcol_change_id.as_deref()))
-            }
-            FileSurfaceColumn::LixcolCreatedAt => {
-                string_array(rows.iter().map(|row| row.lixcol_created_at.as_deref()))
-            }
-            FileSurfaceColumn::LixcolUpdatedAt => {
-                string_array(rows.iter().map(|row| row.lixcol_updated_at.as_deref()))
-            }
-            FileSurfaceColumn::LixcolCommitId => {
-                string_array(rows.iter().map(|row| row.lixcol_commit_id.as_deref()))
-            }
-            FileSurfaceColumn::LixcolUntracked => Arc::new(BooleanArray::from(
-                rows.iter()
-                    .map(|row| row.lixcol_untracked)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            FileSurfaceColumn::LixcolMetadata => {
-                string_array(rows.iter().map(|row| row.lixcol_metadata.as_deref()))
-            }
-        })
-        .collect::<Vec<_>>();
-    RecordBatch::try_new(file_surface_schema(projection), arrays).map_err(|error| {
-        DataFusionError::Execution(format!("sql2 failed to build lix_file batch: {error}"))
-    })
-}
-
-fn file_surface_schema(projection: &[FileSurfaceColumn]) -> SchemaRef {
-    Arc::new(Schema::new(
-        projection
-            .iter()
-            .map(|column| match column {
-                FileSurfaceColumn::Id => Field::new("id", DataType::Utf8, false),
-                FileSurfaceColumn::DirectoryId => Field::new("directory_id", DataType::Utf8, true),
-                FileSurfaceColumn::Name => Field::new("name", DataType::Utf8, false),
-                FileSurfaceColumn::Extension => Field::new("extension", DataType::Utf8, true),
-                FileSurfaceColumn::Path => Field::new("path", DataType::Utf8, true),
-                FileSurfaceColumn::Data => Field::new("data", DataType::Binary, true),
-                FileSurfaceColumn::Metadata => Field::new("metadata", DataType::Utf8, true),
-                FileSurfaceColumn::Hidden => Field::new("hidden", DataType::Boolean, false),
-                FileSurfaceColumn::LixcolEntityId => {
-                    Field::new("lixcol_entity_id", DataType::Utf8, false)
-                }
-                FileSurfaceColumn::LixcolSchemaKey => {
-                    Field::new("lixcol_schema_key", DataType::Utf8, false)
-                }
-                FileSurfaceColumn::LixcolFileId => {
-                    Field::new("lixcol_file_id", DataType::Utf8, true)
-                }
-                FileSurfaceColumn::LixcolVersionId => {
-                    Field::new("lixcol_version_id", DataType::Utf8, false)
-                }
-                FileSurfaceColumn::LixcolPluginKey => {
-                    Field::new("lixcol_plugin_key", DataType::Utf8, true)
-                }
-                FileSurfaceColumn::LixcolSchemaVersion => {
-                    Field::new("lixcol_schema_version", DataType::Utf8, false)
-                }
-                FileSurfaceColumn::LixcolGlobal => {
-                    Field::new("lixcol_global", DataType::Boolean, false)
-                }
-                FileSurfaceColumn::LixcolChangeId => {
-                    Field::new("lixcol_change_id", DataType::Utf8, true)
-                }
-                FileSurfaceColumn::LixcolCreatedAt => {
-                    Field::new("lixcol_created_at", DataType::Utf8, true)
-                }
-                FileSurfaceColumn::LixcolUpdatedAt => {
-                    Field::new("lixcol_updated_at", DataType::Utf8, true)
-                }
-                FileSurfaceColumn::LixcolCommitId => {
-                    Field::new("lixcol_commit_id", DataType::Utf8, true)
-                }
-                FileSurfaceColumn::LixcolUntracked => {
-                    Field::new("lixcol_untracked", DataType::Boolean, false)
-                }
-                FileSurfaceColumn::LixcolMetadata => {
-                    Field::new("lixcol_metadata", DataType::Utf8, true)
-                }
-            })
-            .collect::<Vec<_>>(),
-    ))
-}
-
-fn file_projection_for_scan(
-    surface_kind: LixFileSurfaceKind,
-    projection: Option<&Vec<usize>>,
-) -> Vec<FileSurfaceColumn> {
-    let mut all_columns = vec![
-        FileSurfaceColumn::Id,
-        FileSurfaceColumn::DirectoryId,
-        FileSurfaceColumn::Name,
-        FileSurfaceColumn::Extension,
-        FileSurfaceColumn::Path,
-        FileSurfaceColumn::Data,
-        FileSurfaceColumn::Metadata,
-        FileSurfaceColumn::Hidden,
-        FileSurfaceColumn::LixcolEntityId,
-        FileSurfaceColumn::LixcolSchemaKey,
-        FileSurfaceColumn::LixcolFileId,
-    ];
-    if surface_kind == LixFileSurfaceKind::FileByVersion {
-        all_columns.push(FileSurfaceColumn::LixcolVersionId);
-    }
-    all_columns.extend([
-        FileSurfaceColumn::LixcolPluginKey,
-        FileSurfaceColumn::LixcolSchemaVersion,
-        FileSurfaceColumn::LixcolGlobal,
-        FileSurfaceColumn::LixcolChangeId,
-        FileSurfaceColumn::LixcolCreatedAt,
-        FileSurfaceColumn::LixcolUpdatedAt,
-        FileSurfaceColumn::LixcolCommitId,
-        FileSurfaceColumn::LixcolUntracked,
-        FileSurfaceColumn::LixcolMetadata,
-    ]);
-    projection.map_or(all_columns.clone(), |indices| {
-        indices
-            .iter()
-            .filter_map(|index| all_columns.get(*index).copied())
-            .collect()
-    })
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LixDirectorySurfaceKind {
-    Directory,
-    DirectoryByVersion,
-}
-
-fn lix_directory_schema(surface_kind: LixDirectorySurfaceKind) -> SchemaRef {
-    let mut fields = vec![
-        Field::new("id", DataType::Utf8, false),
-        Field::new("parent_id", DataType::Utf8, true),
-        Field::new("name", DataType::Utf8, false),
-        Field::new("path", DataType::Utf8, true),
-        Field::new("hidden", DataType::Boolean, false),
-        Field::new("lixcol_entity_id", DataType::Utf8, false),
-        Field::new("lixcol_schema_key", DataType::Utf8, false),
-    ];
-    if surface_kind == LixDirectorySurfaceKind::DirectoryByVersion {
-        fields.push(Field::new("lixcol_version_id", DataType::Utf8, false));
-    }
-    fields.extend([
-        Field::new("lixcol_schema_version", DataType::Utf8, false),
-        Field::new("lixcol_global", DataType::Boolean, false),
-        Field::new("lixcol_change_id", DataType::Utf8, true),
-        Field::new("lixcol_created_at", DataType::Utf8, true),
-        Field::new("lixcol_updated_at", DataType::Utf8, true),
-        Field::new("lixcol_commit_id", DataType::Utf8, true),
-        Field::new("lixcol_untracked", DataType::Boolean, false),
-        Field::new("lixcol_metadata", DataType::Utf8, true),
-    ]);
-    Arc::new(Schema::new(fields))
-}
-
-#[derive(Debug, Clone)]
-struct LixDirectoryProvider {
-    surface_kind: LixDirectorySurfaceKind,
-    default_version_id: String,
-    schema: SchemaRef,
-    snapshot: Arc<dyn DirectorySurfaceSnapshot>,
-}
-
-impl LixDirectoryProvider {
-    fn new(
-        surface_kind: LixDirectorySurfaceKind,
-        default_version_id: String,
-        snapshot: Arc<dyn DirectorySurfaceSnapshot>,
-    ) -> Self {
-        Self {
-            surface_kind,
-            default_version_id,
-            schema: lix_directory_schema(surface_kind),
-            snapshot,
-        }
-    }
-}
-
-#[async_trait]
-impl TableProvider for LixDirectoryProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.schema)
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn supports_filters_pushdown(
-        &self,
-        filters: &[&Expr],
-    ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                if parse_directory_route_filter(filter).is_some() {
-                    TableProviderFilterPushDown::Exact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
-    }
-
-    async fn scan(
-        &self,
-        _state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        filters: &[Expr],
-        limit: Option<usize>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        let projected_schema = projected_schema(&self.schema, projection)?;
-        let route = LixDirectoryRoute::from_filters(filters);
-        Ok(Arc::new(LixDirectoryScanExec::new(
-            self.surface_kind,
-            self.default_version_id.clone(),
-            Arc::clone(&self.snapshot),
-            projected_schema,
-            projection.cloned(),
-            route,
-            limit,
-        )))
-    }
-}
-
-#[derive(Debug)]
-struct LixDirectoryScanExec {
-    surface_kind: LixDirectorySurfaceKind,
-    default_version_id: String,
-    snapshot: Arc<dyn DirectorySurfaceSnapshot>,
-    schema: SchemaRef,
-    projection: Option<Vec<usize>>,
-    route: LixDirectoryRoute,
-    limit: Option<usize>,
-    properties: Arc<PlanProperties>,
-}
-
-impl LixDirectoryScanExec {
-    fn new(
-        surface_kind: LixDirectorySurfaceKind,
-        default_version_id: String,
-        snapshot: Arc<dyn DirectorySurfaceSnapshot>,
-        schema: SchemaRef,
-        projection: Option<Vec<usize>>,
-        route: LixDirectoryRoute,
-        limit: Option<usize>,
-    ) -> Self {
-        let properties = PlanProperties::new(
-            EquivalenceProperties::new(schema.clone()),
-            Partitioning::UnknownPartitioning(1),
-            EmissionType::Incremental,
-            Boundedness::Bounded,
-        );
-        Self {
-            surface_kind,
-            default_version_id,
-            snapshot,
-            schema,
-            projection,
-            route,
-            limit,
-            properties: Arc::new(properties),
-        }
-    }
-}
-
-impl DisplayAs for LixDirectoryScanExec {
-    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                write!(
-                    f,
-                    "LixDirectoryScanExec(limit={:?}, route={:?})",
-                    self.limit, self.route
-                )
-            }
-            DisplayFormatType::TreeRender => write!(f, "LixDirectoryScanExec"),
-        }
-    }
-}
-
-impl ExecutionPlan for LixDirectoryScanExec {
-    fn name(&self) -> &str {
-        "LixDirectoryScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        Vec::new()
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> Result<Arc<dyn ExecutionPlan>> {
-        if !children.is_empty() {
-            return Err(DataFusionError::Execution(
-                "LixDirectoryScanExec does not accept children".to_string(),
-            ));
-        }
-        Ok(self)
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        _context: Arc<TaskContext>,
-    ) -> Result<SendableRecordBatchStream> {
-        if partition != 0 {
-            return Err(DataFusionError::Execution(format!(
-                "LixDirectoryScanExec only exposes one partition, got {partition}"
-            )));
-        }
-
-        let snapshot = Arc::clone(&self.snapshot);
-        let surface_kind = self.surface_kind;
-        let default_version_id = self.default_version_id.clone();
-        let projection = self.projection.clone();
-        let route = self.route.clone();
-        let limit = self.limit;
-        let schema = Arc::clone(&self.schema);
-        let stream = stream::once(async move {
-            let batches = if route.contradictory {
-                Vec::new()
-            } else {
-                let rows = enqueue_directory_surface_scan(
-                    snapshot,
-                    directory_surface_scan_request(
-                        surface_kind,
-                        &default_version_id,
-                        projection.as_ref(),
-                        &route,
-                        limit,
-                    ),
-                )
-                .await?;
-                directory_surface_record_batches(
-                    directory_projection_for_scan(surface_kind, projection.as_ref()),
-                    &rows,
-                )?
-            };
-            Ok::<_, DataFusionError>(stream::iter(
-                batches.into_iter().map(Ok::<RecordBatch, DataFusionError>),
-            ))
-        })
-        .try_flatten();
-        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
-    }
-}
-
-#[derive(Debug)]
-struct DirectorySurfaceScanJob {
-    snapshot: Arc<dyn DirectorySurfaceSnapshot>,
-    request: DirectorySurfaceScanRequest,
-    reply: oneshot::Sender<std::result::Result<Vec<DirectorySurfaceRow>, LixError>>,
-}
-
-fn directory_surface_scan_worker() -> &'static mpsc::Sender<DirectorySurfaceScanJob> {
-    static WORKER: OnceLock<mpsc::Sender<DirectorySurfaceScanJob>> = OnceLock::new();
-    WORKER.get_or_init(|| {
-        let (tx, rx) = mpsc::channel::<DirectorySurfaceScanJob>();
-        thread::Builder::new()
-            .name("sql2-directory-surface-scan".to_string())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("sql2 directory-surface runtime should build");
-                while let Ok(job) = rx.recv() {
-                    let result = runtime
-                        .block_on(async move { job.snapshot.scan_directories(&job.request).await });
-                    let _ = job.reply.send(result);
-                }
-            })
-            .expect("sql2 directory-surface worker thread should spawn");
-        tx
-    })
-}
-
-async fn enqueue_directory_surface_scan(
-    snapshot: Arc<dyn DirectorySurfaceSnapshot>,
-    request: DirectorySurfaceScanRequest,
-) -> Result<Vec<DirectorySurfaceRow>> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    directory_surface_scan_worker()
-        .send(DirectorySurfaceScanJob {
-            snapshot,
-            request,
-            reply: reply_tx,
-        })
-        .map_err(|error| {
-            DataFusionError::Execution(format!(
-                "sql2 failed to enqueue directory surface scan job: {error}"
-            ))
-        })?;
-    reply_rx
-        .await
-        .map_err(|_| {
-            DataFusionError::Execution(
-                "sql2 directory surface scan worker dropped reply".to_string(),
-            )
-        })?
-        .map_err(lix_error_to_datafusion_error)
-}
-
-fn directory_surface_record_batches(
-    projection: Vec<DirectorySurfaceColumn>,
-    rows: &[DirectorySurfaceRow],
-) -> Result<Vec<RecordBatch>> {
-    Ok(vec![directory_surface_record_batch(&projection, rows)?])
-}
-
-fn directory_surface_record_batch(
-    projection: &[DirectorySurfaceColumn],
-    rows: &[DirectorySurfaceRow],
-) -> Result<RecordBatch> {
-    let arrays = projection
-        .iter()
-        .map(|column| match column {
-            DirectorySurfaceColumn::Id => {
-                string_array(rows.iter().map(|row| Some(row.id.as_str())))
-            }
-            DirectorySurfaceColumn::ParentId => {
-                string_array(rows.iter().map(|row| row.parent_id.as_deref()))
-            }
-            DirectorySurfaceColumn::Name => {
-                string_array(rows.iter().map(|row| Some(row.name.as_str())))
-            }
-            DirectorySurfaceColumn::Path => {
-                string_array(rows.iter().map(|row| row.path.as_deref()))
-            }
-            DirectorySurfaceColumn::Hidden => Arc::new(BooleanArray::from(
-                rows.iter().map(|row| row.hidden).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            DirectorySurfaceColumn::LixcolEntityId => {
-                string_array(rows.iter().map(|row| Some(row.lixcol_entity_id.as_str())))
-            }
-            DirectorySurfaceColumn::LixcolSchemaKey => {
-                string_array(rows.iter().map(|row| Some(row.lixcol_schema_key.as_str())))
-            }
-            DirectorySurfaceColumn::LixcolVersionId => {
-                string_array(rows.iter().map(|row| Some(row.lixcol_version_id.as_str())))
-            }
-            DirectorySurfaceColumn::LixcolSchemaVersion => string_array(
-                rows.iter()
-                    .map(|row| Some(row.lixcol_schema_version.as_str())),
-            ),
-            DirectorySurfaceColumn::LixcolGlobal => Arc::new(BooleanArray::from(
-                rows.iter().map(|row| row.lixcol_global).collect::<Vec<_>>(),
-            )) as ArrayRef,
-            DirectorySurfaceColumn::LixcolChangeId => {
-                string_array(rows.iter().map(|row| row.lixcol_change_id.as_deref()))
-            }
-            DirectorySurfaceColumn::LixcolCreatedAt => {
-                string_array(rows.iter().map(|row| row.lixcol_created_at.as_deref()))
-            }
-            DirectorySurfaceColumn::LixcolUpdatedAt => {
-                string_array(rows.iter().map(|row| row.lixcol_updated_at.as_deref()))
-            }
-            DirectorySurfaceColumn::LixcolCommitId => {
-                string_array(rows.iter().map(|row| row.lixcol_commit_id.as_deref()))
-            }
-            DirectorySurfaceColumn::LixcolUntracked => Arc::new(BooleanArray::from(
-                rows.iter()
-                    .map(|row| row.lixcol_untracked)
-                    .collect::<Vec<_>>(),
-            )) as ArrayRef,
-            DirectorySurfaceColumn::LixcolMetadata => {
-                string_array(rows.iter().map(|row| row.lixcol_metadata.as_deref()))
-            }
-        })
-        .collect::<Vec<_>>();
-    RecordBatch::try_new(directory_surface_schema(projection), arrays).map_err(|error| {
-        DataFusionError::Execution(format!("sql2 failed to build lix_directory batch: {error}"))
-    })
-}
-
-fn directory_surface_schema(projection: &[DirectorySurfaceColumn]) -> SchemaRef {
-    Arc::new(Schema::new(
-        projection
-            .iter()
-            .map(|column| match column {
-                DirectorySurfaceColumn::Id => Field::new("id", DataType::Utf8, false),
-                DirectorySurfaceColumn::ParentId => Field::new("parent_id", DataType::Utf8, true),
-                DirectorySurfaceColumn::Name => Field::new("name", DataType::Utf8, false),
-                DirectorySurfaceColumn::Path => Field::new("path", DataType::Utf8, true),
-                DirectorySurfaceColumn::Hidden => Field::new("hidden", DataType::Boolean, false),
-                DirectorySurfaceColumn::LixcolEntityId => {
-                    Field::new("lixcol_entity_id", DataType::Utf8, false)
-                }
-                DirectorySurfaceColumn::LixcolSchemaKey => {
-                    Field::new("lixcol_schema_key", DataType::Utf8, false)
-                }
-                DirectorySurfaceColumn::LixcolVersionId => {
-                    Field::new("lixcol_version_id", DataType::Utf8, false)
-                }
-                DirectorySurfaceColumn::LixcolSchemaVersion => {
-                    Field::new("lixcol_schema_version", DataType::Utf8, false)
-                }
-                DirectorySurfaceColumn::LixcolGlobal => {
-                    Field::new("lixcol_global", DataType::Boolean, false)
-                }
-                DirectorySurfaceColumn::LixcolChangeId => {
-                    Field::new("lixcol_change_id", DataType::Utf8, true)
-                }
-                DirectorySurfaceColumn::LixcolCreatedAt => {
-                    Field::new("lixcol_created_at", DataType::Utf8, true)
-                }
-                DirectorySurfaceColumn::LixcolUpdatedAt => {
-                    Field::new("lixcol_updated_at", DataType::Utf8, true)
-                }
-                DirectorySurfaceColumn::LixcolCommitId => {
-                    Field::new("lixcol_commit_id", DataType::Utf8, true)
-                }
-                DirectorySurfaceColumn::LixcolUntracked => {
-                    Field::new("lixcol_untracked", DataType::Boolean, false)
-                }
-                DirectorySurfaceColumn::LixcolMetadata => {
-                    Field::new("lixcol_metadata", DataType::Utf8, true)
-                }
-            })
-            .collect::<Vec<_>>(),
-    ))
-}
-
-fn directory_projection_for_scan(
-    surface_kind: LixDirectorySurfaceKind,
-    projection: Option<&Vec<usize>>,
-) -> Vec<DirectorySurfaceColumn> {
-    let mut all_columns = vec![
-        DirectorySurfaceColumn::Id,
-        DirectorySurfaceColumn::ParentId,
-        DirectorySurfaceColumn::Name,
-        DirectorySurfaceColumn::Path,
-        DirectorySurfaceColumn::Hidden,
-        DirectorySurfaceColumn::LixcolEntityId,
-        DirectorySurfaceColumn::LixcolSchemaKey,
-    ];
-    if surface_kind == LixDirectorySurfaceKind::DirectoryByVersion {
-        all_columns.push(DirectorySurfaceColumn::LixcolVersionId);
-    }
-    all_columns.extend([
-        DirectorySurfaceColumn::LixcolSchemaVersion,
-        DirectorySurfaceColumn::LixcolGlobal,
-        DirectorySurfaceColumn::LixcolChangeId,
-        DirectorySurfaceColumn::LixcolCreatedAt,
-        DirectorySurfaceColumn::LixcolUpdatedAt,
-        DirectorySurfaceColumn::LixcolCommitId,
-        DirectorySurfaceColumn::LixcolUntracked,
-        DirectorySurfaceColumn::LixcolMetadata,
-    ]);
-    projection.map_or(all_columns.clone(), |indices| {
-        indices
-            .iter()
-            .filter_map(|index| all_columns.get(*index).copied())
-            .collect()
     })
 }
 
@@ -4117,10 +3781,7 @@ impl LixChangeRoute {
                 RoutePredicate::Boolean { field, value } => {
                     let slot = match field {
                         RouteBooleanField::Untracked => &mut route.untracked,
-                        RouteBooleanField::Global
-                        | RouteBooleanField::Hidden
-                        | RouteBooleanField::LixcolGlobal
-                        | RouteBooleanField::LixcolUntracked => continue,
+                        _ => continue,
                     };
                     assign_route_slot(slot, value, &mut route.contradictory);
                 }
@@ -4131,9 +3792,7 @@ impl LixChangeRoute {
                         RouteStringField::SchemaKey => &mut route.schema_key,
                         RouteStringField::FileId => &mut route.file_id,
                         RouteStringField::PluginKey => &mut route.plugin_key,
-                        RouteStringField::VersionId
-                        | RouteStringField::LixcolVersionId
-                        | RouteStringField::Path => continue,
+                        _ => continue,
                     };
                     assign_route_slot(slot, value, &mut route.contradictory);
                 }
@@ -4311,6 +3970,7 @@ impl LixStateRoute {
                     let slot = match field {
                         RouteBooleanField::Global => &mut route.global,
                         RouteBooleanField::Untracked => &mut route.untracked,
+                        #[cfg(test)]
                         RouteBooleanField::Hidden
                         | RouteBooleanField::LixcolGlobal
                         | RouteBooleanField::LixcolUntracked => continue,
@@ -4320,13 +3980,10 @@ impl LixStateRoute {
                 RoutePredicate::String { field, value } => {
                     let slot = match field {
                         RouteStringField::VersionId => &mut route.version_id,
-                        RouteStringField::LixcolVersionId => continue,
                         RouteStringField::SchemaKey => &mut route.schema_key,
                         RouteStringField::EntityId => &mut route.entity_id,
                         RouteStringField::FileId => &mut route.file_id,
-                        RouteStringField::PluginKey
-                        | RouteStringField::Id
-                        | RouteStringField::Path => continue,
+                        _ => continue,
                     };
                     assign_route_slot(slot, value, &mut route.contradictory);
                 }
@@ -4371,176 +4028,6 @@ impl LixStateRoute {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct LixFileRoute {
-    id: Option<String>,
-    path: Option<String>,
-    lixcol_version_id: Option<String>,
-    hidden: Option<bool>,
-    lixcol_global: Option<bool>,
-    lixcol_untracked: Option<bool>,
-    contradictory: bool,
-}
-
-impl LixFileRoute {
-    fn from_filters(filters: &[Expr]) -> Self {
-        let mut route = Self::default();
-        for filter in filters {
-            let Some(predicate) = parse_file_route_filter(filter) else {
-                continue;
-            };
-
-            match predicate {
-                RoutePredicate::Boolean { field, value } => {
-                    let slot = match field {
-                        RouteBooleanField::Hidden => &mut route.hidden,
-                        RouteBooleanField::LixcolGlobal => &mut route.lixcol_global,
-                        RouteBooleanField::LixcolUntracked => &mut route.lixcol_untracked,
-                        RouteBooleanField::Global | RouteBooleanField::Untracked => continue,
-                    };
-                    assign_route_slot(slot, value, &mut route.contradictory);
-                }
-                RoutePredicate::String { field, value } => {
-                    let slot = match field {
-                        RouteStringField::Id => &mut route.id,
-                        RouteStringField::Path => &mut route.path,
-                        RouteStringField::LixcolVersionId => &mut route.lixcol_version_id,
-                        _ => continue,
-                    };
-                    assign_route_slot(slot, value, &mut route.contradictory);
-                }
-            }
-        }
-        route
-    }
-
-    fn file_filters(&self) -> Vec<FileSurfaceFilter> {
-        let mut filters = Vec::new();
-        if let Some(id) = &self.id {
-            filters.push(FileSurfaceFilter::Eq(
-                FileSurfaceColumn::Id,
-                Value::Text(id.clone()),
-            ));
-        }
-        if let Some(path) = &self.path {
-            filters.push(FileSurfaceFilter::Eq(
-                FileSurfaceColumn::Path,
-                Value::Text(path.clone()),
-            ));
-        }
-        if let Some(version_id) = &self.lixcol_version_id {
-            filters.push(FileSurfaceFilter::Eq(
-                FileSurfaceColumn::LixcolVersionId,
-                Value::Text(version_id.clone()),
-            ));
-        }
-        if let Some(hidden) = self.hidden {
-            filters.push(FileSurfaceFilter::Eq(
-                FileSurfaceColumn::Hidden,
-                Value::Boolean(hidden),
-            ));
-        }
-        if let Some(global) = self.lixcol_global {
-            filters.push(FileSurfaceFilter::Eq(
-                FileSurfaceColumn::LixcolGlobal,
-                Value::Boolean(global),
-            ));
-        }
-        if let Some(untracked) = self.lixcol_untracked {
-            filters.push(FileSurfaceFilter::Eq(
-                FileSurfaceColumn::LixcolUntracked,
-                Value::Boolean(untracked),
-            ));
-        }
-        filters
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-struct LixDirectoryRoute {
-    id: Option<String>,
-    path: Option<String>,
-    lixcol_version_id: Option<String>,
-    hidden: Option<bool>,
-    lixcol_global: Option<bool>,
-    lixcol_untracked: Option<bool>,
-    contradictory: bool,
-}
-
-impl LixDirectoryRoute {
-    fn from_filters(filters: &[Expr]) -> Self {
-        let mut route = Self::default();
-        for filter in filters {
-            let Some(predicate) = parse_directory_route_filter(filter) else {
-                continue;
-            };
-
-            match predicate {
-                RoutePredicate::Boolean { field, value } => {
-                    let slot = match field {
-                        RouteBooleanField::Hidden => &mut route.hidden,
-                        RouteBooleanField::LixcolGlobal => &mut route.lixcol_global,
-                        RouteBooleanField::LixcolUntracked => &mut route.lixcol_untracked,
-                        RouteBooleanField::Global | RouteBooleanField::Untracked => continue,
-                    };
-                    assign_route_slot(slot, value, &mut route.contradictory);
-                }
-                RoutePredicate::String { field, value } => {
-                    let slot = match field {
-                        RouteStringField::Id => &mut route.id,
-                        RouteStringField::Path => &mut route.path,
-                        RouteStringField::LixcolVersionId => &mut route.lixcol_version_id,
-                        _ => continue,
-                    };
-                    assign_route_slot(slot, value, &mut route.contradictory);
-                }
-            }
-        }
-        route
-    }
-
-    fn directory_filters(&self) -> Vec<DirectorySurfaceFilter> {
-        let mut filters = Vec::new();
-        if let Some(id) = &self.id {
-            filters.push(DirectorySurfaceFilter::Eq(
-                DirectorySurfaceColumn::Id,
-                Value::Text(id.clone()),
-            ));
-        }
-        if let Some(path) = &self.path {
-            filters.push(DirectorySurfaceFilter::Eq(
-                DirectorySurfaceColumn::Path,
-                Value::Text(path.clone()),
-            ));
-        }
-        if let Some(version_id) = &self.lixcol_version_id {
-            filters.push(DirectorySurfaceFilter::Eq(
-                DirectorySurfaceColumn::LixcolVersionId,
-                Value::Text(version_id.clone()),
-            ));
-        }
-        if let Some(hidden) = self.hidden {
-            filters.push(DirectorySurfaceFilter::Eq(
-                DirectorySurfaceColumn::Hidden,
-                Value::Boolean(hidden),
-            ));
-        }
-        if let Some(global) = self.lixcol_global {
-            filters.push(DirectorySurfaceFilter::Eq(
-                DirectorySurfaceColumn::LixcolGlobal,
-                Value::Boolean(global),
-            ));
-        }
-        if let Some(untracked) = self.lixcol_untracked {
-            filters.push(DirectorySurfaceFilter::Eq(
-                DirectorySurfaceColumn::LixcolUntracked,
-                Value::Boolean(untracked),
-            ));
-        }
-        filters
-    }
-}
-
 fn state_by_version_scan_request(
     surface_kind: LixStateSurfaceKind,
     default_version_id: &str,
@@ -4558,48 +4045,6 @@ fn state_by_version_scan_request(
         filters: route.state_filters(),
         limit,
     })
-}
-
-fn file_surface_scan_request(
-    surface_kind: LixFileSurfaceKind,
-    default_version_id: &str,
-    projection: Option<&Vec<usize>>,
-    route: &LixFileRoute,
-    limit: Option<usize>,
-) -> FileSurfaceScanRequest {
-    let mut filters = route.file_filters();
-    if surface_kind == LixFileSurfaceKind::File {
-        filters.push(FileSurfaceFilter::Eq(
-            FileSurfaceColumn::LixcolVersionId,
-            Value::Text(default_version_id.to_string()),
-        ));
-    }
-    FileSurfaceScanRequest {
-        projection: file_projection_for_scan(surface_kind, projection),
-        filters,
-        limit,
-    }
-}
-
-fn directory_surface_scan_request(
-    surface_kind: LixDirectorySurfaceKind,
-    default_version_id: &str,
-    projection: Option<&Vec<usize>>,
-    route: &LixDirectoryRoute,
-    limit: Option<usize>,
-) -> DirectorySurfaceScanRequest {
-    let mut filters = route.directory_filters();
-    if surface_kind == LixDirectorySurfaceKind::Directory {
-        filters.push(DirectorySurfaceFilter::Eq(
-            DirectorySurfaceColumn::LixcolVersionId,
-            Value::Text(default_version_id.to_string()),
-        ));
-    }
-    DirectorySurfaceScanRequest {
-        projection: directory_projection_for_scan(surface_kind, projection),
-        filters,
-        limit,
-    }
 }
 
 fn assign_route_slot<T: PartialEq>(slot: &mut Option<T>, value: T, contradictory: &mut bool) {
@@ -4626,20 +4071,25 @@ enum RoutePredicate {
 enum RouteBooleanField {
     Global,
     Untracked,
+    #[cfg(test)]
     Hidden,
+    #[cfg(test)]
     LixcolGlobal,
+    #[cfg(test)]
     LixcolUntracked,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RouteStringField {
     VersionId,
+    #[cfg(test)]
     LixcolVersionId,
     SchemaKey,
     EntityId,
     FileId,
     PluginKey,
     Id,
+    #[cfg(test)]
     Path,
 }
 
@@ -4677,6 +4127,7 @@ fn parse_route_column_literal_filter(
     }
 }
 
+#[cfg(test)]
 fn parse_file_route_filter(expr: &Expr) -> Option<RoutePredicate> {
     let Expr::BinaryExpr(binary_expr) = expr else {
         return None;
@@ -4689,6 +4140,7 @@ fn parse_file_route_filter(expr: &Expr) -> Option<RoutePredicate> {
         .or_else(|| parse_file_route_column_literal_filter(&binary_expr.right, &binary_expr.left))
 }
 
+#[cfg(test)]
 fn parse_directory_route_filter(expr: &Expr) -> Option<RoutePredicate> {
     let Expr::BinaryExpr(binary_expr) = expr else {
         return None;
@@ -4714,6 +4166,7 @@ fn parse_change_route_filter(expr: &Expr) -> Option<RoutePredicate> {
         .or_else(|| parse_change_route_column_literal_filter(&binary_expr.right, &binary_expr.left))
 }
 
+#[cfg(test)]
 fn parse_directory_route_column_literal_filter(
     column_expr: &Expr,
     literal_expr: &Expr,
@@ -4758,6 +4211,7 @@ fn parse_change_route_column_literal_filter(
     }
 }
 
+#[cfg(test)]
 fn parse_file_route_column_literal_filter(
     column_expr: &Expr,
     literal_expr: &Expr,
@@ -4888,6 +4342,68 @@ fn query_result_from_batches(
     })
 }
 
+async fn hydrate_filesystem_history_blob_columns(
+    backend: &dyn LixBackend,
+    artifact: &PreparedSql2ReadArtifact,
+    result: &mut QueryResult,
+) -> Result<(), LixError> {
+    if !artifact.surface_names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "lix_file_history" | "lix_file_history_by_version"
+        )
+    }) {
+        return Ok(());
+    }
+
+    let data_column_indexes = result
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, name)| (name == "data").then_some(index))
+        .collect::<Vec<_>>();
+    if data_column_indexes.is_empty() {
+        return Ok(());
+    }
+
+    let mut required_blob_hashes = BTreeSet::new();
+    for row in &result.rows {
+        for &column_index in &data_column_indexes {
+            if let Some(Value::Text(blob_hash)) = row.get(column_index) {
+                required_blob_hashes.insert(blob_hash.clone());
+            }
+        }
+    }
+    if required_blob_hashes.is_empty() {
+        return Ok(());
+    }
+
+    let mut blob_data_by_hash = BTreeMap::new();
+    for blob_hash in required_blob_hashes {
+        blob_data_by_hash.insert(
+            blob_hash.clone(),
+            backend.load_blob_data_by_hash(&blob_hash).await?,
+        );
+    }
+
+    for row in &mut result.rows {
+        for &column_index in &data_column_indexes {
+            let hydrated = match row.get(column_index) {
+                Some(Value::Text(blob_hash)) => blob_data_by_hash
+                    .get(blob_hash)
+                    .cloned()
+                    .unwrap_or(None)
+                    .map(Value::Blob)
+                    .unwrap_or(Value::Null),
+                _ => continue,
+            };
+            row[column_index] = hydrated;
+        }
+    }
+
+    Ok(())
+}
+
 fn scalar_value_to_lix_value(value: &ScalarValue, variant_output: bool) -> Value {
     match value {
         ScalarValue::Null => Value::Null,
@@ -4951,11 +4467,6 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values)) as ArrayRef
 }
 
-fn binary_array<'a>(values: impl Iterator<Item = Option<&'a [u8]>>) -> ArrayRef {
-    let values = values.collect::<Vec<_>>();
-    Arc::new(BinaryArray::from(values)) as ArrayRef
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
@@ -4966,15 +4477,18 @@ mod tests {
     use super::{
         build_session_for_read_with_borrowed_backend, build_session_for_read_with_shared_backend,
         execute_read_with_backend, execute_read_with_shared_backend, parse_directory_route_filter,
-        parse_file_route_filter, parse_route_filter, LixStateHistoryProvider,
-        PreparedSql2ReadArtifact, RouteBooleanField, RoutePredicate, RouteStringField,
+        parse_file_route_filter, parse_route_filter, state_history_route_from_sql,
+        LixStateHistoryProvider, PreparedSql2ReadArtifact, RouteBooleanField, RoutePredicate,
+        RouteStringField,
     };
     use crate::live_state::{
         open_state_by_version_snapshot_with_shared_backend, StateByVersionScanRequest,
         StateSurfaceColumn, StateSurfaceFilter,
     };
     use crate::session::AdditionalSessionOptions;
-    use crate::sql2::prepared_entity_view_plans_for_registry;
+    use crate::sql2::{
+        prepared_entity_view_plans_for_registry, prepared_filesystem_view_plans_for_registry,
+    };
     use crate::test_support::{boot_test_engine, TestSqliteBackendEvent};
     use crate::{CreateVersionOptions, LixBackend, TransactionBeginMode, Value};
     use serde_json::json;
@@ -5217,6 +4731,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
@@ -5243,6 +4758,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -5298,6 +4814,7 @@ mod tests {
                         &registry,
                         &["test_state_schema".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
@@ -5321,6 +4838,58 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_backend_path_registers_filesystem_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT id FROM lix_file".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec![
+                        "lix_file".to_string(),
+                        "lix_file_by_version".to_string(),
+                        "lix_directory".to_string(),
+                        "lix_directory_by_version".to_string(),
+                    ],
+                    entity_views: BTreeMap::new(),
+                    filesystem_views: prepared_filesystem_view_plans_for_registry(
+                        &registry,
+                        &[
+                            "lix_file".to_string(),
+                            "lix_file_by_version".to_string(),
+                            "lix_directory".to_string(),
+                            "lix_directory_by_version".to_string(),
+                        ],
+                    ),
+                };
+
+                let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
+                    .await
+                    .expect("filesystem session should build");
+
+                for surface_name in &artifact.surface_names {
+                    let provider = ctx
+                        .table_provider(surface_name)
+                        .await
+                        .expect("filesystem surface should be registered");
+                    assert!(
+                        provider.as_any().is::<ViewTable>(),
+                        "filesystem surfaces should register as native DataFusion views"
+                    );
+                    assert!(
+                        provider.get_logical_plan().is_some(),
+                        "registered filesystem view should expose a logical plan"
+                    );
+                }
+            })
+        });
+    }
+
+    #[test]
     fn borrowed_backend_path_registers_history_entity_surfaces_as_views() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
@@ -5337,6 +4906,7 @@ mod tests {
                         &registry,
                         &["test_state_schema_history".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
@@ -5386,6 +4956,56 @@ mod tests {
     }
 
     #[test]
+    fn borrowed_backend_path_registers_history_filesystem_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT id FROM lix_file_history".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec![
+                        "lix_file_history".to_string(),
+                        "lix_file_history_by_version".to_string(),
+                        "lix_directory_history".to_string(),
+                    ],
+                    entity_views: BTreeMap::new(),
+                    filesystem_views: prepared_filesystem_view_plans_for_registry(
+                        &registry,
+                        &[
+                            "lix_file_history".to_string(),
+                            "lix_file_history_by_version".to_string(),
+                            "lix_directory_history".to_string(),
+                        ],
+                    ),
+                };
+
+                let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
+                    .await
+                    .expect("history filesystem session should build");
+
+                for surface_name in &artifact.surface_names {
+                    let provider = ctx
+                        .table_provider(surface_name)
+                        .await
+                        .expect("history filesystem surface should be registered");
+                    assert!(
+                        provider.as_any().is::<ViewTable>(),
+                        "history filesystem surfaces should register as native DataFusion views"
+                    );
+                    assert!(
+                        provider.get_logical_plan().is_some(),
+                        "registered history filesystem view should expose a logical plan"
+                    );
+                }
+            })
+        });
+    }
+
+    #[test]
     fn shared_backend_path_registers_history_entity_surfaces_as_views() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
@@ -5402,6 +5022,7 @@ mod tests {
                         &registry,
                         &["test_state_schema_history".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let shared_backend: Arc<dyn crate::LixBackend + Send + Sync> =
@@ -5427,6 +5048,112 @@ mod tests {
     }
 
     #[test]
+    fn shared_backend_path_registers_filesystem_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT id FROM lix_file".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec![
+                        "lix_file".to_string(),
+                        "lix_file_by_version".to_string(),
+                        "lix_directory".to_string(),
+                        "lix_directory_by_version".to_string(),
+                    ],
+                    entity_views: BTreeMap::new(),
+                    filesystem_views: prepared_filesystem_view_plans_for_registry(
+                        &registry,
+                        &[
+                            "lix_file".to_string(),
+                            "lix_file_by_version".to_string(),
+                            "lix_directory".to_string(),
+                            "lix_directory_by_version".to_string(),
+                        ],
+                    ),
+                };
+
+                let shared_backend: Arc<dyn crate::LixBackend + Send + Sync> =
+                    Arc::new(backend.clone());
+                let ctx = build_session_for_read_with_shared_backend(shared_backend, &artifact)
+                    .await
+                    .expect("shared-backend filesystem session should build");
+
+                for surface_name in &artifact.surface_names {
+                    let provider = ctx
+                        .table_provider(surface_name)
+                        .await
+                        .expect("filesystem surface should be registered");
+                    assert!(
+                        provider.as_any().is::<ViewTable>(),
+                        "shared-backend filesystem surfaces should register as native DataFusion views"
+                    );
+                    assert!(
+                        provider.get_logical_plan().is_some(),
+                        "shared-backend registered filesystem view should expose a logical plan"
+                    );
+                }
+            })
+        });
+    }
+
+    #[test]
+    fn shared_backend_path_registers_history_filesystem_surfaces_as_views() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT id FROM lix_file_history".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec![
+                        "lix_file_history".to_string(),
+                        "lix_file_history_by_version".to_string(),
+                        "lix_directory_history".to_string(),
+                    ],
+                    entity_views: BTreeMap::new(),
+                    filesystem_views: prepared_filesystem_view_plans_for_registry(
+                        &registry,
+                        &[
+                            "lix_file_history".to_string(),
+                            "lix_file_history_by_version".to_string(),
+                            "lix_directory_history".to_string(),
+                        ],
+                    ),
+                };
+
+                let shared_backend: Arc<dyn crate::LixBackend + Send + Sync> =
+                    Arc::new(backend.clone());
+                let ctx = build_session_for_read_with_shared_backend(shared_backend, &artifact)
+                    .await
+                    .expect("shared-backend history filesystem session should build");
+
+                for surface_name in &artifact.surface_names {
+                    let provider = ctx
+                        .table_provider(surface_name)
+                        .await
+                        .expect("shared-backend history filesystem surface should be registered");
+                    assert!(
+                        provider.as_any().is::<ViewTable>(),
+                        "shared-backend history filesystem surfaces should register as native DataFusion views"
+                    );
+                    assert!(
+                        provider.get_logical_plan().is_some(),
+                        "shared-backend registered history filesystem view should expose a logical plan"
+                    );
+                }
+            })
+        });
+    }
+
+    #[test]
     fn borrowed_backend_path_registers_lix_state_history_as_native_relation() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
@@ -5439,6 +5166,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_history".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let ctx = build_session_for_read_with_borrowed_backend(&backend, &artifact)
@@ -5475,6 +5203,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -5514,6 +5243,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -5547,6 +5277,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -5696,6 +5427,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -5727,6 +5459,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -5751,6 +5484,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -5778,6 +5512,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 backend.clear_query_log();
@@ -5809,6 +5544,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_by_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -5844,6 +5580,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_by_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -5876,6 +5613,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_history".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -5929,6 +5667,7 @@ mod tests {
                         &registry,
                         &["test_state_schema_history".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -5976,6 +5715,7 @@ mod tests {
                         &registry,
                         &["lix_key_value".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6015,6 +5755,7 @@ mod tests {
                         &registry,
                         &["lix_key_value".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6053,10 +5794,11 @@ mod tests {
                         &registry,
                         &["lix_key_value".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
-                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
-                    .await;
+                let result =
+                    execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact).await;
                 assert!(
                     result.is_err(),
                     "variant text comparison should require an explicit cast or extraction"
@@ -6092,6 +5834,7 @@ mod tests {
                         &registry,
                         &["lix_key_value".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6134,6 +5877,7 @@ mod tests {
                         &registry,
                         &["lix_key_value".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6173,13 +5917,17 @@ mod tests {
                         &registry,
                         &["lix_key_value".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
                     .await
                     .expect("sql2 shared-backend variant null read should execute");
                 assert_eq!(result.columns, vec!["value"]);
-                assert_eq!(result.rows, vec![vec![Value::Json(serde_json::Value::Null)]]);
+                assert_eq!(
+                    result.rows,
+                    vec![vec![Value::Json(serde_json::Value::Null)]]
+                );
             })
         });
     }
@@ -6207,6 +5955,7 @@ mod tests {
                         &registry,
                         &["stable_scalar_schema".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6249,6 +5998,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_state_history".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6278,6 +6028,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6310,6 +6061,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6346,6 +6098,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file_by_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6367,6 +6120,52 @@ mod tests {
     }
 
     #[test]
+    fn execute_read_with_shared_backend_hydrates_file_history_data_from_blob_hashes() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let registry = session.public_surface_registry();
+                let artifact = PreparedSql2ReadArtifact {
+                    sql: "SELECT data FROM lix_file_history WHERE id = 'file-a'".to_string(),
+                    bound_parameters: vec![],
+                    active_version_id: "version-a".to_string(),
+                    surface_names: vec!["lix_file_history".to_string()],
+                    entity_views: BTreeMap::new(),
+                    filesystem_views: prepared_filesystem_view_plans_for_registry(
+                        &registry,
+                        &["lix_file_history".to_string()],
+                    ),
+                };
+
+                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
+                    .await
+                    .expect("sql2 shared-backend file history read should execute");
+                assert_eq!(result.columns, vec!["data"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0], vec![Value::Blob(b"hello".to_vec())]);
+            })
+        });
+    }
+
+    #[test]
+    fn state_history_route_from_sql_recognizes_lixcol_root_and_depth_aliases() {
+        let route = state_history_route_from_sql(
+            "SELECT data \
+             FROM lix_file_history \
+             WHERE lixcol_root_commit_id = 'root-123' \
+               AND lixcol_depth >= 1 \
+               AND lixcol_depth <= 3",
+        )
+        .expect("route extraction should succeed");
+
+        assert_eq!(route.root_commit_ids, vec!["root-123".to_string()]);
+        assert_eq!(route.min_depth, Some(1));
+        assert_eq!(route.max_depth, Some(3));
+    }
+
+    #[test]
     fn execute_read_with_backend_reads_lix_directory() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
@@ -6380,6 +6179,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_directory".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6412,6 +6212,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_directory".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6448,6 +6249,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_directory_by_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6481,6 +6283,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6513,6 +6316,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6544,6 +6348,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_change".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6574,6 +6379,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_change".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6614,6 +6420,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_change".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_backend(&backend, &artifact)
@@ -6645,6 +6452,7 @@ mod tests {
                     active_version_id: "version-a".to_string(),
                     surface_names: vec!["lix_file".to_string(), "lix_file_by_version".to_string()],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6685,6 +6493,7 @@ mod tests {
                         &registry,
                         &["test_state_schema".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6720,6 +6529,7 @@ mod tests {
                         &registry,
                         &["test_state_schema".to_string(), "lix_state".to_string()],
                     ),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
@@ -6761,6 +6571,7 @@ mod tests {
                         "lix_state_by_version".to_string(),
                     ],
                     entity_views: BTreeMap::new(),
+                    filesystem_views: BTreeMap::new(),
                 };
 
                 let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)

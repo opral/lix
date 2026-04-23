@@ -1,7 +1,4 @@
-use crate::catalog::{
-    builtin_catalog_compiler_facade, CatalogCompilerApi, ResolvedRelation, SurfaceFamily,
-    SurfaceRegistry, SurfaceVariant,
-};
+use crate::catalog::{ResolvedRelation, SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 #[cfg(test)]
 use crate::sql::binder::bind_broad_public_read_statement_with_registry;
 use crate::sql::logical_plan::public_ir::{
@@ -147,6 +144,10 @@ fn classify_public_read_plan_kind_with_settings(
     let binding = &surface_read_plan.structured_read().resolved_relation;
     let kind = if is_direct_only_history_surface(binding) {
         PublicReadPlanKind::HistoryRead
+    } else if matches!(binding.descriptor.surface_family, SurfaceFamily::Filesystem)
+        && !matches!(binding.descriptor.surface_variant, SurfaceVariant::History)
+    {
+        PublicReadPlanKind::PreparedBatch
     } else if let Some(rowset_read) = try_compile_read_time_projection_read(surface_read_plan) {
         PublicReadPlanKind::ReadTimeProjection(rowset_read)
     } else {
@@ -2258,13 +2259,8 @@ fn collect_relation_names_in_sql_function_arg_expr<F>(
 }
 
 fn is_direct_only_history_surface(binding: &ResolvedRelation) -> bool {
-    matches!(
-        builtin_catalog_compiler_facade().history_read_semantics(binding),
-        Some(
-            crate::catalog::CatalogHistoryReadSemantics::FileHistory { .. }
-                | crate::catalog::CatalogHistoryReadSemantics::DirectoryHistoryActiveVersion
-        )
-    )
+    let _ = binding;
+    false
 }
 
 #[cfg(test)]
@@ -2527,6 +2523,28 @@ mod tests {
             vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new(
                 "entity_id",
             )))],
+        );
+        let decision = classify_public_read_plan_kind(&plan);
+
+        assert!(matches!(decision.kind, PublicReadPlanKind::PreparedBatch));
+    }
+
+    #[test]
+    fn filesystem_surface_routes_to_prepared_batch() {
+        let plan = surface_read_plan_for(
+            "lix_file",
+            vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("id")))],
+        );
+        let decision = classify_public_read_plan_kind(&plan);
+
+        assert!(matches!(decision.kind, PublicReadPlanKind::PreparedBatch));
+    }
+
+    #[test]
+    fn filesystem_history_surface_routes_to_prepared_batch() {
+        let plan = surface_read_plan_for(
+            "lix_file_history",
+            vec![SelectItem::UnnamedExpr(Expr::Identifier(Ident::new("id")))],
         );
         let decision = classify_public_read_plan_kind(&plan);
 

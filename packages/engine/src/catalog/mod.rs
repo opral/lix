@@ -376,9 +376,18 @@ mod tests {
         }))
         .expect("schema should compile");
 
-        assert_eq!(spec.column_types.get("title"), Some(&SurfaceColumnType::String));
-        assert_eq!(spec.column_types.get("count"), Some(&SurfaceColumnType::Integer));
-        assert_eq!(spec.column_types.get("score"), Some(&SurfaceColumnType::Number));
+        assert_eq!(
+            spec.column_types.get("title"),
+            Some(&SurfaceColumnType::String)
+        );
+        assert_eq!(
+            spec.column_types.get("count"),
+            Some(&SurfaceColumnType::Integer)
+        );
+        assert_eq!(
+            spec.column_types.get("score"),
+            Some(&SurfaceColumnType::Number)
+        );
         assert_eq!(
             spec.column_types.get("published"),
             Some(&SurfaceColumnType::Boolean)

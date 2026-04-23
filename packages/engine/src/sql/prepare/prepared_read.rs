@@ -256,6 +256,10 @@ pub(crate) fn prepare_public_read_artifact(
                         surface_registry,
                         &public_read.resolved_relations,
                     ),
+                    filesystem_views: crate::sql2::prepared_filesystem_view_plans_for_registry(
+                        surface_registry,
+                        &public_read.resolved_relations,
+                    ),
                 },
             })
         }

@@ -1791,10 +1791,7 @@ simulation_test!(
             .await
             .unwrap();
         assert_eq!(result.statements[0].rows.len(), 1);
-        assert_eq!(
-            result.statements[0].rows[0][0],
-            Value::Json(json!("ok"))
-        );
+        assert_eq!(result.statements[0].rows[0][0], Value::Json(json!("ok")));
     }
 );
 
