@@ -14,9 +14,9 @@ use crate::transaction::{
 };
 use crate::{LixError, QueryResult, Value};
 
+use super::directory_provider::register_lix_directory_providers;
 use super::entity_provider::register_entity_providers;
-use super::lix_directory_views::register_lix_directory_views;
-use super::lix_file_views::register_lix_file_views;
+use super::file_provider::register_lix_file_providers;
 use super::lix_state_provider::register_lix_state_providers;
 use super::udf::register_sql2_udfs;
 
@@ -200,12 +200,19 @@ pub(crate) async fn execute_sql(
         ctx.write_stager(),
     )
     .await?;
-    register_lix_directory_views(&session, ctx.active_version_id()).await?;
-    register_lix_file_views(
+    register_lix_directory_providers(
+        &session,
+        ctx.active_version_id(),
+        ctx.live_state(),
+        ctx.write_stager(),
+    )
+    .await?;
+    register_lix_file_providers(
         &session,
         ctx.active_version_id(),
         ctx.live_state(),
         ctx.blob_reader(),
+        ctx.write_stager(),
     )
     .await?;
     register_entity_providers(
@@ -499,6 +506,74 @@ mod tests {
             file_id: None,
             plugin_key: None,
             snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
+            metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            change_id: Some(format!("change-{entity_id}")),
+            commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: Some("2026-04-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+        }
+    }
+
+    fn live_directory_row(
+        entity_id: &str,
+        version_id: &str,
+        parent_id: Option<&str>,
+        name: &str,
+        hidden: bool,
+    ) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            schema_key: "lix_directory_descriptor".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some(
+                json!({
+                    "id": entity_id,
+                    "parent_id": parent_id,
+                    "name": name,
+                    "hidden": hidden
+                })
+                .to_string(),
+            ),
+            metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            change_id: Some(format!("change-{entity_id}")),
+            commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: Some("2026-04-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+        }
+    }
+
+    fn live_file_row(
+        entity_id: &str,
+        version_id: &str,
+        directory_id: Option<&str>,
+        name: &str,
+        extension: Option<&str>,
+        hidden: bool,
+    ) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            schema_key: "lix_file_descriptor".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some(
+                json!({
+                    "id": entity_id,
+                    "directory_id": directory_id,
+                    "name": name,
+                    "extension": extension,
+                    "hidden": hidden
+                })
+                .to_string(),
+            ),
             metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
             schema_version: "1".to_string(),
             version_id: version_id.to_string(),
@@ -833,6 +908,459 @@ mod tests {
             rows[0].snapshot_content.as_deref(),
             Some("{\"value\":\"C\"}")
         );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_directory_by_version_stages_write() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_directory_by_version (\
+             id, parent_id, name, hidden, lixcol_version_id\
+             ) VALUES ('dir-docs', NULL, 'docs', false, 'version-b')",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_directory_by_version should stage write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "dir-docs");
+        assert_eq!(rows[0].schema_version, "1");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"hidden\":false,\"id\":\"dir-docs\",\"name\":\"docs\",\"parent_id\":null}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_active_directory_defaults_active_version() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_directory (id, parent_id, name, hidden) \
+             VALUES ('dir-docs', NULL, 'docs', false)",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_directory should stage write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "dir-docs");
+        assert_eq!(rows[0].version_id, "version-a");
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_directory_stages_rewritten_descriptor() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_directory_row("dir-guides", "version-a", Some("dir-docs"), "guides", false),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "UPDATE lix_directory \
+             SET name = 'docs-updated', hidden = true, lixcol_metadata = '{\"source\":\"directory-update\"}' \
+             WHERE id = 'dir-docs'",
+            &[],
+        )
+        .await
+        .expect("UPDATE lix_directory should stage rewritten descriptor");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_directory_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "dir-docs");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some(
+                "{\"hidden\":true,\"id\":\"dir-docs\",\"name\":\"docs-updated\",\"parent_id\":null}"
+            )
+        );
+        assert_eq!(
+            rows[0].metadata.as_deref(),
+            Some("{\"source\":\"directory-update\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_directory_rejects_path_assignment() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![live_directory_row(
+                "dir-docs",
+                "version-a",
+                None,
+                "docs",
+                false,
+            )],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let error = execute_sql(
+            &ctx,
+            "UPDATE lix_directory SET path = '/renamed/' WHERE id = 'dir-docs'",
+            &[],
+        )
+        .await
+        .expect_err("path should remain read-only");
+
+        assert!(
+            error.description.contains("read-only column 'path'"),
+            "unexpected error: {error:?}"
+        );
+        assert!(stager.lock().expect("stager lock").deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_directory_by_version_stages_tombstone() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_directory_row("dir-docs", "version-a", None, "docs", false),
+                live_directory_row("dir-guides", "version-b", Some("dir-docs"), "guides", false),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "DELETE FROM lix_directory_by_version \
+             WHERE id = 'dir-guides' AND lixcol_version_id = 'version-b'",
+            &[],
+        )
+        .await
+        .expect("DELETE lix_directory_by_version should stage tombstone");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "dir-guides");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert!(rows[0].tombstone);
+        assert_eq!(rows[0].snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_file_by_version_stages_descriptor_write() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_file_by_version (\
+             id, directory_id, name, extension, hidden, lixcol_version_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme', 'md', false, 'version-b')",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_file_by_version should stage descriptor write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "file-readme");
+        assert_eq!(rows[0].schema_version, "1");
+        assert_eq!(rows[0].version_id, "version-b");
+        let snapshot: JsonValue =
+            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "readme");
+        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["hidden"], false);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_active_file_defaults_active_version() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_file (id, directory_id, name, extension, hidden) \
+             VALUES ('file-readme', 'dir-docs', 'readme', 'md', false)",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_file should stage descriptor write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "file-readme");
+        assert_eq!(rows[0].version_id, "version-a");
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_file_stages_rewritten_descriptor() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_file_row(
+                    "file-readme",
+                    "version-a",
+                    Some("dir-docs"),
+                    "readme",
+                    Some("md"),
+                    false,
+                ),
+                live_file_row(
+                    "file-guide",
+                    "version-a",
+                    Some("dir-docs"),
+                    "guide",
+                    Some("md"),
+                    false,
+                ),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "UPDATE lix_file \
+             SET name = 'readme-updated', extension = 'txt', hidden = true, lixcol_metadata = '{\"source\":\"file-update\"}' \
+             WHERE id = 'file-readme'",
+            &[],
+        )
+        .await
+        .expect("UPDATE lix_file should stage rewritten descriptor");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "file-readme");
+        assert_eq!(rows[0].version_id, "version-a");
+        let snapshot: JsonValue =
+            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "readme-updated");
+        assert_eq!(snapshot["extension"], "txt");
+        assert_eq!(snapshot["hidden"], true);
+        assert_eq!(
+            rows[0].metadata.as_deref(),
+            Some("{\"source\":\"file-update\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_file_rejects_data_assignment() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![live_file_row(
+                "file-readme",
+                "version-a",
+                Some("dir-docs"),
+                "readme",
+                Some("md"),
+                false,
+            )],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let error = execute_sql(
+            &ctx,
+            "UPDATE lix_file SET data = X'4142' WHERE id = 'file-readme'",
+            &[],
+        )
+        .await
+        .expect_err("data should remain read-only");
+
+        assert!(
+            error.description.contains("read-only column 'data'"),
+            "unexpected error: {error:?}"
+        );
+        assert!(stager.lock().expect("stager lock").deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_file_by_version_stages_descriptor_tombstone() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_file_row(
+                    "file-readme",
+                    "version-a",
+                    Some("dir-docs"),
+                    "readme",
+                    Some("md"),
+                    false,
+                ),
+                live_file_row(
+                    "file-guide",
+                    "version-b",
+                    Some("dir-docs"),
+                    "guide",
+                    Some("md"),
+                    false,
+                ),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "DELETE FROM lix_file_by_version \
+             WHERE id = 'file-guide' AND lixcol_version_id = 'version-b'",
+            &[],
+        )
+        .await
+        .expect("DELETE lix_file_by_version should stage descriptor tombstone");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "file-guide");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert!(rows[0].tombstone);
+        assert_eq!(rows[0].snapshot_content, None);
     }
 
     #[tokio::test]
