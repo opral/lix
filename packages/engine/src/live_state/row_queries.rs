@@ -247,9 +247,12 @@ async fn scan_tracked_rows(
     backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
-    let contract =
-        load_live_row_shape_for_version_with_backend(backend, &request.schema_key, &request.version_id)
-            .await?;
+    let contract = load_live_row_shape_for_version_with_backend(
+        backend,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await?;
     let mut rows = scan_tracked_rows_with_backend(
         backend,
         &TrackedScanRequest {
@@ -287,9 +290,12 @@ async fn scan_untracked_rows(
     backend: LiveStateBackendRef<'_>,
     request: &LiveRowQuery,
 ) -> Result<Vec<LiveRow>, LixError> {
-    let contract =
-        load_live_row_shape_for_version_with_backend(backend, &request.schema_key, &request.version_id)
-            .await?;
+    let contract = load_live_row_shape_for_version_with_backend(
+        backend,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await?;
     let mut rows = scan_untracked_rows_with_backend(
         backend,
         &UntrackedScanRequest {
@@ -312,9 +318,12 @@ async fn load_exact_tracked_row(
     backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
-    let contract =
-        load_live_row_shape_for_version_with_backend(backend, &request.schema_key, &request.version_id)
-            .await?;
+    let contract = load_live_row_shape_for_version_with_backend(
+        backend,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await?;
     if let Some(row) = load_exact_tracked_row_with_backend(
         backend,
         &ExactTrackedRowRequest {
@@ -357,9 +366,12 @@ async fn load_exact_untracked_row(
     backend: LiveStateBackendRef<'_>,
     request: &ExactLiveRowQuery,
 ) -> Result<Option<LiveRow>, LixError> {
-    let contract =
-        load_live_row_shape_for_version_with_backend(backend, &request.schema_key, &request.version_id)
-            .await?;
+    let contract = load_live_row_shape_for_version_with_backend(
+        backend,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await?;
     let row = load_exact_untracked_row_with_backend(
         backend,
         &ExactUntrackedRowRequest {
@@ -505,9 +517,12 @@ async fn load_exact_untracked_row_for_lane(
     request: &ExactLiveRowQuery,
     lane: EffectiveLane,
 ) -> Result<EffectiveLaneOutcome, LixError> {
-    let contract =
-        load_live_row_shape_for_version_with_backend(backend, &request.schema_key, &request.version_id)
-            .await?;
+    let contract = load_live_row_shape_for_version_with_backend(
+        backend,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await?;
     let row = load_exact_untracked_row_with_backend(
         backend,
         &ExactUntrackedRowRequest {
@@ -733,9 +748,12 @@ async fn scan_lane_rows(
         .collect();
     }
 
-    let contract =
-        load_live_row_shape_for_version_with_backend(backend, &request.schema_key, &request.version_id)
-            .await?;
+    let contract = load_live_row_shape_for_version_with_backend(
+        backend,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await?;
     let mut rows = scan_tracked_rows_with_backend(
         backend,
         &TrackedScanRequest {

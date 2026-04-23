@@ -329,8 +329,12 @@ pub(crate) async fn load_live_row_access_for_version_with_executor(
     requested_version_id: &str,
 ) -> Result<LiveRowAccess, LixError> {
     Ok(LiveRowAccess::new(
-        load_live_table_layout_for_version_with_executor(executor, schema_key, requested_version_id)
-            .await?,
+        load_live_table_layout_for_version_with_executor(
+            executor,
+            schema_key,
+            requested_version_id,
+        )
+        .await?,
     ))
 }
 

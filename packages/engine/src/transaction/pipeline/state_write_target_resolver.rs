@@ -307,7 +307,8 @@ async fn candidate_row_from_live_row(
         ..
     } = row;
     let snapshot_content = snapshot_content.or(row_snapshot_content);
-    let projected_version_id = selector_projected_version_id(requested_version_id, lane, &version_id);
+    let projected_version_id =
+        selector_projected_version_id(requested_version_id, lane, &version_id);
     let values = LiveStateQueryBackend::normalize_live_snapshot_values(
         backend,
         &schema_key,

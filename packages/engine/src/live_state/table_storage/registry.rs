@@ -154,7 +154,9 @@ pub(crate) fn compile_registered_live_layout(
 }
 
 fn is_schema_not_stored_error(error: &LixError, schema_key: &str) -> bool {
-    error.description.starts_with(&format!("schema '{}' is not stored", schema_key))
+    error
+        .description
+        .starts_with(&format!("schema '{}' is not stored", schema_key))
 }
 
 #[cfg(test)]

@@ -3247,7 +3247,10 @@ simulation_test!(
             )
             .await
             .expect("debug state row query should succeed");
-        println!("DEBUG file_by_version untracked rows: {:?}", debug_rows.statements[0].rows);
+        println!(
+            "DEBUG file_by_version untracked rows: {:?}",
+            debug_rows.statements[0].rows
+        );
 
         let debug_live_rows = engine
             .execute(

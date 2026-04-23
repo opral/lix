@@ -383,9 +383,18 @@ mod tests {
         }))
         .expect("schema should compile");
 
-        assert_eq!(spec.column_types.get("title"), Some(&SurfaceColumnType::String));
-        assert_eq!(spec.column_types.get("count"), Some(&SurfaceColumnType::Integer));
-        assert_eq!(spec.column_types.get("score"), Some(&SurfaceColumnType::Number));
+        assert_eq!(
+            spec.column_types.get("title"),
+            Some(&SurfaceColumnType::String)
+        );
+        assert_eq!(
+            spec.column_types.get("count"),
+            Some(&SurfaceColumnType::Integer)
+        );
+        assert_eq!(
+            spec.column_types.get("score"),
+            Some(&SurfaceColumnType::Number)
+        );
         assert_eq!(
             spec.column_types.get("published"),
             Some(&SurfaceColumnType::Boolean)
@@ -424,7 +433,10 @@ mod tests {
         }))
         .expect("schema should compile");
 
-        assert_eq!(spec.column_types.get("payload"), Some(&SurfaceColumnType::Json));
+        assert_eq!(
+            spec.column_types.get("payload"),
+            Some(&SurfaceColumnType::Json)
+        );
     }
 
     #[test]
@@ -443,7 +455,10 @@ mod tests {
         }))
         .expect("schema should compile");
 
-        assert_eq!(spec.column_types.get("payload"), Some(&SurfaceColumnType::Json));
+        assert_eq!(
+            spec.column_types.get("payload"),
+            Some(&SurfaceColumnType::Json)
+        );
     }
 
     #[test]
@@ -514,9 +529,11 @@ mod tests {
         ];
 
         for relation_name in relation_names {
-            let resolved = registry.bind_relation_name(&relation_name).unwrap_or_else(|| {
-                panic!("builtin registry relation '{relation_name}' should bind")
-            });
+            let resolved = registry
+                .bind_relation_name(&relation_name)
+                .unwrap_or_else(|| {
+                    panic!("builtin registry relation '{relation_name}' should bind")
+                });
 
             let variant_columns = resolved
                 .column_types
