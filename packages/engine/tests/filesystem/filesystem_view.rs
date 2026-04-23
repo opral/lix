@@ -1588,7 +1588,7 @@ simulation_test!(directory_by_version_requires_version_id, |sim| async move {
 });
 
 simulation_test!(
-    file_update_data_plus_metadata_updates_descriptor,
+    file_update_with_removed_metadata_column_is_rejected,
     |sim| async move {
         let engine = sim
             .boot_simulated_lix_deterministic()
@@ -1602,20 +1602,7 @@ simulation_test!(
         .await
         .unwrap();
 
-        let before = engine
-            .execute(
-                "SELECT lixcol_change_id FROM lix_file WHERE id = 'file-mixed'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(before.statements[0].rows.len(), 1);
-        let before_change_id = match &before.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text lixcol_change_id before update, got {other:?}"),
-        };
-
-        engine
+        let err = engine
             .execute(
                 "UPDATE lix_file \
              SET data = lix_text_encode('ignored-again'), metadata = '{\"owner\":\"sam\"}' \
@@ -1623,36 +1610,20 @@ simulation_test!(
                 &[],
             )
             .await
-            .unwrap();
-
-        let after = engine
-            .execute(
-                "SELECT lixcol_change_id FROM lix_file WHERE id = 'file-mixed'",
-                &[],
-            )
-            .await
-            .unwrap();
-        assert_eq!(after.statements[0].rows.len(), 1);
-        let after_change_id = match &after.statements[0].rows[0][0] {
-            Value::Text(value) => value.clone(),
-            other => panic!("expected text lixcol_change_id after update, got {other:?}"),
-        };
-        assert_ne!(after_change_id, before_change_id);
+            .expect_err("metadata should no longer be a writable filesystem view column");
+        assert_eq!(err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(
+            err.description.contains("metadata"),
+            "unexpected error: {}",
+            err.description
+        );
 
         let file_row = engine
-            .execute(
-                "SELECT data, metadata FROM lix_file WHERE id = 'file-mixed'",
-                &[],
-            )
+            .execute("SELECT data FROM lix_file WHERE id = 'file-mixed'", &[])
             .await
             .unwrap();
         assert_eq!(file_row.statements[0].rows.len(), 1);
-        assert_blob_text(&file_row.statements[0].rows[0][0], "ignored-again");
-        assert!(
-            matches!(&file_row.statements[0].rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"sam\"")),
-            "expected metadata containing owner key, got {:?}",
-            file_row.statements[0].rows[0][1]
-        );
+        assert_blob_text(&file_row.statements[0].rows[0][0], "ignored");
     }
 );
 
@@ -3690,8 +3661,10 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (id, path, data, metadata) \
-             VALUES ('lixcol-file', '/lixcol.json', lix_text_encode('ignored'), '{\"tag\":\"file\"}')", &[])
+                "INSERT INTO lix_file (id, path, data) \
+             VALUES ('lixcol-file', '/lixcol.json', lix_text_encode('ignored'))",
+                &[],
+            )
             .await
             .unwrap();
         engine
@@ -3863,62 +3836,54 @@ simulation_test!(
     }
 );
 
-simulation_test!(file_metadata_update_changes_change_id, |sim| async move {
-    let engine = sim
-        .boot_simulated_lix_deterministic()
-        .await
-        .expect("boot_simulated_lix should succeed");
-    engine.initialize().await.unwrap();
+simulation_test!(
+    file_metadata_column_is_not_exposed_on_filesystem_views,
+    |sim| async move {
+        let engine = sim
+            .boot_simulated_lix_deterministic()
+            .await
+            .expect("boot_simulated_lix should succeed");
+        engine.initialize().await.unwrap();
 
-    engine
+        let insert_err = engine
         .execute(
             "INSERT INTO lix_file (id, path, data, metadata) \
              VALUES ('metadata-change-file', '/metadata-change.json', lix_text_encode('ignored'), '{\"owner\":\"a\"}')", &[])
         .await
-        .unwrap();
+        .expect_err("metadata insert should fail");
+        assert_eq!(insert_err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(
+            insert_err.description.contains("metadata"),
+            "unexpected error: {}",
+            insert_err.description
+        );
 
-    let before = engine
-        .execute(
-            "SELECT lixcol_change_id FROM lix_file WHERE id = 'metadata-change-file'",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(before.statements[0].rows.len(), 1);
-    let before_change_id = match &before.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected text change id, got {other:?}"),
-    };
+        engine
+            .execute(
+                "INSERT INTO lix_file (id, path, data) \
+             VALUES ('metadata-change-file', '/metadata-change.json', lix_text_encode('ignored'))",
+                &[],
+            )
+            .await
+            .unwrap();
 
-    engine
-        .execute(
-            "UPDATE lix_file \
+        let update_err = engine
+            .execute(
+                "UPDATE lix_file \
              SET metadata = '{\"owner\":\"b\"}' \
              WHERE id = 'metadata-change-file'",
-            &[],
-        )
-        .await
-        .unwrap();
-
-    let after = engine
-        .execute(
-            "SELECT lixcol_change_id, metadata FROM lix_file WHERE id = 'metadata-change-file'",
-            &[],
-        )
-        .await
-        .unwrap();
-    assert_eq!(after.statements[0].rows.len(), 1);
-    let after_change_id = match &after.statements[0].rows[0][0] {
-        Value::Text(value) => value.clone(),
-        other => panic!("expected text change id, got {other:?}"),
-    };
-    assert_ne!(before_change_id, after_change_id);
-    assert!(
-        matches!(&after.statements[0].rows[0][1], Value::Text(metadata) if metadata.contains("\"owner\":\"b\"")),
-        "expected updated metadata payload, got {:?}",
-        after.statements[0].rows[0][1]
-    );
-});
+                &[],
+            )
+            .await
+            .expect_err("metadata update should fail");
+        assert_eq!(update_err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+        assert!(
+            update_err.description.contains("metadata"),
+            "unexpected error: {}",
+            update_err.description
+        );
+    }
+);
 
 /*
 simulation_test!(

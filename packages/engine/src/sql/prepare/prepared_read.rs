@@ -410,7 +410,6 @@ fn prepared_file_history_field(field: FileHistoryField) -> PreparedFileHistoryFi
         FileHistoryField::Id => PreparedFileHistoryField::Id,
         FileHistoryField::Path => PreparedFileHistoryField::Path,
         FileHistoryField::Data => PreparedFileHistoryField::Data,
-        FileHistoryField::Metadata => PreparedFileHistoryField::Metadata,
         FileHistoryField::Hidden => PreparedFileHistoryField::Hidden,
         FileHistoryField::EntityId => PreparedFileHistoryField::EntityId,
         FileHistoryField::SchemaKey => PreparedFileHistoryField::SchemaKey,

@@ -1421,7 +1421,7 @@ simulation_test!(
 );
 
 simulation_test!(
-    transaction_path_exact_filesystem_metadata_updates_coalesce_into_single_commit,
+    transaction_path_exact_filesystem_data_updates_coalesce_into_single_commit,
     simulations = [sqlite, postgres],
     |sim| async move {
         let engine = sim
@@ -1453,13 +1453,13 @@ simulation_test!(
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE lix_file SET metadata = '{\"tag\":\"after-a\"}' \
+                        "UPDATE lix_file SET data = lix_text_encode('after-a') \
                          WHERE id = 'tx-file-update-a'",
                         &[],
                     )
                     .await?;
                     tx.execute(
-                        "UPDATE lix_file SET metadata = '{\"tag\":\"after-b\"}' \
+                        "UPDATE lix_file SET data = lix_text_encode('after-b') \
                          WHERE id = 'tx-file-update-b'",
                         &[],
                     )
@@ -1475,7 +1475,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT id, metadata \
+                "SELECT id, data \
                  FROM lix_file \
                  WHERE id IN ('tx-file-update-a', 'tx-file-update-b') \
                  ORDER BY id",
@@ -1483,19 +1483,17 @@ simulation_test!(
             )
             .await
             .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 2);
         assert_eq!(
-            rows.statements[0].rows,
-            vec![
-                vec![
-                    Value::Text("tx-file-update-a".to_string()),
-                    Value::Text("{\"tag\":\"after-a\"}".to_string())
-                ],
-                vec![
-                    Value::Text("tx-file-update-b".to_string()),
-                    Value::Text("{\"tag\":\"after-b\"}".to_string())
-                ],
-            ]
+            rows.statements[0].rows[0][0],
+            Value::Text("tx-file-update-a".to_string())
         );
+        assert_blob_text(&rows.statements[0].rows[0][1], "after-a");
+        assert_eq!(
+            rows.statements[0].rows[1][0],
+            Value::Text("tx-file-update-b".to_string())
+        );
+        assert_blob_text(&rows.statements[0].rows[1][1], "after-b");
     }
 );
 
@@ -1532,7 +1530,7 @@ simulation_test!(
             .transaction(ExecuteOptions::default(), |tx| {
                 Box::pin(async move {
                     tx.execute(
-                        "UPDATE lix_file SET metadata = '{\"tag\":\"after-a\"}' \
+                        "UPDATE lix_file SET data = lix_text_encode('after-a') \
                          WHERE id = 'tx-file-ud-a'",
                         &[],
                     )
@@ -1550,7 +1548,7 @@ simulation_test!(
 
         let rows = engine
             .execute(
-                "SELECT id, metadata \
+                "SELECT id, data \
                  FROM lix_file \
                  WHERE id IN ('tx-file-ud-a', 'tx-file-ud-b') \
                  ORDER BY id",
@@ -1558,13 +1556,12 @@ simulation_test!(
             )
             .await
             .unwrap();
+        assert_eq!(rows.statements[0].rows.len(), 1);
         assert_eq!(
-            rows.statements[0].rows,
-            vec![vec![
-                Value::Text("tx-file-ud-a".to_string()),
-                Value::Text("{\"tag\":\"after-a\"}".to_string())
-            ],]
+            rows.statements[0].rows[0][0],
+            Value::Text("tx-file-ud-a".to_string())
         );
+        assert_blob_text(&rows.statements[0].rows[0][1], "after-a");
     }
 );
 

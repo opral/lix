@@ -6,21 +6,6 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum OptionalTextAssignment {
-    Unchanged,
-    Set(Option<String>),
-}
-
-impl OptionalTextAssignment {
-    pub(crate) fn apply(&self, current: Option<String>) -> Option<String> {
-        match self {
-            Self::Unchanged => current,
-            Self::Set(value) => value.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BlobAssignment {
     Unchanged,
     Set(Vec<u8>),
@@ -41,7 +26,6 @@ pub(crate) struct DirectoryUpdateAssignments {
     pub(crate) parent_id: Option<String>,
     pub(crate) name: Option<String>,
     pub(crate) hidden: Option<bool>,
-    pub(crate) metadata: OptionalTextAssignment,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,7 +48,6 @@ impl DirectoryUpdateAssignments {
 pub(crate) struct FileUpdateAssignments {
     pub(crate) path: Option<ParsedFilePath>,
     pub(crate) hidden: Option<bool>,
-    pub(crate) metadata: OptionalTextAssignment,
     pub(crate) data: BlobAssignment,
 }
 
@@ -76,7 +59,6 @@ pub(crate) struct DirectoryInsertAssignments {
     pub(crate) path: Option<NormalizedDirectoryPath>,
     pub(crate) hidden: bool,
     pub(crate) untracked: Option<bool>,
-    pub(crate) metadata: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +67,6 @@ pub(crate) struct FileInsertAssignments {
     pub(crate) path: ParsedFilePath,
     pub(crate) hidden: bool,
     pub(crate) untracked: Option<bool>,
-    pub(crate) metadata: Option<String>,
     pub(crate) data: Option<Vec<u8>>,
 }
 
@@ -93,9 +74,25 @@ fn assignment_error(message: impl Into<String>) -> LixError {
     LixError::new("LIX_ERROR_UNKNOWN", message)
 }
 
+fn reject_removed_metadata_column(
+    payload: &BTreeMap<String, Value>,
+    relation_name: &str,
+) -> Result<(), LixError> {
+    if payload.contains_key("metadata") {
+        return Err(LixError::new(
+            "LIX_ERROR_SQL_UNKNOWN_COLUMN",
+            "Column `metadata` does not exist on `{relation_name}`. Available columns use `lixcol_metadata`."
+                .replace("{relation_name}", relation_name),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn parse_directory_update_assignments(
     payload: &BTreeMap<String, Value>,
 ) -> Result<DirectoryUpdateAssignments, LixError> {
+    reject_removed_metadata_column(payload, "lix_directory")?;
+
     if payload.contains_key("id") {
         return Err(assignment_error(
             "lix_directory id is immutable; create a new row and delete the old row instead",
@@ -119,13 +116,14 @@ pub(crate) fn parse_directory_update_assignments(
             .transpose()
             .map_err(filesystem_path_error)?,
         hidden: payload.get("hidden").and_then(value_as_bool),
-        metadata: optional_text_assignment(payload, "metadata", "public filesystem directory")?,
     })
 }
 
 pub(crate) fn parse_file_update_assignments(
     payload: &BTreeMap<String, Value>,
 ) -> Result<FileUpdateAssignments, LixError> {
+    reject_removed_metadata_column(payload, "lix_file")?;
+
     if payload.contains_key("id") {
         return Err(assignment_error(
             "lix_file id is immutable; create a new row and delete the old row instead",
@@ -141,7 +139,6 @@ pub(crate) fn parse_file_update_assignments(
             .transpose()
             .map_err(filesystem_path_error)?,
         hidden: payload.get("hidden").and_then(value_as_bool),
-        metadata: optional_text_assignment(payload, "metadata", "public filesystem resolver")?,
         data: blob_assignment(payload, "data")?,
     })
 }
@@ -153,6 +150,8 @@ pub(crate) fn parse_directory_insert_assignments(
     payload: &BTreeMap<String, Value>,
     functions: &DynFunctionProvider,
 ) -> Result<DirectoryInsertAssignments, LixError> {
+    reject_removed_metadata_column(payload, "lix_directory")?;
+
     let defaults = filesystem_insert_defaults(FILESYSTEM_DIRECTORY_SCHEMA_KEY, functions)?;
     Ok(DirectoryInsertAssignments {
         id: payload
@@ -180,7 +179,6 @@ pub(crate) fn parse_directory_insert_assignments(
             .or_else(|| defaults.get("hidden").and_then(value_as_bool))
             .unwrap_or(false),
         untracked: payload.get("untracked").and_then(value_as_bool),
-        metadata: optional_insert_text(payload, "metadata", "public filesystem directory")?,
     })
 }
 
@@ -188,6 +186,8 @@ pub(crate) fn parse_file_insert_assignments(
     payload: &BTreeMap<String, Value>,
     functions: &DynFunctionProvider,
 ) -> Result<FileInsertAssignments, LixError> {
+    reject_removed_metadata_column(payload, "lix_file")?;
+
     if !payload
         .keys()
         .any(|key| !matches!(key.as_str(), "data" | "version_id" | "untracked"))
@@ -217,24 +217,8 @@ pub(crate) fn parse_file_insert_assignments(
             .or_else(|| defaults.get("hidden").and_then(value_as_bool))
             .unwrap_or(false),
         untracked: payload.get("untracked").and_then(value_as_bool),
-        metadata: optional_insert_text(payload, "metadata", "public filesystem file")?,
         data: insert_blob_value(payload, "data")?,
     })
-}
-
-fn optional_text_assignment(
-    payload: &BTreeMap<String, Value>,
-    key: &str,
-    context: &str,
-) -> Result<OptionalTextAssignment, LixError> {
-    match payload.get(key) {
-        None => Ok(OptionalTextAssignment::Unchanged),
-        Some(Value::Null) => Ok(OptionalTextAssignment::Set(None)),
-        Some(Value::Text(value)) => Ok(OptionalTextAssignment::Set(Some(value.clone()))),
-        Some(other) => Err(assignment_error(format!(
-            "{context} expected text/null {key}, got {other:?}"
-        ))),
-    }
 }
 
 fn filesystem_insert_defaults(
@@ -320,19 +304,6 @@ fn insert_blob_value(
         Some(other) => Err(assignment_error(format!(
             "public filesystem resolver expected blob {key}, got {other:?}"
         ))),
-    }
-}
-
-fn optional_insert_text(
-    payload: &BTreeMap<String, Value>,
-    key: &str,
-    context: &str,
-) -> Result<Option<String>, LixError> {
-    match payload.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(value) => text_from_value(value).map(Some).ok_or_else(|| {
-            assignment_error(format!("{context} expected text/null {key}, got {value:?}"))
-        }),
     }
 }
 

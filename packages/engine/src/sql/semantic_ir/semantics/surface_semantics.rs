@@ -60,7 +60,6 @@ pub(crate) fn public_selector_column_name(
             "version_id" => Some("lixcol_version_id".to_string()),
             "global" => Some("lixcol_global".to_string()),
             "untracked" => Some("lixcol_untracked".to_string()),
-            "metadata" => Some("lixcol_metadata".to_string()),
             _ => None,
         },
         SurfaceFamily::Admin => match canonical_column {

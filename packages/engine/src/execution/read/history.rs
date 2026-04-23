@@ -174,7 +174,6 @@ fn file_history_field_from_column_name_for_projection(
         "id" => Some(PreparedFileHistoryField::Id),
         "path" => Some(PreparedFileHistoryField::Path),
         "data" => Some(PreparedFileHistoryField::Data),
-        "metadata" => Some(PreparedFileHistoryField::Metadata),
         "hidden" => Some(PreparedFileHistoryField::Hidden),
         "lixcol_entity_id" => Some(PreparedFileHistoryField::EntityId),
         "lixcol_schema_key" => Some(PreparedFileHistoryField::SchemaKey),
@@ -204,11 +203,6 @@ fn file_history_field_value(row: &FileHistoryRow, field: &PreparedFileHistoryFie
             .data
             .as_ref()
             .map(|value| Value::Blob(value.clone()))
-            .unwrap_or(Value::Null),
-        PreparedFileHistoryField::Metadata => row
-            .metadata
-            .as_ref()
-            .map(|value| Value::Text(value.clone()))
             .unwrap_or(Value::Null),
         PreparedFileHistoryField::Hidden => row.hidden.map(Value::Boolean).unwrap_or(Value::Null),
         PreparedFileHistoryField::EntityId => Value::Text(row.lixcol_entity_id.clone()),

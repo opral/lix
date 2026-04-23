@@ -117,7 +117,7 @@ mod tests {
     #[test]
     fn non_file_surface_writes_do_not_invalidate_installed_plugins_cache() {
         let statements = vec![parse_one(
-            "UPDATE lix_directory SET metadata = '{}' WHERE id = 'dir-1'",
+            "UPDATE lix_directory SET name = 'docs' WHERE id = 'dir-1'",
         )];
         assert!(!should_invalidate_installed_plugins_cache_for_statements(
             &statements

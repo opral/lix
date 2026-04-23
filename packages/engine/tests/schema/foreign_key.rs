@@ -99,7 +99,6 @@ async fn seed_file_descriptor(
         "directory_id": null,
         "name": name,
         "extension": extension,
-        "metadata": null,
         "hidden": false
     })
     .to_string();

@@ -121,7 +121,6 @@ pub enum PreparedFileHistoryField {
     Id,
     Path,
     Data,
-    Metadata,
     Hidden,
     EntityId,
     SchemaKey,

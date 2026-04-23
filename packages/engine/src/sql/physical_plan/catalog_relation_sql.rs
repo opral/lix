@@ -312,7 +312,6 @@ fn build_filesystem_file_projection_sql(
                c.payload_directory_id AS payload_directory_id, \
                c.payload_name AS payload_name, \
                c.payload_extension AS payload_extension, \
-               c.payload_metadata AS payload_metadata, \
                c.payload_hidden AS payload_hidden, \
                c.schema_version AS schema_version, \
                c.created_at AS created_at, \
@@ -338,7 +337,6 @@ fn build_filesystem_file_projection_sql(
                payload_directory_id AS directory_id, \
                payload_name AS name, \
                payload_extension AS extension, \
-               payload_metadata AS metadata, \
                payload_hidden AS hidden, \
                entity_id AS lixcol_entity_id, \
                schema_key AS lixcol_schema_key, \
@@ -409,7 +407,6 @@ fn build_filesystem_file_projection_sql(
                END \
            END AS path, \
            bbs.data AS data, \
-           f.metadata, \
            f.hidden, \
            f.lixcol_entity_id, \
            f.lixcol_schema_key, \
@@ -815,13 +812,12 @@ fn effective_directory_descriptor_candidates_sql(
 fn effective_file_descriptor_candidates_sql(
     schema_key: &str,
     global_version_id: &str,
-    dialect: SqlDialect,
+    _dialect: SqlDialect,
 ) -> String {
     let id_column = live_payload_column_name(schema_key, "id");
     let directory_id_column = live_payload_column_name(schema_key, "directory_id");
     let name_column = live_payload_column_name(schema_key, "name");
     let extension_column = live_payload_column_name(schema_key, "extension");
-    let metadata_column = live_payload_column_name(schema_key, "metadata");
     let hidden_column = live_payload_column_name(schema_key, "hidden");
     effective_state_candidates_sql(
         schema_key,
@@ -846,17 +842,6 @@ fn effective_file_descriptor_candidates_sql(
                 "payload_extension",
                 format!("t.{}", quote_ident(&extension_column)),
                 format!("u.{}", quote_ident(&extension_column)),
-            ),
-            (
-                "payload_metadata",
-                normalized_json_text_projection(
-                    dialect,
-                    &qualified_column_ref("t", &metadata_column),
-                ),
-                normalized_json_text_projection(
-                    dialect,
-                    &qualified_column_ref("u", &metadata_column),
-                ),
             ),
             (
                 "payload_hidden",
@@ -993,25 +978,4 @@ fn live_payload_column_name(schema_key: &str, property_name: &str) -> String {
             error.description
         )
     })
-}
-
-fn qualified_column_ref(table_alias: &str, column_name: &str) -> String {
-    format!("{}.{}", quote_ident(table_alias), quote_ident(column_name))
-}
-
-fn normalized_json_text_projection(dialect: SqlDialect, column_ref: &str) -> String {
-    match dialect {
-        SqlDialect::Sqlite => format!(
-            "CASE \
-               WHEN {column_ref} IS NULL THEN NULL \
-               ELSE json_extract({column_ref}, '$') || '' \
-             END",
-        ),
-        SqlDialect::Postgres => format!(
-            "CASE \
-               WHEN {column_ref} IS NULL THEN NULL \
-               ELSE (CAST({column_ref} AS JSONB) #>> '{{}}') \
-             END",
-        ),
-    }
 }

@@ -311,7 +311,6 @@ fn plugin_archive_file_descriptor_row(
         "directory_id": descriptor.directory_id,
         "name": descriptor.name,
         "extension": descriptor.extension,
-        "metadata": descriptor.metadata,
         "hidden": descriptor.hidden,
     })
     .to_string();

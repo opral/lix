@@ -552,7 +552,7 @@ pub(crate) async fn load_file_rows_under_path(
 ) -> Result<Vec<FileFilesystemRow>, LixError> {
     let prefix_length = root_path.chars().count();
     let sql = format!(
-        "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, metadata, lixcol_change_id \
+        "SELECT id, directory_id, name, extension, path, hidden, lixcol_version_id, lixcol_untracked, lixcol_metadata, lixcol_change_id \
          FROM ({projection_sql}) files \
          WHERE lixcol_version_id = '{version_id}' \
            AND substr(path, 1, {prefix_length}) = '{root_path}' \

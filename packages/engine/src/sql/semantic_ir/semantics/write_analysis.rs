@@ -810,10 +810,13 @@ mod tests {
 
     #[test]
     fn builds_file_insert_intent_during_write_analysis() {
-        let planned = analyze_write(&canonicalized_write(
-            "INSERT INTO lix_file (path, metadata) VALUES ('/docs/readme.md', '{\"kind\":\"doc\"}')",
-            "main",
-        ), &system_functions())
+        let planned = analyze_write(
+            &canonicalized_write(
+                "INSERT INTO lix_file (path) VALUES ('/docs/readme.md')",
+                "main",
+            ),
+            &system_functions(),
+        )
         .expect("write analysis should succeed");
 
         let Some(FilesystemWriteIntent::FileInsert(rows)) = planned.filesystem_write_intent else {
@@ -823,7 +826,6 @@ mod tests {
         assert_eq!(rows[0].path.normalized_path.as_str(), "/docs/readme.md");
         assert_eq!(rows[0].path.name, "readme");
         assert_eq!(rows[0].path.extension.as_deref(), Some("md"));
-        assert_eq!(rows[0].metadata.as_deref(), Some("{\"kind\":\"doc\"}"));
     }
 
     #[test]
