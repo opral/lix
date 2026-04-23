@@ -568,12 +568,12 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET metadata = '{\"stage\":\"after-rename\"}' \
+                 SET data = lix_text_encode('{\"content\":\"hello-after-rename\"}') \
                  WHERE id = 'history-dir-rename-file'",
                 &[],
             )
             .await
-            .expect("file metadata touch after directory rename should succeed");
+            .expect("file data touch after directory rename should succeed");
         let after_rename_commit_id = active_version_commit_id(&engine).await;
 
         let before_rename_row = engine
@@ -743,12 +743,12 @@ simulation_test!(
         engine
             .execute(
                 "UPDATE lix_file \
-                 SET metadata = '{\"stage\":\"after-move\"}' \
+                 SET data = lix_text_encode('{\"note\":\"move-after-directory-move\"}') \
                  WHERE id = 'history-dir-move-file'",
                 &[],
             )
             .await
-            .expect("file metadata touch after directory move should succeed");
+            .expect("file data touch after directory move should succeed");
         let after_move_commit_id = active_version_commit_id(&engine).await;
 
         let before_move_row = engine

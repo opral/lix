@@ -163,8 +163,8 @@ simulation_test!(checkpoint_clears_working_changes, |sim| async move {
 
     engine
         .execute(
-            "INSERT INTO lix_file (path, data, metadata) \
-             VALUES ('/checkpoint-working.md', lix_text_encode('v1'), NULL)",
+            "INSERT INTO lix_file (path, data) \
+             VALUES ('/checkpoint-working.md', lix_text_encode('v1'))",
             &[],
         )
         .await

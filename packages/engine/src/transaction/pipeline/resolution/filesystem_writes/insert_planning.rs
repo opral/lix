@@ -652,7 +652,7 @@ where
         name: parsed.name.clone(),
         extension: parsed.extension.clone(),
         hidden: assignments.hidden,
-        metadata: assignments.metadata.clone(),
+        metadata: None,
     })
 }
 
@@ -754,7 +754,7 @@ where
         parent_path,
         name,
         hidden: assignments.hidden,
-        metadata: assignments.metadata.clone(),
+        metadata: None,
     })
 }
 
@@ -1193,7 +1193,6 @@ mod tests {
             path: None,
             hidden: false,
             untracked: None,
-            metadata: None,
         }];
         let existing_directory_paths_by_id =
             BTreeMap::from([("parent-1".to_string(), "/docs:root/".to_string())]);

@@ -441,7 +441,6 @@ fn file_descriptor_change_for_state(
                 },
                 "name": descriptor.name,
                 "extension": descriptor.extension,
-                "metadata": metadata,
                 "hidden": descriptor.hidden,
             })
             .to_string(),

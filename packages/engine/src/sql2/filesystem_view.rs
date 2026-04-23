@@ -828,7 +828,7 @@ fn prepared_filesystem_base_relation_plans(
                                     ),
                                     expression: filesystem_base_relation_expr_for_column(
                                         base_relation,
-                                        public_name,
+                                        source_column_name,
                                     ),
                                 },
                             )
@@ -907,7 +907,7 @@ fn filesystem_base_relation_columns(
             ("updated_at", "updated_at"),
             ("commit_id", "commit_id"),
             ("untracked", "untracked"),
-            ("metadata", "metadata"),
+            ("lixcol_metadata", "metadata"),
             ("id", "id"),
             ("directory_id", "directory_id"),
             ("name", "name"),
@@ -926,7 +926,7 @@ fn filesystem_base_relation_columns(
             ("commit_created_at", "commit_created_at"),
             ("root_commit_id", "root_commit_id"),
             ("depth", "depth"),
-            ("metadata", "metadata"),
+            ("lixcol_metadata", "metadata"),
             ("id", "id"),
             ("directory_id", "directory_id"),
             ("name", "name"),
@@ -946,7 +946,7 @@ fn filesystem_base_relation_columns(
             ("updated_at", "updated_at"),
             ("commit_id", "commit_id"),
             ("untracked", "untracked"),
-            ("metadata", "metadata"),
+            ("lixcol_metadata", "metadata"),
             ("id", "id"),
             ("parent_id", "parent_id"),
             ("name", "name"),
@@ -964,7 +964,7 @@ fn filesystem_base_relation_columns(
             ("commit_created_at", "commit_created_at"),
             ("root_commit_id", "root_commit_id"),
             ("depth", "depth"),
-            ("metadata", "metadata"),
+            ("lixcol_metadata", "metadata"),
             ("id", "id"),
             ("parent_id", "parent_id"),
             ("name", "name"),
@@ -983,7 +983,7 @@ fn filesystem_base_relation_columns(
             ("updated_at", "updated_at"),
             ("commit_id", "commit_id"),
             ("untracked", "untracked"),
-            ("metadata", "metadata"),
+            ("lixcol_metadata", "metadata"),
             ("id", "id"),
             ("blob_hash", "blob_hash"),
             ("size_bytes", "size_bytes"),
@@ -1000,7 +1000,7 @@ fn filesystem_base_relation_columns(
             ("commit_created_at", "commit_created_at"),
             ("root_commit_id", "root_commit_id"),
             ("depth", "depth"),
-            ("metadata", "metadata"),
+            ("lixcol_metadata", "metadata"),
             ("id", "id"),
             ("blob_hash", "blob_hash"),
             ("size_bytes", "size_bytes"),
@@ -1086,43 +1086,45 @@ fn filesystem_projection_type_for_public_column(
 
 fn filesystem_base_relation_expr_for_column(
     base_relation: Sql2FilesystemViewBaseRelation,
-    column_name: &str,
+    source_column_name: &str,
 ) -> PreparedSql2FilesystemBaseRelationExpr {
     match base_relation {
         Sql2FilesystemViewBaseRelation::FileDescriptorRows
-        | Sql2FilesystemViewBaseRelation::FileDescriptorHistoryRows => match column_name {
+        | Sql2FilesystemViewBaseRelation::FileDescriptorHistoryRows => match source_column_name {
             "id" | "directory_id" | "name" | "extension" | "hidden" => {
                 PreparedSql2FilesystemBaseRelationExpr::JsonPayloadProperty {
-                    property_name: column_name.to_string(),
+                    property_name: source_column_name.to_string(),
                 }
             }
             _ => PreparedSql2FilesystemBaseRelationExpr::StateColumn {
-                column_name: column_name.to_string(),
+                column_name: source_column_name.to_string(),
             },
         },
         Sql2FilesystemViewBaseRelation::DirectoryDescriptorRows
-        | Sql2FilesystemViewBaseRelation::DirectoryDescriptorHistoryRows => match column_name {
-            "id" | "parent_id" | "name" | "hidden" => {
-                PreparedSql2FilesystemBaseRelationExpr::JsonPayloadProperty {
-                    property_name: column_name.to_string(),
+        | Sql2FilesystemViewBaseRelation::DirectoryDescriptorHistoryRows => {
+            match source_column_name {
+                "id" | "parent_id" | "name" | "hidden" => {
+                    PreparedSql2FilesystemBaseRelationExpr::JsonPayloadProperty {
+                        property_name: source_column_name.to_string(),
+                    }
                 }
+                _ => PreparedSql2FilesystemBaseRelationExpr::StateColumn {
+                    column_name: source_column_name.to_string(),
+                },
             }
-            _ => PreparedSql2FilesystemBaseRelationExpr::StateColumn {
-                column_name: column_name.to_string(),
-            },
-        },
+        }
         Sql2FilesystemViewBaseRelation::BinaryBlobRefRows
-        | Sql2FilesystemViewBaseRelation::BinaryBlobRefHistoryRows => match column_name {
+        | Sql2FilesystemViewBaseRelation::BinaryBlobRefHistoryRows => match source_column_name {
             "id" => PreparedSql2FilesystemBaseRelationExpr::StateColumn {
                 column_name: "file_id".to_string(),
             },
             "blob_hash" | "size_bytes" => {
                 PreparedSql2FilesystemBaseRelationExpr::JsonPayloadProperty {
-                    property_name: column_name.to_string(),
+                    property_name: source_column_name.to_string(),
                 }
             }
             _ => PreparedSql2FilesystemBaseRelationExpr::StateColumn {
-                column_name: column_name.to_string(),
+                column_name: source_column_name.to_string(),
             },
         },
     }
@@ -1686,7 +1688,7 @@ mod sql_fragments {
            schema_key, \
            version_id, \
            schema_version, \
-           metadata, \
+           lixcol_metadata, \
            directory_id, \
            name, \
            extension, \
@@ -1707,7 +1709,7 @@ mod sql_fragments {
              fd.schema_key, \
              fd.version_id, \
              fd.schema_version, \
-             fd.metadata, \
+             fd.lixcol_metadata, \
              fd.directory_id, \
              fd.name, \
              fd.extension, \
@@ -2351,6 +2353,10 @@ mod tests {
         let directory = plans
             .get("lix_directory_history")
             .expect("directory history plan should exist");
+        assert!(
+            directory.column_plan("metadata").is_none(),
+            "public directory history views should not expose metadata"
+        );
 
         assert_eq!(
             directory.base_relations,
@@ -3291,10 +3297,13 @@ mod tests {
         let file = plans
             .get("lix_file_history")
             .expect("lix_file_history plan should exist");
+        assert!(
+            file.column_plan("metadata").is_none(),
+            "public file history views should not expose metadata"
+        );
 
         for column_name in [
             "hidden",
-            "metadata",
             "lixcol_entity_id",
             "lixcol_schema_key",
             "lixcol_file_id",
@@ -3434,10 +3443,13 @@ mod tests {
         let file = plans
             .get("lix_file_history")
             .expect("lix_file_history plan should exist");
+        assert!(
+            file.column_plan("metadata").is_none(),
+            "public file history views should not expose metadata"
+        );
 
         for column_name in [
             "hidden",
-            "metadata",
             "lixcol_entity_id",
             "lixcol_schema_key",
             "lixcol_file_id",
@@ -3502,7 +3514,7 @@ mod tests {
         assert!(rendered.contains("d.schema_key AS lixcol_schema_key"));
         assert!(rendered.contains("d.version_id AS lixcol_version_id"));
         assert!(rendered.contains("d.hidden AS hidden"));
-        assert!(rendered.contains("d.metadata AS metadata"));
+        assert!(!rendered.contains(" AS metadata"));
         assert!(rendered.contains("p.path AS path"));
         assert!(rendered.contains("b.blob_hash AS data"));
     }
@@ -3517,6 +3529,10 @@ mod tests {
         let file = plans
             .get("lix_file_history_by_version")
             .expect("lix_file_history_by_version plan should exist");
+        assert!(
+            file.column_plan("metadata").is_none(),
+            "public file history by version views should not expose metadata"
+        );
 
         let ctx = SessionContext::new();
         let file_history_provider = Arc::new(
@@ -3621,6 +3637,7 @@ mod tests {
         assert!(rendered.contains("lixcol_version_id"));
         assert!(rendered.contains("lixcol_root_commit_id"));
         assert!(rendered.contains("lixcol_depth"));
+        assert!(!rendered.contains(" AS metadata"));
     }
 
     #[test]
@@ -3756,6 +3773,10 @@ mod tests {
         let directory = plans
             .get("lix_directory_history")
             .expect("lix_directory_history plan should exist");
+        assert!(
+            directory.column_plan("metadata").is_none(),
+            "public directory history views should not expose metadata"
+        );
 
         let ctx = SessionContext::new();
         let directory_provider = Arc::new(
@@ -3805,6 +3826,7 @@ mod tests {
         let rendered = format!("{:?}", view.logical_plan());
         assert!(rendered.contains("lix_directory_descriptor_history_winners"));
         assert!(rendered.contains("__lix_directory_paths"));
+        assert!(!rendered.contains(" AS metadata"));
         assert!(rendered.contains("root_commit_id"));
         assert!(rendered.contains("depth"));
         assert!(rendered.contains("lixcol_root_commit_id"));

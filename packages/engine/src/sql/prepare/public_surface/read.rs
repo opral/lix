@@ -950,7 +950,6 @@ fn push_text_value_for_file_history_field(
         | FileHistoryField::FileId
         | FileHistoryField::Path
         | FileHistoryField::Data
-        | FileHistoryField::Metadata
         | FileHistoryField::Hidden
         | FileHistoryField::SchemaKey
         | FileHistoryField::PluginKey
@@ -1176,7 +1175,6 @@ fn file_history_field_from_column_name(
         "id" => Ok(FileHistoryField::Id),
         "path" => Ok(FileHistoryField::Path),
         "data" => Ok(FileHistoryField::Data),
-        "metadata" => Ok(FileHistoryField::Metadata),
         "hidden" => Ok(FileHistoryField::Hidden),
         "entity_id" | "lixcol_entity_id" => Ok(FileHistoryField::EntityId),
         "schema_key" | "lixcol_schema_key" => Ok(FileHistoryField::SchemaKey),
@@ -1509,7 +1507,6 @@ fn file_history_field_name(field: &FileHistoryField) -> &'static str {
         FileHistoryField::Id => "id",
         FileHistoryField::Path => "path",
         FileHistoryField::Data => "data",
-        FileHistoryField::Metadata => "metadata",
         FileHistoryField::Hidden => "hidden",
         FileHistoryField::EntityId => "lixcol_entity_id",
         FileHistoryField::SchemaKey => "lixcol_schema_key",

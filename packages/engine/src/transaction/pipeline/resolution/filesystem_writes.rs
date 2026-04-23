@@ -1183,8 +1183,6 @@ async fn resolve_file_update_target(
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<(FileFilesystemRow, Vec<DirectoryFilesystemRow>), crate::LixError> {
     let next_hidden = assignments.hidden.unwrap_or(current_row.hidden);
-    let next_metadata = assignments.metadata.apply(current_row.metadata.clone());
-
     let mut ancestor_rows = Vec::new();
     let (next_directory_id, next_name, next_extension, next_path) =
         if let Some(parsed) = assignments.path.as_ref() {
@@ -1247,7 +1245,7 @@ async fn resolve_file_update_target(
             path: next_path.unwrap_or_default(),
             hidden: next_hidden,
             untracked: current_row.untracked,
-            metadata: next_metadata,
+            metadata: current_row.metadata.clone(),
             change_id: current_row.change_id.clone(),
         },
         ancestor_rows,
@@ -1270,8 +1268,6 @@ async fn resolve_directory_update_target(
     lookup_scope: FilesystemProjectionScope,
 ) -> Result<DirectoryFilesystemRow, crate::LixError> {
     let next_hidden = assignments.hidden.unwrap_or(current_row.hidden);
-    let next_metadata = assignments.metadata.apply(current_row.metadata.clone());
-
     let (resolved_parent_id, resolved_name, resolved_path) = if let Some(normalized_path) =
         assignments.path.as_ref()
     {
@@ -1382,7 +1378,7 @@ async fn resolve_directory_update_target(
         hidden: next_hidden,
         version_id: version_id.to_string(),
         untracked: current_row.untracked,
-        metadata: next_metadata,
+        metadata: current_row.metadata.clone(),
         change_id: current_row.change_id.clone(),
     })
 }
@@ -1393,7 +1389,6 @@ struct ProposedDirectoryUpdate {
     parent_id: Option<String>,
     name: String,
     hidden: bool,
-    metadata: Option<String>,
 }
 
 async fn resolve_directory_update_targets_batch(
@@ -1429,7 +1424,6 @@ async fn resolve_directory_update_targets_batch(
         }
         let name = assignments.name.clone().unwrap_or_else(|| row.name.clone());
         let hidden = assignments.hidden.unwrap_or(row.hidden);
-        let metadata = assignments.metadata.apply(row.metadata.clone());
         proposed_by_id.insert(
             row.id.clone(),
             ProposedDirectoryUpdate {
@@ -1437,7 +1431,6 @@ async fn resolve_directory_update_targets_batch(
                 parent_id,
                 name,
                 hidden,
-                metadata,
             },
         );
     }
@@ -1565,7 +1558,7 @@ async fn resolve_directory_update_targets_batch(
             hidden: proposal.hidden,
             version_id: version_id.to_string(),
             untracked: row.untracked,
-            metadata: proposal.metadata.clone(),
+            metadata: row.metadata.clone(),
             change_id: row.change_id.clone(),
         });
     }
@@ -2040,7 +2033,6 @@ fn file_descriptor_row(
         "directory_id": directory_id,
         "name": name,
         "extension": extension,
-        "metadata": metadata,
         "hidden": hidden,
     })
     .to_string();

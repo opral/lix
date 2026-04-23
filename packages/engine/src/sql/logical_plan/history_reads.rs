@@ -7,7 +7,6 @@ pub(crate) enum FileHistoryField {
     Id,
     Path,
     Data,
-    Metadata,
     Hidden,
     EntityId,
     SchemaKey,

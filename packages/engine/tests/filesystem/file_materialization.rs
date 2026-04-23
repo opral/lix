@@ -1105,7 +1105,7 @@ mod legacy_plugin_and_cache_tests {
                     "INSERT INTO lix_state_by_version (\
                      entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
                      ) VALUES (\
-                     'file-1', 'lix_file_descriptor', NULL, '{}', NULL, '{{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"config\",\"extension\":\"json\",\"metadata\":null,\"hidden\":false}}', '1'\
+                     'file-1', 'lix_file_descriptor', NULL, '{}', NULL, '{{\"id\":\"file-1\",\"directory_id\":null,\"name\":\"config\",\"extension\":\"json\",\"hidden\":false}}', '1'\
                      )",
                     main_version_id
                 ), &[])
@@ -2737,21 +2737,29 @@ mod legacy_plugin_and_cache_tests {
     );
 
     simulation_test!(
-        file_multi_statement_delete_with_metadata_predicate_works_with_overlay_prefetch,
+        file_multi_statement_delete_with_removed_metadata_predicate_fails,
         simulations = [sqlite, postgres],
         |sim| async move {
             let engine = boot_engine_with_json_plugin(&sim).await;
             let main_version_id = main_version_id(&engine).await;
 
-            engine
-            .execute(
+            let err = engine
+                .execute(
                 "INSERT INTO lix_file (id, path, data, metadata) \
                  VALUES ('file-json-overlay-meta-delete', '/overlay-meta-delete.json', lix_text_encode('{\"v\":1}'), '{\"tag\":\"x\"}'); \
                  DELETE FROM lix_file \
                  WHERE metadata IS NOT NULL \
-                   AND id = 'file-json-overlay-meta-delete'", &[])
-            .await
-            .expect("metadata-predicate delete should succeed");
+                   AND id = 'file-json-overlay-meta-delete'",
+                    &[],
+                )
+                .await
+                .expect_err("metadata should no longer be supported on filesystem views");
+            assert_eq!(err.code, "LIX_ERROR_SQL_UNKNOWN_COLUMN");
+            assert!(
+                err.description.contains("metadata"),
+                "unexpected error: {}",
+                err.description
+            );
 
             let rows = engine
                 .execute(
@@ -2761,7 +2769,7 @@ mod legacy_plugin_and_cache_tests {
                     &[],
                 )
                 .await
-                .expect("post-delete read should succeed");
+                .expect("post-failure read should succeed");
             assert!(rows.statements[0].rows.is_empty());
             assert_eq!(
                 file_cache_row_count(&engine, "file-json-overlay-meta-delete", &main_version_id)

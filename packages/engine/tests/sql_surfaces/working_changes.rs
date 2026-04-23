@@ -821,8 +821,8 @@ simulation_test!(
 
         engine
             .execute(
-                "INSERT INTO lix_file (path, data, metadata) \
-                 VALUES ('/wc-reinit.md', lix_text_encode('hello'), NULL)",
+                "INSERT INTO lix_file (path, data) \
+                 VALUES ('/wc-reinit.md', lix_text_encode('hello'))",
                 &[],
             )
             .await
@@ -896,7 +896,9 @@ simulation_test!(
         let file_path = format!("/{}.txt", unique_key("wc-view-nested-subquery"));
         engine
             .execute(
-                "INSERT INTO lix_file (path, data, metadata) VALUES ($1, lix_text_encode('hello'), NULL)", &[Value::Text(file_path.clone())])
+                "INSERT INTO lix_file (path, data) VALUES ($1, lix_text_encode('hello'))",
+                &[Value::Text(file_path.clone())],
+            )
             .await
             .expect("file insert should succeed");
 

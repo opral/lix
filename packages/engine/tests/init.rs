@@ -202,8 +202,8 @@ fn init_reopen_preserves_working_changes_sqlite() {
 
                     session_a
                         .execute(
-                            "INSERT INTO lix_file (path, data, metadata) \
-                             VALUES ('/wc-reopen.md', lix_text_encode('hello'), NULL)", &[])
+                            "INSERT INTO lix_file (path, data) \
+                             VALUES ('/wc-reopen.md', lix_text_encode('hello'))", &[])
                         .await
                         .expect("file insert should succeed");
 

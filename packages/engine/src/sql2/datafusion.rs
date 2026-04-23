@@ -4629,7 +4629,7 @@ mod tests {
             .await?;
         sql2_session
             .execute(
-                "INSERT INTO lix_file (id, path, data, metadata) VALUES ('file-a', '/hello.txt', X'68656C6C6F', '{\"kind\":\"text\"}')",
+                "INSERT INTO lix_file (id, path, data, lixcol_metadata) VALUES ('file-a', '/hello.txt', X'68656C6C6F', '{\"kind\":\"text\"}')",
                 &[],
             )
             .await?;

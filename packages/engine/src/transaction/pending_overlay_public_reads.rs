@@ -579,7 +579,6 @@ fn visible_live_row_from_pending_filesystem_state(
         },
         "name": descriptor.name,
         "extension": descriptor.extension,
-        "metadata": descriptor.metadata,
         "hidden": descriptor.hidden,
     })
     .to_string();

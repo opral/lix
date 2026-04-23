@@ -111,7 +111,6 @@ struct DerivedFileRow {
     extension: Option<String>,
     path: Option<String>,
     data: Option<Vec<u8>>,
-    metadata: Option<String>,
     hidden: bool,
     schema_key: String,
     file_id: Option<String>,
@@ -228,7 +227,6 @@ fn derive_file_rows_for_versions(
             let directory_id = nullable_text(descriptor.values().get("directory_id"));
             let name = descriptor.property_text("name").unwrap_or_default();
             let extension = nullable_text(descriptor.values().get("extension"));
-            let metadata = nullable_value_text(descriptor.values().get("metadata"));
             let hidden = bool_value(descriptor.values().get("hidden")).unwrap_or(false);
             let path = file_path(
                 directory_id.as_deref(),
@@ -256,7 +254,6 @@ fn derive_file_rows_for_versions(
                 extension,
                 path,
                 data,
-                metadata,
                 hidden,
                 schema_key: descriptor.schema_key.clone(),
                 file_id: descriptor.file_id().map(str::to_string),
@@ -469,10 +466,6 @@ fn file_row_to_surface(
                 "data".to_string(),
                 row.data.map(Value::Blob).unwrap_or(Value::Null),
             ),
-            (
-                "metadata".to_string(),
-                row.metadata.map(Value::Text).unwrap_or(Value::Null),
-            ),
             ("hidden".to_string(), Value::Boolean(row.hidden)),
             (
                 "lixcol_entity_id".to_string(),
@@ -549,20 +542,6 @@ fn nullable_text(value: Option<&Value>) -> Option<String> {
     }
 }
 
-fn nullable_value_text(value: Option<&Value>) -> Option<String> {
-    match value {
-        Some(Value::Text(value)) => Some(decode_wrapped_json_string(value)),
-        Some(Value::Json(serde_json::Value::String(value))) => Some(value.clone()),
-        Some(Value::Json(value)) => Some(value.to_string()),
-        Some(Value::Null) | None => None,
-        _ => None,
-    }
-}
-
-fn decode_wrapped_json_string(value: &str) -> String {
-    serde_json::from_str::<String>(value).unwrap_or_else(|_| value.to_string())
-}
-
 fn bool_value(value: Option<&Value>) -> Option<bool> {
     match value {
         Some(Value::Boolean(value)) => Some(*value),
@@ -630,10 +609,6 @@ mod tests {
                             ("directory_id".to_string(), Value::Text("dir-1".to_string())),
                             ("name".to_string(), Value::Text("hello".to_string())),
                             ("extension".to_string(), Value::Text("txt".to_string())),
-                            (
-                                "metadata".to_string(),
-                                Value::Text("{\"owner\":\"sam\"}".to_string()),
-                            ),
                             ("hidden".to_string(), Value::Boolean(false)),
                         ]),
                     )],
@@ -716,10 +691,8 @@ mod tests {
             row.values.get("data"),
             Some(&Value::Blob(b"hello".to_vec()))
         );
-        assert_eq!(
-            row.values.get("metadata"),
-            Some(&Value::Text("{\"owner\":\"sam\"}".to_string()))
-        );
+        assert_eq!(row.values.get("metadata"), None);
+        assert_eq!(row.values.get("lixcol_metadata"), Some(&Value::Null));
         assert_eq!(
             row.values.get("lixcol_commit_id"),
             Some(&Value::Text("commit-main".to_string()))
@@ -744,7 +717,6 @@ mod tests {
                             ("directory_id".to_string(), Value::Null),
                             ("name".to_string(), Value::Text("hello".to_string())),
                             ("extension".to_string(), Value::Null),
-                            ("metadata".to_string(), Value::Null),
                             ("hidden".to_string(), Value::Boolean(false)),
                         ]),
                     )
@@ -847,7 +819,6 @@ mod tests {
                             ("directory_id".to_string(), Value::Null),
                             ("name".to_string(), Value::Text("scratch".to_string())),
                             ("extension".to_string(), Value::Null),
-                            ("metadata".to_string(), Value::Null),
                             ("hidden".to_string(), Value::Boolean(false)),
                         ]),
                     )
