@@ -909,6 +909,7 @@ fn planned_row_snapshot_content(row: &PlannedStateRow) -> Result<Option<JsonValu
 fn map_mutation_operation(operation: &MutationOperation) -> StateCommitStreamOperation {
     match operation {
         MutationOperation::Insert => StateCommitStreamOperation::Insert,
+        MutationOperation::Delete => StateCommitStreamOperation::Delete,
     }
 }
 

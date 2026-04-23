@@ -254,6 +254,7 @@ pub(crate) enum ExplainReadContract {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ExplainMutationOperation {
     Insert,
+    Delete,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -5790,6 +5791,7 @@ fn write_operation_kind_snapshot(kind: WriteOperationKind) -> ExplainWriteOperat
 fn mutation_operation_snapshot(operation: &MutationOperation) -> ExplainMutationOperation {
     match operation {
         MutationOperation::Insert => ExplainMutationOperation::Insert,
+        MutationOperation::Delete => ExplainMutationOperation::Delete,
     }
 }
 

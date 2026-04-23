@@ -1,6 +1,6 @@
 mod datafusion;
+mod entity_provider;
 mod entity_view;
-mod entity_views;
 mod execute;
 mod filesystem_view;
 mod lix_directory_views;

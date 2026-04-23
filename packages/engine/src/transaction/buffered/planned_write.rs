@@ -906,17 +906,21 @@ fn collect_semantic_overlay_from_mutation_rows(
     }
 
     for row in rows {
-        let snapshot_content = row
-            .snapshot_content
-            .as_ref()
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("failed to serialize pending registered schema snapshot: {error}"),
-                )
-            })?;
+        let tombstone = row.operation == crate::sql::MutationOperation::Delete;
+        let snapshot_content = if tombstone {
+            None
+        } else {
+            row.snapshot_content
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("failed to serialize pending registered schema snapshot: {error}"),
+                    )
+                })?
+        };
         overlay.rows.insert(
             PendingSemanticRowIdentity {
                 untracked: row.untracked,
@@ -938,7 +942,7 @@ fn collect_semantic_overlay_from_mutation_rows(
                 change_id: None,
                 snapshot_content,
                 metadata: row.metadata.clone(),
-                tombstone: false,
+                tombstone,
             },
         );
     }
