@@ -9,6 +9,8 @@ use crate::live_state::LiveStateContext;
 use crate::{LixError, QueryResult, Value};
 
 use super::entity_views::register_entity_views;
+use super::lix_directory_views::register_lix_directory_views;
+use super::lix_file_views::register_lix_file_views;
 use super::lix_state_provider::register_lix_state_providers;
 use super::udf::register_sql2_udfs;
 
@@ -24,7 +26,7 @@ use super::udf::register_sql2_udfs;
 pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateContext>;
-    fn blob_reader(&self) -> &dyn BlobDataReader;
+    fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError>;
 }
 
@@ -43,6 +45,14 @@ pub(crate) async fn execute_sql(
     let session = SessionContext::new();
     register_sql2_udfs(&session);
     register_lix_state_providers(&session, ctx.active_version_id(), ctx.live_state()).await?;
+    register_lix_directory_views(&session, ctx.active_version_id()).await?;
+    register_lix_file_views(
+        &session,
+        ctx.active_version_id(),
+        ctx.live_state(),
+        ctx.blob_reader(),
+    )
+    .await?;
     register_entity_views(
         &session,
         &ctx.list_visible_schemas(ctx.active_version_id())?,
@@ -183,7 +193,7 @@ mod tests {
 
     struct DummySqlExecutionContext<'a> {
         active_version_id: &'a str,
-        blob_reader: &'a dyn BlobDataReader,
+        blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateContext>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -197,8 +207,8 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
-        fn blob_reader(&self) -> &dyn BlobDataReader {
-            self.blob_reader
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::clone(&self.blob_reader)
         }
 
         fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
@@ -221,7 +231,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl BlobDataReader for DummyBlobReader {
         async fn load_blob_data_by_hash(
             &self,
@@ -231,7 +241,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl BlobDataReader for BackendBlobReader {
         async fn load_blob_data_by_hash(
             &self,
@@ -243,11 +253,11 @@ mod tests {
 
     #[tokio::test]
     async fn sql_execution_context_exposes_live_state_and_blob_reader() {
-        let blob_reader = DummyBlobReader;
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateContext);
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
-            blob_reader: &blob_reader,
+            blob_reader: Arc::clone(&blob_reader),
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateContext>,
             schema_definitions: vec![],
         };
@@ -256,19 +266,16 @@ mod tests {
         let expected = live_state as Arc<dyn LiveStateContext>;
         assert_eq!(ctx.active_version_id(), "version-a");
         assert!(Arc::ptr_eq(&actual, &expected));
-        assert!(std::ptr::eq(
-            ctx.blob_reader(),
-            &blob_reader as &dyn BlobDataReader,
-        ));
+        assert!(Arc::ptr_eq(&ctx.blob_reader(), &blob_reader));
     }
 
     #[tokio::test]
     async fn execute_sql_uses_execution_context_boundary() {
-        let blob_reader = DummyBlobReader;
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(DummyLiveStateContext);
         let ctx = DummySqlExecutionContext {
             active_version_id: "version-a",
-            blob_reader: &blob_reader,
+            blob_reader,
             live_state,
             schema_definitions: vec![],
         };
@@ -281,7 +288,7 @@ mod tests {
 
     struct BackendSqlExecutionContext<'a> {
         active_version_id: &'a str,
-        blob_reader: &'a dyn BlobDataReader,
+        blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateContext>,
         schema_definitions: Vec<JsonValue>,
     }
@@ -295,8 +302,8 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
-        fn blob_reader(&self) -> &dyn BlobDataReader {
-            self.blob_reader
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::clone(&self.blob_reader)
         }
 
         fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
@@ -359,6 +366,23 @@ mod tests {
                 &[],
             )
             .await?;
+        session
+            .execute(
+                "INSERT INTO lix_state_by_version (\
+                 entity_id, schema_key, file_id, version_id, plugin_key, snapshot_content, schema_version\
+                 ) VALUES (\
+                 'dir-docs', 'lix_directory_descriptor', NULL, 'version-a', NULL, '{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}', '1'\
+                 )",
+                &[],
+            )
+            .await?;
+        session
+            .execute(
+                "INSERT INTO lix_file_by_version (id, path, data, lixcol_version_id) \
+                 VALUES ('file-a', '/docs/readme.md', X'4142', 'version-a')",
+                &[],
+            )
+            .await?;
         Ok((backend, session, schema_definition))
     }
 
@@ -389,10 +413,11 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
-                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    blob_reader: &blob_reader,
+                    blob_reader: Arc::clone(&blob_reader),
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
@@ -435,10 +460,11 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
-                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    blob_reader: &blob_reader,
+                    blob_reader: Arc::clone(&blob_reader),
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
@@ -470,10 +496,11 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
-                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    blob_reader: &blob_reader,
+                    blob_reader: Arc::clone(&blob_reader),
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
@@ -508,10 +535,11 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
-                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    blob_reader: &blob_reader,
+                    blob_reader: Arc::clone(&blob_reader),
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
@@ -542,10 +570,11 @@ mod tests {
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
-                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
                 let ctx = BackendSqlExecutionContext {
                     active_version_id: "version-a",
-                    blob_reader: &blob_reader,
+                    blob_reader: Arc::clone(&blob_reader),
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                     schema_definitions: vec![schema_definition],
                 };
@@ -564,6 +593,165 @@ mod tests {
                 assert_eq!(result.rows.len(), 1);
                 assert_eq!(result.rows[0][0], Value::Text("B".to_string()));
                 assert_eq!(result.rows[0][1], Value::Text("version-b".to_string()));
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_lix_directory_by_version_view() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: Arc::clone(&blob_reader),
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT path, name, lixcol_version_id \
+                     FROM lix_directory_by_version \
+                     WHERE id = 'dir-docs' AND lixcol_version_id = 'version-a'",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read lix_directory_by_version");
+
+                assert_eq!(result.columns, vec!["path", "name", "lixcol_version_id"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0][0], Value::Text("/docs/".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
+                assert_eq!(result.rows[0][2], Value::Text("version-a".to_string()));
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_lix_directory_from_active_version() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: Arc::clone(&blob_reader),
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT path, name \
+                     FROM lix_directory \
+                     WHERE id = 'dir-docs'",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read lix_directory");
+
+                assert_eq!(result.columns, vec!["path", "name"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0][0], Value::Text("/docs/".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("docs".to_string()));
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_lix_file_by_version_view() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: Arc::clone(&blob_reader),
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT path, name, extension, data, lixcol_version_id \
+                     FROM lix_file_by_version \
+                     WHERE id = 'file-a' AND lixcol_version_id = 'version-a'",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read lix_file_by_version");
+
+                assert_eq!(
+                    result.columns,
+                    vec!["path", "name", "extension", "data", "lixcol_version_id"]
+                );
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(
+                    result.rows[0][0],
+                    Value::Text("/docs/readme.md".to_string())
+                );
+                assert_eq!(result.rows[0][1], Value::Text("readme".to_string()));
+                assert_eq!(result.rows[0][2], Value::Text("md".to_string()));
+                assert_eq!(result.rows[0][3], Value::Blob(vec![0x41, 0x42]));
+                assert_eq!(result.rows[0][4], Value::Text("version-a".to_string()));
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_lix_file_from_active_version() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader: Arc<dyn BlobDataReader> =
+                    Arc::new(BackendBlobReader(Arc::clone(&backend_ref)));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: Arc::clone(&blob_reader),
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT path, name, extension, data \
+                     FROM lix_file \
+                     WHERE id = 'file-a'",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read lix_file");
+
+                assert_eq!(result.columns, vec!["path", "name", "extension", "data"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(
+                    result.rows[0][0],
+                    Value::Text("/docs/readme.md".to_string())
+                );
+                assert_eq!(result.rows[0][1], Value::Text("readme".to_string()));
+                assert_eq!(result.rows[0][2], Value::Text("md".to_string()));
+                assert_eq!(result.rows[0][3], Value::Blob(vec![0x41, 0x42]));
             })
         });
     }

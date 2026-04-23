@@ -3,6 +3,8 @@ mod entity_view;
 mod entity_views;
 mod execute;
 mod filesystem_view;
+mod lix_directory_views;
+mod lix_file_views;
 mod lix_state_provider;
 mod udf;
 

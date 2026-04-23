@@ -3,8 +3,8 @@ use async_trait::async_trait;
 
 use crate::LixError;
 
-#[async_trait(?Send)]
-pub(crate) trait BlobDataReader {
+#[async_trait]
+pub(crate) trait BlobDataReader: Send + Sync {
     async fn load_blob_data_by_hash(&self, blob_hash: &str) -> Result<Option<Vec<u8>>, LixError>;
 }
 
