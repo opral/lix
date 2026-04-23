@@ -19,8 +19,8 @@ pub(crate) type CanonicalPreparedStatement = crate::PreparedStatement;
 pub(crate) type CanonicalCommitQueryExecutor<'a> = dyn crate::QueryExecutor + 'a;
 
 /// Owner-facing read surface for canonical committed-history persistence.
-#[async_trait(?Send)]
-pub(crate) trait CanonicalReadStore {
+#[async_trait]
+pub(crate) trait CanonicalReadStore: Send {
     async fn load_commit(&mut self, commit_id: &str) -> Result<Option<CanonicalCommit>, LixError>;
 
     async fn load_change(&mut self, change_id: &str) -> Result<Option<CanonicalChange>, LixError>;
@@ -43,8 +43,8 @@ pub(crate) trait CanonicalReadStore {
 }
 
 /// Owner-facing write surface for canonical committed-history persistence.
-#[async_trait(?Send)]
-pub(crate) trait CanonicalWriteStore {
+#[async_trait]
+pub(crate) trait CanonicalWriteStore: Send {
     async fn append_changes(
         &mut self,
         changes: &[CanonicalChangeWrite],

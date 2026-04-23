@@ -1140,7 +1140,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackend for CountingObserveBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -1181,7 +1181,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for CountingObserveTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -1217,7 +1217,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackend for SnapshotObserveBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -1275,7 +1275,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for SnapshotObserveTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

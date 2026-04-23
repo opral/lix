@@ -18,7 +18,7 @@ pub use prepared::{PreparedBatch, PreparedStatement};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
 pub use transaction_mode::TransactionBeginMode;
 
-#[async_trait(?Send)]
+#[async_trait]
 pub trait LixBackend: Send + Sync {
     fn dialect(&self) -> SqlDialect;
 
@@ -92,13 +92,13 @@ pub trait LixBackend: Send + Sync {
     }
 }
 
-#[async_trait(?Send)]
-pub(crate) trait QueryExecutor {
+#[async_trait]
+pub(crate) trait QueryExecutor: Send + Sync {
     fn dialect(&self) -> SqlDialect;
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<T> QueryExecutor for &T
 where
     T: LixBackend + ?Sized,
@@ -112,7 +112,7 @@ where
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
     fn dialect(&self) -> SqlDialect {
         self.as_ref().dialect()
@@ -123,7 +123,7 @@ impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<T> QueryExecutor for &mut T
 where
     T: LixBackendTransaction + ?Sized,
@@ -137,8 +137,8 @@ where
     }
 }
 
-#[async_trait(?Send)]
-pub trait LixBackendTransaction {
+#[async_trait]
+pub trait LixBackendTransaction: Send + Sync {
     fn dialect(&self) -> SqlDialect;
     fn mode(&self) -> TransactionBeginMode;
 

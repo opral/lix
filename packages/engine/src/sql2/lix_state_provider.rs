@@ -16,29 +16,33 @@ use crate::LixError;
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
-    live_state: &dyn LiveStateContext,
+    live_state: Arc<dyn LiveStateContext>,
 ) -> Result<(), LixError> {
-    let rows = live_state.scan(&LiveStateScanRequest::default()).await?;
     session
         .register_table(
             "lix_state_by_version",
-            Arc::new(LixStateByVersionProvider::new(rows)),
+            Arc::new(LixStateByVersionProvider::new(live_state)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     Ok(())
 }
 
-#[derive(Debug)]
 pub(crate) struct LixStateByVersionProvider {
     schema: SchemaRef,
-    rows: Vec<LiveRow>,
+    live_state: Arc<dyn LiveStateContext>,
+}
+
+impl std::fmt::Debug for LixStateByVersionProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixStateByVersionProvider").finish()
+    }
 }
 
 impl LixStateByVersionProvider {
-    pub(crate) fn new(rows: Vec<LiveRow>) -> Self {
+    pub(crate) fn new(live_state: Arc<dyn LiveStateContext>) -> Self {
         Self {
             schema: lix_state_by_version_schema(),
-            rows,
+            live_state,
         }
     }
 }
@@ -74,7 +78,12 @@ impl TableProvider for LixStateByVersionProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let batch = lix_state_by_version_record_batch(Arc::clone(&self.schema), &self.rows)
+        let rows = self
+            .live_state
+            .scan(&LiveStateScanRequest::default())
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+        let batch = lix_state_by_version_record_batch(Arc::clone(&self.schema), &rows)
             .map_err(lix_error_to_datafusion_error)?;
         let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
         table.scan(state, projection, filters, limit).await
@@ -141,7 +150,10 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
-    LixError::new("LIX_ERROR_UNKNOWN", format!("sql2 DataFusion error: {error}"))
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!("sql2 DataFusion error: {error}"),
+    )
 }
 
 fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {

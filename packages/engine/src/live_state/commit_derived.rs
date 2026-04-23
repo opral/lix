@@ -71,7 +71,7 @@ pub(crate) async fn scan_commit_derived_rows(
         LiveStateBackendRef<'a>,
         &LiveRowQuery,
     ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Vec<LiveRow>, LixError>> + 'a>,
+        Box<dyn std::future::Future<Output = Result<Vec<LiveRow>, LixError>> + Send + 'a>,
     >,
 ) -> Result<Vec<LiveRow>, LixError> {
     let Some(CommitQuerySurface::LazyDerived(surface)) =
@@ -668,7 +668,11 @@ mod tests {
             |_backend, _request| {
                 let commit_rows = commit_rows.clone();
                 Box::pin(async move { Ok(commit_rows) })
-                    as Pin<Box<dyn std::future::Future<Output = Result<Vec<LiveRow>, LixError>>>>
+                    as Pin<
+                        Box<
+                            dyn std::future::Future<Output = Result<Vec<LiveRow>, LixError>> + Send,
+                        >,
+                    >
             },
         )
         .await

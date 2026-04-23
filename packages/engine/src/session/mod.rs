@@ -1194,7 +1194,7 @@ mod tests {
             .expect("session mode test thread should not panic");
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl crate::LixBackend for RecordingBackend {
         fn dialect(&self) -> crate::SqlDialect {
             crate::SqlDialect::Sqlite
@@ -1256,7 +1256,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl crate::LixBackendTransaction for RecordingTransaction {
         fn dialect(&self) -> crate::SqlDialect {
             crate::SqlDialect::Sqlite

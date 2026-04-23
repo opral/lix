@@ -99,7 +99,7 @@ mod tests {
         fail_sql: Option<String>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackend for FakeBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -133,7 +133,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

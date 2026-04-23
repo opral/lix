@@ -203,7 +203,7 @@ mod tests {
 
     struct UnusedTransaction;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackend for InstalledPluginLookupBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -249,7 +249,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for UnusedTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

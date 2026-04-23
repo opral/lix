@@ -114,7 +114,9 @@ fn plan224_public_read_path_has_no_sql1_or_backend_fallbacks() {
         "PublicReadPhysicalPlan::HistoryRead",
     );
     assert!(
-        !engine_root().join("src/sql/physical_plan/lowerer.rs").exists(),
+        !engine_root()
+            .join("src/sql/physical_plan/lowerer.rs")
+            .exists(),
         "src/sql/physical_plan/lowerer.rs should be deleted under Plan 224",
     );
 }

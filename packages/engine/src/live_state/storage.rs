@@ -1152,7 +1152,7 @@ pub(crate) async fn delete_live_state_status_row_for_tests(
     Ok(())
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateReadStore for SqlLiveStateStore<'_> {
     async fn require_ready(&self) -> Result<(), LixError> {
         match &self.access {
@@ -1207,7 +1207,7 @@ impl LiveStateReadStore for SqlLiveStateStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateWriteStore for SqlLiveStateStore<'_> {
     async fn register_schema(&mut self, registration: &SchemaRegistration) -> Result<(), LixError> {
         let requirement = live_table_requirement_from_registration(registration)?;
@@ -1252,7 +1252,7 @@ impl LiveStateWriteStore for SqlLiveStateStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateMaterializeStore for SqlLiveStateStore<'_> {
     async fn rebuild_plan(
         &mut self,
@@ -1321,7 +1321,7 @@ impl LiveStateMaterializeStore for SqlLiveStateStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateLifecycleReadStore for SqlLiveStateStore<'_> {
     async fn load_live_state_snapshot(&self) -> Result<LiveStateSnapshot, LixError> {
         let backend = self.backend()?;
@@ -1360,7 +1360,7 @@ impl LiveStateLifecycleReadStore for SqlLiveStateStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateLifecycleAdminStore for SqlLiveStateStore<'_> {
     async fn init_live_state_status_storage(&self) -> Result<(), LixError> {
         let backend = self.backend()?;
@@ -1441,7 +1441,7 @@ struct VersionHeadRef {
     commit_id: String,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateLifecycleWriteStore for SqlLiveStateStore<'_> {
     async fn load_live_state_snapshot(&mut self) -> Result<LiveStateSnapshot, LixError> {
         let transaction = self.transaction()?;
@@ -1599,7 +1599,7 @@ impl LiveStateLifecycleWriteStore for SqlLiveStateStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateFrontierReadStore for SqlLiveStateStore<'_> {
     async fn load_version_head_commit_id(
         &mut self,

@@ -721,7 +721,7 @@ pub(crate) async fn resolve_last_checkpoint_commit_id_for_tip(
     .await
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CanonicalReadStore for SqlCanonicalReadStore<'_> {
     async fn load_commit(&mut self, commit_id: &str) -> Result<Option<CanonicalCommit>, LixError> {
         let _ = commit_id;
@@ -766,7 +766,7 @@ impl CanonicalReadStore for SqlCanonicalReadStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CanonicalReadStore for SqlCanonicalExecutorReadStore<'_> {
     async fn load_commit(&mut self, commit_id: &str) -> Result<Option<CanonicalCommit>, LixError> {
         api::load_commit(self.executor, commit_id).await
@@ -802,7 +802,7 @@ impl CanonicalReadStore for SqlCanonicalExecutorReadStore<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl CanonicalWriteStore for SqlCanonicalWriteStore<'_> {
     async fn append_changes(
         &mut self,

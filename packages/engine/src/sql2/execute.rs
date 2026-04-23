@@ -1,6 +1,7 @@
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
+use std::sync::Arc;
 
 use crate::binary_cas::BlobDataReader;
 use crate::live_state::LiveStateContext;
@@ -18,7 +19,7 @@ use super::lix_state_provider::register_lix_state_providers;
 /// actually needs it.
 #[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
-    fn live_state(&self) -> &dyn LiveStateContext;
+    fn live_state(&self) -> Arc<dyn LiveStateContext>;
     fn blob_reader(&self) -> &dyn BlobDataReader;
 }
 
@@ -43,7 +44,12 @@ pub(crate) async fn execute_sql(
         .map_err(datafusion_error_to_lix_error)?;
     if !params.is_empty() {
         dataframe = dataframe
-            .with_param_values(params.iter().map(scalar_value_from_lix_value).collect::<Vec<_>>())
+            .with_param_values(
+                params
+                    .iter()
+                    .map(scalar_value_from_lix_value)
+                    .collect::<Vec<_>>(),
+            )
             .map_err(datafusion_error_to_lix_error)?;
     }
 
@@ -53,7 +59,10 @@ pub(crate) async fn execute_sql(
         .iter()
         .map(|field| field.name().to_string())
         .collect::<Vec<_>>();
-    let batches = dataframe.collect().await.map_err(datafusion_error_to_lix_error)?;
+    let batches = dataframe
+        .collect()
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
     query_result_from_batches(&result_columns, &batches)
 }
 
@@ -70,7 +79,10 @@ fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {
 }
 
 fn datafusion_error_to_lix_error(error: datafusion::error::DataFusionError) -> LixError {
-    LixError::new("LIX_ERROR_UNKNOWN", format!("sql2 DataFusion error: {error}"))
+    LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        format!("sql2 DataFusion error: {error}"),
+    )
 }
 
 fn query_result_from_batches(
@@ -140,6 +152,8 @@ fn scalar_value_to_lix_value(value: &ScalarValue) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use async_trait::async_trait;
     use serde_json::json;
 
@@ -153,16 +167,16 @@ mod tests {
 
     struct DummyBlobReader;
     struct DummyLiveStateContext;
-    struct BackendBlobReader<'a>(&'a dyn crate::LixBackend);
+    struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
 
     struct DummySqlExecutionContext<'a> {
         blob_reader: &'a dyn BlobDataReader,
-        live_state: &'a dyn LiveStateContext,
+        live_state: Arc<dyn LiveStateContext>,
     }
 
-    impl SqlExecutionContext for DummySqlExecutionContext<'_> {
-        fn live_state(&self) -> &dyn LiveStateContext {
-            self.live_state
+    impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
+        fn live_state(&self) -> Arc<dyn LiveStateContext> {
+            Arc::clone(&self.live_state)
         }
 
         fn blob_reader(&self) -> &dyn BlobDataReader {
@@ -170,13 +184,16 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LiveStateContext for DummyLiveStateContext {
         async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
             Ok(vec![])
         }
 
-        async fn load_exact(&self, _request: &ExactRowRequest) -> Result<Option<LiveRow>, LixError> {
+        async fn load_exact(
+            &self,
+            _request: &ExactRowRequest,
+        ) -> Result<Option<LiveRow>, LixError> {
             Ok(None)
         }
     }
@@ -192,25 +209,27 @@ mod tests {
     }
 
     #[async_trait(?Send)]
-    impl BlobDataReader for BackendBlobReader<'_> {
+    impl BlobDataReader for BackendBlobReader {
         async fn load_blob_data_by_hash(
             &self,
             blob_hash: &str,
         ) -> Result<Option<Vec<u8>>, LixError> {
-            self.0.load_blob_data_by_hash(blob_hash).await
+            crate::binary_cas::load_blob_data_by_hash(self.0.as_ref(), blob_hash).await
         }
     }
 
     #[tokio::test]
     async fn sql_execution_context_exposes_live_state_and_blob_reader() {
         let blob_reader = DummyBlobReader;
-        let live_state = DummyLiveStateContext;
+        let live_state = Arc::new(DummyLiveStateContext);
         let ctx = DummySqlExecutionContext {
             blob_reader: &blob_reader,
-            live_state: &live_state,
+            live_state: Arc::clone(&live_state) as Arc<dyn LiveStateContext>,
         };
 
-        assert!(std::ptr::eq(ctx.live_state(), &live_state as &dyn LiveStateContext));
+        let actual = ctx.live_state();
+        let expected = live_state as Arc<dyn LiveStateContext>;
+        assert!(Arc::ptr_eq(&actual, &expected));
         assert!(std::ptr::eq(
             ctx.blob_reader(),
             &blob_reader as &dyn BlobDataReader,
@@ -220,10 +239,10 @@ mod tests {
     #[tokio::test]
     async fn execute_sql_uses_execution_context_boundary() {
         let blob_reader = DummyBlobReader;
-        let live_state = DummyLiveStateContext;
+        let live_state = Arc::new(DummyLiveStateContext);
         let ctx = DummySqlExecutionContext {
             blob_reader: &blob_reader,
-            live_state: &live_state,
+            live_state,
         };
 
         let result = execute_sql(&ctx, "SELECT 1", &[])
@@ -233,17 +252,17 @@ mod tests {
     }
 
     struct BackendSqlExecutionContext<'a> {
-        blob_reader: BackendBlobReader<'a>,
-        live_state: CommittedLiveStateContext<'a>,
+        blob_reader: &'a dyn BlobDataReader,
+        live_state: Arc<dyn LiveStateContext>,
     }
 
     impl SqlExecutionContext for BackendSqlExecutionContext<'_> {
-        fn live_state(&self) -> &dyn LiveStateContext {
-            &self.live_state
+        fn live_state(&self) -> Arc<dyn LiveStateContext> {
+            Arc::clone(&self.live_state)
         }
 
         fn blob_reader(&self) -> &dyn BlobDataReader {
-            &self.blob_reader
+            self.blob_reader
         }
     }
 
@@ -324,10 +343,12 @@ mod tests {
                 let (backend, _session) = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend_ref: &dyn crate::LixBackend = &backend;
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
                 let ctx = BackendSqlExecutionContext {
-                    blob_reader: BackendBlobReader(backend_ref),
-                    live_state: CommittedLiveStateContext::new(backend_ref),
+                    blob_reader: &blob_reader,
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                 };
 
                 let result = execute_sql(
@@ -366,10 +387,12 @@ mod tests {
                 let (backend, _session) = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
-                let backend_ref: &dyn crate::LixBackend = &backend;
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
                 let ctx = BackendSqlExecutionContext {
-                    blob_reader: BackendBlobReader(backend_ref),
-                    live_state: CommittedLiveStateContext::new(backend_ref),
+                    blob_reader: &blob_reader,
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                 };
 
                 let result = execute_sql(

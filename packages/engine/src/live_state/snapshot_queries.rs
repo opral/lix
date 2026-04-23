@@ -25,8 +25,8 @@ pub(crate) trait LiveRowShapeContract {
     ) -> Result<Option<JsonValue>, LixError>;
 }
 
-#[async_trait(?Send)]
-pub(crate) trait LiveStateQueryBackend {
+#[async_trait]
+pub(crate) trait LiveStateQueryBackend: Send + Sync {
     async fn load_live_read_shape_for_table_name(
         &self,
         table_name: &str,
