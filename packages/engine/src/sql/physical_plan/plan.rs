@@ -21,6 +21,7 @@ pub(crate) enum PhysicalPlan {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum PublicReadPhysicalPlan {
+    Sql2,
     LoweredSql(LoweredReadBatch),
     ReadTimeProjection(ReadTimeProjectionPlan),
     HistoryRead(HistoryReadPlan),

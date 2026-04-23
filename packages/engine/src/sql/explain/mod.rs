@@ -1066,6 +1066,7 @@ pub(crate) enum ExplainHistoryReadPlan {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", content = "details", rename_all = "snake_case")]
 pub(crate) enum ExplainPublicReadExecution {
+    Sql2,
     LoweredSql(Box<LoweredReadBatchSnapshot>),
     ReadTimeProjection(Box<ExplainReadTimeProjectionPlanSnapshot>),
     HistoryRead(Box<ExplainHistoryReadPlan>),
@@ -1940,6 +1941,9 @@ fn render_logical_plan_text(plan: &ExplainLogicalPlanSnapshot) -> String {
 fn render_physical_plan_text(plan: &ExplainPhysicalPlanSnapshot) -> String {
     match plan {
         ExplainPhysicalPlanSnapshot::PublicRead(execution) => match execution.as_ref() {
+            ExplainPublicReadExecution::Sql2 => {
+                "kind: public_read\nexecution: sql2".to_string()
+            }
             ExplainPublicReadExecution::LoweredSql(batch) => format!(
                 "kind: public_read\nexecution: lowered_sql\nstatements: {}\nresult_columns: {}",
                 batch.statements.len(),
@@ -4640,6 +4644,7 @@ fn public_read_execution_snapshot(
     execution: &PublicReadPhysicalPlan,
 ) -> ExplainPublicReadExecution {
     match execution {
+        PublicReadPhysicalPlan::Sql2 => ExplainPublicReadExecution::Sql2,
         PublicReadPhysicalPlan::LoweredSql(batch) => {
             ExplainPublicReadExecution::LoweredSql(Box::new(lowered_read_batch_snapshot(batch)))
         }

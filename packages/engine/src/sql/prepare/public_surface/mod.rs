@@ -102,6 +102,7 @@ impl PublicReadPlan {
 
     pub(crate) fn lowered_batch(&self) -> Option<&LoweredReadBatch> {
         match &self.execution {
+            PublicReadPhysicalPlan::Sql2 => None,
             PublicReadPhysicalPlan::LoweredSql(lowered) => Some(lowered),
             PublicReadPhysicalPlan::ReadTimeProjection(_) => None,
             PublicReadPhysicalPlan::HistoryRead(_) => None,
@@ -2150,6 +2151,9 @@ mod tests {
             SurfaceReadFreshness::AllowsStaleProjection
         );
         match &admin_read.execution {
+            PublicReadPhysicalPlan::Sql2 => {
+                assert!(admin_read.explain.compiled_artifacts.lowered_sql.is_empty());
+            }
             PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
                 assert_eq!(artifact.surface_name(), "lix_version");
                 assert!(admin_read.explain.compiled_artifacts.lowered_sql.is_empty());
@@ -2184,6 +2188,7 @@ mod tests {
                     .expect("plain lix_version read should prepare");
 
                     match &prepared.execution {
+                        PublicReadPhysicalPlan::Sql2 => {}
                         PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
                             assert_eq!(artifact.surface_name(), "lix_version");
                         }
@@ -2202,6 +2207,7 @@ mod tests {
                     match prepared.explain.physical_plan.as_deref() {
                         Some(ExplainPhysicalPlanSnapshot::PublicRead(execution)) => {
                             match execution.as_ref() {
+                                ExplainPublicReadExecution::Sql2 => {}
                                 ExplainPublicReadExecution::ReadTimeProjection(snapshot) => {
                                     assert_eq!(snapshot.surface_name, "lix_version");
                                 }
@@ -5684,6 +5690,7 @@ mod tests {
 
                     assert_eq!(prepared.resolved_relations(), vec!["lix_version"]);
                     match &prepared.execution {
+                        PublicReadPhysicalPlan::Sql2 => {}
                         PublicReadPhysicalPlan::LoweredSql(_) => {
                             let lowered_sql = prepared
                                 .explain

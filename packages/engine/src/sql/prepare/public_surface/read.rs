@@ -1703,7 +1703,7 @@ async fn try_prepare_public_read_via_specialized_optimization(
     };
 
     let physical_started = Instant::now();
-    let (execution, pushdown_decision) = match plan_choice.kind {
+    let (_legacy_execution, pushdown_decision) = match plan_choice.kind {
         PublicReadPlanKind::HistoryRead => {
             match builtin_catalog_compiler_facade()
                 .history_read_semantics(&structured_read.resolved_relation)
@@ -1831,7 +1831,9 @@ async fn try_prepare_public_read_via_specialized_optimization(
     };
     stage_timings.record(ExplainStage::PhysicalPlanning, physical_started.elapsed());
 
-    let lowered_sql = match &execution {
+    let execution = PublicReadPhysicalPlan::Sql2;
+
+    let lowered_sql = match &_legacy_execution {
         PublicReadPhysicalPlan::LoweredSql(lowered_batch) => {
             let artifact_started = Instant::now();
             let lowered_sql = render_lowered_read_batch_sql(
@@ -1846,11 +1848,13 @@ async fn try_prepare_public_read_via_specialized_optimization(
             );
             lowered_sql
         }
+        PublicReadPhysicalPlan::Sql2 => Vec::new(),
         PublicReadPhysicalPlan::ReadTimeProjection(_) => Vec::new(),
         PublicReadPhysicalPlan::HistoryRead(_) => Vec::new(),
     };
 
-    let optimized_logical_plan = match &execution {
+    let optimized_logical_plan = match &_legacy_execution {
+        PublicReadPhysicalPlan::Sql2 => logical_plan.clone(),
         PublicReadPhysicalPlan::LoweredSql(_) => logical_plan.clone(),
         PublicReadPhysicalPlan::ReadTimeProjection(_) => logical_plan.clone(),
         PublicReadPhysicalPlan::HistoryRead(history_read_plan) => {
