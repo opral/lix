@@ -4,26 +4,16 @@ use crate::sql::diagnostics::{
     build_read_diagnostic_catalog_snapshot, normalize_sql_error_with_read_diagnostic_context,
 };
 use crate::sql::explain::{prepare_analyzed_explain_template, prepare_plain_explain_template};
-use crate::sql::logical_plan::history_reads::{
-    DirectoryHistoryAggregate, DirectoryHistoryField, DirectoryHistoryPredicate,
-    DirectoryHistoryProjection, DirectoryHistoryReadPlan, DirectoryHistorySortKey,
-    FileHistoryAggregate, FileHistoryField, FileHistoryPredicate, FileHistoryProjection,
-    FileHistoryReadPlan, FileHistorySortKey, HistoryReadPlan,
-};
+use crate::sql::logical_plan::history_reads::HistoryReadPlan;
 use crate::sql::physical_plan::{
     LoweredResultColumn, LoweredResultColumns, PublicReadPhysicalPlan,
 };
 use crate::sql::prepare::SqlPreparationMetadataReader;
 use crate::sql::{
-    PreparedBatchReadArtifact, PreparedDirectoryHistoryAggregate, PreparedDirectoryHistoryField,
-    PreparedDirectoryHistoryPredicate, PreparedDirectoryHistoryProjection,
-    PreparedDirectoryHistoryReadPlan, PreparedDirectoryHistorySortKey, PreparedExplainMode,
-    PreparedFileHistoryAggregate, PreparedFileHistoryField, PreparedFileHistoryPredicate,
-    PreparedFileHistoryProjection, PreparedFileHistoryReadPlan, PreparedFileHistorySortKey,
-    PreparedHistoryReadArtifact, PreparedHistoryReadPlan, PreparedPublicRead,
+    PreparedBatchReadArtifact, PreparedExplainMode, PreparedPublicRead,
     PreparedPublicReadPlanArtifact, PreparedReadArtifact, PreparedReadBatch, PreparedReadStatement,
-    PreparedReadTimeProjectionArtifact, PreparedSql2ReadPlanArtifact, PublicReadResultColumn,
-    PublicReadResultColumns, ReadDiagnosticContext,
+    PreparedSql2ReadPlanArtifact, PublicReadResultColumn, PublicReadResultColumns,
+    ReadDiagnosticContext,
 };
 use crate::{LixBackend, LixBackendTransaction, LixError};
 use sqlparser::ast::{visit_relations, ObjectNamePart, Statement};
@@ -239,36 +229,9 @@ pub(crate) fn prepare_public_read_artifact(
         contract.result_columns = result_columns_for_public_read_execution(&public_read.execution);
     }
 
-    let execution = match &public_read.execution {
-        PublicReadPhysicalPlan::ReadTimeProjection(read) => {
-            PreparedPublicReadPlanArtifact::ReadTimeProjection(PreparedReadTimeProjectionArtifact {
-                read: read.clone(),
-            })
-        }
-        PublicReadPhysicalPlan::LoweredSql(_lowered) => {
-            PreparedPublicReadPlanArtifact::Sql2(PreparedSql2ReadPlanArtifact {
-                artifact: crate::sql2::PreparedSql2ReadArtifact {
-                    sql: public_read.source_statement_sql.clone(),
-                    bound_parameters: public_read.bound_parameters.clone(),
-                    active_version_id: public_read.runtime_bindings.active_version_id.clone(),
-                    surface_names: public_read.resolved_relations.clone(),
-                    entity_views: crate::sql2::prepared_entity_view_plans_for_registry(
-                        surface_registry,
-                        &public_read.resolved_relations,
-                    ),
-                    filesystem_views: crate::sql2::prepared_filesystem_view_plans_for_registry(
-                        surface_registry,
-                        &public_read.resolved_relations,
-                    ),
-                },
-            })
-        }
-        PublicReadPhysicalPlan::HistoryRead(plan) => {
-            PreparedPublicReadPlanArtifact::HistoryRead(PreparedHistoryReadArtifact {
-                plan: prepared_history_read_plan(plan),
-            })
-        }
-    };
+    let execution = PreparedPublicReadPlanArtifact::Sql2(PreparedSql2ReadPlanArtifact {
+        artifact: prepared_sql2_read_artifact(public_read, surface_registry),
+    });
 
     Ok(PreparedPublicRead {
         contract,
@@ -279,10 +242,31 @@ pub(crate) fn prepare_public_read_artifact(
     })
 }
 
+fn prepared_sql2_read_artifact(
+    public_read: &PublicReadPlan,
+    surface_registry: &crate::catalog::SurfaceRegistry,
+) -> crate::sql2::PreparedSql2ReadArtifact {
+    crate::sql2::PreparedSql2ReadArtifact {
+        sql: public_read.source_statement_sql.clone(),
+        bound_parameters: public_read.bound_parameters.clone(),
+        active_version_id: public_read.runtime_bindings.active_version_id.clone(),
+        surface_names: public_read.resolved_relations.clone(),
+        entity_views: crate::sql2::prepared_entity_view_plans_for_registry(
+            surface_registry,
+            &public_read.resolved_relations,
+        ),
+        filesystem_views: crate::sql2::prepared_filesystem_view_plans_for_registry(
+            surface_registry,
+            &public_read.resolved_relations,
+        ),
+    }
+}
+
 fn result_columns_for_public_read_execution(
     execution: &PublicReadPhysicalPlan,
 ) -> Option<PublicReadResultColumns> {
     match execution {
+        PublicReadPhysicalPlan::Sql2 => None,
         PublicReadPhysicalPlan::ReadTimeProjection(_) => None,
         PublicReadPhysicalPlan::LoweredSql(lowered) => Some(
             public_read_result_columns_from_lowered(&lowered.result_columns),
@@ -326,245 +310,6 @@ fn public_read_result_column_from_lowered(kind: LoweredResultColumn) -> PublicRe
     match kind {
         LoweredResultColumn::Untyped => PublicReadResultColumn::Untyped,
         LoweredResultColumn::Boolean => PublicReadResultColumn::Boolean,
-    }
-}
-
-fn prepared_history_read_plan(plan: &HistoryReadPlan) -> PreparedHistoryReadPlan {
-    match plan {
-        HistoryReadPlan::FileHistory(plan) => {
-            PreparedHistoryReadPlan::FileHistory(prepared_file_history_read_plan(plan))
-        }
-        HistoryReadPlan::DirectoryHistory(plan) => {
-            PreparedHistoryReadPlan::DirectoryHistory(prepared_directory_history_read_plan(plan))
-        }
-    }
-}
-
-fn prepared_file_history_read_plan(plan: &FileHistoryReadPlan) -> PreparedFileHistoryReadPlan {
-    PreparedFileHistoryReadPlan {
-        request: plan.request.clone(),
-        predicates: plan
-            .predicates
-            .iter()
-            .cloned()
-            .map(prepared_file_history_predicate)
-            .collect(),
-        projections: plan
-            .projections
-            .iter()
-            .cloned()
-            .map(prepared_file_history_projection)
-            .collect(),
-        wildcard_projection: plan.wildcard_projection,
-        wildcard_columns: plan.wildcard_columns.clone(),
-        sort_keys: plan
-            .sort_keys
-            .iter()
-            .cloned()
-            .map(prepared_file_history_sort_key)
-            .collect(),
-        limit: plan.limit,
-        offset: plan.offset,
-        aggregate: plan.aggregate.clone().map(prepared_file_history_aggregate),
-        aggregate_output_name: plan.aggregate_output_name.clone(),
-    }
-}
-
-fn prepared_directory_history_read_plan(
-    plan: &DirectoryHistoryReadPlan,
-) -> PreparedDirectoryHistoryReadPlan {
-    PreparedDirectoryHistoryReadPlan {
-        request: plan.request.clone(),
-        predicates: plan
-            .predicates
-            .iter()
-            .cloned()
-            .map(prepared_directory_history_predicate)
-            .collect(),
-        projections: plan
-            .projections
-            .iter()
-            .cloned()
-            .map(prepared_directory_history_projection)
-            .collect(),
-        wildcard_projection: plan.wildcard_projection,
-        wildcard_columns: plan.wildcard_columns.clone(),
-        sort_keys: plan
-            .sort_keys
-            .iter()
-            .cloned()
-            .map(prepared_directory_history_sort_key)
-            .collect(),
-        limit: plan.limit,
-        offset: plan.offset,
-        aggregate: plan
-            .aggregate
-            .clone()
-            .map(prepared_directory_history_aggregate),
-        aggregate_output_name: plan.aggregate_output_name.clone(),
-    }
-}
-
-fn prepared_file_history_field(field: FileHistoryField) -> PreparedFileHistoryField {
-    match field {
-        FileHistoryField::Id => PreparedFileHistoryField::Id,
-        FileHistoryField::Path => PreparedFileHistoryField::Path,
-        FileHistoryField::Data => PreparedFileHistoryField::Data,
-        FileHistoryField::Hidden => PreparedFileHistoryField::Hidden,
-        FileHistoryField::EntityId => PreparedFileHistoryField::EntityId,
-        FileHistoryField::SchemaKey => PreparedFileHistoryField::SchemaKey,
-        FileHistoryField::FileId => PreparedFileHistoryField::FileId,
-        FileHistoryField::VersionId => PreparedFileHistoryField::VersionId,
-        FileHistoryField::PluginKey => PreparedFileHistoryField::PluginKey,
-        FileHistoryField::SchemaVersion => PreparedFileHistoryField::SchemaVersion,
-        FileHistoryField::ChangeId => PreparedFileHistoryField::ChangeId,
-        FileHistoryField::LixcolMetadata => PreparedFileHistoryField::LixcolMetadata,
-        FileHistoryField::CommitId => PreparedFileHistoryField::CommitId,
-        FileHistoryField::CommitCreatedAt => PreparedFileHistoryField::CommitCreatedAt,
-        FileHistoryField::RootCommitId => PreparedFileHistoryField::RootCommitId,
-        FileHistoryField::Depth => PreparedFileHistoryField::Depth,
-    }
-}
-
-fn prepared_file_history_projection(
-    projection: FileHistoryProjection,
-) -> PreparedFileHistoryProjection {
-    PreparedFileHistoryProjection {
-        output_name: projection.output_name,
-        field: prepared_file_history_field(projection.field),
-    }
-}
-
-fn prepared_file_history_sort_key(key: FileHistorySortKey) -> PreparedFileHistorySortKey {
-    PreparedFileHistorySortKey {
-        output_name: key.output_name,
-        field: key.field.map(prepared_file_history_field),
-        descending: key.descending,
-    }
-}
-
-fn prepared_file_history_predicate(
-    predicate: FileHistoryPredicate,
-) -> PreparedFileHistoryPredicate {
-    match predicate {
-        FileHistoryPredicate::Eq(field, value) => {
-            PreparedFileHistoryPredicate::Eq(prepared_file_history_field(field), value)
-        }
-        FileHistoryPredicate::NotEq(field, value) => {
-            PreparedFileHistoryPredicate::NotEq(prepared_file_history_field(field), value)
-        }
-        FileHistoryPredicate::Gt(field, value) => {
-            PreparedFileHistoryPredicate::Gt(prepared_file_history_field(field), value)
-        }
-        FileHistoryPredicate::GtEq(field, value) => {
-            PreparedFileHistoryPredicate::GtEq(prepared_file_history_field(field), value)
-        }
-        FileHistoryPredicate::Lt(field, value) => {
-            PreparedFileHistoryPredicate::Lt(prepared_file_history_field(field), value)
-        }
-        FileHistoryPredicate::LtEq(field, value) => {
-            PreparedFileHistoryPredicate::LtEq(prepared_file_history_field(field), value)
-        }
-        FileHistoryPredicate::In(field, values) => {
-            PreparedFileHistoryPredicate::In(prepared_file_history_field(field), values)
-        }
-        FileHistoryPredicate::IsNull(field) => {
-            PreparedFileHistoryPredicate::IsNull(prepared_file_history_field(field))
-        }
-        FileHistoryPredicate::IsNotNull(field) => {
-            PreparedFileHistoryPredicate::IsNotNull(prepared_file_history_field(field))
-        }
-    }
-}
-
-fn prepared_file_history_aggregate(
-    aggregate: FileHistoryAggregate,
-) -> PreparedFileHistoryAggregate {
-    match aggregate {
-        FileHistoryAggregate::Count => PreparedFileHistoryAggregate::Count,
-    }
-}
-
-fn prepared_directory_history_field(field: DirectoryHistoryField) -> PreparedDirectoryHistoryField {
-    match field {
-        DirectoryHistoryField::Id => PreparedDirectoryHistoryField::Id,
-        DirectoryHistoryField::ParentId => PreparedDirectoryHistoryField::ParentId,
-        DirectoryHistoryField::Name => PreparedDirectoryHistoryField::Name,
-        DirectoryHistoryField::Path => PreparedDirectoryHistoryField::Path,
-        DirectoryHistoryField::Hidden => PreparedDirectoryHistoryField::Hidden,
-        DirectoryHistoryField::EntityId => PreparedDirectoryHistoryField::EntityId,
-        DirectoryHistoryField::SchemaKey => PreparedDirectoryHistoryField::SchemaKey,
-        DirectoryHistoryField::FileId => PreparedDirectoryHistoryField::FileId,
-        DirectoryHistoryField::VersionId => PreparedDirectoryHistoryField::VersionId,
-        DirectoryHistoryField::PluginKey => PreparedDirectoryHistoryField::PluginKey,
-        DirectoryHistoryField::SchemaVersion => PreparedDirectoryHistoryField::SchemaVersion,
-        DirectoryHistoryField::ChangeId => PreparedDirectoryHistoryField::ChangeId,
-        DirectoryHistoryField::LixcolMetadata => PreparedDirectoryHistoryField::LixcolMetadata,
-        DirectoryHistoryField::CommitId => PreparedDirectoryHistoryField::CommitId,
-        DirectoryHistoryField::CommitCreatedAt => PreparedDirectoryHistoryField::CommitCreatedAt,
-        DirectoryHistoryField::RootCommitId => PreparedDirectoryHistoryField::RootCommitId,
-        DirectoryHistoryField::Depth => PreparedDirectoryHistoryField::Depth,
-    }
-}
-
-fn prepared_directory_history_projection(
-    projection: DirectoryHistoryProjection,
-) -> PreparedDirectoryHistoryProjection {
-    PreparedDirectoryHistoryProjection {
-        output_name: projection.output_name,
-        field: prepared_directory_history_field(projection.field),
-    }
-}
-
-fn prepared_directory_history_sort_key(
-    key: DirectoryHistorySortKey,
-) -> PreparedDirectoryHistorySortKey {
-    PreparedDirectoryHistorySortKey {
-        output_name: key.output_name,
-        field: key.field.map(prepared_directory_history_field),
-        descending: key.descending,
-    }
-}
-
-fn prepared_directory_history_predicate(
-    predicate: DirectoryHistoryPredicate,
-) -> PreparedDirectoryHistoryPredicate {
-    match predicate {
-        DirectoryHistoryPredicate::Eq(field, value) => {
-            PreparedDirectoryHistoryPredicate::Eq(prepared_directory_history_field(field), value)
-        }
-        DirectoryHistoryPredicate::NotEq(field, value) => {
-            PreparedDirectoryHistoryPredicate::NotEq(prepared_directory_history_field(field), value)
-        }
-        DirectoryHistoryPredicate::Gt(field, value) => {
-            PreparedDirectoryHistoryPredicate::Gt(prepared_directory_history_field(field), value)
-        }
-        DirectoryHistoryPredicate::GtEq(field, value) => {
-            PreparedDirectoryHistoryPredicate::GtEq(prepared_directory_history_field(field), value)
-        }
-        DirectoryHistoryPredicate::Lt(field, value) => {
-            PreparedDirectoryHistoryPredicate::Lt(prepared_directory_history_field(field), value)
-        }
-        DirectoryHistoryPredicate::LtEq(field, value) => {
-            PreparedDirectoryHistoryPredicate::LtEq(prepared_directory_history_field(field), value)
-        }
-        DirectoryHistoryPredicate::In(field, values) => {
-            PreparedDirectoryHistoryPredicate::In(prepared_directory_history_field(field), values)
-        }
-        DirectoryHistoryPredicate::IsNull(field) => {
-            PreparedDirectoryHistoryPredicate::IsNull(prepared_directory_history_field(field))
-        }
-        DirectoryHistoryPredicate::IsNotNull(field) => {
-            PreparedDirectoryHistoryPredicate::IsNotNull(prepared_directory_history_field(field))
-        }
-    }
-}
-
-fn prepared_directory_history_aggregate(
-    aggregate: DirectoryHistoryAggregate,
-) -> PreparedDirectoryHistoryAggregate {
-    match aggregate {
-        DirectoryHistoryAggregate::Count => PreparedDirectoryHistoryAggregate::Count,
     }
 }
 

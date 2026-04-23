@@ -1344,7 +1344,6 @@ fn candidate_column_key(candidate: &str) -> String {
         "lixcol_schema_version" => "schema_version",
         "lixcol_global" => "global",
         "lixcol_untracked" => "untracked",
-        "lixcol_metadata" => "metadata",
         other => other,
     }
     .to_string()
