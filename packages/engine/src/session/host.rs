@@ -32,8 +32,6 @@ pub(crate) trait SessionHost: Send + Sync {
 
     fn install_public_surface_registry(&self, registry: SurfaceRegistry);
 
-    async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError>;
-
     async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError>;
 
     fn catalog_projection_registry(&self) -> &CatalogProjectionRegistry;

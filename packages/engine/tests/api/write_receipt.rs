@@ -9,8 +9,10 @@ fn insert_key_value_sql(key: &str, value: &str) -> String {
 
 fn first_text(rows: &lix_engine::QueryResult) -> String {
     match &rows.rows[0][0] {
-        Value::Text(value) => value.clone(),
-        Value::Json(JsonValue::String(value)) => value.clone(),
+        Value::Text(value) => serde_json::from_str::<JsonValue>(value)
+            .ok()
+            .and_then(|json| json.as_str().map(str::to_string))
+            .unwrap_or_else(|| value.clone()),
         other => panic!("expected first query cell to be text, got {other:?}"),
     }
 }

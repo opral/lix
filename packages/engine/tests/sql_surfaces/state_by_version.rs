@@ -37,25 +37,19 @@ fn normalize_bool_like_rows(rows: &[Vec<Value>], columns: &[usize]) -> Vec<Vec<V
 }
 
 async fn register_test_schema(engine: &support::simulation_test::SimulatedLix) {
-    register_registered_schema_snapshot(
-        engine,
-        "{\"value\":{\"x-lix-key\":\"test_state_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"value\":{\"type\":\"string\"}},\"required\":[\"value\"],\"additionalProperties\":false}}",
-    )
-    .await;
-}
-
-async fn register_registered_schema_snapshot(
-    engine: &support::simulation_test::SimulatedLix,
-    snapshot_content: &str,
-) {
-    let value = serde_json::from_str::<serde_json::Value>(snapshot_content)
-        .expect("registered schema snapshot must be valid JSON")
-        .get("value")
-        .cloned()
-        .expect("registered schema snapshot must contain value");
+    let value = serde_json::json!({
+        "x-lix-key": "test_state_schema",
+        "x-lix-version": "1",
+        "type": "object",
+        "properties": {
+            "value": { "type": "string" }
+        },
+        "required": ["value"],
+        "additionalProperties": false
+    });
     engine
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), true)",
             &[Value::Text(value.to_string())],
         )
         .await

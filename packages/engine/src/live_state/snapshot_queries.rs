@@ -43,6 +43,7 @@ pub(crate) trait LiveStateQueryBackend {
     async fn normalize_live_snapshot_values(
         &self,
         schema_key: &str,
+        version_id: &str,
         snapshot_content: Option<&str>,
     ) -> Result<BTreeMap<String, Value>, LixError>;
 }
@@ -111,11 +112,12 @@ impl LiveRowShapeContract for LiveRowShapeAdapter {
     }
 }
 
-pub(crate) async fn load_live_read_shape_with_backend(
+pub(crate) async fn load_live_read_shape_for_version_with_backend(
     backend: LiveStateBackendRef<'_>,
     schema_key: &str,
+    version_id: &str,
 ) -> Result<LiveRowShapeAdapter, LixError> {
-    schema_access::load_live_row_shape_with_backend(backend, schema_key)
+    schema_access::load_live_row_shape_for_version_with_backend(backend, schema_key, version_id)
         .await
         .map(|shape| LiveRowShapeAdapter { contract: shape })
 }
@@ -129,12 +131,13 @@ pub(crate) async fn load_live_read_shape_for_table_name(
         .map(|shape| shape.map(|shape| LiveRowShapeAdapter { contract: shape }))
 }
 
-pub(crate) async fn normalize_live_snapshot_values_with_backend(
+pub(crate) async fn normalize_live_snapshot_values_for_version_with_backend(
     backend: LiveStateBackendRef<'_>,
     schema_key: &str,
+    version_id: &str,
     snapshot_content: Option<&str>,
 ) -> Result<BTreeMap<String, Value>, LixError> {
-    load_live_read_shape_with_backend(backend, schema_key)
+    load_live_read_shape_for_version_with_backend(backend, schema_key, version_id)
         .await?
         .normalized_values(snapshot_content)
 }
@@ -150,7 +153,7 @@ pub(crate) async fn load_live_snapshot_rows_with_backend(
         return Ok(Vec::new());
     }
 
-    let shape = load_live_read_shape_with_backend(backend, schema_key).await?;
+    let shape = load_live_read_shape_for_version_with_backend(backend, schema_key, version_id).await?;
     let required_columns = shape.property_names();
     let constraints = filters
         .iter()

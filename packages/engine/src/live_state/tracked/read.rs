@@ -4,8 +4,8 @@ use crate::live_state::batch_row_constraints;
 use crate::live_state::exact_row_constraints;
 use crate::live_state::schema_access::live_storage_relation_exists_with_executor;
 use crate::live_state::storage::{
-    load_live_row_access_with_executor, required_bool_cell, required_text_cell, selected_columns,
-    selected_projection_sql, text_from_value, ScanSqlRequest,
+    load_live_row_access_for_version_with_executor, required_bool_cell, required_text_cell,
+    selected_columns, selected_projection_sql, text_from_value, ScanSqlRequest,
 };
 use crate::live_state::store::{LiveStateBackendRef, LiveStateExecutorRef};
 use crate::{LixError, Value};
@@ -15,6 +15,12 @@ use super::contracts::BatchTrackedRowRequest;
 use super::contracts::{
     ExactTrackedRowRequest, TrackedRow, TrackedScanRequest, TrackedTombstoneMarker,
 };
+
+fn is_schema_not_stored_error(error: &LixError, schema_key: &str) -> bool {
+    error
+        .description
+        .starts_with(&format!("schema '{}' is not stored", schema_key))
+}
 
 pub async fn load_exact_row_with_backend(
     backend: LiveStateBackendRef<'_>,
@@ -161,7 +167,19 @@ async fn scan_rows_with_limit_and_order(
         return Ok(Vec::new());
     }
 
-    let access = load_live_row_access_with_executor(executor, &request.schema_key).await?;
+    let access = match load_live_row_access_for_version_with_executor(
+        executor,
+        &request.schema_key,
+        &request.version_id,
+    )
+    .await
+    {
+        Ok(access) => access,
+        Err(error) if is_schema_not_stored_error(&error, &request.schema_key) => {
+            return Ok(Vec::new())
+        }
+        Err(error) => return Err(error),
+    };
     scan_rows_with_limit_order_and_access(executor, request, &access, limit, order_by).await
 }
 
