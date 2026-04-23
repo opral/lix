@@ -25,13 +25,19 @@ const REGISTERED_SCHEMA_KEY: &str = "lix_registered_schema";
 struct PendingOverlayReadModel<'a> {
     base: &'a dyn LixBackend,
     pending_overlay: Option<&'a dyn PendingOverlay>,
+    requested_version_id: Option<&'a str>,
 }
 
 impl<'a> PendingOverlayReadModel<'a> {
-    fn new(base: &'a dyn LixBackend, pending_overlay: Option<&'a dyn PendingOverlay>) -> Self {
+    fn new(
+        base: &'a dyn LixBackend,
+        pending_overlay: Option<&'a dyn PendingOverlay>,
+        requested_version_id: Option<&'a str>,
+    ) -> Self {
         Self {
             base,
             pending_overlay,
+            requested_version_id,
         }
     }
 
@@ -44,8 +50,11 @@ impl<'a> PendingOverlayReadModel<'a> {
         &self,
     ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
         if !self.has_pending_visibility() {
-            return crate::catalog::load_public_surface_registry_with_backend(self.base, None)
-                .await;
+            return crate::catalog::load_public_surface_registry_with_backend(
+                self.base,
+                self.requested_version_id,
+            )
+            .await;
         }
 
         let mut registry = crate::catalog::build_builtin_surface_registry();
@@ -89,8 +98,14 @@ impl<'a> PendingOverlayReadModel<'a> {
     }
 
     async fn visible_registered_schema_rows(&self) -> Result<BTreeMap<String, String>, LixError> {
-        let mut rows =
-            crate::live_state::load_visible_registered_schema_snapshot_contents(self.base).await?;
+        let requested_version_id = self
+            .requested_version_id
+            .unwrap_or(crate::version::GLOBAL_VERSION_ID);
+        let mut rows = crate::live_state::load_visible_registered_schema_snapshot_contents(
+            self.base,
+            requested_version_id,
+        )
+        .await?;
 
         if let Some(pending_overlay) = self.pending_overlay {
             for (entity_id, snapshot_content) in pending_overlay.visible_registered_schema_entries()
@@ -107,7 +122,8 @@ impl<'a> PendingOverlayReadModel<'a> {
 
             for untracked in [false, true] {
                 for row in pending_overlay.visible_semantic_rows(untracked, REGISTERED_SCHEMA_KEY) {
-                    if row.version_id != GLOBAL_VERSION_ID {
+                    if row.version_id != GLOBAL_VERSION_ID && row.version_id != requested_version_id
+                    {
                         continue;
                     }
                     match row.snapshot_content.as_ref().filter(|_| !row.tombstone) {
@@ -339,8 +355,9 @@ impl<'a> PendingOverlayReadModel<'a> {
 pub(crate) async fn build_public_read_surface_registry_with_pending_overlay(
     base: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
+    requested_version_id: Option<&str>,
 ) -> Result<crate::catalog::SurfaceRegistry, LixError> {
-    PendingOverlayReadModel::new(base, pending_overlay)
+    PendingOverlayReadModel::new(base, pending_overlay, requested_version_id)
         .build_public_read_surface_registry()
         .await
 }
@@ -350,7 +367,7 @@ pub(crate) async fn execute_pending_overlay_public_read(
     pending_overlay: Option<&dyn PendingOverlay>,
     public_read: &PreparedPublicRead,
 ) -> Result<QueryResult, LixError> {
-    PendingOverlayReadModel::new(base, pending_overlay)
+    PendingOverlayReadModel::new(base, pending_overlay, None)
         .execute_pending_overlay_public_read(public_read)
         .await
 }
@@ -363,7 +380,7 @@ pub(crate) async fn execute_pending_overlay_public_read_in_transaction(
     match public_read.contract.source() {
         PublicReadSource::PendingOverlay => {
             let backend = crate::backend::transaction_backend_view(transaction);
-            PendingOverlayReadModel::new(&backend, pending_overlay)
+            PendingOverlayReadModel::new(&backend, pending_overlay, None)
                 .execute_pending_overlay_public_read(public_read)
                 .await
         }

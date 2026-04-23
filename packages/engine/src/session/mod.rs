@@ -482,7 +482,12 @@ impl Session {
     }
 
     pub(crate) async fn refresh_public_surface_registry(&self) -> Result<(), LixError> {
-        let registry = self.session_host.load_public_surface_registry().await?;
+        let active_version_id = self.active_version_id();
+        let registry = crate::catalog::load_public_surface_registry_with_backend(
+            self.session_host.backend().as_ref(),
+            Some(active_version_id.as_str()),
+        )
+        .await?;
         self.install_public_surface_registry(registry);
         Ok(())
     }

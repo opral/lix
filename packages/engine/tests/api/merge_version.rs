@@ -7,8 +7,10 @@ use serde_json::Value as JsonValue;
 
 fn value_as_text(value: &Value) -> String {
     match value {
-        Value::Text(value) => value.clone(),
-        Value::Json(JsonValue::String(value)) => value.clone(),
+        Value::Text(value) => serde_json::from_str::<JsonValue>(value)
+            .ok()
+            .and_then(|json| json.as_str().map(str::to_string))
+            .unwrap_or_else(|| value.clone()),
         Value::Integer(value) => value.to_string(),
         other => panic!("expected text-like value, got {other:?}"),
     }

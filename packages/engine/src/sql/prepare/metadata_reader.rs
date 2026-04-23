@@ -298,7 +298,12 @@ async fn load_latest_registered_schema_entry_with_backend(
             &LiveRowQuery {
                 schema_key: "lix_registered_schema".to_string(),
                 version_id,
-                source: LiveRowSource::Effective,
+                // Registered-schema preparation must follow the same committed
+                // visibility source as registry rebuilds and validation.
+                // Using `Effective` here can disagree with those paths and
+                // leave preparation thinking a schema is missing even though
+                // the committed registry already exposed it.
+                source: LiveRowSource::Tracked,
                 constraints: Vec::new(),
                 include_tombstones: false,
             },

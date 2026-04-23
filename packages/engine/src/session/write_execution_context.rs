@@ -14,9 +14,9 @@ use crate::session::host::{
 use crate::session::public_read_execution::ProjectionReadExecutionHost;
 use crate::session::version_ops::commit::{
     append_tracked_with_pending_public_session, BufferedTrackedAppendArgs,
-    CreateCommitAppliedOutput, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
-    CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
-    CreateCommitPreconditions, CreateCommitWriteLane, StagedChange,
+    CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind, CreateCommitExpectedHead,
+    CreateCommitIdempotencyKey, CreateCommitInvariantChecker, CreateCommitPreconditions,
+    CreateCommitWriteLane, StagedChange,
 };
 use crate::sql::{
     ChangeBatch, CommitPreconditions, ExpectedHead, PreparedPublicRead, PublicChange,
@@ -294,11 +294,8 @@ pub(crate) async fn execute_public_commit_write(
         .await?;
     }
 
-    if let Some(applied_output) = append_outcome.applied_output.as_ref() {
-        mirror_public_registered_schema_bootstrap_rows(transaction, applied_output).await?;
-    }
-
     let applied_changes = public_changes_from_staged(&append_outcome.applied_changes);
+    mirror_public_registered_schema_bootstrap_rows(transaction, &applied_changes).await?;
     let plugin_changes_committed =
         matches!(append_outcome.disposition, CreateCommitDisposition::Applied);
 
@@ -350,9 +347,9 @@ pub(crate) async fn execute_public_commit_write(
 
 async fn mirror_public_registered_schema_bootstrap_rows(
     transaction: &mut dyn LixBackendTransaction,
-    applied_output: &CreateCommitAppliedOutput,
+    applied_changes: &[PublicChange],
 ) -> Result<(), LixError> {
-    for row in &applied_output.canonical_changes {
+    for row in applied_changes {
         if row.schema_key != "lix_registered_schema" {
             continue;
         }
@@ -361,15 +358,15 @@ async fn mirror_public_registered_schema_bootstrap_rows(
             transaction,
             RegisteredSchemaMirrorRow {
                 entity_id: &row.entity_id,
-                schema_version: &row.schema_version,
+                schema_version: row.schema_version.as_deref().unwrap_or("1"),
                 file_id: row.file_id.as_ref().map(|value| value.as_str()),
-                version_id: GLOBAL_VERSION_ID,
+                version_id: &row.version_id,
                 plugin_key: row.plugin_key.as_ref().map(|value| value.as_str()),
                 snapshot_content: row.snapshot_content.as_ref().map(|value| value.as_str()),
                 metadata: row.metadata.as_ref().map(|value| value.as_str()),
-                change_id: &row.id,
+                change_id: "public-write~registered-schema-bootstrap",
                 untracked: false,
-                created_at: &row.created_at,
+                created_at: "1970-01-01T00:00:00Z",
             },
         )
         .await?;

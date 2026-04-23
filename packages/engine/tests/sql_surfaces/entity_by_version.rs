@@ -10,7 +10,11 @@ fn assert_text(value: &Value, expected: &str) {
 
 fn assert_json_string(value: &Value, expected: &str) {
     match value {
-        Value::Json(JsonValue::String(actual)) => assert_eq!(actual, expected),
+        Value::Text(actual) => {
+            let parsed: JsonValue =
+                serde_json::from_str(actual).expect("JSON text result should parse");
+            assert_eq!(parsed, JsonValue::String(expected.to_string()));
+        }
         other => panic!("expected json string value '{expected}', got {other:?}"),
     }
 }

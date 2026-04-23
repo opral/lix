@@ -198,7 +198,11 @@ async fn exact_effective_state_row_from_pending(
         row.version_id.clone()
     };
     let mut values = backend
-        .normalize_live_snapshot_values(&row.schema_key, row.snapshot_content.as_deref())
+        .normalize_live_snapshot_values(
+            &row.schema_key,
+            &projected_version_id,
+            row.snapshot_content.as_deref(),
+        )
         .await?;
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(
@@ -269,7 +273,11 @@ async fn exact_effective_state_row_from_live_row(
         row.version_id.clone()
     };
     let mut values = backend
-        .normalize_live_snapshot_values(&row.schema_key, row.snapshot_content.as_deref())
+        .normalize_live_snapshot_values(
+            &row.schema_key,
+            &projected_version_id,
+            row.snapshot_content.as_deref(),
+        )
         .await?;
     values.insert("entity_id".to_string(), Value::Text(row.entity_id.clone()));
     values.insert(

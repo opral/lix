@@ -20,8 +20,8 @@ pub(crate) async fn load_public_surface_registry_with_backend(
     requested_version_id: Option<&str>,
 ) -> Result<SurfaceRegistry, LixError> {
     let mut registry = build_builtin_surface_registry();
-    let visible_version_ids =
-        visible_registered_schema_version_ids(backend, requested_version_id).await?;
+    let visible_version_ids = visible_registered_schema_version_ids(backend, requested_version_id)
+        .await?;
     for (_, schema) in load_latest_registered_schemas(backend, &visible_version_ids).await? {
         let spec = dynamic_entity_surface_spec_from_schema(&schema)?;
         register_dynamic_entity_surface_spec(&mut registry, spec);

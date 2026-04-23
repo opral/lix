@@ -259,9 +259,12 @@ async fn scan_selector_lane(
             continue;
         }
 
+        let projected_version_id =
+            selector_projected_version_id(requested_version_id, lane, &pending.version_id);
         let values = LiveStateQueryBackend::normalize_live_snapshot_values(
             backend,
             &pending.schema_key,
+            &projected_version_id,
             pending.snapshot_content.as_deref(),
         )
         .await?;
@@ -270,11 +273,7 @@ async fn scan_selector_lane(
             schema_key: pending.schema_key,
             schema_version: pending.schema_version,
             file_id: pending.file_id,
-            version_id: selector_projected_version_id(
-                requested_version_id,
-                lane,
-                &pending.version_id,
-            ),
+            version_id: projected_version_id,
             global: lane.is_global() || pending.version_id == GLOBAL_VERSION_ID,
             untracked: lane.is_untracked(),
             plugin_key: pending.plugin_key,
@@ -308,9 +307,11 @@ async fn candidate_row_from_live_row(
         ..
     } = row;
     let snapshot_content = snapshot_content.or(row_snapshot_content);
+    let projected_version_id = selector_projected_version_id(requested_version_id, lane, &version_id);
     let values = LiveStateQueryBackend::normalize_live_snapshot_values(
         backend,
         &schema_key,
+        &projected_version_id,
         snapshot_content.as_deref(),
     )
     .await?;
@@ -320,7 +321,7 @@ async fn candidate_row_from_live_row(
         schema_key,
         schema_version,
         file_id,
-        version_id: selector_projected_version_id(requested_version_id, lane, &version_id),
+        version_id: projected_version_id,
         global: lane.is_global() || global,
         untracked: lane.is_untracked(),
         plugin_key,

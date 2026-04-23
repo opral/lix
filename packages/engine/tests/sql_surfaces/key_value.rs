@@ -226,7 +226,7 @@ simulation_test!(
         sim.assert_deterministic(updated.statements[0].rows.clone());
         assert_eq!(
             updated.statements[0].rows,
-            vec![vec![Value::Json(json!("after"))]]
+            vec![vec![Value::Text("\"after\"".to_string())]]
         );
     }
 );
