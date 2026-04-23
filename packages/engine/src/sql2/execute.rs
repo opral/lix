@@ -19,6 +19,7 @@ use super::lix_state_provider::register_lix_state_providers;
 /// actually needs it.
 #[allow(dead_code)]
 pub(crate) trait SqlExecutionContext {
+    fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateContext>;
     fn blob_reader(&self) -> &dyn BlobDataReader;
 }
@@ -36,7 +37,7 @@ pub(crate) async fn execute_sql(
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
     let session = SessionContext::new();
-    register_lix_state_providers(&session, ctx.live_state()).await?;
+    register_lix_state_providers(&session, ctx.active_version_id(), ctx.live_state()).await?;
 
     let mut dataframe = session
         .sql(sql)
@@ -170,11 +171,16 @@ mod tests {
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
 
     struct DummySqlExecutionContext<'a> {
+        active_version_id: &'a str,
         blob_reader: &'a dyn BlobDataReader,
         live_state: Arc<dyn LiveStateContext>,
     }
 
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
+        fn active_version_id(&self) -> &str {
+            self.active_version_id
+        }
+
         fn live_state(&self) -> Arc<dyn LiveStateContext> {
             Arc::clone(&self.live_state)
         }
@@ -223,12 +229,14 @@ mod tests {
         let blob_reader = DummyBlobReader;
         let live_state = Arc::new(DummyLiveStateContext);
         let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
             blob_reader: &blob_reader,
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateContext>,
         };
 
         let actual = ctx.live_state();
         let expected = live_state as Arc<dyn LiveStateContext>;
+        assert_eq!(ctx.active_version_id(), "version-a");
         assert!(Arc::ptr_eq(&actual, &expected));
         assert!(std::ptr::eq(
             ctx.blob_reader(),
@@ -241,6 +249,7 @@ mod tests {
         let blob_reader = DummyBlobReader;
         let live_state = Arc::new(DummyLiveStateContext);
         let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
             blob_reader: &blob_reader,
             live_state,
         };
@@ -252,11 +261,16 @@ mod tests {
     }
 
     struct BackendSqlExecutionContext<'a> {
+        active_version_id: &'a str,
         blob_reader: &'a dyn BlobDataReader,
         live_state: Arc<dyn LiveStateContext>,
     }
 
     impl SqlExecutionContext for BackendSqlExecutionContext<'_> {
+        fn active_version_id(&self) -> &str {
+            self.active_version_id
+        }
+
         fn live_state(&self) -> Arc<dyn LiveStateContext> {
             Arc::clone(&self.live_state)
         }
@@ -347,6 +361,7 @@ mod tests {
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
                 let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
                 let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
                     blob_reader: &blob_reader,
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                 };
@@ -391,6 +406,7 @@ mod tests {
                 let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
                 let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
                 let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
                     blob_reader: &blob_reader,
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
                 };
@@ -408,6 +424,43 @@ mod tests {
                         && result.rows.iter().any(|row| row[0] == Value::Text("entity-b".to_string())),
                     "expected broad by-version read to include rows from multiple visible versions: {:?}",
                     result.rows
+                );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_lix_state_from_active_version() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: &blob_reader,
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT entity_id, snapshot_content \
+                     FROM lix_state \
+                     WHERE schema_key = 'test_state_schema'",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read lix_state");
+
+                assert_eq!(result.columns, vec!["entity_id", "snapshot_content"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0][0], Value::Text("entity-a".to_string()));
+                assert_eq!(
+                    result.rows[0][1],
+                    Value::Text("{\"value\":\"A\"}".to_string())
                 );
             })
         });
