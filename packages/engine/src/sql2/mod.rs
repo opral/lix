@@ -1,12 +1,12 @@
 mod datafusion;
 mod entity_view;
+mod entity_views;
 mod execute;
 mod filesystem_view;
 mod lix_state_provider;
 mod udf;
 
 #[allow(unused_imports)]
-pub(crate) use crate::catalog::CatalogContext;
 pub(crate) use datafusion::{
     execute_read_with_backend, execute_read_with_shared_backend, PreparedSql2ReadArtifact,
 };

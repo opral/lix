@@ -1,13 +1,16 @@
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
+use serde_json::Value as JsonValue;
 use std::sync::Arc;
 
 use crate::binary_cas::BlobDataReader;
 use crate::live_state::LiveStateContext;
 use crate::{LixError, QueryResult, Value};
 
+use super::entity_views::register_entity_views;
 use super::lix_state_provider::register_lix_state_providers;
+use super::udf::register_sql2_udfs;
 
 /// Single execution boundary for `sql2::execute_sql(...)`.
 ///
@@ -22,6 +25,7 @@ pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateContext>;
     fn blob_reader(&self) -> &dyn BlobDataReader;
+    fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError>;
 }
 
 /// Minimal top-level sql2 entrypoint.
@@ -37,7 +41,13 @@ pub(crate) async fn execute_sql(
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
     let session = SessionContext::new();
+    register_sql2_udfs(&session);
     register_lix_state_providers(&session, ctx.active_version_id(), ctx.live_state()).await?;
+    register_entity_views(
+        &session,
+        &ctx.list_visible_schemas(ctx.active_version_id())?,
+    )
+    .await?;
 
     let mut dataframe = session
         .sql(sql)
@@ -157,6 +167,7 @@ mod tests {
 
     use async_trait::async_trait;
     use serde_json::json;
+    use serde_json::Value as JsonValue;
 
     use super::{execute_sql, SqlExecutionContext};
     use crate::binary_cas::BlobDataReader;
@@ -174,6 +185,7 @@ mod tests {
         active_version_id: &'a str,
         blob_reader: &'a dyn BlobDataReader,
         live_state: Arc<dyn LiveStateContext>,
+        schema_definitions: Vec<JsonValue>,
     }
 
     impl<'a> SqlExecutionContext for DummySqlExecutionContext<'a> {
@@ -187,6 +199,11 @@ mod tests {
 
         fn blob_reader(&self) -> &dyn BlobDataReader {
             self.blob_reader
+        }
+
+        fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
+            let _ = version_id;
+            Ok(self.schema_definitions.clone())
         }
     }
 
@@ -232,6 +249,7 @@ mod tests {
             active_version_id: "version-a",
             blob_reader: &blob_reader,
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateContext>,
+            schema_definitions: vec![],
         };
 
         let actual = ctx.live_state();
@@ -252,6 +270,7 @@ mod tests {
             active_version_id: "version-a",
             blob_reader: &blob_reader,
             live_state,
+            schema_definitions: vec![],
         };
 
         let result = execute_sql(&ctx, "SELECT 1", &[])
@@ -264,6 +283,7 @@ mod tests {
         active_version_id: &'a str,
         blob_reader: &'a dyn BlobDataReader,
         live_state: Arc<dyn LiveStateContext>,
+        schema_definitions: Vec<JsonValue>,
     }
 
     impl SqlExecutionContext for BackendSqlExecutionContext<'_> {
@@ -278,23 +298,33 @@ mod tests {
         fn blob_reader(&self) -> &dyn BlobDataReader {
             self.blob_reader
         }
+
+        fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
+            let _ = version_id;
+            Ok(self.schema_definitions.clone())
+        }
     }
 
-    async fn setup_sql2_state_fixture(
-    ) -> Result<(crate::test_support::TestSqliteBackend, crate::Session), crate::LixError> {
+    async fn setup_sql2_state_fixture() -> Result<
+        (
+            crate::test_support::TestSqliteBackend,
+            crate::Session,
+            JsonValue,
+        ),
+        crate::LixError,
+    > {
         let (backend, _lix, session) = boot_test_engine().await?;
-        session
-            .register_schema(&json!({
-                "x-lix-key": "test_state_schema",
-                "x-lix-version": "1",
-                "type": "object",
-                "properties": {
-                    "value": { "type": "string" }
-                },
-                "required": ["value"],
-                "additionalProperties": false
-            }))
-            .await?;
+        let schema_definition = json!({
+            "x-lix-key": "test_state_schema",
+            "x-lix-version": "1",
+            "type": "object",
+            "properties": {
+                "value": { "type": "string" }
+            },
+            "required": ["value"],
+            "additionalProperties": false
+        });
+        session.register_schema(&schema_definition).await?;
         session
             .create_version(CreateVersionOptions {
                 id: Some("version-a".to_string()),
@@ -329,7 +359,7 @@ mod tests {
                 &[],
             )
             .await?;
-        Ok((backend, session))
+        Ok((backend, session, schema_definition))
     }
 
     fn run_async_test_with_large_stack(
@@ -354,7 +384,7 @@ mod tests {
     fn execute_sql_reads_lix_state_by_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, _session) = setup_sql2_state_fixture()
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
@@ -364,6 +394,7 @@ mod tests {
                     active_version_id: "version-a",
                     blob_reader: &blob_reader,
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
                 };
 
                 let result = execute_sql(
@@ -399,7 +430,7 @@ mod tests {
     fn execute_sql_supports_broad_lix_state_by_version_reads() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, _session) = setup_sql2_state_fixture()
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
@@ -409,6 +440,7 @@ mod tests {
                     active_version_id: "version-a",
                     blob_reader: &blob_reader,
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
                 };
 
                 let result = execute_sql(
@@ -433,7 +465,7 @@ mod tests {
     fn execute_sql_reads_lix_state_from_active_version() {
         run_async_test_with_large_stack(|| {
             Box::pin(async move {
-                let (backend, _session) = setup_sql2_state_fixture()
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
                     .await
                     .expect("fixture should initialize");
                 let backend = Arc::new(backend);
@@ -443,6 +475,7 @@ mod tests {
                     active_version_id: "version-a",
                     blob_reader: &blob_reader,
                     live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
                 };
 
                 let result = execute_sql(
@@ -462,6 +495,75 @@ mod tests {
                     result.rows[0][1],
                     Value::Text("{\"value\":\"A\"}".to_string())
                 );
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_entity_view_from_active_version() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: &blob_reader,
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT value, lixcol_entity_id \
+                     FROM test_state_schema",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read entity view");
+
+                assert_eq!(result.columns, vec!["value", "lixcol_entity_id"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0][0], Value::Text("A".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("entity-a".to_string()));
+            })
+        });
+    }
+
+    #[test]
+    fn execute_sql_reads_entity_by_version_view() {
+        run_async_test_with_large_stack(|| {
+            Box::pin(async move {
+                let (backend, _session, schema_definition) = setup_sql2_state_fixture()
+                    .await
+                    .expect("fixture should initialize");
+                let backend = Arc::new(backend);
+                let backend_ref: Arc<dyn crate::LixBackend + Send + Sync> = backend;
+                let blob_reader = BackendBlobReader(Arc::clone(&backend_ref));
+                let ctx = BackendSqlExecutionContext {
+                    active_version_id: "version-a",
+                    blob_reader: &blob_reader,
+                    live_state: Arc::new(CommittedLiveStateContext::new(Arc::clone(&backend_ref))),
+                    schema_definitions: vec![schema_definition],
+                };
+
+                let result = execute_sql(
+                    &ctx,
+                    "SELECT value, lixcol_version_id \
+                     FROM test_state_schema_by_version \
+                     WHERE lixcol_version_id = 'version-b'",
+                    &[],
+                )
+                .await
+                .expect("sql2 execute should read entity by-version view");
+
+                assert_eq!(result.columns, vec!["value", "lixcol_version_id"]);
+                assert_eq!(result.rows.len(), 1);
+                assert_eq!(result.rows[0][0], Value::Text("B".to_string()));
+                assert_eq!(result.rows[0][1], Value::Text("version-b".to_string()));
             })
         });
     }
