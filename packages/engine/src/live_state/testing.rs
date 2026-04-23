@@ -22,6 +22,7 @@ pub(crate) fn local_version_head_live_row(
         change_id: Some(local_version_head_change_id(
             version_id, commit_id, timestamp,
         )),
+        commit_id: Some(commit_id.to_string()),
         global: true,
         untracked: true,
         created_at: Some(timestamp.to_string()),
