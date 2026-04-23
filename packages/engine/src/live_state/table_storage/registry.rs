@@ -13,12 +13,46 @@ pub(crate) async fn load_live_table_layout_with_backend(
     schema_key: &str,
 ) -> Result<LiveTableLayout, LixError> {
     let mut provider = BackendSchemaLayoutProvider { backend };
+    if schema_key.starts_with("same_request") {
+        eprintln!("versionless layout lookup for {}", schema_key);
+    }
     match load_live_table_layout_with_provider(&mut provider, schema_key).await {
         Ok(layout) => Ok(layout),
-        Err(error) if error.description == format!("schema '{}' is not stored", schema_key) => {
+        Err(error) if is_schema_not_stored_error(&error, schema_key) => {
             load_live_table_layout_from_registered_schema_live_table(backend, schema_key)
                 .await
                 .or(Err(error))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub(crate) async fn load_live_table_layout_for_version_with_backend(
+    backend: LiveStateBackendRef<'_>,
+    schema_key: &str,
+    requested_version_id: &str,
+) -> Result<LiveTableLayout, LixError> {
+    if let Some(layout) = builtin_live_table_layout(schema_key)? {
+        return Ok(layout);
+    }
+
+    let mut provider = BackendVersionScopedSchemaLayoutProvider {
+        backend,
+        requested_version_id,
+    };
+    let provider_rows = provider.load_registered_schema_rows().await?;
+    match compile_registered_live_layout(schema_key, provider_rows) {
+        Ok(layout) => Ok(layout),
+        Err(error) if is_schema_not_stored_error(&error, schema_key) => {
+            compile_registered_live_layout(
+                schema_key,
+                crate::live_state::storage::load_registered_schema_live_table_layout_rows_for_version(
+                    backend,
+                    requested_version_id,
+                )
+                .await?,
+            )
+            .or(Err(error))
         }
         Err(error) => Err(error),
     }
@@ -33,11 +67,27 @@ struct BackendSchemaLayoutProvider<'a> {
     backend: LiveStateBackendRef<'a>,
 }
 
+struct BackendVersionScopedSchemaLayoutProvider<'a> {
+    backend: LiveStateBackendRef<'a>,
+    requested_version_id: &'a str,
+}
+
 #[async_trait(?Send)]
 impl RegisteredSchemaLayoutProvider for BackendSchemaLayoutProvider<'_> {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
         crate::live_state::storage::load_registered_schema_layout_rows_with_backend(self.backend)
             .await
+    }
+}
+
+#[async_trait(?Send)]
+impl RegisteredSchemaLayoutProvider for BackendVersionScopedSchemaLayoutProvider<'_> {
+    async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
+        crate::live_state::storage::load_registered_schema_layout_rows_for_version_with_backend(
+            self.backend,
+            self.requested_version_id,
+        )
+        .await
     }
 }
 
@@ -101,6 +151,12 @@ pub(crate) fn compile_registered_live_layout(
     }
 
     merge_live_table_layouts(schema_key, layouts)
+}
+
+fn is_schema_not_stored_error(error: &LixError, schema_key: &str) -> bool {
+    error
+        .description
+        .starts_with(&format!("schema '{}' is not stored", schema_key))
 }
 
 #[cfg(test)]

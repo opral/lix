@@ -72,7 +72,12 @@ fn first_text(result: &lix_engine::ExecuteResult) -> String {
 
 fn first_json_string(result: &lix_engine::ExecuteResult) -> String {
     match &result.statements[0].rows[0][0] {
-        Value::Json(JsonValue::String(value)) => value.clone(),
+        Value::Text(value) => serde_json::from_str::<JsonValue>(value)
+            .ok()
+            .and_then(|json| json.as_str().map(str::to_string))
+            .unwrap_or_else(|| {
+                panic!("expected first result cell to be a JSON string, got text {value:?}")
+            }),
         other => panic!("expected first result cell to be a JSON string, got {other:?}"),
     }
 }

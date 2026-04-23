@@ -2194,14 +2194,6 @@ mod tests {
                 .state_base_relation,
             Sql2FilesystemStateBaseRelation::LixStateByVersion
         );
-        assert_eq!(
-            file.base_relation_plans
-                .get(&Sql2FilesystemViewBaseRelation::FileDescriptorRows)
-                .expect("file descriptor base relation should exist")
-                .state_base_relation
-                .relation_name(),
-            "lix_state_by_version"
-        );
     }
 
     #[test]

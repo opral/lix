@@ -541,13 +541,16 @@ async fn apply_prepared_write_context_invalidation(
             crate::transaction::build_public_read_surface_registry_with_pending_overlay(
                 &backend,
                 pending_write_overlay.map(|view| view as &dyn PendingOverlay),
+                Some(context.active_version_id.as_str()),
             )
             .await?
         }
         PreparedWriteContextInvalidation::RegenerateFromCommittedState => {
             let backend = crate::backend::transaction_backend_view(transaction);
             crate::transaction::build_public_read_surface_registry_with_pending_overlay(
-                &backend, None,
+                &backend,
+                None,
+                Some(context.active_version_id.as_str()),
             )
             .await?
         }

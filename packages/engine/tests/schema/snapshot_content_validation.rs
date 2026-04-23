@@ -101,7 +101,7 @@ simulation_test!(requires_registered_schema, |sim| async move {
     let err = result.expect_err("expected validation error");
     assert!(
         err.to_string()
-            .contains("schema 'missing_schema' (1) is not stored"),
+            .contains("schema 'missing_schema' (1) is not registered in version"),
         "unexpected error: {err}"
     );
 });

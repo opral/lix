@@ -26,9 +26,8 @@ use crate::catalog::{
 use crate::common::{derive_entity_id_from_json_paths, json_pointer_get, EntityIdDerivationError};
 use crate::live_state::LiveStateQueryBackend;
 use crate::live_state::{
-    decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
-    scan_live_rows, LiveFilter, LiveFilterField, LiveFilterOp, LiveRowQuery, LiveRowSource,
-    LiveSnapshotRow, LiveSnapshotStorage,
+    decode_registered_schema_row, scan_live_rows, LiveFilter, LiveFilterField, LiveFilterOp,
+    LiveRowQuery, LiveRowSource, LiveSnapshotRow, LiveSnapshotStorage,
 };
 use crate::plugin::{load_installed_plugin_from_archive_bytes, plugin_key_from_archive_path};
 use crate::schema::CompiledSchemaCache;
@@ -127,7 +126,6 @@ struct WriteValidationSchemaLookup<'a> {
     backend: &'a dyn LixBackend,
     pending: HashMap<SchemaKey, JsonValue>,
     visible_entries: Option<(String, Vec<(SchemaKey, JsonValue)>)>,
-    current_version_heads: Option<BTreeSet<String>>,
 }
 
 impl<'a> WriteValidationSchemaLookup<'a> {
@@ -136,7 +134,6 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             backend,
             pending: HashMap::new(),
             visible_entries: None,
-            current_version_heads: None,
         }
     }
 
@@ -220,8 +217,8 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             return Err(LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!(
-                    "schema '{}' ({}) is not stored",
-                    key.schema_key, key.schema_version
+                    "schema '{}' ({}) is not registered in version '{}'",
+                    key.schema_key, key.schema_version, requested_version_id
                 ),
             ));
         };
@@ -253,7 +250,10 @@ impl<'a> WriteValidationSchemaLookup<'a> {
             .ok_or_else(|| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("schema '{}' is not stored", schema_key),
+                    format!(
+                        "schema '{}' is not registered in version '{}'",
+                        schema_key, requested_version_id
+                    ),
                 )
             })
     }
@@ -327,18 +327,10 @@ impl<'a> WriteValidationSchemaLookup<'a> {
         &mut self,
         requested_version_id: &str,
     ) -> Result<Vec<String>, LixError> {
-        if self.current_version_heads.is_none() {
-            let frontier =
-                load_current_committed_version_frontier_with_backend(self.backend).await?;
-            self.current_version_heads = Some(frontier.version_heads.into_keys().collect());
-        }
-
-        let mut version_ids = BTreeSet::new();
-        version_ids.insert(crate::version::GLOBAL_VERSION_ID.to_string());
-        version_ids.insert(requested_version_id.to_string());
-        if let Some(current_version_heads) = &self.current_version_heads {
-            version_ids.extend(current_version_heads.iter().cloned());
-        }
+        let version_ids = BTreeSet::from([
+            crate::version::GLOBAL_VERSION_ID.to_string(),
+            requested_version_id.to_string(),
+        ]);
         Ok(version_ids.into_iter().collect())
     }
 }

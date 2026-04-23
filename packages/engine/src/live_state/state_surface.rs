@@ -14,7 +14,6 @@ use crate::backend::TransactionBeginMode;
 use crate::{LixBackend, LixError, Value};
 
 use super::commit_derived::{is_lazy_commit_derived_surface, scan_commit_derived_rows};
-use super::schema_access::load_live_row_shape_with_backend;
 use super::tracked::{
     scan_tombstones_with_backend as scan_tracked_tombstones_with_backend, TrackedScanRequest,
 };
@@ -940,10 +939,32 @@ async fn load_effective_rows_for_schema(
     request: &StateByVersionScanRequest,
     source_limit: Option<usize>,
 ) -> Result<Vec<LiveRow>, LixError> {
+    fn is_schema_not_stored_error(error: &LixError, schema_key: &str) -> bool {
+        error
+            .description
+            .starts_with(&format!("schema '{}' is not stored", schema_key))
+    }
+
+    if !crate::live_state::schema_access::live_storage_relation_exists_with_backend(
+        backend, schema_key,
+    )
+    .await?
+    {
+        return Ok(Vec::new());
+    }
+
     let mut resolved = BTreeMap::<(String, Option<String>), LiveRow>::new();
     let mut hidden = BTreeSet::<(String, Option<String>)>::new();
     let snapshot_shape = if request_needs_snapshot_content(request) {
-        Some(load_live_row_shape_with_backend(backend, schema_key).await?)
+        match crate::live_state::schema_access::load_live_row_shape_for_version_with_backend(
+            backend, schema_key, version_id,
+        )
+        .await
+        {
+            Ok(shape) => Some(shape),
+            Err(error) if is_schema_not_stored_error(&error, schema_key) => return Ok(Vec::new()),
+            Err(error) => return Err(error),
+        }
     } else {
         None
     };

@@ -3,7 +3,6 @@ use crate::support;
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{CreateVersionOptions, ExecuteOptions, Lix, LixConfig};
 use lix_engine::{ObserveOptions, ObserveQuery, Value};
-use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -71,7 +70,7 @@ simulation_test!(
             initial.rows.rows,
             vec![vec![
                 Value::Text("observe-existing-visible".to_string()),
-                Value::Json(json!("v0"))
+                Value::Text("\"v0\"".to_string())
             ]]
         );
     }
@@ -225,7 +224,7 @@ simulation_test!(
             update.rows.rows[0],
             vec![
                 Value::Text("observe-public-entity".to_string()),
-                Value::Json(json!("v0"))
+                Value::Text("\"v0\"".to_string())
             ]
         );
     }

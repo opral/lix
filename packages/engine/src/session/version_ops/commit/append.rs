@@ -8,10 +8,9 @@ use crate::LixError;
 
 use super::create::create_commit;
 pub(crate) use super::create::{
-    CreateCommitAppliedOutput, CreateCommitArgs, CreateCommitDisposition, CreateCommitError,
-    CreateCommitErrorKind, CreateCommitExpectedHead, CreateCommitIdempotencyKey,
-    CreateCommitInvariantChecker, CreateCommitPreconditions, CreateCommitResult,
-    CreateCommitWriteLane,
+    CreateCommitArgs, CreateCommitDisposition, CreateCommitError, CreateCommitErrorKind,
+    CreateCommitExpectedHead, CreateCommitIdempotencyKey, CreateCommitInvariantChecker,
+    CreateCommitPreconditions, CreateCommitResult, CreateCommitWriteLane,
 };
 use super::pending::{
     build_pending_commit_state, create_commit_error_to_lix_error,
@@ -34,7 +33,6 @@ pub(crate) struct BufferedTrackedAppendArgs {
 pub(crate) struct BufferedTrackedAppendOutcome {
     pub(crate) disposition: CreateCommitDisposition,
     pub(crate) receipt: Option<CanonicalCommitProjectionReceipt>,
-    pub(crate) applied_output: Option<CreateCommitAppliedOutput>,
     pub(crate) applied_changes: Vec<StagedChange>,
     pub(crate) merged_into_pending_session: bool,
 }
@@ -144,7 +142,6 @@ pub(crate) async fn append_tracked_with_pending_public_session(
             return Ok(BufferedTrackedAppendOutcome {
                 disposition: CreateCommitDisposition::Applied,
                 receipt: Some(receipt),
-                applied_output: None,
                 applied_changes: args.changes,
                 merged_into_pending_session: true,
             });
@@ -184,7 +181,6 @@ pub(crate) async fn append_tracked_with_pending_public_session(
     Ok(BufferedTrackedAppendOutcome {
         disposition: create_result.disposition,
         receipt: create_result.receipt,
-        applied_output: create_result.applied_output,
         applied_changes: create_result.applied_changes,
         merged_into_pending_session: false,
     })

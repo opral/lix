@@ -77,13 +77,18 @@ impl LiveRowShape {
     }
 }
 
-pub(crate) async fn load_live_row_shape_with_backend(
+pub(crate) async fn load_live_row_shape_for_version_with_backend(
     backend: LiveStateBackendRef<'_>,
     schema_key: &str,
+    requested_version_id: &str,
 ) -> Result<LiveRowShape, LixError> {
-    super::storage::load_live_row_access_with_backend(backend, schema_key)
-        .await
-        .map(live_row_shape_from_storage)
+    super::storage::load_live_row_access_for_version_with_backend(
+        backend,
+        schema_key,
+        requested_version_id,
+    )
+    .await
+    .map(live_row_shape_from_storage)
 }
 
 pub(crate) async fn load_live_row_shape_for_table_name(

@@ -328,7 +328,13 @@ fn surface_column_type_from_schema(schema: &JsonValue) -> Option<SurfaceColumnTy
         };
     }
 
-    Some(SurfaceColumnType::Variant)
+    // Design note:
+    // Mixed JSON kinds inside a JSON Schema still describe a JSON value domain.
+    // For example, `anyOf(string, object)` is heterogeneous JSON, not an
+    // engine-native polymorphic payload. `Variant` is reserved for explicit
+    // owner-chosen engine types and must not be inferred solely from JSON Schema
+    // composition.
+    Some(SurfaceColumnType::Json)
 }
 
 fn collect_surface_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a str>) {
@@ -356,10 +362,11 @@ fn collect_surface_type_kinds<'a>(schema: &'a JsonValue, out: &mut BTreeSet<&'a 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
-        surface_column_type_from_schema,
+        build_builtin_surface_registry, builtin_schema_exposed_as_entity_surface,
+        dynamic_entity_surface_spec_from_schema, surface_column_type_from_schema,
     };
     use crate::catalog::SurfaceColumnType;
+    use crate::schema::builtin_schema_keys;
     use serde_json::json;
 
     #[test]
@@ -395,7 +402,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_type_schema_properties_become_variant_surface_types() {
+    fn multi_type_schema_properties_remain_json_surface_types() {
         let kind = surface_column_type_from_schema(&json!({
             "anyOf": [
                 { "type": "string" },
@@ -407,11 +414,55 @@ mod tests {
             ]
         }));
 
-        assert_eq!(kind, Some(SurfaceColumnType::Variant));
+        assert_eq!(kind, Some(SurfaceColumnType::Json));
     }
 
     #[test]
-    fn builtin_lix_key_value_value_column_is_variant() {
+    fn object_type_schema_properties_map_to_json_surface_types() {
+        let spec = dynamic_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "phase8_object_schema",
+            "type": "object",
+            "properties": {
+                "payload": {
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string" }
+                    }
+                }
+            }
+        }))
+        .expect("schema should compile");
+
+        assert_eq!(
+            spec.column_types.get("payload"),
+            Some(&SurfaceColumnType::Json)
+        );
+    }
+
+    #[test]
+    fn anyof_string_object_schema_properties_map_to_json_surface_types() {
+        let spec = dynamic_entity_surface_spec_from_schema(&json!({
+            "x-lix-key": "phase8_anyof_schema",
+            "type": "object",
+            "properties": {
+                "payload": {
+                    "anyOf": [
+                        { "type": "string" },
+                        { "type": "object" }
+                    ]
+                }
+            }
+        }))
+        .expect("schema should compile");
+
+        assert_eq!(
+            spec.column_types.get("payload"),
+            Some(&SurfaceColumnType::Json)
+        );
+    }
+
+    #[test]
+    fn builtin_lix_key_value_value_column_is_json() {
         let registry = build_builtin_surface_registry();
         let resolved = registry
             .bind_relation_name("lix_key_value")
@@ -419,11 +470,85 @@ mod tests {
 
         assert_eq!(
             resolved.column_types.get("value"),
-            Some(&SurfaceColumnType::Variant)
+            Some(&SurfaceColumnType::Json)
         );
         assert_eq!(
             resolved.column_types.get("key"),
             Some(&SurfaceColumnType::String)
         );
+    }
+
+    #[test]
+    fn builtin_schema_derived_entity_surfaces_do_not_infer_variant_columns() {
+        let registry = build_builtin_surface_registry();
+
+        for schema_key in builtin_schema_keys() {
+            if !builtin_schema_exposed_as_entity_surface(schema_key) {
+                continue;
+            }
+
+            let resolved = registry
+                .bind_relation_name(schema_key)
+                .unwrap_or_else(|| panic!("builtin entity surface '{schema_key}' should bind"));
+
+            let variant_columns = resolved
+                .column_types
+                .iter()
+                .filter_map(|(column_name, column_type)| {
+                    (*column_type == SurfaceColumnType::Variant).then_some(column_name.as_str())
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                variant_columns.is_empty(),
+                "builtin schema-derived surface '{}' should not infer Variant columns: {:?}",
+                schema_key,
+                variant_columns
+            );
+        }
+    }
+
+    #[test]
+    fn builtin_registry_currently_has_no_catalog_owned_variant_columns() {
+        let registry = build_builtin_surface_registry();
+
+        let relation_names = [
+            "lix_state",
+            "lix_state_by_version",
+            "lix_state_history",
+            "lix_change",
+            "lix_working_changes",
+            "lix_file",
+            "lix_file_by_version",
+            "lix_file_history",
+            "lix_file_history_by_version",
+            "lix_directory",
+            "lix_directory_by_version",
+            "lix_directory_history",
+            "lix_version",
+        ];
+
+        for relation_name in relation_names {
+            let resolved = registry
+                .bind_relation_name(&relation_name)
+                .unwrap_or_else(|| {
+                    panic!("builtin registry relation '{relation_name}' should bind")
+                });
+
+            let variant_columns = resolved
+                .column_types
+                .iter()
+                .filter_map(|(column_name, column_type)| {
+                    (*column_type == SurfaceColumnType::Variant).then_some(column_name.as_str())
+                })
+                .collect::<Vec<_>>();
+
+            assert!(
+                variant_columns.is_empty(),
+                "catalog-owned relation '{}' currently exposes Variant columns: {:?}",
+                relation_name,
+                variant_columns
+            );
+        }
     }
 }

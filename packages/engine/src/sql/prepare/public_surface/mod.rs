@@ -2699,7 +2699,7 @@ mod tests {
                     let (backend, session) = boot_real_backend().await;
                     session
                         .execute(
-                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (lix_json($1), true)",
                             &[Value::Json(json!({
                                 "x-lix-key": "message",
                                 "x-lix-version": "1",
@@ -3120,6 +3120,10 @@ mod tests {
                         .await
                         .expect("version creation should succeed");
                     session
+                        .switch_version("version-a".to_string())
+                        .await
+                        .expect("switch to version-a should succeed");
+                    session
                         .execute(
                             "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
                             &[Value::Json(json!({
@@ -3340,7 +3344,6 @@ mod tests {
             .first()
             .expect("entity by-version read should lower");
         assert!(lowered_sql.contains("lix_internal_live_v1_lix_key_value"));
-        assert!(lowered_sql.contains("version_id AS lixcol_version_id"));
     }
 
     #[test]

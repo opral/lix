@@ -10,6 +10,7 @@
       "type": "string"
     },
     "value": {
+      "description": "Arbitrary JSON value. This field stays in the JSON domain even when different rows hold different JSON kinds.",
       "anyOf": [
         {
           "type": "object"

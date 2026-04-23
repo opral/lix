@@ -64,7 +64,7 @@ pub(crate) use crate::live_state::table_storage::{
 pub(crate) use crate::live_state::table_storage::{
     builtin_live_table_layout, compile_registered_live_layout, json_value_from_live_row_cell,
     live_table_layout_from_schema, load_live_row_access_for_table_name,
-    load_live_row_access_with_backend, load_live_row_access_with_executor,
+    load_live_row_access_for_version_with_backend, load_live_row_access_for_version_with_executor,
     load_live_table_layout_with_executor, logical_snapshot_from_projected_row, LiveColumnKind,
     LiveColumnSpec, LiveRowAccess, LiveTableLayout,
 };
@@ -315,14 +315,38 @@ pub(crate) async fn load_change_commit_id_map(
 pub(crate) async fn load_registered_schema_layout_rows_with_backend(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<Vec<Vec<Value>>, LixError> {
+    let version_filter = registered_schema_visible_version_filter_sql_with_backend(backend).await?;
     let result = execute_query_with_backend(
         backend,
-        "SELECT snapshot_content \
+        &format!(
+            "SELECT snapshot_content \
          FROM lix_internal_registered_schema_bootstrap \
          WHERE schema_key = 'lix_registered_schema' \
-           AND version_id = 'global' \
+           AND version_id IN ({version_filter}) \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL",
+        ),
+        &[],
+    )
+    .await?;
+    Ok(result.rows)
+}
+
+pub(crate) async fn load_registered_schema_layout_rows_for_version_with_backend(
+    backend: LiveStateBackendRef<'_>,
+    requested_version_id: &str,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let version_filter = registered_schema_requested_version_filter_sql(requested_version_id);
+    let result = execute_query_with_backend(
+        backend,
+        &format!(
+            "SELECT snapshot_content \
+         FROM lix_internal_registered_schema_bootstrap \
+         WHERE schema_key = 'lix_registered_schema' \
+           AND version_id IN ({version_filter}) \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL",
+        ),
         &[],
     )
     .await?;
@@ -332,14 +356,18 @@ pub(crate) async fn load_registered_schema_layout_rows_with_backend(
 pub(crate) async fn load_registered_schema_layout_rows_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
 ) -> Result<Vec<Vec<Value>>, LixError> {
+    let version_filter =
+        registered_schema_visible_version_filter_sql_with_transaction(transaction).await?;
     let result = execute_query_with_transaction(
         transaction,
-        "SELECT snapshot_content \
+        &format!(
+            "SELECT snapshot_content \
          FROM lix_internal_registered_schema_bootstrap \
          WHERE schema_key = 'lix_registered_schema' \
-           AND version_id = 'global' \
+           AND version_id IN ({version_filter}) \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL",
+        ),
         &[],
     )
     .await?;
@@ -349,14 +377,18 @@ pub(crate) async fn load_registered_schema_layout_rows_in_transaction(
 pub(crate) async fn load_registered_schema_layout_rows_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<Vec<Value>>, LixError> {
+    let version_filter =
+        registered_schema_visible_version_filter_sql_with_executor(executor).await?;
     let result = execute_query_with_executor(
         executor,
-        "SELECT snapshot_content \
+        &format!(
+            "SELECT snapshot_content \
          FROM lix_internal_registered_schema_bootstrap \
          WHERE schema_key = 'lix_registered_schema' \
-           AND version_id = 'global' \
+           AND version_id IN ({version_filter}) \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL",
+        ),
         &[],
     )
     .await?;
@@ -367,6 +399,7 @@ pub(crate) async fn load_registered_schema_live_table_layout_rows(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<Vec<Vec<Value>>, LixError> {
     let registered_schema_table = tracked_relation_name("lix_registered_schema");
+    let version_filter = registered_schema_visible_version_filter_sql_with_backend(backend).await?;
     let snapshot_expr = crate::live_state::schema_access::snapshot_select_expr_for_schema(
         "lix_registered_schema",
         None,
@@ -377,12 +410,124 @@ pub(crate) async fn load_registered_schema_live_table_layout_rows(
         "SELECT {snapshot_expr} AS snapshot_content \
          FROM {registered_schema_table} m \
          WHERE m.schema_key = 'lix_registered_schema' \
-           AND m.version_id = 'global' \
+           AND m.version_id IN ({version_filter}) \
            AND m.is_tombstone = 0",
         snapshot_expr = snapshot_expr,
         registered_schema_table = registered_schema_table,
+        version_filter = version_filter,
     );
     Ok(execute_query_with_backend(backend, &sql, &[]).await?.rows)
+}
+
+pub(crate) async fn load_registered_schema_live_table_layout_rows_for_version(
+    backend: LiveStateBackendRef<'_>,
+    requested_version_id: &str,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let registered_schema_table = tracked_relation_name("lix_registered_schema");
+    let version_filter = registered_schema_requested_version_filter_sql(requested_version_id);
+    let snapshot_expr = crate::live_state::schema_access::snapshot_select_expr_for_schema(
+        "lix_registered_schema",
+        None,
+        backend.dialect(),
+        Some("m"),
+    )?;
+    let sql = format!(
+        "SELECT {snapshot_expr} AS snapshot_content \
+         FROM {registered_schema_table} m \
+         WHERE m.schema_key = 'lix_registered_schema' \
+           AND m.version_id IN ({version_filter}) \
+           AND m.is_tombstone = 0",
+        snapshot_expr = snapshot_expr,
+        registered_schema_table = registered_schema_table,
+        version_filter = version_filter,
+    );
+    Ok(execute_query_with_backend(backend, &sql, &[]).await?.rows)
+}
+
+async fn registered_schema_visible_version_filter_sql_with_backend(
+    backend: LiveStateBackendRef<'_>,
+) -> Result<String, LixError> {
+    let frontier =
+        crate::live_state::load_current_committed_version_frontier_with_backend(backend).await?;
+    Ok(registered_schema_visible_version_filter_sql(
+        frontier.version_heads.into_keys(),
+    ))
+}
+
+async fn registered_schema_visible_version_filter_sql_with_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<String, LixError> {
+    let frontier = load_current_committed_version_frontier_with_transaction(transaction).await?;
+    Ok(registered_schema_visible_version_filter_sql(
+        frontier.version_heads.into_keys(),
+    ))
+}
+
+async fn registered_schema_visible_version_filter_sql_with_executor(
+    executor: &mut dyn QueryExecutor,
+) -> Result<String, LixError> {
+    let frontier = load_current_committed_version_frontier_with_executor(executor).await?;
+    Ok(registered_schema_visible_version_filter_sql(
+        frontier.version_heads.into_keys(),
+    ))
+}
+
+fn registered_schema_visible_version_filter_sql(
+    visible_version_ids: impl IntoIterator<Item = String>,
+) -> String {
+    let mut version_ids = BTreeSet::from([crate::version::GLOBAL_VERSION_ID.to_string()]);
+    version_ids.extend(visible_version_ids);
+    version_ids
+        .into_iter()
+        .map(|version_id| format!("'{}'", escape_sql_string(&version_id)))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn registered_schema_requested_version_filter_sql(requested_version_id: &str) -> String {
+    registered_schema_visible_version_filter_sql([requested_version_id.to_string()])
+}
+
+async fn load_current_committed_version_frontier_with_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+) -> Result<CommittedVersionFrontier, LixError> {
+    let result = execute_query_with_transaction(
+        transaction,
+        &format!(
+            "SELECT entity_id, commit_id \
+             FROM {table} \
+             WHERE schema_key = $1 \
+               AND schema_version = $2 \
+               AND file_id IS NULL \
+               AND version_id = $3 \
+               AND plugin_key IS NULL \
+               AND untracked = true \
+               AND is_tombstone = 0 \
+               AND commit_id IS NOT NULL \
+               AND commit_id <> '' \
+             ORDER BY entity_id ASC, updated_at DESC",
+            table = tracked_relation_name(version_ref_schema_key()),
+        ),
+        &[
+            Value::Text(version_ref_schema_key().to_string()),
+            Value::Text(version_ref_schema_version().to_string()),
+            Value::Text(version_ref_storage_version_id().to_string()),
+        ],
+    )
+    .await?;
+
+    let mut version_heads = BTreeMap::new();
+    for row in result.rows {
+        let Some(Value::Text(version_id)) = row.first() else {
+            continue;
+        };
+        let Some(Value::Text(commit_id)) = row.get(1) else {
+            continue;
+        };
+        version_heads.insert(version_id.clone(), commit_id.clone());
+    }
+
+    Ok(CommittedVersionFrontier { version_heads })
 }
 
 pub(crate) async fn load_plugin_archive_ref_rows(
@@ -536,6 +681,27 @@ pub(crate) async fn load_registered_schema_bootstrap_layout_rows_with_executor(
            AND version_id = 'global' \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL",
+        &[],
+    )
+    .await?;
+    Ok(result.rows)
+}
+
+pub(crate) async fn load_registered_schema_bootstrap_layout_rows_for_version_with_executor(
+    executor: &mut dyn QueryExecutor,
+    requested_version_id: &str,
+) -> Result<Vec<Vec<Value>>, LixError> {
+    let version_filter = registered_schema_requested_version_filter_sql(requested_version_id);
+    let result = execute_query_with_executor(
+        executor,
+        &format!(
+            "SELECT snapshot_content \
+         FROM lix_internal_registered_schema_bootstrap \
+         WHERE schema_key = 'lix_registered_schema' \
+           AND version_id IN ({version_filter}) \
+           AND is_tombstone = 0 \
+           AND snapshot_content IS NOT NULL",
+        ),
         &[],
     )
     .await?;
@@ -1763,14 +1929,17 @@ fn invalid_live_state_store_access(expected: &'static str) -> LixError {
 
 pub(crate) async fn load_visible_registered_schema_snapshot_contents(
     backend: &dyn LixBackend,
+    requested_version_id: &str,
 ) -> Result<BTreeMap<String, String>, LixError> {
+    let version_filter =
+        registered_schema_visible_version_filter_sql([requested_version_id.to_string()]);
     let sql = format!(
         "SELECT snapshot_content FROM {table} \
-         WHERE version_id = '{global_version}' \
+         WHERE version_id IN ({version_filter}) \
            AND is_tombstone = 0 \
            AND snapshot_content IS NOT NULL",
         table = crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
-        global_version = crate::version::GLOBAL_VERSION_ID,
+        version_filter = version_filter,
     );
     let result = backend.execute(&sql, &[]).await?;
     let mut rows = BTreeMap::new();

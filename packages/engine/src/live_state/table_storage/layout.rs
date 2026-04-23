@@ -299,12 +299,42 @@ pub(crate) async fn load_live_row_access_with_backend(
     ))
 }
 
+pub(crate) async fn load_live_row_access_for_version_with_backend(
+    backend: LiveStateBackendRef<'_>,
+    schema_key: &str,
+    requested_version_id: &str,
+) -> Result<LiveRowAccess, LixError> {
+    Ok(LiveRowAccess::new(
+        super::registry::load_live_table_layout_for_version_with_backend(
+            backend,
+            schema_key,
+            requested_version_id,
+        )
+        .await?,
+    ))
+}
+
 pub(crate) async fn load_live_row_access_with_executor(
     executor: LiveStateExecutorRef<'_>,
     schema_key: &str,
 ) -> Result<LiveRowAccess, LixError> {
     Ok(LiveRowAccess::new(
         load_live_table_layout_with_executor(executor, schema_key).await?,
+    ))
+}
+
+pub(crate) async fn load_live_row_access_for_version_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+    schema_key: &str,
+    requested_version_id: &str,
+) -> Result<LiveRowAccess, LixError> {
+    Ok(LiveRowAccess::new(
+        load_live_table_layout_for_version_with_executor(
+            executor,
+            schema_key,
+            requested_version_id,
+        )
+        .await?,
     ))
 }
 
@@ -329,8 +359,24 @@ pub(crate) async fn load_live_table_layout_with_executor(
     }
     compile_registered_live_layout(
         schema_key,
-        crate::live_state::storage::load_registered_schema_bootstrap_layout_rows_with_executor(
+        crate::live_state::storage::load_registered_schema_layout_rows_with_executor(executor)
+            .await?,
+    )
+}
+
+pub(crate) async fn load_live_table_layout_for_version_with_executor(
+    executor: LiveStateExecutorRef<'_>,
+    schema_key: &str,
+    requested_version_id: &str,
+) -> Result<LiveTableLayout, LixError> {
+    if let Some(layout) = builtin_live_table_layout(schema_key)? {
+        return Ok(layout);
+    }
+    compile_registered_live_layout(
+        schema_key,
+        crate::live_state::storage::load_registered_schema_bootstrap_layout_rows_for_version_with_executor(
             executor,
+            requested_version_id,
         )
         .await?,
     )
