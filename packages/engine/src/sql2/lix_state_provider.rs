@@ -7,9 +7,11 @@ use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{not_impl_err, DataFusionError, Result, SchemaExt};
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use datafusion::datasource::TableType;
 use datafusion::execution::TaskContext;
+use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
 use datafusion::physical_expr::EquivalenceProperties;
@@ -20,22 +22,26 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
-use futures_util::{stream, TryStreamExt};
+use futures_util::{stream, StreamExt, TryStreamExt};
 
 use crate::live_state::{
     LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
+use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
+
+use super::execute::{LixStateWriteRow, SqlWriteIntent, SqlWriteStager};
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
     active_version_id: &str,
     live_state: Arc<dyn LiveStateContext>,
+    write_stager: Option<Arc<dyn SqlWriteStager>>,
 ) -> Result<(), LixError> {
     session
         .register_table(
             "lix_state_by_version",
-            Arc::new(LixStateProvider::by_version(Arc::clone(&live_state))),
+            Arc::new(LixStateProvider::by_version(Arc::clone(&live_state), None)),
         )
         .map_err(datafusion_error_to_lix_error)?;
     session
@@ -44,6 +50,7 @@ pub(crate) async fn register_lix_state_providers(
             Arc::new(LixStateProvider::active_version(
                 active_version_id,
                 live_state,
+                write_stager,
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -53,12 +60,15 @@ pub(crate) async fn register_lix_state_providers(
 pub(crate) struct LixStateProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateContext>,
+    write_stager: Option<Arc<dyn SqlWriteStager>>,
     default_version_id: Option<String>,
 }
 
 impl std::fmt::Debug for LixStateProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LixStateProvider").finish()
+        f.debug_struct("LixStateProvider")
+            .field("has_write_stager", &self.write_stager.is_some())
+            .finish()
     }
 }
 
@@ -66,18 +76,24 @@ impl LixStateProvider {
     pub(crate) fn active_version(
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateContext>,
+        write_stager: Option<Arc<dyn SqlWriteStager>>,
     ) -> Self {
         Self {
             schema: lix_state_schema(),
             live_state,
+            write_stager,
             default_version_id: Some(active_version_id.into()),
         }
     }
 
-    pub(crate) fn by_version(live_state: Arc<dyn LiveStateContext>) -> Self {
+    pub(crate) fn by_version(
+        live_state: Arc<dyn LiveStateContext>,
+        write_stager: Option<Arc<dyn SqlWriteStager>>,
+    ) -> Self {
         Self {
             schema: lix_state_by_version_schema(),
             live_state,
+            write_stager,
             default_version_id: None,
         }
     }
@@ -135,6 +151,219 @@ impl TableProvider for LixStateProvider {
             request,
         )))
     }
+
+    async fn insert_into(
+        &self,
+        _state: &dyn Session,
+        input: Arc<dyn ExecutionPlan>,
+        insert_op: InsertOp,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if insert_op != InsertOp::Append {
+            return not_impl_err!("{insert_op} not implemented for lix_state yet");
+        }
+
+        let Some(default_version_id) = &self.default_version_id else {
+            return Err(DataFusionError::Execution(
+                "INSERT is only supported for active lix_state".to_string(),
+            ));
+        };
+
+        let Some(write_stager) = &self.write_stager else {
+            return Err(DataFusionError::Execution(
+                "INSERT into lix_state requires a write transaction".to_string(),
+            ));
+        };
+
+        self.schema
+            .logically_equivalent_names_and_types(&input.schema())?;
+
+        let sink = LixStateInsertSink::new(
+            Arc::clone(&self.schema),
+            Arc::clone(write_stager),
+            default_version_id.clone(),
+        );
+        Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
+    }
+}
+
+struct LixStateInsertSink {
+    schema: SchemaRef,
+    write_stager: Arc<dyn SqlWriteStager>,
+    default_version_id: String,
+}
+
+impl std::fmt::Debug for LixStateInsertSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixStateInsertSink").finish()
+    }
+}
+
+impl LixStateInsertSink {
+    fn new(
+        schema: SchemaRef,
+        write_stager: Arc<dyn SqlWriteStager>,
+        default_version_id: String,
+    ) -> Self {
+        Self {
+            schema,
+            write_stager,
+            default_version_id,
+        }
+    }
+}
+
+impl DisplayAs for LixStateInsertSink {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "LixStateInsertSink")
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixStateInsertSink"),
+        }
+    }
+}
+
+#[async_trait]
+impl DataSink for LixStateInsertSink {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    async fn write_all(
+        &self,
+        mut data: SendableRecordBatchStream,
+        _context: &Arc<TaskContext>,
+    ) -> Result<u64> {
+        let mut rows = Vec::new();
+        while let Some(batch) = data.next().await.transpose()? {
+            rows.extend(lix_state_write_rows_from_batch(
+                &batch,
+                &self.default_version_id,
+            )?);
+        }
+        let count = u64::try_from(rows.len())
+            .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
+
+        self.write_stager
+            .stage_write(SqlWriteIntent::InsertLixState { rows })
+            .await
+            .map_err(lix_error_to_datafusion_error)?;
+
+        Ok(count)
+    }
+}
+
+fn lix_state_write_rows_from_batch(
+    batch: &RecordBatch,
+    default_version_id: &str,
+) -> Result<Vec<LixStateWriteRow>> {
+    (0..batch.num_rows())
+        .map(|row_index| {
+            let global = required_bool_value(batch, row_index, "global")?;
+            let version_id =
+                optional_string_value(batch, row_index, "version_id")?.unwrap_or_else(|| {
+                    if global {
+                        GLOBAL_VERSION_ID.to_string()
+                    } else {
+                        default_version_id.to_string()
+                    }
+                });
+
+            Ok(LixStateWriteRow {
+                entity_id: required_string_value(batch, row_index, "entity_id")?,
+                schema_key: required_string_value(batch, row_index, "schema_key")?,
+                file_id: optional_string_value(batch, row_index, "file_id")?,
+                plugin_key: optional_string_value(batch, row_index, "plugin_key")?,
+                snapshot_content: optional_string_value(batch, row_index, "snapshot_content")?,
+                metadata: optional_string_value(batch, row_index, "metadata")?,
+                schema_version: optional_string_value(batch, row_index, "schema_version")?,
+                created_at: optional_string_value(batch, row_index, "created_at")?,
+                updated_at: optional_string_value(batch, row_index, "updated_at")?,
+                global,
+                change_id: optional_string_value(batch, row_index, "change_id")?,
+                commit_id: optional_string_value(batch, row_index, "commit_id")?,
+                untracked: required_bool_value(batch, row_index, "untracked")?,
+                version_id,
+            })
+        })
+        .collect()
+}
+
+fn required_string_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<String> {
+    optional_string_value(batch, row_index, column_name)?.ok_or_else(|| {
+        DataFusionError::Execution(format!(
+            "INSERT into lix_state requires non-null text column '{column_name}'"
+        ))
+    })
+}
+
+fn optional_string_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<String>> {
+    match optional_scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Utf8(None))
+        | Some(ScalarValue::Utf8View(None))
+        | Some(ScalarValue::LargeUtf8(None)) => Ok(None),
+        Some(ScalarValue::Utf8(Some(value)))
+        | Some(ScalarValue::Utf8View(Some(value)))
+        | Some(ScalarValue::LargeUtf8(Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "INSERT into lix_state expected text-compatible column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn required_bool_value(batch: &RecordBatch, row_index: usize, column_name: &str) -> Result<bool> {
+    match optional_scalar_value(batch, row_index, column_name)? {
+        Some(ScalarValue::Boolean(Some(value))) => Ok(value),
+        None | Some(ScalarValue::Null) | Some(ScalarValue::Boolean(None)) => {
+            Err(DataFusionError::Execution(format!(
+                "INSERT into lix_state requires non-null boolean column '{column_name}'"
+            )))
+        }
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "INSERT into lix_state expected boolean column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
+fn optional_scalar_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<ScalarValue>> {
+    let schema = batch.schema();
+    let column_index = match schema.index_of(column_name) {
+        Ok(column_index) => column_index,
+        Err(_) => return Ok(None),
+    };
+
+    if row_index >= batch.num_rows() {
+        return Err(DataFusionError::Execution(format!(
+            "row index {row_index} out of bounds for lix_state batch with {} rows",
+            batch.num_rows()
+        )));
+    }
+
+    ScalarValue::try_from_array(batch.column(column_index).as_ref(), row_index)
+        .map(Some)
+        .map_err(|error| {
+            DataFusionError::Execution(format!(
+                "failed to decode lix_state column '{column_name}' at row {row_index}: {error}"
+            ))
+        })
 }
 
 struct LixStateScanExec {
@@ -629,15 +858,173 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 #[cfg(test)]
 mod tests {
     use super::{
-        lix_state_scan_request, parse_lix_state_filter, LixStateByVersionRoute,
-        LixStateFilterPredicate,
+        lix_state_scan_request, lix_state_schema, lix_state_write_rows_from_batch,
+        parse_lix_state_filter, register_lix_state_providers, LixStateByVersionRoute,
+        LixStateFilterPredicate, LixStateInsertSink, LixStateProvider,
     };
-    use crate::NullableKeyFilter;
-    use datafusion::common::Column;
+    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+    use crate::sql2::{LixStateWriteRow, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
+    use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
+    use crate::{LixError, NullableKeyFilter};
+    use async_trait::async_trait;
+    use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray, UInt64Array};
+    use datafusion::arrow::datatypes::DataType;
+    use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::catalog::TableProvider;
+    use datafusion::common::{Column, DataFusionError};
+    use datafusion::datasource::sink::{DataSink, DataSinkExec};
+    use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::dml::InsertOp;
     use datafusion::logical_expr::expr::InList;
     use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
+    use datafusion::physical_expr::EquivalenceProperties;
+    use datafusion::physical_plan::empty::EmptyExec;
+    use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
+    use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+    use datafusion::physical_plan::{
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+    };
+    use datafusion::prelude::SessionContext;
     use datafusion::scalar::ScalarValue;
+    use futures_util::stream;
     use std::collections::BTreeSet;
+    use std::sync::Arc;
+    use std::sync::Mutex;
+
+    struct EmptyLiveStateContext;
+    struct DummyWriteStager;
+    #[derive(Default)]
+    struct CapturingWriteStager {
+        writes: Mutex<Vec<SqlWriteIntent>>,
+    }
+    #[derive(Default)]
+    struct CapturingBufferedWriteStager {
+        deltas: Vec<TransactionWriteDelta>,
+    }
+
+    struct SingleBatchExec {
+        batch: RecordBatch,
+        properties: Arc<PlanProperties>,
+    }
+
+    impl std::fmt::Debug for SingleBatchExec {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("SingleBatchExec").finish()
+        }
+    }
+
+    impl SingleBatchExec {
+        fn new(batch: RecordBatch) -> Self {
+            let properties = PlanProperties::new(
+                EquivalenceProperties::new(batch.schema()),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Incremental,
+                Boundedness::Bounded,
+            );
+            Self {
+                batch,
+                properties: Arc::new(properties),
+            }
+        }
+    }
+
+    impl DisplayAs for SingleBatchExec {
+        fn fmt_as(
+            &self,
+            _t: DisplayFormatType,
+            f: &mut std::fmt::Formatter<'_>,
+        ) -> std::fmt::Result {
+            write!(f, "SingleBatchExec")
+        }
+    }
+
+    impl ExecutionPlan for SingleBatchExec {
+        fn name(&self) -> &str {
+            "SingleBatchExec"
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.properties
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            Vec::new()
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
+            if !children.is_empty() {
+                return Err(DataFusionError::Execution(
+                    "SingleBatchExec does not accept children".to_string(),
+                ));
+            }
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> datafusion::common::Result<SendableRecordBatchStream> {
+            if partition != 0 {
+                return Err(DataFusionError::Execution(format!(
+                    "SingleBatchExec only exposes one partition, got {partition}"
+                )));
+            }
+
+            let batch = self.batch.clone();
+            let schema = batch.schema();
+            let stream = stream::iter(vec![Ok(batch)]);
+            Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
+        }
+    }
+
+    #[async_trait]
+    impl LiveStateContext for EmptyLiveStateContext {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+            Ok(vec![])
+        }
+
+        async fn load_exact(
+            &self,
+            _request: &ExactRowRequest,
+        ) -> Result<Option<LiveRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
+    impl SqlWriteStager for DummyWriteStager {
+        async fn stage_write(&self, _write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+            Ok(SqlWriteOutcome { count: 0 })
+        }
+    }
+
+    #[async_trait]
+    impl SqlWriteStager for CapturingWriteStager {
+        async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+            self.writes.lock().expect("writes lock").push(write);
+            Ok(SqlWriteOutcome { count: 0 })
+        }
+    }
+
+    impl PreparedWriteStatementStager for CapturingBufferedWriteStager {
+        fn mark_public_surface_registry_refresh_pending(&mut self) {}
+
+        fn stage_transaction_write_delta(
+            &mut self,
+            delta: TransactionWriteDelta,
+        ) -> Result<(), LixError> {
+            self.deltas.push(delta);
+            Ok(())
+        }
+    }
 
     fn col(name: &str) -> Expr {
         Expr::Column(Column::from_name(name))
@@ -645,6 +1032,54 @@ mod tests {
 
     fn str_lit(value: &str) -> Expr {
         Expr::Literal(ScalarValue::Utf8(Some(value.to_string())), None)
+    }
+
+    fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
+        Arc::new(StringArray::from(values)) as ArrayRef
+    }
+
+    fn one_row_lix_state_batch(global: bool) -> RecordBatch {
+        RecordBatch::try_new(
+            lix_state_schema(),
+            vec![
+                string_column(vec![Some("entity-1")]),
+                string_column(vec![Some("lix_key_value")]),
+                string_column(vec![None]),
+                string_column(vec![Some("plugin-a")]),
+                string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
+                string_column(vec![Some("{\"source\":\"test\"}")]),
+                string_column(vec![Some("1")]),
+                string_column(vec![Some("2026-04-23T00:00:00Z")]),
+                string_column(vec![Some("2026-04-23T01:00:00Z")]),
+                Arc::new(BooleanArray::from(vec![global])) as ArrayRef,
+                string_column(vec![Some("change-a")]),
+                string_column(vec![None]),
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+            ],
+        )
+        .expect("valid lix_state batch")
+    }
+
+    fn one_row_stageable_lix_state_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            lix_state_schema(),
+            vec![
+                string_column(vec![Some("entity-1")]),
+                string_column(vec![Some("lix_key_value")]),
+                string_column(vec![None]),
+                string_column(vec![None]),
+                string_column(vec![Some("{\"key\":\"hello\",\"value\":\"world\"}")]),
+                string_column(vec![None]),
+                string_column(vec![Some("1")]),
+                string_column(vec![None]),
+                string_column(vec![None]),
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+                string_column(vec![None]),
+                string_column(vec![None]),
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+            ],
+        )
+        .expect("valid stageable lix_state batch")
     }
 
     #[test]
@@ -749,5 +1184,226 @@ mod tests {
 
         assert_eq!(request.filter.schema_keys, vec!["profile".to_string()]);
         assert_eq!(request.filter.version_ids, vec!["version-a".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn registers_active_lix_state_with_write_context_only() {
+        let session = SessionContext::new();
+        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+
+        register_lix_state_providers(
+            &session,
+            "version-a",
+            live_state,
+            Some(Arc::clone(&write_stager)),
+        )
+        .await
+        .expect("lix_state providers should register");
+
+        let lix_state = session
+            .table_provider("lix_state")
+            .await
+            .expect("lix_state provider should exist");
+        let lix_state = lix_state
+            .as_any()
+            .downcast_ref::<LixStateProvider>()
+            .expect("lix_state should be a LixStateProvider");
+        assert!(lix_state.write_stager.is_some());
+
+        let by_version = session
+            .table_provider("lix_state_by_version")
+            .await
+            .expect("lix_state_by_version provider should exist");
+        let by_version = by_version
+            .as_any()
+            .downcast_ref::<LixStateProvider>()
+            .expect("lix_state_by_version should be a LixStateProvider");
+        assert!(by_version.write_stager.is_none());
+    }
+
+    #[tokio::test]
+    async fn insert_into_requires_write_transaction() {
+        let session = SessionContext::new();
+        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let provider = LixStateProvider::active_version("version-a", live_state, None);
+        let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+
+        let error = provider
+            .insert_into(&session.state(), input, InsertOp::Append)
+            .await
+            .expect_err("insert without a write stager should fail");
+
+        assert!(
+            error.to_string().contains("requires a write transaction"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_into_returns_data_sink_exec_with_write_stager() {
+        let session = SessionContext::new();
+        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let write_stager = Arc::new(DummyWriteStager) as Arc<dyn SqlWriteStager>;
+        let provider =
+            LixStateProvider::active_version("version-a", live_state, Some(write_stager));
+        let input = Arc::new(EmptyExec::new(provider.schema())) as Arc<dyn ExecutionPlan>;
+
+        let plan = provider
+            .insert_into(&session.state(), input, InsertOp::Append)
+            .await
+            .expect("insert should produce a write plan");
+
+        assert!(plan.as_any().is::<DataSinkExec>());
+    }
+
+    #[test]
+    fn decodes_lix_state_batch_into_write_rows() {
+        let rows = lix_state_write_rows_from_batch(&one_row_lix_state_batch(false), "version-a")
+            .expect("batch should decode");
+
+        assert_eq!(
+            rows,
+            vec![LixStateWriteRow {
+                entity_id: "entity-1".to_string(),
+                schema_key: "lix_key_value".to_string(),
+                file_id: None,
+                plugin_key: Some("plugin-a".to_string()),
+                snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
+                metadata: Some("{\"source\":\"test\"}".to_string()),
+                schema_version: Some("1".to_string()),
+                created_at: Some("2026-04-23T00:00:00Z".to_string()),
+                updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+                global: false,
+                change_id: Some("change-a".to_string()),
+                commit_id: None,
+                untracked: false,
+                version_id: "version-a".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn decodes_global_lix_state_batch_into_global_version() {
+        let rows = lix_state_write_rows_from_batch(&one_row_lix_state_batch(true), "version-a")
+            .expect("batch should decode");
+
+        assert_eq!(rows[0].version_id, "global");
+        assert!(rows[0].global);
+    }
+
+    #[tokio::test]
+    async fn insert_sink_stages_decoded_lix_state_rows() {
+        let stager = Arc::new(CapturingWriteStager::default());
+        let sink = LixStateInsertSink::new(
+            lix_state_schema(),
+            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            "version-a".to_string(),
+        );
+        let batch = one_row_lix_state_batch(false);
+        let stream = stream::iter(vec![Ok(batch)]);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(lix_state_schema(), stream));
+
+        let count = sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("sink should stage write");
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            stager.writes.lock().expect("writes lock").as_slice(),
+            &[SqlWriteIntent::InsertLixState {
+                rows: vec![LixStateWriteRow {
+                    entity_id: "entity-1".to_string(),
+                    schema_key: "lix_key_value".to_string(),
+                    file_id: None,
+                    plugin_key: Some("plugin-a".to_string()),
+                    snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
+                    metadata: Some("{\"source\":\"test\"}".to_string()),
+                    schema_version: Some("1".to_string()),
+                    created_at: Some("2026-04-23T00:00:00Z".to_string()),
+                    updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+                    global: false,
+                    change_id: Some("change-a".to_string()),
+                    commit_id: None,
+                    untracked: false,
+                    version_id: "version-a".to_string(),
+                }]
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_sink_stages_through_buffered_transaction_delta() {
+        let stager = Arc::new(Mutex::new(CapturingBufferedWriteStager::default()));
+        let sink = LixStateInsertSink::new(
+            lix_state_schema(),
+            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            "version-a".to_string(),
+        );
+        let batch = one_row_stageable_lix_state_batch();
+        let stream = stream::iter(vec![Ok(batch)]);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(lix_state_schema(), stream));
+
+        let count = sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("sink should stage through buffered path");
+
+        assert_eq!(count, 1);
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"hello\",\"value\":\"world\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn insert_plan_returns_datafusion_count_uint64() {
+        let session = SessionContext::new();
+        let live_state = Arc::new(EmptyLiveStateContext) as Arc<dyn LiveStateContext>;
+        let stager = Arc::new(Mutex::new(CapturingBufferedWriteStager::default()));
+        let provider = LixStateProvider::active_version(
+            "version-a",
+            live_state,
+            Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+        );
+        let input = Arc::new(SingleBatchExec::new(one_row_stageable_lix_state_batch()))
+            as Arc<dyn ExecutionPlan>;
+
+        let plan = provider
+            .insert_into(&session.state(), input, InsertOp::Append)
+            .await
+            .expect("insert should produce a write plan");
+        let batches = datafusion::physical_plan::collect(plan, Arc::new(TaskContext::default()))
+            .await
+            .expect("insert write plan should execute");
+
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(batches[0].num_columns(), 1);
+        assert_eq!(batches[0].schema().field(0).name(), "count");
+        assert_eq!(batches[0].schema().field(0).data_type(), &DataType::UInt64);
+        assert!(!batches[0].schema().field(0).is_nullable());
+
+        let count = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("count should be UInt64");
+        assert_eq!(count.value(0), 1);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
     }
 }

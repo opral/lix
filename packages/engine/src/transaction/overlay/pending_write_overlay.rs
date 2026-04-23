@@ -45,6 +45,13 @@ impl PendingWriteOverlay {
     pub(crate) fn semantic_overlay(&self) -> Option<&PendingSemanticOverlay> {
         self.semantic_overlay.as_ref()
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn visible_all_semantic_rows(&self) -> Vec<PendingSemanticRow> {
+        self.semantic_overlay()
+            .map(|overlay| overlay.visible_all_rows().cloned().collect())
+            .unwrap_or_default()
+    }
 }
 
 impl PendingOverlay for PendingWriteOverlay {

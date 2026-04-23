@@ -1,15 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::backend::PreparedBatch;
 use crate::canonical::CanonicalChangeWrite;
 use crate::catalog::{
     builtin_catalog_compiler_facade, CatalogCompilerApi, CatalogWriteTargetKind,
     FilesystemRelationKind, ResolvedRelation,
 };
-use crate::functions::LixFunctionProvider;
+use crate::functions::{LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider};
 use crate::live_state::{SchemaRegistration, SchemaRegistrationSet};
 use crate::sql::{
     coalesce_live_table_requirements, ChangeBatch, ExpectedHead, MutationRow, OptionalTextPatch,
-    PlanEffects, PlannedStateRow, ResultContract, WriteMode,
+    PlanEffects, PlannedStateRow, ResultContract, SchemaLiveTableRequirement, WriteMode,
 };
 use crate::transaction::filesystem::runtime::{
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
@@ -342,6 +343,11 @@ impl PendingFilesystemOverlay {
 }
 
 impl PendingSemanticOverlay {
+    #[allow(dead_code)]
+    pub(crate) fn visible_all_rows(&self) -> impl Iterator<Item = &PendingSemanticRow> {
+        self.rows.values()
+    }
+
     pub(crate) fn visible_rows<'a>(
         &'a self,
         untracked: bool,
@@ -445,6 +451,42 @@ pub(crate) fn build_transaction_write_delta(
     build_planned_write_plan(prepared, function_bindings)
         .map(TransactionWriteDelta::from_materialization_plan)
         .transpose()
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_direct_mutation_transaction_write_delta(
+    mutations: Vec<MutationRow>,
+    origin_key: Option<String>,
+) -> Result<TransactionWriteDelta, LixError> {
+    let function_bindings = PreparedWriteFunctionBindings::new(
+        false,
+        SharedFunctionProvider::new(Box::new(SystemFunctionProvider)),
+    );
+    let live_table_requirements = mutations
+        .iter()
+        .map(|row| SchemaLiveTableRequirement {
+            schema_key: row.schema_key.clone(),
+            schema_definition: None,
+        })
+        .collect::<Vec<_>>();
+    let direct = PreparedDirectWriteArtifact {
+        prepared_batch: PreparedBatch { steps: Vec::new() },
+        live_table_requirements,
+        mutations,
+        has_update_validations: false,
+        should_refresh_file_cache: false,
+        read_only_query: false,
+        filesystem_state: Default::default(),
+        effects: PlanEffects::default(),
+        origin_key,
+    };
+    TransactionWriteDelta::from_materialization_plan(PlannedWritePlan {
+        units: vec![TransactionWriteUnit::Direct(PlannedDirectWriteUnit {
+            execution: direct,
+            result_contract: ResultContract::DmlNoReturning,
+            function_bindings,
+        })],
+    })
 }
 
 fn schema_registrations_for_planned_write_plan(plan: &PlannedWritePlan) -> SchemaRegistrationSet {
@@ -895,7 +937,7 @@ fn collect_semantic_overlay_from_mutation_rows(
                 plugin_key: row.plugin_key.clone(),
                 change_id: None,
                 snapshot_content,
-                metadata: None,
+                metadata: row.metadata.clone(),
                 tombstone: false,
             },
         );

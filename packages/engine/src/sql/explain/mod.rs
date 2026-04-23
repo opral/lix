@@ -520,6 +520,7 @@ pub(crate) struct MutationRowSnapshot {
     pub(crate) version_id: String,
     pub(crate) plugin_key: Option<String>,
     pub(crate) snapshot_content: Option<JsonValue>,
+    pub(crate) metadata: Option<String>,
     pub(crate) untracked: bool,
 }
 
@@ -5669,6 +5670,7 @@ fn mutation_row_snapshot(row: &MutationRow) -> MutationRowSnapshot {
         version_id: row.version_id.clone(),
         plugin_key: row.plugin_key.clone(),
         snapshot_content: row.snapshot_content.clone(),
+        metadata: row.metadata.clone(),
         untracked: row.untracked,
     }
 }

@@ -14,5 +14,8 @@ pub(crate) use datafusion::{
 };
 pub(crate) use entity_view::prepared_entity_view_plans_for_registry;
 #[allow(unused_imports)]
-pub(crate) use execute::{execute_sql, SqlExecutionContext};
+pub(crate) use execute::{
+    execute_sql, stage_decoded_write, LixStateWriteRow, SqlExecutionContext, SqlWriteIntent,
+    SqlWriteOutcome, SqlWriteStager,
+};
 pub(crate) use filesystem_view::prepared_filesystem_view_plans_for_registry;
