@@ -4,9 +4,7 @@ mod change_surface;
 mod declaration;
 mod dependency;
 mod directory;
-mod directory_surface;
 mod file;
-mod file_surface;
 mod filesystem_query;
 mod history_read;
 mod public_surface_registry;
@@ -78,25 +76,11 @@ pub(crate) use directory::{
     builtin_lix_directory_catalog_registration, LixDirectoryByVersionProjection,
 };
 #[allow(unused_imports)]
-pub(crate) use directory_surface::{
-    open_directory_by_version_surface_snapshot,
-    open_directory_by_version_surface_snapshot_with_shared_backend,
-    open_directory_surface_snapshot, DirectorySurfaceColumn, DirectorySurfaceFilter,
-    DirectorySurfaceRow, DirectorySurfaceScanRequest, DirectorySurfaceSnapshot,
-};
-#[allow(unused_imports)]
 pub(crate) use file::LixFileProjection;
 #[allow(unused_imports)]
 pub(crate) use file::{
     builtin_lix_file_by_version_catalog_registration, builtin_lix_file_catalog_registration,
     LixFileByVersionProjection,
-};
-#[allow(unused_imports)]
-pub(crate) use file_surface::{
-    open_file_by_version_surface_snapshot,
-    open_file_by_version_surface_snapshot_with_shared_backend, open_file_surface_snapshot,
-    FileSurfaceColumn, FileSurfaceFilter, FileSurfaceRow, FileSurfaceScanRequest,
-    FileSurfaceSnapshot,
 };
 #[allow(unused_imports)]
 pub(crate) use filesystem_query::*;

@@ -341,7 +341,7 @@ impl PreparedSql2FilesystemViewPlan {
         active_version_id: &str,
         file_winner_provider: Arc<dyn TableProvider>,
         directory_winner_provider: Arc<dyn TableProvider>,
-        file_data_provider: Arc<dyn TableProvider>,
+        blob_winner_provider: Arc<dyn TableProvider>,
     ) -> Result<LogicalPlan, LixError> {
         if !self.public_name.starts_with("lix_file") {
             return Err(LixError::new(
@@ -365,7 +365,7 @@ impl PreparedSql2FilesystemViewPlan {
             )
             .await?,
         )?;
-        register_named_table(ctx, file_data_relation_name, file_data_provider)?;
+        register_named_table(ctx, file_data_relation_name, blob_winner_provider)?;
 
         let file_relation = primary_descriptor_relation(&self.public_name, self.surface_variant);
         let dataframe = ctx
@@ -387,7 +387,7 @@ impl PreparedSql2FilesystemViewPlan {
         active_version_id: &str,
         file_winner_provider: Arc<dyn TableProvider>,
         directory_winner_provider: Arc<dyn TableProvider>,
-        file_data_provider: Arc<dyn TableProvider>,
+        blob_winner_provider: Arc<dyn TableProvider>,
     ) -> Result<Arc<dyn TableProvider>, LixError> {
         Ok(view_provider_from_logical_plan(
             self.compiled_lix_file_logical_plan(
@@ -395,7 +395,7 @@ impl PreparedSql2FilesystemViewPlan {
                 active_version_id,
                 file_winner_provider,
                 directory_winner_provider,
-                file_data_provider,
+                blob_winner_provider,
             )
             .await?,
         ))
@@ -2999,12 +2999,11 @@ mod tests {
             )
             .expect("memtable should build"),
         );
-        let file_data_provider = Arc::new(
+        let blob_provider = Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Utf8, false),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("data", DataType::Binary, true),
                     Field::new("blob_hash", DataType::Utf8, true),
                     Field::new("size_bytes", DataType::Int64, true),
                 ])),
@@ -3023,7 +3022,7 @@ mod tests {
                 "version-a",
                 file_provider,
                 directory_provider,
-                file_data_provider,
+                blob_provider,
             ))
             .expect("file view provider should compile");
         assert!(view_provider.as_any().downcast_ref::<ViewTable>().is_some());
@@ -3090,12 +3089,11 @@ mod tests {
             )
             .expect("memtable should build"),
         );
-        let file_data_provider = Arc::new(
+        let blob_provider = Arc::new(
             MemTable::try_new(
                 Arc::new(Schema::new(vec![
                     Field::new("id", DataType::Utf8, false),
                     Field::new("version_id", DataType::Utf8, false),
-                    Field::new("data", DataType::Binary, true),
                     Field::new("blob_hash", DataType::Utf8, true),
                     Field::new("size_bytes", DataType::Int64, true),
                 ])),
@@ -3114,7 +3112,7 @@ mod tests {
                 "version-a",
                 file_provider,
                 directory_provider,
-                file_data_provider,
+                blob_provider,
             ))
             .expect("file by version view provider should compile");
         assert!(view_provider.as_any().downcast_ref::<ViewTable>().is_some());
