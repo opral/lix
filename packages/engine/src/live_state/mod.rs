@@ -76,7 +76,10 @@ use serde_json::Value as JsonValue;
 pub(crate) use bridge::LiveStateTransactionBridge;
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 #[allow(unused_imports)]
-pub(crate) use context::{CommittedLiveStateContext, LiveStateContext, LiveStateScanRequest};
+pub(crate) use context::{
+    CommittedLiveStateContext, LiveStateContext, LiveStateFilter, LiveStateProjection,
+    LiveStateScanRequest,
+};
 #[cfg(test)]
 pub(crate) use effective::EffectiveRowsResolver;
 pub use effective::{
