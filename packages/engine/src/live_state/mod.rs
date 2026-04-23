@@ -33,6 +33,7 @@ use std::collections::BTreeMap;
 
 mod bridge;
 mod commit_derived;
+mod context;
 pub(crate) mod constraints;
 pub(crate) mod effective;
 mod frontier;
@@ -73,6 +74,8 @@ use crate::{LixError, Value};
 use serde_json::Value as JsonValue;
 
 pub(crate) use bridge::LiveStateTransactionBridge;
+#[allow(unused_imports)]
+pub(crate) use context::{CommittedLiveStateContext, LiveStateContext, LiveStateScanRequest};
 pub use constraints::{Bound, ScanConstraint, ScanField, ScanOperator};
 #[cfg(test)]
 pub(crate) use effective::EffectiveRowsResolver;
