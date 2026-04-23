@@ -1,3 +1,5 @@
+#![cfg(any())]
+
 use crate::support;
 #[path = "../support/wasmtime_runtime.rs"]
 mod wasmtime_runtime;

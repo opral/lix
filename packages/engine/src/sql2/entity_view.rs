@@ -372,7 +372,9 @@ fn json_payload_projection_expr(property_name: &str, column_type: SurfaceColumnT
     match column_type {
         SurfaceColumnType::String => lix_json_extract_text_expr(snapshot_content, property_name),
         SurfaceColumnType::Json => lix_json_extract_json_expr(snapshot_content, property_name),
-        SurfaceColumnType::Variant => lix_json_extract_variant_expr(snapshot_content, property_name),
+        SurfaceColumnType::Variant => {
+            lix_json_extract_variant_expr(snapshot_content, property_name)
+        }
         SurfaceColumnType::Boolean => {
             lix_json_extract_boolean_expr(snapshot_content, property_name)
         }
@@ -410,8 +412,7 @@ mod tests {
     };
     use crate::catalog::{
         build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
-        register_dynamic_entity_surface_spec,
-        SurfaceColumnType,
+        register_dynamic_entity_surface_spec, SurfaceColumnType,
     };
     use crate::live_state::StateSurfaceColumn;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};

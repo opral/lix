@@ -930,6 +930,22 @@ fn lower_filesystem_read_for_execution(
     let Some(filesystem_scan) = canonical_filesystem_scan(&canonicalized.read_command.root) else {
         return Ok(None);
     };
+    if matches!(
+        canonicalized.resolved_relation.descriptor.surface_variant,
+        SurfaceVariant::History
+    ) {
+        let source_sql = format!(
+            "SELECT * FROM {}",
+            render_identifier(&canonicalized.resolved_relation.descriptor.public_name)
+        );
+        return build_lowered_read_batch(
+            dialect,
+            canonicalized,
+            source_sql,
+            canonicalized.query.selection.clone(),
+        )
+        .map(Some);
+    }
     let active_version_id = canonicalized.requested_version_id.as_deref();
     let Some(binding) =
         bind_filesystem_surface_binding(&canonicalized.resolved_relation, active_version_id)?

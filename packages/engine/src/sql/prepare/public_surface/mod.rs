@@ -1823,7 +1823,6 @@ mod tests {
     };
     use crate::catalog::SurfaceReadFreshness;
     use crate::execution::execute_prepared_public_read_artifact_with_backend;
-    use crate::history::{FileHistoryRootScope, FileHistoryVersionScope};
     use crate::live_state::{self, mark_mode_with_backend, LiveStateMode};
     use crate::schema::LixCommit;
     use crate::sql::prepare::prepare_public_read_artifact;
@@ -1835,7 +1834,6 @@ mod tests {
         explain::{
             ExplainPhysicalPlanSnapshot, ExplainPublicReadExecution, ExplainTimingCollector,
         },
-        logical_plan::HistoryReadPlan,
         semantic_ir::StatementContext,
         DependencyPrecision,
     };
@@ -3530,279 +3528,1014 @@ mod tests {
         assert!(!lowered_sql.contains("lix_internal_live_state_status"));
     }
 
-    #[tokio::test]
-    async fn prepares_filesystem_reads_through_internal_projection_sources() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one("SELECT id, path, data FROM lix_file WHERE id = 'file-1'"),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("filesystem read should canonicalize");
+    #[test]
+    fn plain_public_filesystem_projection_reads_prepare_as_sql2_with_filesystem_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-a', '/a.txt', lix_text_encode('a'))",
+                            &[],
+                        )
+                        .await
+                        .expect("first filesystem row write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-b', '/b.txt', lix_text_encode('b'))",
+                            &[],
+                        )
+                        .await
+                        .expect("second filesystem row write should succeed");
 
-        assert_eq!(prepared.resolved_relations(), vec!["lix_file"]);
-        assert!(prepared.effective_state_request().is_none());
-        assert!(prepared.effective_state_plan().is_none());
-        assert_eq!(
-            prepared
-                .dependency_spec()
-                .expect("filesystem dependency spec should be recorded")
-                .schema_keys
-                .iter()
-                .cloned()
-                .collect::<Vec<_>>(),
-            vec![
-                "lix_binary_blob_ref".to_string(),
-                "lix_directory_descriptor".to_string(),
-                "lix_file_descriptor".to_string(),
-            ]
-        );
-        assert!(prepared
-            .dependency_spec()
-            .expect("filesystem dependency spec should be recorded")
-            .query_dependencies
-            .contains(&crate::sql::QueryDependency::ActiveVersion));
-        assert_eq!(
-            prepared
-                .explain
-                .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .residual_predicates
-                .clone(),
-            vec!["id = 'file-1'".to_string()]
-        );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface_name(), "lix_file");
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::LoweredSql(_) => {
-                panic!("filesystem read should use read-time projection execution")
-            }
-            PublicReadPhysicalPlan::HistoryRead(_) => {
-                panic!("filesystem read should not use direct execution")
-            }
-        }
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one("SELECT id, path FROM lix_file ORDER BY path ASC"),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("plain filesystem projection read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("plain filesystem projection read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file"),
+                                "plain filesystem projection read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("plain filesystem projection read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["id".to_string(), "path".to_string()],
+                            rows: vec![
+                                vec![
+                                    Value::Text("file-a".to_string()),
+                                    Value::Text("/a.txt".to_string()),
+                                ],
+                                vec![
+                                    Value::Text("file-b".to_string()),
+                                    Value::Text("/b.txt".to_string()),
+                                ],
+                            ],
+                        }
+                    );
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn prepares_filesystem_by_version_reads_with_residual_version_filter() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT id, path FROM lix_directory_by_version \
-                 WHERE id = 'dir-1' AND lixcol_version_id = 'version-a'",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("filesystem by-version read should canonicalize");
+    #[test]
+    fn public_filesystem_reads_prepare_as_sql2_with_filesystem_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-1', '/src/index.ts', lix_text_encode('hello'))",
+                            &[],
+                        )
+                        .await
+                        .expect("filesystem row write should succeed");
 
-        assert_eq!(
-            prepared.resolved_relations(),
-            vec!["lix_directory_by_version"]
-        );
-        assert!(prepared.effective_state_request().is_none());
-        assert!(prepared.effective_state_plan().is_none());
-        assert_eq!(
-            prepared
-                .explain
-                .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .residual_predicates
-                .clone(),
-            vec![
-                "id = 'dir-1'".to_string(),
-                "lixcol_version_id = 'version-a'".to_string()
-            ]
-        );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::ReadTimeProjection(artifact) => {
-                assert_eq!(artifact.surface_name(), "lix_directory_by_version");
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::LoweredSql(_) => {
-                panic!("filesystem by-version read should use read-time projection execution")
-            }
-            PublicReadPhysicalPlan::HistoryRead(_) => {
-                panic!("filesystem by-version read should not use direct execution")
-            }
-        }
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one("SELECT id, path FROM lix_file WHERE id = 'file-1'"),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("filesystem read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file"),
+                                "filesystem read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("filesystem read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["id".to_string(), "path".to_string()],
+                            rows: vec![vec![
+                                Value::Text("file-1".to_string()),
+                                Value::Text("/src/index.ts".to_string()),
+                            ]],
+                        }
+                    );
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn prepares_filesystem_history_reads_through_internal_history_sources() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT id, path, lixcol_root_commit_id \
-                 FROM lix_file_history \
-                 WHERE id = 'file-1' AND lixcol_root_commit_id = 'commit-1'",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("filesystem history read should canonicalize");
+    #[test]
+    fn public_filesystem_by_version_reads_prepare_as_sql2_with_filesystem_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    let active_version_id = session.active_version_id();
+                    session
+                        .execute(
+                            "INSERT INTO lix_directory_by_version (id, path, parent_id, name, lixcol_version_id) \
+                             VALUES ('dir-1', '/docs/', NULL, 'docs', $1)",
+                            &[Value::Text(active_version_id.clone())],
+                        )
+                        .await
+                        .expect("filesystem by-version row write should succeed");
 
-        assert_eq!(prepared.resolved_relations(), vec!["lix_file_history"]);
-        assert!(prepared.effective_state_request().is_none());
-        assert!(prepared.effective_state_plan().is_none());
-        assert_eq!(
-            prepared
-                .explain
-                .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .accepted_predicates
-                .clone(),
-            vec!["root_commit_id = 'commit-1'".to_string()]
-        );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
-                );
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
-                panic!("filesystem history read should not use directory-history history plan")
-            }
-            PublicReadPhysicalPlan::LoweredSql(_) => {
-                panic!("filesystem history read should not use lowered SQL")
-            }
-            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
-                panic!("filesystem history read should not use read-time projection execution")
-            }
-        }
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, path FROM lix_directory_by_version \
+                             WHERE id = 'dir-1' AND lixcol_version_id = $1",
+                        ),
+                        &[Value::Text(active_version_id.clone())],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("filesystem by-version read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem by-version read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact
+                                    .filesystem_views
+                                    .contains_key("lix_directory_by_version"),
+                                "filesystem by-version read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("filesystem by-version read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["id".to_string(), "path".to_string()],
+                            rows: vec![vec![
+                                Value::Text("dir-1".to_string()),
+                                Value::Text("/docs/".to_string()),
+                            ]],
+                        }
+                    );
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn prepares_filesystem_history_by_version_reads_through_internal_history_sources() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT id, path, lixcol_version_id, lixcol_root_commit_id \
-                 FROM lix_file_history_by_version \
-                 WHERE id = 'file-1' \
-                   AND lixcol_version_id = 'version-a' \
-                   AND lixcol_root_commit_id = 'commit-1'",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("filesystem by-version history read should canonicalize");
+    #[test]
+    fn public_filesystem_reads_filtered_on_visible_file_columns_prepare_as_sql2_with_filesystem_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-visible-filter', '/docs/readme.md', lix_text_encode('hello'))",
+                            &[],
+                        )
+                        .await
+                        .expect("filesystem row write should succeed");
 
-        assert_eq!(
-            prepared.resolved_relations(),
-            vec!["lix_file_history_by_version"]
-        );
-        assert_eq!(
-            prepared
-                .explain
-                .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .accepted_predicates
-                .clone(),
-            vec![
-                "root_commit_id = 'commit-1'".to_string(),
-                "version_id = 'version-a'".to_string()
-            ]
-        );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(plan)) => {
-                assert_eq!(
-                    plan.request.version_scope,
-                    FileHistoryVersionScope::RequestedVersions(vec!["version-a".to_string()])
-                );
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(_)) => {
-                panic!(
-                    "filesystem by-version history read should not use directory-history history plan"
-                )
-            }
-            PublicReadPhysicalPlan::LoweredSql(_) => {
-                panic!("filesystem by-version history read should not use lowered SQL")
-            }
-            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
-                panic!(
-                    "filesystem by-version history read should not use read-time projection execution"
-                )
-            }
-        }
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, path, extension, hidden \
+                             FROM lix_file \
+                             WHERE path = '/docs/readme.md' \
+                               AND name = 'readme' \
+                               AND extension = 'md' \
+                               AND hidden = false",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("filesystem visible-column filter read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect(
+                        "filesystem visible-column filter read should convert to execution artifact",
+                    );
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file"),
+                                "filesystem visible-column filter read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("filesystem visible-column filter read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec![
+                                "id".to_string(),
+                                "path".to_string(),
+                                "extension".to_string(),
+                                "hidden".to_string(),
+                            ],
+                            rows: vec![vec![
+                                Value::Text("file-visible-filter".to_string()),
+                                Value::Text("/docs/readme.md".to_string()),
+                                Value::Text("md".to_string()),
+                                Value::Boolean(false),
+                            ]],
+                        }
+                    );
+                })
+        });
     }
 
-    #[tokio::test]
-    async fn prepares_directory_history_reads_through_internal_history_sources() {
-        let backend = FakeBackend::default();
-        let prepared = prepare_public_read(
-            &backend,
-            &parse_one(
-                "SELECT id, path, lixcol_root_commit_id \
-                 FROM lix_directory_history \
-                 WHERE id = 'dir-1' AND lixcol_root_commit_id = 'commit-1'",
-            ),
-            &[],
-            "main",
-            None,
-        )
-        .await
-        .expect("directory history read should canonicalize");
+    #[test]
+    fn public_filesystem_reads_filtered_on_visible_directory_columns_prepare_as_sql2_with_filesystem_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_directory (id, path, parent_id, name) \
+                             VALUES ('dir-visible-filter', '/docs/', NULL, 'docs')",
+                            &[],
+                        )
+                        .await
+                        .expect("directory row write should succeed");
 
-        assert_eq!(prepared.resolved_relations(), vec!["lix_directory_history"]);
-        assert_eq!(
-            prepared
-                .explain
-                .compiled_artifacts
-                .pushdown
-                .as_ref()
-                .expect("pushdown trace should be recorded")
-                .accepted_predicates
-                .clone(),
-            vec![
-                "root_commit_id = 'commit-1'".to_string(),
-                "id = 'dir-1'".to_string()
-            ]
-        );
-        match &prepared.execution {
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::DirectoryHistory(plan)) => {
-                assert_eq!(
-                    plan.request.root_scope,
-                    FileHistoryRootScope::RequestedRoots(vec!["commit-1".to_string()])
-                );
-                assert_eq!(plan.request.directory_ids, vec!["dir-1".to_string()]);
-                assert!(prepared.explain.compiled_artifacts.lowered_sql.is_empty());
-            }
-            PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(_)) => {
-                panic!("directory history read should not use file-history history plan")
-            }
-            PublicReadPhysicalPlan::LoweredSql(_) => {
-                panic!("directory history read should not use lowered SQL")
-            }
-            PublicReadPhysicalPlan::ReadTimeProjection(_) => {
-                panic!("directory history read should not use read-time projection execution")
-            }
-        }
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, path, name, hidden \
+                             FROM lix_directory \
+                             WHERE path = '/docs/' \
+                               AND name = 'docs' \
+                               AND hidden = false",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("directory visible-column filter read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect(
+                        "directory visible-column filter read should convert to execution artifact",
+                    );
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_directory"),
+                                "directory visible-column filter read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("directory visible-column filter read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec![
+                                "id".to_string(),
+                                "path".to_string(),
+                                "name".to_string(),
+                                "hidden".to_string(),
+                            ],
+                            rows: vec![vec![
+                                Value::Text("dir-visible-filter".to_string()),
+                                Value::Text("/docs/".to_string()),
+                                Value::Text("docs".to_string()),
+                                Value::Boolean(false),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_filesystem_reads_filtered_on_exposed_lixcol_state_columns_prepare_as_sql2_with_filesystem_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-lixcol-filter', '/lixcol-filter.txt', lix_text_encode('hello'))",
+                            &[],
+                        )
+                        .await
+                        .expect("filesystem row write should succeed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT id, lixcol_entity_id, lixcol_untracked \
+                             FROM lix_file \
+                             WHERE lixcol_entity_id = 'file-lixcol-filter' \
+                               AND lixcol_untracked = false",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("filesystem lixcol filter read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem lixcol filter read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file"),
+                                "filesystem lixcol filter read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("filesystem lixcol filter read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec![
+                                "id".to_string(),
+                                "lixcol_entity_id".to_string(),
+                                "lixcol_untracked".to_string(),
+                            ],
+                            rows: vec![vec![
+                                Value::Text("file-lixcol-filter".to_string()),
+                                Value::Text("file-lixcol-filter".to_string()),
+                                Value::Boolean(false),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn mixed_public_queries_joining_file_and_directory_surfaces_prepare_as_sql2_with_filesystem_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_directory (id, path, parent_id, name) \
+                             VALUES ('dir-join', '/docs/', NULL, 'docs')",
+                            &[],
+                        )
+                        .await
+                        .expect("directory row write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-join', '/docs/readme.md', lix_text_encode('hello'))",
+                            &[],
+                        )
+                        .await
+                        .expect("file row write should succeed");
+
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(
+                            "SELECT f.id AS file_id, d.id AS directory_id \
+                             FROM lix_file f \
+                             JOIN lix_directory d ON f.directory_id = d.id \
+                             WHERE f.path = '/docs/readme.md' \
+                               AND d.path = '/docs/'",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("filesystem join read should prepare")
+                    .expect("filesystem join read should lower through sql2");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem join read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file")
+                                    && sql2.artifact.filesystem_views.contains_key("lix_directory"),
+                                "filesystem join read should carry compiled filesystem views"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("filesystem join read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["file_id".to_string(), "directory_id".to_string()],
+                            rows: vec![vec![
+                                Value::Text("file-join".to_string()),
+                                Value::Text("dir-join".to_string()),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn mixed_public_queries_joining_filesystem_with_state_and_entity_surfaces_prepare_as_sql2_with_views(
+    ) {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_registered_schema (value) VALUES (lix_json($1))",
+                            &[Value::Json(json!({
+                                "x-lix-key": "message",
+                                "x-lix-version": "1",
+                                "x-lix-primary-key": ["/id"],
+                                "type": "object",
+                                "properties": {
+                                    "id": { "type": "string" },
+                                    "file_path": { "type": "string" }
+                                },
+                                "required": ["id", "file_path"],
+                                "additionalProperties": false
+                            }))],
+                        )
+                        .await
+                        .expect("schema registration write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('file-mixed-view', '/docs/mixed.md', lix_text_encode('hello'))",
+                            &[],
+                        )
+                        .await
+                        .expect("file row write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO message (id, file_path) VALUES ('m1', '/docs/mixed.md')",
+                            &[],
+                        )
+                        .await
+                        .expect("entity row write should succeed");
+
+                    let prepared = prepare_public_read_strict(
+                        &backend,
+                        &parse_one(
+                            "SELECT m.file_path AS file_path, st.entity_id AS entity_id \
+                             FROM lix_file f \
+                             JOIN lix_state st ON f.lixcol_entity_id = st.entity_id \
+                             JOIN message m ON f.path = m.file_path \
+                             WHERE st.schema_key = 'lix_file_descriptor'",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("mixed filesystem/state/entity read should prepare")
+                    .expect("mixed filesystem/state/entity read should lower through sql2");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect(
+                        "mixed filesystem/state/entity read should convert to execution artifact",
+                    );
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file")
+                                    && sql2.artifact.entity_views.contains_key("message"),
+                                "mixed filesystem/state/entity read should carry compiled views"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("mixed filesystem/state/entity read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["file_path".to_string(), "entity_id".to_string()],
+                            rows: vec![vec![
+                                Value::Text("/docs/mixed.md".to_string()),
+                                Value::Text("file-mixed-view".to_string()),
+                            ]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn public_filesystem_aggregate_reads_prepare_as_sql2_with_filesystem_views() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session) = boot_real_backend().await;
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('count-a', '/docs/a.txt', lix_text_encode('a'))",
+                            &[],
+                        )
+                        .await
+                        .expect("first aggregate row write should succeed");
+                    session
+                        .execute(
+                            "INSERT INTO lix_file (id, path, data) \
+                             VALUES ('count-b', '/docs/b.txt', lix_text_encode('b'))",
+                            &[],
+                        )
+                        .await
+                        .expect("second aggregate row write should succeed");
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(
+                            "SELECT COUNT(*) AS total FROM lix_file WHERE path LIKE '/docs/%'",
+                        ),
+                        &[],
+                        &session.active_version_id(),
+                        None,
+                    )
+                    .await
+                    .expect("filesystem aggregate read should prepare");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem aggregate read should convert to execution artifact");
+
+                    match &artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(
+                                sql2.artifact.filesystem_views.contains_key("lix_file"),
+                                "filesystem aggregate read should carry a compiled filesystem view"
+                            );
+                        }
+                        other => panic!("expected sql2 execution artifact, got {other:?}"),
+                    }
+
+                    let actual = execute_prepared_public_read_artifact_with_backend(
+                        &backend,
+                        &BuiltinReadExecutionHost,
+                        &artifact,
+                    )
+                    .await
+                    .expect("filesystem aggregate read should execute through sql2");
+
+                    assert_eq!(
+                        actual,
+                        crate::QueryResult {
+                            columns: vec!["total".to_string()],
+                            rows: vec![vec![Value::Integer(2)]],
+                        }
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn prepares_filesystem_history_reads_through_internal_history_sources() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT id, path, lixcol_root_commit_id \
+                             FROM lix_file_history \
+                             WHERE id = 'file-1' AND lixcol_root_commit_id = '{}'",
+                            active_commit_id
+                        )),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("filesystem history read should canonicalize");
+
+                    assert_eq!(prepared.resolved_relations(), vec!["lix_file_history"]);
+                    assert!(prepared.effective_state_request().is_none());
+                    assert!(prepared.effective_state_plan().is_none());
+                    assert!(
+                        prepared
+                            .explain
+                            .compiled_artifacts
+                            .pushdown
+                            .as_ref()
+                            .map(|pushdown| pushdown.accepted_predicates.is_empty())
+                            .unwrap_or(true),
+                        "filesystem history read should not rely on the removed direct-history pushdown trace"
+                    );
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("filesystem history read should lower through sql2");
+                    assert!(lowered_sql.contains("FROM lix_file_history"));
+                    assert!(lowered_sql.contains(&active_commit_id));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem history read should convert to execution artifact");
+                    match artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(sql2.artifact.filesystem_views.contains_key("lix_file_history"));
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::HistoryRead(_) => {
+                            panic!("filesystem history read should not use history-read artifact")
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::PreparedBatch(_) => {
+                            panic!("filesystem history read should not use prepared-batch artifact")
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::ReadTimeProjection(_) => {
+                            panic!(
+                                "filesystem history read should not use read-time projection artifact"
+                            )
+                        }
+                    }
+                })
+        });
+    }
+
+    #[test]
+    fn prepares_filesystem_history_by_version_reads_through_internal_history_sources() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT id, path, lixcol_version_id, lixcol_root_commit_id \
+                             FROM lix_file_history_by_version \
+                             WHERE id = 'file-1' \
+                               AND lixcol_version_id = 'version-a' \
+                               AND lixcol_root_commit_id = '{}'",
+                            active_commit_id
+                        )),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("filesystem by-version history read should canonicalize");
+
+                    assert_eq!(
+                        prepared.resolved_relations(),
+                        vec!["lix_file_history_by_version"]
+                    );
+                    assert!(
+                        prepared
+                            .explain
+                            .compiled_artifacts
+                            .pushdown
+                            .as_ref()
+                            .map(|pushdown| pushdown.accepted_predicates.is_empty())
+                            .unwrap_or(true),
+                        "filesystem by-version history read should not rely on the removed direct-history pushdown trace"
+                    );
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("filesystem by-version history read should lower through sql2");
+                    assert!(lowered_sql.contains("FROM lix_file_history_by_version"));
+                    assert!(lowered_sql.contains(&active_commit_id));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("filesystem by-version history read should convert to execution artifact");
+                    match artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(sql2
+                                .artifact
+                                .filesystem_views
+                                .contains_key("lix_file_history_by_version"));
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::HistoryRead(_) => {
+                            panic!("filesystem by-version history read should not use history-read artifact")
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::PreparedBatch(_) => {
+                            panic!("filesystem by-version history read should not use prepared-batch artifact")
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::ReadTimeProjection(_) => {
+                            panic!(
+                                "filesystem by-version history read should not use read-time projection artifact"
+                            )
+                        }
+                    }
+                })
+        });
+    }
+
+    #[test]
+    fn prepares_directory_history_reads_through_internal_history_sources() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT id, path, lixcol_root_commit_id \
+                             FROM lix_directory_history \
+                             WHERE id = 'dir-1' AND lixcol_root_commit_id = '{}'",
+                            active_commit_id
+                        )),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("directory history read should canonicalize");
+
+                    assert_eq!(prepared.resolved_relations(), vec!["lix_directory_history"]);
+                    assert!(
+                        prepared
+                            .explain
+                            .compiled_artifacts
+                            .pushdown
+                            .as_ref()
+                            .map(|pushdown| pushdown.accepted_predicates.is_empty())
+                            .unwrap_or(true),
+                        "directory history read should not rely on the removed direct-history pushdown trace"
+                    );
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("directory history read should lower through sql2");
+                    assert!(lowered_sql.contains("FROM lix_directory_history"));
+                    assert!(lowered_sql.contains(&active_commit_id));
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect("directory history read should convert to execution artifact");
+                    match artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(sql2
+                                .artifact
+                                .filesystem_views
+                                .contains_key("lix_directory_history"));
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::HistoryRead(_) => {
+                            panic!("directory history read should not use history-read artifact")
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::PreparedBatch(_) => {
+                            panic!("directory history read should not use prepared-batch artifact")
+                        }
+                        crate::sql::PreparedPublicReadPlanArtifact::ReadTimeProjection(_) => {
+                            panic!(
+                                "directory history read should not use read-time projection artifact"
+                            )
+                        }
+                    }
+                })
+        });
     }
 
     #[test]
@@ -3831,26 +4564,93 @@ mod tests {
                     .await
                     .expect("filesystem history read should canonicalize");
 
-                    match &prepared.execution {
-                        PublicReadPhysicalPlan::HistoryRead(HistoryReadPlan::FileHistory(
-                            plan,
-                        )) => {
-                            assert_eq!(
-                                plan.request.root_scope,
-                                FileHistoryRootScope::RequestedRoots(vec![active_commit_id])
-                            );
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("filesystem history read should lower through sql2");
+                    assert!(
+                        lowered_sql.contains(&active_commit_id),
+                        "filesystem history read should bind the active root commit into lowered sql"
+                    );
+                })
+        });
+    }
+
+    #[test]
+    fn preserves_explicit_root_commit_for_filesystem_history_reads() {
+        run_with_large_stack(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(async move {
+                    let (backend, session, active_version_id, active_commit_id) =
+                        active_version_fixture().await;
+                    let explicit_root_commit_id = "root-explicit-filesystem-history";
+
+                    let prepared = prepare_public_read(
+                        &backend,
+                        &parse_one(&format!(
+                            "SELECT id, lixcol_root_commit_id, lixcol_depth \
+                             FROM lix_file_history \
+                             WHERE id = 'file-1' \
+                               AND lixcol_root_commit_id = '{}' \
+                             ORDER BY lixcol_depth ASC",
+                            explicit_root_commit_id
+                        )),
+                        &[],
+                        &active_version_id,
+                        None,
+                    )
+                    .await
+                    .expect("filesystem history read with explicit root should canonicalize");
+
+                    assert!(matches!(
+                        prepared.execution,
+                        PublicReadPhysicalPlan::LoweredSql(_)
+                    ));
+                    let lowered_sql = prepared
+                        .explain
+                        .compiled_artifacts
+                        .lowered_sql
+                        .first()
+                        .expect("filesystem history read should lower through sql2");
+                    assert!(
+                        lowered_sql.contains(explicit_root_commit_id),
+                        "filesystem history read should preserve the explicit root commit in lowered sql"
+                    );
+                    assert!(
+                        !lowered_sql.contains(&active_commit_id),
+                        "filesystem history read should not replace the explicit root with the active root commit"
+                    );
+
+                    let artifact = prepare_public_read_artifact(
+                        &prepared,
+                        &session.public_surface_registry(),
+                        backend.dialect(),
+                    )
+                    .expect(
+                        "filesystem history read with explicit root should convert to execution artifact",
+                    );
+                    match artifact.execution {
+                        crate::sql::PreparedPublicReadPlanArtifact::Sql2(sql2) => {
+                            assert!(sql2.artifact.filesystem_views.contains_key("lix_file_history"));
                         }
-                        PublicReadPhysicalPlan::HistoryRead(
-                            HistoryReadPlan::DirectoryHistory(_),
-                        ) => {
-                            panic!("filesystem history read should not use directory-history history plan")
+                        crate::sql::PreparedPublicReadPlanArtifact::HistoryRead(_) => {
+                            panic!("filesystem history read with explicit root should not use history-read artifact")
                         }
-                        PublicReadPhysicalPlan::LoweredSql(_) => {
-                            panic!("filesystem history read should not use lowered SQL")
+                        crate::sql::PreparedPublicReadPlanArtifact::PreparedBatch(_) => {
+                            panic!("filesystem history read with explicit root should not use prepared-batch artifact")
                         }
-                        PublicReadPhysicalPlan::ReadTimeProjection(_) => {
+                        crate::sql::PreparedPublicReadPlanArtifact::ReadTimeProjection(_) => {
                             panic!(
-                                "filesystem history read should not use read-time projection execution"
+                                "filesystem history read with explicit root should not use read-time projection artifact"
                             )
                         }
                     }
