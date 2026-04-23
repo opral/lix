@@ -35,6 +35,7 @@ pub fn coalesce_live_table_requirements(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MutationOperation {
     Insert,
+    Delete,
 }
 
 #[derive(Debug, Clone, PartialEq)]

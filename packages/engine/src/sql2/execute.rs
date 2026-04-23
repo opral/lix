@@ -14,7 +14,7 @@ use crate::transaction::{
 };
 use crate::{LixError, QueryResult, Value};
 
-use super::entity_views::register_entity_views;
+use super::entity_provider::register_entity_providers;
 use super::lix_directory_views::register_lix_directory_views;
 use super::lix_file_views::register_lix_file_views;
 use super::lix_state_provider::register_lix_state_providers;
@@ -42,6 +42,7 @@ pub(crate) trait SqlExecutionContext {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqlWriteIntent {
     InsertLixState { rows: Vec<LixStateWriteRow> },
+    DeleteLixState { rows: Vec<LixStateWriteRow> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,7 +104,17 @@ pub(crate) fn stage_decoded_write(
             let count = rows.len() as u64;
             let mutations = rows
                 .into_iter()
-                .map(mutation_row_from_lix_state_write_row)
+                .map(|row| mutation_row_from_lix_state_write_row(row, MutationOperation::Insert))
+                .collect::<Result<Vec<_>, _>>()?;
+            let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
+            stager.stage_transaction_write_delta(delta)?;
+            Ok(SqlWriteOutcome { count })
+        }
+        SqlWriteIntent::DeleteLixState { rows } => {
+            let count = rows.len() as u64;
+            let mutations = rows
+                .into_iter()
+                .map(|row| mutation_row_from_lix_state_write_row(row, MutationOperation::Delete))
                 .collect::<Result<Vec<_>, _>>()?;
             let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
             stager.stage_transaction_write_delta(delta)?;
@@ -112,7 +123,10 @@ pub(crate) fn stage_decoded_write(
     }
 }
 
-fn mutation_row_from_lix_state_write_row(row: LixStateWriteRow) -> Result<MutationRow, LixError> {
+fn mutation_row_from_lix_state_write_row(
+    row: LixStateWriteRow,
+    operation: MutationOperation,
+) -> Result<MutationRow, LixError> {
     reject_read_only_lix_state_insert_field("created_at", &row.created_at)?;
     reject_read_only_lix_state_insert_field("updated_at", &row.updated_at)?;
     reject_read_only_lix_state_insert_field("change_id", &row.change_id)?;
@@ -123,20 +137,23 @@ fn mutation_row_from_lix_state_write_row(row: LixStateWriteRow) -> Result<Mutati
             "INSERT into lix_state requires schema_version before staging",
         )
     })?;
-    let snapshot_content = row
-        .snapshot_content
-        .map(|snapshot| {
-            serde_json::from_str::<JsonValue>(&snapshot).map_err(|error| {
-                LixError::new(
-                    "LIX_ERROR_UNKNOWN",
-                    format!("INSERT into lix_state has invalid snapshot_content JSON: {error}"),
-                )
+    let snapshot_content = if operation == MutationOperation::Delete {
+        None
+    } else {
+        row.snapshot_content
+            .map(|snapshot| {
+                serde_json::from_str::<JsonValue>(&snapshot).map_err(|error| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("INSERT into lix_state has invalid snapshot_content JSON: {error}"),
+                    )
+                })
             })
-        })
-        .transpose()?;
+            .transpose()?
+    };
 
     Ok(MutationRow {
-        operation: MutationOperation::Insert,
+        operation,
         entity_id: row.entity_id,
         schema_key: row.schema_key,
         schema_version,
@@ -191,8 +208,11 @@ pub(crate) async fn execute_sql(
         ctx.blob_reader(),
     )
     .await?;
-    register_entity_views(
+    register_entity_providers(
         &session,
+        ctx.active_version_id(),
+        ctx.live_state(),
+        ctx.write_stager(),
         &ctx.list_visible_schemas(ctx.active_version_id())?,
     )
     .await?;
@@ -331,6 +351,9 @@ mod tests {
 
     struct DummyBlobReader;
     struct DummyLiveStateContext;
+    struct RowsLiveStateContext {
+        rows: Vec<LiveRow>,
+    }
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
     #[derive(Default)]
     struct CapturingPreparedWriteStager {
@@ -398,6 +421,20 @@ mod tests {
     }
 
     #[async_trait]
+    impl LiveStateContext for RowsLiveStateContext {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn load_exact(
+            &self,
+            _request: &ExactRowRequest,
+        ) -> Result<Option<LiveRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    #[async_trait]
     impl BlobDataReader for DummyBlobReader {
         async fn load_blob_data_by_hash(
             &self,
@@ -433,6 +470,44 @@ mod tests {
             commit_id: None,
             untracked: false,
             version_id: "version-a".to_string(),
+        }
+    }
+
+    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            schema_key: "lix_key_value".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
+            metadata: metadata.map(ToOwned::to_owned),
+            schema_version: "1".to_string(),
+            version_id: "version-a".to_string(),
+            change_id: Some(format!("change-{entity_id}")),
+            commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: Some("2026-04-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
+        }
+    }
+
+    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            schema_key: "test_state_schema".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some(format!("{{\"value\":\"{value}\"}}")),
+            metadata: Some(format!("{{\"source\":\"{entity_id}\"}}")),
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            change_id: Some(format!("change-{entity_id}")),
+            commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: Some("2026-04-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
         }
     }
 
@@ -482,6 +557,33 @@ mod tests {
             "unexpected error: {error:?}"
         );
         assert!(stager.deltas.is_empty());
+    }
+
+    #[test]
+    fn stage_decoded_write_stages_lix_state_delete_in_buffered_delta() {
+        let mut stager = CapturingPreparedWriteStager::default();
+        let mut row = minimal_lix_state_write_row();
+        row.snapshot_content = None;
+        row.metadata = Some("{\"source\":\"delete\"}".to_string());
+
+        let outcome = stage_decoded_write(
+            &mut stager,
+            SqlWriteIntent::DeleteLixState { rows: vec![row] },
+        )
+        .expect("delete intent should stage");
+
+        assert_eq!(outcome.count, 1);
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert!(rows[0].tombstone);
+        assert_eq!(rows[0].snapshot_content, None);
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"delete\"}"));
     }
 
     #[tokio::test]
@@ -635,6 +737,295 @@ mod tests {
             Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
         );
         assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_entity_by_version_stages_write() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO test_state_schema_by_version (\
+             lixcol_entity_id, lixcol_version_id, value\
+             ) VALUES ('entity-c', 'version-b', 'C')",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO entity by-version surface should stage write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-c");
+        assert_eq!(rows[0].schema_version, "1");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"C\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_active_entity_defaults_active_version() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO test_state_schema (lixcol_entity_id, value) \
+             VALUES ('entity-c', 'C')",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO active entity surface should stage write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-c");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"C\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_entity_surface_stages_rewritten_snapshot() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_entity_row("entity-a", "version-a", "A"),
+                live_entity_row("entity-b", "version-a", "B"),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "UPDATE test_state_schema \
+             SET value = 'updated', lixcol_metadata = '{\"source\":\"entity-update\"}' \
+             WHERE value = 'A'",
+            &[],
+        )
+        .await
+        .expect("UPDATE entity surface should stage rewritten row");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "test_state_schema");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-a");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"value\":\"updated\"}")
+        );
+        assert_eq!(
+            rows[0].metadata.as_deref(),
+            Some("{\"source\":\"entity-update\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_entity_by_version_stages_tombstone() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_entity_row("entity-a", "version-a", "A"),
+                live_entity_row("entity-b", "version-b", "B"),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "DELETE FROM test_state_schema_by_version \
+             WHERE lixcol_version_id = 'version-b'",
+            &[],
+        )
+        .await
+        .expect("DELETE entity by-version surface should stage tombstone");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-b");
+        assert_eq!(rows[0].version_id, "version-b");
+        assert!(rows[0].tombstone);
+        assert_eq!(rows[0].snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_lix_state_stages_rewritten_rows() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_lix_state_row("entity-1", Some("{\"source\":\"match\"}")),
+                live_lix_state_row("entity-2", Some("{\"source\":\"skip\"}")),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "UPDATE lix_state \
+             SET snapshot_content = '{\"key\":\"hello\",\"value\":\"updated\"}', \
+                 metadata = schema_key \
+             WHERE metadata = '{\"source\":\"match\"}'",
+            &[],
+        )
+        .await
+        .expect("UPDATE lix_state should stage rewritten rows");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"hello\",\"value\":\"updated\"}")
+        );
+        assert_eq!(rows[0].metadata.as_deref(), Some("lix_key_value"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_delete_lix_state_without_where_stages_all_rows() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![
+                live_lix_state_row("entity-1", Some("{\"source\":\"one\"}")),
+                live_lix_state_row("entity-2", Some("{\"source\":\"two\"}")),
+            ],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(&ctx, "DELETE FROM lix_state", &[])
+            .await
+            .expect("DELETE FROM lix_state should follow DataFusion delete-all semantics");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(2)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_all_semantic_rows();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.tombstone));
+        assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
+        assert!(rows.iter().any(|row| row.entity_id == "entity-1"));
+        assert!(rows.iter().any(|row| row.entity_id == "entity-2"));
     }
 
     struct BackendSqlExecutionContext<'a> {
