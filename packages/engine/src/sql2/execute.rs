@@ -2,10 +2,16 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
 use datafusion::prelude::SessionContext;
 use serde_json::Value as JsonValue;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
 use crate::live_state::LiveStateContext;
+use crate::sql::{MutationOperation, MutationRow};
+use crate::transaction::{
+    build_direct_mutation_transaction_write_delta, PreparedWriteStatementStager,
+};
 use crate::{LixError, QueryResult, Value};
 
 use super::entity_views::register_entity_views;
@@ -27,7 +33,133 @@ pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateContext>;
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
+    fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
+        None
+    }
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SqlWriteIntent {
+    InsertLixState { rows: Vec<LixStateWriteRow> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LixStateWriteRow {
+    pub(crate) entity_id: String,
+    pub(crate) schema_key: String,
+    pub(crate) file_id: Option<String>,
+    pub(crate) plugin_key: Option<String>,
+    pub(crate) snapshot_content: Option<String>,
+    pub(crate) metadata: Option<String>,
+    pub(crate) schema_version: Option<String>,
+    pub(crate) created_at: Option<String>,
+    pub(crate) updated_at: Option<String>,
+    pub(crate) global: bool,
+    pub(crate) change_id: Option<String>,
+    pub(crate) commit_id: Option<String>,
+    pub(crate) untracked: bool,
+    pub(crate) version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SqlWriteOutcome {
+    pub(crate) count: u64,
+}
+
+/// Execution-scoped authority for staging SQL writes into the current Lix
+/// transaction.
+///
+/// `LiveStateContext` stays read-only and visibility-oriented. Write execution
+/// plans use this boundary to stage mutations through the transaction pipeline.
+#[async_trait]
+#[allow(dead_code)]
+pub(crate) trait SqlWriteStager: Send + Sync {
+    async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError>;
+}
+
+#[async_trait]
+impl<T> SqlWriteStager for Mutex<T>
+where
+    T: PreparedWriteStatementStager + Send + 'static,
+{
+    async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+        let mut stager = self.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire buffered write stager lock",
+            )
+        })?;
+        stage_decoded_write(&mut *stager, write)
+    }
+}
+
+pub(crate) fn stage_decoded_write(
+    stager: &mut dyn PreparedWriteStatementStager,
+    write: SqlWriteIntent,
+) -> Result<SqlWriteOutcome, LixError> {
+    match write {
+        SqlWriteIntent::InsertLixState { rows } => {
+            let count = rows.len() as u64;
+            let mutations = rows
+                .into_iter()
+                .map(mutation_row_from_lix_state_write_row)
+                .collect::<Result<Vec<_>, _>>()?;
+            let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
+            stager.stage_transaction_write_delta(delta)?;
+            Ok(SqlWriteOutcome { count })
+        }
+    }
+}
+
+fn mutation_row_from_lix_state_write_row(row: LixStateWriteRow) -> Result<MutationRow, LixError> {
+    reject_read_only_lix_state_insert_field("created_at", &row.created_at)?;
+    reject_read_only_lix_state_insert_field("updated_at", &row.updated_at)?;
+    reject_read_only_lix_state_insert_field("change_id", &row.change_id)?;
+    reject_read_only_lix_state_insert_field("commit_id", &row.commit_id)?;
+    let schema_version = row.schema_version.ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "INSERT into lix_state requires schema_version before staging",
+        )
+    })?;
+    let snapshot_content = row
+        .snapshot_content
+        .map(|snapshot| {
+            serde_json::from_str::<JsonValue>(&snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("INSERT into lix_state has invalid snapshot_content JSON: {error}"),
+                )
+            })
+        })
+        .transpose()?;
+
+    Ok(MutationRow {
+        operation: MutationOperation::Insert,
+        entity_id: row.entity_id,
+        schema_key: row.schema_key,
+        schema_version,
+        file_id: row.file_id,
+        version_id: row.version_id,
+        plugin_key: row.plugin_key,
+        snapshot_content,
+        metadata: row.metadata,
+        untracked: row.untracked,
+    })
+}
+
+fn reject_read_only_lix_state_insert_field(
+    field_name: &str,
+    value: &Option<String>,
+) -> Result<(), LixError> {
+    if value.is_some() {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("INSERT into lix_state cannot stage read-only column '{field_name}'"),
+        ));
+    }
+    Ok(())
 }
 
 /// Minimal top-level sql2 entrypoint.
@@ -44,7 +176,13 @@ pub(crate) async fn execute_sql(
 ) -> Result<QueryResult, LixError> {
     let session = SessionContext::new();
     register_sql2_udfs(&session);
-    register_lix_state_providers(&session, ctx.active_version_id(), ctx.live_state()).await?;
+    register_lix_state_providers(
+        &session,
+        ctx.active_version_id(),
+        ctx.live_state(),
+        ctx.write_stager(),
+    )
+    .await?;
     register_lix_directory_views(&session, ctx.active_version_id()).await?;
     register_lix_file_views(
         &session,
@@ -173,28 +311,38 @@ fn scalar_value_to_lix_value(value: &ScalarValue) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
     use serde_json::json;
     use serde_json::Value as JsonValue;
 
-    use super::{execute_sql, SqlExecutionContext};
+    use super::{
+        execute_sql, stage_decoded_write, LixStateWriteRow, SqlExecutionContext, SqlWriteIntent,
+        SqlWriteStager,
+    };
     use crate::binary_cas::BlobDataReader;
     use crate::live_state::{
         CommittedLiveStateContext, ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest,
     };
     use crate::test_support::boot_test_engine;
+    use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{CreateVersionOptions, LixError, Value};
 
     struct DummyBlobReader;
     struct DummyLiveStateContext;
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
+    #[derive(Default)]
+    struct CapturingPreparedWriteStager {
+        deltas: Vec<TransactionWriteDelta>,
+        refresh_pending: bool,
+    }
 
     struct DummySqlExecutionContext<'a> {
         active_version_id: &'a str,
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateContext>,
+        write_stager: Option<Arc<dyn SqlWriteStager>>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -211,9 +359,27 @@ mod tests {
             Arc::clone(&self.blob_reader)
         }
 
+        fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
+            self.write_stager.as_ref().map(Arc::clone)
+        }
+
         fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
             let _ = version_id;
             Ok(self.schema_definitions.clone())
+        }
+    }
+
+    impl PreparedWriteStatementStager for CapturingPreparedWriteStager {
+        fn mark_public_surface_registry_refresh_pending(&mut self) {
+            self.refresh_pending = true;
+        }
+
+        fn stage_transaction_write_delta(
+            &mut self,
+            delta: TransactionWriteDelta,
+        ) -> Result<(), LixError> {
+            self.deltas.push(delta);
+            Ok(())
         }
     }
 
@@ -251,6 +417,91 @@ mod tests {
         }
     }
 
+    fn minimal_lix_state_write_row() -> LixStateWriteRow {
+        LixStateWriteRow {
+            entity_id: "entity-1".to_string(),
+            schema_key: "lix_key_value".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some("{\"key\":\"hello\",\"value\":\"world\"}".to_string()),
+            metadata: None,
+            schema_version: Some("1".to_string()),
+            created_at: None,
+            updated_at: None,
+            global: false,
+            change_id: None,
+            commit_id: None,
+            untracked: false,
+            version_id: "version-a".to_string(),
+        }
+    }
+
+    #[test]
+    fn stage_decoded_write_stages_lix_state_insert_in_buffered_delta() {
+        let mut stager = CapturingPreparedWriteStager::default();
+        let mut row = minimal_lix_state_write_row();
+        row.metadata = Some("{\"source\":\"sql\"}".to_string());
+
+        let outcome = stage_decoded_write(
+            &mut stager,
+            SqlWriteIntent::InsertLixState { rows: vec![row] },
+        )
+        .expect("write intent should stage");
+
+        assert_eq!(outcome.count, 1);
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].schema_version, "1");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"hello\",\"value\":\"world\"}")
+        );
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
+    }
+
+    #[test]
+    fn stage_decoded_write_rejects_read_only_lix_state_columns() {
+        let mut row = minimal_lix_state_write_row();
+        row.change_id = Some("change-a".to_string());
+        let mut stager = CapturingPreparedWriteStager::default();
+
+        let error = stage_decoded_write(
+            &mut stager,
+            SqlWriteIntent::InsertLixState { rows: vec![row] },
+        )
+        .expect_err("read-only fields should be rejected");
+
+        assert!(
+            error.description.contains("read-only column 'change_id'"),
+            "unexpected error: {error:?}"
+        );
+        assert!(stager.deltas.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mutex_prepared_write_stager_implements_sql_write_stager() {
+        let stager = Mutex::new(CapturingPreparedWriteStager::default());
+
+        let outcome = stager
+            .stage_write(SqlWriteIntent::InsertLixState {
+                rows: vec![minimal_lix_state_write_row()],
+            })
+            .await
+            .expect("mutex stager should bridge into buffered staging");
+
+        assert_eq!(outcome.count, 1);
+        let stager = stager
+            .into_inner()
+            .expect("stager lock should not be poisoned");
+        assert_eq!(stager.deltas.len(), 1);
+    }
+
     #[tokio::test]
     async fn sql_execution_context_exposes_live_state_and_blob_reader() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
@@ -259,6 +510,7 @@ mod tests {
             active_version_id: "version-a",
             blob_reader: Arc::clone(&blob_reader),
             live_state: Arc::clone(&live_state) as Arc<dyn LiveStateContext>,
+            write_stager: None,
             schema_definitions: vec![],
         };
 
@@ -277,6 +529,7 @@ mod tests {
             active_version_id: "version-a",
             blob_reader,
             live_state,
+            write_stager: None,
             schema_definitions: vec![],
         };
 
@@ -284,6 +537,104 @@ mod tests {
             .await
             .expect("sql2 execute should support literal-only queries");
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_values_stages_write() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_state (\
+             entity_id, schema_key, file_id, plugin_key, snapshot_content, metadata, schema_version, global, untracked\
+             ) VALUES (\
+             'entity-1', 'lix_key_value', NULL, NULL, '{\"key\":\"hello\",\"value\":\"world\"}', '{\"source\":\"sql\"}', '1', false, false\
+             )",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_state VALUES should stage write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-1");
+        assert_eq!(rows[0].schema_version, "1");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"hello\",\"value\":\"world\"}")
+        );
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"sql\"}"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_insert_into_lix_state_select_stages_write() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_state (\
+             entity_id, schema_key, file_id, plugin_key, snapshot_content, metadata, schema_version, global, untracked\
+             ) \
+             SELECT \
+             'entity-from-select' AS entity_id, \
+             'lix_key_value' AS schema_key, \
+             NULL AS file_id, \
+             NULL AS plugin_key, \
+             '{\"key\":\"hello\",\"value\":\"from-select\"}' AS snapshot_content, \
+             '{\"source\":\"select\"}' AS metadata, \
+             '1' AS schema_version, \
+             false AS global, \
+             false AS untracked",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_state SELECT should stage write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let rows = overlay.visible_semantic_rows(false, "lix_key_value");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].entity_id, "entity-from-select");
+        assert_eq!(rows[0].schema_version, "1");
+        assert_eq!(rows[0].version_id, "version-a");
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"hello\",\"value\":\"from-select\"}")
+        );
+        assert_eq!(rows[0].metadata.as_deref(), Some("{\"source\":\"select\"}"));
     }
 
     struct BackendSqlExecutionContext<'a> {

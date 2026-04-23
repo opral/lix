@@ -15,6 +15,7 @@ mod compiler_state;
 mod contracts;
 mod deterministic_sequence;
 pub(crate) mod filesystem;
+mod live_state_context;
 #[cfg(test)]
 mod live_state_write_transaction;
 pub(crate) mod overlay;
@@ -33,10 +34,10 @@ pub(crate) use backend::{
     normalize_sql_error_with_transaction_and_relation_names, TransactionExecutionBackend,
 };
 pub(crate) use buffered::{
-    apply_schema_registrations_in_transaction, upsert_registered_schema_mirror_row_in_transaction,
-    BufferedWriteCommandMetadata, BufferedWriteExecutionResult, BufferedWriteFlushClass,
-    BufferedWriteSessionEffects, PlannedDirectWriteUnit, PublicWriteTxnUnit,
-    RegisteredSchemaMirrorRow, TransactionWriteDelta,
+    apply_schema_registrations_in_transaction, build_direct_mutation_transaction_write_delta,
+    upsert_registered_schema_mirror_row_in_transaction, BufferedWriteCommandMetadata,
+    BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
+    PlannedDirectWriteUnit, PublicWriteTxnUnit, RegisteredSchemaMirrorRow, TransactionWriteDelta,
 };
 pub(crate) use buffered_write_transaction::BufferedWriteTransaction;
 pub(crate) use checkpoint_labels::{
@@ -74,6 +75,8 @@ pub(crate) use filesystem::runtime::{
     FILESYSTEM_FILE_SCHEMA_KEY,
 };
 pub(crate) use filesystem::state::filesystem_transaction_state_from_planned;
+#[allow(unused_imports)]
+pub(crate) use live_state_context::TransactionLiveStateContext;
 #[cfg(test)]
 pub(crate) use live_state_write_transaction::LiveStateWriteTransaction;
 pub(crate) use overlay::{

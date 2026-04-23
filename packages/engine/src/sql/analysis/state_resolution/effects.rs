@@ -67,6 +67,7 @@ mod tests {
                     "id": "main",
                     "version_id": "version-b"
                 })),
+                metadata: None,
                 untracked: true,
             }],
             update_validations: vec![UpdateValidationPlan {
