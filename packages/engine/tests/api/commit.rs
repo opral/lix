@@ -29,8 +29,9 @@ use support::simulation_test::SimulatedLix;
 async fn register_test_schema(engine: &SimulatedLix) {
     engine
         .execute(
-            "INSERT INTO lix_registered_schema (value) VALUES (\
-             lix_json('{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}')\
+            "INSERT INTO lix_registered_schema (value, lixcol_global) VALUES (\
+             lix_json('{\"x-lix-key\":\"test_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"key\":{\"type\":\"string\"}},\"required\":[\"key\"],\"additionalProperties\":false}'),\
+             true\
              )", &[])
         .await
         .unwrap();
@@ -483,14 +484,14 @@ simulation_test!(
             values.statements[0].rows[0],
             vec![
                 Value::Text("tx-kv-a".to_string()),
-                Value::Json(JsonValue::String("value-a".to_string()))
+                Value::Text("\"value-a\"".to_string())
             ]
         );
         assert_eq!(
             values.statements[0].rows[1],
             vec![
                 Value::Text("tx-kv-b".to_string()),
-                Value::Json(JsonValue::String("value-b".to_string()))
+                Value::Text("\"value-b\"".to_string())
             ]
         );
 
@@ -583,14 +584,14 @@ simulation_test!(
             values.statements[0].rows[0],
             vec![
                 Value::Text("tx-handle-kv-a".to_string()),
-                Value::Json(JsonValue::String("value-a".to_string()))
+                Value::Text("\"value-a\"".to_string())
             ]
         );
         assert_eq!(
             values.statements[0].rows[1],
             vec![
                 Value::Text("tx-handle-kv-b".to_string()),
-                Value::Json(JsonValue::String("value-b".to_string()))
+                Value::Text("\"value-b\"".to_string())
             ]
         );
 

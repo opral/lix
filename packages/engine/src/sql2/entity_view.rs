@@ -81,6 +81,8 @@ pub(crate) struct PreparedSql2EntityViewColumn {
 impl PreparedSql2EntityViewColumn {
     pub(crate) fn projection_expr(&self) -> Expr {
         let expr = entity_view_projection_expr(self);
+        // Only explicit engine-owned Variant columns carry variant metadata.
+        // Schema-derived JSON fields should flow through the Json branch below.
         if self.column_type == SurfaceColumnType::Variant {
             expr.alias_with_metadata(self.public_name.clone(), Some(variant_field_metadata()))
         } else {
@@ -372,6 +374,8 @@ fn json_payload_projection_expr(property_name: &str, column_type: SurfaceColumnT
     match column_type {
         SurfaceColumnType::String => lix_json_extract_text_expr(snapshot_content, property_name),
         SurfaceColumnType::Json => lix_json_extract_json_expr(snapshot_content, property_name),
+        // Variant remains available for future explicit owner-chosen polymorphic
+        // payloads, but schema-derived JSON fields must not route through it.
         SurfaceColumnType::Variant => {
             lix_json_extract_variant_expr(snapshot_content, property_name)
         }
@@ -407,8 +411,8 @@ fn variant_field_metadata() -> FieldMetadata {
 #[cfg(test)]
 mod tests {
     use super::{
-        prepared_entity_view_plans_for_registry, PreparedSql2EntityViewExpr,
-        Sql2EntityViewBaseRelation,
+        prepared_entity_view_plans_for_registry, variant_field_metadata,
+        PreparedSql2EntityViewColumn, PreparedSql2EntityViewExpr, Sql2EntityViewBaseRelation,
     };
     use crate::catalog::{
         build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
@@ -641,7 +645,7 @@ mod tests {
     }
 
     #[test]
-    fn variant_payload_projection_uses_json_extract_json() {
+    fn json_payload_projection_uses_json_extract_json_for_lix_key_value() {
         let registry = build_builtin_surface_registry();
         let plans =
             prepared_entity_view_plans_for_registry(&registry, &["lix_key_value".to_string()]);
@@ -651,7 +655,7 @@ mod tests {
 
         assert_eq!(
             plan.column_types.get("value"),
-            Some(&SurfaceColumnType::Variant)
+            Some(&SurfaceColumnType::Json)
         );
 
         let exprs = plan
@@ -662,9 +666,127 @@ mod tests {
             panic!("projection should alias the payload expr");
         };
         let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
+            panic!("json payload should compile to a scalar function");
+        };
+        assert_eq!(func.name(), "lix_json_extract_json");
+    }
+
+    #[test]
+    fn lix_registered_schema_value_stays_json_in_sql2() {
+        let registry = build_builtin_surface_registry();
+        let plans = prepared_entity_view_plans_for_registry(
+            &registry,
+            &["lix_registered_schema".to_string()],
+        );
+        let plan = plans
+            .get("lix_registered_schema")
+            .expect("registered schema surface should compile");
+
+        assert_eq!(
+            plan.column_types.get("value"),
+            Some(&SurfaceColumnType::Json)
+        );
+
+        let exprs = plan
+            .projection_exprs(&["value".to_string()])
+            .expect("projection exprs should build");
+
+        let Expr::Alias(Alias { expr, .. }) = &exprs[0] else {
+            panic!("projection should alias the payload expr");
+        };
+        let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
+            panic!("registered schema JSON payload should compile to a scalar function");
+        };
+        assert_eq!(func.name(), "lix_json_extract_json");
+
+        let schema = plan
+            .projected_schema(&["value".to_string()])
+            .expect("schema should build");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert!(schema.field(0).is_nullable());
+    }
+
+    #[test]
+    fn schema_derived_multi_kind_json_payload_stays_utf8_json_in_sql2() {
+        let mut registry = build_builtin_surface_registry();
+        register_dynamic_entity_surface_spec(
+            &mut registry,
+            dynamic_entity_surface_spec_from_schema(&json!({
+                "x-lix-key": "flex_value",
+                "type": "object",
+                "properties": {
+                    "value": {
+                        "anyOf": [
+                            { "type": "string" },
+                            { "type": "object" }
+                        ]
+                    }
+                }
+            }))
+            .expect("schema should compile"),
+        );
+
+        let plans = prepared_entity_view_plans_for_registry(&registry, &["flex_value".to_string()]);
+        let plan = plans
+            .get("flex_value")
+            .expect("flex_value surface should compile");
+
+        assert_eq!(
+            plan.column_types.get("value"),
+            Some(&SurfaceColumnType::Json)
+        );
+
+        let exprs = plan
+            .projection_exprs(&["value".to_string()])
+            .expect("projection exprs should build");
+
+        let Expr::Alias(Alias { expr, .. }) = &exprs[0] else {
+            panic!("projection should alias the payload expr");
+        };
+        let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
+            panic!("json payload should compile to a scalar function");
+        };
+        assert_eq!(func.name(), "lix_json_extract_json");
+
+        let schema = plan
+            .projected_schema(&["value".to_string()])
+            .expect("schema should build");
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
+        assert!(schema.field(0).is_nullable());
+    }
+
+    #[test]
+    fn explicit_variant_column_keeps_variant_sql2_behavior() {
+        let column = PreparedSql2EntityViewColumn {
+            public_name: "value".to_string(),
+            column_type: SurfaceColumnType::Variant,
+            nullable: true,
+            expression: PreparedSql2EntityViewExpr::JsonPayloadProperty {
+                property_name: "value".to_string(),
+            },
+        };
+
+        let expr = column.projection_expr();
+        let Expr::Alias(Alias {
+            expr,
+            metadata,
+            name,
+            ..
+        }) = expr
+        else {
+            panic!("projection should alias the variant payload expr");
+        };
+        assert_eq!(name, "value");
+        assert_eq!(metadata.as_ref(), Some(&variant_field_metadata()));
+
+        let Expr::ScalarFunction(ScalarFunction { func, .. }) = expr.as_ref() else {
             panic!("variant payload should compile to a scalar function");
         };
         assert_eq!(func.name(), "lix_json_extract_variant");
+
+        let field = column.output_field();
+        assert_eq!(field.data_type(), &DataType::Binary);
+        assert!(field.is_nullable());
     }
 
     #[test]
@@ -688,7 +810,7 @@ mod tests {
             .expect("schema should build");
 
         assert_eq!(schema.field(0).name(), "value");
-        assert_eq!(schema.field(0).data_type(), &DataType::Binary);
+        assert_eq!(schema.field(0).data_type(), &DataType::Utf8);
         assert!(schema.field(0).is_nullable());
 
         assert_eq!(schema.field(1).name(), "lixcol_entity_id");

@@ -3213,7 +3213,6 @@ simulation_test!(
             )
             .await
             .expect("untracked file_by_version insert should succeed");
-
         let rows = engine
             .execute(
                 &format!(

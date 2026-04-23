@@ -41,8 +41,15 @@ impl<'a> TransactionWriteSelectorResolver<'a> {
         pending_overlay: Option<&'a dyn PendingOverlay>,
         functions: &DynFunctionProvider,
     ) -> Result<Self, LixError> {
-        let preparation_context =
-            build_read_preparation_context(backend, pending_overlay, functions).await?;
+        let requested_version_id =
+            crate::session::workspace::require_workspace_active_version_id(backend).await?;
+        let preparation_context = build_read_preparation_context(
+            backend,
+            pending_overlay,
+            functions,
+            &requested_version_id,
+        )
+        .await?;
         Ok(Self {
             backend,
             projection_registry,
@@ -286,10 +293,12 @@ async fn build_read_preparation_context(
     backend: &dyn LixBackend,
     pending_overlay: Option<&dyn PendingOverlay>,
     _functions: &DynFunctionProvider,
+    requested_version_id: &str,
 ) -> Result<ReadPreparationContext, LixError> {
     let registry = crate::transaction::build_public_read_surface_registry_with_pending_overlay(
         backend,
         pending_overlay,
+        Some(requested_version_id),
     )
     .await?;
     let compiler_metadata = load_sql_compiler_metadata(backend, &registry).await?;

@@ -285,12 +285,6 @@ impl crate::session::SessionHost for EngineSessionHost {
         self.engine.install_public_surface_registry(registry);
     }
 
-    async fn load_public_surface_registry(&self) -> Result<SurfaceRegistry, LixError> {
-        self.engine
-            .load_public_surface_registry_from_backend()
-            .await
-    }
-
     async fn export_image(
         &self,
         writer: &mut dyn crate::image::ImageChunkWriter,

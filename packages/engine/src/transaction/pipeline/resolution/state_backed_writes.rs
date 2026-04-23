@@ -1,8 +1,7 @@
 use super::*;
 use crate::functions::{LixFunctionProvider, SharedFunctionProvider};
 use crate::live_state::{
-    decode_registered_schema_row, load_current_committed_version_frontier_with_backend,
-    scan_live_rows, LiveRowQuery, LiveRowSource,
+    decode_registered_schema_row, scan_live_rows, LiveRowQuery, LiveRowSource,
 };
 use crate::schema::{
     apply_schema_defaults_with_shared_runtime, builtin_schema_definition,
@@ -38,7 +37,7 @@ async fn load_latest_registered_schema(
 ) -> Result<Option<JsonValue>, crate::LixError> {
     let mut latest = None::<(SchemaKey, JsonValue)>;
 
-    for version_id in visible_registered_schema_version_ids(backend, requested_version_id).await? {
+    for version_id in visible_registered_schema_version_ids(requested_version_id).await? {
         let rows = scan_live_rows(
             backend,
             &LiveRowQuery {
@@ -94,15 +93,12 @@ async fn load_latest_registered_schema(
 }
 
 async fn visible_registered_schema_version_ids(
-    backend: &dyn LixBackend,
     requested_version_id: &str,
 ) -> Result<Vec<String>, crate::LixError> {
-    let frontier = load_current_committed_version_frontier_with_backend(backend).await?;
-    let mut version_ids = BTreeSet::from([
+    let version_ids = BTreeSet::from([
         GLOBAL_VERSION_ID.to_string(),
         requested_version_id.to_string(),
     ]);
-    version_ids.extend(frontier.version_heads.into_keys());
     Ok(version_ids.into_iter().collect())
 }
 
@@ -1070,7 +1066,10 @@ where
             .ok_or_else(|| {
                 crate::LixError::new(
                     "LIX_ERROR_UNKNOWN",
-                    format!("schema '{}' is not stored", schema_key),
+                    format!(
+                        "schema '{}' is not registered in version '{}'",
+                        schema_key, requested_version_id
+                    ),
                 )
             })?
     };

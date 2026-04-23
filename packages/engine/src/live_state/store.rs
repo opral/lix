@@ -11,7 +11,8 @@ use super::{
     materialize::{LiveStateApplyReport, LiveStateRebuildPlan, LiveStateRebuildRequest},
     snapshot_queries::{
         load_live_read_shape_for_table_name, load_live_snapshot_rows_with_backend,
-        normalize_live_snapshot_values_with_backend, LiveRowShapeContract, LiveStateQueryBackend,
+        normalize_live_snapshot_values_for_version_with_backend, LiveRowShapeContract,
+        LiveStateQueryBackend,
     },
     ExactLiveRowQuery, LiveRow, LiveRowQuery, LiveStateMode, ProjectionStatus, ReplayCursor,
     SchemaRegistration,
@@ -45,9 +46,16 @@ impl LiveStateQueryBackend for dyn crate::LixBackend + '_ {
     async fn normalize_live_snapshot_values(
         &self,
         schema_key: &str,
+        version_id: &str,
         snapshot_content: Option<&str>,
     ) -> Result<BTreeMap<String, crate::Value>, LixError> {
-        normalize_live_snapshot_values_with_backend(self, schema_key, snapshot_content).await
+        normalize_live_snapshot_values_for_version_with_backend(
+            self,
+            schema_key,
+            version_id,
+            snapshot_content,
+        )
+        .await
     }
 }
 

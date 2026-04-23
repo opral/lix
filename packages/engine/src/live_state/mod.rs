@@ -286,8 +286,9 @@ pub(crate) async fn list_installed_plugin_archive_refs(
 
 pub(crate) async fn load_visible_registered_schema_snapshot_contents(
     backend: LiveStateBackendRef<'_>,
+    requested_version_id: &str,
 ) -> Result<BTreeMap<String, String>, LixError> {
-    storage::load_visible_registered_schema_snapshot_contents(backend).await
+    storage::load_visible_registered_schema_snapshot_contents(backend, requested_version_id).await
 }
 
 pub(crate) async fn derive_read_time_surface_rows(
