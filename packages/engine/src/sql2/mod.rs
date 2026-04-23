@@ -1,10 +1,10 @@
 mod datafusion;
+mod directory_provider;
 mod entity_provider;
 mod entity_view;
 mod execute;
+mod file_provider;
 mod filesystem_view;
-mod lix_directory_views;
-mod lix_file_views;
 mod lix_state_provider;
 mod udf;
 
