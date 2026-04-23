@@ -6,7 +6,9 @@ use std::sync::OnceLock;
 use std::thread;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
+use datafusion::arrow::array::{
+    Array, ArrayRef, BinaryArray, BooleanArray, Int64Array, StringArray,
+};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
@@ -19,7 +21,7 @@ use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning};
 use datafusion::prelude::SessionContext;
 use datafusion::{
-    datasource::{TableType, ViewTable},
+    datasource::{MemTable, TableType},
     physical_plan::SendableRecordBatchStream,
 };
 use futures_util::{stream, TryStreamExt};
@@ -38,26 +40,19 @@ use super::entity_view::{
     PreparedSql2EntityViewPlan, Sql2EntityViewBaseRelation, VARIANT_FIELD_METADATA_KEY,
     VARIANT_FIELD_METADATA_VALUE,
 };
-use super::filesystem_provider::{
-    LixDirectoryProvider, LixDirectorySurfaceKind, LixFileProvider, LixFileSurfaceKind,
-};
 use super::filesystem_view::{PreparedSql2FilesystemViewPlan, Sql2FilesystemViewBaseRelation};
 use super::udf::register_sql2_udfs;
 use crate::binary_cas::BlobDataReader;
 use crate::catalog::SurfaceColumnType;
 use crate::catalog::{
     open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,
-    open_directory_by_version_surface_snapshot,
-    open_directory_by_version_surface_snapshot_with_shared_backend,
-    open_directory_surface_snapshot, open_file_by_version_surface_snapshot,
-    open_file_by_version_surface_snapshot_with_shared_backend, open_file_surface_snapshot,
     open_version_surface_snapshot, open_version_surface_snapshot_with_shared_backend,
     open_working_changes_surface_snapshot,
     open_working_changes_surface_snapshot_with_shared_backend, ChangeSurfaceColumn,
     ChangeSurfaceFilter, ChangeSurfaceRow, ChangeSurfaceScanRequest, ChangeSurfaceSnapshot,
-    FileSurfaceSnapshot, VersionSurfaceColumn, VersionSurfaceRow, VersionSurfaceScanRequest,
-    VersionSurfaceSnapshot, WorkingChangesSurfaceColumn, WorkingChangesSurfaceFilter,
-    WorkingChangesSurfaceRow, WorkingChangesSurfaceScanRequest, WorkingChangesSurfaceSnapshot,
+    VersionSurfaceColumn, VersionSurfaceRow, VersionSurfaceScanRequest, VersionSurfaceSnapshot,
+    WorkingChangesSurfaceColumn, WorkingChangesSurfaceFilter, WorkingChangesSurfaceRow,
+    WorkingChangesSurfaceScanRequest, WorkingChangesSurfaceSnapshot,
 };
 use crate::history::{
     CommittedStateHistoryReader, StateHistoryContentMode, StateHistoryLineageScope,
@@ -140,7 +135,7 @@ async fn collect_query_result_from_ctx(
         .map_err(|error| datafusion_error_to_lix_error_with_artifact(error, artifact))?;
     let mut result = query_result_from_batches(&result_columns, &variant_result_columns, &batches)?;
     if let Some(backend) = backend {
-        hydrate_filesystem_history_blob_columns(backend, artifact, &mut result).await?;
+        hydrate_filesystem_blob_columns(backend, artifact, &mut result).await?;
     }
     Ok(result)
 }
@@ -731,99 +726,76 @@ async fn build_session_for_read_with_borrowed_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_file" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_borrowed_backend(
-                        &ctx,
-                        backend,
-                        artifact,
-                        spec,
-                        surface_name,
-                    )
-                    .await?;
-                } else {
-                    let snapshot =
-                        open_file_surface_snapshot(backend, &artifact.active_version_id).await?;
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixFileProvider::new(
-                            LixFileSurfaceKind::File,
-                            artifact.active_version_id.clone(),
-                            snapshot,
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled filesystem surface '{surface_name}'"
+                        ),
+                    ));
+                };
+                register_filesystem_view_with_borrowed_backend(
+                    &ctx,
+                    backend,
+                    artifact,
+                    spec,
+                    surface_name,
+                )
+                .await?;
             }
             "lix_file_by_version" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_borrowed_backend(
-                        &ctx,
-                        backend,
-                        artifact,
-                        spec,
-                        surface_name,
-                    )
-                    .await?;
-                } else {
-                    let snapshot = open_file_by_version_surface_snapshot(backend).await?;
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixFileProvider::new(
-                            LixFileSurfaceKind::FileByVersion,
-                            artifact.active_version_id.clone(),
-                            snapshot,
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled filesystem surface '{surface_name}'"
+                        ),
+                    ));
+                };
+                register_filesystem_view_with_borrowed_backend(
+                    &ctx,
+                    backend,
+                    artifact,
+                    spec,
+                    surface_name,
+                )
+                .await?;
             }
             "lix_directory" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_borrowed_backend(
-                        &ctx,
-                        backend,
-                        artifact,
-                        spec,
-                        surface_name,
-                    )
-                    .await?;
-                } else {
-                    let snapshot =
-                        open_directory_surface_snapshot(backend, &artifact.active_version_id)
-                            .await?;
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixDirectoryProvider::new(
-                            LixDirectorySurfaceKind::Directory,
-                            artifact.active_version_id.clone(),
-                            snapshot,
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled filesystem surface '{surface_name}'"
+                        ),
+                    ));
+                };
+                register_filesystem_view_with_borrowed_backend(
+                    &ctx,
+                    backend,
+                    artifact,
+                    spec,
+                    surface_name,
+                )
+                .await?;
             }
             "lix_directory_by_version" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_borrowed_backend(
-                        &ctx,
-                        backend,
-                        artifact,
-                        spec,
-                        surface_name,
-                    )
-                    .await?;
-                } else {
-                    let snapshot = open_directory_by_version_surface_snapshot(backend).await?;
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixDirectoryProvider::new(
-                            LixDirectorySurfaceKind::DirectoryByVersion,
-                            artifact.active_version_id.clone(),
-                            snapshot,
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled filesystem surface '{surface_name}'"
+                        ),
+                    ));
+                };
+                register_filesystem_view_with_borrowed_backend(
+                    &ctx,
+                    backend,
+                    artifact,
+                    spec,
+                    surface_name,
+                )
+                .await?;
             }
             "lix_file_history" | "lix_file_history_by_version" | "lix_directory_history" => {
                 if let Some(spec) = artifact.filesystem_views.get(surface_name) {
@@ -912,34 +884,6 @@ async fn build_session_for_read_with_shared_backend(
     } else {
         None
     };
-    let shared_file_snapshot = if artifact
-        .surface_names
-        .iter()
-        .any(|surface| matches!(surface.as_str(), "lix_file" | "lix_file_by_version"))
-    {
-        Some(open_file_by_version_surface_snapshot_with_shared_backend(Arc::clone(&backend)).await?)
-    } else {
-        None
-    };
-    let needs_directory_snapshot = artifact.surface_names.iter().any(|surface| {
-        matches!(
-            surface.as_str(),
-            "lix_directory" | "lix_directory_by_version"
-        )
-    }) || artifact
-        .filesystem_views
-        .keys()
-        .any(|surface| matches!(surface.as_str(), "lix_file" | "lix_file_by_version"));
-    let shared_directory_snapshot = if needs_directory_snapshot {
-        Some(if artifact.filesystem_views.is_empty() {
-            open_directory_by_version_surface_snapshot_with_shared_backend(Arc::clone(&backend))
-                .await?
-        } else {
-            open_directory_by_version_surface_snapshot(backend.as_ref()).await?
-        })
-    } else {
-        None
-    };
     let shared_version_snapshot = if artifact
         .surface_names
         .iter()
@@ -1016,136 +960,96 @@ async fn build_session_for_read_with_shared_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_file" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_shared_snapshot(
-                        &ctx,
-                        artifact,
-                        spec,
-                        surface_name,
-                        Arc::clone(
-                            shared_state_snapshot
-                                .as_ref()
-                                .expect("state surface snapshot should exist"),
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled shared-backend filesystem surface '{surface_name}'"
                         ),
-                        Some(Arc::clone(
-                            shared_file_snapshot
-                                .as_ref()
-                                .expect("file surface snapshot should exist"),
-                        )),
-                    )
-                    .await?;
-                } else {
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixFileProvider::new(
-                            LixFileSurfaceKind::File,
-                            artifact.active_version_id.clone(),
-                            Arc::clone(
-                                shared_file_snapshot
-                                    .as_ref()
-                                    .expect("file surface snapshot should exist"),
-                            ),
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                    ));
+                };
+                register_filesystem_view_with_shared_snapshot(
+                    &ctx,
+                    backend.as_ref(),
+                    artifact,
+                    spec,
+                    surface_name,
+                    Arc::clone(
+                        shared_state_snapshot
+                            .as_ref()
+                            .expect("state surface snapshot should exist"),
+                    ),
+                )
+                .await?;
             }
             "lix_file_by_version" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_shared_snapshot(
-                        &ctx,
-                        artifact,
-                        spec,
-                        surface_name,
-                        Arc::clone(
-                            shared_state_snapshot
-                                .as_ref()
-                                .expect("state surface snapshot should exist"),
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled shared-backend filesystem surface '{surface_name}'"
                         ),
-                        Some(Arc::clone(
-                            shared_file_snapshot
-                                .as_ref()
-                                .expect("file-by-version surface snapshot should exist"),
-                        )),
-                    )
-                    .await?;
-                } else {
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixFileProvider::new(
-                            LixFileSurfaceKind::FileByVersion,
-                            artifact.active_version_id.clone(),
-                            Arc::clone(
-                                shared_file_snapshot
-                                    .as_ref()
-                                    .expect("file-by-version surface snapshot should exist"),
-                            ),
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                    ));
+                };
+                register_filesystem_view_with_shared_snapshot(
+                    &ctx,
+                    backend.as_ref(),
+                    artifact,
+                    spec,
+                    surface_name,
+                    Arc::clone(
+                        shared_state_snapshot
+                            .as_ref()
+                            .expect("state surface snapshot should exist"),
+                    ),
+                )
+                .await?;
             }
             "lix_directory" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_shared_snapshot(
-                        &ctx,
-                        artifact,
-                        spec,
-                        surface_name,
-                        Arc::clone(
-                            shared_state_snapshot
-                                .as_ref()
-                                .expect("state surface snapshot should exist"),
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled shared-backend filesystem surface '{surface_name}'"
                         ),
-                        None,
-                    )
-                    .await?;
-                } else {
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixDirectoryProvider::new(
-                            LixDirectorySurfaceKind::Directory,
-                            artifact.active_version_id.clone(),
-                            Arc::clone(
-                                shared_directory_snapshot
-                                    .as_ref()
-                                    .expect("directory surface snapshot should exist"),
-                            ),
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                    ));
+                };
+                register_filesystem_view_with_shared_snapshot(
+                    &ctx,
+                    backend.as_ref(),
+                    artifact,
+                    spec,
+                    surface_name,
+                    Arc::clone(
+                        shared_state_snapshot
+                            .as_ref()
+                            .expect("state surface snapshot should exist"),
+                    ),
+                )
+                .await?;
             }
             "lix_directory_by_version" => {
-                if let Some(spec) = artifact.filesystem_views.get(surface_name) {
-                    register_filesystem_view_with_shared_snapshot(
-                        &ctx,
-                        artifact,
-                        spec,
-                        surface_name,
-                        Arc::clone(
-                            shared_state_snapshot
-                                .as_ref()
-                                .expect("state surface snapshot should exist"),
+                let Some(spec) = artifact.filesystem_views.get(surface_name) else {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!(
+                            "sql2 does not support uncompiled shared-backend filesystem surface '{surface_name}'"
                         ),
-                        None,
-                    )
-                    .await?;
-                } else {
-                    ctx.register_table(
-                        surface_name,
-                        Arc::new(LixDirectoryProvider::new(
-                            LixDirectorySurfaceKind::DirectoryByVersion,
-                            artifact.active_version_id.clone(),
-                            Arc::clone(
-                                shared_directory_snapshot
-                                    .as_ref()
-                                    .expect("directory surface snapshot should exist"),
-                            ),
-                        )),
-                    )
-                    .map_err(datafusion_error_to_lix_error)?;
-                }
+                    ));
+                };
+                register_filesystem_view_with_shared_snapshot(
+                    &ctx,
+                    backend.as_ref(),
+                    artifact,
+                    spec,
+                    surface_name,
+                    Arc::clone(
+                        shared_state_snapshot
+                            .as_ref()
+                            .expect("state surface snapshot should exist"),
+                    ),
+                )
+                .await?;
             }
             "lix_file_history" | "lix_file_history_by_version" | "lix_directory_history" => {
                 if let Some(spec) = artifact.filesystem_views.get(surface_name) {
@@ -1331,77 +1235,41 @@ async fn register_filesystem_view_with_borrowed_backend(
     let state_snapshot = open_visible_state_by_version_snapshot(backend).await?;
     register_filesystem_view_with_state_snapshot(
         ctx,
+        backend,
         artifact,
         spec,
         surface_name,
         state_snapshot,
-        Some(open_file_by_version_surface_snapshot(backend).await?),
     )
     .await
 }
 
-fn normalize_file_winner_provider(
-    ctx: &SessionContext,
-    provider: Arc<dyn TableProvider>,
-) -> Result<Arc<dyn TableProvider>, LixError> {
-    let dataframe = ctx
-        .read_table(provider)
-        .map_err(datafusion_error_to_lix_error)?
-        .select(vec![
-            datafusion::logical_expr::col("id"),
-            datafusion::logical_expr::col("directory_id"),
-            datafusion::logical_expr::col("name"),
-            datafusion::logical_expr::col("extension"),
-            datafusion::logical_expr::col("path"),
-            datafusion::logical_expr::col("hidden"),
-            datafusion::logical_expr::col("data"),
-            datafusion::logical_expr::col("metadata"),
-            datafusion::logical_expr::col("lixcol_entity_id").alias("entity_id"),
-            datafusion::logical_expr::col("lixcol_schema_key").alias("schema_key"),
-            datafusion::logical_expr::col("lixcol_file_id").alias("file_id"),
-            datafusion::logical_expr::col("lixcol_version_id").alias("version_id"),
-            datafusion::logical_expr::col("lixcol_plugin_key").alias("plugin_key"),
-            datafusion::logical_expr::col("lixcol_schema_version").alias("schema_version"),
-            datafusion::logical_expr::col("lixcol_global").alias("global"),
-            datafusion::logical_expr::col("lixcol_change_id").alias("change_id"),
-            datafusion::logical_expr::col("lixcol_created_at").alias("created_at"),
-            datafusion::logical_expr::col("lixcol_updated_at").alias("updated_at"),
-            datafusion::logical_expr::col("lixcol_commit_id").alias("commit_id"),
-            datafusion::logical_expr::col("lixcol_untracked").alias("untracked"),
-        ])
-        .map_err(datafusion_error_to_lix_error)?;
-    Ok(Arc::new(ViewTable::new(
-        dataframe.into_unoptimized_plan(),
-        None,
-    )))
-}
-
 async fn register_filesystem_view_with_shared_snapshot(
     ctx: &SessionContext,
+    backend: &dyn LixBackend,
     artifact: &PreparedSql2ReadArtifact,
     spec: &PreparedSql2FilesystemViewPlan,
     surface_name: &str,
     state_snapshot: Arc<dyn StateByVersionSnapshot>,
-    file_snapshot: Option<Arc<dyn FileSurfaceSnapshot>>,
 ) -> Result<(), LixError> {
     register_filesystem_view_with_state_snapshot(
         ctx,
+        backend,
         artifact,
         spec,
         surface_name,
         state_snapshot,
-        file_snapshot,
     )
     .await
 }
 
 async fn register_filesystem_view_with_state_snapshot(
     ctx: &SessionContext,
+    backend: &dyn LixBackend,
     artifact: &PreparedSql2ReadArtifact,
     spec: &PreparedSql2FilesystemViewPlan,
     surface_name: &str,
     state_snapshot: Arc<dyn StateByVersionSnapshot>,
-    file_snapshot: Option<Arc<dyn FileSurfaceSnapshot>>,
 ) -> Result<(), LixError> {
     let state_provider: Arc<dyn TableProvider> = Arc::new(LixStateProvider::new(
         LixStateSurfaceKind::StateByVersion,
@@ -1458,18 +1326,8 @@ async fn register_filesystem_view_with_state_snapshot(
                 .get(&blob_relation)
                 .cloned()
                 .expect("filesystem file view should have blob winner provider");
-            let file_snapshot = file_snapshot
-                .expect("filesystem file view should have file snapshot for live data");
-            let raw_file_data_provider: Arc<dyn TableProvider> = Arc::new(LixFileProvider::new(
-                LixFileSurfaceKind::FileByVersion,
-                artifact.active_version_id.clone(),
-                file_snapshot,
-            ));
-            let file_data_ctx = SessionContext::new();
-            register_sql2_udfs(&file_data_ctx);
-            let _ = blob_provider;
             let file_data_provider =
-                normalize_file_winner_provider(&file_data_ctx, raw_file_data_provider)?;
+                materialize_live_file_data_provider(backend, Arc::clone(&blob_provider)).await?;
             let final_ctx = SessionContext::new();
             register_sql2_udfs(&final_ctx);
             ctx.register_table(
@@ -1511,6 +1369,185 @@ async fn register_filesystem_view_with_state_snapshot(
         }
     }
     Ok(())
+}
+
+async fn materialize_live_file_data_provider(
+    backend: &dyn LixBackend,
+    blob_winner_provider: Arc<dyn TableProvider>,
+) -> Result<Arc<dyn TableProvider>, LixError> {
+    let ctx = SessionContext::new();
+    let batches = ctx
+        .read_table(blob_winner_provider)
+        .map_err(datafusion_error_to_lix_error)?
+        .select(vec![
+            datafusion::logical_expr::col("id"),
+            datafusion::logical_expr::col("version_id"),
+            datafusion::logical_expr::col("blob_hash"),
+            datafusion::logical_expr::col("size_bytes"),
+        ])
+        .map_err(datafusion_error_to_lix_error)?
+        .collect()
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+
+    let mut ids = Vec::<Option<String>>::new();
+    let mut version_ids = Vec::<Option<String>>::new();
+    let mut blob_hashes = Vec::<Option<String>>::new();
+    let mut payloads = Vec::<Option<Vec<u8>>>::new();
+    let mut size_bytes = Vec::<Option<i64>>::new();
+
+    for batch in &batches {
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "sql2 expected string id column while materializing live file data",
+                )
+            })?;
+        let version_id_array = batch
+            .column_by_name("version_id")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "sql2 expected string version_id column while materializing live file data",
+                )
+            })?;
+        let blob_hash_array = batch
+            .column_by_name("blob_hash")
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "sql2 expected string blob_hash column while materializing live file data",
+                )
+            })?;
+        let size_bytes_array = batch
+            .column_by_name("size_bytes")
+            .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    "sql2 expected int64 size_bytes column while materializing live file data",
+                )
+            })?;
+
+        for row_index in 0..batch.num_rows() {
+            let id = (!id_array.is_null(row_index)).then(|| id_array.value(row_index).to_string());
+            let version_id = (!version_id_array.is_null(row_index))
+                .then(|| version_id_array.value(row_index).to_string());
+            let blob_hash = (!blob_hash_array.is_null(row_index))
+                .then(|| blob_hash_array.value(row_index).to_string());
+            let data = match (&id, &version_id, &blob_hash) {
+                (Some(file_id), Some(version_id), Some(blob_hash)) => {
+                    load_live_file_payload_bytes(backend, file_id, version_id, blob_hash).await?
+                }
+                _ => None,
+            };
+            let size =
+                (!size_bytes_array.is_null(row_index)).then(|| size_bytes_array.value(row_index));
+
+            ids.push(id);
+            version_ids.push(version_id);
+            blob_hashes.push(blob_hash);
+            payloads.push(data);
+            size_bytes.push(size);
+        }
+    }
+
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Utf8, true),
+        Field::new("version_id", DataType::Utf8, true),
+        Field::new("data", DataType::Binary, true),
+        Field::new("blob_hash", DataType::Utf8, true),
+        Field::new("size_bytes", DataType::Int64, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(version_ids)) as ArrayRef,
+            Arc::new(BinaryArray::from(
+                payloads
+                    .iter()
+                    .map(|value| value.as_deref())
+                    .collect::<Vec<_>>(),
+            )) as ArrayRef,
+            Arc::new(StringArray::from(blob_hashes)) as ArrayRef,
+            Arc::new(Int64Array::from(size_bytes)) as ArrayRef,
+        ],
+    )
+    .map_err(|error| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("sql2 failed to build live file data batch: {error}"),
+        )
+    })?;
+
+    Ok(Arc::new(
+        MemTable::try_new(schema, vec![vec![batch]]).map_err(datafusion_error_to_lix_error)?,
+    ))
+}
+
+async fn load_live_file_payload_bytes(
+    backend: &dyn LixBackend,
+    file_id: &str,
+    version_id: &str,
+    blob_hash: &str,
+) -> Result<Option<Vec<u8>>, LixError> {
+    let cached = backend
+        .execute(
+            "SELECT data \
+             FROM lix_internal_file_data_cache \
+             WHERE file_id = $1 AND version_id = $2 \
+             LIMIT 1",
+            &[
+                Value::Text(file_id.to_string()),
+                Value::Text(version_id.to_string()),
+            ],
+        )
+        .await?;
+    if let Some(row) = cached.rows.first() {
+        return match row.first() {
+            Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
+            Some(Value::Null) => Ok(None),
+            Some(other) => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!(
+                    "sql2 expected blob cache payload for file '{file_id}' version '{version_id}', got {other:?}"
+                ),
+            )),
+            None => Ok(None),
+        };
+    }
+
+    let inline = backend
+        .execute(
+            &format!(
+                "SELECT data \
+                 FROM {} \
+                 WHERE blob_hash = $1 \
+                 LIMIT 1",
+                crate::binary_cas::binary_blob_store_relation_name(),
+            ),
+            &[Value::Text(blob_hash.to_string())],
+        )
+        .await?;
+    if let Some(row) = inline.rows.first() {
+        return match row.first() {
+            Some(Value::Blob(bytes)) => Ok(Some(bytes.clone())),
+            Some(Value::Null) => Ok(None),
+            Some(other) => Err(LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("sql2 expected inline blob payload for hash '{blob_hash}', got {other:?}"),
+            )),
+            None => Ok(None),
+        };
+    }
+
+    Ok(None)
 }
 
 async fn register_filesystem_history_view_with_state_history_provider(
@@ -4344,7 +4381,7 @@ fn query_result_from_batches(
     })
 }
 
-async fn hydrate_filesystem_history_blob_columns(
+async fn hydrate_filesystem_blob_columns(
     backend: &dyn LixBackend,
     artifact: &PreparedSql2ReadArtifact,
     result: &mut QueryResult,
@@ -4352,7 +4389,7 @@ async fn hydrate_filesystem_history_blob_columns(
     if !artifact.surface_names.iter().any(|name| {
         matches!(
             name.as_str(),
-            "lix_file_history" | "lix_file_history_by_version"
+            "lix_file" | "lix_file_by_version" | "lix_file_history" | "lix_file_history_by_version"
         )
     }) {
         return Ok(());
