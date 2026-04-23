@@ -58,8 +58,8 @@ pub(crate) async fn load_live_table_layout_for_version_with_backend(
     }
 }
 
-#[async_trait(?Send)]
-trait RegisteredSchemaLayoutProvider {
+#[async_trait]
+trait RegisteredSchemaLayoutProvider: Send {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError>;
 }
 
@@ -72,7 +72,7 @@ struct BackendVersionScopedSchemaLayoutProvider<'a> {
     requested_version_id: &'a str,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl RegisteredSchemaLayoutProvider for BackendSchemaLayoutProvider<'_> {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
         crate::live_state::storage::load_registered_schema_layout_rows_with_backend(self.backend)
@@ -80,7 +80,7 @@ impl RegisteredSchemaLayoutProvider for BackendSchemaLayoutProvider<'_> {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl RegisteredSchemaLayoutProvider for BackendVersionScopedSchemaLayoutProvider<'_> {
     async fn load_registered_schema_rows(&mut self) -> Result<Vec<Vec<Value>>, LixError> {
         crate::live_state::storage::load_registered_schema_layout_rows_for_version_with_backend(

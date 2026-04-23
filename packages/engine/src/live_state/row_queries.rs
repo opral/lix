@@ -165,9 +165,22 @@ async fn scan_lazy_commit_derived_rows(
 ) -> Result<Vec<LiveRow>, LixError> {
     scan_commit_derived_rows(backend, request, |backend, request| {
         let request = request.clone();
-        Box::pin(async move { scan_live_rows(backend, &request).await })
+        Box::pin(
+            async move { scan_base_commit_rows_for_lazy_derived_surface(backend, &request).await },
+        )
     })
     .await
+}
+
+async fn scan_base_commit_rows_for_lazy_derived_surface(
+    backend: LiveStateBackendRef<'_>,
+    request: &LiveRowQuery,
+) -> Result<Vec<LiveRow>, LixError> {
+    match request.source {
+        LiveRowSource::Tracked => scan_tracked_rows(backend, request).await,
+        LiveRowSource::Untracked => Ok(Vec::new()),
+        LiveRowSource::Effective => scan_effective_rows(backend, request).await,
+    }
 }
 
 async fn load_exact_lazy_commit_derived_row(

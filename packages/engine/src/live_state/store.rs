@@ -22,7 +22,7 @@ pub(crate) type LiveStateBackendRef<'a> = &'a (dyn crate::LixBackend + 'a);
 pub(crate) type LiveStateExecutorRef<'a> = &'a mut (dyn crate::QueryExecutor + 'a);
 pub(crate) type LiveStateTransactionRef<'a> = &'a mut (dyn crate::LixBackendTransaction + 'a);
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LiveStateQueryBackend for dyn crate::LixBackend + '_ {
     async fn load_live_read_shape_for_table_name(
         &self,
@@ -59,7 +59,7 @@ impl LiveStateQueryBackend for dyn crate::LixBackend + '_ {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl super::LiveStateTransactionBridge for dyn crate::LixBackendTransaction + '_ {
     async fn register_live_state_schema(
         &mut self,
@@ -81,8 +81,8 @@ impl super::LiveStateTransactionBridge for dyn crate::LixBackendTransaction + '_
 }
 
 /// Owner-facing read surface for durable live-state persistence.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateReadStore {
+#[async_trait]
+pub(crate) trait LiveStateReadStore: Send {
     async fn require_ready(&self) -> Result<(), LixError>;
 
     async fn projection_status(&self) -> Result<ProjectionStatus, LixError>;
@@ -96,8 +96,8 @@ pub(crate) trait LiveStateReadStore {
 }
 
 /// Owner-facing write surface for durable live-state persistence.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateWriteStore {
+#[async_trait]
+pub(crate) trait LiveStateWriteStore: Send {
     async fn register_schema(&mut self, registration: &SchemaRegistration) -> Result<(), LixError>;
 
     async fn write_live_rows(&mut self, rows: &[LiveRow]) -> Result<(), LixError>;
@@ -106,8 +106,8 @@ pub(crate) trait LiveStateWriteStore {
 }
 
 /// Owner-facing rebuild/materialization surface for durable live-state persistence.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateMaterializeStore {
+#[async_trait]
+pub(crate) trait LiveStateMaterializeStore: Send {
     async fn rebuild_plan(
         &mut self,
         request: &LiveStateRebuildRequest,
@@ -125,8 +125,8 @@ pub(crate) trait LiveStateMaterializeStore {
 }
 
 /// Read-side lifecycle surface for live-state readiness and replay status.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateLifecycleReadStore {
+#[async_trait]
+pub(crate) trait LiveStateLifecycleReadStore: Send {
     async fn load_live_state_snapshot(&self) -> Result<LiveStateSnapshot, LixError>;
 
     async fn load_latest_replay_cursor(&self) -> Result<Option<ReplayCursor>, LixError>;
@@ -135,8 +135,8 @@ pub(crate) trait LiveStateLifecycleReadStore {
 }
 
 /// Write-side lifecycle surface for transaction-scoped live-state persistence.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateLifecycleWriteStore {
+#[async_trait]
+pub(crate) trait LiveStateLifecycleWriteStore: Send {
     async fn load_live_state_snapshot(&mut self) -> Result<LiveStateSnapshot, LixError>;
 
     async fn load_latest_replay_cursor(&mut self) -> Result<Option<ReplayCursor>, LixError>;
@@ -182,8 +182,8 @@ pub(crate) trait LiveStateLifecycleWriteStore {
 }
 
 /// Non-transactional lifecycle mutation surface for live-state persistence.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateLifecycleAdminStore {
+#[async_trait]
+pub(crate) trait LiveStateLifecycleAdminStore: Send {
     async fn init_live_state_status_storage(&self) -> Result<(), LixError>;
 
     async fn try_claim_live_state_bootstrap(&self) -> Result<bool, LixError>;
@@ -205,8 +205,8 @@ pub(crate) trait LiveStateLifecycleAdminStore {
 }
 
 /// Read-side committed-frontier surface for live-state owner logic.
-#[async_trait(?Send)]
-pub(crate) trait LiveStateFrontierReadStore {
+#[async_trait]
+pub(crate) trait LiveStateFrontierReadStore: Send {
     async fn load_version_head_commit_id(
         &mut self,
         version_id: &str,

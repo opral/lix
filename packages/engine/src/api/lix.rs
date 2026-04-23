@@ -586,7 +586,7 @@ struct VecImageWriter {
     bytes: Vec<u8>,
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ImageChunkWriter for VecImageWriter {
     async fn write_chunk(&mut self, chunk: &[u8]) -> Result<(), LixError> {
         self.bytes.extend_from_slice(chunk);
@@ -633,7 +633,7 @@ mod tests {
         mode: TransactionBeginMode,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackend for TestBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -672,7 +672,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for TestTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

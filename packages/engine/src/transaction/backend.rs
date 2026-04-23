@@ -1,9 +1,7 @@
 //! Write-transaction lifecycle and transaction-scoped execution helpers.
 
-use std::marker::PhantomData;
-use std::sync::Mutex;
-
 use async_trait::async_trait;
+use tokio::sync::Mutex;
 
 use crate::backend::TransactionBeginMode;
 use crate::backend::{LixBackend, LixBackendTransaction, QueryExecutor};
@@ -24,52 +22,39 @@ pub(crate) async fn lookup_directory_id_by_path_in_transaction(
 
 pub(crate) struct TransactionExecutionBackend<'a> {
     dialect: SqlDialect,
-    transaction: Mutex<*mut (dyn LixBackendTransaction + 'a)>,
-    _lifetime: PhantomData<&'a mut dyn LixBackendTransaction>,
+    transaction: Mutex<&'a mut dyn LixBackendTransaction>,
 }
-
-unsafe impl<'a> Send for TransactionExecutionBackend<'a> {}
-unsafe impl<'a> Sync for TransactionExecutionBackend<'a> {}
 
 impl<'a> TransactionExecutionBackend<'a> {
     pub(crate) fn new(transaction: &'a mut dyn LixBackendTransaction) -> Self {
         Self {
             dialect: transaction.dialect(),
-            transaction: Mutex::new(transaction as *mut (dyn LixBackendTransaction + 'a)),
-            _lifetime: PhantomData,
+            transaction: Mutex::new(transaction),
         }
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<'a> QueryExecutor for TransactionExecutionBackend<'a> {
     fn dialect(&self) -> SqlDialect {
         self.dialect
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut guard = self.transaction.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction adapter lock poisoned".to_string(),
-            hint: None,
-        })?;
-        unsafe { (&mut **guard).execute(sql, params).await }
+        let mut guard = self.transaction.lock().await;
+        (**guard).execute(sql, params).await
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl<'a> LixBackend for TransactionExecutionBackend<'a> {
     fn dialect(&self) -> SqlDialect {
         self.dialect
     }
 
     async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        let mut guard = self.transaction.lock().map_err(|_| LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "transaction adapter lock poisoned".to_string(),
-            hint: None,
-        })?;
-        unsafe { (&mut **guard).execute(sql, params).await }
+        let mut guard = self.transaction.lock().await;
+        (**guard).execute(sql, params).await
     }
 
     async fn begin_transaction(

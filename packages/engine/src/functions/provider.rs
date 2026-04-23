@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-pub trait LixFunctionProvider {
+pub trait LixFunctionProvider: Send {
     fn uuid_v7(&mut self) -> String;
     fn timestamp(&mut self) -> String;
 

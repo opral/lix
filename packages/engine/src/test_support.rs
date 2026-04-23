@@ -159,7 +159,7 @@ impl TestSqliteBackend {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LixBackend for TestSqliteBackend {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
@@ -202,7 +202,7 @@ impl LixBackend for TestSqliteBackend {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LixBackendTransaction for TestSqliteTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite

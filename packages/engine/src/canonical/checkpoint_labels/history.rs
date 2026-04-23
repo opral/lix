@@ -108,7 +108,7 @@ mod tests {
         executed_sql: Vec<String>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl QueryExecutor for FakeQueryExecutor {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

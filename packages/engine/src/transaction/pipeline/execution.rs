@@ -769,7 +769,7 @@ mod tests {
 
     struct NoopTransaction;
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl crate::LixBackend for NoopBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
@@ -801,7 +801,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl crate::LixBackendTransaction for NoopTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

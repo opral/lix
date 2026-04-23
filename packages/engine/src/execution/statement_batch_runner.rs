@@ -269,7 +269,7 @@ mod tests {
         fail_sql: Option<String>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for FakeTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

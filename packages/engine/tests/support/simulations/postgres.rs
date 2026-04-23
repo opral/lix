@@ -217,7 +217,7 @@ impl PostgresBackend {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl LixBackend for PostgresBackend {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Postgres
@@ -272,7 +272,7 @@ impl LixBackend for PostgresBackend {
     }
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl LixBackendTransaction for PostgresLixBackendTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Postgres

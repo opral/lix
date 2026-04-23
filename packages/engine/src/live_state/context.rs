@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use crate::live_state::store::LiveStateBackendRef;
 use crate::version::GLOBAL_VERSION_ID;
-use crate::{LixError, NullableKeyFilter, Value};
+use crate::{LixBackend, LixError, NullableKeyFilter, Value};
 
 use super::{
-    load_current_committed_version_frontier_with_backend, scan_live_rows, ExactRowRequest,
-    LiveRow, LiveRowQuery, LiveRowSource, ScanConstraint, ScanField, ScanOperator,
+    load_current_committed_version_frontier_with_backend, scan_live_rows, ExactRowRequest, LiveRow,
+    LiveRowQuery, LiveRowSource, ScanConstraint, ScanField, ScanOperator,
 };
 
 /// Execution-facing live-state boundary consumed by `sql2`.
@@ -19,9 +20,9 @@ use super::{
 ///
 /// Overlay-aware transaction contexts can implement the same trait later
 /// without changing the `sql2` call sites.
-#[async_trait(?Send)]
+#[async_trait]
 #[allow(dead_code)]
-pub(crate) trait LiveStateContext {
+pub(crate) trait LiveStateContext: Send + Sync {
     async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError>;
 
     async fn load_exact(&self, request: &ExactRowRequest) -> Result<Option<LiveRow>, LixError>;
@@ -106,9 +107,7 @@ fn push_text_identity_constraints(
         }),
         many => constraints.push(ScanConstraint {
             field,
-            operator: ScanOperator::In(
-                many.iter().cloned().map(Value::Text).collect::<Vec<_>>(),
-            ),
+            operator: ScanOperator::In(many.iter().cloned().map(Value::Text).collect::<Vec<_>>()),
         }),
     }
 }
@@ -138,42 +137,41 @@ fn push_nullable_key_constraints(
         }
         _ => Err(LixError::new(
             "LIX_ERROR_UNKNOWN",
-            format!(
-                "CommittedLiveStateContext does not yet support multiple {label} filters"
-            ),
+            format!("CommittedLiveStateContext does not yet support multiple {label} filters"),
         )),
     }
 }
 
 /// Committed-state implementation used for normal engine reads.
 #[allow(dead_code)]
-pub(crate) struct CommittedLiveStateContext<'a> {
-    backend: LiveStateBackendRef<'a>,
+pub(crate) struct CommittedLiveStateContext {
+    backend: Arc<dyn LixBackend + Send + Sync>,
 }
 
 #[allow(dead_code)]
-impl<'a> CommittedLiveStateContext<'a> {
-    pub(crate) fn new(backend: LiveStateBackendRef<'a>) -> Self {
+impl CommittedLiveStateContext {
+    pub(crate) fn new(backend: Arc<dyn LixBackend + Send + Sync>) -> Self {
         Self { backend }
     }
 
-    pub(crate) fn backend(&self) -> LiveStateBackendRef<'a> {
-        self.backend
+    pub(crate) fn backend(&self) -> LiveStateBackendRef<'_> {
+        self.backend.as_ref()
     }
 }
 
-#[async_trait(?Send)]
-impl LiveStateContext for CommittedLiveStateContext<'_> {
+#[async_trait]
+impl LiveStateContext for CommittedLiveStateContext {
     async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
-        let version_ids = resolve_target_version_ids(self.backend, request).await?;
-        let schema_keys = resolve_target_schema_keys(self.backend, request).await?;
+        let backend = self.backend();
+        let version_ids = resolve_target_version_ids(backend, request).await?;
+        let schema_keys = resolve_target_schema_keys(backend, request).await?;
         let constraints = request.base_constraints()?;
         let mut rows = Vec::new();
 
         for version_id in &version_ids {
             for schema_key in &schema_keys {
                 let mut scanned = scan_live_rows(
-                    self.backend,
+                    backend,
                     &LiveRowQuery {
                         schema_key: schema_key.clone(),
                         version_id: version_id.clone(),
@@ -193,7 +191,7 @@ impl LiveStateContext for CommittedLiveStateContext<'_> {
             }
         }
 
-        hydrate_commit_ids(self.backend, &mut rows).await?;
+        hydrate_commit_ids(backend, &mut rows).await?;
 
         if let Some(limit) = request.limit {
             rows.truncate(limit);
@@ -217,9 +215,10 @@ impl LiveStateContext for CommittedLiveStateContext<'_> {
             include_global_overlay: true,
             include_untracked_overlay: true,
         };
-        let mut row = super::load_exact_live_row(self.backend, &query).await?;
+        let backend = self.backend();
+        let mut row = super::load_exact_live_row(backend, &query).await?;
         if let Some(row) = row.as_mut() {
-            hydrate_commit_ids(self.backend, std::slice::from_mut(row)).await?;
+            hydrate_commit_ids(backend, std::slice::from_mut(row)).await?;
         }
         Ok(row)
     }

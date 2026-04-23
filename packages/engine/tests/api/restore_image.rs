@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -58,11 +58,11 @@ fn cleanup_sqlite_path(path: &Path) {
 }
 
 struct TestImageSqliteBackend {
-    conn: Mutex<Connection>,
+    conn: Arc<Mutex<Connection>>,
 }
 
-struct TestImageSqliteTransaction<'a> {
-    conn: MutexGuard<'a, Connection>,
+struct TestImageSqliteTransaction {
+    conn: Arc<Mutex<Connection>>,
     finalized: bool,
     mode: TransactionBeginMode,
 }
@@ -83,12 +83,12 @@ impl TestImageSqliteBackend {
                 )
             })?;
         Ok(Self {
-            conn: Mutex::new(conn),
+            conn: Arc::new(Mutex::new(conn)),
         })
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl LixBackend for TestImageSqliteBackend {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
@@ -130,19 +130,19 @@ impl LixBackend for TestImageSqliteBackend {
         })?;
 
         Ok(Box::new(TestImageSqliteTransaction {
-            conn,
+            conn: Arc::clone(&self.conn),
             finalized: false,
             mode,
         }))
     }
 
     async fn export_image(&self, writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        let conn = self.conn.lock().map_err(|_| {
-            LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
-        })?;
         let image_path = temp_image_path("export");
 
         let export_result = (|| -> Result<(), LixError> {
+            let conn = self.conn.lock().map_err(|_| {
+                LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
+            })?;
             let mut snapshot_conn = Connection::open(&image_path).map_err(|error| {
                 LixError::new(
                     "LIX_ERROR_UNKNOWN",
@@ -225,8 +225,8 @@ impl LixBackend for TestImageSqliteBackend {
     }
 }
 
-#[async_trait(?Send)]
-impl LixBackendTransaction for TestImageSqliteTransaction<'_> {
+#[async_trait]
+impl LixBackendTransaction for TestImageSqliteTransaction {
     fn dialect(&self) -> SqlDialect {
         SqlDialect::Sqlite
     }
@@ -236,15 +236,24 @@ impl LixBackendTransaction for TestImageSqliteTransaction<'_> {
     }
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        execute_sql(&self.conn, sql, params)
+        let conn = self.conn.lock().map_err(|_| {
+            LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
+        })?;
+        execute_sql(&conn, sql, params)
     }
 
     async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        execute_prepared_batch(&self.conn, batch, self.dialect())
+        let conn = self.conn.lock().map_err(|_| {
+            LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
+        })?;
+        execute_prepared_batch(&conn, batch, self.dialect())
     }
 
     async fn commit(mut self: Box<Self>) -> Result<(), LixError> {
-        self.conn.execute_batch("COMMIT").map_err(|error| {
+        let conn = self.conn.lock().map_err(|_| {
+            LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
+        })?;
+        conn.execute_batch("COMMIT").map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("failed to commit sqlite transaction: {error}"),
@@ -255,7 +264,10 @@ impl LixBackendTransaction for TestImageSqliteTransaction<'_> {
     }
 
     async fn rollback(mut self: Box<Self>) -> Result<(), LixError> {
-        self.conn.execute_batch("ROLLBACK").map_err(|error| {
+        let conn = self.conn.lock().map_err(|_| {
+            LixError::new("LIX_ERROR_UNKNOWN", "sqlite test backend mutex poisoned")
+        })?;
+        conn.execute_batch("ROLLBACK").map_err(|error| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 format!("failed to roll back sqlite transaction: {error}"),
@@ -266,10 +278,12 @@ impl LixBackendTransaction for TestImageSqliteTransaction<'_> {
     }
 }
 
-impl Drop for TestImageSqliteTransaction<'_> {
+impl Drop for TestImageSqliteTransaction {
     fn drop(&mut self) {
         if !self.finalized && !std::thread::panicking() {
-            let _ = self.conn.execute_batch("ROLLBACK");
+            if let Ok(conn) = self.conn.lock() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
         }
     }
 }
@@ -408,7 +422,7 @@ impl OneShotImageReader {
     }
 }
 
-#[async_trait(?Send)]
+#[async_trait]
 impl ImageChunkReader for OneShotImageReader {
     async fn read_chunk(&mut self) -> Result<Option<Vec<u8>>, LixError> {
         Ok(self.bytes.take())

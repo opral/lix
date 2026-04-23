@@ -218,7 +218,7 @@ mod tests {
         live_state_mode: Option<String>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackendTransaction for GateTransaction {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite

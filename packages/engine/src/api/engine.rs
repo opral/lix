@@ -494,7 +494,7 @@ mod tests {
         execute_calls: Arc<AtomicUsize>,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LixBackend for CountingBackend {
         fn dialect(&self) -> SqlDialect {
             SqlDialect::Sqlite
