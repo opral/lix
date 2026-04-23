@@ -44,6 +44,7 @@ fn active_version_helper_live_row(entity_id: &str, version_id: &str, timestamp: 
         change_id: Some(format!(
             "change-active-version::{entity_id}::{version_id}::{timestamp}"
         )),
+        commit_id: None,
         untracked: true,
     }
 }
@@ -205,6 +206,7 @@ async fn live_untracked_state_delete_removes_rows() {
             plugin_key: None,
             metadata: None,
             change_id: Some("change-delete-version-ref-main".to_string()),
+            commit_id: None,
             untracked: true,
             snapshot_content: None,
             created_at: None,

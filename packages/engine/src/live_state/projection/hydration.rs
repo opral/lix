@@ -439,6 +439,7 @@ mod tests {
             plugin_key: plugin_key.map(str::to_string),
             metadata: None,
             change_id: Some(change_id.to_string()),
+            commit_id: None,
             global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: false,
             created_at: Some(timestamp.to_string()),
@@ -468,6 +469,7 @@ mod tests {
             change_id: Some(format!(
                 "change-untracked::{schema_key}::{entity_id}::{version_id}::{timestamp}"
             )),
+            commit_id: None,
             global: version_id == crate::version::GLOBAL_VERSION_ID,
             untracked: true,
             created_at: Some(timestamp.to_string()),

@@ -106,6 +106,7 @@ fn checkpoint_commit_label_live_row(
         plugin_key: None,
         metadata: None,
         change_id: Some(write.change_id.clone()),
+        commit_id: Some(write.commit_id.clone()),
         global: true,
         untracked: false,
         created_at: Some(write.created_at.clone()),

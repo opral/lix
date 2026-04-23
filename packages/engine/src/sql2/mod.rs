@@ -2,6 +2,7 @@ mod datafusion;
 mod entity_view;
 mod execute;
 mod filesystem_view;
+mod lix_state_provider;
 mod udf;
 
 pub(crate) use datafusion::{

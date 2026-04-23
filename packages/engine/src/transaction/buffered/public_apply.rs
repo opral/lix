@@ -288,6 +288,7 @@ fn live_row_from_planned_row(
         plugin_key,
         metadata: planned_row_optional_text_value(row, "metadata").map(ToString::to_string),
         change_id: Some(change.id.clone()),
+        commit_id: None,
         untracked: true,
         created_at: Some(change.created_at.clone()),
         updated_at: Some(change.created_at.clone()),
