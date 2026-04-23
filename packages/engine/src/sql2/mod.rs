@@ -1,6 +1,5 @@
 mod datafusion;
 mod entity_view;
-mod filesystem_provider;
 mod filesystem_view;
 mod udf;
 
