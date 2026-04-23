@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 use crate::live_state::constraints::{ScanConstraint, ScanField, ScanOperator};
 use crate::live_state::init as init_live_state;
 use crate::live_state::tracked::{
-    load_exact_row_with_backend, scan_rows_with_backend, ExactTrackedRowRequest,
-    TrackedScanRequest,
+    load_exact_row_with_backend, scan_rows_with_backend, ExactTrackedRowRequest, TrackedScanRequest,
 };
 use crate::live_state::{LiveWriteOperation, LiveWriteRow};
 use crate::session::workspace::init as init_workspace;

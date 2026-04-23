@@ -9,11 +9,10 @@ pub(crate) use layout::{
     load_live_row_access_for_version_with_backend, load_live_row_access_for_version_with_executor,
     load_live_row_access_with_backend, load_live_row_access_with_executor,
     load_live_table_layout_for_version_with_executor, load_live_table_layout_with_executor,
-    logical_live_snapshot_from_row_with_layout,
-    logical_snapshot_from_projected_row, merge_live_table_layouts, normalized_live_column_values,
-    normalized_live_returning_columns, normalized_live_returning_columns_for_layout,
-    render_normalized_live_projection_sql, LiveColumnKind, LiveColumnSpec, LiveRowAccess,
-    LiveTableLayout,
+    logical_live_snapshot_from_row_with_layout, logical_snapshot_from_projected_row,
+    merge_live_table_layouts, normalized_live_column_values, normalized_live_returning_columns,
+    normalized_live_returning_columns_for_layout, render_normalized_live_projection_sql,
+    LiveColumnKind, LiveColumnSpec, LiveRowAccess, LiveTableLayout,
 };
 #[allow(unused_imports)]
 pub(crate) use registry::{

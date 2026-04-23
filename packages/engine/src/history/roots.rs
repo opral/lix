@@ -163,10 +163,12 @@ fn build_history_root_facts(
             normalize_requested_root_ids(root_commit_ids)
                 .into_iter()
                 .filter_map(|commit_id| {
-                    request.lineage_version_id.map(|version_id| ResolvedRootCommit {
-                        commit_id,
-                        version_id: version_id.to_string(),
-                    })
+                    request
+                        .lineage_version_id
+                        .map(|version_id| ResolvedRootCommit {
+                            commit_id,
+                            version_id: version_id.to_string(),
+                        })
                 })
                 .collect(),
         ),

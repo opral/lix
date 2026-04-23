@@ -36,6 +36,7 @@ use super::entity_view::{
     VARIANT_FIELD_METADATA_VALUE,
 };
 use super::udf::register_sql2_udfs;
+use crate::catalog::SurfaceColumnType;
 use crate::catalog::{
     open_change_surface_snapshot, open_change_surface_snapshot_with_shared_backend,
     open_directory_by_version_surface_snapshot,
@@ -63,7 +64,6 @@ use crate::live_state::{
     StateSurfaceColumn, StateSurfaceFilter,
 };
 use crate::sql::diagnostics::sql_unknown_column_error;
-use crate::catalog::SurfaceColumnType;
 use crate::{LixBackend, LixError, QueryResult, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -351,9 +351,7 @@ fn validate_variant_text_coercions_in_join_constraint(
         sqlparser::ast::JoinConstraint::On(expr) => {
             validate_variant_text_coercions_in_expr(expr, artifact, scope)
         }
-        sqlparser::ast::JoinConstraint::Using(_idents) => {
-            Ok(())
-        }
+        sqlparser::ast::JoinConstraint::Using(_idents) => Ok(()),
         sqlparser::ast::JoinConstraint::Natural | sqlparser::ast::JoinConstraint::None => Ok(()),
     }
 }
@@ -366,7 +364,8 @@ fn validate_variant_text_coercions_in_expr(
     match expr {
         SqlExpr::BinaryOp { left, op, right } => {
             if binary_operator_wants_text(op)
-                && ((expr_is_string_like_literal(left) && expr_is_bare_variant_column(right, artifact, scope))
+                && ((expr_is_string_like_literal(left)
+                    && expr_is_bare_variant_column(right, artifact, scope))
                     || (expr_is_string_like_literal(right)
                         && expr_is_bare_variant_column(left, artifact, scope)))
             {
@@ -399,7 +398,9 @@ fn validate_variant_text_coercions_in_expr(
             }
             Ok(())
         }
-        SqlExpr::Between { expr, low, high, .. } => {
+        SqlExpr::Between {
+            expr, low, high, ..
+        } => {
             if expr_is_bare_variant_column(expr, artifact, scope)
                 && (expr_is_string_like_literal(low) || expr_is_string_like_literal(high))
             {
@@ -421,8 +422,7 @@ fn validate_variant_text_coercions_in_expr(
         | SqlExpr::IsNotUnknown(expr) => {
             validate_variant_text_coercions_in_expr(expr, artifact, scope)
         }
-        SqlExpr::IsDistinctFrom(left, right)
-        | SqlExpr::IsNotDistinctFrom(left, right) => {
+        SqlExpr::IsDistinctFrom(left, right) | SqlExpr::IsNotDistinctFrom(left, right) => {
             validate_variant_text_coercions_in_expr(left, artifact, scope)?;
             validate_variant_text_coercions_in_expr(right, artifact, scope)
         }
@@ -564,13 +564,9 @@ fn expr_is_bare_variant_column(
     scope: &BTreeMap<String, String>,
 ) -> bool {
     match expr {
-        SqlExpr::Identifier(ident) => variant_column_type_for_reference(
-            None,
-            &ident.value,
-            artifact,
-            scope,
-        )
-        .is_some(),
+        SqlExpr::Identifier(ident) => {
+            variant_column_type_for_reference(None, &ident.value, artifact, scope).is_some()
+        }
         SqlExpr::CompoundIdentifier(idents) if idents.len() == 2 => {
             variant_column_type_for_reference(
                 Some(&idents[0].value),
@@ -601,15 +597,12 @@ fn variant_column_type_for_reference(
         return (*column_type == SurfaceColumnType::Variant).then_some(*column_type);
     }
 
-    let mut variant_matches = artifact
-        .entity_views
-        .values()
-        .filter_map(|plan| {
-            plan.column_types
-                .get(column_name)
-                .copied()
-                .filter(|column_type| *column_type == SurfaceColumnType::Variant)
-        });
+    let mut variant_matches = artifact.entity_views.values().filter_map(|plan| {
+        plan.column_types
+            .get(column_name)
+            .copied()
+            .filter(|column_type| *column_type == SurfaceColumnType::Variant)
+    });
     let first = variant_matches.next()?;
     variant_matches.next().is_none().then_some(first)
 }
@@ -710,13 +703,12 @@ async fn build_session_for_read_with_borrowed_backend(
                 .map_err(datafusion_error_to_lix_error)?;
             }
             "lix_state_history" => {
-                let rows =
-                    load_materialized_state_history_rows(
-                        backend,
-                        &artifact.active_version_id,
-                        &artifact.sql,
-                    )
-                    .await?;
+                let rows = load_materialized_state_history_rows(
+                    backend,
+                    &artifact.active_version_id,
+                    &artifact.sql,
+                )
+                .await?;
                 ctx.register_table(
                     surface_name,
                     Arc::new(LixStateHistoryProvider::new_materialized(
@@ -1513,12 +1505,12 @@ impl ExecutionPlan for LixStateHistoryScanExec {
                 Vec::new()
             } else {
                 match source {
-                LixStateHistorySource::Materialized(rows) => rows.as_ref().clone(),
-                LixStateHistorySource::SharedBackend(backend) => {
-                    enqueue_state_history_scan(backend, request)
-                        .await?
+                    LixStateHistorySource::Materialized(rows) => rows.as_ref().clone(),
+                    LixStateHistorySource::SharedBackend(backend) => {
+                        enqueue_state_history_scan(backend, request).await?
+                    }
                 }
-            }};
+            };
             let rows = if let Some(limit) = limit {
                 rows.into_iter().take(limit).collect::<Vec<_>>()
             } else {
@@ -1617,7 +1609,10 @@ async fn load_materialized_state_history_rows(
         .await
 }
 
-fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> StateHistoryRequest {
+fn state_history_request(
+    active_version_id: &str,
+    route: &StateHistoryRoute,
+) -> StateHistoryRequest {
     let mut request = StateHistoryRequest {
         lineage_scope: StateHistoryLineageScope::ActiveVersion,
         lineage_version_id: Some(active_version_id.to_string()),
@@ -1635,7 +1630,8 @@ fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> 
         request.schema_keys = route.schema_keys.clone();
     }
     if !route.version_ids.is_empty() {
-        request.version_scope = StateHistoryVersionScope::RequestedVersions(route.version_ids.clone());
+        request.version_scope =
+            StateHistoryVersionScope::RequestedVersions(route.version_ids.clone());
     }
     request.min_depth = route.min_depth;
     request.max_depth = route.max_depth;
@@ -1643,7 +1639,10 @@ fn state_history_request(active_version_id: &str, route: &StateHistoryRoute) -> 
 }
 
 fn request_contradictory(request: &StateHistoryRequest) -> bool {
-    request.min_depth.zip(request.max_depth).is_some_and(|(min, max)| min > max)
+    request
+        .min_depth
+        .zip(request.max_depth)
+        .is_some_and(|(min, max)| min > max)
         || matches!(request.root_scope, StateHistoryRootScope::RequestedRoots(ref roots) if roots.is_empty())
         || matches!(request.version_scope, StateHistoryVersionScope::RequestedVersions(ref versions) if versions.is_empty())
 }
@@ -1722,26 +1721,30 @@ fn apply_state_history_filter(expr: &Expr, route: &mut StateHistoryRoute) {
         }
         ("depth", Operator::Gt, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth =
-                    Some(route.min_depth.map_or(value + 1, |current| current.max(value + 1)));
+                route.min_depth = Some(
+                    route
+                        .min_depth
+                        .map_or(value + 1, |current| current.max(value + 1)),
+                );
             }
         }
         ("depth", Operator::GtEq, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.min_depth =
-                    Some(route.min_depth.map_or(value, |current| current.max(value)));
+                route.min_depth = Some(route.min_depth.map_or(value, |current| current.max(value)));
             }
         }
         ("depth", Operator::Lt, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.max_depth =
-                    Some(route.max_depth.map_or(value - 1, |current| current.min(value - 1)));
+                route.max_depth = Some(
+                    route
+                        .max_depth
+                        .map_or(value - 1, |current| current.min(value - 1)),
+                );
             }
         }
         ("depth", Operator::LtEq, depth_expr) => {
             if let Some(value) = scalar_i64_literal(depth_expr) {
-                route.max_depth =
-                    Some(route.max_depth.map_or(value, |current| current.min(value)));
+                route.max_depth = Some(route.max_depth.map_or(value, |current| current.min(value)));
             }
         }
         _ => {}
@@ -1794,7 +1797,11 @@ fn collect_state_history_route_from_sql_expr(expr: &SqlExpr, route: &mut StateHi
                 collect_state_history_route_from_sql_expr(right, route);
                 return;
             }
-            match (history_column_name(left), op, sql_expr_string_literal(right)) {
+            match (
+                history_column_name(left),
+                op,
+                sql_expr_string_literal(right),
+            ) {
                 (Some("root_commit_id"), sqlparser::ast::BinaryOperator::Eq, Some(value)) => {
                     if !route.root_commit_ids.contains(&value.to_string()) {
                         route.root_commit_ids.push(value.to_string());
@@ -1844,7 +1851,12 @@ fn history_column_name(expr: &SqlExpr) -> Option<&str> {
         SqlExpr::CompoundIdentifier(parts) => parts.last().map(|ident| ident.value.as_str()),
         _ => None,
     }
-    .filter(|name| matches!(*name, "root_commit_id" | "entity_id" | "schema_key" | "version_id"))
+    .filter(|name| {
+        matches!(
+            *name,
+            "root_commit_id" | "entity_id" | "schema_key" | "version_id"
+        )
+    })
 }
 
 fn sql_expr_string_literal(expr: &SqlExpr) -> Option<&str> {
@@ -6006,7 +6018,10 @@ mod tests {
                     .await
                     .expect("sql2 shared-backend JSON read should execute");
                 assert_eq!(result.columns, vec!["value"]);
-                assert_eq!(result.rows, vec![vec![Value::Text("\"value-a\"".to_string())]]);
+                assert_eq!(
+                    result.rows,
+                    vec![vec![Value::Text("\"value-a\"".to_string())]]
+                );
             })
         });
     }
@@ -6042,7 +6057,10 @@ mod tests {
                     .await
                     .expect("sql2 shared-backend aliased JSON read should execute");
                 assert_eq!(result.columns, vec!["payload"]);
-                assert_eq!(result.rows, vec![vec![Value::Text("\"value-a\"".to_string())]]);
+                assert_eq!(
+                    result.rows,
+                    vec![vec![Value::Text("\"value-a\"".to_string())]]
+                );
             })
         });
     }
@@ -6123,8 +6141,8 @@ mod tests {
                 };
                 force_entity_view_column_to_variant(&mut artifact, "lix_key_value", "value");
 
-                let result = execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact)
-                    .await;
+                let result =
+                    execute_read_with_shared_backend(Arc::new(backend.clone()), &artifact).await;
                 assert!(
                     result.is_err(),
                     "explicit variant text comparison should require an explicit cast or extraction"

@@ -376,7 +376,9 @@ fn json_payload_projection_expr(property_name: &str, column_type: SurfaceColumnT
         SurfaceColumnType::Json => lix_json_extract_json_expr(snapshot_content, property_name),
         // Variant remains available for future explicit owner-chosen polymorphic
         // payloads, but schema-derived JSON fields must not route through it.
-        SurfaceColumnType::Variant => lix_json_extract_variant_expr(snapshot_content, property_name),
+        SurfaceColumnType::Variant => {
+            lix_json_extract_variant_expr(snapshot_content, property_name)
+        }
         SurfaceColumnType::Boolean => {
             lix_json_extract_boolean_expr(snapshot_content, property_name)
         }
@@ -414,8 +416,7 @@ mod tests {
     };
     use crate::catalog::{
         build_builtin_surface_registry, dynamic_entity_surface_spec_from_schema,
-        register_dynamic_entity_surface_spec,
-        SurfaceColumnType,
+        register_dynamic_entity_surface_spec, SurfaceColumnType,
     };
     use crate::live_state::StateSurfaceColumn;
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -652,7 +653,10 @@ mod tests {
             .get("lix_key_value")
             .expect("lix_key_value surface should compile");
 
-        assert_eq!(plan.column_types.get("value"), Some(&SurfaceColumnType::Json));
+        assert_eq!(
+            plan.column_types.get("value"),
+            Some(&SurfaceColumnType::Json)
+        );
 
         let exprs = plan
             .projection_exprs(&["value".to_string()])
@@ -678,7 +682,10 @@ mod tests {
             .get("lix_registered_schema")
             .expect("registered schema surface should compile");
 
-        assert_eq!(plan.column_types.get("value"), Some(&SurfaceColumnType::Json));
+        assert_eq!(
+            plan.column_types.get("value"),
+            Some(&SurfaceColumnType::Json)
+        );
 
         let exprs = plan
             .projection_exprs(&["value".to_string()])
@@ -719,13 +726,15 @@ mod tests {
             .expect("schema should compile"),
         );
 
-        let plans =
-            prepared_entity_view_plans_for_registry(&registry, &["flex_value".to_string()]);
+        let plans = prepared_entity_view_plans_for_registry(&registry, &["flex_value".to_string()]);
         let plan = plans
             .get("flex_value")
             .expect("flex_value surface should compile");
 
-        assert_eq!(plan.column_types.get("value"), Some(&SurfaceColumnType::Json));
+        assert_eq!(
+            plan.column_types.get("value"),
+            Some(&SurfaceColumnType::Json)
+        );
 
         let exprs = plan
             .projection_exprs(&["value".to_string()])

@@ -377,7 +377,8 @@ pub(crate) async fn load_registered_schema_layout_rows_in_transaction(
 pub(crate) async fn load_registered_schema_layout_rows_with_executor(
     executor: &mut dyn QueryExecutor,
 ) -> Result<Vec<Vec<Value>>, LixError> {
-    let version_filter = registered_schema_visible_version_filter_sql_with_executor(executor).await?;
+    let version_filter =
+        registered_schema_visible_version_filter_sql_with_executor(executor).await?;
     let result = execute_query_with_executor(
         executor,
         &format!(
@@ -446,8 +447,8 @@ pub(crate) async fn load_registered_schema_live_table_layout_rows_for_version(
 async fn registered_schema_visible_version_filter_sql_with_backend(
     backend: LiveStateBackendRef<'_>,
 ) -> Result<String, LixError> {
-    let frontier = crate::live_state::load_current_committed_version_frontier_with_backend(backend)
-        .await?;
+    let frontier =
+        crate::live_state::load_current_committed_version_frontier_with_backend(backend).await?;
     Ok(registered_schema_visible_version_filter_sql(
         frontier.version_heads.into_keys(),
     ))
@@ -1930,7 +1931,8 @@ pub(crate) async fn load_visible_registered_schema_snapshot_contents(
     backend: &dyn LixBackend,
     requested_version_id: &str,
 ) -> Result<BTreeMap<String, String>, LixError> {
-    let version_filter = registered_schema_visible_version_filter_sql([requested_version_id.to_string()]);
+    let version_filter =
+        registered_schema_visible_version_filter_sql([requested_version_id.to_string()]);
     let sql = format!(
         "SELECT snapshot_content FROM {table} \
          WHERE version_id IN ({version_filter}) \

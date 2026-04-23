@@ -957,9 +957,9 @@ async fn load_effective_rows_for_schema(
     let mut hidden = BTreeSet::<(String, Option<String>)>::new();
     let snapshot_shape = if request_needs_snapshot_content(request) {
         match crate::live_state::schema_access::load_live_row_shape_for_version_with_backend(
-                backend, schema_key, version_id,
-            )
-            .await
+            backend, schema_key, version_id,
+        )
+        .await
         {
             Ok(shape) => Some(shape),
             Err(error) if is_schema_not_stored_error(&error, schema_key) => return Ok(Vec::new()),

@@ -153,7 +153,8 @@ pub(crate) async fn load_live_snapshot_rows_with_backend(
         return Ok(Vec::new());
     }
 
-    let shape = load_live_read_shape_for_version_with_backend(backend, schema_key, version_id).await?;
+    let shape =
+        load_live_read_shape_for_version_with_backend(backend, schema_key, version_id).await?;
     let required_columns = shape.property_names();
     let constraints = filters
         .iter()
