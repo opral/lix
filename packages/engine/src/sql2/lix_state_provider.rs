@@ -5,14 +5,22 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::arrow::array::{ArrayRef, BooleanArray, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::{DataFusionError, Result};
-use datafusion::datasource::{MemTable, TableType};
+use datafusion::datasource::TableType;
+use datafusion::execution::TaskContext;
 use datafusion::logical_expr::expr::InList;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator, TableProviderFilterPushDown};
+use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType, PlanProperties};
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, SendableRecordBatchStream,
+};
 use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
+use futures_util::{stream, TryStreamExt};
 
 use crate::live_state::{
     LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
@@ -107,12 +115,13 @@ impl TableProvider for LixStateProvider {
 
     async fn scan(
         &self,
-        state: &dyn Session,
+        _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
     ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         let route = LixStateByVersionRoute::from_filters(filters);
+        let projected_schema = projected_schema(&self.schema, projection)?;
         let request = lix_state_scan_request(
             &self.schema,
             self.default_version_id.as_deref(),
@@ -120,15 +129,120 @@ impl TableProvider for LixStateProvider {
             &route,
             limit,
         );
-        let rows = self
-            .live_state
-            .scan(&request)
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
-        let batch = lix_state_by_version_record_batch(Arc::clone(&self.schema), &rows)
-            .map_err(lix_error_to_datafusion_error)?;
-        let table = MemTable::try_new(Arc::clone(&self.schema), vec![vec![batch]])?;
-        table.scan(state, projection, filters, limit).await
+        Ok(Arc::new(LixStateScanExec::new(
+            Arc::clone(&self.live_state),
+            projected_schema,
+            request,
+        )))
+    }
+}
+
+struct LixStateScanExec {
+    live_state: Arc<dyn LiveStateContext>,
+    schema: SchemaRef,
+    request: LiveStateScanRequest,
+    properties: Arc<PlanProperties>,
+}
+
+impl std::fmt::Debug for LixStateScanExec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixStateScanExec").finish()
+    }
+}
+
+impl LixStateScanExec {
+    fn new(
+        live_state: Arc<dyn LiveStateContext>,
+        schema: SchemaRef,
+        request: LiveStateScanRequest,
+    ) -> Self {
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(schema.clone()),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Incremental,
+            Boundedness::Bounded,
+        );
+        Self {
+            live_state,
+            schema,
+            request,
+            properties: Arc::new(properties),
+        }
+    }
+}
+
+impl DisplayAs for LixStateScanExec {
+    fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match t {
+            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+                write!(f, "LixStateScanExec(limit={:?})", self.request.limit)
+            }
+            DisplayFormatType::TreeRender => write!(f, "LixStateScanExec"),
+        }
+    }
+}
+
+impl ExecutionPlan for LixStateScanExec {
+    fn name(&self) -> &str {
+        "LixStateScanExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn properties(&self) -> &Arc<PlanProperties> {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        Vec::new()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if !children.is_empty() {
+            return Err(DataFusionError::Execution(
+                "LixStateScanExec does not accept children".to_string(),
+            ));
+        }
+        Ok(self)
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        _context: Arc<TaskContext>,
+    ) -> Result<SendableRecordBatchStream> {
+        if partition != 0 {
+            return Err(DataFusionError::Execution(format!(
+                "LixStateScanExec only exposes one partition, got {partition}"
+            )));
+        }
+
+        let live_state = Arc::clone(&self.live_state);
+        let schema = Arc::clone(&self.schema);
+        let request = self.request.clone();
+        let stream_schema = Arc::clone(&schema);
+        let stream = stream::once(async move {
+            let rows = if request.limit == Some(0) {
+                Vec::new()
+            } else {
+                live_state
+                    .scan(&request)
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?
+            };
+            let batch = lix_state_record_batch(Arc::clone(&stream_schema), &rows)
+                .map_err(lix_error_to_datafusion_error)?;
+            Ok::<_, DataFusionError>(stream::iter(vec![Ok::<RecordBatch, DataFusionError>(
+                batch,
+            )]))
+        })
+        .try_flatten();
+        Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
 
@@ -427,10 +541,17 @@ fn is_null_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(ScalarValue::Null, _))
 }
 
-fn lix_state_by_version_record_batch(
-    schema: SchemaRef,
-    rows: &[LiveRow],
-) -> Result<RecordBatch, LixError> {
+fn lix_state_record_batch(schema: SchemaRef, rows: &[LiveRow]) -> Result<RecordBatch, LixError> {
+    if schema.fields().is_empty() {
+        let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
+        return RecordBatch::try_new_with_options(schema, vec![], &options).map_err(|error| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                format!("sql2 failed to build zero-column lix_state batch: {error}"),
+            )
+        });
+    }
+
     let columns = schema
         .fields()
         .iter()
@@ -481,6 +602,17 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
         .map(|value| value.map(ToOwned::to_owned))
         .collect::<Vec<_>>();
     Arc::new(StringArray::from(values)) as ArrayRef
+}
+
+fn projected_schema(schema: &SchemaRef, projection: Option<&Vec<usize>>) -> Result<SchemaRef> {
+    let Some(projection) = projection else {
+        return Ok(Arc::clone(schema));
+    };
+
+    let projected = schema.project(projection).map_err(|error| {
+        DataFusionError::Execution(format!("sql2 failed to project lix_state schema: {error}"))
+    })?;
+    Ok(Arc::new(projected))
 }
 
 fn datafusion_error_to_lix_error(error: DataFusionError) -> LixError {
