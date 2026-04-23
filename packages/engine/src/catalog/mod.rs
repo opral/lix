@@ -1,6 +1,7 @@
 mod api;
 mod binding;
 mod change_surface;
+mod context;
 mod declaration;
 mod dependency;
 mod directory;
@@ -31,6 +32,8 @@ pub(crate) use api::{
     builtin_catalog_compiler_facade, catalog_compiler_facade_for_registry, CatalogCompilerApi,
     CatalogCompilerFacade,
 };
+#[allow(unused_imports)]
+pub(crate) use context::CatalogContext;
 
 #[allow(unused_imports)]
 pub(crate) use registry::*;
