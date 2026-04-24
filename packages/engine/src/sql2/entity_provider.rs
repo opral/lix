@@ -28,13 +28,14 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde_json::Value as JsonValue;
 
+use crate::common::{derive_entity_id_from_json_paths, EntityIdDerivationError};
 use crate::live_state::{
     LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
-use super::execute::{LixStateWriteRow, SqlWriteIntent, SqlWriteStager};
+use super::execute::{SqlWriteIntent, SqlWriteStager, StateWriteRow};
 use super::udf::{
     lix_json_extract_boolean_expr, lix_json_extract_json_expr, lix_json_extract_text_expr,
 };
@@ -180,6 +181,7 @@ enum EntityColumnType {
 struct EntitySurfaceSpec {
     schema_key: String,
     schema_version: Option<String>,
+    primary_key_paths: Vec<Vec<String>>,
     visible_columns: Vec<String>,
     column_types: BTreeMap<String, EntityColumnType>,
 }
@@ -482,7 +484,7 @@ impl DataSink for EntityInsertSink {
             .map_err(|_| DataFusionError::Execution("entity INSERT row count overflow".into()))?;
 
         self.write_stager
-            .stage_write(SqlWriteIntent::InsertLixState { rows })
+            .stage_write(SqlWriteIntent::InsertRows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -632,7 +634,7 @@ impl ExecutionPlan for EntityDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::DeleteLixState { rows: write_rows })
+                    .stage_write(SqlWriteIntent::DeleteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -796,7 +798,7 @@ impl ExecutionPlan for EntityUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::InsertLixState { rows: write_rows })
+                    .stage_write(SqlWriteIntent::InsertRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -928,7 +930,7 @@ fn entity_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<LixStateWriteRow>> {
+) -> Result<Vec<StateWriteRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, true)
 }
 
@@ -936,7 +938,7 @@ fn entity_existing_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<LixStateWriteRow>> {
+) -> Result<Vec<StateWriteRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, false)
 }
 
@@ -945,11 +947,11 @@ fn entity_lix_state_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<LixStateWriteRow>> {
+) -> Result<Vec<StateWriteRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
-            let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
-            let version_id = if global {
+            let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
+            let version_id = if explicit_global == Some(true) {
                 GLOBAL_VERSION_ID.to_string()
             } else {
                 optional_string_value(batch, row_index, "lixcol_version_id")?
@@ -961,6 +963,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                         ))
                     })?
             };
+            let global = explicit_global.unwrap_or(version_id == GLOBAL_VERSION_ID);
 
             if let Some(schema_key) = optional_string_value(batch, row_index, "lixcol_schema_key")?
             {
@@ -988,13 +991,27 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                         spec.schema_key
                     ))
                 })?;
+            let snapshot_content = entity_snapshot_content_from_batch(spec, batch, row_index)?;
+            let snapshot = serde_json::from_str::<JsonValue>(&snapshot_content).map_err(|error| {
+                DataFusionError::Execution(format!(
+                    "failed to decode entity surface '{}' snapshot_content for entity id derivation: {error}",
+                    spec.schema_key
+                ))
+            })?;
+            let entity_id = match optional_string_value(batch, row_index, "lixcol_entity_id")? {
+                Some(entity_id) => entity_id,
+                None => {
+                    derive_entity_id_from_snapshot(spec, &snapshot)
+                        .map_err(DataFusionError::Execution)?
+                }
+            };
 
-            Ok(LixStateWriteRow {
-                entity_id: required_string_value(batch, row_index, "lixcol_entity_id")?,
+            Ok(StateWriteRow {
+                entity_id,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
-                snapshot_content: Some(entity_snapshot_content_from_batch(spec, batch, row_index)?),
+                snapshot_content: Some(snapshot_content),
                 metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
                 schema_version: Some(schema_version),
                 created_at: None,
@@ -1045,6 +1062,55 @@ fn entity_snapshot_content_from_batch(
     })
 }
 
+fn derive_entity_id_from_snapshot(
+    spec: &EntitySurfaceSpec,
+    snapshot: &JsonValue,
+) -> std::result::Result<String, String> {
+    if spec.primary_key_paths.is_empty() {
+        return Err(format!(
+            "INSERT into entity surface '{}' requires lixcol_entity_id because the schema has no x-lix-primary-key",
+            spec.schema_key
+        ));
+    }
+
+    derive_entity_id_from_json_paths(snapshot, &spec.primary_key_paths)
+        .map(|entity_id| entity_id.into_inner())
+        .map_err(|error| entity_id_derivation_error_message(spec, error))
+}
+
+fn entity_id_derivation_error_message(
+    spec: &EntitySurfaceSpec,
+    error: EntityIdDerivationError,
+) -> String {
+    match error {
+        EntityIdDerivationError::EmptyPrimaryKeyPath { index } => format!(
+            "INSERT into entity surface '{}' has empty x-lix-primary-key pointer at index {index}",
+            spec.schema_key
+        ),
+        EntityIdDerivationError::MissingPrimaryKeyValue { index } => {
+            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
+            format!(
+                "INSERT into entity surface '{}' requires value at primary-key pointer '{pointer}'",
+                spec.schema_key
+            )
+        }
+        EntityIdDerivationError::NullPrimaryKeyValue { index } => {
+            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
+            format!(
+                "INSERT into entity surface '{}' requires non-null value at primary-key pointer '{pointer}'",
+                spec.schema_key
+            )
+        }
+        EntityIdDerivationError::EmptyPrimaryKeyValue { index } => {
+            let pointer = format_json_pointer(&spec.primary_key_paths[index]);
+            format!(
+                "INSERT into entity surface '{}' requires non-empty value at primary-key pointer '{pointer}'",
+                spec.schema_key
+            )
+        }
+    }
+}
+
 fn entity_json_value_from_scalar(
     value: Option<ScalarValue>,
     column_type: EntityColumnType,
@@ -1067,11 +1133,12 @@ fn entity_json_value_from_scalar(
         ScalarValue::Utf8(Some(value))
         | ScalarValue::Utf8View(Some(value))
         | ScalarValue::LargeUtf8(Some(value)) => match column_type {
-            EntityColumnType::Json => serde_json::from_str(&value).map_err(|error| {
-                DataFusionError::Execution(format!(
-                    "entity JSON column expected valid JSON text, got error: {error}"
-                ))
-            }),
+            EntityColumnType::Json => {
+                // JSON surface columns accept SQL strings as JSON string values,
+                // while still allowing callers to pass serialized JSON text for
+                // objects, arrays, numbers, booleans, and null.
+                Ok(serde_json::from_str(&value).unwrap_or(JsonValue::String(value)))
+            }
             EntityColumnType::Integer => {
                 value.parse::<i64>().map(JsonValue::from).map_err(|error| {
                     DataFusionError::Execution(format!(
@@ -1128,18 +1195,6 @@ fn reject_present_entity_insert_field(
         )));
     }
     Ok(())
-}
-
-fn required_string_value(
-    batch: &RecordBatch,
-    row_index: usize,
-    column_name: &str,
-) -> Result<String> {
-    optional_string_value(batch, row_index, column_name)?.ok_or_else(|| {
-        DataFusionError::Execution(format!(
-            "INSERT into entity surface requires non-null text column '{column_name}'"
-        ))
-    })
 }
 
 fn optional_string_value(
@@ -1619,13 +1674,93 @@ fn derive_entity_surface_spec_from_schema(
                 .collect::<BTreeMap<_, _>>()
         })
         .unwrap_or_default();
+    let primary_key_paths = parse_primary_key_paths(schema)?;
 
     Ok(EntitySurfaceSpec {
         schema_key: schema_key.to_string(),
         schema_version,
+        primary_key_paths,
         visible_columns,
         column_types,
     })
+}
+
+fn parse_primary_key_paths(schema: &JsonValue) -> std::result::Result<Vec<Vec<String>>, LixError> {
+    let Some(primary_key) = schema.get("x-lix-primary-key") else {
+        return Ok(Vec::new());
+    };
+    let primary_key = primary_key.as_array().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "schema x-lix-primary-key must be an array of JSON Pointers".to_string(),
+        )
+    })?;
+
+    primary_key
+        .iter()
+        .enumerate()
+        .map(|(index, pointer)| {
+            let pointer = pointer.as_str().ok_or_else(|| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("schema x-lix-primary-key entry at index {index} must be a string"),
+                )
+            })?;
+            parse_json_pointer(pointer)
+        })
+        .collect()
+}
+
+// TODO(engine2): share JSON Pointer parsing with schema/canonical validation once
+// those helpers have a clean module boundary for SQL providers.
+fn parse_json_pointer(pointer: &str) -> std::result::Result<Vec<String>, LixError> {
+    if pointer.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !pointer.starts_with('/') {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("invalid JSON pointer '{pointer}'"),
+        ));
+    }
+    pointer[1..]
+        .split('/')
+        .map(decode_json_pointer_segment)
+        .collect()
+}
+
+fn decode_json_pointer_segment(segment: &str) -> std::result::Result<String, LixError> {
+    let mut out = String::new();
+    let mut chars = segment.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '~' {
+            match chars.next() {
+                Some('0') => out.push('~'),
+                Some('1') => out.push('/'),
+                _ => {
+                    return Err(LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        format!("invalid JSON pointer segment '{segment}'"),
+                    ))
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    Ok(out)
+}
+
+fn format_json_pointer(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return String::new();
+    }
+    let encoded = segments
+        .iter()
+        .map(|segment| segment.replace('~', "~0").replace('/', "~1"))
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/{encoded}")
 }
 
 fn schema_exposed_as_entity_surface(schema_key: &str) -> bool {
@@ -1709,7 +1844,7 @@ mod tests {
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
     use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
-    use crate::sql2::{LixStateWriteRow, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
     use crate::LixError;
 
     struct EmptyLiveStateContext;
@@ -2080,8 +2215,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::InsertLixState {
-                rows: vec![LixStateWriteRow {
+            &[SqlWriteIntent::InsertRows {
+                rows: vec![StateWriteRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "project_message".to_string(),
                     file_id: None,

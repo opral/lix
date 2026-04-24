@@ -44,7 +44,7 @@ use crate::history::{
 };
 
 use super::execute::{
-    FileDataWrite, HistoryContext, LixStateWriteRow, SqlWriteIntent, SqlWriteStager,
+    FileDataWrite, HistoryContext, SqlWriteIntent, SqlWriteStager, StateWriteRow,
 };
 
 pub(crate) async fn register_lix_file_providers(
@@ -423,11 +423,11 @@ impl DataSink for LixFileInsertSink {
 
         if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
             let intent = if staged.file_data_writes.is_empty() {
-                SqlWriteIntent::InsertLixState {
+                SqlWriteIntent::InsertRows {
                     rows: staged.state_rows,
                 }
             } else {
-                SqlWriteIntent::InsertLixStateWithFileData {
+                SqlWriteIntent::InsertRowsWithFileData {
                     rows: staged.state_rows,
                     file_data: staged.file_data_writes,
                     count: staged.count,
@@ -575,7 +575,7 @@ impl ExecutionPlan for LixFileDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::DeleteLixState { rows: write_rows })
+                    .stage_write(SqlWriteIntent::DeleteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -739,11 +739,11 @@ impl ExecutionPlan for LixFileUpdateExec {
 
             if count > 0 {
                 let intent = if staged.file_data_writes.is_empty() {
-                    SqlWriteIntent::InsertLixState {
+                    SqlWriteIntent::InsertRows {
                         rows: staged.state_rows,
                     }
                 } else {
-                    SqlWriteIntent::InsertLixStateWithFileData {
+                    SqlWriteIntent::InsertRowsWithFileData {
                         rows: staged.state_rows,
                         file_data: staged.file_data_writes,
                         count,
@@ -1131,7 +1131,7 @@ struct FileHistoryOutputRow {
 
 #[derive(Debug, Default)]
 struct LixFileStagedBatch {
-    state_rows: Vec<LixStateWriteRow>,
+    state_rows: Vec<StateWriteRow>,
     file_data_writes: Vec<FileDataWrite>,
     count: u64,
 }
@@ -1555,14 +1555,14 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 fn lix_file_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<LixStateWriteRow>> {
+) -> Result<Vec<StateWriteRow>> {
     Ok(lix_file_insert_stage_from_batch(batch, default_version_id)?.state_rows)
 }
 
 fn lix_file_existing_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<LixStateWriteRow>> {
+) -> Result<Vec<StateWriteRow>> {
     Ok(lix_file_existing_stage_from_batch(batch, default_version_id, true, false)?.state_rows)
 }
 
@@ -1642,7 +1642,7 @@ fn lix_file_stage_from_batch_with_options(
             })
             .to_string();
 
-            staged.state_rows.push(LixStateWriteRow {
+            staged.state_rows.push(StateWriteRow {
                 entity_id: id.clone(),
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
@@ -2439,7 +2439,7 @@ mod tests {
         let writes = stager.writes.lock().expect("writes lock");
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            SqlWriteIntent::InsertLixState { rows } => {
+            SqlWriteIntent::InsertRows { rows } => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(rows[0].entity_id, "file-readme");
                 assert_eq!(rows[0].schema_key, "lix_file_descriptor");
@@ -2467,7 +2467,7 @@ mod tests {
         let writes = stager.writes.lock().expect("writes lock");
         assert_eq!(writes.len(), 1);
         match &writes[0] {
-            SqlWriteIntent::InsertLixStateWithFileData {
+            SqlWriteIntent::InsertRowsWithFileData {
                 rows,
                 file_data,
                 count,
