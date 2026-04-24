@@ -61,21 +61,18 @@ pub(crate) trait HistoryContext: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqlWriteIntent {
-    InsertRows {
-        rows: Vec<StateWriteRow>,
+    WriteRows {
+        rows: Vec<StateRow>,
     },
-    DeleteRows {
-        rows: Vec<StateWriteRow>,
-    },
-    InsertRowsWithFileData {
-        rows: Vec<StateWriteRow>,
+    WriteRowsWithFileData {
+        rows: Vec<StateRow>,
         file_data: Vec<FileDataWrite>,
         count: u64,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct StateWriteRow {
+pub(crate) struct StateRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -163,34 +160,24 @@ pub(crate) fn stage_decoded_write(
     write: SqlWriteIntent,
 ) -> Result<SqlWriteOutcome, LixError> {
     match write {
-        SqlWriteIntent::InsertRows { rows } => {
+        SqlWriteIntent::WriteRows { rows } => {
             let count = rows.len() as u64;
             let mutations = rows
                 .into_iter()
-                .map(|row| mutation_row_from_state_write_row(row, MutationOperation::Insert))
+                .map(mutation_row_from_state_row)
                 .collect::<Result<Vec<_>, _>>()?;
             let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
             stager.stage_transaction_write_delta(delta)?;
             Ok(SqlWriteOutcome { count })
         }
-        SqlWriteIntent::DeleteRows { rows } => {
-            let count = rows.len() as u64;
-            let mutations = rows
-                .into_iter()
-                .map(|row| mutation_row_from_state_write_row(row, MutationOperation::Delete))
-                .collect::<Result<Vec<_>, _>>()?;
-            let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
-            stager.stage_transaction_write_delta(delta)?;
-            Ok(SqlWriteOutcome { count })
-        }
-        SqlWriteIntent::InsertRowsWithFileData {
+        SqlWriteIntent::WriteRowsWithFileData {
             rows,
             file_data,
             count,
         } => {
             let mutations = rows
                 .into_iter()
-                .map(|row| mutation_row_from_state_write_row(row, MutationOperation::Insert))
+                .map(mutation_row_from_state_row)
                 .collect::<Result<Vec<_>, _>>()?;
             let filesystem_state = filesystem_state_from_file_data_writes(file_data);
             let delta = build_direct_mutation_transaction_write_delta_with_filesystem_state(
@@ -223,10 +210,7 @@ fn filesystem_state_from_file_data_writes(file_data: Vec<FileDataWrite>) -> Plan
     filesystem_state
 }
 
-fn mutation_row_from_state_write_row(
-    row: StateWriteRow,
-    operation: MutationOperation,
-) -> Result<MutationRow, LixError> {
+fn mutation_row_from_state_row(row: StateRow) -> Result<MutationRow, LixError> {
     reject_read_only_lix_state_insert_field("created_at", &row.created_at)?;
     reject_read_only_lix_state_insert_field("updated_at", &row.updated_at)?;
     reject_read_only_lix_state_insert_field("change_id", &row.change_id)?;
@@ -237,20 +221,22 @@ fn mutation_row_from_state_write_row(
             "INSERT into lix_state requires schema_version before staging",
         )
     })?;
-    let snapshot_content = if operation == MutationOperation::Delete {
-        None
+    let operation = if row.snapshot_content.is_none() {
+        MutationOperation::Delete
     } else {
-        row.snapshot_content
-            .map(|snapshot| {
-                serde_json::from_str::<JsonValue>(&snapshot).map_err(|error| {
-                    LixError::new(
-                        "LIX_ERROR_UNKNOWN",
-                        format!("INSERT into lix_state has invalid snapshot_content JSON: {error}"),
-                    )
-                })
-            })
-            .transpose()?
+        MutationOperation::Insert
     };
+    let snapshot_content = row
+        .snapshot_content
+        .map(|snapshot| {
+            serde_json::from_str::<JsonValue>(&snapshot).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("INSERT into lix_state has invalid snapshot_content JSON: {error}"),
+                )
+            })
+        })
+        .transpose()?;
 
     Ok(MutationRow {
         operation,
@@ -505,7 +491,7 @@ mod tests {
 
     use super::{
         execute_sql, stage_decoded_write, HistoryContext, SqlExecutionContext, SqlWriteIntent,
-        SqlWriteStager, StateWriteRow,
+        SqlWriteStager, StateRow,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::history::{
@@ -697,8 +683,8 @@ mod tests {
         }
     }
 
-    fn minimal_lix_state_write_row() -> StateWriteRow {
-        StateWriteRow {
+    fn minimal_lix_state_write_row() -> StateRow {
+        StateRow {
             entity_id: "entity-1".to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -829,7 +815,7 @@ mod tests {
         row.metadata = Some("{\"source\":\"sql\"}".to_string());
 
         let outcome =
-            stage_decoded_write(&mut stager, SqlWriteIntent::InsertRows { rows: vec![row] })
+            stage_decoded_write(&mut stager, SqlWriteIntent::WriteRows { rows: vec![row] })
                 .expect("write intent should stage");
 
         assert_eq!(outcome.count, 1);
@@ -855,9 +841,8 @@ mod tests {
         row.change_id = Some("change-a".to_string());
         let mut stager = CapturingPreparedWriteStager::default();
 
-        let error =
-            stage_decoded_write(&mut stager, SqlWriteIntent::InsertRows { rows: vec![row] })
-                .expect_err("read-only fields should be rejected");
+        let error = stage_decoded_write(&mut stager, SqlWriteIntent::WriteRows { rows: vec![row] })
+            .expect_err("read-only fields should be rejected");
 
         assert!(
             error.description.contains("read-only column 'change_id'"),
@@ -874,7 +859,7 @@ mod tests {
         row.metadata = Some("{\"source\":\"delete\"}".to_string());
 
         let outcome =
-            stage_decoded_write(&mut stager, SqlWriteIntent::DeleteRows { rows: vec![row] })
+            stage_decoded_write(&mut stager, SqlWriteIntent::WriteRows { rows: vec![row] })
                 .expect("delete intent should stage");
 
         assert_eq!(outcome.count, 1);
@@ -896,7 +881,7 @@ mod tests {
         let stager = Mutex::new(CapturingPreparedWriteStager::default());
 
         let outcome = stager
-            .stage_write(SqlWriteIntent::InsertRows {
+            .stage_write(SqlWriteIntent::WriteRows {
                 rows: vec![minimal_lix_state_write_row()],
             })
             .await

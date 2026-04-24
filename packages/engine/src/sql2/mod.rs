@@ -18,6 +18,6 @@ pub(crate) use entity_view::prepared_entity_view_plans_for_registry;
 pub(crate) use execute::{
     create_logical_plan, execute_logical_plan, execute_sql, stage_decoded_write, HistoryContext,
     SqlExecutionContext, SqlLogicalPlan, SqlStatementKind, SqlWriteIntent, SqlWriteOutcome,
-    SqlWriteStager, StateWriteRow,
+    SqlWriteStager, StateRow,
 };
 pub(crate) use filesystem_view::prepared_filesystem_view_plans_for_registry;

@@ -31,7 +31,7 @@ use crate::live_state::{
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
-use super::execute::{SqlWriteIntent, SqlWriteStager, StateWriteRow};
+use super::execute::{SqlWriteIntent, SqlWriteStager, StateRow};
 
 pub(crate) async fn register_lix_state_providers(
     session: &SessionContext,
@@ -337,7 +337,7 @@ impl DataSink for LixStateInsertSink {
             .map_err(|_| DataFusionError::Execution("INSERT row count overflow".into()))?;
 
         self.write_stager
-            .stage_write(SqlWriteIntent::InsertRows { rows })
+            .stage_write(SqlWriteIntent::WriteRows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -470,7 +470,7 @@ impl ExecutionPlan for LixStateDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::DeleteRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -623,7 +623,7 @@ impl ExecutionPlan for LixStateUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::InsertRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -732,7 +732,7 @@ fn apply_lix_state_update_assignments(
 fn lix_state_stageable_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     let mut rows = lix_state_write_rows_from_batch(batch, default_version_id)?;
     for row in &mut rows {
         row.created_at = None;
@@ -746,7 +746,7 @@ fn lix_state_stageable_write_rows_from_batch(
 fn lix_state_deletable_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     let mut rows = lix_state_stageable_write_rows_from_batch(batch, default_version_id)?;
     for row in &mut rows {
         row.snapshot_content = None;
@@ -773,7 +773,7 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
 fn lix_state_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: &str,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let global = required_bool_value(batch, row_index, "global")?;
@@ -786,7 +786,7 @@ fn lix_state_write_rows_from_batch(
                     }
                 });
 
-            Ok(StateWriteRow {
+            Ok(StateRow {
                 entity_id: required_string_value(batch, row_index, "entity_id")?,
                 schema_key: required_string_value(batch, row_index, "schema_key")?,
                 file_id: optional_string_value(batch, row_index, "file_id")?,
@@ -1377,7 +1377,7 @@ mod tests {
         LixStateUpdateExec,
     };
     use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{LixError, NullableKeyFilter};
     use async_trait::async_trait;
@@ -1911,7 +1911,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StateWriteRow {
+            vec![StateRow {
                 entity_id: "entity-1".to_string(),
                 schema_key: "lix_key_value".to_string(),
                 file_id: None,
@@ -1960,8 +1960,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::InsertRows {
-                rows: vec![StateWriteRow {
+            &[SqlWriteIntent::WriteRows {
+                rows: vec![StateRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
@@ -2104,8 +2104,8 @@ mod tests {
 
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::InsertRows {
-                rows: vec![StateWriteRow {
+            &[SqlWriteIntent::WriteRows {
+                rows: vec![StateRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "lix_key_value".to_string(),
                     file_id: None,
@@ -2161,9 +2161,9 @@ mod tests {
 
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::DeleteRows {
+            &[SqlWriteIntent::WriteRows {
                 rows: vec![
-                    StateWriteRow {
+                    StateRow {
                         entity_id: "entity-1".to_string(),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,
@@ -2179,7 +2179,7 @@ mod tests {
                         untracked: false,
                         version_id: "version-a".to_string(),
                     },
-                    StateWriteRow {
+                    StateRow {
                         entity_id: "entity-2".to_string(),
                         schema_key: "lix_key_value".to_string(),
                         file_id: None,

@@ -35,7 +35,7 @@ use crate::live_state::{
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
-use super::execute::{SqlWriteIntent, SqlWriteStager, StateWriteRow};
+use super::execute::{SqlWriteIntent, SqlWriteStager, StateRow};
 use super::udf::{
     lix_json_extract_boolean_expr, lix_json_extract_json_expr, lix_json_extract_text_expr,
 };
@@ -484,7 +484,7 @@ impl DataSink for EntityInsertSink {
             .map_err(|_| DataFusionError::Execution("entity INSERT row count overflow".into()))?;
 
         self.write_stager
-            .stage_write(SqlWriteIntent::InsertRows { rows })
+            .stage_write(SqlWriteIntent::WriteRows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -634,7 +634,7 @@ impl ExecutionPlan for EntityDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::DeleteRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -798,7 +798,7 @@ impl ExecutionPlan for EntityUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::InsertRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -930,7 +930,7 @@ fn entity_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, true)
 }
 
@@ -938,7 +938,7 @@ fn entity_existing_lix_state_write_rows_from_batch(
     spec: &EntitySurfaceSpec,
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     entity_lix_state_write_rows_from_batch_with_options(spec, batch, default_version_id, false)
 }
 
@@ -947,7 +947,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             let explicit_global = optional_bool_value(batch, row_index, "lixcol_global")?;
@@ -1006,7 +1006,7 @@ fn entity_lix_state_write_rows_from_batch_with_options(
                 }
             };
 
-            Ok(StateWriteRow {
+            Ok(StateRow {
                 entity_id,
                 schema_key: spec.schema_key.clone(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
@@ -1844,7 +1844,7 @@ mod tests {
         EntityColumnType, EntityInsertSink, EntityProviderVariant,
     };
     use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::LixError;
 
     struct EmptyLiveStateContext;
@@ -2215,8 +2215,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::InsertRows {
-                rows: vec![StateWriteRow {
+            &[SqlWriteIntent::WriteRows {
+                rows: vec![StateRow {
                     entity_id: "entity-1".to_string(),
                     schema_key: "project_message".to_string(),
                     file_id: None,
