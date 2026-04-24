@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::engine2::session::Session;
-use crate::engine2::write_services::WriteServices;
 use crate::live_state::CommittedLiveStateContext;
 use crate::{LixBackend, LixError};
 
@@ -9,12 +8,6 @@ use crate::{LixBackend, LixError};
 pub struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
-    // Engine-owned services used by write transactions at commit time.
-    //
-    // Keep this concrete. It is not meant to become another kitchen-sink
-    // execution context; the `WriteExecutionContext` trait implementation is a
-    // compatibility seam for the existing buffered transaction pipeline.
-    write_services: Arc<WriteServices>,
 }
 
 impl Engine {
@@ -24,10 +17,6 @@ impl Engine {
     /// instance instead of being hidden behind a legacy boot path.
     pub async fn new(backend: Box<dyn LixBackend + Send + Sync>) -> Result<Self, LixError> {
         let backend: Arc<dyn LixBackend + Send + Sync> = Arc::from(backend);
-        // Construct lower write services once at engine creation, then thread
-        // them down through Session -> Transaction. This mirrors the desired
-        // DAG instead of creating ad hoc commit contexts inside transactions.
-        let write_services = Arc::new(WriteServices::new(backend.dialect()));
 
         // TODO(engine2): assert that the backend has been initialized through an
         // engine-owned storage readiness check. This should not ask live_state,
@@ -56,7 +45,6 @@ impl Engine {
         Ok(Self {
             backend,
             committed_live_state,
-            write_services,
         })
     }
 
@@ -72,7 +60,6 @@ impl Engine {
             active_version_id.into(),
             self.backend(),
             Arc::clone(&self.committed_live_state),
-            Arc::clone(&self.write_services),
         )
         .await
     }

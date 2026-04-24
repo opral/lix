@@ -8,7 +8,6 @@
 pub mod engine;
 pub mod session;
 pub mod transaction;
-mod write_services;
 
 pub use engine::Engine;
 pub use session::Session;

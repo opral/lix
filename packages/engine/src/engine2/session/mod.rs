@@ -4,7 +4,6 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::BlobDataReader;
-use crate::engine2::write_services::WriteServices;
 use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
@@ -18,10 +17,6 @@ pub struct Session {
     active_version_id: String,
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
-    // Stable engine-owned write services. A session does not own commit
-    // machinery; it passes these services into each execution-scoped
-    // transaction.
-    write_services: Arc<WriteServices>,
 }
 
 impl Session {
@@ -29,27 +24,19 @@ impl Session {
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
-        write_services: Arc<WriteServices>,
     ) -> Result<Self, LixError> {
-        Ok(Self::new(
-            active_version_id,
-            backend,
-            committed_live_state,
-            write_services,
-        ))
+        Ok(Self::new(active_version_id, backend, committed_live_state))
     }
 
     pub(crate) fn new(
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
-        write_services: Arc<WriteServices>,
     ) -> Self {
         Self {
             active_version_id,
             backend,
             committed_live_state,
-            write_services,
         }
     }
 

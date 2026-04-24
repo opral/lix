@@ -147,23 +147,20 @@ impl Session {
             // Open an autocommit write transaction for this statement, execute
             // through a transaction-aware SQL context, then commit on success
             // or rollback on error.
-            let transaction = Transaction::new(
+            let transaction = Transaction::open(
+                self.active_version_id().to_string(),
                 &self.backend,
                 Arc::clone(&self.committed_live_state),
-                Arc::clone(&self.write_services),
             )
             .await?;
-            let tx_sql_ctx = transaction.sql_execution_context(self.active_version_id())?;
-            // Re-plan against the transaction context so reads during write
-            // execution see the pending overlay. Once the transaction context
-            // exposes a write stager, DataFusion provider hooks will stage
-            // writes through that same transaction.
-            let tx_plan = sql2::create_logical_plan(&tx_sql_ctx, sql).await?;
-            let result = sql2::execute_logical_plan(&tx_sql_ctx, tx_plan, params).await;
+            // Re-plan against the transaction so DataFusion provider hooks
+            // stage writes through the transaction-owned write stager.
+            let tx_plan = sql2::create_logical_plan(&transaction, sql).await?;
+            let result = sql2::execute_logical_plan(&transaction, tx_plan, params).await;
             match result {
                 Ok(result) => {
                     let affected_rows = affected_rows_from_query_result(result)?;
-                    transaction.commit(self.active_version_id()).await?;
+                    transaction.commit().await?;
                     return Ok(ExecuteResult::AffectedRows(affected_rows));
                 }
                 Err(error) => {
