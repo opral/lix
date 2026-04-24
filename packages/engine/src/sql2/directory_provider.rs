@@ -36,7 +36,7 @@ use crate::live_state::{
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
-use super::execute::{HistoryContext, SqlWriteIntent, SqlWriteStager, StateWriteRow};
+use super::execute::{HistoryContext, SqlWriteIntent, SqlWriteStager, StateRow};
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
 const DIRECTORY_SCHEMA_VERSION: &str = "1";
@@ -379,7 +379,7 @@ impl DataSink for LixDirectoryInsertSink {
         })?;
 
         self.write_stager
-            .stage_write(SqlWriteIntent::InsertRows { rows })
+            .stage_write(SqlWriteIntent::WriteRows { rows })
             .await
             .map_err(lix_error_to_datafusion_error)?;
 
@@ -514,7 +514,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::DeleteRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -667,7 +667,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::InsertRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -1114,14 +1114,14 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
 fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, true)
 }
 
 fn lix_directory_existing_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, false)
 }
 
@@ -1129,7 +1129,7 @@ fn lix_directory_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<StateWriteRow>> {
+) -> Result<Vec<StateRow>> {
     (0..batch.num_rows())
         .map(|row_index| {
             if reject_read_only_fields {
@@ -1167,7 +1167,7 @@ fn lix_directory_write_rows_from_batch_with_options(
             })
             .to_string();
 
-            Ok(StateWriteRow {
+            Ok(StateRow {
                 entity_id: id,
                 schema_key: DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
@@ -1654,7 +1654,7 @@ mod tests {
     use futures_util::stream;
 
     use crate::live_state::LiveRow;
-    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateWriteRow};
+    use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::LixError;
 
     use super::{
@@ -1806,7 +1806,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![StateWriteRow {
+            vec![StateRow {
                 entity_id: "dir-docs".to_string(),
                 schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                 file_id: None,
@@ -1901,8 +1901,8 @@ mod tests {
         assert_eq!(count, 1);
         assert_eq!(
             stager.writes.lock().expect("writes lock").as_slice(),
-            &[SqlWriteIntent::InsertRows {
-                rows: vec![StateWriteRow {
+            &[SqlWriteIntent::WriteRows {
+                rows: vec![StateRow {
                     entity_id: "dir-docs".to_string(),
                     schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
                     file_id: None,
