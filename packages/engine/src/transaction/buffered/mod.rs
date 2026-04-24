@@ -25,10 +25,11 @@ pub(crate) use live_state_write_state::prepare_materialization_plan;
 #[cfg(test)]
 pub(crate) use live_state_write_state::LiveStateWriteState;
 pub(crate) use planned_write::{
-    build_direct_mutation_transaction_write_delta, build_transaction_write_delta,
-    BufferedWriteJournal, PendingFilesystemOverlay, PendingRegisteredSchemaOverlay,
-    PendingSemanticOverlay, PlannedDirectWriteUnit, PublicWriteTxnUnit, TransactionWriteDelta,
-    TransactionWriteUnit,
+    build_direct_mutation_transaction_write_delta,
+    build_direct_mutation_transaction_write_delta_with_filesystem_state,
+    build_transaction_write_delta, BufferedWriteJournal, PendingFilesystemOverlay,
+    PendingRegisteredSchemaOverlay, PendingSemanticOverlay, PlannedDirectWriteUnit,
+    PublicWriteTxnUnit, TransactionWriteDelta, TransactionWriteUnit,
 };
 pub(crate) use storage::{
     upsert_registered_schema_mirror_row_in_transaction, RegisteredSchemaMirrorRow,

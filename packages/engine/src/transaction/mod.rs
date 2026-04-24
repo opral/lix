@@ -35,6 +35,7 @@ pub(crate) use backend::{
 };
 pub(crate) use buffered::{
     apply_schema_registrations_in_transaction, build_direct_mutation_transaction_write_delta,
+    build_direct_mutation_transaction_write_delta_with_filesystem_state,
     upsert_registered_schema_mirror_row_in_transaction, BufferedWriteCommandMetadata,
     BufferedWriteExecutionResult, BufferedWriteFlushClass, BufferedWriteSessionEffects,
     PlannedDirectWriteUnit, PublicWriteTxnUnit, RegisteredSchemaMirrorRow, TransactionWriteDelta,

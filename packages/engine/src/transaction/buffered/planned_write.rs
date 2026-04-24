@@ -13,6 +13,7 @@ use crate::sql::{
     PlanEffects, PlannedStateRow, ResultContract, SchemaLiveTableRequirement, WriteMode,
 };
 use crate::transaction::filesystem::runtime::{
+    compile_filesystem_transaction_state_from_state,
     filesystem_transaction_state_has_binary_payloads, merge_filesystem_transaction_state,
     FilesystemTransactionFileState, FilesystemTransactionState,
 };
@@ -458,6 +459,19 @@ pub(crate) fn build_direct_mutation_transaction_write_delta(
     mutations: Vec<MutationRow>,
     origin_key: Option<String>,
 ) -> Result<TransactionWriteDelta, LixError> {
+    build_direct_mutation_transaction_write_delta_with_filesystem_state(
+        mutations,
+        origin_key,
+        crate::sql::PlannedFilesystemState::default(),
+    )
+}
+
+#[allow(dead_code)]
+pub(crate) fn build_direct_mutation_transaction_write_delta_with_filesystem_state(
+    mutations: Vec<MutationRow>,
+    origin_key: Option<String>,
+    filesystem_state: crate::sql::PlannedFilesystemState,
+) -> Result<TransactionWriteDelta, LixError> {
     let function_bindings = PreparedWriteFunctionBindings::new(
         false,
         SharedFunctionProvider::new(Box::new(SystemFunctionProvider)),
@@ -476,7 +490,7 @@ pub(crate) fn build_direct_mutation_transaction_write_delta(
         has_update_validations: false,
         should_refresh_file_cache: false,
         read_only_query: false,
-        filesystem_state: Default::default(),
+        filesystem_state,
         effects: PlanEffects::default(),
         origin_key,
     };
@@ -636,12 +650,19 @@ fn collect_semantic_overlay_from_planned_write_plan(
                     )?
             }
             TransactionWriteUnit::Direct(internal) => {
-                internal.execution.filesystem_state.files.is_empty()
-                    && collect_semantic_overlay_from_mutation_rows(
-                        &internal.execution.mutations,
-                        overlay,
-                    )?
-                    && !internal.execution.has_update_validations
+                collect_semantic_overlay_from_mutation_rows(
+                    &internal.execution.mutations,
+                    overlay,
+                )?;
+                collect_semantic_overlay_from_direct_filesystem_state(
+                    &filesystem_transaction_state_from_planned(
+                        &internal.execution.filesystem_state,
+                    ),
+                    internal.execution.origin_key.as_deref(),
+                    &internal.execution.mutations,
+                    overlay,
+                )?;
+                !internal.execution.has_update_validations
             }
         };
 
@@ -667,7 +688,15 @@ fn collect_filesystem_overlay_from_planned_write_plan(
             TransactionWriteUnit::Public(public) => {
                 collect_filesystem_overlay_from_commit_plan(public, overlay, &mut saw_entry)
             }
-            TransactionWriteUnit::Direct(_) => false,
+            TransactionWriteUnit::Direct(internal) => {
+                if !internal.execution.filesystem_state.files.is_empty() {
+                    saw_entry = true;
+                }
+                let filesystem_state =
+                    filesystem_transaction_state_from_planned(&internal.execution.filesystem_state);
+                overlay.files.extend(filesystem_state.files);
+                true
+            }
         };
         if !unit_supported {
             return false;
@@ -942,6 +971,49 @@ fn collect_semantic_overlay_from_mutation_rows(
                 change_id: None,
                 snapshot_content,
                 metadata: row.metadata.clone(),
+                tombstone,
+            },
+        );
+    }
+
+    Ok(true)
+}
+
+fn collect_semantic_overlay_from_direct_filesystem_state(
+    filesystem_state: &FilesystemTransactionState,
+    origin_key: Option<&str>,
+    mutations: &[MutationRow],
+    overlay: &mut PendingSemanticOverlay,
+) -> Result<bool, LixError> {
+    if filesystem_state.files.is_empty() {
+        return Ok(false);
+    }
+
+    let compiled =
+        compile_filesystem_transaction_state_from_state(filesystem_state, origin_key, mutations)?;
+    for change in compiled.semantic_changes {
+        let tombstone = change.snapshot_content.is_none();
+        overlay.rows.insert(
+            PendingSemanticRowIdentity {
+                untracked: change.untracked,
+                schema_key: change.schema_key.clone(),
+                entity_id: change.entity_id.clone(),
+                file_id: change.file_id.clone(),
+                version_id: change.version_id.clone(),
+                plugin_key: change.plugin_key.clone(),
+                schema_version: change.schema_version.clone(),
+            },
+            PendingSemanticRow {
+                untracked: change.untracked,
+                entity_id: change.entity_id,
+                schema_key: change.schema_key,
+                schema_version: change.schema_version,
+                file_id: change.file_id,
+                version_id: change.version_id,
+                plugin_key: change.plugin_key,
+                change_id: None,
+                snapshot_content: change.snapshot_content,
+                metadata: change.metadata,
                 tombstone,
             },
         );
