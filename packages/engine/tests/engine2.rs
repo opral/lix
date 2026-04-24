@@ -41,13 +41,14 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
                     .await
                     .expect("initialized backend should open a session");
 
-                session
+                let insert_result = session
                     .execute(
                         "INSERT INTO lix_key_value (key, value) VALUES ('sql2-key', 'sql2-value')",
                         &[],
                     )
                     .await
                     .expect("session insert should succeed");
+                assert_eq!(insert_result, ExecuteResult::AffectedRows(1));
 
                 let result = session
                     .execute(
