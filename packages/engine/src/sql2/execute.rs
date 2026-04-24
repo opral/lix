@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
+use crate::history::{StateHistoryRequest, StateHistoryRow};
 use crate::live_state::LiveStateContext;
 use crate::sql::{
     MutationOperation, MutationRow, OptionalTextPatch, PlannedFilesystemFile,
@@ -22,6 +23,7 @@ use crate::{LixError, QueryResult, Value};
 use super::directory_provider::register_lix_directory_providers;
 use super::entity_provider::register_entity_providers;
 use super::file_provider::register_lix_file_providers;
+use super::history_provider::register_history_providers;
 use super::lix_state_provider::register_lix_state_providers;
 use super::udf::register_sql2_udfs;
 
@@ -37,11 +39,23 @@ use super::udf::register_sql2_udfs;
 pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateContext>;
+    fn history(&self) -> Option<Arc<dyn HistoryContext>> {
+        None
+    }
     fn blob_reader(&self) -> Arc<dyn BlobDataReader>;
     fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
         None
     }
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError>;
+}
+
+#[async_trait]
+#[allow(dead_code)]
+pub(crate) trait HistoryContext: Send + Sync {
+    async fn scan_state_history(
+        &self,
+        request: &StateHistoryRequest,
+    ) -> Result<Vec<StateHistoryRow>, LixError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +266,7 @@ pub(crate) async fn execute_sql(
 ) -> Result<QueryResult, LixError> {
     let session = SessionContext::new();
     register_sql2_udfs(&session);
+    let history = ctx.history();
     register_lix_state_providers(
         &session,
         ctx.active_version_id(),
@@ -259,11 +274,18 @@ pub(crate) async fn execute_sql(
         ctx.write_stager(),
     )
     .await?;
+    let state_history_provider = register_history_providers(
+        &session,
+        ctx.active_version_id(),
+        history.as_ref().map(Arc::clone),
+    )
+    .await?;
     register_lix_directory_providers(
         &session,
         ctx.active_version_id(),
         ctx.live_state(),
         ctx.write_stager(),
+        history.as_ref().map(Arc::clone),
     )
     .await?;
     register_lix_file_providers(
@@ -272,6 +294,7 @@ pub(crate) async fn execute_sql(
         ctx.live_state(),
         ctx.blob_reader(),
         ctx.write_stager(),
+        history.as_ref().map(Arc::clone),
     )
     .await?;
     register_entity_providers(
@@ -279,6 +302,7 @@ pub(crate) async fn execute_sql(
         ctx.active_version_id(),
         ctx.live_state(),
         ctx.write_stager(),
+        state_history_provider.is_some(),
         &ctx.list_visible_schemas(ctx.active_version_id())?,
     )
     .await?;
@@ -397,6 +421,7 @@ fn scalar_value_to_lix_value(value: &ScalarValue) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -404,10 +429,14 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::{
-        execute_sql, stage_decoded_write, LixStateWriteRow, SqlExecutionContext, SqlWriteIntent,
-        SqlWriteStager,
+        execute_sql, stage_decoded_write, HistoryContext, LixStateWriteRow, SqlExecutionContext,
+        SqlWriteIntent, SqlWriteStager,
     };
     use crate::binary_cas::BlobDataReader;
+    use crate::history::{
+        StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
+        StateHistoryVersionScope,
+    };
     use crate::live_state::{
         CommittedLiveStateContext, ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest,
     };
@@ -419,6 +448,13 @@ mod tests {
     struct DummyLiveStateContext;
     struct RowsLiveStateContext {
         rows: Vec<LiveRow>,
+    }
+    struct RowsHistoryContext {
+        rows: Vec<StateHistoryRow>,
+        requests: Arc<Mutex<Vec<StateHistoryRequest>>>,
+    }
+    struct RowsBlobReader {
+        blobs: BTreeMap<String, Vec<u8>>,
     }
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
     #[derive(Default)]
@@ -432,6 +468,14 @@ mod tests {
         blob_reader: Arc<dyn BlobDataReader>,
         live_state: Arc<dyn LiveStateContext>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
+        schema_definitions: Vec<JsonValue>,
+    }
+
+    struct HistorySqlExecutionContext<'a> {
+        active_version_id: &'a str,
+        blob_reader: Arc<dyn BlobDataReader>,
+        live_state: Arc<dyn LiveStateContext>,
+        history: Arc<dyn HistoryContext>,
         schema_definitions: Vec<JsonValue>,
     }
 
@@ -450,6 +494,29 @@ mod tests {
 
         fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
             self.write_stager.as_ref().map(Arc::clone)
+        }
+
+        fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
+            let _ = version_id;
+            Ok(self.schema_definitions.clone())
+        }
+    }
+
+    impl<'a> SqlExecutionContext for HistorySqlExecutionContext<'a> {
+        fn active_version_id(&self) -> &str {
+            self.active_version_id
+        }
+
+        fn live_state(&self) -> Arc<dyn LiveStateContext> {
+            Arc::clone(&self.live_state)
+        }
+
+        fn history(&self) -> Option<Arc<dyn HistoryContext>> {
+            Some(Arc::clone(&self.history))
+        }
+
+        fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
+            Arc::clone(&self.blob_reader)
         }
 
         fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
@@ -511,12 +578,47 @@ mod tests {
     }
 
     #[async_trait]
+    impl BlobDataReader for RowsBlobReader {
+        async fn load_blob_data_by_hash(
+            &self,
+            blob_hash: &str,
+        ) -> Result<Option<Vec<u8>>, LixError> {
+            Ok(self.blobs.get(blob_hash).cloned())
+        }
+    }
+
+    #[async_trait]
     impl BlobDataReader for BackendBlobReader {
         async fn load_blob_data_by_hash(
             &self,
             blob_hash: &str,
         ) -> Result<Option<Vec<u8>>, LixError> {
             crate::binary_cas::load_blob_data_by_hash(self.0.as_ref(), blob_hash).await
+        }
+    }
+
+    #[async_trait]
+    impl HistoryContext for RowsHistoryContext {
+        async fn scan_state_history(
+            &self,
+            request: &StateHistoryRequest,
+        ) -> Result<Vec<StateHistoryRow>, LixError> {
+            self.requests
+                .lock()
+                .expect("history request lock")
+                .push(request.clone());
+            Ok(self
+                .rows
+                .iter()
+                .filter(|row| {
+                    request.schema_keys.is_empty()
+                        || request
+                            .schema_keys
+                            .iter()
+                            .any(|schema_key| schema_key == &row.schema_key)
+                })
+                .cloned()
+                .collect())
         }
     }
 
@@ -773,6 +875,368 @@ mod tests {
             .await
             .expect("sql2 execute should support literal-only queries");
         assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_reads_lix_state_history_from_history_context() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::new(RowsHistoryContext {
+            rows: vec![StateHistoryRow {
+                entity_id: "entity-history".to_string(),
+                schema_key: "test_state_schema".to_string(),
+                file_id: Some("file-a".to_string()),
+                plugin_key: None,
+                snapshot_content: Some("{\"value\":\"A\"}".to_string()),
+                metadata: Some("{\"source\":\"history\"}".to_string()),
+                schema_version: "1".to_string(),
+                change_id: "change-a".to_string(),
+                commit_id: "commit-a".to_string(),
+                commit_created_at: "2026-01-01T00:00:00Z".to_string(),
+                root_commit_id: "root-a".to_string(),
+                depth: 0,
+                version_id: "version-a".to_string(),
+            }],
+            requests: Arc::clone(&requests),
+        });
+        let ctx = HistorySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            history,
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "SELECT entity_id, snapshot_content, metadata, depth, version_id \
+             FROM lix_state_history \
+             WHERE schema_key = 'test_state_schema' AND version_id = 'version-a' AND depth >= 0",
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read lix_state_history through history context");
+
+        assert_eq!(
+            result.columns,
+            vec![
+                "entity_id",
+                "snapshot_content",
+                "metadata",
+                "depth",
+                "version_id"
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("entity-history".to_string()),
+                Value::Text("{\"value\":\"A\"}".to_string()),
+                Value::Text("{\"source\":\"history\"}".to_string()),
+                Value::Integer(0),
+                Value::Text("version-a".to_string()),
+            ]]
+        );
+
+        let requests = requests.lock().expect("history request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].lineage_scope,
+            StateHistoryLineageScope::ActiveVersion
+        );
+        assert_eq!(requests[0].lineage_version_id.as_deref(), Some("version-a"));
+        assert_eq!(requests[0].schema_keys, vec!["test_state_schema"]);
+        assert_eq!(
+            requests[0].version_scope,
+            StateHistoryVersionScope::RequestedVersions(vec!["version-a".to_string()])
+        );
+        assert_eq!(requests[0].min_depth, Some(0));
+        assert_eq!(
+            requests[0].content_mode,
+            StateHistoryContentMode::IncludeSnapshotContent
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_sql_reads_entity_history_view_from_history_context() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::new(RowsHistoryContext {
+            rows: vec![StateHistoryRow {
+                entity_id: "entity-history".to_string(),
+                schema_key: "test_state_schema".to_string(),
+                file_id: Some("file-a".to_string()),
+                plugin_key: None,
+                snapshot_content: Some("{\"count\":7,\"value\":\"A\"}".to_string()),
+                metadata: Some("{\"source\":\"history\"}".to_string()),
+                schema_version: "1".to_string(),
+                change_id: "change-a".to_string(),
+                commit_id: "commit-a".to_string(),
+                commit_created_at: "2026-01-01T00:00:00Z".to_string(),
+                root_commit_id: "root-a".to_string(),
+                depth: 2,
+                version_id: "version-a".to_string(),
+            }],
+            requests: Arc::clone(&requests),
+        });
+        let ctx = HistorySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            history,
+            schema_definitions: vec![json!({
+                "x-lix-key": "test_state_schema",
+                "x-lix-version": "1",
+                "type": "object",
+                "properties": {
+                    "count": { "type": "integer" },
+                    "value": { "type": "string" }
+                }
+            })],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "SELECT value, count, lixcol_entity_id, lixcol_root_commit_id, lixcol_depth, lixcol_version_id \
+             FROM test_state_schema_history \
+             WHERE lixcol_version_id = 'version-a'",
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read entity history view through history context");
+
+        assert_eq!(
+            result.columns,
+            vec![
+                "value",
+                "count",
+                "lixcol_entity_id",
+                "lixcol_root_commit_id",
+                "lixcol_depth",
+                "lixcol_version_id",
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("A".to_string()),
+                Value::Integer(7),
+                Value::Text("entity-history".to_string()),
+                Value::Text("root-a".to_string()),
+                Value::Integer(2),
+                Value::Text("version-a".to_string()),
+            ]]
+        );
+
+        let requests = requests.lock().expect("history request lock");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].schema_keys, vec!["test_state_schema"]);
+        assert_eq!(requests[0].lineage_version_id.as_deref(), Some("version-a"));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_reads_directory_history_view_from_history_context() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::new(RowsHistoryContext {
+            rows: vec![StateHistoryRow {
+                entity_id: "dir-docs".to_string(),
+                schema_key: "lix_directory_descriptor".to_string(),
+                file_id: None,
+                plugin_key: None,
+                snapshot_content: Some(
+                    "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}"
+                        .to_string(),
+                ),
+                metadata: None,
+                schema_version: "1".to_string(),
+                change_id: "change-dir".to_string(),
+                commit_id: "commit-dir".to_string(),
+                commit_created_at: "2026-01-01T00:00:00Z".to_string(),
+                root_commit_id: "root-dir".to_string(),
+                depth: 1,
+                version_id: "version-a".to_string(),
+            }],
+            requests: Arc::clone(&requests),
+        });
+        let ctx = HistorySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            history,
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "SELECT id, parent_id, name, path, hidden, lixcol_root_commit_id, lixcol_depth, lixcol_version_id \
+             FROM lix_directory_history \
+             WHERE id = 'dir-docs'",
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read directory history through history context");
+
+        assert_eq!(
+            result.columns,
+            vec![
+                "id",
+                "parent_id",
+                "name",
+                "path",
+                "hidden",
+                "lixcol_root_commit_id",
+                "lixcol_depth",
+                "lixcol_version_id",
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("dir-docs".to_string()),
+                Value::Null,
+                Value::Text("docs".to_string()),
+                Value::Text("/docs/".to_string()),
+                Value::Boolean(false),
+                Value::Text("root-dir".to_string()),
+                Value::Integer(1),
+                Value::Text("version-a".to_string()),
+            ]]
+        );
+
+        let requests = requests.lock().expect("history request lock");
+        assert!(!requests.is_empty());
+        assert!(requests
+            .iter()
+            .any(|request| request.schema_keys == vec!["lix_directory_descriptor"]));
+        assert!(requests
+            .iter()
+            .all(|request| request.lineage_version_id.as_deref() == Some("version-a")));
+    }
+
+    #[tokio::test]
+    async fn execute_sql_reads_file_history_view_from_history_context() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(RowsBlobReader {
+            blobs: BTreeMap::from([("blob-a".to_string(), b"hello".to_vec())]),
+        });
+        let live_state = Arc::new(DummyLiveStateContext);
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let history = Arc::new(RowsHistoryContext {
+            rows: vec![
+                StateHistoryRow {
+                    entity_id: "file-a".to_string(),
+                    schema_key: "lix_file_descriptor".to_string(),
+                    file_id: Some("file-a".to_string()),
+                    plugin_key: None,
+                    snapshot_content: Some(
+                        "{\"id\":\"file-a\",\"directory_id\":\"dir-docs\",\"name\":\"readme\",\"extension\":\"md\",\"hidden\":false}"
+                            .to_string(),
+                    ),
+                    metadata: None,
+                    schema_version: "1".to_string(),
+                    change_id: "change-file".to_string(),
+                    commit_id: "commit-file".to_string(),
+                    commit_created_at: "2026-01-01T00:00:00Z".to_string(),
+                    root_commit_id: "root-file".to_string(),
+                    depth: 1,
+                    version_id: "version-a".to_string(),
+                },
+                StateHistoryRow {
+                    entity_id: "dir-docs".to_string(),
+                    schema_key: "lix_directory_descriptor".to_string(),
+                    file_id: None,
+                    plugin_key: None,
+                    snapshot_content: Some(
+                        "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}"
+                            .to_string(),
+                    ),
+                    metadata: None,
+                    schema_version: "1".to_string(),
+                    change_id: "change-dir".to_string(),
+                    commit_id: "commit-dir".to_string(),
+                    commit_created_at: "2026-01-01T00:00:00Z".to_string(),
+                    root_commit_id: "root-file".to_string(),
+                    depth: 1,
+                    version_id: "version-a".to_string(),
+                },
+                StateHistoryRow {
+                    entity_id: "blob-ref-a".to_string(),
+                    schema_key: "lix_binary_blob_ref".to_string(),
+                    file_id: Some("file-a".to_string()),
+                    plugin_key: None,
+                    snapshot_content: Some(
+                        "{\"id\":\"file-a\",\"blob_hash\":\"blob-a\",\"size_bytes\":5}"
+                            .to_string(),
+                    ),
+                    metadata: None,
+                    schema_version: "1".to_string(),
+                    change_id: "change-blob".to_string(),
+                    commit_id: "commit-blob".to_string(),
+                    commit_created_at: "2026-01-01T00:00:01Z".to_string(),
+                    root_commit_id: "root-file".to_string(),
+                    depth: 0,
+                    version_id: "version-a".to_string(),
+                },
+            ],
+            requests: Arc::clone(&requests),
+        });
+        let ctx = HistorySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            history,
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "SELECT id, path, data, hidden, lixcol_root_commit_id, lixcol_depth, lixcol_version_id \
+             FROM lix_file_history \
+             WHERE id = 'file-a' \
+             ORDER BY lixcol_depth",
+            &[],
+        )
+        .await
+        .expect("sql2 execute should read file history through history context");
+
+        assert_eq!(
+            result.columns,
+            vec![
+                "id",
+                "path",
+                "data",
+                "hidden",
+                "lixcol_root_commit_id",
+                "lixcol_depth",
+                "lixcol_version_id",
+            ]
+        );
+        assert_eq!(
+            result.rows,
+            vec![vec![
+                Value::Text("file-a".to_string()),
+                Value::Text("/docs/readme.md".to_string()),
+                Value::Blob(b"hello".to_vec()),
+                Value::Boolean(false),
+                Value::Text("root-file".to_string()),
+                Value::Integer(0),
+                Value::Text("version-a".to_string()),
+            ]]
+        );
+
+        let requests = requests.lock().expect("history request lock");
+        assert!(requests
+            .iter()
+            .any(|request| request.schema_keys == vec!["lix_file_descriptor"]));
+        assert!(requests
+            .iter()
+            .any(|request| request.schema_keys == vec!["lix_directory_descriptor"]));
+        assert!(requests
+            .iter()
+            .any(|request| request.schema_keys == vec!["lix_binary_blob_ref"]));
     }
 
     #[tokio::test]

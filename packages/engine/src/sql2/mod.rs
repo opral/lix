@@ -5,6 +5,7 @@ mod entity_view;
 mod execute;
 mod file_provider;
 mod filesystem_view;
+mod history_provider;
 mod lix_state_provider;
 mod udf;
 
@@ -15,7 +16,7 @@ pub(crate) use datafusion::{
 pub(crate) use entity_view::prepared_entity_view_plans_for_registry;
 #[allow(unused_imports)]
 pub(crate) use execute::{
-    execute_sql, stage_decoded_write, LixStateWriteRow, SqlExecutionContext, SqlWriteIntent,
-    SqlWriteOutcome, SqlWriteStager,
+    execute_sql, stage_decoded_write, HistoryContext, LixStateWriteRow, SqlExecutionContext,
+    SqlWriteIntent, SqlWriteOutcome, SqlWriteStager,
 };
 pub(crate) use filesystem_view::prepared_filesystem_view_plans_for_registry;
