@@ -1,5 +1,6 @@
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::ScalarValue;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::prelude::SessionContext;
 use serde_json::Value as JsonValue;
 use std::sync::{Arc, Mutex};
@@ -113,6 +114,41 @@ pub(crate) struct SqlWriteOutcome {
 #[allow(dead_code)]
 pub(crate) trait SqlWriteStager: Send + Sync {
     async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError>;
+}
+
+/// Transaction-owned destination for SQL write intents.
+///
+/// `sql2` should decode write plans into `SqlWriteIntent`s, while the
+/// caller-owned transaction decides how those intents are staged and committed.
+#[allow(dead_code)]
+pub(crate) trait SqlWriteTarget {
+    fn stage_sql_write(&mut self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlStatementKind {
+    Read,
+    Write,
+    Other,
+}
+
+#[allow(dead_code)]
+pub(crate) struct SqlLogicalPlan {
+    session: SessionContext,
+    plan: LogicalPlan,
+    kind: SqlStatementKind,
+}
+
+impl SqlLogicalPlan {
+    #[allow(dead_code)]
+    pub(crate) fn kind(&self) -> SqlStatementKind {
+        self.kind
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn is_write(&self) -> bool {
+        self.kind == SqlStatementKind::Write
+    }
 }
 
 #[async_trait]
@@ -264,6 +300,94 @@ pub(crate) async fn execute_sql(
     sql: &str,
     params: &[Value],
 ) -> Result<QueryResult, LixError> {
+    let plan = create_logical_plan(ctx, sql).await?;
+    execute_logical_plan(ctx, plan, params).await
+}
+
+pub(crate) async fn create_logical_plan(
+    ctx: &dyn SqlExecutionContext,
+    sql: &str,
+) -> Result<SqlLogicalPlan, LixError> {
+    let session = build_session(ctx).await?;
+    let plan = session
+        .state()
+        .create_logical_plan(sql)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    let kind = classify_logical_plan(&plan);
+
+    Ok(SqlLogicalPlan {
+        session,
+        plan,
+        kind,
+    })
+}
+
+pub(crate) async fn execute_logical_plan(
+    _ctx: &dyn SqlExecutionContext,
+    plan: SqlLogicalPlan,
+    params: &[Value],
+) -> Result<QueryResult, LixError> {
+    let SqlLogicalPlan {
+        session,
+        plan,
+        kind: _,
+    } = plan;
+
+    let mut dataframe = session
+        .execute_logical_plan(plan)
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    if !params.is_empty() {
+        dataframe = dataframe
+            .with_param_values(
+                params
+                    .iter()
+                    .map(scalar_value_from_lix_value)
+                    .collect::<Vec<_>>(),
+            )
+            .map_err(datafusion_error_to_lix_error)?;
+    }
+
+    let result_columns = dataframe
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<Vec<_>>();
+    let batches = dataframe
+        .collect()
+        .await
+        .map_err(datafusion_error_to_lix_error)?;
+    query_result_from_batches(&result_columns, &batches)
+}
+
+pub(crate) async fn execute_write_logical_plan(
+    _ctx: &dyn SqlExecutionContext,
+    _write_target: &mut dyn SqlWriteTarget,
+    plan: SqlLogicalPlan,
+    _params: &[Value],
+) -> Result<QueryResult, LixError> {
+    if plan.kind != SqlStatementKind::Write {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "sql2 write executor received a non-write logical plan",
+        ));
+    }
+
+    // TODO(sql2): implement the DataFusion DML executor here:
+    // 1. inspect LogicalPlan::Dml,
+    // 2. execute the DML input plan into RecordBatches,
+    // 3. decode batches into SqlWriteIntent for the target table,
+    // 4. call write_target.stage_sql_write(...),
+    // 5. return a DataFusion-compatible count result.
+    Err(LixError::new(
+        "LIX_ERROR_UNKNOWN",
+        "sql2 DataFusion DML executor is not implemented yet; writes must decode the DML input plan and call Transaction::stage_sql_write",
+    ))
+}
+
+async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
     let session = SessionContext::new();
     register_sql2_udfs(&session);
     let history = ctx.history();
@@ -307,32 +431,17 @@ pub(crate) async fn execute_sql(
     )
     .await?;
 
-    let mut dataframe = session
-        .sql(sql)
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    if !params.is_empty() {
-        dataframe = dataframe
-            .with_param_values(
-                params
-                    .iter()
-                    .map(scalar_value_from_lix_value)
-                    .collect::<Vec<_>>(),
-            )
-            .map_err(datafusion_error_to_lix_error)?;
-    }
+    Ok(session)
+}
 
-    let result_columns = dataframe
-        .schema()
-        .fields()
-        .iter()
-        .map(|field| field.name().to_string())
-        .collect::<Vec<_>>();
-    let batches = dataframe
-        .collect()
-        .await
-        .map_err(datafusion_error_to_lix_error)?;
-    query_result_from_batches(&result_columns, &batches)
+fn classify_logical_plan(plan: &LogicalPlan) -> SqlStatementKind {
+    match plan {
+        LogicalPlan::Dml(_) => SqlStatementKind::Write,
+        LogicalPlan::Ddl(_) | LogicalPlan::Statement(_) | LogicalPlan::Copy(_) => {
+            SqlStatementKind::Other
+        }
+        _ => SqlStatementKind::Read,
+    }
 }
 
 fn scalar_value_from_lix_value(value: &Value) -> ScalarValue {

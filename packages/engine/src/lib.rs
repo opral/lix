@@ -5,6 +5,7 @@ pub(crate) mod canonical;
 pub(crate) mod catalog;
 pub(crate) mod cel;
 mod common;
+pub mod engine2;
 pub(crate) mod execution;
 pub(crate) mod functions;
 pub(crate) mod history;
@@ -45,6 +46,7 @@ pub use common::{
 };
 pub use common::{ExecuteResult, NullableKeyFilter, QueryResult, Value, WriteReceipt};
 pub use common::{WireQueryResult, WireValue};
+pub use engine2::Engine;
 pub use live_state::{
     LatestVisibleWinnerDebugRow, LiveStateApplyReport, LiveStateRebuildDebugMode,
     LiveStateRebuildDebugTrace, LiveStateRebuildPlan, LiveStateRebuildReport,
