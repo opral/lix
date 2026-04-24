@@ -61,13 +61,5 @@ impl LiveStateContext for TransactionLiveStateContext {
 }
 
 fn staged_identity_from_live_row(row: &LiveRow) -> StagedStateRowIdentity {
-    (
-        row.untracked,
-        row.schema_key.clone(),
-        row.entity_id.clone(),
-        row.file_id.clone(),
-        row.version_id.clone(),
-        row.plugin_key.clone(),
-        row.schema_version.clone(),
-    )
+    StagedStateRowIdentity::from_live_row(row)
 }

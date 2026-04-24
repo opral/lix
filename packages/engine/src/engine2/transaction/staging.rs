@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
@@ -16,7 +16,7 @@ use crate::{LixError, NullableKeyFilter};
 /// and commit later drains the same rows.
 #[derive(Default)]
 pub(crate) struct TransactionStagedWrites {
-    rows: Mutex<Vec<StateRow>>,
+    rows: Mutex<BTreeMap<StagedStateRowIdentity, StateRow>>,
 }
 
 impl TransactionStagedWrites {
@@ -28,7 +28,7 @@ impl TransactionStagedWrites {
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        Ok(std::mem::take(&mut *guard))
+        Ok(std::mem::take(&mut *guard).into_values().collect())
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.
@@ -51,32 +51,34 @@ impl SqlWriteStager for TransactionStagedWrites {
             SqlWriteIntent::WriteRows { rows } => rows.len() as u64,
             SqlWriteIntent::WriteRowsWithFileData { count, .. } => *count,
         };
-        let mut rows = state_rows_from_write_intent(write, &mut functions)?;
+        let rows = state_rows_from_write_intent(write, &mut functions)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        guard.append(&mut rows);
+        for row in rows {
+            guard.insert(StagedStateRowIdentity::from(&row), row);
+        }
         Ok(SqlWriteOutcome { count })
     }
 }
 
 /// Read overlay derived from staged transaction writes.
 pub(crate) struct StagedStateRowOverlay {
-    rows: Vec<StateRow>,
+    rows: BTreeMap<StagedStateRowIdentity, StateRow>,
 }
 
 impl StagedStateRowOverlay {
-    fn new(rows: Vec<StateRow>) -> Self {
+    fn new(rows: BTreeMap<StagedStateRowIdentity, StateRow>) -> Self {
         Self { rows }
     }
 
     /// Returns staged rows visible for a scan request.
     pub(crate) fn scan(&self, request: &LiveStateScanRequest) -> Vec<LiveRow> {
         self.rows
-            .iter()
+            .values()
             .filter(|row| staged_row_matches_scan(row, request))
             .map(|row| live_row_from_state_row_ref(row))
             .collect::<Result<Vec<_>, _>>()
@@ -97,7 +99,7 @@ impl StagedStateRowOverlay {
         request: &LiveStateScanRequest,
     ) -> BTreeSet<StagedStateRowIdentity> {
         self.rows
-            .iter()
+            .values()
             .filter(|row| staged_row_identity_matches_scan(row, request))
             .map(StagedStateRowIdentity::from)
             .collect()
@@ -106,7 +108,7 @@ impl StagedStateRowOverlay {
     /// Returns a staged exact-row answer, if this transaction has one.
     pub(crate) fn load_exact(&self, request: &ExactRowRequest) -> Option<StagedExactRow> {
         self.rows
-            .iter()
+            .values()
             .find(|row| staged_row_matches_exact(row, request))
             .map(|row| {
                 if row.snapshot_content.is_none() {
@@ -126,29 +128,40 @@ pub(crate) enum StagedExactRow {
     Tombstone,
 }
 
-pub(crate) type StagedStateRowIdentity = (
-    bool,
-    String,
-    String,
-    Option<String>,
-    String,
-    Option<String>,
-    String,
-);
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StagedStateRowIdentity {
+    untracked: bool,
+    schema_key: String,
+    entity_id: String,
+    file_id: Option<String>,
+    version_id: String,
+}
+
+impl StagedStateRowIdentity {
+    fn from_state_row(row: &StateRow) -> Self {
+        Self {
+            untracked: row.untracked,
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+            version_id: row.version_id.clone(),
+        }
+    }
+
+    pub(crate) fn from_live_row(row: &LiveRow) -> Self {
+        Self {
+            untracked: row.untracked,
+            schema_key: row.schema_key.clone(),
+            entity_id: row.entity_id.clone(),
+            file_id: row.file_id.clone(),
+            version_id: row.version_id.clone(),
+        }
+    }
+}
 
 impl From<&StateRow> for StagedStateRowIdentity {
     fn from(row: &StateRow) -> Self {
-        (
-            row.untracked,
-            row.schema_key.clone(),
-            row.entity_id.clone(),
-            row.file_id.clone(),
-            row.version_id.clone(),
-            row.plugin_key.clone(),
-            row.schema_version
-                .clone()
-                .expect("engine2 staged rows should already be normalized"),
-        )
+        Self::from_state_row(row)
     }
 }
 
@@ -258,8 +271,8 @@ fn staged_row_identity_matches_scan(row: &StateRow, request: &LiveStateScanReque
 
 fn staged_row_matches_exact(row: &StateRow, request: &ExactRowRequest) -> bool {
     row.schema_key == request.schema_key
-        && row.entity_id == request.entity_id
         && row.version_id == request.version_id
+        && row.entity_id == request.entity_id
         && nullable_key_matches_filter(&row.file_id, &request.file_id)
 }
 
@@ -278,5 +291,300 @@ fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilte
         NullableKeyFilter::Any => true,
         NullableKeyFilter::Null => value.is_none(),
         NullableKeyFilter::Value(expected) => value.as_ref() == Some(expected),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::live_state::{ExactRowRequest, LiveStateFilter};
+
+    #[tokio::test]
+    async fn staging_overlay_uses_last_staged_row_for_exact_load() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("sql2-duplicate-key", "first"),
+                    state_row("sql2-duplicate-key", "second"),
+                ],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let row = overlay
+            .load_exact(&ExactRowRequest {
+                schema_key: "lix_key_value".to_string(),
+                version_id: "global".to_string(),
+                entity_id: "sql2-duplicate-key".to_string(),
+                file_id: NullableKeyFilter::Null,
+            })
+            .expect("staged row should be visible");
+
+        let StagedExactRow::Row(row) = row else {
+            panic!("latest staged row should not be a tombstone");
+        };
+        assert_eq!(
+            row.snapshot_content.as_deref(),
+            Some("{\"key\":\"sql2-duplicate-key\",\"value\":\"second\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_overlay_scan_returns_only_latest_row_per_identity() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("sql2-duplicate-key", "first"),
+                    state_row("sql2-duplicate-key", "second"),
+                ],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let rows = overlay.scan(&scan_request_for_key("sql2-duplicate-key", false));
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].snapshot_content.as_deref(),
+            Some("{\"key\":\"sql2-duplicate-key\",\"value\":\"second\"}")
+        );
+    }
+
+    #[tokio::test]
+    async fn staging_overlay_delete_hides_prior_staged_insert() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("sql2-delete-key", "visible"),
+                    tombstone_row("sql2-delete-key"),
+                ],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let exact = overlay
+            .load_exact(&exact_request_for_key("sql2-delete-key"))
+            .expect("staged tombstone should answer exact load");
+        assert!(matches!(exact, StagedExactRow::Tombstone));
+        assert!(overlay
+            .scan(&scan_request_for_key("sql2-delete-key", false))
+            .is_empty());
+
+        let tombstones = overlay.scan(&scan_request_for_key("sql2-delete-key", true));
+        assert_eq!(tombstones.len(), 1);
+        assert_eq!(tombstones[0].snapshot_content, None);
+    }
+
+    #[tokio::test]
+    async fn staging_overlay_insert_after_delete_resurrects_row() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    tombstone_row("sql2-resurrect-key"),
+                    state_row("sql2-resurrect-key", "visible-again"),
+                ],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let exact = overlay
+            .load_exact(&exact_request_for_key("sql2-resurrect-key"))
+            .expect("staged row should answer exact load");
+
+        let StagedExactRow::Row(row) = exact else {
+            panic!("latest staged row should be visible");
+        };
+        assert_eq!(
+            row.snapshot_content.as_deref(),
+            Some("{\"key\":\"sql2-resurrect-key\",\"value\":\"visible-again\"}")
+        );
+        assert_eq!(
+            overlay
+                .scan(&scan_request_for_key("sql2-resurrect-key", false))
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn staged_writes_drain_returns_coalesced_latest_rows() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("sql2-key-a", "first"),
+                    state_row("sql2-key-a", "second"),
+                    state_row("sql2-key-b", "only"),
+                ],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+
+        assert_eq!(drained.len(), 2);
+        assert!(drained.iter().any(|row| {
+            row.entity_id == "sql2-key-a"
+                && row.snapshot_content.as_deref()
+                    == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
+        }));
+        assert!(drained.iter().any(|row| {
+            row.entity_id == "sql2-key-b"
+                && row.snapshot_content.as_deref()
+                    == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
+        }));
+    }
+
+    #[tokio::test]
+    async fn staging_overlay_identity_matches_live_state_conflict_key() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![
+                    state_row("shared-entity", "base"),
+                    state_row("shared-entity", "other-version").with_version("version-b"),
+                    state_row("shared-entity", "other-schema").with_schema("other_schema"),
+                    state_row("shared-entity", "other-file").with_file_id("file-a"),
+                    state_row("shared-entity", "other-plugin").with_plugin_key("plugin-a"),
+                    state_row("shared-entity", "other-schema-version").with_schema_version("2"),
+                    state_row("shared-entity", "tracked").with_tracked(),
+                ],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let overlay = staged_writes
+            .staging_overlay()
+            .expect("overlay should build from staged rows");
+        let rows = overlay.scan(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                entity_ids: vec!["shared-entity".to_string()],
+                include_tombstones: true,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        });
+
+        assert_eq!(rows.len(), 5);
+        assert!(rows.iter().any(|row| {
+            row.snapshot_content.as_deref()
+                == Some("{\"key\":\"shared-entity\",\"value\":\"other-schema-version\"}")
+        }));
+        assert!(rows.iter().any(|row| {
+            row.snapshot_content.as_deref()
+                == Some("{\"key\":\"shared-entity\",\"value\":\"tracked\"}")
+        }));
+    }
+
+    fn state_row(key: &str, value: &str) -> StateRow {
+        StateRow {
+            entity_id: key.to_string(),
+            schema_key: "lix_key_value".to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some(format!("{{\"key\":\"{key}\",\"value\":\"{value}\"}}")),
+            metadata: None,
+            schema_version: Some("1".to_string()),
+            created_at: None,
+            updated_at: None,
+            global: true,
+            change_id: None,
+            commit_id: None,
+            untracked: true,
+            version_id: "global".to_string(),
+        }
+    }
+
+    fn tombstone_row(key: &str) -> StateRow {
+        StateRow {
+            snapshot_content: None,
+            ..state_row(key, "deleted")
+        }
+    }
+
+    fn exact_request_for_key(key: &str) -> ExactRowRequest {
+        ExactRowRequest {
+            schema_key: "lix_key_value".to_string(),
+            version_id: "global".to_string(),
+            entity_id: key.to_string(),
+            file_id: NullableKeyFilter::Null,
+        }
+    }
+
+    fn scan_request_for_key(key: &str, include_tombstones: bool) -> LiveStateScanRequest {
+        LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec!["lix_key_value".to_string()],
+                entity_ids: vec![key.to_string()],
+                version_ids: vec!["global".to_string()],
+                file_ids: vec![NullableKeyFilter::Null],
+                include_tombstones,
+                ..LiveStateFilter::default()
+            },
+            ..LiveStateScanRequest::default()
+        }
+    }
+
+    trait StateRowTestExt {
+        fn with_schema(self, schema_key: &str) -> Self;
+        fn with_schema_version(self, schema_version: &str) -> Self;
+        fn with_file_id(self, file_id: &str) -> Self;
+        fn with_plugin_key(self, plugin_key: &str) -> Self;
+        fn with_tracked(self) -> Self;
+        fn with_version(self, version_id: &str) -> Self;
+    }
+
+    impl StateRowTestExt for StateRow {
+        fn with_schema(mut self, schema_key: &str) -> Self {
+            self.schema_key = schema_key.to_string();
+            self
+        }
+
+        fn with_schema_version(mut self, schema_version: &str) -> Self {
+            self.schema_version = Some(schema_version.to_string());
+            self
+        }
+
+        fn with_file_id(mut self, file_id: &str) -> Self {
+            self.file_id = Some(file_id.to_string());
+            self
+        }
+
+        fn with_plugin_key(mut self, plugin_key: &str) -> Self {
+            self.plugin_key = Some(plugin_key.to_string());
+            self
+        }
+
+        fn with_tracked(mut self) -> Self {
+            self.untracked = false;
+            self
+        }
+
+        fn with_version(mut self, version_id: &str) -> Self {
+            self.version_id = version_id.to_string();
+            self
+        }
     }
 }
