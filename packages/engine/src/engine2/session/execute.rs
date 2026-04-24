@@ -137,7 +137,7 @@ impl RowRef<'_> {
 impl Session {
     pub async fn execute(&self, sql: &str, params: &[Value]) -> Result<ExecuteResult, LixError> {
         let ctx = SessionSqlExecutionContext {
-            active_version_id: &self.active_version_id,
+            active_version_id: self.active_version_id(),
             backend: Arc::clone(&self.backend),
             committed_live_state: Arc::clone(&self.committed_live_state),
         };
@@ -147,24 +147,23 @@ impl Session {
             // Open an autocommit write transaction for this statement, execute
             // through a transaction-aware SQL context, then commit on success
             // or rollback on error.
-            let mut transaction = Transaction::new(
+            let transaction = Transaction::new(
                 &self.backend,
                 Arc::clone(&self.committed_live_state),
                 Arc::clone(&self.write_services),
             )
             .await?;
-            let tx_sql_ctx = transaction.sql_execution_context(&self.active_version_id)?;
+            let tx_sql_ctx = transaction.sql_execution_context(self.active_version_id())?;
             // Re-plan against the transaction context so reads during write
-            // execution see the pending overlay and write execution gets the
-            // transaction-owned write target.
+            // execution see the pending overlay. Once the transaction context
+            // exposes a write stager, DataFusion provider hooks will stage
+            // writes through that same transaction.
             let tx_plan = sql2::create_logical_plan(&tx_sql_ctx, sql).await?;
-            let result =
-                sql2::execute_write_logical_plan(&tx_sql_ctx, &mut transaction, tx_plan, params)
-                    .await;
+            let result = sql2::execute_logical_plan(&tx_sql_ctx, tx_plan, params).await;
             match result {
                 Ok(result) => {
                     let affected_rows = affected_rows_from_query_result(result)?;
-                    transaction.commit(&self.active_version_id).await?;
+                    transaction.commit(self.active_version_id()).await?;
                     return Ok(ExecuteResult::AffectedRows(affected_rows));
                 }
                 Err(error) => {

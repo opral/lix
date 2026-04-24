@@ -25,6 +25,20 @@ pub struct Session {
 }
 
 impl Session {
+    pub(crate) async fn open(
+        active_version_id: String,
+        backend: Arc<dyn LixBackend + Send + Sync>,
+        committed_live_state: Arc<CommittedLiveStateContext>,
+        write_services: Arc<WriteServices>,
+    ) -> Result<Self, LixError> {
+        Ok(Self::new(
+            active_version_id,
+            backend,
+            committed_live_state,
+            write_services,
+        ))
+    }
+
     pub(crate) fn new(
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,

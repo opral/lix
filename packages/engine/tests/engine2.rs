@@ -2,6 +2,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use lix_engine::engine2::ExecuteResult;
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
     Engine, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, PreparedBatch,
@@ -36,7 +37,7 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
                     .await
                     .expect("initialized backend should create an engine");
                 let session = engine
-                    .open_session()
+                    .open_session("global")
                     .await
                     .expect("initialized backend should open a session");
 
@@ -56,13 +57,16 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
                     .await
                     .expect("session read should succeed");
 
-                assert_eq!(result.statements.len(), 1);
+                let ExecuteResult::Rows(row_set) = result else {
+                    panic!("SELECT should return rows");
+                };
+                assert_eq!(row_set.len(), 1);
                 assert_eq!(
-                    result.statements[0].rows,
-                    vec![vec![
+                    row_set.rows()[0].values(),
+                    &[
                         Value::Text("sql2-key".to_string()),
                         Value::Text("\"sql2-value\"".to_string()),
-                    ]]
+                    ]
                 );
 
                 drop(session);

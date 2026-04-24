@@ -61,21 +61,21 @@ pub(crate) trait HistoryContext: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqlWriteIntent {
-    InsertLixState {
-        rows: Vec<LixStateWriteRow>,
+    InsertRows {
+        rows: Vec<StateWriteRow>,
     },
-    DeleteLixState {
-        rows: Vec<LixStateWriteRow>,
+    DeleteRows {
+        rows: Vec<StateWriteRow>,
     },
-    InsertLixStateWithFileData {
-        rows: Vec<LixStateWriteRow>,
+    InsertRowsWithFileData {
+        rows: Vec<StateWriteRow>,
         file_data: Vec<FileDataWrite>,
         count: u64,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct LixStateWriteRow {
+pub(crate) struct StateWriteRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
     pub(crate) file_id: Option<String>,
@@ -114,15 +114,6 @@ pub(crate) struct SqlWriteOutcome {
 #[allow(dead_code)]
 pub(crate) trait SqlWriteStager: Send + Sync {
     async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError>;
-}
-
-/// Transaction-owned destination for SQL write intents.
-///
-/// `sql2` should decode write plans into `SqlWriteIntent`s, while the
-/// caller-owned transaction decides how those intents are staged and committed.
-#[allow(dead_code)]
-pub(crate) trait SqlWriteTarget {
-    fn stage_sql_write(&mut self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,34 +163,34 @@ pub(crate) fn stage_decoded_write(
     write: SqlWriteIntent,
 ) -> Result<SqlWriteOutcome, LixError> {
     match write {
-        SqlWriteIntent::InsertLixState { rows } => {
+        SqlWriteIntent::InsertRows { rows } => {
             let count = rows.len() as u64;
             let mutations = rows
                 .into_iter()
-                .map(|row| mutation_row_from_lix_state_write_row(row, MutationOperation::Insert))
+                .map(|row| mutation_row_from_state_write_row(row, MutationOperation::Insert))
                 .collect::<Result<Vec<_>, _>>()?;
             let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
             stager.stage_transaction_write_delta(delta)?;
             Ok(SqlWriteOutcome { count })
         }
-        SqlWriteIntent::DeleteLixState { rows } => {
+        SqlWriteIntent::DeleteRows { rows } => {
             let count = rows.len() as u64;
             let mutations = rows
                 .into_iter()
-                .map(|row| mutation_row_from_lix_state_write_row(row, MutationOperation::Delete))
+                .map(|row| mutation_row_from_state_write_row(row, MutationOperation::Delete))
                 .collect::<Result<Vec<_>, _>>()?;
             let delta = build_direct_mutation_transaction_write_delta(mutations, None)?;
             stager.stage_transaction_write_delta(delta)?;
             Ok(SqlWriteOutcome { count })
         }
-        SqlWriteIntent::InsertLixStateWithFileData {
+        SqlWriteIntent::InsertRowsWithFileData {
             rows,
             file_data,
             count,
         } => {
             let mutations = rows
                 .into_iter()
-                .map(|row| mutation_row_from_lix_state_write_row(row, MutationOperation::Insert))
+                .map(|row| mutation_row_from_state_write_row(row, MutationOperation::Insert))
                 .collect::<Result<Vec<_>, _>>()?;
             let filesystem_state = filesystem_state_from_file_data_writes(file_data);
             let delta = build_direct_mutation_transaction_write_delta_with_filesystem_state(
@@ -232,8 +223,8 @@ fn filesystem_state_from_file_data_writes(file_data: Vec<FileDataWrite>) -> Plan
     filesystem_state
 }
 
-fn mutation_row_from_lix_state_write_row(
-    row: LixStateWriteRow,
+fn mutation_row_from_state_write_row(
+    row: StateWriteRow,
     operation: MutationOperation,
 ) -> Result<MutationRow, LixError> {
     reject_read_only_lix_state_insert_field("created_at", &row.created_at)?;
@@ -360,31 +351,6 @@ pub(crate) async fn execute_logical_plan(
         .await
         .map_err(datafusion_error_to_lix_error)?;
     query_result_from_batches(&result_columns, &batches)
-}
-
-pub(crate) async fn execute_write_logical_plan(
-    _ctx: &dyn SqlExecutionContext,
-    _write_target: &mut dyn SqlWriteTarget,
-    plan: SqlLogicalPlan,
-    _params: &[Value],
-) -> Result<QueryResult, LixError> {
-    if plan.kind != SqlStatementKind::Write {
-        return Err(LixError::new(
-            "LIX_ERROR_UNKNOWN",
-            "sql2 write executor received a non-write logical plan",
-        ));
-    }
-
-    // TODO(sql2): implement the DataFusion DML executor here:
-    // 1. inspect LogicalPlan::Dml,
-    // 2. execute the DML input plan into RecordBatches,
-    // 3. decode batches into SqlWriteIntent for the target table,
-    // 4. call write_target.stage_sql_write(...),
-    // 5. return a DataFusion-compatible count result.
-    Err(LixError::new(
-        "LIX_ERROR_UNKNOWN",
-        "sql2 DataFusion DML executor is not implemented yet; writes must decode the DML input plan and call Transaction::stage_sql_write",
-    ))
 }
 
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
@@ -538,8 +504,8 @@ mod tests {
     use serde_json::Value as JsonValue;
 
     use super::{
-        execute_sql, stage_decoded_write, HistoryContext, LixStateWriteRow, SqlExecutionContext,
-        SqlWriteIntent, SqlWriteStager,
+        execute_sql, stage_decoded_write, HistoryContext, SqlExecutionContext, SqlWriteIntent,
+        SqlWriteStager, StateWriteRow,
     };
     use crate::binary_cas::BlobDataReader;
     use crate::history::{
@@ -731,8 +697,8 @@ mod tests {
         }
     }
 
-    fn minimal_lix_state_write_row() -> LixStateWriteRow {
-        LixStateWriteRow {
+    fn minimal_lix_state_write_row() -> StateWriteRow {
+        StateWriteRow {
             entity_id: "entity-1".to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -862,11 +828,9 @@ mod tests {
         let mut row = minimal_lix_state_write_row();
         row.metadata = Some("{\"source\":\"sql\"}".to_string());
 
-        let outcome = stage_decoded_write(
-            &mut stager,
-            SqlWriteIntent::InsertLixState { rows: vec![row] },
-        )
-        .expect("write intent should stage");
+        let outcome =
+            stage_decoded_write(&mut stager, SqlWriteIntent::InsertRows { rows: vec![row] })
+                .expect("write intent should stage");
 
         assert_eq!(outcome.count, 1);
         assert_eq!(stager.deltas.len(), 1);
@@ -891,11 +855,9 @@ mod tests {
         row.change_id = Some("change-a".to_string());
         let mut stager = CapturingPreparedWriteStager::default();
 
-        let error = stage_decoded_write(
-            &mut stager,
-            SqlWriteIntent::InsertLixState { rows: vec![row] },
-        )
-        .expect_err("read-only fields should be rejected");
+        let error =
+            stage_decoded_write(&mut stager, SqlWriteIntent::InsertRows { rows: vec![row] })
+                .expect_err("read-only fields should be rejected");
 
         assert!(
             error.description.contains("read-only column 'change_id'"),
@@ -911,11 +873,9 @@ mod tests {
         row.snapshot_content = None;
         row.metadata = Some("{\"source\":\"delete\"}".to_string());
 
-        let outcome = stage_decoded_write(
-            &mut stager,
-            SqlWriteIntent::DeleteLixState { rows: vec![row] },
-        )
-        .expect("delete intent should stage");
+        let outcome =
+            stage_decoded_write(&mut stager, SqlWriteIntent::DeleteRows { rows: vec![row] })
+                .expect("delete intent should stage");
 
         assert_eq!(outcome.count, 1);
         assert_eq!(stager.deltas.len(), 1);
@@ -936,7 +896,7 @@ mod tests {
         let stager = Mutex::new(CapturingPreparedWriteStager::default());
 
         let outcome = stager
-            .stage_write(SqlWriteIntent::InsertLixState {
+            .stage_write(SqlWriteIntent::InsertRows {
                 rows: vec![minimal_lix_state_write_row()],
             })
             .await

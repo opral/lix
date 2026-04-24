@@ -64,16 +64,16 @@ impl Engine {
         Arc::clone(&self.backend)
     }
 
-    pub async fn open_session(&self) -> Result<Session, LixError> {
-        // TODO(engine2): load this from an engine2-owned workspace/session
-        // selector context instead of depending on the legacy session module.
-        let active_version_id = "global".to_string();
-
-        Ok(Session::new(
-            active_version_id,
+    pub async fn open_session(
+        &self,
+        active_version_id: impl Into<String>,
+    ) -> Result<Session, LixError> {
+        Session::open(
+            active_version_id.into(),
             self.backend(),
             Arc::clone(&self.committed_live_state),
             Arc::clone(&self.write_services),
-        ))
+        )
+        .await
     }
 }

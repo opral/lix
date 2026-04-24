@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value as JsonValue;
@@ -8,7 +8,7 @@ use crate::binary_cas::BlobDataReader;
 use crate::engine2::write_services::WriteServices;
 use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::{
-    stage_decoded_write, SqlExecutionContext, SqlWriteIntent, SqlWriteOutcome, SqlWriteTarget,
+    stage_decoded_write, SqlExecutionContext, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager,
 };
 use crate::transaction::{BufferedWriteExecutionInput, TransactionCommitOutcome};
 use crate::transaction::{BufferedWriteTransaction, TransactionLiveStateContext};
@@ -25,6 +25,10 @@ pub(crate) struct Transaction<'a> {
     // Concrete engine-owned services used when flushing the buffered write
     // pipeline. The transaction owns the staged writes, not these services.
     write_services: Arc<WriteServices>,
+    // TODO(engine2): replace this collector bridge with a direct transaction
+    // stager. Provider hooks currently require `Arc<dyn SqlWriteStager>`, while
+    // `BufferedWriteTransaction` is transaction-scoped and mutable.
+    pending_sql_writes: Arc<PendingSqlWriteStager>,
     write_transaction: BufferedWriteTransaction<'a>,
 }
 
@@ -47,6 +51,7 @@ impl<'a> Transaction<'a> {
             backend,
             committed_live_state,
             write_services,
+            pending_sql_writes: Arc::new(PendingSqlWriteStager::default()),
             write_transaction: BufferedWriteTransaction::new(backend_transaction),
         })
     }
@@ -58,10 +63,9 @@ impl<'a> Transaction<'a> {
     /// which combines committed live state with the transaction's pending write
     /// overlay.
     ///
-    /// TODO(engine2): once `execute_write_logical_plan` stages writes during
-    /// execution, refresh this context after each staged write if a single DML
-    /// execution can perform subsequent reads that must observe earlier staged
-    /// rows.
+    /// TODO(engine2): once this context exposes a provider-hook write stager,
+    /// refresh this context after each staged write if a single DML execution
+    /// can perform subsequent reads that must observe earlier staged rows.
     pub(crate) fn sql_execution_context(
         &self,
         active_version_id: &'a str,
@@ -78,6 +82,7 @@ impl<'a> Transaction<'a> {
             active_version_id,
             backend: Arc::clone(self.backend),
             live_state,
+            write_stager: Some(Arc::clone(&self.pending_sql_writes) as Arc<dyn SqlWriteStager>),
         })
     }
 
@@ -85,6 +90,7 @@ impl<'a> Transaction<'a> {
     ///
     /// SQL execution decodes DML into semantic intents, but the transaction
     /// remains the only owner of the actual Lix buffered write pipeline.
+    #[allow(dead_code)]
     pub(crate) fn stage_sql_write(
         &mut self,
         write: SqlWriteIntent,
@@ -98,9 +104,14 @@ impl<'a> Transaction<'a> {
     /// flushes the buffered write pipeline, then commits the backend
     /// transaction.
     pub(crate) async fn commit(
-        self,
+        mut self,
         active_version_id: &str,
     ) -> Result<TransactionCommitOutcome, LixError> {
+        let pending_writes = self.pending_sql_writes.drain()?;
+        for write in pending_writes {
+            self.stage_sql_write(write)?;
+        }
+
         // TODO(engine2): active account ids and origin key are hardcoded until
         // engine2 owns workspace/session selector state.
         let execution_input =
@@ -121,12 +132,6 @@ impl<'a> Transaction<'a> {
     }
 }
 
-impl SqlWriteTarget for Transaction<'_> {
-    fn stage_sql_write(&mut self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
-        Self::stage_sql_write(self, write)
-    }
-}
-
 /// SQL-facing adapter for an execution-scoped transaction.
 ///
 /// This type intentionally contains only what `sql2` needs: the active version,
@@ -135,6 +140,7 @@ pub(crate) struct TransactionSqlExecutionContext<'a> {
     active_version_id: &'a str,
     backend: Arc<dyn LixBackend + Send + Sync>,
     live_state: Arc<dyn LiveStateContext>,
+    write_stager: Option<Arc<dyn SqlWriteStager>>,
 }
 
 impl SqlExecutionContext for TransactionSqlExecutionContext<'_> {
@@ -154,6 +160,12 @@ impl SqlExecutionContext for TransactionSqlExecutionContext<'_> {
         Arc::new(TransactionBackendBlobReader(Arc::clone(&self.backend)))
     }
 
+    /// Provides the transaction-scoped write collector used by DataFusion
+    /// provider hooks while this statement executes.
+    fn write_stager(&self) -> Option<Arc<dyn SqlWriteStager>> {
+        self.write_stager.as_ref().map(Arc::clone)
+    }
+
     /// Lists visible schemas for SQL surface registration.
     ///
     /// This is still a bootstrap implementation until engine2 owns the real
@@ -166,6 +178,43 @@ impl SqlExecutionContext for TransactionSqlExecutionContext<'_> {
         let key_value_schema = crate::schema::builtin_schema_definition("lix_key_value")
             .ok_or_else(|| LixError::unknown("missing builtin lix_key_value schema"))?;
         Ok(vec![key_value_schema.clone()])
+    }
+}
+
+#[derive(Default)]
+struct PendingSqlWriteStager {
+    writes: Mutex<Vec<SqlWriteIntent>>,
+}
+
+impl PendingSqlWriteStager {
+    fn drain(&self) -> Result<Vec<SqlWriteIntent>, LixError> {
+        let mut guard = self.writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire pending SQL write collector lock",
+            )
+        })?;
+        Ok(std::mem::take(&mut *guard))
+    }
+}
+
+#[async_trait]
+impl SqlWriteStager for PendingSqlWriteStager {
+    async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
+        let count = match &write {
+            SqlWriteIntent::InsertRows { rows } | SqlWriteIntent::DeleteRows { rows } => {
+                rows.len() as u64
+            }
+            SqlWriteIntent::InsertRowsWithFileData { count, .. } => *count,
+        };
+        let mut guard = self.writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire pending SQL write collector lock",
+            )
+        })?;
+        guard.push(write);
+        Ok(SqlWriteOutcome { count })
     }
 }
 
