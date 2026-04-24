@@ -39,7 +39,7 @@ const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
-use super::execute::{LixStateWriteRow, SqlWriteIntent, SqlWriteStager};
+use super::execute::{FileDataWrite, LixStateWriteRow, SqlWriteIntent, SqlWriteStager};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -306,22 +306,33 @@ impl DataSink for LixFileInsertSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        let mut rows = Vec::new();
+        let mut staged = LixFileStagedBatch::default();
         while let Some(batch) = data.next().await.transpose()? {
-            rows.extend(lix_file_write_rows_from_batch(
+            staged.extend(lix_file_insert_stage_from_batch(
                 &batch,
                 self.default_version_id.as_deref(),
             )?);
         }
-        let count = u64::try_from(rows.len())
-            .map_err(|_| DataFusionError::Execution("lix_file INSERT row count overflow".into()))?;
 
-        self.write_stager
-            .stage_write(SqlWriteIntent::InsertLixState { rows })
-            .await
-            .map_err(lix_error_to_datafusion_error)?;
+        if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
+            let intent = if staged.file_data_writes.is_empty() {
+                SqlWriteIntent::InsertLixState {
+                    rows: staged.state_rows,
+                }
+            } else {
+                SqlWriteIntent::InsertLixStateWithFileData {
+                    rows: staged.state_rows,
+                    file_data: staged.file_data_writes,
+                    count: staged.count,
+                }
+            };
+            self.write_stager
+                .stage_write(intent)
+                .await
+                .map_err(lix_error_to_datafusion_error)?;
+        }
 
-        Ok(count)
+        Ok(staged.count)
     }
 }
 
@@ -605,17 +616,34 @@ impl ExecutionPlan for LixFileUpdateExec {
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
             let updated_batch =
                 apply_lix_file_update_assignments(&table_schema, matched_batch, &assignments)?;
-            let write_rows = lix_file_existing_write_rows_from_batch(
+            let include_data_writes = assignments
+                .iter()
+                .any(|(column_name, _)| column_name == "data");
+            let include_descriptor_writes = assignments
+                .iter()
+                .any(|(column_name, _)| column_name != "data");
+            let staged = lix_file_existing_stage_from_batch(
                 &updated_batch,
                 default_version_id.as_deref(),
+                include_descriptor_writes,
+                include_data_writes,
             )?;
-            let count = u64::try_from(write_rows.len()).map_err(|_| {
-                DataFusionError::Execution("lix_file UPDATE row count overflow".into())
-            })?;
+            let count = staged.count;
 
             if count > 0 {
+                let intent = if staged.file_data_writes.is_empty() {
+                    SqlWriteIntent::InsertLixState {
+                        rows: staged.state_rows,
+                    }
+                } else {
+                    SqlWriteIntent::InsertLixStateWithFileData {
+                        rows: staged.state_rows,
+                        file_data: staged.file_data_writes,
+                        count,
+                    }
+                };
                 write_stager
-                    .stage_write(SqlWriteIntent::InsertLixState { rows: write_rows })
+                    .stage_write(intent)
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -790,58 +818,105 @@ struct DirectoryDescriptorSnapshot {
     name: String,
 }
 
+#[derive(Debug, Default)]
+struct LixFileStagedBatch {
+    state_rows: Vec<LixStateWriteRow>,
+    file_data_writes: Vec<FileDataWrite>,
+    count: u64,
+}
+
+impl LixFileStagedBatch {
+    fn extend(&mut self, other: LixFileStagedBatch) {
+        self.state_rows.extend(other.state_rows);
+        self.file_data_writes.extend(other.file_data_writes);
+        self.count += other.count;
+    }
+}
+
+#[cfg(test)]
 fn lix_file_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
 ) -> Result<Vec<LixStateWriteRow>> {
-    lix_file_write_rows_from_batch_with_options(batch, default_version_id, true)
+    Ok(lix_file_insert_stage_from_batch(batch, default_version_id)?.state_rows)
 }
 
 fn lix_file_existing_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
 ) -> Result<Vec<LixStateWriteRow>> {
-    lix_file_write_rows_from_batch_with_options(batch, default_version_id, false)
+    Ok(lix_file_existing_stage_from_batch(batch, default_version_id, true, false)?.state_rows)
 }
 
-fn lix_file_write_rows_from_batch_with_options(
+fn lix_file_insert_stage_from_batch(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+) -> Result<LixFileStagedBatch> {
+    lix_file_stage_from_batch_with_options(batch, default_version_id, true, true, true)
+}
+
+fn lix_file_existing_stage_from_batch(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    include_descriptor_writes: bool,
+    include_data_writes: bool,
+) -> Result<LixFileStagedBatch> {
+    lix_file_stage_from_batch_with_options(
+        batch,
+        default_version_id,
+        false,
+        include_descriptor_writes,
+        include_data_writes,
+    )
+}
+
+fn lix_file_stage_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
-) -> Result<Vec<LixStateWriteRow>> {
-    (0..batch.num_rows())
-        .map(|row_index| {
-            if reject_read_only_fields {
-                reject_read_only_lix_file_insert_field(batch, row_index, "path")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "data")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_id")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_updated_at")?;
-                reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_commit_id")?;
-            }
+    include_descriptor_writes: bool,
+    include_data_writes: bool,
+) -> Result<LixFileStagedBatch> {
+    let count = u64::try_from(batch.num_rows())
+        .map_err(|_| DataFusionError::Execution("lix_file row count overflow".into()))?;
+    let mut staged = LixFileStagedBatch {
+        count,
+        ..LixFileStagedBatch::default()
+    };
 
-            let id = required_string_value(batch, row_index, "id")?;
-            let directory_id = optional_string_value(batch, row_index, "directory_id")?;
-            let name = required_string_value(batch, row_index, "name")?;
-            let extension = optional_string_value(batch, row_index, "extension")?;
-            let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
-            let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
-            let version_id = if global {
-                GLOBAL_VERSION_ID.to_string()
-            } else {
-                optional_string_value(batch, row_index, "lixcol_version_id")?
-                    .or_else(|| default_version_id.map(ToOwned::to_owned))
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "INSERT into lix_file_by_version requires lixcol_version_id"
-                                .to_string(),
-                        )
-                    })?
-            };
+    for row_index in 0..batch.num_rows() {
+        if reject_read_only_fields {
+            reject_read_only_lix_file_insert_field(batch, row_index, "path")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_id")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_created_at")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_updated_at")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_commit_id")?;
+        }
+
+        let id = required_string_value(batch, row_index, "id")?;
+        let directory_id = optional_string_value(batch, row_index, "directory_id")?;
+        let name = required_string_value(batch, row_index, "name")?;
+        let extension = optional_string_value(batch, row_index, "extension")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
+        let version_id = if global {
+            GLOBAL_VERSION_ID.to_string()
+        } else {
+            optional_string_value(batch, row_index, "lixcol_version_id")?
+                .or_else(|| default_version_id.map(ToOwned::to_owned))
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "INSERT into lix_file_by_version requires lixcol_version_id".to_string(),
+                    )
+                })?
+        };
+        let untracked = optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false);
+
+        if include_descriptor_writes {
             let snapshot_content = json!({
-                "id": id,
+                "id": id.clone(),
                 "directory_id": directory_id,
                 "name": name,
                 "extension": extension,
@@ -849,8 +924,8 @@ fn lix_file_write_rows_from_batch_with_options(
             })
             .to_string();
 
-            Ok(LixStateWriteRow {
-                entity_id: id,
+            staged.state_rows.push(LixStateWriteRow {
+                entity_id: id.clone(),
                 schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
                 file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
                 plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
@@ -863,12 +938,24 @@ fn lix_file_write_rows_from_batch_with_options(
                 global,
                 change_id: None,
                 commit_id: None,
-                untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?
-                    .unwrap_or(false),
-                version_id,
-            })
-        })
-        .collect()
+                untracked,
+                version_id: version_id.clone(),
+            });
+        }
+
+        if include_data_writes {
+            if let Some(data) = optional_binary_value(batch, row_index, "data")? {
+                staged.file_data_writes.push(FileDataWrite {
+                    file_id: id,
+                    version_id,
+                    untracked,
+                    data,
+                });
+            }
+        }
+    }
+
+    Ok(staged)
 }
 
 async fn lix_file_record_batch(
@@ -1164,7 +1251,7 @@ fn validate_lix_file_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "directory_id" | "name" | "extension" | "hidden" | "lixcol_metadata"
+            "directory_id" | "name" | "extension" | "hidden" | "data" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
@@ -1319,6 +1406,27 @@ fn optional_bool_value(
     }
 }
 
+fn optional_binary_value(
+    batch: &RecordBatch,
+    row_index: usize,
+    column_name: &str,
+) -> Result<Option<Vec<u8>>> {
+    match optional_scalar_value(batch, row_index, column_name)? {
+        None
+        | Some(ScalarValue::Null)
+        | Some(ScalarValue::Binary(None))
+        | Some(ScalarValue::LargeBinary(None))
+        | Some(ScalarValue::FixedSizeBinary(_, None)) => Ok(None),
+        Some(ScalarValue::Binary(Some(value))) | Some(ScalarValue::LargeBinary(Some(value))) => {
+            Ok(Some(value))
+        }
+        Some(ScalarValue::FixedSizeBinary(_, Some(value))) => Ok(Some(value)),
+        Some(other) => Err(DataFusionError::Execution(format!(
+            "INSERT into lix_file expected binary column '{column_name}', got {other:?}"
+        ))),
+    }
+}
+
 fn optional_scalar_value(
     batch: &RecordBatch,
     row_index: usize,
@@ -1409,8 +1517,8 @@ mod tests {
     use crate::LixError;
 
     use super::{
-        derive_directory_path_for, lix_file_write_rows_from_batch, DirectoryDescriptorRecord,
-        LixFileInsertSink,
+        derive_directory_path_for, lix_file_insert_stage_from_batch,
+        lix_file_write_rows_from_batch, DirectoryDescriptorRecord, LixFileInsertSink,
     };
 
     #[derive(Default)]
@@ -1456,7 +1564,7 @@ mod tests {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("file insert batch")
     }
 
-    fn data_rejected_batch() -> RecordBatch {
+    fn data_insert_batch() -> RecordBatch {
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![
                 Field::new("id", DataType::Utf8, false),
@@ -1560,15 +1668,17 @@ mod tests {
     }
 
     #[test]
-    fn file_insert_rejects_non_null_data() {
-        let batch = data_rejected_batch();
+    fn file_insert_stages_non_null_data() {
+        let batch = data_insert_batch();
 
-        let error = lix_file_write_rows_from_batch(&batch, None).expect_err("data is read-only");
+        let staged = lix_file_insert_stage_from_batch(&batch, None).expect("decode file data");
 
-        assert!(
-            error.to_string().contains("read-only column 'data'"),
-            "unexpected error: {error}"
-        );
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 1);
+        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(staged.file_data_writes[0].version_id, "version-b");
+        assert_eq!(staged.file_data_writes[0].data, b"hello");
     }
 
     #[tokio::test]
@@ -1596,6 +1706,40 @@ mod tests {
                 assert_eq!(rows[0].schema_key, "lix_file_descriptor");
             }
             other => panic!("expected insert write intent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_insert_sink_stages_file_data_writes() {
+        let batch = data_insert_batch();
+        let stager = Arc::new(CapturingWriteStager::default());
+        let sink = LixFileInsertSink::new(
+            batch.schema(),
+            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            None,
+        );
+
+        let count = sink
+            .write_all(batch_stream(batch), &Arc::new(TaskContext::default()))
+            .await
+            .expect("file insert sink should stage data");
+
+        assert_eq!(count, 1);
+        let writes = stager.writes.lock().expect("writes lock");
+        assert_eq!(writes.len(), 1);
+        match &writes[0] {
+            SqlWriteIntent::InsertLixStateWithFileData {
+                rows,
+                file_data,
+                count,
+            } => {
+                assert_eq!(*count, 1);
+                assert_eq!(rows.len(), 1);
+                assert_eq!(file_data.len(), 1);
+                assert_eq!(file_data[0].file_id, "file-readme");
+                assert_eq!(file_data[0].data, b"hello");
+            }
+            other => panic!("expected insert with file data write intent, got {other:?}"),
         }
     }
 }

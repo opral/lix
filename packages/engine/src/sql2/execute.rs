@@ -8,9 +8,14 @@ use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
 use crate::live_state::LiveStateContext;
-use crate::sql::{MutationOperation, MutationRow};
+use crate::sql::{
+    MutationOperation, MutationRow, OptionalTextPatch, PlannedFilesystemFile,
+    PlannedFilesystemState,
+};
 use crate::transaction::{
-    build_direct_mutation_transaction_write_delta, PreparedWriteStatementStager,
+    build_direct_mutation_transaction_write_delta,
+    build_direct_mutation_transaction_write_delta_with_filesystem_state,
+    PreparedWriteStatementStager,
 };
 use crate::{LixError, QueryResult, Value};
 
@@ -41,8 +46,17 @@ pub(crate) trait SqlExecutionContext {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SqlWriteIntent {
-    InsertLixState { rows: Vec<LixStateWriteRow> },
-    DeleteLixState { rows: Vec<LixStateWriteRow> },
+    InsertLixState {
+        rows: Vec<LixStateWriteRow>,
+    },
+    DeleteLixState {
+        rows: Vec<LixStateWriteRow>,
+    },
+    InsertLixStateWithFileData {
+        rows: Vec<LixStateWriteRow>,
+        file_data: Vec<FileDataWrite>,
+        count: u64,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +75,14 @@ pub(crate) struct LixStateWriteRow {
     pub(crate) commit_id: Option<String>,
     pub(crate) untracked: bool,
     pub(crate) version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FileDataWrite {
+    pub(crate) file_id: String,
+    pub(crate) version_id: String,
+    pub(crate) untracked: bool,
+    pub(crate) data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +142,44 @@ pub(crate) fn stage_decoded_write(
             stager.stage_transaction_write_delta(delta)?;
             Ok(SqlWriteOutcome { count })
         }
+        SqlWriteIntent::InsertLixStateWithFileData {
+            rows,
+            file_data,
+            count,
+        } => {
+            let mutations = rows
+                .into_iter()
+                .map(|row| mutation_row_from_lix_state_write_row(row, MutationOperation::Insert))
+                .collect::<Result<Vec<_>, _>>()?;
+            let filesystem_state = filesystem_state_from_file_data_writes(file_data);
+            let delta = build_direct_mutation_transaction_write_delta_with_filesystem_state(
+                mutations,
+                None,
+                filesystem_state,
+            )?;
+            stager.stage_transaction_write_delta(delta)?;
+            Ok(SqlWriteOutcome { count })
+        }
     }
+}
+
+fn filesystem_state_from_file_data_writes(file_data: Vec<FileDataWrite>) -> PlannedFilesystemState {
+    let mut filesystem_state = PlannedFilesystemState::default();
+    for write in file_data {
+        filesystem_state.files.insert(
+            (write.file_id.clone(), write.version_id.clone()),
+            PlannedFilesystemFile {
+                file_id: write.file_id,
+                version_id: write.version_id,
+                untracked: write.untracked,
+                descriptor: None,
+                metadata_patch: OptionalTextPatch::Unchanged,
+                data: Some(write.data),
+                deleted: false,
+            },
+        );
+    }
+    filesystem_state
 }
 
 fn mutation_row_from_lix_state_write_row(
@@ -1202,6 +1261,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_sql_insert_into_file_with_data_stages_blob_ref() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(DummyLiveStateContext);
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "INSERT INTO lix_file_by_version (\
+             id, directory_id, name, extension, hidden, data, lixcol_version_id\
+             ) VALUES ('file-readme', 'dir-docs', 'readme', 'md', false, X'4142', 'version-b')",
+            &[],
+        )
+        .await
+        .expect("INSERT INTO lix_file_by_version should stage descriptor and data writes");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        let descriptor_rows = overlay.visible_semantic_rows(false, "lix_file_descriptor");
+        assert_eq!(descriptor_rows.len(), 1);
+        assert_eq!(descriptor_rows[0].entity_id, "file-readme");
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_ref_rows.len(), 1);
+        assert_eq!(blob_ref_rows[0].entity_id, "file-readme");
+        assert_eq!(blob_ref_rows[0].file_id.as_deref(), Some("file-readme"));
+        assert_eq!(blob_ref_rows[0].version_id, "version-b");
+        let snapshot: JsonValue =
+            serde_json::from_str(blob_ref_rows[0].snapshot_content.as_deref().unwrap())
+                .expect("blob ref snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["size_bytes"], 2);
+        assert!(snapshot["blob_hash"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+    }
+
+    #[tokio::test]
     async fn execute_sql_update_file_stages_rewritten_descriptor() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateContext {
@@ -1270,7 +1378,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_sql_update_file_rejects_data_assignment() {
+    async fn execute_sql_update_file_stages_data_blob_ref() {
+        let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
+        let live_state = Arc::new(RowsLiveStateContext {
+            rows: vec![live_file_row(
+                "file-readme",
+                "version-a",
+                Some("dir-docs"),
+                "readme",
+                Some("md"),
+                false,
+            )],
+        });
+        let stager = Arc::new(Mutex::new(CapturingPreparedWriteStager::default()));
+        let ctx = DummySqlExecutionContext {
+            active_version_id: "version-a",
+            blob_reader,
+            live_state,
+            write_stager: Some(Arc::clone(&stager) as Arc<dyn SqlWriteStager>),
+            schema_definitions: vec![],
+        };
+
+        let result = execute_sql(
+            &ctx,
+            "UPDATE lix_file SET data = X'4142' WHERE id = 'file-readme'",
+            &[],
+        )
+        .await
+        .expect("UPDATE lix_file should stage data write");
+
+        assert_eq!(result.columns, vec!["count"]);
+        assert_eq!(result.rows, vec![vec![Value::Integer(1)]]);
+
+        let stager = stager.lock().expect("stager lock");
+        assert_eq!(stager.deltas.len(), 1);
+        let overlay = stager.deltas[0]
+            .pending_write_overlay()
+            .expect("staged delta should expose pending overlay");
+        assert!(overlay
+            .visible_semantic_rows(false, "lix_file_descriptor")
+            .is_empty());
+        let blob_ref_rows = overlay.visible_semantic_rows(false, "lix_binary_blob_ref");
+        assert_eq!(blob_ref_rows.len(), 1);
+        assert_eq!(blob_ref_rows[0].entity_id, "file-readme");
+        let snapshot: JsonValue =
+            serde_json::from_str(blob_ref_rows[0].snapshot_content.as_deref().unwrap())
+                .expect("blob ref snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["size_bytes"], 2);
+    }
+
+    #[tokio::test]
+    async fn execute_sql_update_file_rejects_path_assignment() {
         let blob_reader: Arc<dyn BlobDataReader> = Arc::new(DummyBlobReader);
         let live_state = Arc::new(RowsLiveStateContext {
             rows: vec![live_file_row(
@@ -1293,14 +1452,14 @@ mod tests {
 
         let error = execute_sql(
             &ctx,
-            "UPDATE lix_file SET data = X'4142' WHERE id = 'file-readme'",
+            "UPDATE lix_file SET path = '/docs/renamed.md' WHERE id = 'file-readme'",
             &[],
         )
         .await
-        .expect_err("data should remain read-only");
+        .expect_err("path should remain read-only");
 
         assert!(
-            error.description.contains("read-only column 'data'"),
+            error.description.contains("read-only column 'path'"),
             "unexpected error: {error:?}"
         );
         assert!(stager.lock().expect("stager lock").deltas.is_empty());
