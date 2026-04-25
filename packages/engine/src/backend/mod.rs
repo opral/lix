@@ -1,169 +1,23 @@
 mod ddl;
 mod image;
+mod kv;
 mod prepared;
+#[cfg(test)]
+pub(crate) mod testing;
 mod transaction_adapter;
 mod transaction_mode;
+mod types;
 
-use async_trait::async_trait;
-
-use crate::common::SqlDialect;
-use crate::{LixError, QueryResult, Value};
+pub(crate) use crate::common::SqlDialect;
 #[allow(unused_imports)]
 pub(crate) use ddl::{
     add_column_if_missing, add_column_if_missing_with_executor, execute_ddl_batch,
 };
 pub use image::{ImageChunkReader, ImageChunkWriter};
+pub use kv::{KvPair, KvScanRange};
 #[allow(unused_imports)]
 pub use prepared::{PreparedBatch, PreparedStatement};
 pub(crate) use transaction_adapter::TransactionBackendAdapter;
 pub use transaction_mode::TransactionBeginMode;
-
-#[async_trait]
-pub trait LixBackend: Send + Sync {
-    fn dialect(&self) -> SqlDialect;
-
-    /// Execute a single SQL statement on the connection.
-    ///
-    /// No automatic transaction wrapping. If no transaction is active,
-    /// the statement auto-commits (standard SQL behavior). If a transaction
-    /// IS active, the statement participates in it.
-    async fn execute(&self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
-
-    /// Begin a transaction using the requested mode.
-    ///
-    /// The returned handle holds exclusive access to the connection.
-    /// All SQL must go through the handle until commit/rollback.
-    async fn begin_transaction(
-        &self,
-        mode: TransactionBeginMode,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
-
-    /// Begin a named savepoint within an active transaction.
-    ///
-    /// Returns a handle that commits via `RELEASE SAVEPOINT`
-    /// and rolls back via `ROLLBACK TO SAVEPOINT`.
-    /// The caller provides the name.
-    async fn begin_savepoint(
-        &self,
-        name: &str,
-    ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError>;
-
-    /// Exports the current Lix database snapshot as a SQLite database file payload.
-    async fn export_image(&self, _writer: &mut dyn ImageChunkWriter) -> Result<(), LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "export_image is not supported by this backend".to_string(),
-            hint: None,
-        })
-    }
-
-    /// Restores backend state from a SQLite database file payload stream.
-    async fn restore_from_image(&self, _reader: &mut dyn ImageChunkReader) -> Result<(), LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "restore_from_image is not supported by this backend".to_string(),
-            hint: None,
-        })
-    }
-
-    /// Destroys the physical storage target represented by this backend.
-    ///
-    /// This is a persistence lifecycle operation, not a logical SQL operation.
-    ///
-    /// Callers should treat the backend as the authority for what constitutes
-    /// the full storage target. For example:
-    ///
-    /// - native SQLite may delete the main database file plus WAL/SHM sidecars
-    /// - wasm/opfs SQLite may clear the persisted OPFS target
-    /// - Postgres may drop or clear the configured schema/database target
-    ///
-    /// Callers must not attempt to infer or delete backend-owned physical
-    /// artifacts themselves.
-    ///
-    /// Implementations may choose not to support destroy if the backend
-    /// instance does not have enough information or authority to remove its
-    /// target.
-    async fn destroy(&self) -> Result<(), LixError> {
-        Err(LixError {
-            code: "LIX_ERROR_UNKNOWN".to_string(),
-            description: "destroy is not supported by this backend".to_string(),
-            hint: None,
-        })
-    }
-}
-
-#[async_trait]
-pub(crate) trait QueryExecutor: Send + Sync {
-    fn dialect(&self) -> SqlDialect;
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
-}
-
-#[async_trait]
-impl<T> QueryExecutor for &T
-where
-    T: LixBackend + ?Sized,
-{
-    fn dialect(&self) -> SqlDialect {
-        (*self).dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        (*self).execute(sql, params).await
-    }
-}
-
-#[async_trait]
-impl QueryExecutor for Box<dyn LixBackendTransaction + '_> {
-    fn dialect(&self) -> SqlDialect {
-        self.as_ref().dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        self.as_mut().execute(sql, params).await
-    }
-}
-
-#[async_trait]
-impl<T> QueryExecutor for &mut T
-where
-    T: LixBackendTransaction + ?Sized,
-{
-    fn dialect(&self) -> SqlDialect {
-        (**self).dialect()
-    }
-
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
-        (**self).execute(sql, params).await
-    }
-}
-
-#[async_trait]
-pub trait LixBackendTransaction: Send + Sync {
-    fn dialect(&self) -> SqlDialect;
-    fn mode(&self) -> TransactionBeginMode;
-
-    /// Executes one SQL statement inside the current transaction.
-    async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError>;
-
-    /// Executes one parameterized SQL batch inside the current transaction.
-    async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
-        let mut last_result = QueryResult {
-            rows: Vec::new(),
-            columns: Vec::new(),
-        };
-        for statement in &batch.steps {
-            last_result = self.execute(&statement.sql, &statement.params).await?;
-        }
-        Ok(last_result)
-    }
-
-    async fn commit(self: Box<Self>) -> Result<(), LixError>;
-
-    async fn rollback(self: Box<Self>) -> Result<(), LixError>;
-}
-
-pub(crate) fn transaction_backend_view(
-    transaction: &mut dyn LixBackendTransaction,
-) -> TransactionBackendAdapter<'_> {
-    TransactionBackendAdapter::new(transaction)
-}
+pub use types::{LixBackend, LixBackendTransaction};
+pub(crate) use types::{transaction_backend_view, QueryExecutor};
