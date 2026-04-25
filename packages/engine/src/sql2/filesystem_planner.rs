@@ -165,8 +165,15 @@ impl DirectoryPathResolver {
         directory_path: &str,
         context: FilesystemRowContext,
         hidden: bool,
+        generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<StateRow>, LixError> {
-        self.ensure_directory_path_with_leaf_id(directory_path, None, context, hidden)
+        self.ensure_directory_path_with_leaf_id(
+            directory_path,
+            None,
+            context,
+            hidden,
+            generate_directory_id,
+        )
     }
 
     pub(crate) fn ensure_directory_path_with_leaf_id(
@@ -175,6 +182,7 @@ impl DirectoryPathResolver {
         leaf_id: Option<String>,
         context: FilesystemRowContext,
         hidden: bool,
+        generate_directory_id: &mut dyn FnMut() -> String,
     ) -> Result<Vec<StateRow>, LixError> {
         let directory_path = normalize_directory_path(directory_path)?;
         if directory_path == "/" {
@@ -191,11 +199,9 @@ impl DirectoryPathResolver {
             }
 
             let id = if path == directory_path {
-                leaf_id
-                    .clone()
-                    .unwrap_or_else(|| auto_directory_id(&context.version_id, &path))
+                leaf_id.clone().unwrap_or_else(&mut *generate_directory_id)
             } else {
-                auto_directory_id(&context.version_id, &path)
+                generate_directory_id()
             };
             let parent_id = parent_directory_path(&path)
                 .and_then(|parent_path| self.directory_ids_by_path.get(&parent_path).cloned());
@@ -309,6 +315,7 @@ pub(crate) fn blob_ref_row(input: BlobRefRowInput) -> Result<StateRow, LixError>
 pub(crate) fn plan_file_path_write(
     resolver: &mut DirectoryPathResolver,
     input: FilePathWriteInput,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
     let parsed = ParsedFilePath::try_from_path(&input.path)?;
     let mut rows = Vec::new();
@@ -319,6 +326,7 @@ pub(crate) fn plan_file_path_write(
                 directory_path.as_str(),
                 input.context.clone(),
                 false,
+                generate_directory_id,
             )?);
             resolver
                 .directory_id(directory_path.as_str())?
@@ -371,6 +379,7 @@ pub(crate) fn plan_file_path_update(
     existing_hidden: bool,
     _existing_data: Option<Vec<u8>>,
     context: FilesystemRowContext,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<FilesystemWritePlan, LixError> {
     let parsed = ParsedFilePath::try_from_path(&new_path)?;
     let mut rows = Vec::new();
@@ -381,6 +390,7 @@ pub(crate) fn plan_file_path_update(
                 directory_path.as_str(),
                 context.clone(),
                 false,
+                generate_directory_id,
             )?);
             resolver
                 .directory_id(directory_path.as_str())?
@@ -574,10 +584,6 @@ fn tombstone_row(
     state_row(entity_id, schema_key, schema_version, None, context)
 }
 
-fn auto_directory_id(version_id: &str, path: &str) -> String {
-    format!("lix-auto-dir:{version_id}:{path}")
-}
-
 fn collect_recursive_directory_delete(
     directory_id: &str,
     visible_filesystem: &VisibleFilesystem,
@@ -636,6 +642,11 @@ mod tests {
     use crate::sql2::filesystem_visibility::{
         VisibleBlobRef, VisibleDirectory, VisibleFile, VisibleFilesystem,
     };
+
+    fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
+        let mut ids = ids.iter();
+        move || ids.next().expect("test id should exist").to_string()
+    }
 
     #[test]
     fn directory_descriptor_row_builds_state_row() {
@@ -713,6 +724,7 @@ mod tests {
                 "/docs/nested/",
                 FilesystemRowContext::active_version("version-a"),
                 false,
+                &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("directory path should plan");
 
@@ -720,12 +732,12 @@ mod tests {
         assert_eq!(resolver.directory_id("/docs/").unwrap(), Some("dir-docs"));
         assert_eq!(
             resolver.directory_id("/docs/nested/").unwrap(),
-            Some("lix-auto-dir:version-a:/docs/nested/")
+            Some("dir-generated-nested")
         );
 
         let snapshot: JsonValue =
             serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap()).unwrap();
-        assert_eq!(snapshot["id"], "lix-auto-dir:version-a:/docs/nested/");
+        assert_eq!(snapshot["id"], "dir-generated-nested");
         assert_eq!(snapshot["parent_id"], "dir-docs");
         assert_eq!(snapshot["name"], "nested");
     }
@@ -740,6 +752,7 @@ mod tests {
                 "/docs/",
                 FilesystemRowContext::active_version("version-a"),
                 false,
+                &mut test_id_generator(&["dir-generated-docs"]),
             )
             .expect("top-level directory should plan");
         assert_eq!(docs_rows.len(), 1);
@@ -749,14 +762,15 @@ mod tests {
                 "/docs/nested/",
                 FilesystemRowContext::active_version("version-a"),
                 false,
+                &mut test_id_generator(&["dir-generated-nested"]),
             )
             .expect("nested directory should plan");
 
         assert_eq!(nested_rows.len(), 1);
         let snapshot: JsonValue =
             serde_json::from_str(nested_rows[0].snapshot_content.as_deref().unwrap()).unwrap();
-        assert_eq!(snapshot["id"], "lix-auto-dir:version-a:/docs/nested/");
-        assert_eq!(snapshot["parent_id"], "lix-auto-dir:version-a:/docs/");
+        assert_eq!(snapshot["id"], "dir-generated-nested");
+        assert_eq!(snapshot["parent_id"], "dir-generated-docs");
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -771,13 +785,14 @@ mod tests {
                 Some("dir-nested".to_string()),
                 FilesystemRowContext::active_version("version-a"),
                 false,
+                &mut test_id_generator(&["dir-generated-docs"]),
             )
             .expect("directory path should plan");
 
         assert_eq!(rows.len(), 2);
         assert_eq!(
             resolver.directory_id("/docs/").unwrap(),
-            Some("lix-auto-dir:version-a:/docs/")
+            Some("dir-generated-docs")
         );
         assert_eq!(
             resolver.directory_id("/docs/nested/").unwrap(),
@@ -787,7 +802,7 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(rows[1].snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["id"], "dir-nested");
-        assert_eq!(snapshot["parent_id"], "lix-auto-dir:version-a:/docs/");
+        assert_eq!(snapshot["parent_id"], "dir-generated-docs");
         assert_eq!(snapshot["name"], "nested");
     }
 
@@ -801,6 +816,7 @@ mod tests {
                 "/docs/nested/",
                 FilesystemRowContext::active_version("version-a"),
                 false,
+                &mut test_id_generator(&["dir-generated-docs", "dir-generated-nested"]),
             )
             .expect("directory path should plan");
         assert_eq!(rows.len(), 2);
@@ -810,6 +826,7 @@ mod tests {
                 "/docs/nested/",
                 FilesystemRowContext::active_version("version-a"),
                 false,
+                &mut test_id_generator(&["should-not-be-used"]),
             )
             .expect("directory path should plan");
         assert!(rows.is_empty());
@@ -829,6 +846,7 @@ mod tests {
                 hidden: false,
                 context: FilesystemRowContext::active_version("version-a"),
             },
+            &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
         .expect("file path write should plan");
 
@@ -858,10 +876,7 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
         assert_eq!(snapshot["id"], "file-readme");
-        assert_eq!(
-            snapshot["directory_id"],
-            "lix-auto-dir:version-a:/docs/guides/"
-        );
+        assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme");
         assert_eq!(snapshot["extension"], "md");
     }
@@ -883,6 +898,7 @@ mod tests {
                 hidden: false,
                 context: FilesystemRowContext::active_version("version-a"),
             },
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("file path write should plan");
 
@@ -917,6 +933,7 @@ mod tests {
             false,
             Some(b"hello".to_vec()),
             FilesystemRowContext::active_version("version-a"),
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("file path update should plan");
 
@@ -949,6 +966,7 @@ mod tests {
             true,
             Some(b"hello".to_vec()),
             FilesystemRowContext::active_version("version-a"),
+            &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
         .expect("file path update should plan");
 
@@ -974,10 +992,7 @@ mod tests {
             .expect("file descriptor row should be planned");
         let snapshot: JsonValue =
             serde_json::from_str(file_row.snapshot_content.as_deref().unwrap()).unwrap();
-        assert_eq!(
-            snapshot["directory_id"],
-            "lix-auto-dir:version-a:/docs/guides/"
-        );
+        assert_eq!(snapshot["directory_id"], "dir-generated-guides");
         assert_eq!(snapshot["name"], "readme");
         assert_eq!(snapshot["extension"], "md");
         assert_eq!(snapshot["hidden"], true);

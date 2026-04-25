@@ -41,6 +41,22 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
                     .await
                     .expect("initialized backend should open a session");
 
+                let uuid_result = session
+                    .execute("SELECT lix_uuid_v7()", &[])
+                    .await
+                    .expect("session should expose lix_uuid_v7 UDF");
+                let ExecuteResult::Rows(uuid_rows) = uuid_result else {
+                    panic!("SELECT should return uuid rows");
+                };
+                assert_eq!(uuid_rows.len(), 1);
+                let Value::Text(uuid) = &uuid_rows.rows()[0].values()[0] else {
+                    panic!("lix_uuid_v7 should return text");
+                };
+                assert!(
+                    !uuid.is_empty(),
+                    "lix_uuid_v7 should return a non-empty UUID"
+                );
+
                 let insert_result = session
                     .execute(
                         "INSERT INTO lix_key_value (key, value) VALUES ('sql2-key', 'sql2-value')",
@@ -331,16 +347,7 @@ fn session_execute_inserts_file_then_reads_it_back() {
                     .execute(
                         "SELECT entity_id, schema_key \
                          FROM lix_state \
-                         WHERE schema_key IN (\
-                           'lix_directory_descriptor', \
-                           'lix_file_descriptor', \
-                           'lix_binary_blob_ref'\
-                         ) \
-                         AND entity_id IN (\
-                           'lix-auto-dir:global:/docs/', \
-                           'lix-auto-dir:global:/docs/guides/', \
-                           'file-readme'\
-                         ) \
+                         WHERE entity_id = 'file-readme' \
                          ORDER BY schema_key, entity_id",
                         &[],
                     )
@@ -352,8 +359,27 @@ fn session_execute_inserts_file_then_reads_it_back() {
                 };
                 assert_eq!(
                     staged_state_rows.len(),
-                    4,
-                    "file path insert should stage exactly two missing dirs, one file descriptor, and one blob ref"
+                    2,
+                    "file path insert should stage one file descriptor and one blob ref for the file"
+                );
+
+                let directory_result = session
+                    .execute(
+                        "SELECT path \
+                         FROM lix_directory \
+                         WHERE path IN ('/docs/', '/docs/guides/') \
+                         ORDER BY path",
+                        &[],
+                    )
+                    .await
+                    .expect("session directory read after file insert should succeed");
+                let ExecuteResult::Rows(directory_rows) = directory_result else {
+                    panic!("SELECT should return directory rows");
+                };
+                assert_eq!(
+                    directory_rows.len(),
+                    2,
+                    "file path insert should stage exactly the two missing parent directories"
                 );
 
                 drop(session);
@@ -442,16 +468,7 @@ fn session_execute_updates_file_path_and_preserves_data() {
                     .execute(
                         "SELECT entity_id, schema_key \
                          FROM lix_state \
-                         WHERE schema_key IN (\
-                           'lix_directory_descriptor', \
-                           'lix_file_descriptor', \
-                           'lix_binary_blob_ref'\
-                         ) \
-                         AND entity_id IN (\
-                           'lix-auto-dir:global:/docs/', \
-                           'lix-auto-dir:global:/docs/guides/', \
-                           'file-readme'\
-                         ) \
+                         WHERE entity_id = 'file-readme' \
                          ORDER BY schema_key, entity_id",
                         &[],
                     )
@@ -462,8 +479,8 @@ fn session_execute_updates_file_path_and_preserves_data() {
                 };
                 assert_eq!(
                     state_rows.len(),
-                    4,
-                    "path update should reuse existing /docs/, keep /docs/guides/ visible, update one file descriptor, and preserve one blob ref"
+                    2,
+                    "path update should update one file descriptor and preserve one blob ref"
                 );
 
                 let directory_result = session
@@ -534,6 +551,31 @@ fn session_execute_deletes_directory_recursively() {
                     .expect("session file insert should succeed");
                 assert_eq!(file_result, ExecuteResult::AffectedRows(1));
 
+                let directory_ids_result = session
+                    .execute(
+                        "SELECT id \
+                         FROM lix_directory \
+                         WHERE path IN ('/docs/', '/docs/guides/') \
+                         ORDER BY path",
+                        &[],
+                    )
+                    .await
+                    .expect("session directory id read before delete should succeed");
+                let ExecuteResult::Rows(directory_id_rows) = directory_ids_result else {
+                    panic!("SELECT should return directory id rows");
+                };
+                assert_eq!(directory_id_rows.len(), 2);
+                let directory_ids = directory_id_rows
+                    .rows()
+                    .iter()
+                    .map(|row| {
+                        let Value::Text(id) = &row.values()[0] else {
+                            panic!("directory id should be text");
+                        };
+                        id.clone()
+                    })
+                    .collect::<Vec<_>>();
+
                 let delete_result = session
                     .execute("DELETE FROM lix_directory WHERE path = '/docs/'", &[])
                     .await
@@ -579,19 +621,17 @@ fn session_execute_deletes_directory_recursively() {
 
                 let state_result = session
                     .execute(
-                        "SELECT entity_id, schema_key \
+                        &format!(
+                            "SELECT entity_id, schema_key \
                          FROM lix_state \
-                         WHERE schema_key IN (\
-                           'lix_directory_descriptor', \
-                           'lix_file_descriptor', \
-                           'lix_binary_blob_ref'\
-                         ) \
-                         AND entity_id IN (\
-                           'lix-auto-dir:global:/docs/', \
-                           'lix-auto-dir:global:/docs/guides/', \
+                         WHERE entity_id IN (\
+                           '{}', \
+                           '{}', \
                            'file-readme'\
                          ) \
                          ORDER BY schema_key, entity_id",
+                            directory_ids[0], directory_ids[1]
+                        ),
                         &[],
                     )
                     .await

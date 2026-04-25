@@ -5,6 +5,9 @@ use serde_json::Value as JsonValue;
 
 use crate::binary_cas::BlobDataReader;
 use crate::engine2::schema_registry::SchemaRegistry;
+use crate::functions::{
+    DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+};
 use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
@@ -19,6 +22,7 @@ pub struct Session {
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
     schema_registry: Arc<SchemaRegistry>,
+    functions: DynFunctionProvider,
 }
 
 impl Session {
@@ -47,6 +51,13 @@ impl Session {
             backend,
             committed_live_state,
             schema_registry,
+            // The session owns the function source so reads, writes, UDFs, and
+            // provider-side staging can share one execution lineage.
+            // TODO(engine2): replace the system provider with runtime-bound or
+            // deterministic bindings when engine2 owns that boot layer.
+            functions: SharedFunctionProvider::new(
+                Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+            ),
         }
     }
 
@@ -60,6 +71,7 @@ struct SessionSqlExecutionContext<'a> {
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
     visible_schemas: Vec<JsonValue>,
+    functions: DynFunctionProvider,
 }
 
 impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
@@ -70,6 +82,10 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
     fn live_state(&self) -> Arc<dyn LiveStateContext> {
         let live_state: Arc<dyn LiveStateContext> = self.committed_live_state.clone();
         live_state
+    }
+
+    fn functions(&self) -> DynFunctionProvider {
+        self.functions.clone()
     }
 
     fn blob_reader(&self) -> Arc<dyn BlobDataReader> {

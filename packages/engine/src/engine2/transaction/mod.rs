@@ -8,6 +8,7 @@ use crate::binary_cas::BlobDataReader;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
+use crate::functions::DynFunctionProvider;
 use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::{SqlExecutionContext, SqlWriteStager};
 use crate::transaction::TransactionCommitOutcome;
@@ -30,6 +31,7 @@ pub(crate) struct Transaction<'a> {
     staged_writes: Arc<TransactionStagedWrites>,
     backend_transaction: Box<dyn LixBackendTransaction + 'a>,
     visible_schemas: Vec<JsonValue>,
+    functions: DynFunctionProvider,
 }
 
 impl<'a> Transaction<'a> {
@@ -40,8 +42,9 @@ impl<'a> Transaction<'a> {
         backend: &'a Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
         schema_registry: Arc<SchemaRegistry>,
+        functions: DynFunctionProvider,
     ) -> Result<Self, LixError> {
-        let staged_writes = Arc::new(TransactionStagedWrites::default());
+        let staged_writes = Arc::new(TransactionStagedWrites::new(functions.clone()));
         let live_state = transaction_live_state(
             Arc::clone(&committed_live_state),
             Arc::clone(&staged_writes),
@@ -59,6 +62,7 @@ impl<'a> Transaction<'a> {
             staged_writes,
             backend_transaction,
             visible_schemas,
+            functions,
         })
     }
 
@@ -99,6 +103,11 @@ impl SqlExecutionContext for Transaction<'_> {
             Arc::clone(&self.staged_writes),
         )
         .expect("engine2 transaction should build staging overlay")
+    }
+
+    /// Returns the same function provider used by the owning session.
+    fn functions(&self) -> DynFunctionProvider {
+        self.functions.clone()
     }
 
     /// Provides blob reads for file/data surfaces during SQL execution.

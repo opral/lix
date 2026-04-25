@@ -27,6 +27,7 @@ use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
 use crate::binary_cas::BlobDataReader;
+use crate::functions::DynFunctionProvider;
 use crate::live_state::{
     LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
@@ -54,6 +55,7 @@ pub(crate) async fn register_lix_file_providers(
     live_state: Arc<dyn LiveStateContext>,
     blob_reader: Arc<dyn BlobDataReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
+    functions: DynFunctionProvider,
     history: Option<Arc<dyn HistoryContext>>,
 ) -> Result<(), LixError> {
     session
@@ -63,6 +65,7 @@ pub(crate) async fn register_lix_file_providers(
                 Arc::clone(&live_state),
                 Arc::clone(&blob_reader),
                 write_stager.as_ref().map(Arc::clone),
+                functions.clone(),
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -74,6 +77,7 @@ pub(crate) async fn register_lix_file_providers(
                 live_state,
                 Arc::clone(&blob_reader),
                 write_stager,
+                functions,
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -109,6 +113,7 @@ pub(crate) struct LixFileProvider {
     live_state: Arc<dyn LiveStateContext>,
     blob_reader: Arc<dyn BlobDataReader>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
+    functions: DynFunctionProvider,
     default_version_id: Option<String>,
 }
 
@@ -124,12 +129,14 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateContext>,
         blob_reader: Arc<dyn BlobDataReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
+        functions: DynFunctionProvider,
     ) -> Self {
         Self {
             schema: lix_file_schema(),
             live_state,
             blob_reader,
             write_stager,
+            functions,
             default_version_id: Some(active_version_id.into()),
         }
     }
@@ -138,12 +145,14 @@ impl LixFileProvider {
         live_state: Arc<dyn LiveStateContext>,
         blob_reader: Arc<dyn BlobDataReader>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
+        functions: DynFunctionProvider,
     ) -> Self {
         Self {
             schema: lix_file_by_version_schema(),
             live_state,
             blob_reader,
             write_stager,
+            functions,
             default_version_id: None,
         }
     }
@@ -286,6 +295,7 @@ impl TableProvider for LixFileProvider {
             input.schema(),
             Arc::clone(&self.live_state),
             Arc::clone(write_stager),
+            self.functions.clone(),
             self.default_version_id.clone(),
         );
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
@@ -356,6 +366,7 @@ impl TableProvider for LixFileProvider {
             Arc::clone(write_stager),
             Arc::clone(&self.schema),
             self.default_version_id.clone(),
+            self.functions.clone(),
             request,
             physical_assignments,
             physical_filters,
@@ -367,6 +378,7 @@ struct LixFileInsertSink {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateContext>,
     write_stager: Arc<dyn SqlWriteStager>,
+    functions: DynFunctionProvider,
     default_version_id: Option<String>,
 }
 
@@ -381,12 +393,14 @@ impl LixFileInsertSink {
         schema: SchemaRef,
         live_state: Arc<dyn LiveStateContext>,
         write_stager: Arc<dyn SqlWriteStager>,
+        functions: DynFunctionProvider,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
             schema,
             live_state,
             write_stager,
+            functions,
             default_version_id,
         }
     }
@@ -441,6 +455,7 @@ impl DataSink for LixFileInsertSink {
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
+                    &mut || self.functions.call_uuid_v7(),
                 )?);
             } else {
                 staged.extend(lix_file_insert_stage_from_batch(
@@ -628,6 +643,7 @@ struct LixFileUpdateExec {
     write_stager: Arc<dyn SqlWriteStager>,
     table_schema: SchemaRef,
     default_version_id: Option<String>,
+    functions: DynFunctionProvider,
     request: LiveStateScanRequest,
     assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
     filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -648,6 +664,7 @@ impl LixFileUpdateExec {
         write_stager: Arc<dyn SqlWriteStager>,
         table_schema: SchemaRef,
         default_version_id: Option<String>,
+        functions: DynFunctionProvider,
         request: LiveStateScanRequest,
         assignments: Vec<(String, Arc<dyn PhysicalExpr>)>,
         filters: Vec<Arc<dyn PhysicalExpr>>,
@@ -665,6 +682,7 @@ impl LixFileUpdateExec {
             write_stager,
             table_schema,
             default_version_id,
+            functions,
             request,
             assignments,
             filters,
@@ -735,6 +753,7 @@ impl ExecutionPlan for LixFileUpdateExec {
         let write_stager = Arc::clone(&self.write_stager);
         let table_schema = Arc::clone(&self.table_schema);
         let default_version_id = self.default_version_id.clone();
+        let functions = self.functions.clone();
         let request = self.request.clone();
         let assignments = self.assignments.clone();
         let filters = self.filters.clone();
@@ -771,6 +790,7 @@ impl ExecutionPlan for LixFileUpdateExec {
                 default_version_id.as_deref(),
                 update_columns,
                 path_resolvers.as_mut(),
+                &mut || functions.call_uuid_v7(),
             )?;
             let count = staged.count;
 
@@ -1659,6 +1679,7 @@ fn lix_file_insert_stage_from_batch_with_path_resolvers(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
     lix_file_stage_from_batch_with_options_and_path_resolvers(
         batch,
@@ -1667,6 +1688,7 @@ fn lix_file_insert_stage_from_batch_with_path_resolvers(
         true,
         true,
         Some(path_resolvers),
+        Some(generate_directory_id),
     )
 }
 
@@ -1742,6 +1764,7 @@ fn lix_file_update_stage_from_batch(
     default_version_id: Option<&str>,
     update_columns: LixFileUpdateColumns,
     path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
     if update_columns.path {
         let Some(path_resolvers) = path_resolvers else {
@@ -1754,6 +1777,7 @@ fn lix_file_update_stage_from_batch(
             default_version_id,
             update_columns,
             path_resolvers,
+            generate_directory_id,
         )
     } else {
         lix_file_existing_stage_from_batch(
@@ -1770,6 +1794,7 @@ fn lix_file_path_update_stage_from_batch(
     default_version_id: Option<&str>,
     update_columns: LixFileUpdateColumns,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
 
@@ -1790,6 +1815,7 @@ fn lix_file_path_update_stage_from_batch(
             hidden,
             existing_data.clone(),
             context.clone(),
+            generate_directory_id,
         )
         .map_err(lix_error_to_datafusion_error)?;
         staged.extend_filesystem_plan(plan);
@@ -1818,6 +1844,7 @@ fn lix_file_stage_from_batch_with_options(
         include_descriptor_writes,
         include_data_writes,
         None,
+        None,
     )
 }
 
@@ -1828,6 +1855,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
     include_descriptor_writes: bool,
     include_data_writes: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
+    mut generate_directory_id: Option<&mut dyn FnMut() -> String>,
 ) -> Result<LixFileStagedBatch> {
     let mut staged = LixFileStagedBatch::default();
 
@@ -1864,6 +1892,11 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
             let resolver = path_resolvers
                 .entry(file_path_resolver_key(&context))
                 .or_insert_with(DirectoryPathResolver::default);
+            let Some(generate_directory_id) = generate_directory_id.as_deref_mut() else {
+                return Err(DataFusionError::Execution(
+                    "INSERT into lix_file with path requires directory id generator".to_string(),
+                ));
+            };
             let plan = super::filesystem_planner::plan_file_path_write(
                 resolver,
                 FilePathWriteInput {
@@ -1873,6 +1906,7 @@ fn lix_file_stage_from_batch_with_options_and_path_resolvers(
                     hidden,
                     context,
                 },
+                generate_directory_id,
             )
             .map_err(lix_error_to_datafusion_error)?;
             staged.extend_filesystem_plan(plan);
@@ -2585,6 +2619,9 @@ mod tests {
     use futures_util::stream;
     use serde_json::Value as JsonValue;
 
+    use crate::functions::{
+        DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
     use crate::LixError;
@@ -2594,6 +2631,17 @@ mod tests {
         lix_file_insert_stage_from_batch, lix_file_insert_stage_from_batch_with_path_resolvers,
         lix_file_write_rows_from_batch, DirectoryDescriptorRecord, LixFileInsertSink,
     };
+
+    fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
+        let mut ids = ids.iter();
+        move || ids.next().expect("test id should exist").to_string()
+    }
+
+    fn test_functions() -> DynFunctionProvider {
+        SharedFunctionProvider::new(
+            Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+        )
+    }
 
     #[derive(Default)]
     struct CapturingWriteStager {
@@ -2863,6 +2911,7 @@ mod tests {
                 descriptor: false,
             },
             Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("decode file path update");
 
@@ -2905,6 +2954,7 @@ mod tests {
                 descriptor: false,
             },
             Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("decode file path update");
 
@@ -2945,6 +2995,7 @@ mod tests {
                 descriptor: false,
             },
             Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("decode file path update");
 
@@ -2981,6 +3032,7 @@ mod tests {
                 descriptor: false,
             },
             Some(&mut resolvers),
+            &mut test_id_generator(&["dir-generated-docs"]),
         )
         .expect("decode file path update");
 
@@ -3000,7 +3052,7 @@ mod tests {
             .iter()
             .find(|row| row.schema_key == "lix_directory_descriptor")
             .expect("missing /docs/ directory should be staged");
-        assert_eq!(directory.entity_id, "lix-auto-dir:version-b:/docs/");
+        assert_eq!(directory.entity_id, "dir-generated-docs");
 
         let descriptor = staged
             .state_rows
@@ -3010,7 +3062,7 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
-        assert_eq!(snapshot["directory_id"], "lix-auto-dir:version-b:/docs/");
+        assert_eq!(snapshot["directory_id"], "dir-generated-docs");
     }
 
     #[test]
@@ -3034,6 +3086,7 @@ mod tests {
                 descriptor: false,
             },
             Some(&mut resolvers),
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("decode file path and data update");
 
@@ -3062,6 +3115,7 @@ mod tests {
                 descriptor: false,
             },
             None,
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("decode file data update");
 
@@ -3157,6 +3211,7 @@ mod tests {
             &path_data_insert_batch(),
             None,
             &mut resolvers,
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("decode file path data");
 
@@ -3186,6 +3241,7 @@ mod tests {
             &path_data_insert_batch(),
             None,
             &mut resolvers,
+            &mut test_id_generator(&["dir-generated-docs", "dir-generated-guides"]),
         )
         .expect("decode file path data");
 
@@ -3206,10 +3262,7 @@ mod tests {
         let snapshot: JsonValue =
             serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
                 .expect("descriptor snapshot JSON");
-        assert_eq!(
-            snapshot["directory_id"],
-            "lix-auto-dir:version-b:/docs/guides/"
-        );
+        assert_eq!(snapshot["directory_id"], "dir-generated-guides");
     }
 
     #[tokio::test]
@@ -3220,6 +3273,7 @@ mod tests {
             batch.schema(),
             Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            test_functions(),
             None,
         );
 
@@ -3249,6 +3303,7 @@ mod tests {
             batch.schema(),
             Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            test_functions(),
             None,
         );
 
@@ -3303,6 +3358,7 @@ mod tests {
                 ],
             }) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            test_functions(),
             None,
         );
 

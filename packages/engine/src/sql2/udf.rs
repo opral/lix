@@ -14,7 +14,17 @@ use datafusion::logical_expr::{
 };
 use serde_json::Value as JsonValue;
 
-pub(crate) fn register_sql2_udfs(ctx: &SessionContext) {
+use crate::functions::{
+    DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+};
+
+pub(crate) fn system_sql2_function_provider() -> DynFunctionProvider {
+    SharedFunctionProvider::new(
+        Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+    )
+}
+
+pub(crate) fn register_sql2_udfs(ctx: &SessionContext, functions: DynFunctionProvider) {
     ctx.register_udf(ScalarUDF::from(LixJsonExtract::new(
         "lix_json_extract",
         JsonExtractMode::Text,
@@ -41,6 +51,7 @@ pub(crate) fn register_sql2_udfs(ctx: &SessionContext) {
     )));
     ctx.register_udf(ScalarUDF::from(LixJson));
     ctx.register_udf(ScalarUDF::from(LixEmptyBlob));
+    ctx.register_udf(ScalarUDF::from(LixUuidV7 { functions }));
 }
 
 pub(crate) fn lix_json_extract_text_expr(json_expr: Expr, property_name: &str) -> Expr {
@@ -368,6 +379,60 @@ impl ScalarUDFImpl for LixEmptyBlob {
 
     fn invoke_with_args(&self, _args: ScalarFunctionArgs) -> Result<ColumnarValue> {
         Ok(ColumnarValue::Scalar(ScalarValue::Binary(Some(Vec::new()))))
+    }
+}
+
+#[derive(Clone)]
+struct LixUuidV7 {
+    functions: DynFunctionProvider,
+}
+
+impl PartialEq for LixUuidV7 {
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LixUuidV7 {}
+
+impl std::hash::Hash for LixUuidV7 {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.name().hash(state);
+    }
+}
+
+impl std::fmt::Debug for LixUuidV7 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LixUuidV7").finish()
+    }
+}
+
+impl ScalarUDFImpl for LixUuidV7 {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn name(&self) -> &str {
+        "lix_uuid_v7"
+    }
+
+    fn signature(&self) -> &Signature {
+        static SIGNATURE: std::sync::LazyLock<Signature> =
+            std::sync::LazyLock::new(|| Signature::nullary(Volatility::Volatile));
+        &SIGNATURE
+    }
+
+    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
+        Ok(DataType::Utf8)
+    }
+
+    fn invoke_with_args(&self, args: ScalarFunctionArgs) -> Result<ColumnarValue> {
+        if !args.args.is_empty() {
+            return plan_err!("lix_uuid_v7 requires no arguments");
+        }
+        Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(
+            self.functions.call_uuid_v7(),
+        ))))
     }
 }
 
