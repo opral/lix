@@ -217,6 +217,8 @@ pub struct ExactRowRequest {
     pub entity_id: String,
     #[serde(default)]
     pub file_id: NullableKeyFilter<String>,
+    #[serde(default)]
+    pub untracked: bool,
 }
 
 #[cfg(test)]

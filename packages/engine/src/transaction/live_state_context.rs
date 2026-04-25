@@ -280,6 +280,7 @@ mod tests {
                 version_id: "version-a".to_string(),
                 entity_id: "entity-1".to_string(),
                 file_id: NullableKeyFilter::Null,
+                untracked: false,
             })
             .await
             .expect("transaction live-state exact load should succeed")

@@ -86,6 +86,7 @@ pub(crate) async fn resolve_effective_row(
                                     version_id: request.version_id.clone(),
                                     entity_id: request.entity_id.clone(),
                                     file_id: request.file_id.clone(),
+                                    untracked: false,
                                 },
                             ),
                             required_columns: Vec::new(),

@@ -223,6 +223,7 @@ pub(crate) async fn load_version_head_commit_id_with_pending_overlay(
             version_id: version_ref_storage_version_id().to_string(),
             entity_id: version_id.to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         },
     )
     .await?

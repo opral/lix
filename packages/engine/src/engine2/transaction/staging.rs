@@ -107,19 +107,17 @@ impl StagedStateRowOverlay {
 
     /// Returns a staged exact-row answer, if this transaction has one.
     pub(crate) fn load_exact(&self, request: &ExactRowRequest) -> Option<StagedExactRow> {
-        self.rows
-            .values()
-            .find(|row| staged_row_matches_exact(row, request))
-            .map(|row| {
-                if row.snapshot_content.is_none() {
-                    StagedExactRow::Tombstone
-                } else {
-                    StagedExactRow::Row(
-                        live_row_from_state_row_ref(row)
-                            .expect("engine2 staged rows should already be normalized"),
-                    )
-                }
-            })
+        let identity = StagedStateRowIdentity::from_exact_request(request)?;
+        self.rows.get(&identity).map(|row| {
+            if row.snapshot_content.is_none() {
+                StagedExactRow::Tombstone
+            } else {
+                StagedExactRow::Row(
+                    live_row_from_state_row_ref(row)
+                        .expect("engine2 staged rows should already be normalized"),
+                )
+            }
+        })
     }
 }
 
@@ -156,6 +154,22 @@ impl StagedStateRowIdentity {
             file_id: row.file_id.clone(),
             version_id: row.version_id.clone(),
         }
+    }
+
+    fn from_exact_request(request: &ExactRowRequest) -> Option<Self> {
+        let file_id = match &request.file_id {
+            NullableKeyFilter::Null => None,
+            NullableKeyFilter::Value(value) => Some(value.clone()),
+            // Exact overlay lookup requires a concrete row identity.
+            NullableKeyFilter::Any => return None,
+        };
+        Some(Self {
+            untracked: request.untracked,
+            schema_key: request.schema_key.clone(),
+            entity_id: request.entity_id.clone(),
+            file_id,
+            version_id: request.version_id.clone(),
+        })
     }
 }
 
@@ -269,13 +283,6 @@ fn staged_row_identity_matches_scan(row: &StateRow, request: &LiveStateScanReque
         && nullable_key_matches_filters(&row.plugin_key, &request.filter.plugin_keys)
 }
 
-fn staged_row_matches_exact(row: &StateRow, request: &ExactRowRequest) -> bool {
-    row.schema_key == request.schema_key
-        && row.version_id == request.version_id
-        && row.entity_id == request.entity_id
-        && nullable_key_matches_filter(&row.file_id, &request.file_id)
-}
-
 fn nullable_key_matches_filters(
     value: &Option<String>,
     filters: &[NullableKeyFilter<String>],
@@ -322,6 +329,7 @@ mod tests {
                 version_id: "global".to_string(),
                 entity_id: "sql2-duplicate-key".to_string(),
                 file_id: NullableKeyFilter::Null,
+                untracked: true,
             })
             .expect("staged row should be visible");
 
@@ -530,6 +538,7 @@ mod tests {
             version_id: "global".to_string(),
             entity_id: key.to_string(),
             file_id: NullableKeyFilter::Null,
+            untracked: true,
         }
     }
 
