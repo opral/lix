@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::Session;
 use crate::live_state::CommittedLiveStateContext;
 use crate::{LixBackend, LixError};
@@ -8,6 +9,7 @@ use crate::{LixBackend, LixError};
 pub struct Engine {
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    schema_registry: Arc<SchemaRegistry>,
 }
 
 impl Engine {
@@ -45,6 +47,7 @@ impl Engine {
         Ok(Self {
             backend,
             committed_live_state,
+            schema_registry: Arc::new(SchemaRegistry::new()),
         })
     }
 
@@ -60,6 +63,7 @@ impl Engine {
             active_version_id.into(),
             self.backend(),
             Arc::clone(&self.committed_live_state),
+            Arc::clone(&self.schema_registry),
         )
         .await
     }

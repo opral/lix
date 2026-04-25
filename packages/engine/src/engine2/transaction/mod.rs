@@ -5,6 +5,7 @@ use serde_json::Value as JsonValue;
 
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
 use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
@@ -28,6 +29,7 @@ pub(crate) struct Transaction<'a> {
     committed_live_state: Arc<CommittedLiveStateContext>,
     staged_writes: Arc<TransactionStagedWrites>,
     backend_transaction: Box<dyn LixBackendTransaction + 'a>,
+    visible_schemas: Vec<JsonValue>,
 }
 
 impl<'a> Transaction<'a> {
@@ -37,7 +39,16 @@ impl<'a> Transaction<'a> {
         active_version_id: String,
         backend: &'a Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
+        schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
+        let staged_writes = Arc::new(TransactionStagedWrites::default());
+        let live_state = transaction_live_state(
+            Arc::clone(&committed_live_state),
+            Arc::clone(&staged_writes),
+        )?;
+        let visible_schemas = schema_registry
+            .visible_schemas(live_state, &active_version_id)
+            .await?;
         let backend_transaction = backend
             .begin_transaction(TransactionBeginMode::Write)
             .await?;
@@ -45,8 +56,9 @@ impl<'a> Transaction<'a> {
             active_version_id,
             backend,
             committed_live_state,
-            staged_writes: Arc::new(TransactionStagedWrites::default()),
+            staged_writes,
             backend_transaction,
+            visible_schemas,
         })
     }
 
@@ -82,12 +94,11 @@ impl SqlExecutionContext for Transaction<'_> {
     /// Returns committed live state with this transaction's staged rows
     /// overlaid on top.
     fn live_state(&self) -> Arc<dyn LiveStateContext> {
-        let staged = self
-            .staged_writes
-            .staging_overlay()
-            .expect("engine2 transaction should build staging overlay");
-        let committed: Arc<dyn LiveStateContext> = self.committed_live_state.clone();
-        Arc::new(TransactionLiveStateContext::new(committed, staged))
+        transaction_live_state(
+            Arc::clone(&self.committed_live_state),
+            Arc::clone(&self.staged_writes),
+        )
+        .expect("engine2 transaction should build staging overlay")
     }
 
     /// Provides blob reads for file/data surfaces during SQL execution.
@@ -101,19 +112,23 @@ impl SqlExecutionContext for Transaction<'_> {
         Some(Arc::clone(&self.staged_writes) as Arc<dyn SqlWriteStager>)
     }
 
-    /// Lists visible schemas for SQL surface registration.
-    ///
-    /// This is still a bootstrap implementation until engine2 owns the real
-    /// schema registry context.
+    /// Returns the transaction-scoped schema snapshot for SQL surface
+    /// registration.
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
         let _ = version_id;
-        // TODO(engine2): replace this hardcoded bootstrap schema with an
-        // engine2-owned schema registry shared with the read-only session
-        // context.
-        let key_value_schema = crate::schema::builtin_schema_definition("lix_key_value")
-            .ok_or_else(|| LixError::unknown("missing builtin lix_key_value schema"))?;
-        Ok(vec![key_value_schema.clone()])
+        Ok(self.visible_schemas.clone())
     }
+}
+
+fn transaction_live_state(
+    committed_live_state: Arc<CommittedLiveStateContext>,
+    staged_writes: Arc<TransactionStagedWrites>,
+) -> Result<Arc<dyn LiveStateContext>, LixError> {
+    let staged = staged_writes.staging_overlay()?;
+    let committed: Arc<dyn LiveStateContext> = committed_live_state;
+    Ok(Arc::new(TransactionLiveStateContext::new(
+        committed, staged,
+    )))
 }
 
 struct TransactionBackendBlobReader(Arc<dyn LixBackend + Send + Sync>);

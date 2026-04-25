@@ -80,6 +80,95 @@ fn session_execute_inserts_key_value_then_reads_it_back() {
         .expect("sql2 test thread panicked");
 }
 
+#[test]
+fn session_execute_registers_schema_then_writes_lix_state_row() {
+    std::thread::Builder::new()
+        .name("sql2_registered_schema_lix_state_roundtrip".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("failed to build tokio runtime");
+            runtime.block_on(async {
+                let sqlite_uri = shared_memory_sqlite_uri("registered_schema_lix_state");
+                let initializer = Lix::boot(LixConfig::new(
+                    Box::new(SqliteBackend::new(sqlite_uri.clone())),
+                    Arc::new(NoopWasmRuntime),
+                ));
+                initializer
+                    .initialize()
+                    .await
+                    .expect("backend initialization should succeed");
+
+                let engine = Engine::new(Box::new(SqliteBackend::new(sqlite_uri)))
+                    .await
+                    .expect("initialized backend should create an engine");
+                let session = engine
+                    .open_session("global")
+                    .await
+                    .expect("initialized backend should open a session");
+
+                let register_schema_result = session
+                    .execute(
+                        "INSERT INTO lix_registered_schema (value, lixcol_global, lixcol_untracked) \
+                         VALUES (\
+                         lix_json('{\"x-lix-key\":\"engine2_dummy_schema\",\"x-lix-version\":\"1\",\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"string\"},\"name\":{\"type\":\"string\"}},\"required\":[\"id\",\"name\"],\"additionalProperties\":false}'),\
+                         true,\
+                         true\
+                         )",
+                        &[],
+                    )
+                    .await
+                    .expect("session registered schema insert should succeed");
+                assert_eq!(register_schema_result, ExecuteResult::AffectedRows(1));
+
+                let insert_state_result = session
+                    .execute(
+                        "INSERT INTO lix_state (\
+                         entity_id, schema_key, file_id, plugin_key, snapshot_content, schema_version, global, untracked\
+                         ) VALUES (\
+                         'dummy-1', 'engine2_dummy_schema', NULL, NULL, lix_json('{\"id\":\"dummy-1\",\"name\":\"Dummy\"}'), '1', true, true\
+                         )",
+                        &[],
+                    )
+                    .await
+                    .expect("session lix_state insert for registered schema should succeed");
+                assert_eq!(insert_state_result, ExecuteResult::AffectedRows(1));
+
+                let result = session
+                    .execute(
+                        "SELECT entity_id, schema_key, snapshot_content \
+                         FROM lix_state \
+                         WHERE schema_key = 'engine2_dummy_schema' AND entity_id = 'dummy-1'",
+                        &[],
+                    )
+                    .await
+                    .expect("session lix_state read should succeed");
+
+                let ExecuteResult::Rows(row_set) = result else {
+                    panic!("SELECT should return rows");
+                };
+                assert_eq!(row_set.len(), 1);
+                assert_eq!(
+                    row_set.rows()[0].values(),
+                    &[
+                        Value::Text("dummy-1".to_string()),
+                        Value::Text("engine2_dummy_schema".to_string()),
+                        Value::Text("{\"id\":\"dummy-1\",\"name\":\"Dummy\"}".to_string()),
+                    ]
+                );
+
+                drop(session);
+                drop(engine);
+                drop(initializer);
+            });
+        })
+        .expect("failed to spawn sql2 registered schema test thread")
+        .join()
+        .expect("sql2 registered schema test thread panicked");
+}
+
 fn shared_memory_sqlite_uri(label: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)

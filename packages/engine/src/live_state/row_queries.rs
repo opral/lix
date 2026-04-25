@@ -28,7 +28,7 @@ use super::untracked::{
 use super::{
     load_exact_tracked_row_with_backend, load_exact_tracked_tombstone_with_executor,
     load_exact_untracked_row_with_executor, scan_tracked_rows_with_backend,
-    scan_tracked_tombstones_with_executor, LiveWriteOperation, LiveWriteRow,
+    scan_tracked_tombstones_with_executor, LiveWriteOperation, LiveWriteRow, SchemaRegistration,
 };
 use crate::schema::{schema_key_from_definition, SchemaKey};
 use crate::version::GLOBAL_VERSION_ID;
@@ -228,6 +228,8 @@ pub(crate) async fn write_live_rows(
     transaction: LiveStateTransactionRef<'_>,
     rows: &[LiveRow],
 ) -> Result<(), LixError> {
+    ensure_registered_schema_storage_in_transaction(transaction, rows).await?;
+
     let (tracked, untracked) = partition_live_rows_for_write(rows)?;
 
     if !tracked.is_empty() {
@@ -235,6 +237,43 @@ pub(crate) async fn write_live_rows(
     }
     if !untracked.is_empty() {
         apply_untracked_write_batch_in_transaction(transaction, &untracked).await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_registered_schema_storage_in_transaction(
+    transaction: LiveStateTransactionRef<'_>,
+    rows: &[LiveRow],
+) -> Result<(), LixError> {
+    for row in rows {
+        if row.schema_key != "lix_registered_schema" {
+            continue;
+        }
+
+        // Keep registered-schema physical storage owned by live_state. Writers
+        // only submit semantic rows; live_state decides which backing tables and
+        // layout mirrors must exist before those rows are materialized.
+        if let Some((key, schema)) = decode_registered_schema_row(row)? {
+            crate::live_state::register_schema_in_transaction(
+                transaction,
+                SchemaRegistration::with_schema_definition(key.schema_key, schema),
+            )
+            .await?;
+        }
+
+        // The layout compiler still uses this bootstrap mirror while live_state
+        // storage is SQL-backed. Keep it synchronized at the semantic write
+        // boundary instead of requiring callers to know about it.
+        //
+        // TODO(live_state): collapse the bootstrap mirror into the normal
+        // registered-schema live table once layout lookup no longer needs a
+        // separate storage index.
+        crate::live_state::storage::upsert_registered_schema_bootstrap_row_in_transaction(
+            transaction,
+            row,
+        )
+        .await?;
     }
 
     Ok(())
