@@ -25,7 +25,6 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::binary_cas::BlobDataReader;
 use crate::live_state::{
@@ -35,7 +34,6 @@ use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 const FILE_DESCRIPTOR_SCHEMA_KEY: &str = "lix_file_descriptor";
-const FILE_DESCRIPTOR_SCHEMA_VERSION: &str = "1";
 const BLOB_REF_SCHEMA_KEY: &str = "lix_binary_blob_ref";
 const DIRECTORY_DESCRIPTOR_SCHEMA_KEY: &str = "lix_directory_descriptor";
 
@@ -44,6 +42,11 @@ use crate::history::{
 };
 
 use super::execute::{FileDataWrite, HistoryContext, SqlWriteIntent, SqlWriteStager, StateRow};
+use super::filesystem_planner::{
+    blob_ref_row, directory_path_resolvers_from_state_rows, file_descriptor_row, plan_file_delete,
+    plan_file_path_update, BlobRefRowInput, DirectoryPathResolver, FileDeleteInput,
+    FileDescriptorRowInput, FilePathWriteInput, FilesystemDeletePlan, FilesystemRowContext,
+};
 
 pub(crate) async fn register_lix_file_providers(
     session: &SessionContext,
@@ -281,6 +284,7 @@ impl TableProvider for LixFileProvider {
 
         let sink = LixFileInsertSink::new(
             input.schema(),
+            Arc::clone(&self.live_state),
             Arc::clone(write_stager),
             self.default_version_id.clone(),
         );
@@ -361,6 +365,7 @@ impl TableProvider for LixFileProvider {
 
 struct LixFileInsertSink {
     schema: SchemaRef,
+    live_state: Arc<dyn LiveStateContext>,
     write_stager: Arc<dyn SqlWriteStager>,
     default_version_id: Option<String>,
 }
@@ -374,11 +379,13 @@ impl std::fmt::Debug for LixFileInsertSink {
 impl LixFileInsertSink {
     fn new(
         schema: SchemaRef,
+        live_state: Arc<dyn LiveStateContext>,
         write_stager: Arc<dyn SqlWriteStager>,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
             schema,
+            live_state,
             write_stager,
             default_version_id,
         }
@@ -412,11 +419,35 @@ impl DataSink for LixFileInsertSink {
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
         let mut staged = LixFileStagedBatch::default();
+        let mut path_resolvers = None;
         while let Some(batch) = data.next().await.transpose()? {
-            staged.extend(lix_file_insert_stage_from_batch(
-                &batch,
-                self.default_version_id.as_deref(),
-            )?);
+            if record_batch_has_non_null_column(&batch, "path")? {
+                if path_resolvers.is_none() {
+                    // TODO(engine2): make transaction-scoped live-state reads
+                    // use transaction-owned read services instead of requiring
+                    // the committed layer to open a separate backend read.
+                    path_resolvers = Some(
+                        file_path_resolvers_from_live_state(
+                            Arc::clone(&self.live_state),
+                            self.default_version_id.as_deref(),
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                    );
+                }
+                staged.extend(lix_file_insert_stage_from_batch_with_path_resolvers(
+                    &batch,
+                    self.default_version_id.as_deref(),
+                    path_resolvers
+                        .as_mut()
+                        .expect("path resolver should be initialized"),
+                )?);
+            } else {
+                staged.extend(lix_file_insert_stage_from_batch(
+                    &batch,
+                    self.default_version_id.as_deref(),
+                )?);
+            }
         }
 
         if !staged.state_rows.is_empty() || !staged.file_data_writes.is_empty() {
@@ -556,24 +587,24 @@ impl ExecutionPlan for LixFileDeleteExec {
                 .scan(&request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
+            let blob_ref_file_ids =
+                blob_ref_file_ids_from_live_rows(&rows).map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_file_record_batch(&table_schema, &blob_reader, rows)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
-            let mut write_rows = lix_file_existing_write_rows_from_batch(
+            let staged = lix_file_delete_stage_from_batch(
                 &matched_batch,
                 default_version_id.as_deref(),
+                &blob_ref_file_ids,
             )?;
-            for row in &mut write_rows {
-                row.snapshot_content = None;
-            }
-            let count = u64::try_from(write_rows.len()).map_err(|_| {
-                DataFusionError::Execution("lix_file DELETE row count overflow".into())
-            })?;
+            let count = staged.count;
 
             if count > 0 {
                 write_stager
-                    .stage_write(SqlWriteIntent::WriteRows { rows: write_rows })
+                    .stage_write(SqlWriteIntent::WriteRows {
+                        rows: staged.state_rows,
+                    })
                     .await
                     .map_err(lix_error_to_datafusion_error)?;
             }
@@ -721,17 +752,25 @@ impl ExecutionPlan for LixFileUpdateExec {
             let matched_batch = filter_lix_file_batch(source_batch, &filters)?;
             let updated_batch =
                 apply_lix_file_update_assignments(&table_schema, matched_batch, &assignments)?;
-            let include_data_writes = assignments
-                .iter()
-                .any(|(column_name, _)| column_name == "data");
-            let include_descriptor_writes = assignments
-                .iter()
-                .any(|(column_name, _)| column_name != "data");
-            let staged = lix_file_existing_stage_from_batch(
+            let update_columns = LixFileUpdateColumns::from_assignments(&assignments);
+            let mut path_resolvers = None;
+            if update_columns.path {
+                // TODO(engine2): make this resolver transaction-scoped so all
+                // filesystem DML shares one directory identity cache.
+                path_resolvers = Some(
+                    file_path_resolvers_from_live_state(
+                        Arc::clone(&live_state),
+                        default_version_id.as_deref(),
+                    )
+                    .await
+                    .map_err(lix_error_to_datafusion_error)?,
+                );
+            }
+            let staged = lix_file_update_stage_from_batch(
                 &updated_batch,
                 default_version_id.as_deref(),
-                include_descriptor_writes,
-                include_data_writes,
+                update_columns,
+                path_resolvers.as_mut(),
             )?;
             let count = staged.count;
 
@@ -1139,6 +1178,17 @@ impl LixFileStagedBatch {
         self.state_rows.extend(other.state_rows);
         self.file_data_writes.extend(other.file_data_writes);
         self.count += other.count;
+    }
+
+    fn extend_filesystem_plan(&mut self, plan: super::filesystem_planner::FilesystemWritePlan) {
+        self.state_rows.extend(plan.rows);
+        self.file_data_writes.extend(plan.file_data);
+        self.count += plan.count;
+    }
+
+    fn extend_filesystem_delete_plan(&mut self, plan: FilesystemDeletePlan) {
+        self.state_rows.extend(plan.rows);
+        self.count += plan.count;
     }
 }
 
@@ -1557,11 +1607,45 @@ fn lix_file_write_rows_from_batch(
     Ok(lix_file_insert_stage_from_batch(batch, default_version_id)?.state_rows)
 }
 
-fn lix_file_existing_write_rows_from_batch(
+fn lix_file_delete_stage_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
-) -> Result<Vec<StateRow>> {
-    Ok(lix_file_existing_stage_from_batch(batch, default_version_id, true, false)?.state_rows)
+    blob_ref_file_ids: &BTreeSet<String>,
+) -> Result<LixFileStagedBatch> {
+    let mut staged = LixFileStagedBatch::default();
+    for row_index in 0..batch.num_rows() {
+        let file_id = required_string_value(batch, row_index, "id")?;
+        let context = file_row_context_from_batch(batch, row_index, default_version_id)?;
+        staged.extend_filesystem_delete_plan(plan_file_delete(FileDeleteInput {
+            file_id: file_id.clone(),
+            has_blob_ref: blob_ref_file_ids.contains(&file_id),
+            context,
+        }));
+    }
+    Ok(staged)
+}
+
+fn blob_ref_file_ids_from_live_rows(
+    rows: &[LiveRow],
+) -> std::result::Result<BTreeSet<String>, LixError> {
+    let mut file_ids = BTreeSet::new();
+    for row in rows {
+        if row.schema_key != BLOB_REF_SCHEMA_KEY {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot: BlobRefSnapshot =
+            serde_json::from_str(snapshot_content).map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_binary_blob_ref snapshot JSON: {error}"),
+                )
+            })?;
+        file_ids.insert(snapshot.id);
+    }
+    Ok(file_ids)
 }
 
 fn lix_file_insert_stage_from_batch(
@@ -1571,19 +1655,153 @@ fn lix_file_insert_stage_from_batch(
     lix_file_stage_from_batch_with_options(batch, default_version_id, true, true, true)
 }
 
+fn lix_file_insert_stage_from_batch_with_path_resolvers(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+) -> Result<LixFileStagedBatch> {
+    lix_file_stage_from_batch_with_options_and_path_resolvers(
+        batch,
+        default_version_id,
+        true,
+        true,
+        true,
+        Some(path_resolvers),
+    )
+}
+
 fn lix_file_existing_stage_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     include_descriptor_writes: bool,
     include_data_writes: bool,
 ) -> Result<LixFileStagedBatch> {
-    lix_file_stage_from_batch_with_options(
-        batch,
-        default_version_id,
-        false,
-        include_descriptor_writes,
-        include_data_writes,
-    )
+    let mut staged = LixFileStagedBatch::default();
+
+    for row_index in 0..batch.num_rows() {
+        let id = required_string_value(batch, row_index, "id")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let context = file_row_context_from_batch(batch, row_index, default_version_id)?;
+
+        if include_descriptor_writes {
+            staged
+                .state_rows
+                .push(file_descriptor_row(FileDescriptorRowInput {
+                    id: id.clone(),
+                    directory_id: optional_string_value(batch, row_index, "directory_id")?,
+                    name: required_string_value(batch, row_index, "name")?,
+                    extension: optional_string_value(batch, row_index, "extension")?,
+                    hidden,
+                    context: context.clone(),
+                }));
+        }
+
+        if include_data_writes {
+            if let Some(data) = optional_binary_value(batch, row_index, "data")? {
+                stage_lix_file_data_write(&mut staged, id, data, context)?;
+            }
+        }
+
+        staged.count = staged
+            .count
+            .checked_add(1)
+            .ok_or_else(|| DataFusionError::Execution("lix_file row count overflow".into()))?;
+    }
+
+    Ok(staged)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LixFileUpdateColumns {
+    path: bool,
+    data: bool,
+    descriptor: bool,
+}
+
+impl LixFileUpdateColumns {
+    fn from_assignments(assignments: &[(String, Arc<dyn PhysicalExpr>)]) -> Self {
+        let path = assignments
+            .iter()
+            .any(|(column_name, _)| column_name == "path");
+        let data = assignments
+            .iter()
+            .any(|(column_name, _)| column_name == "data");
+        let descriptor = assignments
+            .iter()
+            .any(|(column_name, _)| column_name != "path" && column_name != "data");
+        Self {
+            path,
+            data,
+            descriptor,
+        }
+    }
+}
+
+fn lix_file_update_stage_from_batch(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    update_columns: LixFileUpdateColumns,
+    path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
+) -> Result<LixFileStagedBatch> {
+    if update_columns.path {
+        let Some(path_resolvers) = path_resolvers else {
+            return Err(DataFusionError::Execution(
+                "UPDATE lix_file with path requires directory path resolver".to_string(),
+            ));
+        };
+        lix_file_path_update_stage_from_batch(
+            batch,
+            default_version_id,
+            update_columns,
+            path_resolvers,
+        )
+    } else {
+        lix_file_existing_stage_from_batch(
+            batch,
+            default_version_id,
+            update_columns.descriptor,
+            update_columns.data,
+        )
+    }
+}
+
+fn lix_file_path_update_stage_from_batch(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    update_columns: LixFileUpdateColumns,
+    path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+) -> Result<LixFileStagedBatch> {
+    let mut staged = LixFileStagedBatch::default();
+
+    for row_index in 0..batch.num_rows() {
+        let id = required_string_value(batch, row_index, "id")?;
+        let path = required_string_value(batch, row_index, "path")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let context = file_row_context_from_batch(batch, row_index, default_version_id)?;
+        let existing_data = optional_binary_value(batch, row_index, "data")?;
+
+        let resolver = path_resolvers
+            .entry(file_path_resolver_key(&context))
+            .or_insert_with(DirectoryPathResolver::default);
+        let plan = plan_file_path_update(
+            resolver,
+            id.clone(),
+            path,
+            hidden,
+            existing_data.clone(),
+            context.clone(),
+        )
+        .map_err(lix_error_to_datafusion_error)?;
+        staged.extend_filesystem_plan(plan);
+
+        if update_columns.data {
+            if let Some(data) = existing_data {
+                stage_lix_file_data_write(&mut staged, id, data, context)?;
+            }
+        }
+    }
+
+    Ok(staged)
 }
 
 fn lix_file_stage_from_batch_with_options(
@@ -1593,16 +1811,28 @@ fn lix_file_stage_from_batch_with_options(
     include_descriptor_writes: bool,
     include_data_writes: bool,
 ) -> Result<LixFileStagedBatch> {
-    let count = u64::try_from(batch.num_rows())
-        .map_err(|_| DataFusionError::Execution("lix_file row count overflow".into()))?;
-    let mut staged = LixFileStagedBatch {
-        count,
-        ..LixFileStagedBatch::default()
-    };
+    lix_file_stage_from_batch_with_options_and_path_resolvers(
+        batch,
+        default_version_id,
+        reject_read_only_fields,
+        include_descriptor_writes,
+        include_data_writes,
+        None,
+    )
+}
+
+fn lix_file_stage_from_batch_with_options_and_path_resolvers(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    reject_read_only_fields: bool,
+    include_descriptor_writes: bool,
+    include_data_writes: bool,
+    mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
+) -> Result<LixFileStagedBatch> {
+    let mut staged = LixFileStagedBatch::default();
 
     for row_index in 0..batch.num_rows() {
         if reject_read_only_fields {
-            reject_read_only_lix_file_insert_field(batch, row_index, "path")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_entity_id")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_schema_key")?;
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_change_id")?;
@@ -1611,67 +1841,160 @@ fn lix_file_stage_from_batch_with_options(
             reject_read_only_lix_file_insert_field(batch, row_index, "lixcol_commit_id")?;
         }
 
+        let path = optional_string_value(batch, row_index, "path")?;
         let id = required_string_value(batch, row_index, "id")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let context = file_row_context_from_batch(batch, row_index, default_version_id)?;
+        let data = if include_data_writes {
+            optional_binary_value(batch, row_index, "data")?
+        } else {
+            None
+        };
+
+        if let Some(path) = path {
+            reject_read_only_lix_file_insert_field(batch, row_index, "directory_id")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "name")?;
+            reject_read_only_lix_file_insert_field(batch, row_index, "extension")?;
+
+            let Some(path_resolvers) = path_resolvers.as_deref_mut() else {
+                return Err(DataFusionError::Execution(
+                    "INSERT into lix_file with path requires directory path resolver".to_string(),
+                ));
+            };
+            let resolver = path_resolvers
+                .entry(file_path_resolver_key(&context))
+                .or_insert_with(DirectoryPathResolver::default);
+            let plan = super::filesystem_planner::plan_file_path_write(
+                resolver,
+                FilePathWriteInput {
+                    id,
+                    path,
+                    data,
+                    hidden,
+                    context,
+                },
+            )
+            .map_err(lix_error_to_datafusion_error)?;
+            staged.extend_filesystem_plan(plan);
+            continue;
+        }
+
         let directory_id = optional_string_value(batch, row_index, "directory_id")?;
         let name = required_string_value(batch, row_index, "name")?;
         let extension = optional_string_value(batch, row_index, "extension")?;
-        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
-        let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
-        let version_id = if global {
-            GLOBAL_VERSION_ID.to_string()
-        } else {
-            optional_string_value(batch, row_index, "lixcol_version_id")?
-                .or_else(|| default_version_id.map(ToOwned::to_owned))
-                .ok_or_else(|| {
-                    DataFusionError::Execution(
-                        "INSERT into lix_file_by_version requires lixcol_version_id".to_string(),
-                    )
-                })?
-        };
-        let untracked = optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false);
 
         if include_descriptor_writes {
-            let snapshot_content = json!({
-                "id": id.clone(),
-                "directory_id": directory_id,
-                "name": name,
-                "extension": extension,
-                "hidden": hidden,
-            })
-            .to_string();
-
-            staged.state_rows.push(StateRow {
-                entity_id: id.clone(),
-                schema_key: FILE_DESCRIPTOR_SCHEMA_KEY.to_string(),
-                file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-                plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
-                snapshot_content: Some(snapshot_content),
-                metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
-                schema_version: optional_string_value(batch, row_index, "lixcol_schema_version")?
-                    .or_else(|| Some(FILE_DESCRIPTOR_SCHEMA_VERSION.to_string())),
-                created_at: None,
-                updated_at: None,
-                global,
-                change_id: None,
-                commit_id: None,
-                untracked,
-                version_id: version_id.clone(),
-            });
+            staged
+                .state_rows
+                .push(file_descriptor_row(FileDescriptorRowInput {
+                    id: id.clone(),
+                    directory_id: directory_id.clone(),
+                    name: name.clone(),
+                    extension: extension.clone(),
+                    hidden,
+                    context: context.clone(),
+                }));
         }
 
-        if include_data_writes {
-            if let Some(data) = optional_binary_value(batch, row_index, "data")? {
-                staged.file_data_writes.push(FileDataWrite {
-                    file_id: id,
-                    version_id,
-                    untracked,
-                    data,
-                });
-            }
+        if let Some(data) = data {
+            stage_lix_file_data_write(&mut staged, id, data, context)?;
         }
+        staged.count = staged
+            .count
+            .checked_add(1)
+            .ok_or_else(|| DataFusionError::Execution("lix_file row count overflow".into()))?;
     }
 
     Ok(staged)
+}
+
+fn stage_lix_file_data_write(
+    staged: &mut LixFileStagedBatch,
+    file_id: String,
+    data: Vec<u8>,
+    context: FilesystemRowContext,
+) -> Result<()> {
+    staged.state_rows.push(
+        blob_ref_row(BlobRefRowInput {
+            file_id: file_id.clone(),
+            data: data.clone(),
+            context: FilesystemRowContext {
+                file_id: None,
+                plugin_key: None,
+                metadata: None,
+                schema_version: None,
+                ..context.clone()
+            },
+        })
+        .map_err(lix_error_to_datafusion_error)?,
+    );
+    staged.file_data_writes.push(FileDataWrite {
+        file_id,
+        version_id: context.version_id,
+        untracked: context.untracked,
+        data,
+    });
+    Ok(())
+}
+
+fn file_row_context_from_batch(
+    batch: &RecordBatch,
+    row_index: usize,
+    default_version_id: Option<&str>,
+) -> Result<FilesystemRowContext> {
+    let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
+    let version_id = if global {
+        GLOBAL_VERSION_ID.to_string()
+    } else {
+        optional_string_value(batch, row_index, "lixcol_version_id")?
+            .or_else(|| default_version_id.map(ToOwned::to_owned))
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "INSERT into lix_file_by_version requires lixcol_version_id".to_string(),
+                )
+            })?
+    };
+
+    Ok(FilesystemRowContext {
+        version_id,
+        global,
+        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
+        plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
+        metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+        schema_version: optional_string_value(batch, row_index, "lixcol_schema_version")?,
+    })
+}
+
+fn file_path_resolver_key(context: &FilesystemRowContext) -> String {
+    // TODO(engine2): make this lane-aware if filesystem path uniqueness needs
+    // to distinguish tracked/untracked/global rows inside the same version.
+    context.version_id.clone()
+}
+
+async fn file_path_resolvers_from_live_state(
+    live_state: Arc<dyn LiveStateContext>,
+    default_version_id: Option<&str>,
+) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let rows = live_state
+        .scan(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string()],
+                version_ids: default_version_id
+                    .map(|version_id| vec![version_id.to_string()])
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .await?;
+    let mut resolvers = directory_path_resolvers_from_state_rows(rows)?;
+    if let Some(version_id) = default_version_id {
+        resolvers
+            .entry(version_id.to_string())
+            .or_insert_with(DirectoryPathResolver::default);
+    }
+    Ok(resolvers)
 }
 
 async fn lix_file_record_batch(
@@ -1967,7 +2290,7 @@ fn validate_lix_file_update_assignments(
         })?;
         if !matches!(
             column_name.as_str(),
-            "directory_id" | "name" | "extension" | "hidden" | "data" | "lixcol_metadata"
+            "path" | "directory_id" | "name" | "extension" | "hidden" | "data" | "lixcol_metadata"
         ) {
             return Err(DataFusionError::Execution(format!(
                 "UPDATE lix_file cannot stage read-only column '{column_name}'"
@@ -2061,6 +2384,17 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
         vec![Arc::new(UInt64Array::from(vec![count])) as ArrayRef],
     )
     .map_err(DataFusionError::from)
+}
+
+fn record_batch_has_non_null_column(batch: &RecordBatch, column_name: &str) -> Result<bool> {
+    for row_index in 0..batch.num_rows() {
+        if optional_scalar_value(batch, row_index, column_name)?
+            .is_some_and(|value| !value.is_null())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn reject_read_only_lix_file_insert_field(
@@ -2236,7 +2570,7 @@ fn lix_error_to_datafusion_error(error: LixError) -> DataFusionError {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -2245,16 +2579,19 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::sink::DataSink;
     use datafusion::execution::TaskContext;
+    use datafusion::logical_expr::lit;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
     use serde_json::Value as JsonValue;
 
+    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager};
     use crate::LixError;
 
     use super::{
-        derive_directory_path_for, lix_file_insert_stage_from_batch,
+        derive_directory_path_for, lix_file_delete_stage_from_batch,
+        lix_file_insert_stage_from_batch, lix_file_insert_stage_from_batch_with_path_resolvers,
         lix_file_write_rows_from_batch, DirectoryDescriptorRecord, LixFileInsertSink,
     };
 
@@ -2268,6 +2605,44 @@ mod tests {
         async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
             self.writes.lock().expect("writes lock").push(write);
             Ok(SqlWriteOutcome { count: 0 })
+        }
+    }
+
+    #[derive(Default)]
+    struct RowsLiveStateContext {
+        rows: Vec<LiveRow>,
+    }
+
+    #[async_trait]
+    impl LiveStateContext for RowsLiveStateContext {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn load_exact(
+            &self,
+            _request: &ExactRowRequest,
+        ) -> Result<Option<LiveRow>, LixError> {
+            Ok(None)
+        }
+    }
+
+    fn live_directory_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveRow {
+        LiveRow {
+            entity_id: entity_id.to_string(),
+            schema_key: super::DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
+            file_id: None,
+            plugin_key: None,
+            snapshot_content: Some(snapshot_content.to_string()),
+            metadata: None,
+            schema_version: "1".to_string(),
+            version_id: version_id.to_string(),
+            change_id: Some(format!("change-{entity_id}")),
+            commit_id: Some(format!("commit-{entity_id}")),
+            global: false,
+            untracked: false,
+            created_at: Some("2026-04-23T00:00:00Z".to_string()),
+            updated_at: Some("2026-04-23T01:00:00Z".to_string()),
         }
     }
 
@@ -2323,6 +2698,60 @@ mod tests {
             ],
         )
         .expect("file data batch")
+    }
+
+    fn path_data_insert_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, false),
+                Field::new("hidden", DataType::Boolean, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_version_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("/docs/guides/readme.md")]),
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+                Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
+                string_column(vec![Some("version-b")]),
+            ],
+        )
+        .expect("file path data batch")
+    }
+
+    fn path_update_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, false),
+                Field::new("hidden", DataType::Boolean, false),
+                Field::new("data", DataType::Binary, true),
+                Field::new("lixcol_version_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("/docs/renamed.md")]),
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+                Arc::new(BinaryArray::from_vec(vec![b"hello"])) as ArrayRef,
+                string_column(vec![Some("version-b")]),
+            ],
+        )
+        .expect("file path update batch")
+    }
+
+    fn file_delete_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("lixcol_version_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("file-readme")]),
+                string_column(vec![Some("version-b")]),
+            ],
+        )
+        .expect("file delete batch")
     }
 
     fn batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
@@ -2405,17 +2834,382 @@ mod tests {
     }
 
     #[test]
+    fn file_update_accepts_path_assignment() {
+        super::validate_lix_file_update_assignments(
+            &super::lix_file_schema(),
+            &[("path".to_string(), lit("/docs/renamed.md"))],
+        )
+        .expect("path should be writable for update");
+    }
+
+    #[test]
+    fn file_path_update_stages_descriptor_from_new_path() {
+        let mut resolvers = BTreeMap::new();
+        resolvers.insert(
+            "version-b".to_string(),
+            super::DirectoryPathResolver::from_existing([(
+                "/docs/".to_string(),
+                "dir-docs".to_string(),
+            )])
+            .expect("directory resolver should seed"),
+        );
+
+        let staged = super::lix_file_update_stage_from_batch(
+            &path_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+        )
+        .expect("decode file path update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.file_data_writes.len(), 0);
+        assert_eq!(staged.state_rows.len(), 1);
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("file descriptor row should be staged");
+        let snapshot: JsonValue =
+            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "renamed");
+        assert_eq!(snapshot["extension"], "md");
+        assert_eq!(snapshot["hidden"], false);
+    }
+
+    #[test]
+    fn file_path_update_preserves_existing_data_unless_data_is_assigned() {
+        let mut resolvers = BTreeMap::new();
+        resolvers.insert(
+            "version-b".to_string(),
+            super::DirectoryPathResolver::from_existing([(
+                "/docs/".to_string(),
+                "dir-docs".to_string(),
+            )])
+            .expect("directory resolver should seed"),
+        );
+
+        let staged = super::lix_file_update_stage_from_batch(
+            &path_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+        )
+        .expect("decode file path update");
+
+        assert!(
+            staged.file_data_writes.is_empty(),
+            "path-only update should not rewrite file data"
+        );
+        assert!(
+            staged
+                .state_rows
+                .iter()
+                .all(|row| row.schema_key != "lix_binary_blob_ref"),
+            "path-only update should not rewrite the blob ref"
+        );
+    }
+
+    #[tokio::test]
+    async fn file_path_update_seeds_resolver_from_visible_directory_state() {
+        let mut resolvers = super::file_path_resolvers_from_live_state(
+            Arc::new(RowsLiveStateContext {
+                rows: vec![live_directory_row(
+                    "dir-docs",
+                    "version-b",
+                    "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                )],
+            }) as Arc<dyn LiveStateContext>,
+            Some("version-b"),
+        )
+        .await
+        .expect("directory state should seed path resolver");
+
+        let staged = super::lix_file_update_stage_from_batch(
+            &path_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+        )
+        .expect("decode file path update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 1);
+        assert!(staged
+            .state_rows
+            .iter()
+            .all(|row| row.schema_key != "lix_directory_descriptor"));
+
+        let snapshot: JsonValue =
+            serde_json::from_str(staged.state_rows[0].snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["directory_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "renamed");
+        assert_eq!(snapshot["extension"], "md");
+    }
+
+    #[tokio::test]
+    async fn file_path_update_stages_only_missing_parent_directories() {
+        let mut resolvers = super::file_path_resolvers_from_live_state(
+            Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
+            Some("version-b"),
+        )
+        .await
+        .expect("empty directory state should seed path resolver");
+
+        let staged = super::lix_file_update_stage_from_batch(
+            &path_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: false,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+        )
+        .expect("decode file path update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 2);
+        assert_eq!(
+            staged
+                .state_rows
+                .iter()
+                .filter(|row| row.schema_key == "lix_directory_descriptor")
+                .count(),
+            1
+        );
+
+        let directory = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_directory_descriptor")
+            .expect("missing /docs/ directory should be staged");
+        assert_eq!(directory.entity_id, "lix-auto-dir:version-b:/docs/");
+
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("file descriptor should be staged");
+        let snapshot: JsonValue =
+            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["directory_id"], "lix-auto-dir:version-b:/docs/");
+    }
+
+    #[test]
+    fn file_path_update_with_data_assignment_stages_blob_ref_and_payload() {
+        let mut resolvers = BTreeMap::new();
+        resolvers.insert(
+            "version-b".to_string(),
+            super::DirectoryPathResolver::from_existing([(
+                "/docs/".to_string(),
+                "dir-docs".to_string(),
+            )])
+            .expect("directory resolver should seed"),
+        );
+
+        let staged = super::lix_file_update_stage_from_batch(
+            &path_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: true,
+                data: true,
+                descriptor: false,
+            },
+            Some(&mut resolvers),
+        )
+        .expect("decode file path and data update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(staged.file_data_writes[0].data, b"hello");
+        assert!(staged
+            .state_rows
+            .iter()
+            .any(|row| row.schema_key == "lix_file_descriptor"));
+        assert!(staged
+            .state_rows
+            .iter()
+            .any(|row| row.schema_key == "lix_binary_blob_ref"));
+    }
+
+    #[test]
+    fn file_data_update_without_path_ignores_materialized_path_column() {
+        let staged = super::lix_file_update_stage_from_batch(
+            &path_update_batch(),
+            None,
+            super::LixFileUpdateColumns {
+                path: false,
+                data: true,
+                descriptor: false,
+            },
+            None,
+        )
+        .expect("decode file data update");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(staged.state_rows.len(), 1);
+        assert_eq!(staged.state_rows[0].schema_key, "lix_binary_blob_ref");
+    }
+
+    #[test]
     fn file_insert_stages_non_null_data() {
         let batch = data_insert_batch();
 
         let staged = lix_file_insert_stage_from_batch(&batch, None).expect("decode file data");
 
         assert_eq!(staged.count, 1);
-        assert_eq!(staged.state_rows.len(), 1);
+        assert_eq!(staged.state_rows.len(), 2);
+        assert!(staged
+            .state_rows
+            .iter()
+            .any(|row| row.schema_key == "lix_file_descriptor"));
+        let blob_ref_row = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_binary_blob_ref")
+            .expect("data insert should stage blob ref row");
+        assert_eq!(blob_ref_row.entity_id, "file-readme");
+        assert_eq!(blob_ref_row.file_id.as_deref(), Some("file-readme"));
         assert_eq!(staged.file_data_writes.len(), 1);
         assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
         assert_eq!(staged.file_data_writes[0].version_id, "version-b");
         assert_eq!(staged.file_data_writes[0].data, b"hello");
+    }
+
+    #[test]
+    fn file_delete_with_blob_ref_stages_descriptor_and_blob_ref_tombstones() {
+        let batch = file_delete_batch();
+        let staged = lix_file_delete_stage_from_batch(
+            &batch,
+            None,
+            &BTreeSet::from(["file-readme".to_string()]),
+        )
+        .expect("decode file delete");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 2);
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("file descriptor tombstone should be staged");
+        assert_eq!(descriptor.entity_id, "file-readme");
+        assert_eq!(descriptor.file_id, None);
+        assert_eq!(descriptor.snapshot_content, None);
+
+        let blob_ref = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_binary_blob_ref")
+            .expect("blob ref tombstone should be staged");
+        assert_eq!(blob_ref.entity_id, "file-readme");
+        assert_eq!(blob_ref.file_id.as_deref(), Some("file-readme"));
+        assert_eq!(blob_ref.snapshot_content, None);
+    }
+
+    #[test]
+    fn file_delete_without_blob_ref_stages_only_descriptor_tombstone() {
+        let batch = file_delete_batch();
+        let staged = lix_file_delete_stage_from_batch(&batch, None, &BTreeSet::new())
+            .expect("decode file delete");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 1);
+        assert_eq!(staged.state_rows[0].schema_key, "lix_file_descriptor");
+        assert_eq!(staged.state_rows[0].entity_id, "file-readme");
+        assert_eq!(staged.state_rows[0].snapshot_content, None);
+    }
+
+    #[test]
+    fn file_path_insert_reuses_existing_parent_directory() {
+        let mut resolvers = BTreeMap::new();
+        resolvers.insert(
+            "version-b".to_string(),
+            super::DirectoryPathResolver::from_existing([
+                ("/docs/".to_string(), "dir-docs".to_string()),
+                ("/docs/guides/".to_string(), "dir-guides".to_string()),
+            ])
+            .expect("directory resolver should seed"),
+        );
+
+        let staged = lix_file_insert_stage_from_batch_with_path_resolvers(
+            &path_data_insert_batch(),
+            None,
+            &mut resolvers,
+        )
+        .expect("decode file path data");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.file_data_writes.len(), 1);
+        assert_eq!(staged.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(staged.state_rows.len(), 2);
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("file descriptor row should be staged");
+        let snapshot: JsonValue =
+            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(snapshot["id"], "file-readme");
+        assert_eq!(snapshot["directory_id"], "dir-guides");
+        assert_eq!(snapshot["name"], "readme");
+        assert_eq!(snapshot["extension"], "md");
+    }
+
+    #[test]
+    fn file_path_insert_stages_missing_parent_directories_once() {
+        let mut resolvers = BTreeMap::new();
+
+        let staged = lix_file_insert_stage_from_batch_with_path_resolvers(
+            &path_data_insert_batch(),
+            None,
+            &mut resolvers,
+        )
+        .expect("decode file path data");
+
+        assert_eq!(staged.count, 1);
+        assert_eq!(staged.state_rows.len(), 4);
+        let directory_rows = staged
+            .state_rows
+            .iter()
+            .filter(|row| row.schema_key == "lix_directory_descriptor")
+            .collect::<Vec<_>>();
+        assert_eq!(directory_rows.len(), 2);
+
+        let descriptor = staged
+            .state_rows
+            .iter()
+            .find(|row| row.schema_key == "lix_file_descriptor")
+            .expect("file descriptor row should be staged");
+        let snapshot: JsonValue =
+            serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
+                .expect("descriptor snapshot JSON");
+        assert_eq!(
+            snapshot["directory_id"],
+            "lix-auto-dir:version-b:/docs/guides/"
+        );
     }
 
     #[tokio::test]
@@ -2424,6 +3218,7 @@ mod tests {
         let stager = Arc::new(CapturingWriteStager::default());
         let sink = LixFileInsertSink::new(
             batch.schema(),
+            Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
             None,
         );
@@ -2452,6 +3247,7 @@ mod tests {
         let stager = Arc::new(CapturingWriteStager::default());
         let sink = LixFileInsertSink::new(
             batch.schema(),
+            Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
             None,
         );
@@ -2471,10 +3267,70 @@ mod tests {
                 count,
             } => {
                 assert_eq!(*count, 1);
-                assert_eq!(rows.len(), 1);
+                assert_eq!(rows.len(), 2);
+                assert!(rows
+                    .iter()
+                    .any(|row| row.schema_key == "lix_file_descriptor"));
+                assert!(rows
+                    .iter()
+                    .any(|row| row.schema_key == "lix_binary_blob_ref"));
                 assert_eq!(file_data.len(), 1);
                 assert_eq!(file_data[0].file_id, "file-readme");
                 assert_eq!(file_data[0].data, b"hello");
+            }
+            other => panic!("expected insert with file data write intent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn file_insert_sink_seeds_path_resolver_from_live_state() {
+        let batch = path_data_insert_batch();
+        let stager = Arc::new(CapturingWriteStager::default());
+        let sink = LixFileInsertSink::new(
+            batch.schema(),
+            Arc::new(RowsLiveStateContext {
+                rows: vec![
+                    live_directory_row(
+                        "dir-docs",
+                        "version-b",
+                        "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\"}",
+                    ),
+                    live_directory_row(
+                        "dir-guides",
+                        "version-b",
+                        "{\"id\":\"dir-guides\",\"parent_id\":\"dir-docs\",\"name\":\"guides\"}",
+                    ),
+                ],
+            }) as Arc<dyn LiveStateContext>,
+            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            None,
+        );
+
+        let count = sink
+            .write_all(batch_stream(batch), &Arc::new(TaskContext::default()))
+            .await
+            .expect("file insert sink should stage path data");
+
+        assert_eq!(count, 1);
+        let writes = stager.writes.lock().expect("writes lock");
+        assert_eq!(writes.len(), 1);
+        match &writes[0] {
+            SqlWriteIntent::WriteRowsWithFileData {
+                rows,
+                file_data,
+                count,
+            } => {
+                assert_eq!(*count, 1);
+                assert_eq!(file_data.len(), 1);
+                assert_eq!(file_data[0].file_id, "file-readme");
+                let descriptor = rows
+                    .iter()
+                    .find(|row| row.schema_key == "lix_file_descriptor")
+                    .expect("file descriptor row should be staged");
+                let snapshot: JsonValue =
+                    serde_json::from_str(descriptor.snapshot_content.as_deref().unwrap())
+                        .expect("descriptor snapshot JSON");
+                assert_eq!(snapshot["directory_id"], "dir-guides");
             }
             other => panic!("expected insert with file data write intent, got {other:?}"),
         }

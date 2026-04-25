@@ -1,5 +1,5 @@
 use std::any::Any;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -25,7 +25,6 @@ use datafusion::physical_plan::{
 use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
@@ -37,9 +36,13 @@ use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
 
 use super::execute::{HistoryContext, SqlWriteIntent, SqlWriteStager, StateRow};
+use super::filesystem_planner::{
+    directory_descriptor_row, plan_recursive_directory_delete, DirectoryDescriptorRowInput,
+    DirectoryPathResolver, FilesystemDeletePlan, FilesystemRowContext,
+};
+use super::filesystem_visibility::VisibleFilesystem;
 
 const DIRECTORY_SCHEMA_KEY: &str = "lix_directory_descriptor";
-const DIRECTORY_SCHEMA_VERSION: &str = "1";
 
 pub(crate) async fn register_lix_directory_providers(
     session: &SessionContext,
@@ -239,6 +242,7 @@ impl TableProvider for LixDirectoryProvider {
 
         let sink = LixDirectoryInsertSink::new(
             input.schema(),
+            Arc::clone(&self.live_state),
             Arc::clone(write_stager),
             self.default_version_id.clone(),
         );
@@ -317,6 +321,7 @@ impl TableProvider for LixDirectoryProvider {
 
 struct LixDirectoryInsertSink {
     schema: SchemaRef,
+    live_state: Arc<dyn LiveStateContext>,
     write_stager: Arc<dyn SqlWriteStager>,
     default_version_id: Option<String>,
 }
@@ -330,11 +335,13 @@ impl std::fmt::Debug for LixDirectoryInsertSink {
 impl LixDirectoryInsertSink {
     fn new(
         schema: SchemaRef,
+        live_state: Arc<dyn LiveStateContext>,
         write_stager: Arc<dyn SqlWriteStager>,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
             schema,
+            live_state,
             write_stager,
             default_version_id,
         }
@@ -367,16 +374,46 @@ impl DataSink for LixDirectoryInsertSink {
         mut data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> Result<u64> {
+        let mut path_resolvers = None;
         let mut rows = Vec::new();
+        let mut count = 0_u64;
         while let Some(batch) = data.next().await.transpose()? {
-            rows.extend(lix_directory_write_rows_from_batch(
-                &batch,
-                self.default_version_id.as_deref(),
-            )?);
+            count = count
+                .checked_add(u64::try_from(batch.num_rows()).map_err(|_| {
+                    DataFusionError::Execution("lix_directory INSERT row count overflow".into())
+                })?)
+                .ok_or_else(|| {
+                    DataFusionError::Execution("lix_directory INSERT row count overflow".into())
+                })?;
+            if record_batch_has_non_null_column(&batch, "path")? {
+                if path_resolvers.is_none() {
+                    // TODO(engine2): make transaction-scoped live-state reads
+                    // use transaction-owned read services instead of requiring
+                    // the committed layer to open a separate backend read.
+                    path_resolvers = Some(
+                        directory_path_resolvers_from_live_state(
+                            Arc::clone(&self.live_state),
+                            self.default_version_id.as_deref(),
+                        )
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                    );
+                }
+                rows.extend(lix_directory_write_rows_from_batch_with_path_resolvers(
+                    &batch,
+                    self.default_version_id.as_deref(),
+                    path_resolvers
+                        .as_mut()
+                        .expect("path resolver should be initialized"),
+                )?);
+            } else {
+                rows.extend(lix_directory_write_rows_from_batch_with_options(
+                    &batch,
+                    self.default_version_id.as_deref(),
+                    true,
+                )?);
+            }
         }
-        let count = u64::try_from(rows.len()).map_err(|_| {
-            DataFusionError::Execution("lix_directory INSERT row count overflow".into())
-        })?;
 
         self.write_stager
             .stage_write(SqlWriteIntent::WriteRows { rows })
@@ -501,16 +538,22 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
             let source_batch = lix_directory_record_batch(&table_schema, rows)
                 .map_err(lix_error_to_datafusion_error)?;
             let matched_batch = filter_lix_directory_batch(source_batch, &filters)?;
-            let mut write_rows = lix_directory_existing_write_rows_from_batch(
+            let version_ids =
+                directory_version_ids_from_batch(&matched_batch, default_version_id.as_deref())?;
+            let mut visible_filesystems = BTreeMap::new();
+            for version_id in version_ids {
+                visible_filesystems.insert(
+                    version_id.clone(),
+                    VisibleFilesystem::load(Arc::clone(&live_state), &version_id)
+                        .await
+                        .map_err(lix_error_to_datafusion_error)?,
+                );
+            }
+            let (write_rows, count) = lix_directory_recursive_delete_rows_from_batch(
                 &matched_batch,
                 default_version_id.as_deref(),
+                &visible_filesystems,
             )?;
-            for row in &mut write_rows {
-                row.snapshot_content = None;
-            }
-            let count = u64::try_from(write_rows.len()).map_err(|_| {
-                DataFusionError::Execution("lix_directory DELETE row count overflow".into())
-            })?;
 
             if count > 0 {
                 write_stager
@@ -1111,11 +1154,25 @@ fn string_array<'a>(values: impl Iterator<Item = Option<&'a str>>) -> ArrayRef {
     Arc::new(StringArray::from(values.collect::<Vec<_>>())) as ArrayRef
 }
 
+#[cfg(test)]
 fn lix_directory_write_rows_from_batch(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
 ) -> Result<Vec<StateRow>> {
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, true)
+}
+
+fn lix_directory_write_rows_from_batch_with_path_resolvers(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+) -> Result<Vec<StateRow>> {
+    lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
+        batch,
+        default_version_id,
+        true,
+        Some(path_resolvers),
+    )
 }
 
 fn lix_directory_existing_write_rows_from_batch(
@@ -1125,68 +1182,255 @@ fn lix_directory_existing_write_rows_from_batch(
     lix_directory_write_rows_from_batch_with_options(batch, default_version_id, false)
 }
 
+fn directory_version_ids_from_batch(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let mut version_ids = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        version_ids.insert(
+            directory_row_context_from_batch(batch, row_index, default_version_id)?.version_id,
+        );
+    }
+    Ok(version_ids)
+}
+
+fn lix_directory_recursive_delete_rows_from_batch(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    visible_filesystems: &BTreeMap<String, VisibleFilesystem>,
+) -> Result<(Vec<StateRow>, u64)> {
+    let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
+    for row_index in 0..batch.num_rows() {
+        let directory_id = required_string_value(batch, row_index, "id")?;
+        let context = directory_row_context_from_batch(batch, row_index, default_version_id)?;
+        let visible_filesystem = visible_filesystems
+            .get(&context.version_id)
+            .ok_or_else(|| {
+                DataFusionError::Execution(format!(
+                    "DELETE FROM lix_directory missing visible filesystem for version '{}'",
+                    context.version_id
+                ))
+            })?;
+        append_deduped_delete_plan(
+            &mut rows,
+            &mut seen,
+            plan_recursive_directory_delete(&directory_id, visible_filesystem, context),
+        );
+    }
+    let count = u64::try_from(batch.num_rows()).map_err(|_| {
+        DataFusionError::Execution("lix_directory DELETE row count overflow".into())
+    })?;
+    Ok((rows, count))
+}
+
+fn append_deduped_delete_plan(
+    rows: &mut Vec<StateRow>,
+    seen: &mut BTreeSet<StateRowDedupeKey>,
+    plan: FilesystemDeletePlan,
+) {
+    for row in plan.rows {
+        if seen.insert(StateRowDedupeKey::from(&row)) {
+            rows.push(row);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct StateRowDedupeKey {
+    entity_id: String,
+    schema_key: String,
+    file_id: Option<String>,
+    version_id: String,
+    global: bool,
+    untracked: bool,
+}
+
+impl From<&StateRow> for StateRowDedupeKey {
+    fn from(row: &StateRow) -> Self {
+        Self {
+            entity_id: row.entity_id.clone(),
+            schema_key: row.schema_key.clone(),
+            file_id: row.file_id.clone(),
+            version_id: row.version_id.clone(),
+            global: row.global,
+            untracked: row.untracked,
+        }
+    }
+}
+
 fn lix_directory_write_rows_from_batch_with_options(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
 ) -> Result<Vec<StateRow>> {
-    (0..batch.num_rows())
-        .map(|row_index| {
-            if reject_read_only_fields {
-                reject_read_only_lix_directory_insert_field(batch, row_index, "path")?;
-                reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_entity_id")?;
-                reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_schema_key")?;
-                reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
-                reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
-                reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_updated_at")?;
-                reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_commit_id")?;
-            }
+    lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
+        batch,
+        default_version_id,
+        reject_read_only_fields,
+        None,
+    )
+}
 
-            let id = required_string_value(batch, row_index, "id")?;
-            let parent_id = optional_string_value(batch, row_index, "parent_id")?;
-            let name = required_string_value(batch, row_index, "name")?;
-            let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
-            let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
-            let version_id = if global {
-                GLOBAL_VERSION_ID.to_string()
-            } else {
-                optional_string_value(batch, row_index, "lixcol_version_id")?
-                    .or_else(|| default_version_id.map(ToOwned::to_owned))
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "INSERT into lix_directory_by_version requires lixcol_version_id"
-                                .to_string(),
-                        )
-                    })?
+fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
+    batch: &RecordBatch,
+    default_version_id: Option<&str>,
+    reject_read_only_fields: bool,
+    mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
+) -> Result<Vec<StateRow>> {
+    let mut rows = Vec::new();
+    for row_index in 0..batch.num_rows() {
+        if reject_read_only_fields {
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_entity_id")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_schema_key")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_change_id")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_created_at")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_updated_at")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "lixcol_commit_id")?;
+        }
+
+        let path = optional_string_value(batch, row_index, "path")?;
+        let id = required_string_value(batch, row_index, "id")?;
+        let hidden = optional_bool_value(batch, row_index, "hidden")?.unwrap_or(false);
+        let context = directory_row_context_from_batch(batch, row_index, default_version_id)?;
+
+        if let Some(path) = path {
+            reject_read_only_lix_directory_insert_field(batch, row_index, "parent_id")?;
+            reject_read_only_lix_directory_insert_field(batch, row_index, "name")?;
+
+            let Some(path_resolvers) = path_resolvers.as_deref_mut() else {
+                return Err(DataFusionError::Execution(
+                    "INSERT into lix_directory with path requires directory path resolver"
+                        .to_string(),
+                ));
             };
-            let snapshot_content = json!({
-                "id": id,
-                "parent_id": parent_id,
-                "name": name,
-                "hidden": hidden,
-            })
-            .to_string();
+            let resolver = path_resolvers
+                .entry(directory_path_resolver_key(&context))
+                .or_insert_with(DirectoryPathResolver::default);
+            let planned_rows = resolver
+                .ensure_directory_path_with_leaf_id(&path, Some(id), context, hidden)
+                .map_err(lix_error_to_datafusion_error)?;
+            rows.extend(planned_rows);
+            continue;
+        }
 
-            Ok(StateRow {
-                entity_id: id,
-                schema_key: DIRECTORY_SCHEMA_KEY.to_string(),
-                file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
-                plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
-                snapshot_content: Some(snapshot_content),
-                metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
-                schema_version: optional_string_value(batch, row_index, "lixcol_schema_version")?
-                    .or_else(|| Some(DIRECTORY_SCHEMA_VERSION.to_string())),
-                created_at: None,
-                updated_at: None,
-                global,
-                change_id: None,
-                commit_id: None,
-                untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?
-                    .unwrap_or(false),
-                version_id,
-            })
+        let parent_id = optional_string_value(batch, row_index, "parent_id")?;
+        let name = required_string_value(batch, row_index, "name")?;
+        rows.push(directory_descriptor_row(DirectoryDescriptorRowInput {
+            id,
+            parent_id,
+            name,
+            hidden,
+            context,
+        }));
+    }
+    Ok(rows)
+}
+
+fn directory_row_context_from_batch(
+    batch: &RecordBatch,
+    row_index: usize,
+    default_version_id: Option<&str>,
+) -> Result<FilesystemRowContext> {
+    let global = optional_bool_value(batch, row_index, "lixcol_global")?.unwrap_or(false);
+    let version_id = if global {
+        GLOBAL_VERSION_ID.to_string()
+    } else {
+        optional_string_value(batch, row_index, "lixcol_version_id")?
+            .or_else(|| default_version_id.map(ToOwned::to_owned))
+            .ok_or_else(|| {
+                DataFusionError::Execution(
+                    "INSERT into lix_directory_by_version requires lixcol_version_id".to_string(),
+                )
+            })?
+    };
+
+    Ok(FilesystemRowContext {
+        version_id,
+        global,
+        untracked: optional_bool_value(batch, row_index, "lixcol_untracked")?.unwrap_or(false),
+        file_id: optional_string_value(batch, row_index, "lixcol_file_id")?,
+        plugin_key: optional_string_value(batch, row_index, "lixcol_plugin_key")?,
+        metadata: optional_string_value(batch, row_index, "lixcol_metadata")?,
+        schema_version: optional_string_value(batch, row_index, "lixcol_schema_version")?,
+    })
+}
+
+fn directory_path_resolver_key(context: &FilesystemRowContext) -> String {
+    // TODO(engine2): make this lane-aware if filesystem path uniqueness needs
+    // to distinguish tracked/untracked/global rows inside the same version.
+    context.version_id.clone()
+}
+
+async fn directory_path_resolvers_from_live_state(
+    live_state: Arc<dyn LiveStateContext>,
+    default_version_id: Option<&str>,
+) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
+    let rows = live_state
+        .scan(&LiveStateScanRequest {
+            filter: LiveStateFilter {
+                schema_keys: vec![DIRECTORY_SCHEMA_KEY.to_string()],
+                version_ids: default_version_id
+                    .map(|version_id| vec![version_id.to_string()])
+                    .unwrap_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
         })
-        .collect()
+        .await?;
+    let seeds_by_version = directory_path_seeds_from_live_rows(rows)?;
+
+    let mut resolvers = BTreeMap::new();
+    for (version_id, seeds) in seeds_by_version {
+        resolvers.insert(version_id, DirectoryPathResolver::from_existing(seeds)?);
+    }
+    if let Some(version_id) = default_version_id {
+        resolvers
+            .entry(version_id.to_string())
+            .or_insert_with(DirectoryPathResolver::default);
+    }
+    Ok(resolvers)
+}
+
+fn directory_path_seeds_from_live_rows(
+    rows: Vec<LiveRow>,
+) -> std::result::Result<BTreeMap<String, Vec<(String, String)>>, LixError> {
+    let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
+    for row in rows {
+        if row.schema_key != DIRECTORY_SCHEMA_KEY {
+            continue;
+        }
+        let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+            continue;
+        };
+        let snapshot: DirectoryDescriptorSnapshot = serde_json::from_str(snapshot_content)
+            .map_err(|error| {
+                LixError::new(
+                    "LIX_ERROR_UNKNOWN",
+                    format!("invalid lix_directory_descriptor snapshot JSON: {error}"),
+                )
+            })?;
+        directory_rows.push(DirectoryDescriptorRecord {
+            id: snapshot.id,
+            parent_id: snapshot.parent_id,
+            name: snapshot.name,
+            hidden: snapshot.hidden.unwrap_or(false),
+            live: row,
+        });
+    }
+
+    let paths = derive_directory_paths(&directory_rows);
+    let mut seeds_by_version = BTreeMap::<String, Vec<(String, String)>>::new();
+    for row in directory_rows {
+        if let Some(path) = paths.get(&(row.live.version_id.clone(), row.id.clone())) {
+            seeds_by_version
+                .entry(row.live.version_id.clone())
+                .or_default()
+                .push((path.clone(), row.id));
+        }
+    }
+    Ok(seeds_by_version)
 }
 
 fn lix_directory_record_batch(
@@ -1489,6 +1733,17 @@ fn dml_count_batch(schema: SchemaRef, count: u64) -> Result<RecordBatch> {
     .map_err(DataFusionError::from)
 }
 
+fn record_batch_has_non_null_column(batch: &RecordBatch, column_name: &str) -> Result<bool> {
+    for row_index in 0..batch.num_rows() {
+        if optional_scalar_value(batch, row_index, column_name)?
+            .is_some_and(|value| !value.is_null())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn reject_read_only_lix_directory_insert_field(
     batch: &RecordBatch,
     row_index: usize,
@@ -1653,14 +1908,18 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
 
-    use crate::live_state::LiveRow;
+    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::LixError;
 
     use super::{
-        derive_directory_path_for, lix_directory_by_version_schema, lix_directory_record_batch,
-        lix_directory_write_rows_from_batch, DirectoryDescriptorRecord, LixDirectoryInsertSink,
+        derive_directory_path_for, directory_path_seeds_from_live_rows,
+        lix_directory_by_version_schema, lix_directory_record_batch,
+        lix_directory_recursive_delete_rows_from_batch, lix_directory_write_rows_from_batch,
+        lix_directory_write_rows_from_batch_with_path_resolvers, DirectoryDescriptorRecord,
+        LixDirectoryInsertSink,
     };
+    use crate::sql2::filesystem_visibility::VisibleFilesystem;
 
     #[derive(Default)]
     struct CapturingWriteStager {
@@ -1675,11 +1934,46 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RowsLiveStateContext {
+        rows: Vec<LiveRow>,
+    }
+
+    #[async_trait]
+    impl LiveStateContext for RowsLiveStateContext {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+            Ok(self.rows.clone())
+        }
+
+        async fn load_exact(
+            &self,
+            _request: &ExactRowRequest,
+        ) -> Result<Option<LiveRow>, LixError> {
+            Ok(None)
+        }
+    }
+
     fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveRow {
+        live_filesystem_row(
+            entity_id,
+            super::DIRECTORY_SCHEMA_KEY,
+            None,
+            version_id,
+            snapshot_content,
+        )
+    }
+
+    fn live_filesystem_row(
+        entity_id: &str,
+        schema_key: &str,
+        file_id: Option<&str>,
+        version_id: &str,
+        snapshot_content: &str,
+    ) -> LiveRow {
         LiveRow {
             entity_id: entity_id.to_string(),
-            schema_key: super::DIRECTORY_SCHEMA_KEY.to_string(),
-            file_id: None,
+            schema_key: schema_key.to_string(),
+            file_id: file_id.map(ToOwned::to_owned),
             plugin_key: None,
             snapshot_content: Some(snapshot_content.to_string()),
             metadata: Some("{\"source\":\"test\"}".to_string()),
@@ -1692,6 +1986,46 @@ mod tests {
             created_at: Some("2026-04-23T00:00:00Z".to_string()),
             updated_at: Some("2026-04-23T01:00:00Z".to_string()),
         }
+    }
+
+    fn filesystem_rows() -> Vec<LiveRow> {
+        vec![
+            live_filesystem_row(
+                "dir-docs",
+                "lix_directory_descriptor",
+                None,
+                "version-a",
+                r#"{"id":"dir-docs","parent_id":null,"name":"docs","hidden":false}"#,
+            ),
+            live_filesystem_row(
+                "dir-guides",
+                "lix_directory_descriptor",
+                None,
+                "version-a",
+                r#"{"id":"dir-guides","parent_id":"dir-docs","name":"guides","hidden":false}"#,
+            ),
+            live_filesystem_row(
+                "file-index",
+                "lix_file_descriptor",
+                None,
+                "version-a",
+                r#"{"id":"file-index","directory_id":"dir-docs","name":"index","extension":"md","hidden":false}"#,
+            ),
+            live_filesystem_row(
+                "file-readme",
+                "lix_file_descriptor",
+                None,
+                "version-a",
+                r#"{"id":"file-readme","directory_id":"dir-guides","name":"readme","extension":"md","hidden":false}"#,
+            ),
+            live_filesystem_row(
+                "file-readme",
+                "lix_binary_blob_ref",
+                Some("file-readme"),
+                "version-a",
+                r#"{"id":"file-readme","blob_hash":"abc123","size_bytes":5}"#,
+            ),
+        ]
     }
 
     fn string_column(values: Vec<Option<&str>>) -> ArrayRef {
@@ -1721,6 +2055,38 @@ mod tests {
         }
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .expect("directory insert batch should build")
+    }
+
+    fn directory_path_insert_batch(path: &str) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("path", DataType::Utf8, true),
+                Field::new("hidden", DataType::Boolean, false),
+                Field::new("lixcol_version_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(vec![Some("dir-nested")]),
+                string_column(vec![Some(path)]),
+                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
+                string_column(vec![Some("version-a")]),
+            ],
+        )
+        .expect("directory path insert batch should build")
+    }
+
+    fn directory_delete_batch(ids: &[&str]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Utf8, false),
+                Field::new("lixcol_version_id", DataType::Utf8, false),
+            ])),
+            vec![
+                string_column(ids.iter().copied().map(Some).collect::<Vec<_>>()),
+                string_column(vec![Some("version-a"); ids.len()]),
+            ],
+        )
+        .expect("directory delete batch should build")
     }
 
     #[test]
@@ -1852,32 +2218,96 @@ mod tests {
     }
 
     #[test]
-    fn directory_insert_rejects_non_null_path() {
-        let batch = RecordBatch::try_new(
-            Arc::new(Schema::new(vec![
-                Field::new("id", DataType::Utf8, false),
-                Field::new("path", DataType::Utf8, true),
-                Field::new("parent_id", DataType::Utf8, true),
-                Field::new("name", DataType::Utf8, false),
-                Field::new("hidden", DataType::Boolean, false),
-            ])),
-            vec![
-                string_column(vec![Some("dir-docs")]),
-                string_column(vec![Some("/docs/")]),
-                string_column(vec![None]),
-                string_column(vec![Some("docs")]),
-                Arc::new(BooleanArray::from(vec![false])) as ArrayRef,
-            ],
+    fn directory_path_insert_reuses_existing_parent_descriptor() {
+        let existing_rows = vec![live_row(
+            "dir-docs",
+            "version-a",
+            "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
+        )];
+        let seeds = directory_path_seeds_from_live_rows(existing_rows)
+            .expect("existing directory rows should seed paths");
+        let mut resolvers = BTreeMap::new();
+        for (version_id, seeds) in seeds {
+            resolvers.insert(
+                version_id,
+                super::DirectoryPathResolver::from_existing(seeds)
+                    .expect("directory path resolver should seed"),
+            );
+        }
+
+        let rows = lix_directory_write_rows_from_batch_with_path_resolvers(
+            &directory_path_insert_batch("/docs/nested/"),
+            None,
+            &mut resolvers,
         )
-        .expect("directory insert batch should build");
+        .expect("directory path batch should decode");
 
-        let error = lix_directory_write_rows_from_batch(&batch, Some("version-a"))
-            .expect_err("path is read-only");
+        assert_eq!(rows.len(), 1);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["id"], "dir-nested");
+        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "nested");
+    }
 
-        assert!(
-            error.to_string().contains("read-only column 'path'"),
-            "unexpected error: {error}"
+    #[test]
+    fn recursive_directory_delete_deletes_nested_dirs_files_and_blob_refs() {
+        let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
+            .expect("visible filesystem should build");
+        let mut visible_filesystems = BTreeMap::new();
+        visible_filesystems.insert("version-a".to_string(), visible_filesystem);
+
+        let (rows, count) = lix_directory_recursive_delete_rows_from_batch(
+            &directory_delete_batch(&["dir-docs"]),
+            None,
+            &visible_filesystems,
+        )
+        .expect("recursive directory delete should plan");
+
+        assert_eq!(count, 1);
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.schema_key.as_str(), row.entity_id.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("lix_file_descriptor", "file-readme"),
+                ("lix_binary_blob_ref", "file-readme"),
+                ("lix_directory_descriptor", "dir-guides"),
+                ("lix_file_descriptor", "file-index"),
+                ("lix_directory_descriptor", "dir-docs"),
+            ]
         );
+        assert!(rows.iter().all(|row| row.snapshot_content.is_none()));
+    }
+
+    #[test]
+    fn recursive_directory_delete_dedupes_overlapping_parent_and_child() {
+        let visible_filesystem = VisibleFilesystem::from_live_rows(filesystem_rows())
+            .expect("visible filesystem should build");
+        let mut visible_filesystems = BTreeMap::new();
+        visible_filesystems.insert("version-a".to_string(), visible_filesystem);
+
+        let (rows, count) = lix_directory_recursive_delete_rows_from_batch(
+            &directory_delete_batch(&["dir-docs", "dir-guides"]),
+            None,
+            &visible_filesystems,
+        )
+        .expect("recursive directory delete should plan");
+
+        assert_eq!(count, 2);
+        let identities = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.schema_key.clone(),
+                    row.entity_id.clone(),
+                    row.file_id.clone(),
+                    row.version_id.clone(),
+                )
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(identities.len(), rows.len());
+        assert_eq!(rows.len(), 5);
     }
 
     #[tokio::test]
@@ -1886,6 +2316,7 @@ mod tests {
         let batch = directory_insert_batch(true, false);
         let sink = LixDirectoryInsertSink::new(
             batch.schema(),
+            Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
             None,
         );
@@ -1923,5 +2354,43 @@ mod tests {
                 }]
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn directory_insert_sink_seeds_path_resolver_from_live_state() {
+        let stager = Arc::new(CapturingWriteStager::default());
+        let batch = directory_path_insert_batch("/docs/nested/");
+        let sink = LixDirectoryInsertSink::new(
+            batch.schema(),
+            Arc::new(RowsLiveStateContext {
+                rows: vec![live_row(
+                    "dir-docs",
+                    "version-a",
+                    "{\"id\":\"dir-docs\",\"parent_id\":null,\"name\":\"docs\",\"hidden\":false}",
+                )],
+            }) as Arc<dyn LiveStateContext>,
+            Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            None,
+        );
+        let stream = stream::iter(vec![Ok(batch)]);
+        let stream: SendableRecordBatchStream =
+            Box::pin(RecordBatchStreamAdapter::new(sink.schema().clone(), stream));
+
+        let count = sink
+            .write_all(stream, &Arc::new(TaskContext::default()))
+            .await
+            .expect("directory sink should stage path write");
+
+        assert_eq!(count, 1);
+        let guard = stager.writes.lock().expect("writes lock");
+        let [SqlWriteIntent::WriteRows { rows }] = guard.as_slice() else {
+            panic!("expected one directory write intent");
+        };
+        assert_eq!(rows.len(), 1);
+        let snapshot: serde_json::Value =
+            serde_json::from_str(rows[0].snapshot_content.as_deref().unwrap()).unwrap();
+        assert_eq!(snapshot["id"], "dir-nested");
+        assert_eq!(snapshot["parent_id"], "dir-docs");
+        assert_eq!(snapshot["name"], "nested");
     }
 }

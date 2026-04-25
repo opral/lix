@@ -5,7 +5,7 @@ use async_trait::async_trait;
 
 use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
 use crate::live_state::{ExactRowRequest, LiveRow, LiveStateScanRequest};
-use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
+use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
 use crate::{LixError, NullableKeyFilter};
 
 /// Transaction-local writes decoded by DataFusion provider hooks.
@@ -17,18 +17,34 @@ use crate::{LixError, NullableKeyFilter};
 #[derive(Default)]
 pub(crate) struct TransactionStagedWrites {
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StateRow>>,
+    file_data_writes: Mutex<Vec<FileDataWrite>>,
+}
+
+/// Drained transaction-local writes ready for commit.
+pub(crate) struct StagedWriteSet {
+    pub(crate) state_rows: Vec<StateRow>,
+    pub(crate) file_data_writes: Vec<FileDataWrite>,
 }
 
 impl TransactionStagedWrites {
     /// Drains staged writes for commit.
-    pub(crate) fn drain(&self) -> Result<Vec<StateRow>, LixError> {
-        let mut guard = self.rows.lock().map_err(|_| {
+    pub(crate) fn drain(&self) -> Result<StagedWriteSet, LixError> {
+        let mut rows_guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
                 "failed to acquire transaction staged writes lock",
             )
         })?;
-        Ok(std::mem::take(&mut *guard).into_values().collect())
+        let mut file_data_guard = self.file_data_writes.lock().map_err(|_| {
+            LixError::new(
+                "LIX_ERROR_UNKNOWN",
+                "failed to acquire transaction staged file data lock",
+            )
+        })?;
+        Ok(StagedWriteSet {
+            state_rows: std::mem::take(&mut *rows_guard).into_values().collect(),
+            file_data_writes: std::mem::take(&mut *file_data_guard),
+        })
     }
 
     /// Builds the transaction-local read overlay from currently staged writes.
@@ -51,7 +67,7 @@ impl SqlWriteStager for TransactionStagedWrites {
             SqlWriteIntent::WriteRows { rows } => rows.len() as u64,
             SqlWriteIntent::WriteRowsWithFileData { count, .. } => *count,
         };
-        let rows = state_rows_from_write_intent(write, &mut functions)?;
+        let (rows, file_data_writes) = state_rows_from_write_intent(write, &mut functions)?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -60,6 +76,17 @@ impl SqlWriteStager for TransactionStagedWrites {
         })?;
         for row in rows {
             guard.insert(StagedStateRowIdentity::from(&row), row);
+        }
+        if !file_data_writes.is_empty() {
+            self.file_data_writes
+                .lock()
+                .map_err(|_| {
+                    LixError::new(
+                        "LIX_ERROR_UNKNOWN",
+                        "failed to acquire transaction staged file data lock",
+                    )
+                })?
+                .extend(file_data_writes);
         }
         Ok(SqlWriteOutcome { count })
     }
@@ -182,8 +209,9 @@ impl From<&StateRow> for StagedStateRowIdentity {
 fn state_rows_from_write_intent(
     write: SqlWriteIntent,
     functions: &mut dyn LixFunctionProvider,
-) -> Result<Vec<StateRow>, LixError> {
+) -> Result<(Vec<StateRow>, Vec<FileDataWrite>), LixError> {
     let mut state_rows = Vec::new();
+    let mut file_data_writes = Vec::new();
     match write {
         SqlWriteIntent::WriteRows { rows } => {
             push_state_rows(&mut state_rows, rows, functions)?;
@@ -191,13 +219,11 @@ fn state_rows_from_write_intent(
         SqlWriteIntent::WriteRowsWithFileData {
             rows, file_data, ..
         } => {
-            // TODO(engine2): persist staged file payloads alongside the state
-            // rows when file writes move to the native commit path.
-            let _ = file_data;
             push_state_rows(&mut state_rows, rows, functions)?;
+            file_data_writes.extend(file_data);
         }
     }
-    Ok(state_rows)
+    Ok((state_rows, file_data_writes))
 }
 
 fn push_state_rows(
@@ -451,17 +477,43 @@ mod tests {
 
         let drained = staged_writes.drain().expect("drain should succeed");
 
-        assert_eq!(drained.len(), 2);
-        assert!(drained.iter().any(|row| {
+        assert_eq!(drained.state_rows.len(), 2);
+        assert!(drained.state_rows.iter().any(|row| {
             row.entity_id == "sql2-key-a"
                 && row.snapshot_content.as_deref()
                     == Some("{\"key\":\"sql2-key-a\",\"value\":\"second\"}")
         }));
-        assert!(drained.iter().any(|row| {
+        assert!(drained.state_rows.iter().any(|row| {
             row.entity_id == "sql2-key-b"
                 && row.snapshot_content.as_deref()
                     == Some("{\"key\":\"sql2-key-b\",\"value\":\"only\"}")
         }));
+    }
+
+    #[tokio::test]
+    async fn staged_writes_drain_preserves_file_data_payloads() {
+        let staged_writes = TransactionStagedWrites::default();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRowsWithFileData {
+                rows: vec![state_row("file-readme", "descriptor")],
+                file_data: vec![FileDataWrite {
+                    file_id: "file-readme".to_string(),
+                    version_id: "global".to_string(),
+                    untracked: true,
+                    data: b"hello".to_vec(),
+                }],
+                count: 1,
+            })
+            .await
+            .expect("staging rows with file data should succeed");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+
+        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(drained.file_data_writes.len(), 1);
+        assert_eq!(drained.file_data_writes[0].file_id, "file-readme");
+        assert_eq!(drained.file_data_writes[0].data, b"hello");
     }
 
     #[tokio::test]
