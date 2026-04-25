@@ -3,10 +3,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
+use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
 use crate::engine2::transaction::staging::{
     StagedExactRow, StagedStateRowIdentity, StagedStateRowOverlay,
 };
-use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+use crate::sql2::StateRow;
 use crate::LixError;
 
 /// Live-state view for one engine2 write transaction.
@@ -27,16 +28,16 @@ impl TransactionLiveStateContext {
 
 #[async_trait]
 impl LiveStateContext for TransactionLiveStateContext {
-    async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+    async fn scan_rows(&self, request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
         let mut rows = self.staged.scan(request);
         let hidden_identities = self.staged.identities_matching_scan(request);
         let mut visible_identities = rows
             .iter()
-            .map(staged_identity_from_live_row)
+            .map(StagedStateRowIdentity::from)
             .collect::<BTreeSet<_>>();
 
-        for row in self.committed.scan(request).await? {
-            let identity = staged_identity_from_live_row(&row);
+        for row in self.committed.scan_rows(request).await? {
+            let identity = StagedStateRowIdentity::from(&row);
             if hidden_identities.contains(&identity) {
                 continue;
             }
@@ -51,15 +52,11 @@ impl LiveStateContext for TransactionLiveStateContext {
         Ok(rows)
     }
 
-    async fn load_exact(&self, request: &ExactRowRequest) -> Result<Option<LiveRow>, LixError> {
+    async fn load_row(&self, request: &LiveStateRowRequest) -> Result<Option<StateRow>, LixError> {
         match self.staged.load_exact(request) {
             Some(StagedExactRow::Row(row)) => Ok(Some(row)),
             Some(StagedExactRow::Tombstone) => Ok(None),
-            None => self.committed.load_exact(request).await,
+            None => self.committed.load_row(request).await,
         }
     }
-}
-
-fn staged_identity_from_live_row(row: &LiveRow) -> StagedStateRowIdentity {
-    StagedStateRowIdentity::from_live_row(row)
 }

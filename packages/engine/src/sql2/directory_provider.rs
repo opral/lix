@@ -26,12 +26,12 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
+use crate::engine2::live_state::{
+    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+};
 use crate::functions::DynFunctionProvider;
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
-};
-use crate::live_state::{
-    LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::LixError;
@@ -546,7 +546,7 @@ impl ExecutionPlan for LixDirectoryDeleteExec {
 
         let stream = stream::once(async move {
             let rows = live_state
-                .scan(&request)
+                .scan_rows(&request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_directory_record_batch(&table_schema, rows)
@@ -706,7 +706,7 @@ impl ExecutionPlan for LixDirectoryUpdateExec {
 
         let stream = stream::once(async move {
             let rows = live_state
-                .scan(&request)
+                .scan_rows(&request)
                 .await
                 .map_err(lix_error_to_datafusion_error)?;
             let source_batch = lix_directory_record_batch(&table_schema, rows)
@@ -832,7 +832,7 @@ impl ExecutionPlan for LixDirectoryScanExec {
         let schema = Arc::clone(&self.schema);
         let batch_schema = Arc::clone(&schema);
         let fut = async move {
-            let rows = live_state.scan(&request).await.map_err(|error| {
+            let rows = live_state.scan_rows(&request).await.map_err(|error| {
                 DataFusionError::Execution(format!("sql2 lix_directory scan failed: {error}"))
             })?;
             let batch = lix_directory_record_batch(&batch_schema, rows).map_err(|error| {
@@ -980,7 +980,7 @@ struct DirectoryDescriptorRecord {
     parent_id: Option<String>,
     name: String,
     hidden: bool,
-    live: LiveRow,
+    live: StateRow,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1398,7 +1398,7 @@ async fn directory_path_resolvers_from_live_state(
     default_version_id: Option<&str>,
 ) -> std::result::Result<BTreeMap<String, DirectoryPathResolver>, LixError> {
     let rows = live_state
-        .scan(&LiveStateScanRequest {
+        .scan_rows(&LiveStateScanRequest {
             filter: LiveStateFilter {
                 schema_keys: vec![DIRECTORY_SCHEMA_KEY.to_string()],
                 version_ids: default_version_id
@@ -1424,7 +1424,7 @@ async fn directory_path_resolvers_from_live_state(
 }
 
 fn directory_path_seeds_from_live_rows(
-    rows: Vec<LiveRow>,
+    rows: Vec<StateRow>,
 ) -> std::result::Result<BTreeMap<String, Vec<(String, String)>>, LixError> {
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
     for row in rows {
@@ -1465,7 +1465,7 @@ fn directory_path_seeds_from_live_rows(
 
 fn lix_directory_record_batch(
     schema: &SchemaRef,
-    rows: Vec<LiveRow>,
+    rows: Vec<StateRow>,
 ) -> Result<RecordBatch, LixError> {
     let mut directory_rows = Vec::<DirectoryDescriptorRecord>::new();
 
@@ -1526,7 +1526,7 @@ fn lix_directory_record_batch(
         schema_keys.push(Some(directory.live.schema_key));
         file_ids.push(directory.live.file_id);
         plugin_keys.push(directory.live.plugin_key);
-        schema_versions.push(Some(directory.live.schema_version));
+        schema_versions.push(directory.live.schema_version);
         globals.push(Some(directory.live.global));
         change_ids.push(directory.live.change_id);
         created_ats.push(directory.live.created_at);
@@ -1938,10 +1938,11 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
 
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
-    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+    use crate::sql2::StateRow;
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::LixError;
 
@@ -1980,24 +1981,24 @@ mod tests {
 
     #[derive(Default)]
     struct RowsLiveStateContext {
-        rows: Vec<LiveRow>,
+        rows: Vec<StateRow>,
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> LiveRow {
+    fn live_row(entity_id: &str, version_id: &str, snapshot_content: &str) -> StateRow {
         live_filesystem_row(
             entity_id,
             super::DIRECTORY_SCHEMA_KEY,
@@ -2013,8 +2014,8 @@ mod tests {
         file_id: Option<&str>,
         version_id: &str,
         snapshot_content: &str,
-    ) -> LiveRow {
-        LiveRow {
+    ) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: schema_key.to_string(),
             file_id: file_id.map(ToOwned::to_owned),
@@ -2032,7 +2033,7 @@ mod tests {
         }
     }
 
-    fn filesystem_rows() -> Vec<LiveRow> {
+    fn filesystem_rows() -> Vec<StateRow> {
         vec![
             live_filesystem_row(
                 "dir-docs",

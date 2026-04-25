@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 
 use crate::backend::{
-    ImageChunkReader, ImageChunkWriter, KvPair, KvScanRange, PreparedBatch, TransactionBackendAdapter,
-    TransactionBeginMode,
+    ImageChunkReader, ImageChunkWriter, KvPair, KvScanRange, PreparedBatch,
+    TransactionBackendAdapter, TransactionBeginMode,
 };
 use crate::common::SqlDialect;
 use crate::{LixError, QueryResult, Value};
@@ -165,7 +165,12 @@ pub trait LixBackendTransaction: Send + Sync {
     }
 
     /// Writes one key/value pair inside this transaction.
-    async fn kv_put(&mut self, _namespace: &str, _key: &[u8], _value: &[u8]) -> Result<(), LixError> {
+    async fn kv_put(
+        &mut self,
+        _namespace: &str,
+        _key: &[u8],
+        _value: &[u8],
+    ) -> Result<(), LixError> {
         Err(kv_not_supported("transaction kv_put"))
     }
 

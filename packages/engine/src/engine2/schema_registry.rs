@@ -3,10 +3,9 @@ use std::sync::Arc;
 
 use serde_json::Value as JsonValue;
 
-use crate::live_state::{
-    decode_registered_schema_row, LiveStateContext, LiveStateFilter, LiveStateScanRequest,
-};
+use crate::engine2::live_state::{LiveStateContext, LiveStateFilter, LiveStateScanRequest};
 use crate::schema::{builtin_schema_definition, builtin_schema_keys, schema_key_from_definition};
+use crate::sql2::StateRow;
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
 
@@ -34,7 +33,7 @@ impl SchemaRegistry {
         let mut schemas = builtin_schema_definitions()?;
         for version_id in [GLOBAL_VERSION_ID, version_id] {
             for row in live_state
-                .scan(&LiveStateScanRequest {
+                .scan_rows(&LiveStateScanRequest {
                     filter: LiveStateFilter {
                         schema_keys: vec![REGISTERED_SCHEMA_KEY.to_string()],
                         version_ids: vec![version_id.to_string()],
@@ -91,13 +90,46 @@ fn schema_key_is_older(
     }
 }
 
+fn decode_registered_schema_row(
+    row: &StateRow,
+) -> Result<Option<(crate::schema::SchemaKey, JsonValue)>, LixError> {
+    if row.schema_key != REGISTERED_SCHEMA_KEY {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "expected lix_registered_schema row, got schema_key={}",
+                row.schema_key
+            ),
+        ));
+    }
+
+    let Some(snapshot_content) = row.snapshot_content.as_deref() else {
+        return Ok(None);
+    };
+
+    let snapshot: JsonValue = serde_json::from_str(snapshot_content).map_err(|err| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!("invalid registered schema snapshot JSON: {err}"),
+        )
+    })?;
+    let schema = snapshot.get("value").cloned().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            "registered schema snapshot missing value",
+        )
+    })?;
+    let key = schema_key_from_definition(&schema)?;
+    Ok(Some((key, schema)))
+}
+
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
     use serde_json::json;
 
     use super::*;
-    use crate::live_state::{ExactRowRequest, LiveRow};
+    use crate::engine2::live_state::LiveStateRowRequest;
 
     #[tokio::test]
     async fn visible_schemas_include_builtin_registered_schema() {
@@ -137,18 +169,21 @@ mod tests {
     }
 
     struct RowsLiveStateContext {
-        rows: Vec<LiveRow>,
+        rows: Vec<StateRow>,
     }
 
     impl RowsLiveStateContext {
-        fn new(rows: Vec<LiveRow>) -> Self {
+        fn new(rows: Vec<StateRow>) -> Self {
             Self { rows }
         }
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan_rows(
+            &self,
+            request: &LiveStateScanRequest,
+        ) -> Result<Vec<StateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -164,20 +199,20 @@ mod tests {
                 .collect())
         }
 
-        async fn load_exact(
+        async fn load_row(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn registered_schema_row(schema_key: &str, schema_version: &str) -> LiveRow {
-        LiveRow {
+    fn registered_schema_row(schema_key: &str, schema_version: &str) -> StateRow {
+        StateRow {
             entity_id: format!("{schema_key}~{schema_version}"),
             file_id: None,
             schema_key: REGISTERED_SCHEMA_KEY.to_string(),
-            schema_version: "1".to_string(),
+            schema_version: Some("1".to_string()),
             version_id: GLOBAL_VERSION_ID.to_string(),
             plugin_key: None,
             metadata: None,

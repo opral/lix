@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 
-use crate::live_state::{LiveRow, LiveStateContext, LiveStateFilter, LiveStateScanRequest};
+use crate::engine2::live_state::{LiveStateContext, LiveStateFilter, LiveStateScanRequest};
+use crate::sql2::StateRow;
 use crate::LixError;
 
 use super::filesystem_planner::{
@@ -34,7 +35,7 @@ impl VisibleFilesystem {
         version_id: &str,
     ) -> Result<Self, LixError> {
         let rows = live_state
-            .scan(&LiveStateScanRequest {
+            .scan_rows(&LiveStateScanRequest {
                 filter: LiveStateFilter {
                     schema_keys: vec![
                         DIRECTORY_DESCRIPTOR_SCHEMA_KEY.to_string(),
@@ -52,7 +53,7 @@ impl VisibleFilesystem {
 
     /// Builds filesystem lookup indexes from rows that are already known to be
     /// transaction-visible.
-    pub(crate) fn from_live_rows(rows: Vec<LiveRow>) -> Result<Self, LixError> {
+    pub(crate) fn from_live_rows(rows: Vec<StateRow>) -> Result<Self, LixError> {
         let mut visible = Self::default();
 
         for row in rows {
@@ -183,7 +184,7 @@ struct BlobRefSnapshot {
     size_bytes: Option<u64>,
 }
 
-fn filesystem_row_context(row: &LiveRow) -> FilesystemRowContext {
+fn filesystem_row_context(row: &StateRow) -> FilesystemRowContext {
     FilesystemRowContext {
         version_id: row.version_id.clone(),
         global: row.global,
@@ -191,7 +192,7 @@ fn filesystem_row_context(row: &LiveRow) -> FilesystemRowContext {
         file_id: row.file_id.clone(),
         plugin_key: row.plugin_key.clone(),
         metadata: row.metadata.clone(),
-        schema_version: Some(row.schema_version.clone()),
+        schema_version: row.schema_version.clone(),
     }
 }
 
@@ -199,7 +200,8 @@ fn filesystem_row_context(row: &LiveRow) -> FilesystemRowContext {
 mod tests {
     use async_trait::async_trait;
 
-    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::sql2::StateRow;
     use crate::LixError;
 
     use super::{
@@ -285,17 +287,17 @@ mod tests {
         assert_eq!(blob_ref.size_bytes, Some(5));
     }
 
-    fn live_state(rows: Vec<LiveRow>) -> std::sync::Arc<dyn LiveStateContext> {
+    fn live_state(rows: Vec<StateRow>) -> std::sync::Arc<dyn LiveStateContext> {
         std::sync::Arc::new(RowsLiveStateContext { rows })
     }
 
     struct RowsLiveStateContext {
-        rows: Vec<LiveRow>,
+        rows: Vec<StateRow>,
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(self
                 .rows
                 .iter()
@@ -311,13 +313,13 @@ mod tests {
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
 
-    fn directory_row(entity_id: &str, snapshot_content: &str) -> LiveRow {
+    fn directory_row(entity_id: &str, snapshot_content: &str) -> StateRow {
         live_row(
             entity_id,
             DIRECTORY_DESCRIPTOR_SCHEMA_KEY,
@@ -326,7 +328,7 @@ mod tests {
         )
     }
 
-    fn file_row(entity_id: &str, snapshot_content: &str) -> LiveRow {
+    fn file_row(entity_id: &str, snapshot_content: &str) -> StateRow {
         live_row(
             entity_id,
             FILE_DESCRIPTOR_SCHEMA_KEY,
@@ -335,7 +337,7 @@ mod tests {
         )
     }
 
-    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> LiveRow {
+    fn blob_ref_row(entity_id: &str, snapshot_content: &str) -> StateRow {
         live_row(
             entity_id,
             BLOB_REF_SCHEMA_KEY,
@@ -349,8 +351,8 @@ mod tests {
         schema_key: &str,
         file_id: Option<String>,
         snapshot_content: &str,
-    ) -> LiveRow {
-        LiveRow {
+    ) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: schema_key.to_string(),
             file_id,

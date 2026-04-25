@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
+use crate::engine2::live_state::CommittedLiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::session::Session;
-use crate::live_state::CommittedLiveStateContext;
 use crate::{LixBackend, LixError};
 
 #[derive(Clone)]

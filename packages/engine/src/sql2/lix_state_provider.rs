@@ -25,8 +25,8 @@ use datafusion::prelude::SessionContext;
 use datafusion::scalar::ScalarValue;
 use futures_util::{stream, StreamExt, TryStreamExt};
 
-use crate::live_state::{
-    LiveRow, LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
+use crate::engine2::live_state::{
+    LiveStateContext, LiveStateFilter, LiveStateProjection, LiveStateScanRequest,
 };
 use crate::version::GLOBAL_VERSION_ID;
 use crate::{LixError, NullableKeyFilter};
@@ -456,7 +456,7 @@ impl ExecutionPlan for LixStateDeleteExec {
                 Vec::new()
             } else {
                 live_state
-                    .scan(&request)
+                    .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -607,7 +607,7 @@ impl ExecutionPlan for LixStateUpdateExec {
                 Vec::new()
             } else {
                 live_state
-                    .scan(&request)
+                    .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -973,7 +973,7 @@ impl ExecutionPlan for LixStateScanExec {
                 Vec::new()
             } else {
                 live_state
-                    .scan(&request)
+                    .scan_rows(&request)
                     .await
                     .map_err(lix_error_to_datafusion_error)?
             };
@@ -1283,7 +1283,7 @@ fn is_null_literal(expr: &Expr) -> bool {
     matches!(expr, Expr::Literal(ScalarValue::Null, _))
 }
 
-fn lix_state_record_batch(schema: SchemaRef, rows: &[LiveRow]) -> Result<RecordBatch, LixError> {
+fn lix_state_record_batch(schema: SchemaRef, rows: &[StateRow]) -> Result<RecordBatch, LixError> {
     if schema.fields().is_empty() {
         let options = RecordBatchOptions::new().with_row_count(Some(rows.len()));
         return RecordBatch::try_new_with_options(schema, vec![], &options).map_err(|error| {
@@ -1308,7 +1308,7 @@ fn lix_state_record_batch(schema: SchemaRef, rows: &[LiveRow]) -> Result<RecordB
                 }
                 "metadata" => string_array(rows.iter().map(|row| row.metadata.as_deref())),
                 "schema_version" => {
-                    string_array(rows.iter().map(|row| Some(row.schema_version.as_str())))
+                    string_array(rows.iter().map(|row| row.schema_version.as_deref()))
                 }
                 "created_at" => string_array(rows.iter().map(|row| row.created_at.as_deref())),
                 "updated_at" => string_array(rows.iter().map(|row| row.updated_at.as_deref())),
@@ -1376,7 +1376,8 @@ mod tests {
         LixStateDeleteExec, LixStateFilterPredicate, LixStateInsertSink, LixStateProvider,
         LixStateUpdateExec,
     };
-    use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
+    use crate::sql2::StateRow;
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{LixError, NullableKeyFilter};
@@ -1407,7 +1408,7 @@ mod tests {
 
     struct EmptyLiveStateContext;
     struct RowsLiveStateContext {
-        rows: Vec<LiveRow>,
+        rows: Vec<StateRow>,
     }
     struct DummyWriteStager;
     #[derive(Default)]
@@ -1504,28 +1505,28 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for EmptyLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
@@ -1613,8 +1614,8 @@ mod tests {
         .expect("valid stageable lix_state batch")
     }
 
-    fn live_row(entity_id: &str, metadata: Option<&str>) -> LiveRow {
-        LiveRow {
+    fn live_row(entity_id: &str, metadata: Option<&str>) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,

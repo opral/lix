@@ -1,5 +1,6 @@
 use crate::binary_cas::BinaryBlobWrite;
-use crate::engine2::transaction::staging::{StagedStateRowOverlay, StagedWriteSet};
+use crate::engine2::live_state::write_state_rows;
+use crate::engine2::transaction::staging::StagedWriteSet;
 use crate::{LixBackendTransaction, LixError};
 
 /// Flushes transaction-staged state rows into live_state.
@@ -28,10 +29,9 @@ pub(crate) async fn commit_staged_writes(
         crate::binary_cas::persist_blob_writes_in_transaction(transaction, &blob_writes).await?;
     }
 
-    let live_rows = StagedStateRowOverlay::into_live_rows(staged_writes.state_rows)?;
-    if live_rows.is_empty() {
+    if staged_writes.state_rows.is_empty() {
         return Ok(());
     }
 
-    crate::live_state::write_live_rows(transaction, &live_rows).await
+    write_state_rows(transaction, &staged_writes.state_rows).await
 }

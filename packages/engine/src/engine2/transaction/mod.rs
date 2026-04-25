@@ -5,11 +5,12 @@ use serde_json::Value as JsonValue;
 
 use crate::backend::TransactionBeginMode;
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::live_state::CommittedLiveStateContext;
+use crate::engine2::live_state::LiveStateContext;
 use crate::engine2::schema_registry::SchemaRegistry;
 use crate::engine2::transaction::live_state_overlay::TransactionLiveStateContext;
 use crate::engine2::transaction::staging::TransactionStagedWrites;
 use crate::functions::DynFunctionProvider;
-use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::{SqlExecutionContext, SqlWriteStager};
 use crate::transaction::TransactionCommitOutcome;
 use crate::{LixBackend, LixBackendTransaction, LixError};

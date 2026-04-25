@@ -5,12 +5,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use lix_engine::engine2::ExecuteResult;
 use lix_engine::wasm::NoopWasmRuntime;
 use lix_engine::{
-    Engine, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError, PreparedBatch,
-    QueryResult, SqlDialect, TransactionBeginMode, Value,
+    Engine, KvPair, KvScanRange, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
+    PreparedBatch, QueryResult, SqlDialect, TransactionBeginMode, Value,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Column, Row, SqlitePool, ValueRef};
 use tokio::sync::OnceCell;
+
+const TEST_KV_TABLE: &str = "lix_internal_kv";
 
 #[test]
 fn session_execute_inserts_key_value_then_reads_it_back() {
@@ -748,6 +750,45 @@ impl LixBackend for SqliteBackend {
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction(TransactionBeginMode::Write).await
     }
+
+    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        let mut transaction = self
+            .begin_transaction(TransactionBeginMode::Deferred)
+            .await?;
+        let result = transaction.kv_get(namespace, key).await;
+        match result {
+            Ok(result) => {
+                transaction.commit().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn kv_scan(
+        &self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        let mut transaction = self
+            .begin_transaction(TransactionBeginMode::Deferred)
+            .await?;
+        let result = transaction.kv_scan(namespace, range, limit).await;
+        match result {
+            Ok(result) => {
+                transaction.commit().await?;
+                Ok(result)
+            }
+            Err(error) => {
+                let _ = transaction.rollback().await;
+                Err(error)
+            }
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -762,6 +803,77 @@ impl LixBackendTransaction for SqliteTransaction {
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         execute_query_with_connection(&mut self.conn, sql, params).await
+    }
+
+    async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        ensure_kv_table(&mut self.conn).await?;
+        let row = sqlx::query(&format!(
+            "SELECT value FROM {TEST_KV_TABLE} WHERE namespace = ?1 AND key = ?2 LIMIT 1"
+        ))
+        .bind(namespace)
+        .bind(key)
+        .fetch_optional(&mut *self.conn)
+        .await
+        .map_err(to_lix_error)?;
+        row.map(|row| row.try_get::<Vec<u8>, _>(0).map_err(to_lix_error))
+            .transpose()
+    }
+
+    async fn kv_scan(
+        &mut self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        ensure_kv_table(&mut self.conn).await?;
+        let rows = sqlx::query(&format!(
+            "SELECT key, value FROM {TEST_KV_TABLE} WHERE namespace = ?1 ORDER BY key"
+        ))
+        .bind(namespace)
+        .fetch_all(&mut *self.conn)
+        .await
+        .map_err(to_lix_error)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let key = row.try_get::<Vec<u8>, _>(0).map_err(to_lix_error)?;
+            if !kv_key_in_range(&key, &range) {
+                continue;
+            }
+            let value = row.try_get::<Vec<u8>, _>(1).map_err(to_lix_error)?;
+            out.push(KvPair::new(key, value));
+            if limit.is_some_and(|limit| out.len() >= limit) {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    async fn kv_put(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), LixError> {
+        ensure_kv_table(&mut self.conn).await?;
+        sqlx::query(&format!(
+            "INSERT INTO {TEST_KV_TABLE} (namespace, key, value) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value"
+        ))
+        .bind(namespace)
+        .bind(key)
+        .bind(value)
+        .execute(&mut *self.conn)
+        .await
+        .map_err(to_lix_error)?;
+        Ok(())
+    }
+
+    async fn kv_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), LixError> {
+        ensure_kv_table(&mut self.conn).await?;
+        sqlx::query(&format!(
+            "DELETE FROM {TEST_KV_TABLE} WHERE namespace = ?1 AND key = ?2"
+        ))
+        .bind(namespace)
+        .bind(key)
+        .execute(&mut *self.conn)
+        .await
+        .map_err(to_lix_error)?;
+        Ok(())
     }
 
     async fn execute_batch(&mut self, batch: &PreparedBatch) -> Result<QueryResult, LixError> {
@@ -877,6 +989,30 @@ fn map_sqlite_value(row: &sqlx::sqlite::SqliteRow, index: usize) -> Result<Value
         return Ok(Value::Blob(value));
     }
     Ok(Value::Null)
+}
+
+async fn ensure_kv_table(
+    conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+) -> Result<(), LixError> {
+    sqlx::query(&format!(
+        "CREATE TABLE IF NOT EXISTS {TEST_KV_TABLE} (\
+         namespace TEXT NOT NULL,\
+         key BLOB NOT NULL,\
+         value BLOB NOT NULL,\
+         PRIMARY KEY(namespace, key)\
+         ) WITHOUT ROWID"
+    ))
+    .execute(&mut **conn)
+    .await
+    .map_err(to_lix_error)?;
+    Ok(())
+}
+
+fn kv_key_in_range(key: &[u8], range: &KvScanRange) -> bool {
+    match range {
+        KvScanRange::Prefix(prefix) => key.starts_with(prefix),
+        KvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
+    }
 }
 
 fn to_lix_error(error: impl std::fmt::Display) -> LixError {

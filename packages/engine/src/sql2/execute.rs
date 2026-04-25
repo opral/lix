@@ -8,9 +8,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::live_state::LiveStateContext;
 use crate::functions::DynFunctionProvider;
 use crate::history::{StateHistoryRequest, StateHistoryRow};
-use crate::live_state::LiveStateContext;
 use crate::sql::{
     MutationOperation, MutationRow, OptionalTextPatch, PlannedFilesystemFile,
     PlannedFilesystemState,
@@ -73,7 +73,7 @@ pub(crate) enum SqlWriteIntent {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct StateRow {
     pub(crate) entity_id: String,
     pub(crate) schema_key: String,
@@ -498,6 +498,7 @@ mod tests {
         SqlWriteStager, StateRow,
     };
     use crate::binary_cas::BlobDataReader;
+    use crate::engine2::live_state::{LiveStateContext, LiveStateRowRequest, LiveStateScanRequest};
     use crate::functions::{
         DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
     };
@@ -505,9 +506,7 @@ mod tests {
         StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
         StateHistoryVersionScope,
     };
-    use crate::live_state::{
-        CommittedLiveStateContext, ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest,
-    };
+    use crate::sql2::StateRow;
     use crate::test_support::boot_test_engine;
     use crate::transaction::{PendingOverlay, PreparedWriteStatementStager, TransactionWriteDelta};
     use crate::{CreateVersionOptions, LixError, Value};
@@ -515,7 +514,7 @@ mod tests {
     struct DummyBlobReader;
     struct DummyLiveStateContext;
     struct RowsLiveStateContext {
-        rows: Vec<LiveRow>,
+        rows: Vec<StateRow>,
     }
     struct RowsHistoryContext {
         rows: Vec<StateHistoryRow>,
@@ -625,28 +624,28 @@ mod tests {
 
     #[async_trait]
     impl LiveStateContext for DummyLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(vec![])
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
 
     #[async_trait]
     impl LiveStateContext for RowsLiveStateContext {
-        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<LiveRow>, LixError> {
+        async fn scan(&self, _request: &LiveStateScanRequest) -> Result<Vec<StateRow>, LixError> {
             Ok(self.rows.clone())
         }
 
         async fn load_exact(
             &self,
-            _request: &ExactRowRequest,
-        ) -> Result<Option<LiveRow>, LixError> {
+            _request: &LiveStateRowRequest,
+        ) -> Result<Option<StateRow>, LixError> {
             Ok(None)
         }
     }
@@ -725,8 +724,8 @@ mod tests {
         }
     }
 
-    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> LiveRow {
-        LiveRow {
+    fn live_lix_state_row(entity_id: &str, metadata: Option<&str>) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_key_value".to_string(),
             file_id: None,
@@ -744,8 +743,8 @@ mod tests {
         }
     }
 
-    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> LiveRow {
-        LiveRow {
+    fn live_entity_row(entity_id: &str, version_id: &str, value: &str) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: "test_state_schema".to_string(),
             file_id: None,
@@ -769,8 +768,8 @@ mod tests {
         parent_id: Option<&str>,
         name: &str,
         hidden: bool,
-    ) -> LiveRow {
-        LiveRow {
+    ) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_directory_descriptor".to_string(),
             file_id: None,
@@ -803,8 +802,8 @@ mod tests {
         name: &str,
         extension: Option<&str>,
         hidden: bool,
-    ) -> LiveRow {
-        LiveRow {
+    ) -> StateRow {
+        StateRow {
             entity_id: entity_id.to_string(),
             schema_key: "lix_file_descriptor".to_string(),
             file_id: None,

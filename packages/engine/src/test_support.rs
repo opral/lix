@@ -15,12 +15,14 @@ use crate::transaction::overlay::PendingOverlay;
 use crate::transaction::{resolve_write_plan_with_functions, TransactionWriteSelectorResolver};
 use crate::wasm::NoopWasmRuntime;
 use crate::{
-    CommittedVersionFrontier, Lix, LixBackend, LixBackendTransaction, LixConfig, LixError,
-    QueryResult, ReplayCursor, Session, SqlDialect, TransactionBeginMode, Value,
+    CommittedVersionFrontier, KvPair, KvScanRange, Lix, LixBackend, LixBackendTransaction,
+    LixConfig, LixError, QueryResult, ReplayCursor, Session, SqlDialect, TransactionBeginMode,
+    Value,
 };
 
 type SqlPredicate = Arc<dyn Fn(&str, &[Value]) -> bool + Send + Sync>;
 const TEST_LIVE_STATE_STATUS_TABLE: &str = "lix_internal_live_state_status";
+const TEST_KV_TABLE: &str = "lix_internal_kv";
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TestSqliteBackendEvent {
@@ -200,6 +202,19 @@ impl LixBackend for TestSqliteBackend {
     ) -> Result<Box<dyn LixBackendTransaction + '_>, LixError> {
         self.begin_transaction(TransactionBeginMode::Write).await
     }
+
+    async fn kv_get(&self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        kv_get_with_connection(&self.connection, namespace, key)
+    }
+
+    async fn kv_scan(
+        &self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        kv_scan_with_connection(&self.connection, namespace, range, limit)
+    }
 }
 
 #[async_trait]
@@ -214,6 +229,27 @@ impl LixBackendTransaction for TestSqliteTransaction {
 
     async fn execute(&mut self, sql: &str, params: &[Value]) -> Result<QueryResult, LixError> {
         execute_with_shared_state(&self.connection, &self.state, sql, params, true).await
+    }
+
+    async fn kv_get(&mut self, namespace: &str, key: &[u8]) -> Result<Option<Vec<u8>>, LixError> {
+        kv_get_with_connection(&self.connection, namespace, key)
+    }
+
+    async fn kv_scan(
+        &mut self,
+        namespace: &str,
+        range: KvScanRange,
+        limit: Option<usize>,
+    ) -> Result<Vec<KvPair>, LixError> {
+        kv_scan_with_connection(&self.connection, namespace, range, limit)
+    }
+
+    async fn kv_put(&mut self, namespace: &str, key: &[u8], value: &[u8]) -> Result<(), LixError> {
+        kv_put_with_connection(&self.connection, namespace, key, value)
+    }
+
+    async fn kv_delete(&mut self, namespace: &str, key: &[u8]) -> Result<(), LixError> {
+        kv_delete_with_connection(&self.connection, namespace, key)
     }
 
     async fn commit(self: Box<Self>) -> Result<(), LixError> {
@@ -576,6 +612,114 @@ fn execute_sql(
     }
 
     Ok(QueryResult { rows: out, columns })
+}
+
+fn kv_get_with_connection(
+    connection: &Arc<Mutex<rusqlite::Connection>>,
+    namespace: &str,
+    key: &[u8],
+) -> Result<Option<Vec<u8>>, LixError> {
+    let connection = connection.lock().expect("sqlite connection lock");
+    ensure_kv_table(&connection)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT value FROM {TEST_KV_TABLE} WHERE namespace = ?1 AND key = ?2 LIMIT 1"
+        ))
+        .map_err(sqlite_error)?;
+    let mut rows = statement
+        .query(rusqlite::params![namespace, key])
+        .map_err(sqlite_error)?;
+    let Some(row) = rows.next().map_err(sqlite_error)? else {
+        return Ok(None);
+    };
+    row.get::<_, Vec<u8>>(0).map(Some).map_err(sqlite_error)
+}
+
+fn kv_scan_with_connection(
+    connection: &Arc<Mutex<rusqlite::Connection>>,
+    namespace: &str,
+    range: KvScanRange,
+    limit: Option<usize>,
+) -> Result<Vec<KvPair>, LixError> {
+    let connection = connection.lock().expect("sqlite connection lock");
+    ensure_kv_table(&connection)?;
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT key, value FROM {TEST_KV_TABLE} WHERE namespace = ?1 ORDER BY key"
+        ))
+        .map_err(sqlite_error)?;
+    let mut rows = statement
+        .query(rusqlite::params![namespace])
+        .map_err(sqlite_error)?;
+    let mut out = Vec::new();
+    while let Some(row) = rows.next().map_err(sqlite_error)? {
+        let key = row.get::<_, Vec<u8>>(0).map_err(sqlite_error)?;
+        if !kv_key_in_range(&key, &range) {
+            continue;
+        }
+        let value = row.get::<_, Vec<u8>>(1).map_err(sqlite_error)?;
+        out.push(KvPair::new(key, value));
+        if limit.is_some_and(|limit| out.len() >= limit) {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn kv_put_with_connection(
+    connection: &Arc<Mutex<rusqlite::Connection>>,
+    namespace: &str,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), LixError> {
+    let connection = connection.lock().expect("sqlite connection lock");
+    ensure_kv_table(&connection)?;
+    connection
+        .execute(
+            &format!(
+                "INSERT INTO {TEST_KV_TABLE} (namespace, key, value) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(namespace, key) DO UPDATE SET value = excluded.value"
+            ),
+            rusqlite::params![namespace, key, value],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn kv_delete_with_connection(
+    connection: &Arc<Mutex<rusqlite::Connection>>,
+    namespace: &str,
+    key: &[u8],
+) -> Result<(), LixError> {
+    let connection = connection.lock().expect("sqlite connection lock");
+    ensure_kv_table(&connection)?;
+    connection
+        .execute(
+            &format!("DELETE FROM {TEST_KV_TABLE} WHERE namespace = ?1 AND key = ?2"),
+            rusqlite::params![namespace, key],
+        )
+        .map_err(sqlite_error)?;
+    Ok(())
+}
+
+fn ensure_kv_table(connection: &rusqlite::Connection) -> Result<(), LixError> {
+    connection
+        .execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {TEST_KV_TABLE} (\
+             namespace TEXT NOT NULL,\
+             key BLOB NOT NULL,\
+             value BLOB NOT NULL,\
+             PRIMARY KEY(namespace, key)\
+             ) WITHOUT ROWID"
+        ))
+        .map_err(sqlite_error)
+}
+
+fn kv_key_in_range(key: &[u8], range: &KvScanRange) -> bool {
+    match range {
+        KvScanRange::Prefix(prefix) => key.starts_with(prefix),
+        KvScanRange::Range { start, end } => key >= start.as_slice() && key < end.as_slice(),
+    }
 }
 
 fn to_sqlite_value(value: &Value) -> SqliteValue {
