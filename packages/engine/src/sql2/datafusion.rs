@@ -41,7 +41,7 @@ use super::entity_view::{
     VARIANT_FIELD_METADATA_VALUE,
 };
 use super::filesystem_view::{PreparedSql2FilesystemViewPlan, Sql2FilesystemViewBaseRelation};
-use super::udf::register_sql2_udfs;
+use super::udf::{register_sql2_udfs, system_sql2_function_provider};
 use crate::binary_cas::BlobDataReader;
 use crate::catalog::SurfaceColumnType;
 use crate::catalog::{
@@ -681,7 +681,7 @@ async fn build_session_for_read_with_borrowed_backend(
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<SessionContext, LixError> {
     let ctx = SessionContext::new();
-    register_sql2_udfs(&ctx);
+    register_sql2_udfs(&ctx, system_sql2_function_provider());
     for surface_name in &artifact.surface_names {
         match surface_name.as_str() {
             "lix_state" => {
@@ -872,7 +872,7 @@ async fn build_session_for_read_with_shared_backend(
     artifact: &PreparedSql2ReadArtifact,
 ) -> Result<SessionContext, LixError> {
     let ctx = SessionContext::new();
-    register_sql2_udfs(&ctx);
+    register_sql2_udfs(&ctx, system_sql2_function_provider());
     let shared_state_snapshot = if artifact
         .surface_names
         .iter()
@@ -1279,7 +1279,7 @@ async fn register_filesystem_view_with_state_snapshot(
     let mut winner_providers = BTreeMap::new();
     for (relation, base_plan) in &spec.base_relation_plans {
         let compile_ctx = SessionContext::new();
-        register_sql2_udfs(&compile_ctx);
+        register_sql2_udfs(&compile_ctx, system_sql2_function_provider());
         let base_provider =
             base_plan.compiled_view_provider(&compile_ctx, Arc::clone(&state_provider))?;
         let winner_provider = base_plan
@@ -1329,7 +1329,7 @@ async fn register_filesystem_view_with_state_snapshot(
             let file_data_provider =
                 materialize_live_file_data_provider(backend, Arc::clone(&blob_provider)).await?;
             let final_ctx = SessionContext::new();
-            register_sql2_udfs(&final_ctx);
+            register_sql2_udfs(&final_ctx, system_sql2_function_provider());
             ctx.register_table(
                 surface_name,
                 spec.compiled_lix_file_view_provider(
@@ -1349,7 +1349,7 @@ async fn register_filesystem_view_with_state_snapshot(
                 .cloned()
                 .expect("filesystem directory view should have directory winner provider");
             let final_ctx = SessionContext::new();
-            register_sql2_udfs(&final_ctx);
+            register_sql2_udfs(&final_ctx, system_sql2_function_provider());
             ctx.register_table(
                 surface_name,
                 spec.compiled_lix_directory_view_provider(
@@ -1558,7 +1558,7 @@ async fn register_filesystem_history_view_with_state_history_provider(
     state_history_provider: Arc<dyn TableProvider>,
 ) -> Result<(), LixError> {
     let compile_ctx = SessionContext::new();
-    register_sql2_udfs(&compile_ctx);
+    register_sql2_udfs(&compile_ctx, system_sql2_function_provider());
 
     let mut base_relation_providers: BTreeMap<
         Sql2FilesystemViewBaseRelation,
@@ -1575,7 +1575,7 @@ async fn register_filesystem_history_view_with_state_history_provider(
             )
         })?;
         let base_provider_ctx = SessionContext::new();
-        register_sql2_udfs(&base_provider_ctx);
+        register_sql2_udfs(&base_provider_ctx, system_sql2_function_provider());
         let provider = base_relation_plan
             .compiled_view_provider(&base_provider_ctx, Arc::clone(&state_history_provider))?;
         base_relation_providers.insert(*base_relation, provider);

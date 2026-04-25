@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 
 use crate::binary_cas::BlobDataReader;
+use crate::functions::DynFunctionProvider;
 use crate::history::{StateHistoryRequest, StateHistoryRow};
 use crate::live_state::LiveStateContext;
 use crate::sql::{
@@ -40,6 +41,7 @@ use super::udf::register_sql2_udfs;
 pub(crate) trait SqlExecutionContext {
     fn active_version_id(&self) -> &str;
     fn live_state(&self) -> Arc<dyn LiveStateContext>;
+    fn functions(&self) -> DynFunctionProvider;
     fn history(&self) -> Option<Arc<dyn HistoryContext>> {
         None
     }
@@ -341,7 +343,7 @@ pub(crate) async fn execute_logical_plan(
 
 async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, LixError> {
     let session = SessionContext::new();
-    register_sql2_udfs(&session);
+    register_sql2_udfs(&session, ctx.functions());
     let history = ctx.history();
     register_lix_state_providers(
         &session,
@@ -361,6 +363,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.active_version_id(),
         ctx.live_state(),
         ctx.write_stager(),
+        ctx.functions(),
         history.as_ref().map(Arc::clone),
     )
     .await?;
@@ -370,6 +373,7 @@ async fn build_session(ctx: &dyn SqlExecutionContext) -> Result<SessionContext, 
         ctx.live_state(),
         ctx.blob_reader(),
         ctx.write_stager(),
+        ctx.functions(),
         history.as_ref().map(Arc::clone),
     )
     .await?;
@@ -494,6 +498,9 @@ mod tests {
         SqlWriteStager, StateRow,
     };
     use crate::binary_cas::BlobDataReader;
+    use crate::functions::{
+        DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::history::{
         StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
         StateHistoryVersionScope,
@@ -518,6 +525,14 @@ mod tests {
         blobs: BTreeMap<String, Vec<u8>>,
     }
     struct BackendBlobReader(Arc<dyn crate::LixBackend + Send + Sync>);
+
+    #[allow(dead_code)]
+    fn test_functions() -> DynFunctionProvider {
+        SharedFunctionProvider::new(
+            Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+        )
+    }
+
     #[derive(Default)]
     struct CapturingPreparedWriteStager {
         deltas: Vec<TransactionWriteDelta>,
@@ -549,6 +564,10 @@ mod tests {
             Arc::clone(&self.live_state)
         }
 
+        fn functions(&self) -> DynFunctionProvider {
+            test_functions()
+        }
+
         fn blob_reader(&self) -> Arc<dyn BlobDataReader> {
             Arc::clone(&self.blob_reader)
         }
@@ -570,6 +589,10 @@ mod tests {
 
         fn live_state(&self) -> Arc<dyn LiveStateContext> {
             Arc::clone(&self.live_state)
+        }
+
+        fn functions(&self) -> DynFunctionProvider {
+            test_functions()
         }
 
         fn history(&self) -> Option<Arc<dyn HistoryContext>> {
@@ -2247,6 +2270,10 @@ mod tests {
 
         fn live_state(&self) -> Arc<dyn LiveStateContext> {
             Arc::clone(&self.live_state)
+        }
+
+        fn functions(&self) -> DynFunctionProvider {
+            test_functions()
         }
 
         fn blob_reader(&self) -> Arc<dyn BlobDataReader> {

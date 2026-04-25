@@ -147,6 +147,7 @@ impl Session {
             backend: Arc::clone(&self.backend),
             committed_live_state: Arc::clone(&self.committed_live_state),
             visible_schemas,
+            functions: self.functions.clone(),
         };
 
         let plan = sql2::create_logical_plan(&ctx, sql).await?;
@@ -159,6 +160,7 @@ impl Session {
                 &self.backend,
                 Arc::clone(&self.committed_live_state),
                 Arc::clone(&self.schema_registry),
+                self.functions.clone(),
             )
             .await?;
             // Re-plan against the transaction so DataFusion provider hooks

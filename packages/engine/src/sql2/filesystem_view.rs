@@ -18,7 +18,10 @@ use self::sql_fragments::{
     filesystem_file_history_path_sql, filesystem_file_history_view_sql, filesystem_file_path_sql,
     filesystem_file_view_sql, filesystem_winner_relation_name,
 };
-use super::udf::{lix_json_extract_boolean_expr, lix_json_extract_text_expr, register_sql2_udfs};
+use super::udf::{
+    lix_json_extract_boolean_expr, lix_json_extract_text_expr, register_sql2_udfs,
+    system_sql2_function_provider,
+};
 use crate::catalog::{SurfaceFamily, SurfaceRegistry, SurfaceVariant};
 use crate::common::escape_sql_string;
 use crate::LixError;
@@ -1165,7 +1168,7 @@ fn datafusion_error_to_lix_error(error: datafusion::common::DataFusionError) -> 
 
 fn new_filesystem_compile_ctx() -> SessionContext {
     let ctx = SessionContext::new();
-    register_sql2_udfs(&ctx);
+    register_sql2_udfs(&ctx, system_sql2_function_provider());
     ctx
 }
 

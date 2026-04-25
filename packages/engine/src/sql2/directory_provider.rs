@@ -26,6 +26,7 @@ use datafusion::prelude::SessionContext;
 use futures_util::{stream, StreamExt, TryStreamExt};
 use serde::Deserialize;
 
+use crate::functions::DynFunctionProvider;
 use crate::history::{
     StateHistoryContentMode, StateHistoryLineageScope, StateHistoryRequest, StateHistoryRow,
 };
@@ -49,6 +50,7 @@ pub(crate) async fn register_lix_directory_providers(
     active_version_id: &str,
     live_state: Arc<dyn LiveStateContext>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
+    functions: DynFunctionProvider,
     history: Option<Arc<dyn HistoryContext>>,
 ) -> Result<(), LixError> {
     session
@@ -57,6 +59,7 @@ pub(crate) async fn register_lix_directory_providers(
             Arc::new(LixDirectoryProvider::by_version(
                 Arc::clone(&live_state),
                 write_stager.as_ref().map(Arc::clone),
+                functions.clone(),
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -67,6 +70,7 @@ pub(crate) async fn register_lix_directory_providers(
                 active_version_id,
                 live_state,
                 write_stager,
+                functions,
             )),
         )
         .map_err(datafusion_error_to_lix_error)?;
@@ -85,6 +89,7 @@ pub(crate) struct LixDirectoryProvider {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateContext>,
     write_stager: Option<Arc<dyn SqlWriteStager>>,
+    functions: DynFunctionProvider,
     default_version_id: Option<String>,
 }
 
@@ -99,11 +104,13 @@ impl LixDirectoryProvider {
         active_version_id: impl Into<String>,
         live_state: Arc<dyn LiveStateContext>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
+        functions: DynFunctionProvider,
     ) -> Self {
         Self {
             schema: lix_directory_schema(),
             live_state,
             write_stager,
+            functions,
             default_version_id: Some(active_version_id.into()),
         }
     }
@@ -111,11 +118,13 @@ impl LixDirectoryProvider {
     fn by_version(
         live_state: Arc<dyn LiveStateContext>,
         write_stager: Option<Arc<dyn SqlWriteStager>>,
+        functions: DynFunctionProvider,
     ) -> Self {
         Self {
             schema: lix_directory_by_version_schema(),
             live_state,
             write_stager,
+            functions,
             default_version_id: None,
         }
     }
@@ -244,6 +253,7 @@ impl TableProvider for LixDirectoryProvider {
             input.schema(),
             Arc::clone(&self.live_state),
             Arc::clone(write_stager),
+            self.functions.clone(),
             self.default_version_id.clone(),
         );
         Ok(Arc::new(DataSinkExec::new(input, Arc::new(sink), None)))
@@ -323,6 +333,7 @@ struct LixDirectoryInsertSink {
     schema: SchemaRef,
     live_state: Arc<dyn LiveStateContext>,
     write_stager: Arc<dyn SqlWriteStager>,
+    functions: DynFunctionProvider,
     default_version_id: Option<String>,
 }
 
@@ -337,12 +348,14 @@ impl LixDirectoryInsertSink {
         schema: SchemaRef,
         live_state: Arc<dyn LiveStateContext>,
         write_stager: Arc<dyn SqlWriteStager>,
+        functions: DynFunctionProvider,
         default_version_id: Option<String>,
     ) -> Self {
         Self {
             schema,
             live_state,
             write_stager,
+            functions,
             default_version_id,
         }
     }
@@ -405,6 +418,7 @@ impl DataSink for LixDirectoryInsertSink {
                     path_resolvers
                         .as_mut()
                         .expect("path resolver should be initialized"),
+                    &mut || self.functions.call_uuid_v7(),
                 )?);
             } else {
                 rows.extend(lix_directory_write_rows_from_batch_with_options(
@@ -1166,12 +1180,14 @@ fn lix_directory_write_rows_from_batch_with_path_resolvers(
     batch: &RecordBatch,
     default_version_id: Option<&str>,
     path_resolvers: &mut BTreeMap<String, DirectoryPathResolver>,
+    generate_directory_id: &mut dyn FnMut() -> String,
 ) -> Result<Vec<StateRow>> {
     lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
         batch,
         default_version_id,
         true,
         Some(path_resolvers),
+        Some(generate_directory_id),
     )
 }
 
@@ -1270,6 +1286,7 @@ fn lix_directory_write_rows_from_batch_with_options(
         default_version_id,
         reject_read_only_fields,
         None,
+        None,
     )
 }
 
@@ -1278,6 +1295,7 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
     default_version_id: Option<&str>,
     reject_read_only_fields: bool,
     mut path_resolvers: Option<&mut BTreeMap<String, DirectoryPathResolver>>,
+    mut generate_directory_id: Option<&mut dyn FnMut() -> String>,
 ) -> Result<Vec<StateRow>> {
     let mut rows = Vec::new();
     for row_index in 0..batch.num_rows() {
@@ -1308,8 +1326,20 @@ fn lix_directory_write_rows_from_batch_with_options_and_path_resolvers(
             let resolver = path_resolvers
                 .entry(directory_path_resolver_key(&context))
                 .or_insert_with(DirectoryPathResolver::default);
+            let Some(generate_directory_id) = generate_directory_id.as_deref_mut() else {
+                return Err(DataFusionError::Execution(
+                    "INSERT into lix_directory with path requires directory id generator"
+                        .to_string(),
+                ));
+            };
             let planned_rows = resolver
-                .ensure_directory_path_with_leaf_id(&path, Some(id), context, hidden)
+                .ensure_directory_path_with_leaf_id(
+                    &path,
+                    Some(id),
+                    context,
+                    hidden,
+                    generate_directory_id,
+                )
                 .map_err(lix_error_to_datafusion_error)?;
             rows.extend(planned_rows);
             continue;
@@ -1908,6 +1938,9 @@ mod tests {
     use datafusion::physical_plan::SendableRecordBatchStream;
     use futures_util::stream;
 
+    use crate::functions::{
+        DynFunctionProvider, LixFunctionProvider, SharedFunctionProvider, SystemFunctionProvider,
+    };
     use crate::live_state::{ExactRowRequest, LiveRow, LiveStateContext, LiveStateScanRequest};
     use crate::sql2::{SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
     use crate::LixError;
@@ -1920,6 +1953,17 @@ mod tests {
         LixDirectoryInsertSink,
     };
     use crate::sql2::filesystem_visibility::VisibleFilesystem;
+
+    fn test_id_generator(ids: &'static [&'static str]) -> impl FnMut() -> String {
+        let mut ids = ids.iter();
+        move || ids.next().expect("test id should exist").to_string()
+    }
+
+    fn test_functions() -> DynFunctionProvider {
+        SharedFunctionProvider::new(
+            Box::new(SystemFunctionProvider) as Box<dyn LixFunctionProvider + Send>
+        )
+    }
 
     #[derive(Default)]
     struct CapturingWriteStager {
@@ -2239,6 +2283,7 @@ mod tests {
             &directory_path_insert_batch("/docs/nested/"),
             None,
             &mut resolvers,
+            &mut test_id_generator(&["should-not-be-used"]),
         )
         .expect("directory path batch should decode");
 
@@ -2318,6 +2363,7 @@ mod tests {
             batch.schema(),
             Arc::new(RowsLiveStateContext::default()) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            test_functions(),
             None,
         );
         let stream = stream::iter(vec![Ok(batch)]);
@@ -2370,6 +2416,7 @@ mod tests {
                 )],
             }) as Arc<dyn LiveStateContext>,
             Arc::clone(&stager) as Arc<dyn SqlWriteStager>,
+            test_functions(),
             None,
         );
         let stream = stream::iter(vec![Ok(batch)]);

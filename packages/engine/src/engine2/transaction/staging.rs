@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use async_trait::async_trait;
 
-use crate::functions::{LixFunctionProvider, SystemFunctionProvider};
+use crate::functions::{DynFunctionProvider, LixFunctionProvider};
 use crate::live_state::{ExactRowRequest, LiveRow, LiveStateScanRequest};
 use crate::sql2::{FileDataWrite, SqlWriteIntent, SqlWriteOutcome, SqlWriteStager, StateRow};
 use crate::{LixError, NullableKeyFilter};
@@ -14,8 +14,8 @@ use crate::{LixError, NullableKeyFilter};
 /// providers stage SQL write intents here, the transaction normalizes them into
 /// stable `StateRow`s, reads build a `StagedStateRowOverlay` from those rows,
 /// and commit later drains the same rows.
-#[derive(Default)]
 pub(crate) struct TransactionStagedWrites {
+    functions: DynFunctionProvider,
     rows: Mutex<BTreeMap<StagedStateRowIdentity, StateRow>>,
     file_data_writes: Mutex<Vec<FileDataWrite>>,
 }
@@ -27,6 +27,14 @@ pub(crate) struct StagedWriteSet {
 }
 
 impl TransactionStagedWrites {
+    pub(crate) fn new(functions: DynFunctionProvider) -> Self {
+        Self {
+            functions,
+            rows: Mutex::new(BTreeMap::new()),
+            file_data_writes: Mutex::new(Vec::new()),
+        }
+    }
+
     /// Drains staged writes for commit.
     pub(crate) fn drain(&self) -> Result<StagedWriteSet, LixError> {
         let mut rows_guard = self.rows.lock().map_err(|_| {
@@ -62,12 +70,12 @@ impl TransactionStagedWrites {
 #[async_trait]
 impl SqlWriteStager for TransactionStagedWrites {
     async fn stage_write(&self, write: SqlWriteIntent) -> Result<SqlWriteOutcome, LixError> {
-        let mut functions = SystemFunctionProvider;
         let count = match &write {
             SqlWriteIntent::WriteRows { rows } => rows.len() as u64,
             SqlWriteIntent::WriteRowsWithFileData { count, .. } => *count,
         };
-        let (rows, file_data_writes) = state_rows_from_write_intent(write, &mut functions)?;
+        let (rows, file_data_writes) =
+            state_rows_from_write_intent(write, &mut self.functions.clone())?;
         let mut guard = self.rows.lock().map_err(|_| {
             LixError::new(
                 "LIX_ERROR_UNKNOWN",
@@ -330,11 +338,12 @@ fn nullable_key_matches_filter(value: &Option<String>, filter: &NullableKeyFilte
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::functions::SharedFunctionProvider;
     use crate::live_state::{ExactRowRequest, LiveStateFilter};
 
     #[tokio::test]
     async fn staging_overlay_uses_last_staged_row_for_exact_load() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
@@ -370,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn staging_overlay_scan_returns_only_latest_row_per_identity() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
@@ -396,7 +405,7 @@ mod tests {
 
     #[tokio::test]
     async fn staging_overlay_delete_hides_prior_staged_insert() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
@@ -426,7 +435,7 @@ mod tests {
 
     #[tokio::test]
     async fn staging_overlay_insert_after_delete_resurrects_row() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
@@ -462,7 +471,7 @@ mod tests {
 
     #[tokio::test]
     async fn staged_writes_drain_returns_coalesced_latest_rows() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
@@ -492,7 +501,7 @@ mod tests {
 
     #[tokio::test]
     async fn staged_writes_drain_preserves_file_data_payloads() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRowsWithFileData {
@@ -518,7 +527,7 @@ mod tests {
 
     #[tokio::test]
     async fn staging_overlay_identity_matches_live_state_conflict_key() {
-        let staged_writes = TransactionStagedWrites::default();
+        let staged_writes = test_staged_writes();
 
         staged_writes
             .stage_write(SqlWriteIntent::WriteRows {
@@ -556,6 +565,58 @@ mod tests {
             row.snapshot_content.as_deref()
                 == Some("{\"key\":\"shared-entity\",\"value\":\"tracked\"}")
         }));
+    }
+
+    #[tokio::test]
+    async fn staged_writes_use_injected_function_provider_for_row_metadata() {
+        let staged_writes = test_staged_writes();
+
+        staged_writes
+            .stage_write(SqlWriteIntent::WriteRows {
+                rows: vec![state_row("sql2-functions-key", "value")],
+            })
+            .await
+            .expect("staging rows should succeed");
+
+        let drained = staged_writes.drain().expect("drain should succeed");
+        assert_eq!(drained.state_rows.len(), 1);
+        assert_eq!(
+            drained.state_rows[0].change_id.as_deref(),
+            Some("test-uuid-1")
+        );
+        assert_eq!(
+            drained.state_rows[0].created_at.as_deref(),
+            Some("test-timestamp-1")
+        );
+        assert_eq!(
+            drained.state_rows[0].updated_at.as_deref(),
+            Some("test-timestamp-1")
+        );
+    }
+
+    fn test_staged_writes() -> TransactionStagedWrites {
+        TransactionStagedWrites::new(SharedFunctionProvider::new(Box::new(
+            TestFunctionProvider::default(),
+        )
+            as Box<dyn LixFunctionProvider + Send>))
+    }
+
+    #[derive(Default)]
+    struct TestFunctionProvider {
+        uuid_count: usize,
+        timestamp_count: usize,
+    }
+
+    impl LixFunctionProvider for TestFunctionProvider {
+        fn uuid_v7(&mut self) -> String {
+            self.uuid_count += 1;
+            format!("test-uuid-{}", self.uuid_count)
+        }
+
+        fn timestamp(&mut self) -> String {
+            self.timestamp_count += 1;
+            format!("test-timestamp-{}", self.timestamp_count)
+        }
     }
 
     fn state_row(key: &str, value: &str) -> StateRow {
