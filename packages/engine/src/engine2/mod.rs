@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 pub mod engine;
+pub(crate) mod schema_registry;
 pub mod session;
 pub mod transaction;
 

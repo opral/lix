@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use serde_json::Value as JsonValue;
 
 use crate::binary_cas::BlobDataReader;
+use crate::engine2::schema_registry::SchemaRegistry;
 use crate::live_state::{CommittedLiveStateContext, LiveStateContext};
 use crate::sql2::SqlExecutionContext;
 use crate::{LixBackend, LixError};
@@ -17,6 +18,7 @@ pub struct Session {
     active_version_id: String,
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    schema_registry: Arc<SchemaRegistry>,
 }
 
 impl Session {
@@ -24,19 +26,27 @@ impl Session {
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
+        schema_registry: Arc<SchemaRegistry>,
     ) -> Result<Self, LixError> {
-        Ok(Self::new(active_version_id, backend, committed_live_state))
+        Ok(Self::new(
+            active_version_id,
+            backend,
+            committed_live_state,
+            schema_registry,
+        ))
     }
 
     pub(crate) fn new(
         active_version_id: String,
         backend: Arc<dyn LixBackend + Send + Sync>,
         committed_live_state: Arc<CommittedLiveStateContext>,
+        schema_registry: Arc<SchemaRegistry>,
     ) -> Self {
         Self {
             active_version_id,
             backend,
             committed_live_state,
+            schema_registry,
         }
     }
 
@@ -49,6 +59,7 @@ struct SessionSqlExecutionContext<'a> {
     active_version_id: &'a str,
     backend: Arc<dyn LixBackend + Send + Sync>,
     committed_live_state: Arc<CommittedLiveStateContext>,
+    visible_schemas: Vec<JsonValue>,
 }
 
 impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
@@ -67,12 +78,7 @@ impl SqlExecutionContext for SessionSqlExecutionContext<'_> {
 
     fn list_visible_schemas(&self, version_id: &str) -> Result<Vec<JsonValue>, LixError> {
         let _ = version_id;
-        // TODO(engine2): replace this hardcoded bootstrap schema with an
-        // engine2-owned schema registry that includes builtin and registered
-        // visible schemas for the execution version.
-        let key_value_schema = crate::schema::builtin_schema_definition("lix_key_value")
-            .ok_or_else(|| LixError::unknown("missing builtin lix_key_value schema"))?;
-        Ok(vec![key_value_schema.clone()])
+        Ok(self.visible_schemas.clone())
     }
 }
 

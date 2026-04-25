@@ -743,6 +743,100 @@ pub(crate) async fn set_live_state_mode_in_transaction(
     Ok(())
 }
 
+pub(crate) async fn upsert_registered_schema_bootstrap_row_in_transaction(
+    transaction: &mut dyn LixBackendTransaction,
+    row: &LiveRow,
+) -> Result<(), LixError> {
+    if row.schema_key != "lix_registered_schema" {
+        return Err(LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "registered schema bootstrap mirror received row for schema '{}'",
+                row.schema_key
+            ),
+        ));
+    }
+
+    let updated_at = row.updated_at.as_deref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "registered schema bootstrap mirror requires updated_at for '{}'",
+                row.entity_id
+            ),
+        )
+    })?;
+    let created_at = row.created_at.as_deref().unwrap_or(updated_at);
+    let change_id = row.change_id.as_deref().ok_or_else(|| {
+        LixError::new(
+            "LIX_ERROR_UNKNOWN",
+            format!(
+                "registered schema bootstrap mirror requires change_id for '{}'",
+                row.entity_id
+            ),
+        )
+    })?;
+
+    let snapshot_sql = row
+        .snapshot_content
+        .as_deref()
+        .map(|value| format!("'{}'", escape_sql_string(value)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let file_id_sql = row
+        .file_id
+        .as_deref()
+        .map(|value| format!("'{}'", escape_sql_string(value)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let storage_scope_key_sql = format!(
+        "'{}'",
+        escape_sql_string(&storage_scope_key_for_file_id(row.file_id.as_deref()))
+    );
+    let plugin_key_sql = row
+        .plugin_key
+        .as_deref()
+        .map(|value| format!("'{}'", escape_sql_string(value)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let metadata_sql = row
+        .metadata
+        .as_deref()
+        .map(|value| format!("'{}'", escape_sql_string(value)))
+        .unwrap_or_else(|| "NULL".to_string());
+    let sql = format!(
+        "INSERT INTO {table} (\
+         entity_id, schema_key, schema_version, file_id, storage_scope_key, version_id, global, plugin_key, snapshot_content, change_id, metadata, is_tombstone, untracked, created_at, updated_at\
+         ) VALUES (\
+         '{entity_id}', 'lix_registered_schema', '{schema_version}', {file_id}, {storage_scope_key}, '{version_id}', {global}, {plugin_key}, {snapshot_content}, '{change_id}', {metadata}, {is_tombstone}, {untracked}, '{created_at}', '{updated_at}'\
+         ) ON CONFLICT (entity_id, storage_scope_key, version_id, untracked) DO UPDATE SET \
+         schema_key = excluded.schema_key, \
+         schema_version = excluded.schema_version, \
+         file_id = excluded.file_id, \
+         global = excluded.global, \
+         plugin_key = excluded.plugin_key, \
+         snapshot_content = excluded.snapshot_content, \
+         change_id = excluded.change_id, \
+         metadata = excluded.metadata, \
+         is_tombstone = excluded.is_tombstone, \
+         updated_at = excluded.updated_at",
+        table = crate::live_state::REGISTERED_SCHEMA_BOOTSTRAP_TABLE,
+        entity_id = escape_sql_string(&row.entity_id),
+        schema_version = escape_sql_string(&row.schema_version),
+        file_id = file_id_sql,
+        storage_scope_key = storage_scope_key_sql,
+        version_id = escape_sql_string(&row.version_id),
+        global = if row.global { "true" } else { "false" },
+        plugin_key = plugin_key_sql,
+        snapshot_content = snapshot_sql,
+        change_id = escape_sql_string(change_id),
+        metadata = metadata_sql,
+        is_tombstone = if row.snapshot_content.is_some() { 0 } else { 1 },
+        untracked = if row.untracked { "true" } else { "false" },
+        created_at = escape_sql_string(created_at),
+        updated_at = escape_sql_string(updated_at),
+    );
+    execute_query_with_transaction(transaction, &sql, &[]).await?;
+    Ok(())
+}
+
 pub(crate) async fn upsert_live_state_rebuild_row_in_transaction(
     transaction: &mut dyn LixBackendTransaction,
     write: &crate::live_state::LiveStateWrite,
